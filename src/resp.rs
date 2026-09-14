@@ -18,6 +18,8 @@ pub enum ClusterSubcommand {
     Slots,
     Nodes,
     Info,
+    Meet { ip: String, port: u16 },
+    MyId,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -207,6 +209,7 @@ pub enum Command {
     Msetnx(Vec<(Bytes, Bytes)>),
     Save,
     Bgsave,
+    Lastsave,
     Ping(Option<Bytes>),
     CommandDocs,
     Info,
@@ -319,6 +322,45 @@ pub enum Command {
         key: Bytes,
         maxlen: Option<usize>,
         minid: Option<crate::table::StreamId>,
+    },
+    XgroupCreate {
+        key: Bytes,
+        group: Bytes,
+        id: String,
+        mkstream: bool,
+    },
+    XgroupDestroy {
+        key: Bytes,
+        group: Bytes,
+    },
+    XgroupCreateConsumer {
+        key: Bytes,
+        group: Bytes,
+        consumer: Bytes,
+    },
+    XgroupDelConsumer {
+        key: Bytes,
+        group: Bytes,
+        consumer: Bytes,
+    },
+    Xreadgroup {
+        group: Bytes,
+        consumer: Bytes,
+        count: Option<usize>,
+        block_ms: Option<u64>,
+        noack: bool,
+        keys: Vec<Bytes>,
+        ids: Vec<String>,
+    },
+    Xack {
+        key: Bytes,
+        group: Bytes,
+        ids: Vec<crate::table::StreamId>,
+    },
+    Xpending {
+        key: Bytes,
+        group: Bytes,
+        range: Option<(crate::table::StreamId, crate::table::StreamId, usize, Option<Bytes>)>,
     },
     Unknown(String),
 }
@@ -712,6 +754,18 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "SLOTS" => Ok(Some(Command::Cluster(ClusterSubcommand::Slots))),
                 "NODES" => Ok(Some(Command::Cluster(ClusterSubcommand::Nodes))),
                 "INFO" => Ok(Some(Command::Cluster(ClusterSubcommand::Info))),
+                "MYID" => Ok(Some(Command::Cluster(ClusterSubcommand::MyId))),
+                "MEET" => {
+                    if args.len() < 4 {
+                        return Err("wrong number of arguments for 'cluster meet' command".to_string());
+                    }
+                    let ip = String::from_utf8_lossy(&args[2]).to_string();
+                    let port: u16 = std::str::from_utf8(&args[3])
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                    Ok(Some(Command::Cluster(ClusterSubcommand::Meet { ip, port })))
+                }
                 _ => Ok(Some(Command::Unknown(format!("CLUSTER {}", sub)))),
             }
         }
@@ -1597,6 +1651,7 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
         }
         "SAVE" => Ok(Some(Command::Save)),
         "BGSAVE" => Ok(Some(Command::Bgsave)),
+        "LASTSAVE" => Ok(Some(Command::Lastsave)),
         "COMMAND" => Ok(Some(Command::CommandDocs)),
         "INFO" => Ok(Some(Command::Info)),
         "QUIT" => Ok(Some(Command::Quit)),
@@ -2195,6 +2250,177 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 maxlen,
                 minid,
             }))
+        }
+        "XGROUP" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'xgroup' command".to_string());
+            }
+            let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
+            match sub.as_str() {
+                "CREATE" => {
+                    if args.len() < 5 {
+                        return Err("wrong number of arguments for 'xgroup create' command".to_string());
+                    }
+                    let key = args[2].clone();
+                    let group = args[3].clone();
+                    let id = String::from_utf8_lossy(&args[4]).to_string();
+                    let mut mkstream = false;
+                    for arg in &args[5..] {
+                        if arg.eq_ignore_ascii_case(b"MKSTREAM") {
+                            mkstream = true;
+                        }
+                    }
+                    Ok(Some(Command::XgroupCreate { key, group, id, mkstream }))
+                }
+                "DESTROY" => {
+                    if args.len() < 4 {
+                        return Err("wrong number of arguments for 'xgroup destroy' command".to_string());
+                    }
+                    let key = args[2].clone();
+                    let group = args[3].clone();
+                    Ok(Some(Command::XgroupDestroy { key, group }))
+                }
+                "CREATECONSUMER" => {
+                    if args.len() < 5 {
+                        return Err("wrong number of arguments for 'xgroup createconsumer' command".to_string());
+                    }
+                    let key = args[2].clone();
+                    let group = args[3].clone();
+                    let consumer = args[4].clone();
+                    Ok(Some(Command::XgroupCreateConsumer { key, group, consumer }))
+                }
+                "DELCONSUMER" => {
+                    if args.len() < 5 {
+                        return Err("wrong number of arguments for 'xgroup delconsumer' command".to_string());
+                    }
+                    let key = args[2].clone();
+                    let group = args[3].clone();
+                    let consumer = args[4].clone();
+                    Ok(Some(Command::XgroupDelConsumer { key, group, consumer }))
+                }
+                _ => Ok(Some(Command::Unknown(format!("XGROUP {}", sub)))),
+            }
+        }
+        "XREADGROUP" => {
+            if args.len() < 6 {
+                return Err("wrong number of arguments for 'xreadgroup' command".to_string());
+            }
+            if !args[1].eq_ignore_ascii_case(b"GROUP") {
+                return Err("syntax error".to_string());
+            }
+            let group = args[2].clone();
+            let consumer = args[3].clone();
+            let mut count = None;
+            let mut block_ms = None;
+            let mut noack = false;
+            let mut i = 4;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "COUNT" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let c: usize = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        count = Some(c);
+                        i += 2;
+                    }
+                    "BLOCK" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let b: u64 = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        block_ms = Some(b);
+                        i += 2;
+                    }
+                    "NOACK" => {
+                        noack = true;
+                        i += 1;
+                    }
+                    "STREAMS" => {
+                        i += 1;
+                        break;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            let rem = args.len() - i;
+            if rem < 2 || rem % 2 != 0 {
+                return Err("ERR Unbalanced XREADGROUP list of streams and IDs".to_string());
+            }
+            let n = rem / 2;
+            let keys: Vec<Bytes> = args[i..i + n].to_vec();
+            let ids: Vec<String> = args[i + n..]
+                .iter()
+                .map(|b| String::from_utf8_lossy(b).to_string())
+                .collect();
+            Ok(Some(Command::Xreadgroup {
+                group,
+                consumer,
+                count,
+                block_ms,
+                noack,
+                keys,
+                ids,
+            }))
+        }
+        "XACK" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'xack' command".to_string());
+            }
+            let key = args[1].clone();
+            let group = args[2].clone();
+            let mut ids = Vec::with_capacity(args.len() - 3);
+            for arg in &args[3..] {
+                let s = std::str::from_utf8(arg)
+                    .map_err(|_| "Invalid stream ID specified as stream command argument")?;
+                let id = crate::table::StreamId::parse_exact(s)
+                    .map_err(|e| e.to_string())?;
+                ids.push(id);
+            }
+            Ok(Some(Command::Xack { key, group, ids }))
+        }
+        "XPENDING" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'xpending' command".to_string());
+            }
+            let key = args[1].clone();
+            let group = args[2].clone();
+            if args.len() == 3 {
+                Ok(Some(Command::Xpending { key, group, range: None }))
+            } else {
+                let mut start_idx = 3;
+                if args[start_idx].eq_ignore_ascii_case(b"IDLE") {
+                    start_idx += 2;
+                }
+                if args.len() < start_idx + 3 {
+                    return Err("syntax error".to_string());
+                }
+                let start_s = std::str::from_utf8(&args[start_idx]).map_err(|_| "syntax error")?;
+                let start = if start_s == "-" { crate::table::StreamId::default() } else { crate::table::StreamId::parse(start_s)? };
+                let end_s = std::str::from_utf8(&args[start_idx + 1]).map_err(|_| "syntax error")?;
+                let end = if end_s == "+" { crate::table::StreamId::new(u64::MAX, u64::MAX) } else { crate::table::StreamId::parse(end_s)? };
+                let count: usize = std::str::from_utf8(&args[start_idx + 2])
+                    .map_err(|_| "value is not an integer or out of range")?
+                    .parse()
+                    .map_err(|_| "value is not an integer or out of range")?;
+                let consumer = if args.len() > start_idx + 3 {
+                    Some(args[start_idx + 3].clone())
+                } else {
+                    None
+                };
+                Ok(Some(Command::Xpending {
+                    key,
+                    group,
+                    range: Some((start, end, count, consumer)),
+                }))
+            }
         }
         _ => Ok(Some(Command::Unknown(cmd_name))),
     }

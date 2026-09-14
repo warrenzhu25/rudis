@@ -1908,3 +1908,194 @@ fn test_streams_engine_e2e() {
     assert_eq!(send_and_read(&mut client, b"XLEN stream_copy\r\n"), ":5\r\n");
     assert_eq!(send_and_read(&mut client, b"TYPE stream_copy\r\n"), "+stream\r\n");
 }
+
+#[test]
+fn test_rdb_snapshot_forkless_e2e() {
+    let port = 16396;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    // 1. Write various data types across shards
+    assert_eq!(send_and_read(&mut client, b"SET rdb_str hello_world\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"SET rdb_int 12345\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"HSET rdb_hash f1 v1 f2 v2\r\n"), ":2\r\n");
+    assert_eq!(send_and_read(&mut client, b"RPUSH rdb_list a b c\r\n"), ":3\r\n");
+    assert_eq!(send_and_read(&mut client, b"SADD rdb_set m1 m2\r\n"), ":2\r\n");
+    assert_eq!(send_and_read(&mut client, b"ZADD rdb_zset 10 one 20 two\r\n"), ":2\r\n");
+
+    // 2. Test LASTSAVE
+    let lastsave_resp = send_and_read(&mut client, b"LASTSAVE\r\n");
+    assert!(lastsave_resp.starts_with(':'), "LASTSAVE should return integer timestamp");
+
+    // 3. Test synchronous SAVE
+    let save_resp = send_and_read(&mut client, b"SAVE\r\n");
+    assert_eq!(save_resp, "+OK\r\n");
+
+    // 4. Verify dump.rdb file was created and has valid header
+    let rdb_path = std::path::Path::new("dump.rdb");
+    assert!(rdb_path.exists(), "dump.rdb should exist after SAVE");
+    let content = std::fs::read(rdb_path).unwrap();
+    assert!(content.starts_with(b"REDIS0011"), "RDB file should have REDIS0011 header");
+
+    // 5. Test asynchronous BGSAVE
+    let bgsave_resp = send_and_read(&mut client, b"BGSAVE\r\n");
+    assert_eq!(bgsave_resp, "+Background saving started\r\n");
+
+    // Clean up dump file
+    let _ = std::fs::remove_file("dump.rdb");
+}
+
+#[test]
+fn test_memory_compact_encodings_e2e() {
+    let port = 16397;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    // 1. Integer inlined value (RudisValue::Int)
+    assert_eq!(send_and_read(&mut client, b"SET count 42\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"TYPE count\r\n"), "+string\r\n");
+    assert_eq!(send_and_read(&mut client, b"GET count\r\n"), "$2\r\n42\r\n");
+    assert_eq!(send_and_read(&mut client, b"STRLEN count\r\n"), ":2\r\n");
+
+    // INCRBY on inlined integer (mutated in place without allocation)
+    assert_eq!(send_and_read(&mut client, b"INCRBY count 10\r\n"), ":52\r\n");
+    assert_eq!(send_and_read(&mut client, b"INCRBY count -100\r\n"), ":-48\r\n");
+    assert_eq!(send_and_read(&mut client, b"GET count\r\n"), "$3\r\n-48\r\n");
+
+    // APPEND promotes inlined Int to String
+    assert_eq!(send_and_read(&mut client, b"APPEND count _extra\r\n"), ":9\r\n");
+    assert_eq!(send_and_read(&mut client, b"GET count\r\n"), "$9\r\n-48_extra\r\n");
+
+    // 2. Small Hash flat vector representation (RudisValue::SmallHash)
+    assert_eq!(send_and_read(&mut client, b"HSET compact_hash a 1 b 2 c 3\r\n"), ":3\r\n");
+    assert_eq!(send_and_read(&mut client, b"HLEN compact_hash\r\n"), ":3\r\n");
+    assert_eq!(send_and_read(&mut client, b"HEXISTS compact_hash b\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"HGET compact_hash b\r\n"), "$1\r\n2\r\n");
+    assert_eq!(send_and_read(&mut client, b"HDEL compact_hash b\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"HLEN compact_hash\r\n"), ":2\r\n");
+
+    // Auto-promotion from SmallHash to full Hash when exceeding 64 keys
+    let mut large_hset = String::from("HSET compact_hash");
+    for i in 0..70 {
+        large_hset.push_str(&format!(" k{} v{}", i, i));
+    }
+    large_hset.push_str("\r\n");
+    let resp = send_and_read(&mut client, large_hset.as_bytes());
+    assert!(resp.starts_with(':'));
+
+    // Should now be promoted to full Hash and readable
+    assert_eq!(send_and_read(&mut client, b"HLEN compact_hash\r\n"), ":72\r\n");
+    assert_eq!(send_and_read(&mut client, b"HGET compact_hash k50\r\n"), "$3\r\nv50\r\n");
+}
+
+#[test]
+fn test_streams_consumer_groups_e2e() {
+    let port = 16398;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    // 1. Create stream with initial entry
+    assert_eq!(
+        send_and_read(&mut client, b"XADD stream_cg 1000-0 sensor temp val 20\r\n"),
+        "$6\r\n1000-0\r\n"
+    );
+
+    // 2. Create consumer group
+    assert_eq!(
+        send_and_read(&mut client, b"XGROUP CREATE stream_cg groupA $\r\n"),
+        "+OK\r\n"
+    );
+
+    // Duplicate creation returns BUSYGROUP
+    let dup_resp = send_and_read(&mut client, b"XGROUP CREATE stream_cg groupA $\r\n");
+    assert!(dup_resp.contains("BUSYGROUP"), "Duplicate group should return BUSYGROUP");
+
+    // 3. Create consumer
+    assert_eq!(
+        send_and_read(&mut client, b"XGROUP CREATECONSUMER stream_cg groupA worker1\r\n"),
+        ":1\r\n"
+    );
+
+    // 4. Add new entries that arrive after group was created at $
+    assert_eq!(
+        send_and_read(&mut client, b"XADD stream_cg 1001-0 sensor temp val 25\r\n"),
+        "$6\r\n1001-0\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"XADD stream_cg 1002-0 sensor temp val 30\r\n"),
+        "$6\r\n1002-0\r\n"
+    );
+
+    // 5. Read from group as consumer worker1
+    let read_resp = send_and_read(
+        &mut client,
+        b"XREADGROUP GROUP groupA worker1 COUNT 1 STREAMS stream_cg >\r\n"
+    );
+    assert!(read_resp.contains("1001-0"), "Should receive entry 1001-0");
+
+    // 6. Inspect PEL using XPENDING summary
+    let pending_summary = send_and_read(&mut client, b"XPENDING stream_cg groupA\r\n");
+    assert!(pending_summary.starts_with("*4\r\n:1\r\n"), "Summary should report 1 pending entry");
+    assert!(pending_summary.contains("1001-0"));
+    assert!(pending_summary.contains("worker1"));
+
+    // 7. Inspect PEL range
+    let pending_range = send_and_read(&mut client, b"XPENDING stream_cg groupA - + 10\r\n");
+    assert!(pending_range.contains("1001-0"));
+    assert!(pending_range.contains("worker1"));
+
+    // 8. Acknowledge entry
+    assert_eq!(
+        send_and_read(&mut client, b"XACK stream_cg groupA 1001-0\r\n"),
+        ":1\r\n"
+    );
+
+    // 9. Confirm PEL is now 0
+    let pending_after = send_and_read(&mut client, b"XPENDING stream_cg groupA\r\n");
+    assert!(pending_after.starts_with("*4\r\n:0\r\n"), "PEL should now be empty");
+
+    // 10. Destroy consumer group
+    assert_eq!(
+        send_and_read(&mut client, b"XGROUP DESTROY stream_cg groupA\r\n"),
+        ":1\r\n"
+    );
+}
+
+#[test]
+fn test_cluster_gossip_and_meet_e2e() {
+    let port1 = 16399;
+    let port2 = 16400;
+    start_test_server(port1, 2);
+    start_test_server(port2, 2);
+
+    let mut client1 = TcpStream::connect(("127.0.0.1", port1)).unwrap();
+    let mut client2 = TcpStream::connect(("127.0.0.1", port2)).unwrap();
+
+    // 1. CLUSTER MYID
+    let myid1 = send_and_read(&mut client1, b"CLUSTER MYID\r\n");
+    assert!(myid1.starts_with('$'), "MYID should be bulk string");
+
+    let myid2 = send_and_read(&mut client2, b"CLUSTER MYID\r\n");
+    assert!(myid2.starts_with('$'), "MYID should be bulk string");
+
+    // 2. CLUSTER INFO
+    let info = send_and_read(&mut client1, b"CLUSTER INFO\r\n");
+    assert!(info.contains("cluster_state:ok"));
+    assert!(info.contains("cluster_slots_assigned:16384"));
+
+    // 3. CLUSTER MEET
+    let meet_cmd = format!("CLUSTER MEET 127.0.0.1 {}\r\n", port2);
+    assert_eq!(send_and_read(&mut client1, meet_cmd.as_bytes()), "+OK\r\n");
+
+    // 4. CLUSTER NODES shows local and met remote node
+    let nodes = send_and_read(&mut client1, b"CLUSTER NODES\r\n");
+    assert!(nodes.contains("myself,master"), "Should show myself as master");
+    assert!(nodes.contains(&format!("127.0.0.1:{}", port2)), "Should list the met remote node");
+}
+

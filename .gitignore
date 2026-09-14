@@ -1,2 +1,4 @@
 /target
 /benchmark_logs
+*.rdb
+*.tmp.*

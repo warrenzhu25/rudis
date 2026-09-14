@@ -43,9 +43,30 @@ pub fn target_shard(key: &[u8], num_shards: usize) -> usize {
     slot_to_shard(slot, num_shards)
 }
 
+use std::sync::atomic::Ordering;
+use std::sync::RwLock;
+
+#[derive(Clone, Debug)]
+pub struct RemoteClusterNode {
+    pub id: String,
+    pub ip: String,
+    pub port: u16,
+    pub cport: u16,
+    pub flags: String,
+    pub master_id: String,
+    pub ping_sent: u64,
+    pub pong_recv: u64,
+    pub config_epoch: u64,
+    pub link_state: String,
+}
+
+pub static REMOTE_CLUSTER_NODES: std::sync::LazyLock<RwLock<Vec<RemoteClusterNode>>> =
+    std::sync::LazyLock::new(|| RwLock::new(Vec::new()));
+
 /// The router handles dispatching operations.
 /// If the key belongs to the current shard, it directly touches `local_db` without locking.
 /// If the key belongs to a peer shard, it routes the message across cores via the mesh.
+#[derive(Clone)]
 pub struct Router {
     pub shard_id: usize,
     pub num_shards: usize,
@@ -58,6 +79,8 @@ pub struct Router {
     pub pubsub: Rc<RefCell<crate::pubsub::PubSubHub>>,
     pub tx_lock: Rc<RefCell<Option<u64>>>,
     pub tx_waiters: Rc<RefCell<std::collections::VecDeque<(u64, flume::Sender<()>)>>>,
+    pub is_saving: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub last_save_time: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Router {
@@ -88,6 +111,8 @@ impl Router {
             pubsub,
             tx_lock: Rc::new(RefCell::new(None)),
             tx_waiters: Rc::new(RefCell::new(std::collections::VecDeque::new())),
+            is_saving: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_save_time: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -758,5 +783,178 @@ impl Router {
                 let _ = self.senders[sid].send(ShardMessage::ReleaseTxLock { tx_id });
             }
         }
+    }
+
+    pub fn lastsave(&self) -> u64 {
+        let ts = self.last_save_time.load(Ordering::Relaxed);
+        if ts == 0 {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let _ = self.last_save_time.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
+            self.last_save_time.load(Ordering::Relaxed)
+        } else {
+            ts
+        }
+    }
+
+    pub async fn save_rdb(&self) -> Result<(), String> {
+        if self.is_saving.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            return Err("Background save already in progress".to_string());
+        }
+        self.sync_aof().await;
+        self.perform_save_rdb().await
+    }
+
+    pub async fn bgsave(&self) -> Result<(), String> {
+        if self.is_saving.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            return Err("Background save already in progress".to_string());
+        }
+        let router_clone = self.clone();
+        monoio::spawn(async move {
+            router_clone.sync_aof().await;
+            let _ = router_clone.perform_save_rdb().await;
+        });
+        Ok(())
+    }
+
+    pub async fn perform_save_rdb(&self) -> Result<(), String> {
+        let mut full_rdb = Vec::new();
+        full_rdb.extend_from_slice(b"REDIS0011");
+        full_rdb.extend_from_slice(&[0xFE, 0x00]);
+
+        // Local shard chunk
+        self.local_db.borrow_mut().save_rdb_chunk(&mut full_rdb);
+
+        // Remote shard chunks
+        let mut responders = Vec::new();
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                if sender.send(ShardMessage::SaveRdbChunk { responder: tx }).is_ok() {
+                    responders.push(rx);
+                }
+            }
+        }
+        for rx in responders {
+            if let Ok(chunk) = rx.recv_async().await {
+                full_rdb.extend_from_slice(&chunk);
+            }
+        }
+
+        full_rdb.push(0xFF);
+        let crc = crate::table::crc64(&full_rdb);
+        full_rdb.extend_from_slice(&crc.to_le_bytes());
+
+        static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let tmp_id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let filename = "dump.rdb";
+        let tmp_filename = format!("{}.tmp.{}_{}", filename, std::process::id(), tmp_id);
+        let res = (|| -> Result<(), String> {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&tmp_filename).map_err(|e| e.to_string())?;
+            file.write_all(&full_rdb).map_err(|e| e.to_string())?;
+            file.sync_all().map_err(|e| e.to_string())?;
+            std::fs::rename(&tmp_filename, filename).map_err(|e| e.to_string())?;
+            Ok(())
+        })();
+
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.last_save_time.store(now_unix, Ordering::Relaxed);
+        self.is_saving.store(false, Ordering::SeqCst);
+        res
+    }
+
+    pub fn my_id(&self) -> String {
+        format!("{:040x}", self.shard_id + 1)
+    }
+
+    pub fn cluster_meet(&self, ip: String, port: u16) -> Result<(), String> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let mut nodes = REMOTE_CLUSTER_NODES.write().map_err(|e| e.to_string())?;
+        if nodes.iter().any(|n| n.ip == ip && n.port == port) {
+            return Ok(());
+        }
+        use fxhash::hash64;
+        let node_hash = hash64(format!("{}:{}", ip, port).as_bytes());
+        let node_id = format!("{:040x}", node_hash);
+        let next_epoch = (nodes.len() + self.num_shards + 1) as u64;
+        nodes.push(RemoteClusterNode {
+            id: node_id,
+            ip,
+            port,
+            cport: port + 10000,
+            flags: "master".to_string(),
+            master_id: "-".to_string(),
+            ping_sent: now,
+            pong_recv: now,
+            config_epoch: next_epoch,
+            link_state: "connected".to_string(),
+        });
+        Ok(())
+    }
+
+    pub fn cluster_nodes(&self) -> String {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let mut nodes = String::new();
+        for s in 0..self.num_shards {
+            let start_slot = s * 16384 / self.num_shards;
+            let end_slot = if s == self.num_shards - 1 {
+                16383
+            } else {
+                (s + 1) * 16384 / self.num_shards - 1
+            };
+            let node_id = format!("{:040x}", s + 1);
+            let myself = if s == self.shard_id { "myself," } else { "" };
+            nodes.push_str(&format!(
+                "{} 127.0.0.1:{}@{} {}master - 0 0 {} connected {}-{}\n",
+                node_id,
+                self.port,
+                self.port + 10000,
+                myself,
+                s + 1,
+                start_slot,
+                end_slot
+            ));
+        }
+        if let Ok(mut remote_nodes) = REMOTE_CLUSTER_NODES.write() {
+            for node in remote_nodes.iter_mut() {
+                if now.saturating_sub(node.ping_sent) > 10000 {
+                    node.flags = "fail".to_string();
+                } else if now.saturating_sub(node.ping_sent) > 5000 {
+                    node.flags = "fail?".to_string();
+                }
+                nodes.push_str(&format!(
+                    "{} {}:{}@{} {} {} {} {} {} {}\n",
+                    node.id,
+                    node.ip,
+                    node.port,
+                    node.cport,
+                    node.flags,
+                    node.master_id,
+                    node.ping_sent,
+                    node.pong_recv,
+                    node.config_epoch,
+                    node.link_state,
+                ));
+            }
+        }
+        nodes
+    }
+
+    pub fn cluster_info(&self) -> String {
+        let remote_count = REMOTE_CLUSTER_NODES.read().map(|r| r.len()).unwrap_or(0);
+        let total_nodes = self.num_shards + remote_count;
+        let pfail_count = REMOTE_CLUSTER_NODES.read().map(|r| r.iter().filter(|n| n.flags == "fail?").count()).unwrap_or(0);
+        let fail_count = REMOTE_CLUSTER_NODES.read().map(|r| r.iter().filter(|n| n.flags == "fail").count()).unwrap_or(0);
+        let state = if fail_count > 0 { "fail" } else { "ok" };
+        format!(
+            "cluster_state:{}\r\ncluster_slots_assigned:16384\r\ncluster_slots_ok:16384\r\ncluster_slots_pfail:{}\r\ncluster_slots_fail:{}\r\ncluster_known_nodes:{}\r\ncluster_size:{}\r\ncluster_current_epoch:1\r\ncluster_my_epoch:1\r\ncluster_stats_messages_sent:0\r\ncluster_stats_messages_received:0\r\n",
+            state, pfail_count, fail_count, total_nodes, total_nodes
+        )
     }
 }

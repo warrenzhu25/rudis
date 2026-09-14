@@ -315,6 +315,11 @@ pub fn run_shard_worker(
                         }
                         let _ = responder.send(());
                     }
+                    ShardMessage::SaveRdbChunk { responder } => {
+                        let mut buf = Vec::new();
+                        cross_shard_db.borrow_mut().save_rdb_chunk(&mut buf);
+                        let _ = responder.send(buf);
+                    }
                     ShardMessage::Publish {
                         channel,
                         message,

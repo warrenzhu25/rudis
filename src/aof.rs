@@ -601,6 +601,48 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             Some(buf)
         }
+        Command::XgroupCreate { key, group, id, mkstream } => {
+            let id_str = id.to_string();
+            let mut num_args = 5;
+            if *mkstream {
+                num_args += 1;
+            }
+            buf.extend_from_slice(
+                format!("*{}\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n${}\r\n", num_args, key.len()).as_bytes(),
+            );
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n", group.len()).as_bytes());
+            buf.extend_from_slice(group);
+            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", id_str.len(), id_str).as_bytes());
+            if *mkstream {
+                buf.extend_from_slice(b"$8\r\nMKSTREAM\r\n");
+            }
+            Some(buf)
+        }
+        Command::XgroupDestroy { key, group } => {
+            buf.extend_from_slice(
+                format!("*4\r\n$6\r\nXGROUP\r\n$7\r\nDESTROY\r\n${}\r\n", key.len()).as_bytes(),
+            );
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n", group.len()).as_bytes());
+            buf.extend_from_slice(group);
+            buf.extend_from_slice(b"\r\n");
+            Some(buf)
+        }
+        Command::Xack { key, group, ids } => {
+            buf.extend_from_slice(
+                format!("*{}\r\n$4\r\nXACK\r\n${}\r\n", 3 + ids.len(), key.len()).as_bytes(),
+            );
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n", group.len()).as_bytes());
+            buf.extend_from_slice(group);
+            buf.extend_from_slice(b"\r\n");
+            for id in ids {
+                let s = id.to_string();
+                buf.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
+            }
+            Some(buf)
+        }
         _ => None,
     }
 }

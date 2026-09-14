@@ -73,6 +73,9 @@ pub enum ShardMessage {
     SyncAof {
         responder: flume::Sender<()>,
     },
+    SaveRdbChunk {
+        responder: flume::Sender<Vec<u8>>,
+    },
     Publish {
         channel: Bytes,
         message: Bytes,
@@ -614,5 +617,96 @@ impl ShardDb {
         minid: Option<crate::table::StreamId>,
     ) -> Result<usize, &'static str> {
         self.table.xtrim(key, maxlen, minid)
+    }
+
+    #[inline]
+    pub fn save_rdb_chunk(&mut self, buf: &mut Vec<u8>) {
+        self.table.save_rdb_chunk(buf);
+    }
+
+    #[inline]
+    pub fn restore_rdb_chunk(&mut self, data: &[u8]) -> Result<(), &'static str> {
+        self.table.restore_rdb_chunk(data)
+    }
+
+    #[inline]
+    pub fn xgroup_create(
+        &mut self,
+        key: Bytes,
+        group: Bytes,
+        id_str: &str,
+        mkstream: bool,
+    ) -> Result<(), &'static str> {
+        self.table.xgroup_create(key, group, id_str, mkstream)
+    }
+
+    #[inline]
+    pub fn xgroup_destroy(&mut self, key: &[u8], group: &[u8]) -> Result<bool, &'static str> {
+        self.table.xgroup_destroy(key, group)
+    }
+
+    #[inline]
+    pub fn xgroup_createconsumer(
+        &mut self,
+        key: &[u8],
+        group: &[u8],
+        consumer: Bytes,
+    ) -> Result<bool, &'static str> {
+        self.table.xgroup_createconsumer(key, group, consumer)
+    }
+
+    #[inline]
+    pub fn xgroup_delconsumer(
+        &mut self,
+        key: &[u8],
+        group: &[u8],
+        consumer: &[u8],
+    ) -> Result<usize, &'static str> {
+        self.table.xgroup_delconsumer(key, group, consumer)
+    }
+
+    #[inline]
+    pub fn xreadgroup(
+        &mut self,
+        key: &[u8],
+        group: &[u8],
+        consumer: Bytes,
+        id_str: &str,
+        count: Option<usize>,
+        noack: bool,
+    ) -> Result<Vec<(crate::table::StreamId, Vec<(Bytes, Bytes)>)>, &'static str> {
+        self.table.xreadgroup(key, group, consumer, id_str, count, noack)
+    }
+
+    #[inline]
+    pub fn xack(
+        &mut self,
+        key: &[u8],
+        group: &[u8],
+        ids: &[crate::table::StreamId],
+    ) -> Result<usize, &'static str> {
+        self.table.xack(key, group, ids)
+    }
+
+    #[inline]
+    pub fn xpending_summary(
+        &mut self,
+        key: &[u8],
+        group: &[u8],
+    ) -> Result<(usize, Option<crate::table::StreamId>, Option<crate::table::StreamId>, Vec<(Bytes, usize)>), &'static str> {
+        self.table.xpending_summary(key, group)
+    }
+
+    #[inline]
+    pub fn xpending_range(
+        &mut self,
+        key: &[u8],
+        group: &[u8],
+        start: crate::table::StreamId,
+        end: crate::table::StreamId,
+        count: usize,
+        consumer: Option<&[u8]>,
+    ) -> Result<Vec<(crate::table::StreamId, Bytes, u64, usize)>, &'static str> {
+        self.table.xpending_range(key, group, start, end, count, consumer)
     }
 }

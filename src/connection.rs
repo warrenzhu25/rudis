@@ -668,12 +668,18 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Xrange { key, .. }
         | Command::Xrevrange { key, .. }
         | Command::Xdel { key, .. }
-        | Command::Xtrim { key, .. } => Some(key),
+        | Command::Xtrim { key, .. }
+        | Command::XgroupCreate { key, .. }
+        | Command::XgroupDestroy { key, .. }
+        | Command::XgroupCreateConsumer { key, .. }
+        | Command::XgroupDelConsumer { key, .. }
+        | Command::Xack { key, .. }
+        | Command::Xpending { key, .. } => Some(key),
         Command::Touch(keys) | Command::Del(keys) | Command::Exists(keys) | Command::Mget(keys) => {
             keys.first()
         }
         Command::Pfcount { keys } => keys.first(),
-        Command::Xread { keys, .. } => keys.first(),
+        Command::Xread { keys, .. } | Command::Xreadgroup { keys, .. } => keys.first(),
         Command::Mset(pairs) | Command::Msetnx(pairs) => pairs.first().map(|(k, _)| k),
         Command::Bitop { destkey, .. } | Command::Pfmerge { destkey, .. } => Some(destkey),
         _ => None,
@@ -740,13 +746,19 @@ pub fn cmd_keys<'a>(cmd: &'a Command) -> Vec<&'a [u8]> {
         | Command::Xrange { key, .. }
         | Command::Xrevrange { key, .. }
         | Command::Xdel { key, .. }
-        | Command::Xtrim { key, .. } => vec![key.as_ref()],
+        | Command::Xtrim { key, .. }
+        | Command::XgroupCreate { key, .. }
+        | Command::XgroupDestroy { key, .. }
+        | Command::XgroupCreateConsumer { key, .. }
+        | Command::XgroupDelConsumer { key, .. }
+        | Command::Xack { key, .. }
+        | Command::Xpending { key, .. } => vec![key.as_ref()],
 
         Command::Mget(keys) | Command::Del(keys) | Command::Exists(keys) | Command::Touch(keys) => {
             keys.iter().map(|k| k.as_ref()).collect()
         }
         Command::Pfcount { keys } => keys.iter().map(|k| k.as_ref()).collect(),
-        Command::Xread { keys, .. } => keys.iter().map(|k| k.as_ref()).collect(),
+        Command::Xread { keys, .. } | Command::Xreadgroup { keys, .. } => keys.iter().map(|k| k.as_ref()).collect(),
 
         Command::Mset(pairs) | Command::Msetnx(pairs) => {
             pairs.iter().map(|(k, _)| k.as_ref()).collect()
@@ -840,6 +852,7 @@ async fn execute_command(
         Command::Msetnx(_) => "MSETNX",
         Command::Save => "SAVE",
         Command::Bgsave => "BGSAVE",
+        Command::Lastsave => "LASTSAVE",
         Command::Ping(_) => "PING",
         Command::CommandDocs => "COMMAND",
         Command::Info => "INFO",
@@ -877,6 +890,13 @@ async fn execute_command(
         Command::Xread { .. } => "XREAD",
         Command::Xdel { .. } => "XDEL",
         Command::Xtrim { .. } => "XTRIM",
+        Command::XgroupCreate { .. }
+        | Command::XgroupDestroy { .. }
+        | Command::XgroupCreateConsumer { .. }
+        | Command::XgroupDelConsumer { .. } => "XGROUP",
+        Command::Xreadgroup { .. } => "XREADGROUP",
+        Command::Xack { .. } => "XACK",
+        Command::Xpending { .. } => "XPENDING",
         Command::Unknown(_) => "UNKNOWN",
     };
     if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
@@ -1090,39 +1110,31 @@ async fn execute_command(
                     }
                 }
                 ClusterSubcommand::Nodes => {
-                    let mut nodes = String::new();
-                    for s in 0..router.num_shards {
-                        let start_slot = s * 16384 / router.num_shards;
-                        let end_slot = if s == router.num_shards - 1 {
-                            16383
-                        } else {
-                            (s + 1) * 16384 / router.num_shards - 1
-                        };
-                        let node_id = format!("{:040x}", s + 1);
-                        let myself = if s == router.shard_id { "myself," } else { "" };
-                        nodes.push_str(&format!(
-                            "{} 127.0.0.1:{}@{} {}master - 0 0 {} connected {}-{}\n",
-                            node_id,
-                            router.port,
-                            router.port + 10000,
-                            myself,
-                            s + 1,
-                            start_slot,
-                            end_slot
-                        ));
-                    }
+                    let nodes = router.cluster_nodes();
                     out.extend_from_slice(format!("${}\r\n", nodes.len()).as_bytes());
                     out.extend_from_slice(nodes.as_bytes());
                     out.extend_from_slice(b"\r\n");
                 }
                 ClusterSubcommand::Info => {
-                    let info = format!(
-                        "cluster_state:ok\r\ncluster_slots_assigned:16384\r\ncluster_slots_ok:16384\r\ncluster_slots_pfail:0\r\ncluster_slots_fail:0\r\ncluster_known_nodes:{}\r\ncluster_size:{}\r\n",
-                        router.num_shards, router.num_shards
-                    );
+                    let info = router.cluster_info();
                     out.extend_from_slice(format!("${}\r\n", info.len()).as_bytes());
                     out.extend_from_slice(info.as_bytes());
                     out.extend_from_slice(b"\r\n");
+                }
+                ClusterSubcommand::MyId => {
+                    let id = router.my_id();
+                    out.extend_from_slice(format!("${}\r\n", id.len()).as_bytes());
+                    out.extend_from_slice(id.as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                }
+                ClusterSubcommand::Meet { ip, port } => {
+                    match router.cluster_meet(ip, port) {
+                        Ok(_) => out.extend_from_slice(b"+OK\r\n"),
+                        Err(e) => {
+                            let resp = format!("-ERR {}\r\n", e);
+                            out.extend_from_slice(resp.as_bytes());
+                        }
+                    }
                 }
                 ClusterSubcommand::SetSlot(slot, sub_cmd) => match sub_cmd {
                     SetSlotSubcommand::Migrating(node) => {
@@ -1244,7 +1256,13 @@ async fn execute_command(
         | Command::Xrange { .. }
         | Command::Xrevrange { .. }
         | Command::Xdel { .. }
-        | Command::Xtrim { .. } => {
+        | Command::Xtrim { .. }
+        | Command::XgroupCreate { .. }
+        | Command::XgroupDestroy { .. }
+        | Command::XgroupCreateConsumer { .. }
+        | Command::XgroupDelConsumer { .. }
+        | Command::Xack { .. }
+        | Command::Xpending { .. } => {
             if let Some(target) = target_shard_of_cmd(&cmd, router.num_shards) {
                 if target == router.shard_id {
                     execute_local_command(
@@ -1261,10 +1279,12 @@ async fn execute_command(
             false
         }
         Command::Xread {
-            count: _,
-            block_ms: _,
             ref keys,
-            ids: _,
+            ..
+        }
+        | Command::Xreadgroup {
+            ref keys,
+            ..
         } => {
             if keys.is_empty() {
                 out.extend_from_slice(b"$-1\r\n");
@@ -1453,9 +1473,31 @@ async fn execute_command(
             }
             false
         }
-        Command::Save | Command::Bgsave => {
-            router.sync_aof().await;
-            out.extend_from_slice(b"+OK\r\n");
+        Command::Save => {
+            match router.save_rdb().await {
+                Ok(_) => out.extend_from_slice(b"+OK\r\n"),
+                Err(e) => {
+                    let err = format!("-ERR {}\r\n", e);
+                    out.extend_from_slice(err.as_bytes());
+                }
+            }
+            false
+        }
+        Command::Bgsave => {
+            match router.bgsave().await {
+                Ok(_) => {
+                    out.extend_from_slice(b"+Background saving started\r\n");
+                }
+                Err(e) => {
+                    let err = format!("-ERR {}\r\n", e);
+                    out.extend_from_slice(err.as_bytes());
+                }
+            }
+            false
+        }
+        Command::Lastsave => {
+            let ts = router.lastsave();
+            out.extend_from_slice(format!(":{}\r\n", ts).as_bytes());
             false
         }
         Command::Asking => {
@@ -1552,6 +1594,62 @@ async fn execute_command(
                             tx_buf.extend_from_slice(format!("\r\n${}\r\n", s.len()).as_bytes());
                             tx_buf.extend_from_slice(s);
                             tx_buf.extend_from_slice(b"\r\n");
+                        }
+                    }
+                    crate::table::RudisValue::Int(n) => {
+                        let s = crate::table::RudisTable::format_i64(*n);
+                        if let Some(dur) = ttl {
+                            let ms = dur.as_millis().max(1);
+                            let ms_str = ms.to_string();
+                            tx_buf.extend_from_slice(
+                                format!("*5\r\n$3\r\nSET\r\n${}\r\n", k.len()).as_bytes(),
+                            );
+                            tx_buf.extend_from_slice(k);
+                            tx_buf.extend_from_slice(format!("\r\n${}\r\n", s.len()).as_bytes());
+                            tx_buf.extend_from_slice(&s);
+                            tx_buf.extend_from_slice(
+                                format!("\r\n$2\r\nPX\r\n${}\r\n{}\r\n", ms_str.len(), ms_str)
+                                    .as_bytes(),
+                            );
+                        } else {
+                            tx_buf.extend_from_slice(
+                                format!("*3\r\n$3\r\nSET\r\n${}\r\n", k.len()).as_bytes(),
+                            );
+                            tx_buf.extend_from_slice(k);
+                            tx_buf.extend_from_slice(format!("\r\n${}\r\n", s.len()).as_bytes());
+                            tx_buf.extend_from_slice(&s);
+                            tx_buf.extend_from_slice(b"\r\n");
+                        }
+                    }
+                    crate::table::RudisValue::SmallHash(fields) => {
+                        tx_buf.extend_from_slice(
+                            format!(
+                                "*{}\r\n$4\r\nHSET\r\n${}\r\n",
+                                2 + fields.len() * 2,
+                                k.len()
+                            )
+                            .as_bytes(),
+                        );
+                        tx_buf.extend_from_slice(k);
+                        tx_buf.extend_from_slice(b"\r\n");
+                        for (f, v) in fields {
+                            tx_buf.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
+                            tx_buf.extend_from_slice(f);
+                            tx_buf.extend_from_slice(b"\r\n");
+                            tx_buf.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                            tx_buf.extend_from_slice(v);
+                            tx_buf.extend_from_slice(b"\r\n");
+                        }
+                        if let Some(dur) = ttl {
+                            let ms = dur.as_millis().max(1);
+                            let ms_str = ms.to_string();
+                            tx_buf.extend_from_slice(
+                                format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
+                            );
+                            tx_buf.extend_from_slice(k);
+                            tx_buf.extend_from_slice(
+                                format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
+                            );
                         }
                     }
                     crate::table::RudisValue::Hash(fields) => {
@@ -1914,7 +2012,13 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Xrange { key, .. }
         | Command::Xrevrange { key, .. }
         | Command::Xdel { key, .. }
-        | Command::Xtrim { key, .. } => Some(target_shard(key, num_shards)),
+        | Command::Xtrim { key, .. }
+        | Command::XgroupCreate { key, .. }
+        | Command::XgroupDestroy { key, .. }
+        | Command::XgroupCreateConsumer { key, .. }
+        | Command::XgroupDelConsumer { key, .. }
+        | Command::Xack { key, .. }
+        | Command::Xpending { key, .. } => Some(target_shard(key, num_shards)),
         Command::Pfcount { keys } if keys.len() == 1 => Some(target_shard(&keys[0], num_shards)),
         Command::Rename { key, newkey, .. } => {
             let s1 = target_shard(key, num_shards);
@@ -1938,7 +2042,7 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         Command::Touch(keys) | Command::Del(keys) | Command::Exists(keys) if keys.len() == 1 => {
             Some(target_shard(&keys[0], num_shards))
         }
-        Command::Xread { keys, .. }
+        Command::Xread { keys, .. } | Command::Xreadgroup { keys, .. }
             if !keys.is_empty()
                 && keys
                     .iter()
@@ -3362,6 +3466,244 @@ pub fn execute_local_command(
             }
             false
         }
+        Command::XgroupCreate { key, group, id, mkstream } => {
+            match db.xgroup_create(key.clone(), group.clone(), id, *mkstream) {
+                Ok(()) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                Err(err) => {
+                    if err.starts_with("BUSYGROUP") || err.starts_with("ERR") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::XgroupDestroy { key, group } => {
+            match db.xgroup_destroy(key, group) {
+                Ok(destroyed) => {
+                    if destroyed {
+                        if let Some(aof) = aof {
+                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        }
+                        out.extend_from_slice(b":1\r\n");
+                    } else {
+                        out.extend_from_slice(b":0\r\n");
+                    }
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("NOGROUP") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::XgroupCreateConsumer { key, group, consumer } => {
+            match db.xgroup_createconsumer(key, group, consumer.clone()) {
+                Ok(created) => {
+                    if created {
+                        out.extend_from_slice(b":1\r\n");
+                    } else {
+                        out.extend_from_slice(b":0\r\n");
+                    }
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("NOGROUP") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::XgroupDelConsumer { key, group, consumer } => {
+            match db.xgroup_delconsumer(key, group, consumer) {
+                Ok(pending_count) => {
+                    out.extend_from_slice(format!(":{}\r\n", pending_count).as_bytes());
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("NOGROUP") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Xreadgroup {
+            group,
+            consumer,
+            count,
+            noack,
+            keys,
+            ids,
+            ..
+        } => {
+            let mut all_results = Vec::new();
+            let mut err = None;
+            for (k, id_str) in keys.iter().zip(ids.iter()) {
+                match db.xreadgroup(k, group, consumer.clone(), id_str, *count, *noack) {
+                    Ok(entries) => {
+                        if !entries.is_empty() {
+                            all_results.push((k.clone(), entries));
+                        }
+                    }
+                    Err(e) => {
+                        err = Some(e);
+                        break;
+                    }
+                }
+            }
+            if let Some(err) = err {
+                if err.starts_with("ERR") || err.starts_with("NOGROUP") {
+                    out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                } else {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            } else if all_results.is_empty() {
+                out.extend_from_slice(b"$-1\r\n");
+            } else {
+                out.extend_from_slice(format!("*{}\r\n", all_results.len()).as_bytes());
+                for (stream_key, entries) in all_results {
+                    out.extend_from_slice(
+                        format!(
+                            "*2\r\n${}\r\n",
+                            stream_key.len()
+                        )
+                        .as_bytes(),
+                    );
+                    out.extend_from_slice(&stream_key);
+                    out.extend_from_slice(
+                        format!("\r\n*{}\r\n", entries.len()).as_bytes(),
+                    );
+                    for (id, fields) in entries {
+                        let id_str = id.to_string();
+                        out.extend_from_slice(
+                            format!(
+                                "*2\r\n${}\r\n{}\r\n*{}\r\n",
+                                id_str.len(),
+                                id_str,
+                                fields.len() * 2
+                            )
+                            .as_bytes(),
+                        );
+                        for (f, v) in fields {
+                            out.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
+                            out.extend_from_slice(&f);
+                            out.extend_from_slice(b"\r\n");
+                            out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                            out.extend_from_slice(&v);
+                            out.extend_from_slice(b"\r\n");
+                        }
+                    }
+                }
+            }
+            false
+        }
+        Command::Xack { key, group, ids } => {
+            match db.xack(key, group, ids) {
+                Ok(count) => {
+                    if count > 0 {
+                        if let Some(aof) = aof {
+                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        }
+                    }
+                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("NOGROUP") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Xpending { key, group, range } => {
+            match range {
+                None => match db.xpending_summary(key, group) {
+                    Ok((count, min_id, max_id, consumers)) => {
+                        out.extend_from_slice(b"*4\r\n");
+                        out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                        if let Some(min) = min_id {
+                            let s = min.to_string();
+                            out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
+                        } else {
+                            out.extend_from_slice(b"$-1\r\n");
+                        }
+                        if let Some(max) = max_id {
+                            let s = max.to_string();
+                            out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
+                        } else {
+                            out.extend_from_slice(b"$-1\r\n");
+                        }
+                        out.extend_from_slice(format!("*{}\r\n", consumers.len()).as_bytes());
+                        for (c_name, c_cnt) in consumers {
+                            out.extend_from_slice(
+                                format!("*2\r\n${}\r\n", c_name.len()).as_bytes(),
+                            );
+                            out.extend_from_slice(&c_name);
+                            out.extend_from_slice(format!("\r\n:{}\r\n", c_cnt).as_bytes());
+                        }
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("NOGROUP") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                        }
+                    }
+                },
+                Some((start, end, count, consumer)) => {
+                    match db.xpending_range(key, group, *start, *end, *count, consumer.as_deref()) {
+                        Ok(entries) => {
+                            out.extend_from_slice(format!("*{}\r\n", entries.len()).as_bytes());
+                            for (id, c_name, idle, delivery_cnt) in entries {
+                                let id_str = id.to_string();
+                                out.extend_from_slice(
+                                    format!(
+                                        "*4\r\n${}\r\n{}\r\n${}\r\n",
+                                        id_str.len(),
+                                        id_str,
+                                        c_name.len(),
+                                    )
+                                    .as_bytes(),
+                                );
+                                out.extend_from_slice(&c_name);
+                                out.extend_from_slice(
+                                    format!("\r\n:{}\r\n:{}\r\n", idle, delivery_cnt).as_bytes(),
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            if err.starts_with("ERR") || err.starts_with("NOGROUP") {
+                                out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                            } else {
+                                out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        }
         Command::Quit => {
             out.extend_from_slice(b"+OK\r\n");
             true
@@ -3474,6 +3816,7 @@ async fn execute_commands_squashed(
                 Command::Msetnx(_) => "MSETNX",
                 Command::Save => "SAVE",
                 Command::Bgsave => "BGSAVE",
+                Command::Lastsave => "LASTSAVE",
                 Command::Ping(_) => "PING",
                 Command::CommandDocs => "COMMAND",
                 Command::Info => "INFO",
@@ -3511,6 +3854,13 @@ async fn execute_commands_squashed(
                 Command::Xread { .. } => "XREAD",
                 Command::Xdel { .. } => "XDEL",
                 Command::Xtrim { .. } => "XTRIM",
+                Command::XgroupCreate { .. }
+                | Command::XgroupDestroy { .. }
+                | Command::XgroupCreateConsumer { .. }
+                | Command::XgroupDelConsumer { .. } => "XGROUP",
+                Command::Xreadgroup { .. } => "XREADGROUP",
+                Command::Xack { .. } => "XACK",
+                Command::Xpending { .. } => "XPENDING",
                 Command::Unknown(_) => "UNKNOWN",
             };
             c.last_cmd = cmd_name.to_string();
