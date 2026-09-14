@@ -95,9 +95,23 @@ cargo test
 
 ## Benchmarks
 
-### Baseline Scaling (1 to 32 Threads, 100% SET, 1KB Payload, Pipeline 100)
+### Write-Batched Optimization (1 to 32 Threads, 100% SET, 1KB Payload, Pipeline 100)
+
+Detailed write-batching benchmark document: [docs/benchmarks/write_batching.md](docs/benchmarks/write_batching.md)
+
+| Server Threads | Baseline Ops/sec | **Batched Ops/sec** | Baseline Bandwidth | **Batched Bandwidth** | Baseline Avg Lat | **Batched Avg Lat** | Speedup |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **1** | 60,487.24 | **816,936.81** | 63.3 MB/s | **855.1 MB/s** | 52.87 ms | **3.90 ms** | **13.5x** |
+| **2** | 88,727.36 | **593,237.78** | 92.8 MB/s | **620.9 MB/s** | 36.05 ms | **5.38 ms** | **6.7x** |
+| **4** | 159,224.13 | **857,550.64** | 166.6 MB/s | **897.6 MB/s** | 20.09 ms | **3.71 ms** | **5.4x** |
+| **8** | 295,665.11 | **794,211.64** | 309.5 MB/s | **831.3 MB/s** | 10.82 ms | **4.01 ms** | **2.7x** |
+| **16** | 297,048.94 | **705,995.32** | 310.9 MB/s | **739.0 MB/s** | 10.77 ms | **4.51 ms** | **2.4x** |
+| **32** | 273,831.18 | **704,537.20** | 286.6 MB/s | **737.4 MB/s** | 11.69 ms | **4.52 ms** | **2.6x** |
+
+### Baseline Scaling (Pre-Optimization)
 
 Detailed baseline benchmark document: [docs/benchmarks/baseline.md](docs/benchmarks/baseline.md)
+
 
 | Server Threads | Throughput (Ops/sec) | Bandwidth (MB/s) | Avg Latency (ms) | p50 (ms) | p99 (ms) |
 | :---: | :---: | :---: | :---: | :---: | :---: |
