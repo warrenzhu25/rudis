@@ -1,0 +1,14 @@
+[package]
+name = "rudis"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytes = "1.12.1"
+clap = { version = "4.6.6", features = ["derive"] }
+core_affinity = "0.8.3"
+crc16 = "0.4.0"
+flume = "0.12.0"
+hashbrown = "0.17.1"
+monoio = { version = "0.2.4", features = ["sync"] }
+socket2 = { version = "0.6.5", features = ["all"] }
