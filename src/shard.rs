@@ -52,6 +52,9 @@ pub enum ShardMessage {
         count: usize,
         responder: flume::Sender<Vec<Bytes>>,
     },
+    ClientList {
+        responder: flume::Sender<String>,
+    },
     Batch {
         items: Vec<(usize, Command)>,
         responder: flume::Sender<Vec<(usize, Vec<u8>)>>,

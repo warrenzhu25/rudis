@@ -252,4 +252,38 @@ impl Router {
             }
         }
     }
+
+    pub async fn client_list(
+        &self,
+        local_registry: &RefCell<hashbrown::HashMap<u64, crate::connection::ClientInfo>>,
+    ) -> String {
+        let mut out = String::new();
+        let now = std::time::Instant::now();
+        for client in local_registry.borrow().values() {
+            let age = now.duration_since(client.connected_at).as_secs();
+            let idle = now.duration_since(client.last_active).as_secs();
+            out.push_str(&format!(
+                "id={} addr={} name={} age={} idle={} cmd={}\n",
+                client.id,
+                client.addr,
+                client.name.as_deref().unwrap_or(""),
+                age,
+                idle,
+                client.last_cmd
+            ));
+        }
+
+        for (shard_id, sender) in self.senders.iter().enumerate() {
+            if shard_id != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::ClientList { responder: tx };
+                if sender.send(msg).is_ok() {
+                    if let Ok(peer_list) = rx.recv_async().await {
+                        out.push_str(&peer_list);
+                    }
+                }
+            }
+        }
+        out
+    }
 }

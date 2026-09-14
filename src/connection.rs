@@ -1,9 +1,12 @@
+use std::cell::RefCell;
+use std::net::SocketAddr;
 use std::rc::Rc;
+use std::time::Instant;
 use bytes::BytesMut;
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::TcpStream;
 
-use crate::resp::{parse_command, ClusterSubcommand, Command};
+use crate::resp::{parse_command, ClientSubcommand, ClusterSubcommand, Command};
 use crate::router::{key_slot, target_shard, Router};
 use crate::shard::{ShardDb, ShardMessage};
 
@@ -14,7 +17,50 @@ pub type ResponderChannel = (
     flume::Receiver<Vec<(usize, Vec<u8>)>>,
 );
 
-pub async fn handle_connection(mut stream: TcpStream, router: Rc<Router>) {
+#[derive(Clone, Debug)]
+pub struct ClientInfo {
+    pub id: u64,
+    pub addr: SocketAddr,
+    pub name: Option<String>,
+    pub connected_at: Instant,
+    pub last_active: Instant,
+    pub last_cmd: String,
+}
+
+pub async fn handle_connection(
+    mut stream: TcpStream,
+    client_addr: SocketAddr,
+    client_id: u64,
+    client_registry: Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
+    router: Rc<Router>,
+) {
+    let now = Instant::now();
+    client_registry.borrow_mut().insert(
+        client_id,
+        ClientInfo {
+            id: client_id,
+            addr: client_addr,
+            name: None,
+            connected_at: now,
+            last_active: now,
+            last_cmd: "NONE".to_string(),
+        },
+    );
+
+    struct ClientCleanup {
+        client_id: u64,
+        registry: Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
+    }
+    impl Drop for ClientCleanup {
+        fn drop(&mut self) {
+            self.registry.borrow_mut().remove(&self.client_id);
+        }
+    }
+    let _cleanup = ClientCleanup {
+        client_id,
+        registry: client_registry.clone(),
+    };
+
     let mut buf = BytesMut::with_capacity(131072);
     let mut read_buf = vec![0u8; READ_BUFFER_SIZE];
     let mut out_buf = Vec::with_capacity(65536);
@@ -63,7 +109,14 @@ pub async fn handle_connection(mut stream: TcpStream, router: Rc<Router>) {
                 // 2. Execute parsed commands with pipeline squashing when pipelined
                 if !commands.is_empty() {
                     if commands.len() == 1 {
-                        let quit = execute_command(commands.pop().unwrap(), &router, &mut out_buf).await;
+                        let quit = execute_command(
+                            commands.pop().unwrap(),
+                            &router,
+                            client_id,
+                            &client_registry,
+                            &mut out_buf,
+                        )
+                        .await;
                         if quit {
                             should_quit = true;
                         }
@@ -73,6 +126,8 @@ pub async fn handle_connection(mut stream: TcpStream, router: Rc<Router>) {
                             &router,
                             &responders,
                             &mut remote_batches,
+                            client_id,
+                            &client_registry,
                             &mut out_buf,
                         )
                         .await;
@@ -103,7 +158,37 @@ pub async fn handle_connection(mut stream: TcpStream, router: Rc<Router>) {
     }
 }
 
-async fn execute_command(cmd: Command, router: &Router, out: &mut Vec<u8>) -> bool {
+async fn execute_command(
+    cmd: Command,
+    router: &Router,
+    client_id: u64,
+    client_registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
+    out: &mut Vec<u8>,
+) -> bool {
+    let cmd_name = match &cmd {
+        Command::Get(_) => "GET",
+        Command::Set { .. } => "SET",
+        Command::Mget(_) => "MGET",
+        Command::Mset(_) => "MSET",
+        Command::Del(_) => "DEL",
+        Command::Exists(_) => "EXISTS",
+        Command::IncrBy(_, _) => "INCRBY",
+        Command::Expire(_, _) => "EXPIRE",
+        Command::Persist(_) => "PERSIST",
+        Command::Ttl(_, _) => "TTL",
+        Command::Cluster(_) => "CLUSTER",
+        Command::Client(_) => "CLIENT",
+        Command::Ping(_) => "PING",
+        Command::CommandDocs => "COMMAND",
+        Command::Info => "INFO",
+        Command::Quit => "QUIT",
+        Command::Unknown(_) => "UNKNOWN",
+    };
+    if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+        c.last_active = Instant::now();
+        c.last_cmd = cmd_name.to_string();
+    }
+
     match cmd {
         Command::Get(key) => {
             let val = router.get(key).await;
@@ -313,6 +398,39 @@ async fn execute_command(cmd: Command, router: &Router, out: &mut Vec<u8>) -> bo
             }
             false
         }
+        Command::Client(sub) => {
+            match sub {
+                ClientSubcommand::List => {
+                    let list = router.client_list(client_registry).await;
+                    out.extend_from_slice(format!("${}\r\n", list.len()).as_bytes());
+                    out.extend_from_slice(list.as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                }
+                ClientSubcommand::SetName(name) => {
+                    if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                        c.name = Some(name);
+                    }
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                ClientSubcommand::GetName => {
+                    let name = client_registry.borrow().get(&client_id).and_then(|c| c.name.clone());
+                    match name {
+                        Some(n) => {
+                            out.extend_from_slice(format!("${}\r\n", n.len()).as_bytes());
+                            out.extend_from_slice(n.as_bytes());
+                            out.extend_from_slice(b"\r\n");
+                        }
+                        None => {
+                            out.extend_from_slice(b"$-1\r\n");
+                        }
+                    }
+                }
+                ClientSubcommand::Id => {
+                    out.extend_from_slice(format!(":{}\r\n", client_id).as_bytes());
+                }
+            }
+            false
+        }
         Command::Quit => {
             out.extend_from_slice(b"+OK\r\n");
             true
@@ -448,6 +566,8 @@ async fn execute_commands_squashed(
     router: &Router,
     responders: &[ResponderChannel],
     remote_batches: &mut [Vec<(usize, Command)>],
+    client_id: u64,
+    client_registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
     out: &mut Vec<u8>,
 ) -> bool {
     let mut can_squash = true;
@@ -463,7 +583,7 @@ async fn execute_commands_squashed(
     if !can_squash {
         let mut should_close = false;
         for cmd in commands {
-            if execute_command(cmd, router, out).await {
+            if execute_command(cmd, router, client_id, client_registry, out).await {
                 should_close = true;
             }
         }
@@ -471,6 +591,31 @@ async fn execute_commands_squashed(
     }
 
     let n = commands.len();
+    if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+        c.last_active = Instant::now();
+        if let Some(last_cmd) = commands.last() {
+            let cmd_name = match last_cmd {
+                Command::Get(_) => "GET",
+                Command::Set { .. } => "SET",
+                Command::Mget(_) => "MGET",
+                Command::Mset(_) => "MSET",
+                Command::Del(_) => "DEL",
+                Command::Exists(_) => "EXISTS",
+                Command::IncrBy(_, _) => "INCRBY",
+                Command::Expire(_, _) => "EXPIRE",
+                Command::Persist(_) => "PERSIST",
+                Command::Ttl(_, _) => "TTL",
+                Command::Cluster(_) => "CLUSTER",
+                Command::Client(_) => "CLIENT",
+                Command::Ping(_) => "PING",
+                Command::CommandDocs => "COMMAND",
+                Command::Info => "INFO",
+                Command::Quit => "QUIT",
+                Command::Unknown(_) => "UNKNOWN",
+            };
+            c.last_cmd = cmd_name.to_string();
+        }
+    }
     let mut responses: Vec<Vec<u8>> = vec![Vec::new(); n];
     let mut should_close = false;
 

@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+import subprocess
+import time
+import re
+import os
+import sys
+
+SERVER_BIN = "/usr/local/google/home/warrenzhu/github/rudis/target/release/rudis"
+MEMTIER_BIN = "/usr/local/google/home/warrenzhu/memtier_benchmark/memtier_benchmark"
+PORT = 6379
+DURATION = 10
+THREAD_COUNTS = [1, 2, 4, 8, 16, 32]
+
+results = []
+
+def parse_memtier_output(output):
+    # Find the line under Sets or Totals
+    # Example:
+    # Sets       413989.49          ---          ---         7.72772         7.26300         9.91900        11.39100        14.46300        39.67900    433048.02 
+    for line in output.splitlines():
+        if line.strip().startswith("Sets") or line.strip().startswith("Totals"):
+            parts = line.split()
+            if len(parts) >= 10:
+                ops_sec = parts[1]
+                avg_lat = parts[4]
+                p50 = parts[5]
+                p90 = parts[6]
+                p95 = parts[7]
+                p99 = parts[8]
+                p999 = parts[9]
+                kb_sec = parts[10]
+                return {
+                    "ops_sec": float(ops_sec),
+                    "avg_lat": float(avg_lat),
+                    "p50": float(p50),
+                    "p90": float(p90),
+                    "p95": float(p95),
+                    "p99": float(p99),
+                    "p999": float(p999),
+                    "kb_sec": float(kb_sec),
+                }
+    return None
+
+print(f"Starting baseline benchmarks for threads: {THREAD_COUNTS}")
+
+for t in THREAD_COUNTS:
+    print(f"\n=======================================================")
+    print(f"  Testing rudis with {t} server thread(s)...")
+    print(f"=======================================================")
+
+    # 1. Start rudis server pinned to cores 0..(t-1)
+    core_range = f"0-{t-1}" if t > 1 else "0"
+    server_cmd = ["taskset", "-c", core_range, SERVER_BIN, "--threads", str(t), "--port", str(PORT)]
+    server_proc = subprocess.Popen(server_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+    # Wait for server to bind
+    time.sleep(1.0)
+
+    # 2. Run memtier_benchmark on cores 32-63
+    memtier_cmd = [
+        "taskset", "-c", "32-63",
+        MEMTIER_BIN,
+        "--server", "127.0.0.1",
+        "--port", str(PORT),
+        "--clients", "1",
+        "--threads", "32",
+        "--ratio", "1:0",
+        "--data-size", "1024",
+        "--pipeline", "100",
+        "--key-minimum", "1",
+        "--key-maximum", "1000000",
+        "--key-pattern", "S:S",
+        "--print-percentiles", "50,90,95,99,99.9",
+        "--test-time", str(DURATION),
+        "--hide-histogram"
+    ]
+
+    try:
+        res = subprocess.run(memtier_cmd, capture_output=True, text=True, timeout=DURATION + 15)
+        raw_out = res.stdout
+    except Exception as e:
+        print(f"Error running memtier: {e}")
+        raw_out = ""
+
+    # 3. Kill server
+    server_proc.terminate()
+    try:
+        server_proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        server_proc.kill()
+    time.sleep(1.0)
+
+    stats = parse_memtier_output(raw_out)
+    if stats:
+        stats["threads"] = t
+        results.append(stats)
+        print(f"  -> Ops/sec:  {stats['ops_sec']:,.2f}")
+        print(f"  -> Bandwidth: {stats['kb_sec']/1024:,.2f} MB/sec")
+        print(f"  -> Avg Lat:  {stats['avg_lat']:.3f} ms")
+        print(f"  -> p99 Lat:  {stats['p99']:.3f} ms")
+    else:
+        print("  -> Failed to parse stats. Raw output:\n", raw_out)
+
+print("\n\nSUMMARY RESULTS TABLE:")
+print("| Server Threads | Ops/sec | Bandwidth (MB/s) | Avg Latency (ms) | p50 (ms) | p99 (ms) |")
+print("|---|---|---|---|---|---|")
+for r in results:
+    mb_sec = r['kb_sec'] / 1024.0
+    print(f"| {r['threads']} | {r['ops_sec']:,.2f} | {mb_sec:,.2f} | {r['avg_lat']:.3f} | {r['p50']:.3f} | {r['p99']:.3f} |")

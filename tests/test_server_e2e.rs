@@ -247,4 +247,43 @@ fn test_multithread_shared_nothing_e2e() {
     let info_resp = send_and_read(&mut stream, b"CLUSTER INFO\r\n");
     assert!(info_resp.contains("cluster_state:ok"));
     assert!(info_resp.contains("cluster_slots_assigned:16384"));
+
+    // 13. Test Connection Management and Client Tracking (CLIENT ID, SETNAME, GETNAME, LIST)
+    let id_resp = send_and_read(&mut stream, b"CLIENT ID\r\n");
+    assert!(id_resp.starts_with(':'), "CLIENT ID should return an integer: {}", id_resp);
+    let client_id: u64 = id_resp.trim_matches(|c| c == ':' || c == '\r' || c == '\n').parse().unwrap();
+    assert!(client_id > 0);
+
+    let getname_resp = send_and_read(&mut stream, b"CLIENT GETNAME\r\n");
+    assert_eq!(getname_resp, "$-1\r\n", "Initial client name should be nil");
+
+    let setname_resp = send_and_read(&mut stream, b"CLIENT SETNAME test_client_1\r\n");
+    assert_eq!(setname_resp, "+OK\r\n");
+
+    let getname_resp2 = send_and_read(&mut stream, b"CLIENT GETNAME\r\n");
+    assert_eq!(getname_resp2, "$13\r\ntest_client_1\r\n");
+
+    let list_resp = send_and_read(&mut stream, b"CLIENT LIST\r\n");
+    assert!(list_resp.contains(&format!("id={}", client_id)));
+    assert!(list_resp.contains("name=test_client_1"));
+
+    // Connect a second client to test multi-client listing and cross-core aggregation
+    let mut stream2 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let id_resp2 = send_and_read(&mut stream2, b"CLIENT ID\r\n");
+    let client_id2: u64 = id_resp2.trim_matches(|c| c == ':' || c == '\r' || c == '\n').parse().unwrap();
+    assert_ne!(client_id, client_id2);
+
+    let _ = send_and_read(&mut stream2, b"CLIENT SETNAME test_client_2\r\n");
+    let list_resp2 = send_and_read(&mut stream, b"CLIENT LIST\r\n");
+    assert!(list_resp2.contains(&format!("id={}", client_id)));
+    assert!(list_resp2.contains(&format!("id={}", client_id2)));
+    assert!(list_resp2.contains("name=test_client_1"));
+    assert!(list_resp2.contains("name=test_client_2"));
+
+    // Drop second client and verify cleanup
+    drop(stream2);
+    thread::sleep(Duration::from_millis(50));
+    let list_resp3 = send_and_read(&mut stream, b"CLIENT LIST\r\n");
+    assert!(list_resp3.contains(&format!("id={}", client_id)));
+    assert!(!list_resp3.contains(&format!("id={}", client_id2)), "Disconnected client should be removed");
 }

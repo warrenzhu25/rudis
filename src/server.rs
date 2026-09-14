@@ -45,6 +45,7 @@ pub fn run_shard_worker(
 
         // 2. Pure thread-local Shard DB (no Mutex, no Arc)
         let local_db = Rc::new(RefCell::new(ShardDb::new()));
+        let client_registry = Rc::new(RefCell::new(hashbrown::HashMap::<u64, crate::connection::ClientInfo>::new()));
 
         // Active expiration cycle: run every 100ms
         let active_db = local_db.clone();
@@ -57,6 +58,7 @@ pub fn run_shard_worker(
 
         // 3. Spawn background worker to handle incoming cross-shard messages from peer cores
         let cross_shard_db = local_db.clone();
+        let cross_shard_clients = client_registry.clone();
         monoio::spawn(async move {
             while let Ok(msg) = rx.recv_async().await {
                 match msg {
@@ -121,6 +123,25 @@ pub fn run_shard_worker(
                         let keys = cross_shard_db.borrow_mut().get_keys_in_slot(slot, count);
                         let _ = responder.send(keys);
                     }
+                    ShardMessage::ClientList { responder } => {
+                        let mut out = String::new();
+                        let reg = cross_shard_clients.borrow();
+                        let now = std::time::Instant::now();
+                        for client in reg.values() {
+                            let age = now.duration_since(client.connected_at).as_secs();
+                            let idle = now.duration_since(client.last_active).as_secs();
+                            out.push_str(&format!(
+                                "id={} addr={} name={} age={} idle={} cmd={}\n",
+                                client.id,
+                                client.addr,
+                                client.name.as_deref().unwrap_or(""),
+                                age,
+                                idle,
+                                client.last_cmd
+                            ));
+                        }
+                        let _ = responder.send(out);
+                    }
                     ShardMessage::Batch { items, responder } => {
                         let mut db = cross_shard_db.borrow_mut();
                         let mut results = Vec::with_capacity(items.len());
@@ -144,13 +165,17 @@ pub fn run_shard_worker(
         );
 
         // 5. Accept loop
+        let mut next_client_id: u64 = ((shard_id as u64) << 48) + 1;
         loop {
             match listener.accept().await {
-                Ok((stream, _client_addr)) => {
+                Ok((stream, client_addr)) => {
                     let _ = stream.set_nodelay(true);
                     let r = router.clone();
+                    let client_id = next_client_id;
+                    next_client_id += 1;
+                    let reg = client_registry.clone();
                     monoio::spawn(async move {
-                        handle_connection(stream, r).await;
+                        handle_connection(stream, client_addr, client_id, reg, r).await;
                     });
                 }
                 Err(e) => {

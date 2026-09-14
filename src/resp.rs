@@ -12,6 +12,14 @@ pub enum ClusterSubcommand {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
+pub enum ClientSubcommand {
+    List,
+    SetName(String),
+    GetName,
+    Id,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Command {
     Get(Bytes),
     Set {
@@ -28,6 +36,7 @@ pub enum Command {
     Persist(Bytes),
     Ttl(Bytes, bool), // true for PTTL (milliseconds), false for TTL (seconds)
     Cluster(ClusterSubcommand),
+    Client(ClientSubcommand),
     Ping(Option<Bytes>),
     CommandDocs,
     Info,
@@ -350,6 +359,25 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "NODES" => Ok(Some(Command::Cluster(ClusterSubcommand::Nodes))),
                 "INFO" => Ok(Some(Command::Cluster(ClusterSubcommand::Info))),
                 _ => Ok(Some(Command::Unknown(format!("CLUSTER {}", sub)))),
+            }
+        }
+        "CLIENT" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'client' command".to_string());
+            }
+            let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
+            match sub.as_str() {
+                "LIST" => Ok(Some(Command::Client(ClientSubcommand::List))),
+                "SETNAME" => {
+                    if args.len() < 3 {
+                        return Err("wrong number of arguments for 'client setname' command".to_string());
+                    }
+                    let name = String::from_utf8_lossy(&args[2]).to_string();
+                    Ok(Some(Command::Client(ClientSubcommand::SetName(name))))
+                }
+                "GETNAME" => Ok(Some(Command::Client(ClientSubcommand::GetName))),
+                "ID" => Ok(Some(Command::Client(ClientSubcommand::Id))),
+                _ => Ok(Some(Command::Unknown(format!("CLIENT {}", sub)))),
             }
         }
         "COMMAND" => Ok(Some(Command::CommandDocs)),
