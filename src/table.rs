@@ -333,6 +333,192 @@ impl PartialEq for RudisZSet {
 
 impl Eq for RudisZSet {}
 
+const SMALL_SET_LIMIT: usize = 64;
+
+#[derive(Clone, Debug)]
+pub enum RudisSet {
+    Small(Vec<Bytes>),
+    Full(hashbrown::HashSet<Bytes>),
+}
+
+impl Default for RudisSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub enum RudisSetIter<'a> {
+    Small(std::slice::Iter<'a, Bytes>),
+    Full(hashbrown::hash_set::Iter<'a, Bytes>),
+}
+
+impl<'a> Iterator for RudisSetIter<'a> {
+    type Item = &'a Bytes;
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            RudisSetIter::Small(it) => it.next(),
+            RudisSetIter::Full(it) => it.next(),
+        }
+    }
+
+    #[inline(always)]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            RudisSetIter::Small(it) => it.size_hint(),
+            RudisSetIter::Full(it) => it.size_hint(),
+        }
+    }
+}
+
+impl<'a> ExactSizeIterator for RudisSetIter<'a> {}
+
+impl<'a> IntoIterator for &'a RudisSet {
+    type Item = &'a Bytes;
+    type IntoIter = RudisSetIter<'a>;
+    #[inline(always)]
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl RudisSet {
+    #[inline(always)]
+    pub fn new() -> Self {
+        RudisSet::Small(Vec::new())
+    }
+
+    #[inline(always)]
+    pub fn with_capacity(cap: usize) -> Self {
+        if cap <= SMALL_SET_LIMIT {
+            RudisSet::Small(Vec::with_capacity(cap))
+        } else {
+            RudisSet::Full(hashbrown::HashSet::with_capacity(cap))
+        }
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        match self {
+            RudisSet::Small(v) => v.len(),
+            RudisSet::Full(s) => s.len(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        match self {
+            RudisSet::Small(v) => v.is_empty(),
+            RudisSet::Full(s) => s.is_empty(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn contains(&self, member: &[u8]) -> bool {
+        match self {
+            RudisSet::Small(v) => {
+                for m in v {
+                    if m.as_ref() == member {
+                        return true;
+                    }
+                }
+                false
+            }
+            RudisSet::Full(s) => s.contains(member),
+        }
+    }
+
+    pub fn insert(&mut self, member: Bytes) -> bool {
+        match self {
+            RudisSet::Small(v) => {
+                let m_bytes = member.as_ref();
+                for m in v.iter() {
+                    if m.as_ref() == m_bytes {
+                        return false;
+                    }
+                }
+                v.push(member);
+                if v.len() > SMALL_SET_LIMIT {
+                    let mut set = hashbrown::HashSet::with_capacity(v.len());
+                    for m in v.drain(..) {
+                        set.insert(m);
+                    }
+                    *self = RudisSet::Full(set);
+                }
+                true
+            }
+            RudisSet::Full(s) => s.insert(member),
+        }
+    }
+
+    pub fn remove(&mut self, member: &[u8]) -> bool {
+        match self {
+            RudisSet::Small(v) => {
+                if let Some(pos) = v.iter().position(|m| m.as_ref() == member) {
+                    v.swap_remove(pos);
+                    true
+                } else {
+                    false
+                }
+            }
+            RudisSet::Full(s) => s.remove(member),
+        }
+    }
+
+    pub fn to_vec(&self) -> Vec<Bytes> {
+        match self {
+            RudisSet::Small(v) => v.clone(),
+            RudisSet::Full(s) => s.iter().cloned().collect(),
+        }
+    }
+
+    pub fn pop(&mut self) -> Option<Bytes> {
+        match self {
+            RudisSet::Small(v) => v.pop(),
+            RudisSet::Full(s) => {
+                if let Some(elem) = s.iter().next().cloned() {
+                    s.remove(&elem);
+                    Some(elem)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn iter(&self) -> RudisSetIter<'_> {
+        match self {
+            RudisSet::Small(v) => RudisSetIter::Small(v.iter()),
+            RudisSet::Full(s) => RudisSetIter::Full(s.iter()),
+        }
+    }
+}
+
+impl PartialEq for RudisSet {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        match (self, other) {
+            (RudisSet::Small(a), RudisSet::Small(b)) => {
+                a.iter().all(|m| b.iter().any(|x| x == m))
+            }
+            (RudisSet::Full(a), RudisSet::Full(b)) => a == b,
+            _ => {
+                for m in self.iter() {
+                    if !other.contains(m.as_ref()) {
+                        return false;
+                    }
+                }
+                true
+            }
+        }
+    }
+}
+
+impl Eq for RudisSet {}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StreamId {
     pub ms: u64,
@@ -498,7 +684,7 @@ pub enum RudisValue {
     SmallHash(Vec<(Bytes, Bytes)>),
     Hash(HashMap<Bytes, Bytes>),
     List(std::collections::VecDeque<Bytes>),
-    Set(hashbrown::HashSet<Bytes>),
+    Set(RudisSet),
     ZSet(RudisZSet),
     HyperLogLog(Box<[u8; 16384]>),
     Stream(RudisStream),
@@ -1933,7 +2119,7 @@ impl RudisTable {
             }
         }
 
-        let mut set = hashbrown::HashSet::with_capacity(members.len());
+        let mut set = RudisSet::with_capacity(members.len());
         let mut added = 0;
         for m in members {
             if set.insert(m) {
@@ -1994,7 +2180,7 @@ impl RudisTable {
             }
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
-                    RudisValue::Set(set) => Ok(set.iter().cloned().collect()),
+                    RudisValue::Set(set) => Ok(set.to_vec()),
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
@@ -2008,10 +2194,13 @@ impl RudisTable {
     pub fn sismember(&mut self, key: &[u8], member: &[u8]) -> Result<bool, &'static str> {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
-            if self.check_expired_slot(idx) {
-                return Ok(false);
-            }
             if let Some(entry) = self.table.get_slot(idx) {
+                if let Some(expire_at) = entry.expire_at {
+                    if Instant::now() >= expire_at {
+                        self.table.remove(idx);
+                        return Ok(false);
+                    }
+                }
                 match &entry.val {
                     RudisValue::Set(set) => Ok(set.contains(member)),
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
@@ -2054,8 +2243,7 @@ impl RudisTable {
                     RudisValue::Set(set) => {
                         let mut res = Vec::new();
                         for _ in 0..count {
-                            if let Some(elem) = set.iter().next().cloned() {
-                                set.remove(&elem);
+                            if let Some(elem) = set.pop() {
                                 res.push(elem);
                             } else {
                                 break;
@@ -3522,7 +3710,7 @@ impl RudisTable {
                 }
                 let count = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
                 cursor += 4;
-                let mut set = hashbrown::HashSet::with_capacity(count);
+                let mut set = RudisSet::with_capacity(count);
                 for _ in 0..count {
                     if cursor + 4 > data.len() {
                         return Err("DUMP payload version or checksum are wrong");
