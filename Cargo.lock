@@ -533,6 +533,7 @@ dependencies = [
  "core_affinity",
  "crc16",
  "flume 0.12.0",
+ "fxhash",
  "hashbrown",
  "mimalloc",
  "monoio",

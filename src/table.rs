@@ -1,0 +1,882 @@
+use std::time::{Duration, Instant};
+use bytes::Bytes;
+use fxhash::hash64;
+use hashbrown::HashMap;
+
+pub const GROUP_SIZE: usize = 16;
+pub const EMPTY: u8 = 0xFF;
+pub const DELETED: u8 = 0xFE;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RudisValue {
+    String(Bytes),
+    Hash(HashMap<Bytes, Bytes>),
+}
+
+#[derive(Clone, Debug)]
+pub struct RudisEntry {
+    pub key: Bytes,
+    pub val: RudisValue,
+    pub expire_at: Option<Instant>,
+}
+
+#[inline(always)]
+pub fn hash_key(key: &[u8]) -> u64 {
+    hash64(key)
+}
+
+#[inline(always)]
+pub fn fingerprint(hash: u64) -> u8 {
+    (hash >> 57) as u8 & 0x7F
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn match_control_bytes_simd(ptr: *const u8, target: u8) -> u16 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let group = _mm_loadu_si128(ptr as *const __m128i);
+        let match_target = _mm_set1_epi8(target as i8);
+        let cmp = _mm_cmpeq_epi8(group, match_target);
+        _mm_movemask_epi8(cmp) as u16
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+unsafe fn match_control_bytes_simd(ptr: *const u8, target: u8) -> u16 {
+    let mut mask = 0u16;
+    for i in 0..16 {
+        unsafe {
+            if *ptr.add(i) == target {
+                mask |= 1 << i;
+            }
+        }
+    }
+    mask
+}
+
+#[inline(always)]
+fn match_control_bytes(ctrl: &[u8], offset: usize, target: u8) -> u16 {
+    unsafe { match_control_bytes_simd(ctrl.as_ptr().add(offset), target) }
+}
+
+/// A high-performance flat hash table utilizing 16-slot SIMD group probing
+/// with inlined values and expiration metadata.
+pub struct RudisFlatTable {
+    ctrl: Vec<u8>,
+    slots: Vec<Option<RudisEntry>>,
+    capacity: usize,
+    mask: usize,
+    items: usize,
+    growth_left: usize,
+}
+
+impl RudisFlatTable {
+    pub fn new(capacity: usize) -> Self {
+        let cap = capacity.next_power_of_two().max(GROUP_SIZE);
+        let mut ctrl = vec![EMPTY; cap + GROUP_SIZE];
+        ctrl.copy_within(0..GROUP_SIZE, cap);
+
+        let mut slots = Vec::with_capacity(cap);
+        for _ in 0..cap {
+            slots.push(None);
+        }
+
+        Self {
+            ctrl,
+            slots,
+            capacity: cap,
+            mask: cap - 1,
+            items: 0,
+            growth_left: cap * 7 / 8,
+        }
+    }
+
+    #[inline(always)]
+    fn set_ctrl(&mut self, idx: usize, byte: u8) {
+        self.ctrl[idx] = byte;
+        if idx < GROUP_SIZE {
+            self.ctrl[self.capacity + idx] = byte;
+        }
+    }
+
+    /// Finds the index of a matching key, if present.
+    pub fn find(&self, key: &[u8], hash: u64) -> Option<usize> {
+        let tag = fingerprint(hash);
+        let mut idx = (hash as usize) & self.mask;
+        let mut step = 0;
+
+        loop {
+            let match_mask = match_control_bytes(&self.ctrl, idx, tag);
+            let mut bits = match_mask;
+            while bits != 0 {
+                let offset = bits.trailing_zeros() as usize;
+                let slot_idx = (idx + offset) & self.mask;
+                if let Some(ref entry) = self.slots[slot_idx] {
+                    if entry.key.as_ref() == key {
+                        return Some(slot_idx);
+                    }
+                }
+                bits &= bits - 1;
+            }
+
+            let empty_mask = match_control_bytes(&self.ctrl, idx, EMPTY);
+            if empty_mask != 0 {
+                return None;
+            }
+
+            step += GROUP_SIZE;
+            idx = (idx + step) & self.mask;
+        }
+    }
+
+    /// Searches for key and returns either `(Some(existing_slot_idx), candidate_insert_idx)`
+    /// or `(None, candidate_insert_idx)`.
+    fn find_or_prepare_insert(&self, key: &[u8], hash: u64) -> (Option<usize>, usize) {
+        let tag = fingerprint(hash);
+        let mut idx = (hash as usize) & self.mask;
+        let mut step = 0;
+        let mut first_free: Option<usize> = None;
+
+        loop {
+            let match_mask = match_control_bytes(&self.ctrl, idx, tag);
+            let mut bits = match_mask;
+            while bits != 0 {
+                let offset = bits.trailing_zeros() as usize;
+                let slot_idx = (idx + offset) & self.mask;
+                if let Some(ref entry) = self.slots[slot_idx] {
+                    if entry.key.as_ref() == key {
+                        return (Some(slot_idx), slot_idx);
+                    }
+                }
+                bits &= bits - 1;
+            }
+
+            if first_free.is_none() {
+                let del_mask = match_control_bytes(&self.ctrl, idx, DELETED);
+                if del_mask != 0 {
+                    let offset = del_mask.trailing_zeros() as usize;
+                    first_free = Some((idx + offset) & self.mask);
+                }
+            }
+
+            let empty_mask = match_control_bytes(&self.ctrl, idx, EMPTY);
+            if empty_mask != 0 {
+                let free_idx = match first_free {
+                    Some(f) => f,
+                    None => {
+                        let offset = empty_mask.trailing_zeros() as usize;
+                        (idx + offset) & self.mask
+                    }
+                };
+                return (None, free_idx);
+            }
+
+            step += GROUP_SIZE;
+            idx = (idx + step) & self.mask;
+        }
+    }
+
+    fn resize(&mut self, new_cap: usize) {
+        let mut new_table = RudisFlatTable::new(new_cap);
+        for opt in self.slots.drain(..) {
+            if let Some(entry) = opt {
+                let h = hash_key(&entry.key);
+                let (_, insert_idx) = new_table.find_or_prepare_insert(&entry.key, h);
+                let tag = fingerprint(h);
+                new_table.set_ctrl(insert_idx, tag);
+                new_table.slots[insert_idx] = Some(entry);
+                new_table.items += 1;
+                new_table.growth_left = new_table.growth_left.saturating_sub(1);
+            }
+        }
+        *self = new_table;
+    }
+
+    pub fn insert(&mut self, entry: RudisEntry) -> Option<RudisEntry> {
+        if self.growth_left == 0 {
+            self.resize(self.capacity * 2);
+        }
+
+        let h = hash_key(&entry.key);
+        let (existing, insert_idx) = self.find_or_prepare_insert(&entry.key, h);
+
+        if let Some(idx) = existing {
+            let old = self.slots[idx].replace(entry);
+            old
+        } else {
+            let tag = fingerprint(h);
+            self.set_ctrl(insert_idx, tag);
+            self.slots[insert_idx] = Some(entry);
+            self.items += 1;
+            self.growth_left = self.growth_left.saturating_sub(1);
+            None
+        }
+    }
+
+    pub fn remove(&mut self, slot_idx: usize) -> Option<RudisEntry> {
+        self.set_ctrl(slot_idx, DELETED);
+        self.items -= 1;
+        self.slots[slot_idx].take()
+    }
+
+    #[inline(always)]
+    pub fn get_slot(&self, idx: usize) -> Option<&RudisEntry> {
+        self.slots[idx].as_ref()
+    }
+
+    #[inline(always)]
+    pub fn get_slot_mut(&mut self, idx: usize) -> Option<&mut RudisEntry> {
+        self.slots[idx].as_mut()
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.items
+    }
+
+    #[inline(always)]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+/// The complete thread-local Rudis storage engine unifying:
+/// 1. Flat SIMD-accelerated hash table (`RudisFlatTable`)
+/// 2. Inlined TTL expiration
+/// 3. Secondary cluster slot index
+pub struct RudisTable {
+    table: RudisFlatTable,
+    slot_to_keys: HashMap<u16, hashbrown::HashSet<Bytes>>,
+    sample_cursor: usize,
+}
+
+impl RudisTable {
+    pub fn new() -> Self {
+        Self {
+            table: RudisFlatTable::new(64),
+            slot_to_keys: HashMap::new(),
+            sample_cursor: 0,
+        }
+    }
+
+    #[inline]
+    fn check_expired_slot(&mut self, slot_idx: usize) -> bool {
+        let is_exp = if let Some(entry) = self.table.get_slot(slot_idx) {
+            if let Some(expire_at) = entry.expire_at {
+                Instant::now() >= expire_at
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if is_exp {
+            if let Some(removed) = self.table.remove(slot_idx) {
+                let slot = crate::router::key_slot(&removed.key);
+                if let Some(set) = self.slot_to_keys.get_mut(&slot) {
+                    set.remove(&removed.key);
+                }
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn get(&mut self, key: &[u8]) -> Result<Option<Bytes>, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(None);
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::String(b) => Ok(Some(b.clone())),
+                    RudisValue::Hash(_) => {
+                        Err("WRONGTYPE Operation against a key holding the wrong kind of value")
+                    }
+                }
+            } else {
+                Ok(None)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn set(&mut self, key: Bytes, value: Bytes, expire_in: Option<Duration>) {
+        let slot = crate::router::key_slot(&key);
+        self.slot_to_keys.entry(slot).or_default().insert(key.clone());
+
+        let expire_at = expire_in.map(|d| Instant::now() + d);
+        let entry = RudisEntry {
+            key,
+            val: RudisValue::String(value),
+            expire_at,
+        };
+        self.table.insert(entry);
+    }
+
+    pub fn del(&mut self, key: &[u8]) -> bool {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            let was_exp = self.check_expired_slot(idx);
+            if was_exp {
+                return false;
+            }
+            if let Some(removed) = self.table.remove(idx) {
+                let slot = crate::router::key_slot(&removed.key);
+                if let Some(set) = self.slot_to_keys.get_mut(&slot) {
+                    set.remove(&removed.key);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn exists(&mut self, key: &[u8]) -> bool {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        }
+    }
+
+    pub fn incr_by(&mut self, key: Bytes, delta: i64) -> Result<i64, String> {
+        let h = hash_key(&key);
+        if let Some(idx) = self.table.find(&key, h) {
+            let was_exp = self.check_expired_slot(idx);
+            if !was_exp {
+                let (current, old_expire) = match self.table.get_slot(idx) {
+                    Some(entry) => match &entry.val {
+                        RudisValue::String(b) => {
+                            let s = std::str::from_utf8(b)
+                                .map_err(|_| "value is not an integer or out of range".to_string())?;
+                            let val = s.parse::<i64>()
+                                .map_err(|_| "value is not an integer or out of range".to_string())?;
+                            (val, entry.expire_at)
+                        }
+                        RudisValue::Hash(_) => {
+                            return Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string());
+                        }
+                    },
+                    None => (0, None),
+                };
+
+                let new_val = current
+                    .checked_add(delta)
+                    .ok_or_else(|| "increment or decrement would overflow".to_string())?;
+                
+                let entry = RudisEntry {
+                    key: key.clone(),
+                    val: RudisValue::String(Bytes::from(new_val.to_string())),
+                    expire_at: old_expire,
+                };
+                self.table.insert(entry);
+                return Ok(new_val);
+            }
+        }
+
+        let new_val = delta;
+        let slot = crate::router::key_slot(&key);
+        self.slot_to_keys.entry(slot).or_default().insert(key.clone());
+        let entry = RudisEntry {
+            key,
+            val: RudisValue::String(Bytes::from(new_val.to_string())),
+            expire_at: None,
+        };
+        self.table.insert(entry);
+        Ok(new_val)
+    }
+
+    pub fn expire(&mut self, key: &[u8], duration: Duration) -> bool {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return false;
+            }
+            if let Some(entry) = self.table.get_slot_mut(idx) {
+                entry.expire_at = Some(Instant::now() + duration);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn persist(&mut self, key: &[u8]) -> bool {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return false;
+            }
+            if let Some(entry) = self.table.get_slot_mut(idx) {
+                if entry.expire_at.is_some() {
+                    entry.expire_at = None;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn ttl(&mut self, key: &[u8], in_millis: bool) -> i64 {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return -2;
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match entry.expire_at {
+                    Some(expire_at) => {
+                        let now = Instant::now();
+                        if now >= expire_at {
+                            self.check_expired_slot(idx);
+                            -2
+                        } else {
+                            let diff = expire_at.duration_since(now);
+                            if in_millis {
+                                diff.as_millis() as i64
+                            } else {
+                                diff.as_secs() as i64
+                            }
+                        }
+                    }
+                    None => -1,
+                }
+            } else {
+                -2
+            }
+        } else {
+            -2
+        }
+    }
+
+    pub fn hset(&mut self, key: Bytes, fields: Vec<(Bytes, Bytes)>) -> Result<usize, &'static str> {
+        let h = hash_key(&key);
+        if let Some(idx) = self.table.find(&key, h) {
+            let _ = self.check_expired_slot(idx);
+        }
+
+        let (existing, _) = self.table.find_or_prepare_insert(&key, h);
+        if let Some(idx) = existing {
+            if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::String(_) => {
+                        return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
+                    }
+                    RudisValue::Hash(map) => {
+                        let mut added = 0;
+                        for (f, v) in fields {
+                            if map.insert(f, v).is_none() {
+                                added += 1;
+                            }
+                        }
+                        return Ok(added);
+                    }
+                }
+            }
+        }
+
+        let slot = crate::router::key_slot(&key);
+        self.slot_to_keys.entry(slot).or_default().insert(key.clone());
+
+        let mut map = HashMap::new();
+        let mut added = 0;
+        for (f, v) in fields {
+            if map.insert(f, v).is_none() {
+                added += 1;
+            }
+        }
+        let entry = RudisEntry {
+            key,
+            val: RudisValue::Hash(map),
+            expire_at: None,
+        };
+        self.table.insert(entry);
+        Ok(added)
+    }
+
+    pub fn hget(&mut self, key: &[u8], field: &[u8]) -> Result<Option<Bytes>, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(None);
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::Hash(map) => Ok(map.get(field).cloned()),
+                    RudisValue::String(_) => {
+                        Err("WRONGTYPE Operation against a key holding the wrong kind of value")
+                    }
+                }
+            } else {
+                Ok(None)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn hmget(&mut self, key: &[u8], fields: &[Bytes]) -> Result<Vec<Option<Bytes>>, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(vec![None; fields.len()]);
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::Hash(map) => {
+                        Ok(fields.iter().map(|f| map.get(f).cloned()).collect())
+                    }
+                    RudisValue::String(_) => {
+                        Err("WRONGTYPE Operation against a key holding the wrong kind of value")
+                    }
+                }
+            } else {
+                Ok(vec![None; fields.len()])
+            }
+        } else {
+            Ok(vec![None; fields.len()])
+        }
+    }
+
+    pub fn hdel(&mut self, key: &[u8], fields: &[Bytes]) -> Result<usize, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(0);
+            }
+            let (count, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::Hash(map) => {
+                        let mut c = 0;
+                        for f in fields {
+                            if map.remove(f).is_some() {
+                                c += 1;
+                            }
+                        }
+                        (c, map.is_empty())
+                    }
+                    RudisValue::String(_) => {
+                        return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
+                    }
+                }
+            } else {
+                (0, false)
+            };
+
+            if is_empty {
+                if let Some(removed) = self.table.remove(idx) {
+                    let slot = crate::router::key_slot(&removed.key);
+                    if let Some(set) = self.slot_to_keys.get_mut(&slot) {
+                        set.remove(&removed.key);
+                    }
+                }
+            }
+            Ok(count)
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn hexists(&mut self, key: &[u8], field: &[u8]) -> Result<bool, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(false);
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::Hash(map) => Ok(map.contains_key(field)),
+                    RudisValue::String(_) => {
+                        Err("WRONGTYPE Operation against a key holding the wrong kind of value")
+                    }
+                }
+            } else {
+                Ok(false)
+            }
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn hlen(&mut self, key: &[u8]) -> Result<usize, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(0);
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::Hash(map) => Ok(map.len()),
+                    RudisValue::String(_) => {
+                        Err("WRONGTYPE Operation against a key holding the wrong kind of value")
+                    }
+                }
+            } else {
+                Ok(0)
+            }
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn hgetall(&mut self, key: &[u8]) -> Result<Vec<(Bytes, Bytes)>, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(Vec::new());
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::Hash(map) => {
+                        Ok(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                    }
+                    RudisValue::String(_) => {
+                        Err("WRONGTYPE Operation against a key holding the wrong kind of value")
+                    }
+                }
+            } else {
+                Ok(Vec::new())
+            }
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub fn hkeys(&mut self, key: &[u8]) -> Result<Vec<Bytes>, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(Vec::new());
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::Hash(map) => Ok(map.keys().cloned().collect()),
+                    RudisValue::String(_) => {
+                        Err("WRONGTYPE Operation against a key holding the wrong kind of value")
+                    }
+                }
+            } else {
+                Ok(Vec::new())
+            }
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub fn hvals(&mut self, key: &[u8]) -> Result<Vec<Bytes>, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(Vec::new());
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::Hash(map) => Ok(map.values().cloned().collect()),
+                    RudisValue::String(_) => {
+                        Err("WRONGTYPE Operation against a key holding the wrong kind of value")
+                    }
+                }
+            } else {
+                Ok(Vec::new())
+            }
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub fn count_keys_in_slot(&mut self, slot: u16) -> usize {
+        if let Some(keys) = self.slot_to_keys.get_mut(&slot) {
+            let mut expired = Vec::new();
+            for k in keys.iter() {
+                let h = hash_key(k);
+                if let Some(idx) = self.table.find(k, h) {
+                    if let Some(entry) = self.table.get_slot(idx) {
+                        if let Some(exp) = entry.expire_at {
+                            if Instant::now() >= exp {
+                                expired.push(k.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            for k in expired {
+                keys.remove(&k);
+                let h = hash_key(&k);
+                if let Some(idx) = self.table.find(&k, h) {
+                    self.table.remove(idx);
+                }
+            }
+            keys.len()
+        } else {
+            0
+        }
+    }
+
+    pub fn get_keys_in_slot(&mut self, slot: u16, count: usize) -> Vec<Bytes> {
+        if let Some(keys) = self.slot_to_keys.get_mut(&slot) {
+            let mut expired = Vec::new();
+            for k in keys.iter() {
+                let h = hash_key(k);
+                if let Some(idx) = self.table.find(k, h) {
+                    if let Some(entry) = self.table.get_slot(idx) {
+                        if let Some(exp) = entry.expire_at {
+                            if Instant::now() >= exp {
+                                expired.push(k.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            for k in expired {
+                keys.remove(&k);
+                let h = hash_key(&k);
+                if let Some(idx) = self.table.find(&k, h) {
+                    self.table.remove(idx);
+                }
+            }
+            keys.iter().take(count).cloned().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Active sampling cycle: samples up to 20 slots starting from cursor and evicts expired keys.
+    pub fn active_expire_cycle(&mut self) -> usize {
+        let cap = self.table.capacity();
+        if cap == 0 || self.table.len() == 0 {
+            return 0;
+        }
+
+        let mut expired_count = 0;
+        let mut checked = 0;
+        while checked < 20 {
+            let idx = self.sample_cursor % cap;
+            self.sample_cursor = (self.sample_cursor + 1) % cap;
+            if self.check_expired_slot(idx) {
+                expired_count += 1;
+            }
+            checked += 1;
+        }
+        expired_count
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.table.len() == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+
+    #[test]
+    fn test_flat_table_crud_and_growth() {
+        let mut table = RudisFlatTable::new(16);
+        assert_eq!(table.capacity(), 16);
+
+        // Insert 100 items to force multiple resizes
+        for i in 0..100 {
+            let key = Bytes::from(format!("key_{}", i));
+            let val = Bytes::from(format!("val_{}", i));
+            let entry = RudisEntry {
+                key,
+                val: RudisValue::String(val),
+                expire_at: None,
+            };
+            table.insert(entry);
+        }
+        assert_eq!(table.len(), 100);
+        assert!(table.capacity() >= 128);
+
+        // Verify all items are present
+        for i in 0..100 {
+            let key = format!("key_{}", i);
+            let h = hash_key(key.as_bytes());
+            let idx = table.find(key.as_bytes(), h).expect("key must be found");
+            let entry = table.get_slot(idx).unwrap();
+            assert_eq!(entry.key, key.as_bytes());
+            if let RudisValue::String(ref b) = entry.val {
+                assert_eq!(b, format!("val_{}", i).as_bytes());
+            } else {
+                panic!("expected String value");
+            }
+        }
+
+        // Test removal
+        let h = hash_key(b"key_42");
+        let idx = table.find(b"key_42", h).unwrap();
+        let removed = table.remove(idx).unwrap();
+        assert_eq!(removed.key, b"key_42".as_slice());
+        assert_eq!(table.len(), 99);
+        assert!(table.find(b"key_42", h).is_none());
+    }
+
+    #[test]
+    fn test_rudis_table_redis_operations() {
+        let mut table = RudisTable::new();
+
+        // 1. SET & GET
+        table.set(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"), None);
+        assert_eq!(table.get(b"k1").unwrap(), Some(Bytes::from_static(b"v1")));
+        assert_eq!(table.get(b"nonexistent").unwrap(), None);
+
+        // 2. INCRBY
+        assert_eq!(table.incr_by(Bytes::from_static(b"counter"), 10).unwrap(), 10);
+        assert_eq!(table.incr_by(Bytes::from_static(b"counter"), -3).unwrap(), 7);
+
+        // 3. TTL & Expiration
+        table.set(
+            Bytes::from_static(b"exp_key"),
+            Bytes::from_static(b"temp"),
+            Some(Duration::from_millis(50)),
+        );
+        assert_eq!(table.get(b"exp_key").unwrap(), Some(Bytes::from_static(b"temp")));
+        assert!(table.ttl(b"exp_key", false) >= 0);
+
+        thread::sleep(Duration::from_millis(60));
+        assert_eq!(table.get(b"exp_key").unwrap(), None, "Key must be expired");
+        assert_eq!(table.ttl(b"exp_key", false), -2);
+
+        // 4. Hashes
+        let added = table
+            .hset(
+                Bytes::from_static(b"user:1"),
+                vec![
+                    (Bytes::from_static(b"name"), Bytes::from_static(b"alice")),
+                    (Bytes::from_static(b"age"), Bytes::from_static(b"30")),
+                ],
+            )
+            .unwrap();
+        assert_eq!(added, 2);
+
+        assert_eq!(
+            table.hget(b"user:1", b"name").unwrap(),
+            Some(Bytes::from_static(b"alice"))
+        );
+        assert_eq!(table.hlen(b"user:1").unwrap(), 2);
+        assert!(table.hexists(b"user:1", b"name").unwrap());
+        assert!(!table.hexists(b"user:1", b"missing").unwrap());
+
+        // WRONGTYPE test
+        assert!(table.get(b"user:1").is_err());
+        assert!(table.hget(b"k1", b"field").is_err());
+    }
+}
