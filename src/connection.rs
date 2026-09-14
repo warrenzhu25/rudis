@@ -3,8 +3,8 @@ use bytes::BytesMut;
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::TcpStream;
 
-use crate::resp::{parse_command, Command};
-use crate::router::{target_shard, Router};
+use crate::resp::{parse_command, ClusterSubcommand, Command};
+use crate::router::{key_slot, target_shard, Router};
 use crate::shard::{ShardDb, ShardMessage};
 
 const READ_BUFFER_SIZE: usize = 65536;
@@ -230,6 +230,87 @@ async fn execute_command(cmd: Command, router: &Router, out: &mut Vec<u8>) -> bo
             out.extend_from_slice(format!("${}\r\n", info_str.len()).as_bytes());
             out.extend_from_slice(info_str.as_bytes());
             out.extend_from_slice(b"\r\n");
+            false
+        }
+        Command::Cluster(sub) => {
+            match sub {
+                ClusterSubcommand::KeySlot(key) => {
+                    let slot = key_slot(&key);
+                    out.extend_from_slice(format!(":{}\r\n", slot).as_bytes());
+                }
+                ClusterSubcommand::CountKeysInSlot(slot) => {
+                    let count = router.count_keys_in_slot(slot).await;
+                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                }
+                ClusterSubcommand::GetKeysInSlot(slot, count) => {
+                    let keys = router.get_keys_in_slot(slot, count).await;
+                    out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
+                    for k in keys {
+                        out.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                        out.extend_from_slice(&k);
+                        out.extend_from_slice(b"\r\n");
+                    }
+                }
+                ClusterSubcommand::Slots => {
+                    out.extend_from_slice(format!("*{}\r\n", router.num_shards).as_bytes());
+                    for s in 0..router.num_shards {
+                        let start_slot = s * 16384 / router.num_shards;
+                        let end_slot = if s == router.num_shards - 1 {
+                            16383
+                        } else {
+                            (s + 1) * 16384 / router.num_shards - 1
+                        };
+                        let node_id = format!("{:040x}", s + 1);
+                        out.extend_from_slice(b"*3\r\n");
+                        out.extend_from_slice(format!(":{}\r\n", start_slot).as_bytes());
+                        out.extend_from_slice(format!(":{}\r\n", end_slot).as_bytes());
+                        out.extend_from_slice(
+                            format!(
+                                "*3\r\n$9\r\n127.0.0.1\r\n:{}\r\n${}\r\n{}\r\n",
+                                router.port,
+                                node_id.len(),
+                                node_id
+                            )
+                            .as_bytes(),
+                        );
+                    }
+                }
+                ClusterSubcommand::Nodes => {
+                    let mut nodes = String::new();
+                    for s in 0..router.num_shards {
+                        let start_slot = s * 16384 / router.num_shards;
+                        let end_slot = if s == router.num_shards - 1 {
+                            16383
+                        } else {
+                            (s + 1) * 16384 / router.num_shards - 1
+                        };
+                        let node_id = format!("{:040x}", s + 1);
+                        let myself = if s == router.shard_id { "myself," } else { "" };
+                        nodes.push_str(&format!(
+                            "{} 127.0.0.1:{}@{} {}master - 0 0 {} connected {}-{}\n",
+                            node_id,
+                            router.port,
+                            router.port + 10000,
+                            myself,
+                            s + 1,
+                            start_slot,
+                            end_slot
+                        ));
+                    }
+                    out.extend_from_slice(format!("${}\r\n", nodes.len()).as_bytes());
+                    out.extend_from_slice(nodes.as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                }
+                ClusterSubcommand::Info => {
+                    let info = format!(
+                        "cluster_state:ok\r\ncluster_slots_assigned:16384\r\ncluster_slots_ok:16384\r\ncluster_slots_pfail:0\r\ncluster_slots_fail:0\r\ncluster_known_nodes:{}\r\ncluster_size:{}\r\n",
+                        router.num_shards, router.num_shards
+                    );
+                    out.extend_from_slice(format!("${}\r\n", info.len()).as_bytes());
+                    out.extend_from_slice(info.as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                }
+            }
             false
         }
         Command::Quit => {

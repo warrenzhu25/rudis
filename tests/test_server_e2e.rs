@@ -209,4 +209,42 @@ fn test_multithread_shared_nothing_e2e() {
         total_read += n;
     }
     assert_eq!(String::from_utf8_lossy(&actual_resp), expected_resp);
+
+    // 12. Test CLUSTER commands and Slot Migration secondary index
+    // 12a. CLUSTER KEYSLOT with hash tag support
+    let resp1 = send_and_read(&mut stream, b"CLUSTER KEYSLOT {user:42}:profile\r\n");
+    let resp2 = send_and_read(&mut stream, b"CLUSTER KEYSLOT {user:42}:orders\r\n");
+    assert_eq!(resp1, resp2, "Keys with same hash tag must have identical slot");
+    assert!(resp1.starts_with(':'), "Slot response should be integer");
+
+    // Parse the slot number
+    let slot_str = resp1.trim_matches(|c| c == ':' || c == '\r' || c == '\n');
+    let slot: u16 = slot_str.parse().unwrap();
+    assert!(slot < 16384, "Slot must be < 16384");
+
+    // 12b. Populate keys in slot and query COUNTKEYSINSLOT & GETKEYSINSLOT
+    let _ = send_and_read(&mut stream, b"SET {user:42}:k1 val1\r\n");
+    let _ = send_and_read(&mut stream, b"SET {user:42}:k2 val2\r\n");
+    let _ = send_and_read(&mut stream, b"SET {user:42}:k3 val3\r\n");
+
+    let count_resp = send_and_read(&mut stream, format!("CLUSTER COUNTKEYSINSLOT {}\r\n", slot).as_bytes());
+    assert_eq!(count_resp, ":3\r\n");
+
+    let get_keys_resp = send_and_read(&mut stream, format!("CLUSTER GETKEYSINSLOT {} 10\r\n", slot).as_bytes());
+    assert!(get_keys_resp.starts_with("*3\r\n"), "Expected 3 keys returned");
+    assert!(get_keys_resp.contains("{user:42}:k1"));
+    assert!(get_keys_resp.contains("{user:42}:k2"));
+    assert!(get_keys_resp.contains("{user:42}:k3"));
+
+    // 12c. CLUSTER SLOTS, NODES, INFO
+    let slots_resp = send_and_read(&mut stream, b"CLUSTER SLOTS\r\n");
+    assert!(slots_resp.starts_with("*4\r\n"), "Expected 4 shard slots ranges");
+
+    let nodes_resp = send_and_read(&mut stream, b"CLUSTER NODES\r\n");
+    assert!(nodes_resp.contains("myself,master"));
+    assert!(nodes_resp.contains("connected"));
+
+    let info_resp = send_and_read(&mut stream, b"CLUSTER INFO\r\n");
+    assert!(info_resp.contains("cluster_state:ok"));
+    assert!(info_resp.contains("cluster_slots_assigned:16384"));
 }

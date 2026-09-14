@@ -2,6 +2,16 @@ use std::time::Duration;
 use bytes::{Buf, Bytes, BytesMut};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
+pub enum ClusterSubcommand {
+    KeySlot(Bytes),
+    CountKeysInSlot(u16),
+    GetKeysInSlot(u16, usize),
+    Slots,
+    Nodes,
+    Info,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Command {
     Get(Bytes),
     Set {
@@ -17,6 +27,7 @@ pub enum Command {
     Expire(Bytes, Duration),
     Persist(Bytes),
     Ttl(Bytes, bool), // true for PTTL (milliseconds), false for TTL (seconds)
+    Cluster(ClusterSubcommand),
     Ping(Option<Bytes>),
     CommandDocs,
     Info,
@@ -298,6 +309,48 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 None
             };
             Ok(Some(Command::Ping(msg)))
+        }
+        "CLUSTER" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'cluster' command".to_string());
+            }
+            let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
+            match sub.as_str() {
+                "KEYSLOT" => {
+                    if args.len() < 3 {
+                        return Err("wrong number of arguments for 'cluster keyslot' command".to_string());
+                    }
+                    Ok(Some(Command::Cluster(ClusterSubcommand::KeySlot(args[2].clone()))))
+                }
+                "COUNTKEYSINSLOT" => {
+                    if args.len() < 3 {
+                        return Err("wrong number of arguments for 'cluster countkeysinslot' command".to_string());
+                    }
+                    let slot: u16 = std::str::from_utf8(&args[2])
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                    Ok(Some(Command::Cluster(ClusterSubcommand::CountKeysInSlot(slot))))
+                }
+                "GETKEYSINSLOT" => {
+                    if args.len() < 4 {
+                        return Err("wrong number of arguments for 'cluster getkeysinslot' command".to_string());
+                    }
+                    let slot: u16 = std::str::from_utf8(&args[2])
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                    let count: usize = std::str::from_utf8(&args[3])
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                    Ok(Some(Command::Cluster(ClusterSubcommand::GetKeysInSlot(slot, count))))
+                }
+                "SLOTS" => Ok(Some(Command::Cluster(ClusterSubcommand::Slots))),
+                "NODES" => Ok(Some(Command::Cluster(ClusterSubcommand::Nodes))),
+                "INFO" => Ok(Some(Command::Cluster(ClusterSubcommand::Info))),
+                _ => Ok(Some(Command::Unknown(format!("CLUSTER {}", sub)))),
+            }
         }
         "COMMAND" => Ok(Some(Command::CommandDocs)),
         "INFO" => Ok(Some(Command::Info)),

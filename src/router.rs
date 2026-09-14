@@ -5,13 +5,41 @@ use bytes::Bytes;
 
 use crate::shard::{ShardDb, ShardMessage};
 
-/// Calculates the target shard ID for a given key using CRC16.
+/// Extracts the hash tag from a key if present (e.g. "{user:1}:profile" -> "user:1").
+#[inline]
+pub fn extract_hash_tag(key: &[u8]) -> &[u8] {
+    if let Some(open) = key.iter().position(|&b| b == b'{') {
+        if let Some(close) = key[open + 1..].iter().position(|&b| b == b'}') {
+            if close > 0 {
+                return &key[open + 1..open + 1 + close];
+            }
+        }
+    }
+    key
+}
+
+/// Calculates the Redis Cluster 16384 slot for a given key.
+#[inline]
+pub fn key_slot(key: &[u8]) -> u16 {
+    let tag = extract_hash_tag(key);
+    (crc16::State::<crc16::XMODEM>::calculate(tag) % 16384) as u16
+}
+
+/// Maps a slot (0..16383) to an owning shard (0..num_shards-1).
+#[inline]
+pub fn slot_to_shard(slot: u16, num_shards: usize) -> usize {
+    if num_shards <= 1 {
+        0
+    } else {
+        ((slot as usize) * num_shards) / 16384
+    }
+}
+
+/// Calculates the target shard ID for a given key using CRC16 slot mapping.
 #[inline]
 pub fn target_shard(key: &[u8], num_shards: usize) -> usize {
-    if num_shards <= 1 {
-        return 0;
-    }
-    (crc16::State::<crc16::XMODEM>::calculate(key) as usize) % num_shards
+    let slot = key_slot(key);
+    slot_to_shard(slot, num_shards)
 }
 
 /// The router handles dispatching operations.
@@ -20,6 +48,7 @@ pub fn target_shard(key: &[u8], num_shards: usize) -> usize {
 pub struct Router {
     pub shard_id: usize,
     pub num_shards: usize,
+    pub port: u16,
     pub local_db: Rc<RefCell<ShardDb>>,
     pub senders: Vec<flume::Sender<ShardMessage>>,
 }
@@ -28,12 +57,14 @@ impl Router {
     pub fn new(
         shard_id: usize,
         num_shards: usize,
+        port: u16,
         local_db: Rc<RefCell<ShardDb>>,
         senders: Vec<flume::Sender<ShardMessage>>,
     ) -> Self {
         Self {
             shard_id,
             num_shards,
+            port,
             local_db,
             senders,
         }
@@ -184,6 +215,40 @@ impl Router {
                 rx.recv_async().await.unwrap_or(-2)
             } else {
                 -2
+            }
+        }
+    }
+
+    pub async fn count_keys_in_slot(&self, slot: u16) -> usize {
+        let target = slot_to_shard(slot, self.num_shards);
+        if target == self.shard_id {
+            self.local_db.borrow_mut().count_keys_in_slot(slot)
+        } else {
+            let (tx, rx) = flume::bounded(1);
+            let msg = ShardMessage::CountKeysInSlot { slot, responder: tx };
+            if self.senders[target].send(msg).is_ok() {
+                rx.recv_async().await.unwrap_or(0)
+            } else {
+                0
+            }
+        }
+    }
+
+    pub async fn get_keys_in_slot(&self, slot: u16, count: usize) -> Vec<Bytes> {
+        let target = slot_to_shard(slot, self.num_shards);
+        if target == self.shard_id {
+            self.local_db.borrow_mut().get_keys_in_slot(slot, count)
+        } else {
+            let (tx, rx) = flume::bounded(1);
+            let msg = ShardMessage::GetKeysInSlot {
+                slot,
+                count,
+                responder: tx,
+            };
+            if self.senders[target].send(msg).is_ok() {
+                rx.recv_async().await.unwrap_or_default()
+            } else {
+                Vec::new()
             }
         }
     }

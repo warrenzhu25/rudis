@@ -109,6 +109,18 @@ pub fn run_shard_worker(
                         let res = cross_shard_db.borrow_mut().ttl(&key, in_millis);
                         let _ = responder.send(res);
                     }
+                    ShardMessage::CountKeysInSlot { slot, responder } => {
+                        let count = cross_shard_db.borrow_mut().count_keys_in_slot(slot);
+                        let _ = responder.send(count);
+                    }
+                    ShardMessage::GetKeysInSlot {
+                        slot,
+                        count,
+                        responder,
+                    } => {
+                        let keys = cross_shard_db.borrow_mut().get_keys_in_slot(slot, count);
+                        let _ = responder.send(keys);
+                    }
                     ShardMessage::Batch { items, responder } => {
                         let mut db = cross_shard_db.borrow_mut();
                         let mut results = Vec::with_capacity(items.len());
@@ -124,7 +136,7 @@ pub fn run_shard_worker(
         });
 
         // 4. Create router
-        let router = Rc::new(Router::new(shard_id, num_shards, local_db, senders));
+        let router = Rc::new(Router::new(shard_id, num_shards, port, local_db, senders));
 
         println!(
             "[Shard {}/{}] Worker started and listening on {} via io_uring",

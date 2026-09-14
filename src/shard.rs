@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 use bytes::Bytes;
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 
 use crate::resp::Command;
 
@@ -43,6 +43,15 @@ pub enum ShardMessage {
         in_millis: bool,
         responder: flume::Sender<i64>,
     },
+    CountKeysInSlot {
+        slot: u16,
+        responder: flume::Sender<usize>,
+    },
+    GetKeysInSlot {
+        slot: u16,
+        count: usize,
+        responder: flume::Sender<Vec<Bytes>>,
+    },
     Batch {
         items: Vec<(usize, Command)>,
         responder: flume::Sender<Vec<(usize, Vec<u8>)>>,
@@ -55,6 +64,7 @@ pub enum ShardMessage {
 pub struct ShardDb {
     entries: HashMap<Bytes, Bytes>,
     expirations: HashMap<Bytes, Instant>,
+    slot_to_keys: HashMap<u16, HashSet<Bytes>>,
 }
 
 impl ShardDb {
@@ -62,6 +72,7 @@ impl ShardDb {
         Self {
             entries: HashMap::new(),
             expirations: HashMap::new(),
+            slot_to_keys: HashMap::new(),
         }
     }
 
@@ -71,6 +82,10 @@ impl ShardDb {
     fn check_expired(&mut self, key: &[u8]) -> bool {
         if let Some(&expire_at) = self.expirations.get(key) {
             if Instant::now() >= expire_at {
+                let slot = crate::router::key_slot(key);
+                if let Some(set) = self.slot_to_keys.get_mut(&slot) {
+                    set.remove(key);
+                }
                 self.entries.remove(key);
                 self.expirations.remove(key);
                 return true;
@@ -89,6 +104,8 @@ impl ShardDb {
 
     #[inline]
     pub fn set(&mut self, key: Bytes, value: Bytes, expire_in: Option<Duration>) {
+        let slot = crate::router::key_slot(&key);
+        self.slot_to_keys.entry(slot).or_default().insert(key.clone());
         if let Some(d) = expire_in {
             self.expirations.insert(key.clone(), Instant::now() + d);
         } else {
@@ -99,6 +116,10 @@ impl ShardDb {
 
     #[inline]
     pub fn del(&mut self, key: &[u8]) -> bool {
+        let slot = crate::router::key_slot(key);
+        if let Some(set) = self.slot_to_keys.get_mut(&slot) {
+            set.remove(key);
+        }
         self.expirations.remove(key);
         self.entries.remove(key).is_some()
     }
@@ -126,7 +147,7 @@ impl ShardDb {
         let new_val = current
             .checked_add(delta)
             .ok_or_else(|| "increment or decrement would overflow".to_string())?;
-        self.entries.insert(key, Bytes::from(new_val.to_string()));
+        self.set(key, Bytes::from(new_val.to_string()), None);
         Ok(new_val)
     }
 
@@ -157,6 +178,10 @@ impl ShardDb {
             Some(&expire_at) => {
                 let now = Instant::now();
                 if now >= expire_at {
+                    let slot = crate::router::key_slot(key);
+                    if let Some(set) = self.slot_to_keys.get_mut(&slot) {
+                        set.remove(key);
+                    }
                     self.entries.remove(key);
                     self.expirations.remove(key);
                     -2
@@ -170,6 +195,40 @@ impl ShardDb {
                 }
             }
             None => -1, // Key exists with no expiration
+        }
+    }
+
+    pub fn count_keys_in_slot(&mut self, slot: u16) -> usize {
+        if let Some(keys) = self.slot_to_keys.get_mut(&slot) {
+            let now = Instant::now();
+            let exp = &self.expirations;
+            keys.retain(|k| {
+                if let Some(&expire_at) = exp.get(k) {
+                    now < expire_at
+                } else {
+                    true
+                }
+            });
+            keys.len()
+        } else {
+            0
+        }
+    }
+
+    pub fn get_keys_in_slot(&mut self, slot: u16, count: usize) -> Vec<Bytes> {
+        if let Some(keys) = self.slot_to_keys.get_mut(&slot) {
+            let now = Instant::now();
+            let exp = &self.expirations;
+            keys.retain(|k| {
+                if let Some(&expire_at) = exp.get(k) {
+                    now < expire_at
+                } else {
+                    true
+                }
+            });
+            keys.iter().take(count).cloned().collect()
+        } else {
+            Vec::new()
         }
     }
 
@@ -189,6 +248,10 @@ impl ShardDb {
 
         let count = expired_keys.len();
         for k in expired_keys {
+            let slot = crate::router::key_slot(&k);
+            if let Some(set) = self.slot_to_keys.get_mut(&slot) {
+                set.remove(&k);
+            }
             self.entries.remove(&k);
             self.expirations.remove(&k);
         }
