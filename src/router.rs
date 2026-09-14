@@ -76,4 +76,40 @@ impl Router {
             }
         }
     }
+
+    pub async fn del(&self, key: Bytes) -> bool {
+        let target = target_shard(&key, self.num_shards);
+        if target == self.shard_id {
+            self.local_db.borrow_mut().del(&key)
+        } else {
+            let (tx, rx) = flume::bounded(1);
+            let msg = ShardMessage::Del {
+                key,
+                responder: tx,
+            };
+            if self.senders[target].send(msg).is_ok() {
+                rx.recv_async().await.unwrap_or(false)
+            } else {
+                false
+            }
+        }
+    }
+
+    pub async fn exists(&self, key: Bytes) -> bool {
+        let target = target_shard(&key, self.num_shards);
+        if target == self.shard_id {
+            self.local_db.borrow().exists(&key)
+        } else {
+            let (tx, rx) = flume::bounded(1);
+            let msg = ShardMessage::Exists {
+                key,
+                responder: tx,
+            };
+            if self.senders[target].send(msg).is_ok() {
+                rx.recv_async().await.unwrap_or(false)
+            } else {
+                false
+            }
+        }
+    }
 }

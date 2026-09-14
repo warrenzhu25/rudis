@@ -63,6 +63,14 @@ pub fn run_shard_worker(
                         cross_shard_db.borrow_mut().set(key, value);
                         let _ = responder.send(());
                     }
+                    ShardMessage::Del { key, responder } => {
+                        let deleted = cross_shard_db.borrow_mut().del(&key);
+                        let _ = responder.send(deleted);
+                    }
+                    ShardMessage::Exists { key, responder } => {
+                        let exists = cross_shard_db.borrow().exists(&key);
+                        let _ = responder.send(exists);
+                    }
                 }
             }
         });

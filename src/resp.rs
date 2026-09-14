@@ -4,6 +4,8 @@ use bytes::{Buf, Bytes, BytesMut};
 pub enum Command {
     Get(Bytes),
     Set(Bytes, Bytes),
+    Del(Vec<Bytes>),
+    Exists(Vec<Bytes>),
     Ping(Option<Bytes>),
     CommandDocs,
     Info,
@@ -143,6 +145,18 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'set'/'put' command".to_string());
             }
             Ok(Some(Command::Set(args[1].clone(), args[2].clone())))
+        }
+        "DEL" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'del' command".to_string());
+            }
+            Ok(Some(Command::Del(args[1..].to_vec())))
+        }
+        "EXISTS" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'exists' command".to_string());
+            }
+            Ok(Some(Command::Exists(args[1..].to_vec())))
         }
         "PING" => {
             let msg = if args.len() > 1 {

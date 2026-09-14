@@ -12,6 +12,14 @@ pub enum ShardMessage {
         value: Bytes,
         responder: flume::Sender<()>,
     },
+    Del {
+        key: Bytes,
+        responder: flume::Sender<bool>,
+    },
+    Exists {
+        key: Bytes,
+        responder: flume::Sender<bool>,
+    },
 }
 
 /// A purely thread-local key-value store for one shard.
@@ -36,6 +44,16 @@ impl ShardDb {
     #[inline]
     pub fn set(&mut self, key: Bytes, value: Bytes) {
         self.entries.insert(key, value);
+    }
+
+    #[inline]
+    pub fn del(&mut self, key: &[u8]) -> bool {
+        self.entries.remove(key).is_some()
+    }
+
+    #[inline]
+    pub fn exists(&self, key: &[u8]) -> bool {
+        self.entries.contains_key(key)
     }
 
     #[inline]

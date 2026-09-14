@@ -100,4 +100,17 @@ fn test_multithread_shared_nothing_e2e() {
     let get_resp_array = b"*2\r\n$3\r\nGET\r\n$7\r\nrespkey\r\n";
     let resp = send_and_read(&mut stream, get_resp_array);
     assert_eq!(resp, "$7\r\nrespval\r\n");
+
+    // 7. Test EXISTS and DEL
+    let resp = send_and_read(&mut stream, b"EXISTS respkey user:1 non_existent\r\n");
+    assert_eq!(resp, ":2\r\n");
+
+    let resp = send_and_read(&mut stream, b"DEL respkey user:1 non_existent\r\n");
+    assert_eq!(resp, ":2\r\n");
+
+    let resp = send_and_read(&mut stream, b"EXISTS respkey\r\n");
+    assert_eq!(resp, ":0\r\n");
+
+    let resp = send_and_read(&mut stream, b"GET respkey\r\n");
+    assert_eq!(resp, "$-1\r\n");
 }

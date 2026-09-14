@@ -102,6 +102,26 @@ async fn execute_command(cmd: Command, router: &Router, out: &mut Vec<u8>) -> bo
             out.extend_from_slice(b"+OK\r\n");
             false
         }
+        Command::Del(keys) => {
+            let mut count = 0usize;
+            for key in keys {
+                if router.del(key).await {
+                    count += 1;
+                }
+            }
+            out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+            false
+        }
+        Command::Exists(keys) => {
+            let mut count = 0usize;
+            for key in keys {
+                if router.exists(key).await {
+                    count += 1;
+                }
+            }
+            out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+            false
+        }
         Command::Ping(msg) => {
             match msg {
                 Some(m) => {
