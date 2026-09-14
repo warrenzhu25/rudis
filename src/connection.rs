@@ -206,6 +206,40 @@ pub async fn handle_connection(
                     return;
                 }
 
+                // 2.5 Transition to Replica Stream mode if PSYNC is received
+                if let Some(psync_idx) = commands
+                    .iter()
+                    .position(|c| matches!(c, Command::Psync { .. }))
+                {
+                    for c in commands.drain(..psync_idx) {
+                        let _ = execute_command(
+                            c,
+                            &router,
+                            client_id,
+                            &client_registry,
+                            &mut out_buf,
+                            &mut asking,
+                            &mut authenticated,
+                            &mut auth_user,
+                        )
+                        .await;
+                    }
+                    if !out_buf.is_empty() {
+                        let write_chunk = std::mem::replace(&mut out_buf, Vec::new());
+                        let _ = stream.write_all(write_chunk).await.0;
+                    }
+                    let psync_cmd = commands.remove(0);
+                    run_master_replica_stream(
+                        stream,
+                        client_id,
+                        client_registry,
+                        router,
+                        psync_cmd,
+                    )
+                    .await;
+                    return;
+                }
+
                 // 3. Execute parsed commands with transaction support and pipeline squashing
                 if !commands.is_empty() {
                     let has_tx = in_multi
@@ -635,6 +669,75 @@ async fn run_pubsub_loop(
             Err(_) => break,
         }
     }
+}
+
+async fn run_master_replica_stream(
+    stream: TcpStream,
+    client_id: u64,
+    _client_registry: Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
+    router: Rc<Router>,
+    _psync_cmd: Command,
+) {
+    let hub = crate::replication::get_replication_hub(router.port);
+    let (mut reader, mut writer) = stream.into_split();
+    let (write_tx, write_rx) = flume::unbounded::<Vec<u8>>();
+
+    let rdb = router.generate_full_rdb().await;
+    let _repl = hub.register_replica(client_id, write_tx.clone());
+
+    let replid = hub.master_replid.clone();
+    let offset = hub.master_repl_offset.load(std::sync::atomic::Ordering::SeqCst);
+    let mut initial_msg = format!("+FULLRESYNC {} {}\r\n${}\r\n", replid, offset, rdb.len()).into_bytes();
+    initial_msg.extend_from_slice(&rdb);
+    if let Err(_) = writer.write_all(initial_msg).await.0 {
+        hub.unregister_replica(client_id);
+        return;
+    }
+
+    let writer_hub = hub.clone();
+    monoio::spawn(async move {
+        while let Ok(data) = write_rx.recv_async().await {
+            if let Err(_) = writer.write_all(data).await.0 {
+                break;
+            }
+        }
+        writer_hub.unregister_replica(client_id);
+    });
+
+    let mut read_buf = vec![0u8; READ_BUFFER_SIZE];
+    let mut buf = BytesMut::with_capacity(32768);
+    loop {
+        let (res, returned_buf) = reader.read(read_buf).await;
+        read_buf = returned_buf;
+        match res {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&read_buf[..n]);
+                while !buf.is_empty() {
+                    match crate::resp::parse_command(&mut buf) {
+                        Ok(Some(cmd)) => {
+                            if let Command::Replconf(args) = cmd {
+                                if args.len() >= 2 && args[0].eq_ignore_ascii_case(b"ack") {
+                                    if let Ok(s) = std::str::from_utf8(&args[1]) {
+                                        if let Ok(ack_off) = s.parse::<u64>() {
+                                            hub.update_replica_ack(client_id, ack_off);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(_) => {
+                            buf.clear();
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    hub.unregister_replica(client_id);
 }
 
 pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
@@ -1305,7 +1408,11 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Lastsave => "LASTSAVE",
         Command::Ping(_) => "PING",
         Command::CommandDocs => "COMMAND",
-        Command::Info => "INFO",
+        Command::Info(_) => "INFO",
+        Command::Replicaof { .. } => "REPLICAOF",
+        Command::Psync { .. } => "PSYNC",
+        Command::Replconf(_) => "REPLCONF",
+        Command::Role => "ROLE",
         Command::Quit => "QUIT",
         Command::Subscribe(_) => "SUBSCRIBE",
         Command::Unsubscribe(_) => "UNSUBSCRIBE",
@@ -1406,6 +1513,13 @@ async fn execute_command(
         }
     }
 
+    if crate::replication::get_replication_hub(router.port).is_slave()
+        && crate::aof::command_to_resp(&cmd).is_some()
+    {
+        out.extend_from_slice(b"-READONLY You can't write against a read only replica.\r\n");
+        return false;
+    }
+
     match cmd {
         Command::Get(key) => {
             let val = router.get(key).await;
@@ -1426,6 +1540,13 @@ async fn execute_command(
             value,
             expire_in,
         } => {
+            if let Some(bytes) = crate::aof::command_to_resp(&Command::Set {
+                key: key.clone(),
+                value: value.clone(),
+                expire_in,
+            }) {
+                crate::replication::propagate_bytes(router.port, &bytes);
+            }
             router.set(key, value, expire_in).await;
             out.extend_from_slice(b"+OK\r\n");
             false
@@ -1447,6 +1568,9 @@ async fn execute_command(
             false
         }
         Command::Mset(pairs) => {
+            if let Some(bytes) = crate::aof::command_to_resp(&Command::Mset(pairs.clone())) {
+                crate::replication::propagate_bytes(router.port, &bytes);
+            }
             for (key, val) in pairs {
                 router.set(key, val, None).await;
             }
@@ -1455,9 +1579,14 @@ async fn execute_command(
         }
         Command::Del(keys) => {
             let mut count = 0usize;
-            for key in keys {
+            for key in keys.clone() {
                 if router.del(key).await {
                     count += 1;
+                }
+            }
+            if count > 0 {
+                if let Some(bytes) = crate::aof::command_to_resp(&Command::Del(keys)) {
+                    crate::replication::propagate_bytes(router.port, &bytes);
                 }
             }
             write_resp_integer(out, count as i64);
@@ -1474,8 +1603,11 @@ async fn execute_command(
             false
         }
         Command::IncrBy(key, delta) => {
-            match router.incr_by(key, delta).await {
+            match router.incr_by(key.clone(), delta).await {
                 Ok(val) => {
+                    if let Some(bytes) = crate::aof::command_to_resp(&Command::IncrBy(key, delta)) {
+                        crate::replication::propagate_bytes(router.port, &bytes);
+                    }
                     write_resp_integer(out, val);
                 }
                 Err(err) => {
@@ -1485,8 +1617,11 @@ async fn execute_command(
             false
         }
         Command::Expire(key, duration) => {
-            let res = router.expire(key, duration).await;
+            let res = router.expire(key.clone(), duration).await;
             if res {
+                if let Some(bytes) = crate::aof::command_to_resp(&Command::Expire(key, duration)) {
+                    crate::replication::propagate_bytes(router.port, &bytes);
+                }
                 out.extend_from_slice(b":1\r\n");
             } else {
                 out.extend_from_slice(b":0\r\n");
@@ -1494,8 +1629,11 @@ async fn execute_command(
             false
         }
         Command::Persist(key) => {
-            let res = router.persist(key).await;
+            let res = router.persist(key.clone()).await;
             if res {
+                if let Some(bytes) = crate::aof::command_to_resp(&Command::Persist(key)) {
+                    crate::replication::propagate_bytes(router.port, &bytes);
+                }
                 out.extend_from_slice(b":1\r\n");
             } else {
                 out.extend_from_slice(b":0\r\n");
@@ -1524,14 +1662,91 @@ async fn execute_command(
             out.extend_from_slice(b"*0\r\n");
             false
         }
-        Command::Info => {
-            let info_str = format!(
-                "# Server\r\nrudis_version:0.1.0\r\narch:shared-nothing-io_uring\r\nshard_id:{}\r\nnum_shards:{}\r\n",
-                router.shard_id, router.num_shards
-            );
+        Command::Info(section) => {
+            let hub = crate::replication::get_replication_hub(router.port);
+            let info_str = match section.as_deref() {
+                Some(b"replication") | Some(b"REPLICATION") => {
+                    hub.format_info_replication()
+                }
+                _ => {
+                    format!(
+                        "# Server\r\nrudis_version:0.1.0\r\narch:shared-nothing-io_uring\r\nshard_id:{}\r\nnum_shards:{}\r\n\
+                         # Replication\r\n{}",
+                        router.shard_id, router.num_shards, hub.format_info_replication()
+                    )
+                }
+            };
             out.extend_from_slice(format!("${}\r\n", info_str.len()).as_bytes());
             out.extend_from_slice(info_str.as_bytes());
             out.extend_from_slice(b"\r\n");
+            false
+        }
+        Command::Role => {
+            let hub = crate::replication::get_replication_hub(router.port);
+            out.extend_from_slice(&hub.format_role_resp());
+            false
+        }
+        Command::Replconf(args) => {
+            if args.is_empty() {
+                out.extend_from_slice(b"-ERR wrong number of arguments for 'replconf' command\r\n");
+            } else if args[0].eq_ignore_ascii_case(b"listening-port") {
+                if args.len() >= 2 {
+                    if let Ok(s) = std::str::from_utf8(&args[1]) {
+                        if let Ok(rport) = s.parse::<u16>() {
+                            let hub = crate::replication::get_replication_hub(router.port);
+                            hub.set_replica_port(client_id, rport);
+                        }
+                    }
+                }
+                out.extend_from_slice(b"+OK\r\n");
+            } else if args[0].eq_ignore_ascii_case(b"capa") {
+                out.extend_from_slice(b"+OK\r\n");
+            } else if args[0].eq_ignore_ascii_case(b"ack") {
+                if args.len() >= 2 {
+                    if let Ok(s) = std::str::from_utf8(&args[1]) {
+                        if let Ok(off) = s.parse::<u64>() {
+                            let hub = crate::replication::get_replication_hub(router.port);
+                            hub.update_replica_ack(client_id, off);
+                        }
+                    }
+                }
+            } else if args[0].eq_ignore_ascii_case(b"getack") {
+                let hub = crate::replication::get_replication_hub(router.port);
+                let off = hub.master_repl_offset.load(std::sync::atomic::Ordering::SeqCst).to_string();
+                out.extend_from_slice(
+                    format!("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n${}\r\n{}\r\n", off.len(), off)
+                        .as_bytes(),
+                );
+            } else {
+                out.extend_from_slice(b"+OK\r\n");
+            }
+            false
+        }
+        Command::Replicaof { host, port } => {
+            let hub = crate::replication::get_replication_hub(router.port);
+            if host.eq_ignore_ascii_case(b"no") && port.eq_ignore_ascii_case(b"one") {
+                hub.stop_sync();
+                hub.make_master();
+                out.extend_from_slice(b"+OK\r\n");
+            } else {
+                let host_str = String::from_utf8_lossy(&host).to_string();
+                let port_str = String::from_utf8_lossy(&port);
+                if let Ok(mport) = port_str.parse::<u16>() {
+                    crate::replication::start_replica_sync(
+                        router.port,
+                        host_str,
+                        mport,
+                        router.clone(),
+                    );
+                    out.extend_from_slice(b"+OK\r\n");
+                } else {
+                    out.extend_from_slice(b"-ERR invalid port\r\n");
+                }
+            }
+            false
+        }
+        Command::Psync { .. } => {
+            out.extend_from_slice(b"+OK\r\n");
             false
         }
         Command::Cluster(sub) => {
@@ -3270,6 +3485,16 @@ pub fn execute_local_command(
     out: &mut Vec<u8>,
     aof: Option<&RefCell<crate::aof::AofWriter>>,
 ) -> bool {
+    macro_rules! record_change {
+        ($cmd_expr:expr) => {
+            if let Some(bytes) = crate::aof::command_to_resp($cmd_expr) {
+                if let Some(aof_w) = aof {
+                    aof_w.borrow_mut().append(&bytes);
+                }
+                crate::replication::propagate_bytes(db.port, &bytes);
+            }
+        };
+    }
     match cmd {
         Command::Get(key) => {
             match db.get(key) {
@@ -3306,11 +3531,7 @@ pub fn execute_local_command(
             expire_in,
         } => {
             db.set(key.clone(), value.clone(), *expire_in);
-            if let Some(aof) = aof {
-                if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                    aof.borrow_mut().append(&bytes);
-                }
-            }
+            record_change!(cmd);
             out.extend_from_slice(b"+OK\r\n");
             false
         }
@@ -3318,11 +3539,7 @@ pub fn execute_local_command(
             for (k, v) in pairs {
                 db.set(k.clone(), v.clone(), None);
             }
-            if let Some(aof) = aof {
-                if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                    aof.borrow_mut().append(&bytes);
-                }
-            }
+            record_change!(cmd);
             out.extend_from_slice(b"+OK\r\n");
             false
         }
@@ -3334,11 +3551,7 @@ pub fn execute_local_command(
                 }
             }
             if count > 0 {
-                if let Some(aof) = aof {
-                    if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                        aof.borrow_mut().append(&bytes);
-                    }
-                }
+                record_change!(cmd);
             }
             write_resp_integer(out, count as i64);
             false
@@ -3356,11 +3569,7 @@ pub fn execute_local_command(
         Command::IncrBy(key, delta) => {
             match db.incr_by(key.clone(), *delta) {
                 Ok(val) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     write_resp_integer(out, val);
                 }
                 Err(err) => {
@@ -3372,11 +3581,7 @@ pub fn execute_local_command(
         Command::Expire(key, duration) => {
             let res = db.expire(key, *duration);
             if res {
-                if let Some(aof) = aof {
-                    if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                        aof.borrow_mut().append(&bytes);
-                    }
-                }
+                record_change!(cmd);
                 out.extend_from_slice(b":1\r\n");
             } else {
                 out.extend_from_slice(b":0\r\n");
@@ -3386,11 +3591,7 @@ pub fn execute_local_command(
         Command::Persist(key) => {
             let res = db.persist(key);
             if res {
-                if let Some(aof) = aof {
-                    if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                        aof.borrow_mut().append(&bytes);
-                    }
-                }
+                record_change!(cmd);
                 out.extend_from_slice(b":1\r\n");
             } else {
                 out.extend_from_slice(b":0\r\n");
@@ -3405,11 +3606,7 @@ pub fn execute_local_command(
         Command::Hset { key, fields } => {
             match db.hset(key.clone(), fields.clone()) {
                 Ok(count) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     write_resp_integer(out, count as i64);
                 }
                 Err(err) => {
@@ -3421,11 +3618,7 @@ pub fn execute_local_command(
         Command::Hmset { key, fields } => {
             match db.hset(key.clone(), fields.clone()) {
                 Ok(_) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 Err(err) => {
@@ -3477,11 +3670,7 @@ pub fn execute_local_command(
             match db.hdel(key, fields) {
                 Ok(count) => {
                     if count > 0 {
-                        if let Some(aof) = aof {
-                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                                aof.borrow_mut().append(&bytes);
-                            }
-                        }
+                        record_change!(cmd);
                     }
                     out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
                 }
@@ -3572,11 +3761,7 @@ pub fn execute_local_command(
         Command::Lpush { key, values } => {
             match db.lpush(key.clone(), values.clone()) {
                 Ok(len) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     crate::block::get_block_hub_for_port(db.port)
                         .lock()
                         .unwrap()
@@ -3592,11 +3777,7 @@ pub fn execute_local_command(
         Command::Rpush { key, values } => {
             match db.rpush(key.clone(), values.clone()) {
                 Ok(len) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     crate::block::get_block_hub_for_port(db.port)
                         .lock()
                         .unwrap()
@@ -3614,11 +3795,7 @@ pub fn execute_local_command(
             match db.lpop(key, n) {
                 Ok(popped) => {
                     if !popped.is_empty() {
-                        if let Some(aof) = aof {
-                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                                aof.borrow_mut().append(&bytes);
-                            }
-                        }
+                        record_change!(cmd);
                     }
                     if count.is_some() {
                         out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
@@ -3646,11 +3823,7 @@ pub fn execute_local_command(
             match db.rpop(key, n) {
                 Ok(popped) => {
                     if !popped.is_empty() {
-                        if let Some(aof) = aof {
-                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                                aof.borrow_mut().append(&bytes);
-                            }
-                        }
+                        record_change!(cmd);
                     }
                     if count.is_some() {
                         out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
@@ -3721,11 +3894,7 @@ pub fn execute_local_command(
             match db.sadd(key.clone(), members.clone()) {
                 Ok(added) => {
                     if added > 0 {
-                        if let Some(aof) = aof {
-                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                                aof.borrow_mut().append(&bytes);
-                            }
-                        }
+                        record_change!(cmd);
                     }
                     out.extend_from_slice(format!(":{}\r\n", added).as_bytes());
                 }
@@ -3739,11 +3908,7 @@ pub fn execute_local_command(
             match db.srem(key, members) {
                 Ok(count) => {
                     if count > 0 {
-                        if let Some(aof) = aof {
-                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                                aof.borrow_mut().append(&bytes);
-                            }
-                        }
+                        record_change!(cmd);
                     }
                     out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
                 }
@@ -3800,15 +3965,11 @@ pub fn execute_local_command(
             match db.spop(key, n) {
                 Ok(popped) => {
                     if !popped.is_empty() {
-                        if let Some(aof) = aof {
-                            let srem_cmd = Command::Srem {
-                                key: key.clone(),
-                                members: popped.clone(),
-                            };
-                            if let Some(bytes) = crate::aof::command_to_resp(&srem_cmd) {
-                                aof.borrow_mut().append(&bytes);
-                            }
-                        }
+                        let srem_cmd = Command::Srem {
+                            key: key.clone(),
+                            members: popped.clone(),
+                        };
+                        record_change!(&srem_cmd);
                     }
                     if count.is_some() {
                         out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
@@ -3882,11 +4043,7 @@ pub fn execute_local_command(
         Command::Sinterstore { destination, keys } => {
             match db.sinterstore(destination.clone(), keys) {
                 Ok(count) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     write_resp_integer(out, count as i64);
                 }
                 Err(err) => {
@@ -3898,11 +4055,7 @@ pub fn execute_local_command(
         Command::Sunionstore { destination, keys } => {
             match db.sunionstore(destination.clone(), keys) {
                 Ok(count) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     write_resp_integer(out, count as i64);
                 }
                 Err(err) => {
@@ -3914,11 +4067,7 @@ pub fn execute_local_command(
         Command::Sdiffstore { destination, keys } => {
             match db.sdiffstore(destination.clone(), keys) {
                 Ok(count) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     write_resp_integer(out, count as i64);
                 }
                 Err(err) => {
@@ -3935,18 +4084,12 @@ pub fn execute_local_command(
         } => {
             match db.zadd(key.clone(), elements.clone(), *flags) {
                 Ok((count, incr_score)) => {
-                    if let Some(aof) = aof {
-                        if flags.incr {
-                            if incr_score.is_some() {
-                                if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                                    aof.borrow_mut().append(&bytes);
-                                }
-                            }
-                        } else if count > 0 {
-                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                                aof.borrow_mut().append(&bytes);
-                            }
+                    if flags.incr {
+                        if incr_score.is_some() {
+                            record_change!(cmd);
                         }
+                    } else if count > 0 {
+                        record_change!(cmd);
                     }
                     if flags.incr {
                         if let Some(score) = incr_score {
@@ -3969,11 +4112,7 @@ pub fn execute_local_command(
             match db.zrem(key, members) {
                 Ok(count) => {
                     if count > 0 {
-                        if let Some(aof) = aof {
-                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                                aof.borrow_mut().append(&bytes);
-                            }
-                        }
+                        record_change!(cmd);
                     }
                     out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
                 }
@@ -4057,11 +4196,7 @@ pub fn execute_local_command(
         Command::Zincrby { key, delta, member } => {
             match db.zincrby(key.clone(), *delta, member.clone()) {
                 Ok(score) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     let s = score.to_string();
                     out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
                 }
@@ -4104,15 +4239,11 @@ pub fn execute_local_command(
             match db.zpopmin(key, *count) {
                 Ok(popped) => {
                     if !popped.is_empty() {
-                        if let Some(aof) = aof {
-                            let zrem_cmd = Command::Zrem {
-                                key: key.clone(),
-                                members: popped.iter().map(|(m, _)| m.clone()).collect(),
-                            };
-                            if let Some(bytes) = crate::aof::command_to_resp(&zrem_cmd) {
-                                aof.borrow_mut().append(&bytes);
-                            }
-                        }
+                        let zrem_cmd = Command::Zrem {
+                            key: key.clone(),
+                            members: popped.iter().map(|(m, _)| m.clone()).collect(),
+                        };
+                        record_change!(&zrem_cmd);
                     }
                     out.extend_from_slice(format!("*{}\r\n", popped.len() * 2).as_bytes());
                     for (m, s) in popped {
@@ -4135,15 +4266,11 @@ pub fn execute_local_command(
             match db.zpopmax(key, *count) {
                 Ok(popped) => {
                     if !popped.is_empty() {
-                        if let Some(aof) = aof {
-                            let zrem_cmd = Command::Zrem {
-                                key: key.clone(),
-                                members: popped.iter().map(|(m, _)| m.clone()).collect(),
-                            };
-                            if let Some(bytes) = crate::aof::command_to_resp(&zrem_cmd) {
-                                aof.borrow_mut().append(&bytes);
-                            }
-                        }
+                        let zrem_cmd = Command::Zrem {
+                            key: key.clone(),
+                            members: popped.iter().map(|(m, _)| m.clone()).collect(),
+                        };
+                        record_change!(&zrem_cmd);
                     }
                     out.extend_from_slice(format!("*{}\r\n", popped.len() * 2).as_bytes());
                     for (m, s) in popped {
@@ -4170,11 +4297,7 @@ pub fn execute_local_command(
         } => {
             match db.zunionstore(destination.clone(), keys, weights, *aggregate) {
                 Ok(count) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     write_resp_integer(out, count as i64);
                 }
                 Err(err) => {
@@ -4191,11 +4314,7 @@ pub fn execute_local_command(
         } => {
             match db.zinterstore(destination.clone(), keys, weights, *aggregate) {
                 Ok(count) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     write_resp_integer(out, count as i64);
                 }
                 Err(err) => {
@@ -4207,11 +4326,7 @@ pub fn execute_local_command(
         Command::Zdiffstore { destination, keys } => {
             match db.zdiffstore(destination.clone(), keys) {
                 Ok(count) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     write_resp_integer(out, count as i64);
                 }
                 Err(err) => {
@@ -4330,11 +4445,7 @@ pub fn execute_local_command(
         }
         Command::Flushdb | Command::Flushall => {
             db.flushdb();
-            if let Some(aof) = aof {
-                if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                    aof.borrow_mut().append(&bytes);
-                }
-            }
+            record_change!(cmd);
             out.extend_from_slice(b"+OK\r\n");
             false
         }
@@ -4347,11 +4458,7 @@ pub fn execute_local_command(
             match db.rename(key, newkey.clone(), *nx) {
                 Ok(success) => {
                     if success {
-                        if let Some(aof) = aof {
-                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                                aof.borrow_mut().append(&bytes);
-                            }
-                        }
+                        record_change!(cmd);
                         if *nx {
                             out.extend_from_slice(b":1\r\n");
                         } else {
@@ -4371,11 +4478,7 @@ pub fn execute_local_command(
         Command::Setnx { key, value } => {
             let set = db.setnx(key.clone(), value.clone());
             if set {
-                if let Some(aof) = aof {
-                    if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                        aof.borrow_mut().append(&bytes);
-                    }
-                }
+                record_change!(cmd);
                 out.extend_from_slice(b":1\r\n");
             } else {
                 out.extend_from_slice(b":0\r\n");
@@ -4385,11 +4488,7 @@ pub fn execute_local_command(
         Command::Getset { key, value } => {
             match db.getset(key.clone(), value.clone()) {
                 Ok(old) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     match old {
                         Some(v) => {
                             out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
@@ -4409,11 +4508,7 @@ pub fn execute_local_command(
             match db.getdel(key) {
                 Ok(old) => {
                     if old.is_some() {
-                        if let Some(aof) = aof {
-                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                                aof.borrow_mut().append(&bytes);
-                            }
-                        }
+                        record_change!(cmd);
                     }
                     match old {
                         Some(v) => {
@@ -4433,11 +4528,7 @@ pub fn execute_local_command(
         Command::Append { key, value } => {
             match db.append(key.clone(), value) {
                 Ok(new_len) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     out.extend_from_slice(format!(":{}\r\n", new_len).as_bytes());
                 }
                 Err(err) => {
@@ -4465,11 +4556,7 @@ pub fn execute_local_command(
                 for (k, v) in pairs {
                     db.set(k.clone(), v.clone(), None);
                 }
-                if let Some(aof) = aof {
-                    if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                        aof.borrow_mut().append(&bytes);
-                    }
-                }
+                record_change!(cmd);
                 out.extend_from_slice(b":1\r\n");
             }
             false
@@ -4556,11 +4643,7 @@ pub fn execute_local_command(
         Command::Setbit { key, offset, value } => {
             match db.setbit(key.clone(), *offset, *value) {
                 Ok(old) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     out.extend_from_slice(format!(":{}\r\n", old).as_bytes());
                 }
                 Err(err) => {
@@ -4614,11 +4697,7 @@ pub fn execute_local_command(
         } => {
             match db.bitop(op, destkey.clone(), srckeys) {
                 Ok(len) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
                 }
                 Err(err) => {
@@ -4631,11 +4710,7 @@ pub fn execute_local_command(
             match db.pfadd(key.clone(), elements) {
                 Ok(updated) => {
                     if updated {
-                        if let Some(aof) = aof {
-                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                                aof.borrow_mut().append(&bytes);
-                            }
-                        }
+                        record_change!(cmd);
                         out.extend_from_slice(b":1\r\n");
                     } else {
                         out.extend_from_slice(b":0\r\n");
@@ -4661,11 +4736,7 @@ pub fn execute_local_command(
         Command::Pfmerge { destkey, srckeys } => {
             match db.pfmerge(destkey.clone(), srckeys) {
                 Ok(()) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 Err(err) => {
@@ -4696,11 +4767,7 @@ pub fn execute_local_command(
         } => {
             match db.restore(key.clone(), *ttl_ms, serialized, *replace, *absttl) {
                 Ok(()) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 Err(err) => {
@@ -4730,19 +4797,15 @@ pub fn execute_local_command(
                 *minid,
             ) {
                 Ok(Some(generated_id)) => {
-                    if let Some(aof) = aof {
-                        let explicit_cmd = Command::Xadd {
-                            key: key.clone(),
-                            nomkstream: *nomkstream,
-                            maxlen: *maxlen,
-                            minid: *minid,
-                            id: crate::table::StreamAddId::Explicit(generated_id),
-                            fields: fields.clone(),
-                        };
-                        if let Some(bytes) = crate::aof::command_to_resp(&explicit_cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    let explicit_cmd = Command::Xadd {
+                        key: key.clone(),
+                        nomkstream: *nomkstream,
+                        maxlen: *maxlen,
+                        minid: *minid,
+                        id: crate::table::StreamAddId::Explicit(generated_id),
+                        fields: fields.clone(),
+                    };
+                    record_change!(&explicit_cmd);
                     let s = generated_id.to_string();
                     crate::block::get_block_hub_for_port(db.port)
                         .lock()
@@ -4903,11 +4966,7 @@ pub fn execute_local_command(
             match db.xdel(key, ids) {
                 Ok(count) => {
                     if count > 0 {
-                        if let Some(aof) = aof {
-                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                                aof.borrow_mut().append(&bytes);
-                            }
-                        }
+                        record_change!(cmd);
                     }
                     out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
                 }
@@ -4925,11 +4984,7 @@ pub fn execute_local_command(
             match db.xtrim(key, *maxlen, *minid) {
                 Ok(count) => {
                     if count > 0 {
-                        if let Some(aof) = aof {
-                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                                aof.borrow_mut().append(&bytes);
-                            }
-                        }
+                        record_change!(cmd);
                     }
                     out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
                 }
@@ -4942,11 +4997,7 @@ pub fn execute_local_command(
         Command::XgroupCreate { key, group, id, mkstream } => {
             match db.xgroup_create(key.clone(), group.clone(), id, *mkstream) {
                 Ok(()) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 Err(err) => {
@@ -4963,11 +5014,7 @@ pub fn execute_local_command(
             match db.xgroup_destroy(key, group) {
                 Ok(destroyed) => {
                     if destroyed {
-                        if let Some(aof) = aof {
-                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                                aof.borrow_mut().append(&bytes);
-                            }
-                        }
+                        record_change!(cmd);
                         out.extend_from_slice(b":1\r\n");
                     } else {
                         out.extend_from_slice(b":0\r\n");
@@ -5091,11 +5138,7 @@ pub fn execute_local_command(
             match db.xack(key, group, ids) {
                 Ok(count) => {
                     if count > 0 {
-                        if let Some(aof) = aof {
-                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                                aof.borrow_mut().append(&bytes);
-                            }
-                        }
+                        record_change!(cmd);
                     }
                     out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
                 }
@@ -5180,11 +5223,7 @@ pub fn execute_local_command(
         Command::Hincrby { key, field, increment } => {
             match db.hincrby(key.clone(), field.clone(), *increment) {
                 Ok(val) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     write_resp_integer(out, val);
                 }
                 Err(err) => {
@@ -5200,11 +5239,7 @@ pub fn execute_local_command(
         Command::Hincrbyfloat { key, field, increment } => {
             match db.hincrbyfloat(key.clone(), field.clone(), *increment) {
                 Ok(val) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     write_resp_bulk(out, val.to_string().as_bytes());
                 }
                 Err(err) => {
@@ -5312,11 +5347,7 @@ pub fn execute_local_command(
             match db.smove(source, destination.clone(), member.clone()) {
                 Ok(moved) => {
                     if moved {
-                        if let Some(aof) = aof {
-                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                                aof.borrow_mut().append(&bytes);
-                            }
-                        }
+                        record_change!(cmd);
                     }
                     write_resp_integer(out, if moved { 1 } else { 0 });
                 }
@@ -5408,11 +5439,7 @@ pub fn execute_local_command(
             match db.zremrangebyrank(key, *start, *stop) {
                 Ok(removed) => {
                     if removed > 0 {
-                        if let Some(aof) = aof {
-                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                                aof.borrow_mut().append(&bytes);
-                            }
-                        }
+                        record_change!(cmd);
                     }
                     write_resp_integer(out, removed as i64);
                 }
@@ -5430,11 +5457,7 @@ pub fn execute_local_command(
             match db.zremrangebyscore(key, *min_score, *min_inc, *max_score, *max_inc) {
                 Ok(removed) => {
                     if removed > 0 {
-                        if let Some(aof) = aof {
-                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                                aof.borrow_mut().append(&bytes);
-                            }
-                        }
+                        record_change!(cmd);
                     }
                     write_resp_integer(out, removed as i64);
                 }
@@ -5452,11 +5475,7 @@ pub fn execute_local_command(
             match db.zremrangebylex(key, min, max) {
                 Ok(removed) => {
                     if removed > 0 {
-                        if let Some(aof) = aof {
-                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                                aof.borrow_mut().append(&bytes);
-                            }
-                        }
+                        record_change!(cmd);
                     }
                     write_resp_integer(out, removed as i64);
                 }
@@ -5510,11 +5529,7 @@ pub fn execute_local_command(
         Command::Ltrim { key, start, stop } => {
             match db.ltrim(key, *start, *stop) {
                 Ok(()) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 Err(err) => {
@@ -5530,11 +5545,7 @@ pub fn execute_local_command(
         Command::Lset { key, index, element } => {
             match db.lset(key, *index, element.clone()) {
                 Ok(()) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 Err(err) => {
@@ -5551,11 +5562,7 @@ pub fn execute_local_command(
             match db.lrem(key, *count, element) {
                 Ok(removed) => {
                     if removed > 0 {
-                        if let Some(aof) = aof {
-                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                                aof.borrow_mut().append(&bytes);
-                            }
-                        }
+                        record_change!(cmd);
                     }
                     write_resp_integer(out, removed as i64);
                 }
@@ -5599,11 +5606,7 @@ pub fn execute_local_command(
             match db.linsert(key.clone(), *before, pivot, element.clone()) {
                 Ok(len) => {
                     if len > 0 {
-                        if let Some(aof) = aof {
-                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                                aof.borrow_mut().append(&bytes);
-                            }
-                        }
+                        record_change!(cmd);
                         crate::block::get_block_hub_for_port(db.port)
                             .lock()
                             .unwrap()
@@ -5624,11 +5627,7 @@ pub fn execute_local_command(
         Command::Lmove { source, destination, where_from, where_to } => {
             match db.lmove(source, destination.clone(), *where_from, *where_to) {
                 Ok(Some(val)) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     crate::block::get_block_hub_for_port(db.port)
                         .lock()
                         .unwrap()
@@ -5651,11 +5650,7 @@ pub fn execute_local_command(
         Command::Incrbyfloat { key, increment } => {
             match db.incrbyfloat(key.clone(), *increment) {
                 Ok(val) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     write_resp_bulk(out, val.to_string().as_bytes());
                 }
                 Err(err) => {
@@ -5671,11 +5666,7 @@ pub fn execute_local_command(
         Command::Setrange { key, offset, value } => {
             match db.setrange(key.clone(), *offset, value) {
                 Ok(len) => {
-                    if let Some(aof) = aof {
-                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
-                            aof.borrow_mut().append(&bytes);
-                        }
-                    }
+                    record_change!(cmd);
                     write_resp_integer(out, len as i64);
                 }
                 Err(err) => {

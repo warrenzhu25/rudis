@@ -6104,6 +6104,15 @@ pub fn load_rdb(
         return Ok(0);
     }
     let data = std::fs::read(path)?;
+    load_rdb_bytes(&data, db, shard_id, num_shards)
+}
+
+pub fn load_rdb_bytes(
+    data: &[u8],
+    db: &mut crate::shard::ShardDb,
+    shard_id: usize,
+    num_shards: usize,
+) -> std::io::Result<usize> {
     if data.len() < 18 {
         return Ok(0);
     }

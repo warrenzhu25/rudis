@@ -288,7 +288,17 @@ pub enum Command {
     Lastsave,
     Ping(Option<Bytes>),
     CommandDocs,
-    Info,
+    Info(Option<Bytes>),
+    Replicaof {
+        host: Bytes,
+        port: Bytes,
+    },
+    Psync {
+        replid: Bytes,
+        offset: i64,
+    },
+    Replconf(Vec<Bytes>),
+    Role,
     Quit,
     // PUBSUB COMMANDS
     Subscribe(Vec<Bytes>),
@@ -2178,7 +2188,41 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
         "BGSAVE" => Ok(Some(Command::Bgsave)),
         "LASTSAVE" => Ok(Some(Command::Lastsave)),
         "COMMAND" => Ok(Some(Command::CommandDocs)),
-        "INFO" => Ok(Some(Command::Info)),
+        "INFO" => {
+            let section = if args.len() > 1 {
+                Some(args[1].clone())
+            } else {
+                None
+            };
+            Ok(Some(Command::Info(section)))
+        }
+        "REPLICAOF" | "SLAVEOF" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'replicaof' command".to_string());
+            }
+            Ok(Some(Command::Replicaof {
+                host: args[1].clone(),
+                port: args[2].clone(),
+            }))
+        }
+        "PSYNC" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'psync' command".to_string());
+            }
+            let replid = args[1].clone();
+            let offset = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<i64>().ok()) {
+                Some(o) => o,
+                None => return Err("ERR value is not an integer or out of range".to_string()),
+            };
+            Ok(Some(Command::Psync { replid, offset }))
+        }
+        "REPLCONF" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'replconf' command".to_string());
+            }
+            Ok(Some(Command::Replconf(args[1..].to_vec())))
+        }
+        "ROLE" => Ok(Some(Command::Role)),
         "QUIT" => Ok(Some(Command::Quit)),
         "SUBSCRIBE" => {
             if args.len() < 2 {

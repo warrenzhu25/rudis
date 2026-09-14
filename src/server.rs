@@ -429,6 +429,18 @@ pub fn run_shard_worker(
                             }
                         }
                     }
+                    ShardMessage::RestoreRdbChunk { data, responder } => {
+                        let mut db = cross_shard_db.borrow_mut();
+                        let _ = crate::table::load_rdb_bytes(&data, &mut db, shard_id, num_shards);
+                        let _ = responder.send(());
+                    }
+                    ShardMessage::ExecuteReplicaCmd { cmd, responder } => {
+                        let mut db = cross_shard_db.borrow_mut();
+                        let mut dummy_out = Vec::new();
+                        let aof_ref = cross_shard_aof.as_deref();
+                        execute_local_command(&cmd, &mut db, &mut dummy_out, aof_ref);
+                        let _ = responder.send(());
+                    }
                 }
             }
         });

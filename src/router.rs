@@ -822,7 +822,7 @@ impl Router {
         Ok(())
     }
 
-    pub async fn perform_save_rdb(&self) -> Result<(), String> {
+    pub async fn generate_full_rdb(&self) -> Vec<u8> {
         let mut full_rdb = Vec::new();
         full_rdb.extend_from_slice(b"REDIS0011");
         full_rdb.extend_from_slice(&[0xFE, 0x00]);
@@ -849,7 +849,100 @@ impl Router {
         full_rdb.push(0xFF);
         let crc = crate::table::crc64(&full_rdb);
         full_rdb.extend_from_slice(&crc.to_le_bytes());
+        full_rdb
+    }
 
+    pub async fn restore_rdb_bytes(&self, data: Bytes) {
+        let _ = crate::table::load_rdb_bytes(
+            &data,
+            &mut self.local_db.borrow_mut(),
+            self.shard_id,
+            self.num_shards,
+        );
+        let mut responders = Vec::new();
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                if sender
+                    .send(ShardMessage::RestoreRdbChunk {
+                        data: data.clone(),
+                        responder: tx,
+                    })
+                    .is_ok()
+                {
+                    responders.push(rx);
+                }
+            }
+        }
+        for rx in responders {
+            let _ = rx.recv_async().await;
+        }
+    }
+
+    pub async fn execute_replica_command(&self, cmd: Command) {
+        if let Some(target) = crate::connection::target_shard_of_cmd(&cmd, self.num_shards) {
+            if target == self.shard_id {
+                let mut dummy_out = Vec::new();
+                crate::connection::execute_local_command(
+                    &cmd,
+                    &mut self.local_db.borrow_mut(),
+                    &mut dummy_out,
+                    self.aof.as_deref(),
+                );
+            } else {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::ExecuteReplicaCmd {
+                    cmd,
+                    responder: tx,
+                };
+                if self.senders[target].send(msg).is_ok() {
+                    let _ = rx.recv_async().await;
+                }
+            }
+        } else {
+            match cmd {
+                Command::Flushall | Command::Flushdb => {
+                    self.local_db.borrow_mut().flushdb();
+                    for (sid, sender) in self.senders.iter().enumerate() {
+                        if sid != self.shard_id {
+                            let (tx, rx) = flume::bounded(1);
+                            if sender
+                                .send(ShardMessage::ExecuteReplicaCmd {
+                                    cmd: Command::Flushall,
+                                    responder: tx,
+                                })
+                                .is_ok()
+                            {
+                                let _ = rx.recv_async().await;
+                            }
+                        }
+                    }
+                }
+                Command::Mset(pairs) => {
+                    for (k, v) in pairs {
+                        self.set(k, v, None).await;
+                    }
+                }
+                Command::Del(keys) => {
+                    for k in keys {
+                        self.del(k).await;
+                    }
+                }
+                _ => {
+                    let mut dummy_out = Vec::new();
+                    crate::connection::execute_local_command(
+                        &cmd,
+                        &mut self.local_db.borrow_mut(),
+                        &mut dummy_out,
+                        self.aof.as_deref(),
+                    );
+                }
+            }
+        }
+    }
+
+    pub async fn perform_save_rdb(&self) -> Result<(), String> {
+        let full_rdb = self.generate_full_rdb().await;
         static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let tmp_id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let filename = self.db_dir.join("dump.rdb");

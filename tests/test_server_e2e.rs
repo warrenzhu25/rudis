@@ -2526,6 +2526,71 @@ fn test_valkey_missing_features_e2e() {
     assert_eq!(incrbyfloat_resp, "$5\r\n12.75\r\n");
 }
 
+#[test]
+fn test_primary_replica_replication_e2e() {
+    let master_port = 16420;
+    let replica_port = 16421;
+
+    let _master = start_test_server(master_port, 2);
+    let _replica = start_test_server(replica_port, 2);
+
+    let mut master_client = TcpStream::connect(format!("127.0.0.1:{}", master_port)).unwrap();
+    let mut replica_client = TcpStream::connect(format!("127.0.0.1:{}", replica_port)).unwrap();
+
+    // 1. Verify master role
+    let master_role = send_and_read(&mut master_client, b"ROLE\r\n");
+    assert!(master_role.starts_with("*3\r\n$6\r\nmaster\r\n"));
+
+    // 2. Pre-populate data on master before replica connects
+    assert_eq!(send_and_read(&mut master_client, b"SET init_k1 val1\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut master_client, b"SET init_k2 val2\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut master_client, b"HSET myhash field1 hello\r\n"), ":1\r\n");
+
+    // 3. Initiate replication on replica
+    let rep_resp = send_and_read(&mut replica_client, format!("REPLICAOF 127.0.0.1 {}\r\n", master_port).as_bytes());
+    assert_eq!(rep_resp, "+OK\r\n");
+
+    // Wait for handshake, RDB snapshot generation, transfer, and restore
+    thread::sleep(Duration::from_millis(300));
+
+    // 4. Verify replica role and link status
+    let replica_role = send_and_read(&mut replica_client, b"ROLE\r\n");
+    assert!(replica_role.contains("slave"), "Expected slave role, got {}", replica_role);
+    assert!(replica_role.contains("connected"), "Expected connected state, got {}", replica_role);
+
+    // 5. Verify pre-existing data was restored from RDB on replica
+    assert_eq!(send_and_read(&mut replica_client, b"GET init_k1\r\n"), "$4\r\nval1\r\n");
+    assert_eq!(send_and_read(&mut replica_client, b"GET init_k2\r\n"), "$4\r\nval2\r\n");
+    assert_eq!(send_and_read(&mut replica_client, b"HGET myhash field1\r\n"), "$5\r\nhello\r\n");
+
+    // 6. Test read-only replica enforcement
+    let write_resp = send_and_read(&mut replica_client, b"SET forbidden_key write_val\r\n");
+    assert!(write_resp.contains("READONLY"), "Expected READONLY error, got: {}", write_resp);
+
+    // 7. Live streaming mutation replication
+    assert_eq!(send_and_read(&mut master_client, b"SET live_key live_val\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut master_client, b"INCRBY live_counter 42\r\n"), ":42\r\n");
+    assert_eq!(send_and_read(&mut master_client, b"RPUSH mylist itemA itemB\r\n"), ":2\r\n");
+
+    // Wait for replication stream propagation
+    thread::sleep(Duration::from_millis(150));
+
+    // Verify replicated on replica
+    assert_eq!(send_and_read(&mut replica_client, b"GET live_key\r\n"), "$8\r\nlive_val\r\n");
+    assert_eq!(send_and_read(&mut replica_client, b"GET live_counter\r\n"), "$2\r\n42\r\n");
+    assert_eq!(send_and_read(&mut replica_client, b"LRANGE mylist 0 -1\r\n"), "*2\r\n$5\r\nitemA\r\n$5\r\nitemB\r\n");
+
+    // 8. Promotion via REPLICAOF NO ONE
+    assert_eq!(send_and_read(&mut replica_client, b"REPLICAOF NO ONE\r\n"), "+OK\r\n");
+    let promoted_role = send_and_read(&mut replica_client, b"ROLE\r\n");
+    assert!(promoted_role.starts_with("*3\r\n$6\r\nmaster\r\n"), "Expected master after promotion, got {}", promoted_role);
+
+    // Writes should now succeed on promoted node
+    assert_eq!(send_and_read(&mut replica_client, b"SET promoted_key promoted_value\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut replica_client, b"GET promoted_key\r\n"), "$14\r\npromoted_value\r\n");
+}
+
+
 
 
 

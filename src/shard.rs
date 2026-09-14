@@ -175,6 +175,14 @@ pub enum ShardMessage {
     ReleaseTxLock {
         tx_id: u64,
     },
+    RestoreRdbChunk {
+        data: Bytes,
+        responder: flume::Sender<()>,
+    },
+    ExecuteReplicaCmd {
+        cmd: Command,
+        responder: flume::Sender<()>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
