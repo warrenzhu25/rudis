@@ -978,4 +978,118 @@ fn test_sorted_sets_zset_e2e() {
     assert!(resp.starts_with("-ERR WRONGTYPE"));
 }
 
+#[test]
+fn test_generic_and_string_commands_e2e() {
+    let port = 16386;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("Failed to connect to rudis server");
+
+    // 1. Test TYPE
+    let resp = send_and_read(&mut stream, b"TYPE non_existent_key\r\n");
+    assert_eq!(resp, "+none\r\n");
+
+    send_and_read(&mut stream, b"SET k_str hello\r\n");
+    assert_eq!(send_and_read(&mut stream, b"TYPE k_str\r\n"), "+string\r\n");
+
+    send_and_read(&mut stream, b"HSET k_hash f v\r\n");
+    assert_eq!(send_and_read(&mut stream, b"TYPE k_hash\r\n"), "+hash\r\n");
+
+    send_and_read(&mut stream, b"RPUSH k_list e\r\n");
+    assert_eq!(send_and_read(&mut stream, b"TYPE k_list\r\n"), "+list\r\n");
+
+    send_and_read(&mut stream, b"SADD k_set s\r\n");
+    assert_eq!(send_and_read(&mut stream, b"TYPE k_set\r\n"), "+set\r\n");
+
+    send_and_read(&mut stream, b"ZADD k_zset 1.0 z\r\n");
+    assert_eq!(send_and_read(&mut stream, b"TYPE k_zset\r\n"), "+zset\r\n");
+
+    // 2. Test DBSIZE
+    let resp = send_and_read(&mut stream, b"DBSIZE\r\n");
+    assert_eq!(resp, ":5\r\n");
+
+    // 3. Test TOUCH
+    let resp = send_and_read(&mut stream, b"TOUCH k_str k_hash non_existent\r\n");
+    assert_eq!(resp, ":2\r\n");
+
+    // 4. Test STRLEN and APPEND
+    let resp = send_and_read(&mut stream, b"STRLEN k_str\r\n");
+    assert_eq!(resp, ":5\r\n");
+
+    let resp = send_and_read(&mut stream, b"APPEND k_str _world\r\n");
+    assert_eq!(resp, ":11\r\n");
+    assert_eq!(send_and_read(&mut stream, b"GET k_str\r\n"), "$11\r\nhello_world\r\n");
+
+    // 5. Test SETNX
+    let resp = send_and_read(&mut stream, b"SETNX k_str new_val\r\n");
+    assert_eq!(resp, ":0\r\n"); // already exists
+    let resp = send_and_read(&mut stream, b"SETNX k_new_nx brand_new\r\n");
+    assert_eq!(resp, ":1\r\n");
+    assert_eq!(send_and_read(&mut stream, b"GET k_new_nx\r\n"), "$9\r\nbrand_new\r\n");
+
+    // 6. Test SETEX and PSETEX
+    let resp = send_and_read(&mut stream, b"SETEX k_ex 100 ex_val\r\n");
+    assert_eq!(resp, "+OK\r\n");
+    assert_eq!(send_and_read(&mut stream, b"GET k_ex\r\n"), "$6\r\nex_val\r\n");
+    let resp = send_and_read(&mut stream, b"TTL k_ex\r\n");
+    assert!(resp.starts_with(':'));
+
+    let resp = send_and_read(&mut stream, b"PSETEX k_pex 100000 pex_val\r\n");
+    assert_eq!(resp, "+OK\r\n");
+    assert_eq!(send_and_read(&mut stream, b"GET k_pex\r\n"), "$7\r\npex_val\r\n");
+
+    // 7. Test GETSET
+    let resp = send_and_read(&mut stream, b"GETSET k_getset initial\r\n");
+    assert_eq!(resp, "$-1\r\n");
+    let resp = send_and_read(&mut stream, b"GETSET k_getset updated\r\n");
+    assert_eq!(resp, "$7\r\ninitial\r\n");
+    assert_eq!(send_and_read(&mut stream, b"GET k_getset\r\n"), "$7\r\nupdated\r\n");
+
+    // 8. Test GETDEL
+    let resp = send_and_read(&mut stream, b"GETDEL k_getset\r\n");
+    assert_eq!(resp, "$7\r\nupdated\r\n");
+    assert_eq!(send_and_read(&mut stream, b"GETDEL k_getset\r\n"), "$-1\r\n");
+
+    // 9. Test RENAME and RENAMENX with hash tags (guaranteed same slot)
+    send_and_read(&mut stream, b"SET {user:1}:tag_a val_a\r\n");
+    let resp = send_and_read(&mut stream, b"RENAME {user:1}:tag_a {user:1}:tag_b\r\n");
+    assert_eq!(resp, "+OK\r\n");
+    assert_eq!(send_and_read(&mut stream, b"GET {user:1}:tag_a\r\n"), "$-1\r\n");
+    assert_eq!(send_and_read(&mut stream, b"GET {user:1}:tag_b\r\n"), "$5\r\nval_a\r\n");
+
+    send_and_read(&mut stream, b"SET {user:1}:tag_c val_c\r\n");
+    let resp = send_and_read(&mut stream, b"RENAMENX {user:1}:tag_c {user:1}:tag_b\r\n");
+    assert_eq!(resp, ":0\r\n"); // tag_b exists
+    let resp = send_and_read(&mut stream, b"RENAMENX {user:1}:tag_c {user:1}:tag_d\r\n");
+    assert_eq!(resp, ":1\r\n"); // tag_d does not exist
+
+    // 10. Test MSETNX with same slot
+    let resp = send_and_read(&mut stream, b"MSETNX {user:1}:m1 v1 {user:1}:m2 v2\r\n");
+    assert_eq!(resp, ":1\r\n");
+    assert_eq!(send_and_read(&mut stream, b"GET {user:1}:m1\r\n"), "$2\r\nv1\r\n");
+    assert_eq!(send_and_read(&mut stream, b"GET {user:1}:m2\r\n"), "$2\r\nv2\r\n");
+
+    let resp = send_and_read(&mut stream, b"MSETNX {user:1}:m1 new {user:1}:m3 v3\r\n");
+    assert_eq!(resp, ":0\r\n"); // m1 exists, aborts all
+    assert_eq!(send_and_read(&mut stream, b"EXISTS {user:1}:m3\r\n"), ":0\r\n");
+
+    // 11. Test EXPIREAT and PEXPIREAT
+    let future_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() + 300;
+    let cmd = format!("EXPIREAT k_str {}\r\n", future_ts);
+    let resp = send_and_read(&mut stream, cmd.as_bytes());
+    assert_eq!(resp, ":1\r\n");
+
+    // 12. Test FLUSHDB
+    let resp = send_and_read(&mut stream, b"FLUSHDB\r\n");
+    assert_eq!(resp, "+OK\r\n");
+    let resp = send_and_read(&mut stream, b"DBSIZE\r\n");
+    assert_eq!(resp, ":0\r\n");
+}
+
+
 

@@ -336,6 +336,60 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             buf.extend_from_slice(b"\r\n");
             Some(buf)
         }
+        Command::Setnx { key, value } => {
+            buf.extend_from_slice(format!("*3\r\n$5\r\nSETNX\r\n${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n", value.len()).as_bytes());
+            buf.extend_from_slice(value);
+            buf.extend_from_slice(b"\r\n");
+            Some(buf)
+        }
+        Command::Getset { key, value } => {
+            buf.extend_from_slice(format!("*3\r\n$3\r\nSET\r\n${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n", value.len()).as_bytes());
+            buf.extend_from_slice(value);
+            buf.extend_from_slice(b"\r\n");
+            Some(buf)
+        }
+        Command::Getdel(key) => {
+            buf.extend_from_slice(format!("*2\r\n$3\r\nDEL\r\n${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(b"\r\n");
+            Some(buf)
+        }
+        Command::Append { key, value } => {
+            buf.extend_from_slice(format!("*3\r\n$6\r\nAPPEND\r\n${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n", value.len()).as_bytes());
+            buf.extend_from_slice(value);
+            buf.extend_from_slice(b"\r\n");
+            Some(buf)
+        }
+        Command::Rename { key, newkey, .. } => {
+            buf.extend_from_slice(format!("*3\r\n$6\r\nRENAME\r\n${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n", newkey.len()).as_bytes());
+            buf.extend_from_slice(newkey);
+            buf.extend_from_slice(b"\r\n");
+            Some(buf)
+        }
+        Command::Flushdb | Command::Flushall => {
+            buf.extend_from_slice(b"*1\r\n$7\r\nFLUSHDB\r\n");
+            Some(buf)
+        }
+        Command::Msetnx(pairs) => {
+            buf.extend_from_slice(format!("*{}\r\n$4\r\nMSET\r\n", 1 + pairs.len() * 2).as_bytes());
+            for (k, v) in pairs {
+                buf.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                buf.extend_from_slice(k);
+                buf.extend_from_slice(b"\r\n");
+                buf.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                buf.extend_from_slice(v);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
         _ => None,
     }
 }

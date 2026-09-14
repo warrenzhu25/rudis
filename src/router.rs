@@ -446,4 +446,35 @@ impl Router {
         }
         b"-ERR internal shard routing error\r\n".to_vec()
     }
+
+    pub async fn dbsize(&self) -> usize {
+        let mut total = self.local_db.borrow_mut().dbsize();
+        for sid in 0..self.num_shards {
+            if sid != self.shard_id {
+                let res = self.execute_remote(sid, Command::Dbsize).await;
+                if let Ok(s) = std::str::from_utf8(&res) {
+                    if let Some(num_str) = s.strip_prefix(':').and_then(|x| x.split("\r\n").next()) {
+                        if let Ok(n) = num_str.parse::<usize>() {
+                            total += n;
+                        }
+                    }
+                }
+            }
+        }
+        total
+    }
+
+    pub async fn flushdb(&self) {
+        self.local_db.borrow_mut().flushdb();
+        if let Some(aof) = &self.aof {
+            if let Some(bytes) = crate::aof::command_to_resp(&Command::Flushdb) {
+                aof.borrow_mut().append(&bytes);
+            }
+        }
+        for sid in 0..self.num_shards {
+            if sid != self.shard_id {
+                let _ = self.execute_remote(sid, Command::Flushdb).await;
+            }
+        }
+    }
 }

@@ -305,6 +305,56 @@ impl ShardDb {
     }
 
     #[inline]
+    pub fn flushdb(&mut self) {
+        self.table.flushdb();
+    }
+
+    #[inline]
+    pub fn dbsize(&mut self) -> usize {
+        self.table.dbsize()
+    }
+
+    #[inline]
+    pub fn type_of(&mut self, key: &[u8]) -> &'static str {
+        self.table.type_of(key)
+    }
+
+    #[inline]
+    pub fn touch(&mut self, keys: &[Bytes]) -> usize {
+        self.table.touch(keys)
+    }
+
+    #[inline]
+    pub fn rename(&mut self, src: &[u8], dst: Bytes, nx: bool) -> Result<bool, &'static str> {
+        self.table.rename(src, dst, nx)
+    }
+
+    #[inline]
+    pub fn setnx(&mut self, key: Bytes, value: Bytes) -> bool {
+        self.table.setnx(key, value)
+    }
+
+    #[inline]
+    pub fn getset(&mut self, key: Bytes, value: Bytes) -> Result<Option<Bytes>, &'static str> {
+        self.table.getset(key, value)
+    }
+
+    #[inline]
+    pub fn getdel(&mut self, key: &[u8]) -> Result<Option<Bytes>, &'static str> {
+        self.table.getdel(key)
+    }
+
+    #[inline]
+    pub fn append(&mut self, key: Bytes, val_to_append: &[u8]) -> Result<usize, &'static str> {
+        self.table.append(key, val_to_append)
+    }
+
+    #[inline]
+    pub fn strlen(&mut self, key: &[u8]) -> Result<usize, &'static str> {
+        self.table.strlen(key)
+    }
+
+    #[inline]
     pub fn count_keys_in_slot(&mut self, slot: u16) -> usize {
         self.table.count_keys_in_slot(slot)
     }

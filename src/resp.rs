@@ -178,6 +178,33 @@ pub enum Command {
         key: Bytes,
         count: usize,
     },
+    // GENERIC & DATABASE COMMANDS
+    Type(Bytes),
+    Dbsize,
+    Flushdb,
+    Flushall,
+    Touch(Vec<Bytes>),
+    Rename {
+        key: Bytes,
+        newkey: Bytes,
+        nx: bool,
+    },
+    // EXTENDED STRING COMMANDS
+    Setnx {
+        key: Bytes,
+        value: Bytes,
+    },
+    Getset {
+        key: Bytes,
+        value: Bytes,
+    },
+    Getdel(Bytes),
+    Append {
+        key: Bytes,
+        value: Bytes,
+    },
+    Strlen(Bytes),
+    Msetnx(Vec<(Bytes, Bytes)>),
     Save,
     Bgsave,
     Ping(Option<Bytes>),
@@ -1255,6 +1282,163 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 key: args[1].clone(),
                 count,
             }))
+        }
+        "TYPE" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'type' command".to_string());
+            }
+            Ok(Some(Command::Type(args[1].clone())))
+        }
+        "DBSIZE" => {
+            if args.len() != 1 {
+                return Err("wrong number of arguments for 'dbsize' command".to_string());
+            }
+            Ok(Some(Command::Dbsize))
+        }
+        "EXPIREAT" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'expireat' command".to_string());
+            }
+            let ts: u64 = std::str::from_utf8(&args[2])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let dur = if ts <= now_unix {
+                Duration::from_millis(1)
+            } else {
+                Duration::from_secs(ts - now_unix)
+            };
+            Ok(Some(Command::Expire(args[1].clone(), dur)))
+        }
+        "PEXPIREAT" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'pexpireat' command".to_string());
+            }
+            let ts_ms: u64 = std::str::from_utf8(&args[2])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            let now_unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let dur = if ts_ms <= now_unix_ms {
+                Duration::from_millis(1)
+            } else {
+                Duration::from_millis(ts_ms - now_unix_ms)
+            };
+            Ok(Some(Command::Expire(args[1].clone(), dur)))
+        }
+        "TOUCH" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'touch' command".to_string());
+            }
+            Ok(Some(Command::Touch(args[1..].to_vec())))
+        }
+        "RENAME" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'rename' command".to_string());
+            }
+            Ok(Some(Command::Rename {
+                key: args[1].clone(),
+                newkey: args[2].clone(),
+                nx: false,
+            }))
+        }
+        "RENAMENX" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'renamenx' command".to_string());
+            }
+            Ok(Some(Command::Rename {
+                key: args[1].clone(),
+                newkey: args[2].clone(),
+                nx: true,
+            }))
+        }
+        "FLUSHDB" => Ok(Some(Command::Flushdb)),
+        "FLUSHALL" => Ok(Some(Command::Flushall)),
+        "SETNX" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'setnx' command".to_string());
+            }
+            Ok(Some(Command::Setnx {
+                key: args[1].clone(),
+                value: args[2].clone(),
+            }))
+        }
+        "SETEX" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'setex' command".to_string());
+            }
+            let secs: u64 = std::str::from_utf8(&args[2])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            Ok(Some(Command::Set {
+                key: args[1].clone(),
+                value: args[3].clone(),
+                expire_in: Some(Duration::from_secs(secs)),
+            }))
+        }
+        "PSETEX" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'psetex' command".to_string());
+            }
+            let ms: u64 = std::str::from_utf8(&args[2])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            Ok(Some(Command::Set {
+                key: args[1].clone(),
+                value: args[3].clone(),
+                expire_in: Some(Duration::from_millis(ms)),
+            }))
+        }
+        "GETSET" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'getset' command".to_string());
+            }
+            Ok(Some(Command::Getset {
+                key: args[1].clone(),
+                value: args[2].clone(),
+            }))
+        }
+        "GETDEL" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'getdel' command".to_string());
+            }
+            Ok(Some(Command::Getdel(args[1].clone())))
+        }
+        "APPEND" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'append' command".to_string());
+            }
+            Ok(Some(Command::Append {
+                key: args[1].clone(),
+                value: args[2].clone(),
+            }))
+        }
+        "STRLEN" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'strlen' command".to_string());
+            }
+            Ok(Some(Command::Strlen(args[1].clone())))
+        }
+        "MSETNX" => {
+            if args.len() < 3 || (args.len() - 1) % 2 != 0 {
+                return Err("wrong number of arguments for 'msetnx' command".to_string());
+            }
+            let mut pairs = Vec::with_capacity((args.len() - 1) / 2);
+            let mut i = 1;
+            while i < args.len() {
+                pairs.push((args[i].clone(), args[i + 1].clone()));
+                i += 2;
+            }
+            Ok(Some(Command::Msetnx(pairs)))
         }
         "SAVE" => Ok(Some(Command::Save)),
         "BGSAVE" => Ok(Some(Command::Bgsave)),

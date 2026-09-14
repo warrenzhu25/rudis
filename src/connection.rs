@@ -203,9 +203,16 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Zincrby { key, .. }
         | Command::Zrange { key, .. }
         | Command::Zpopmin { key, .. }
-        | Command::Zpopmax { key, .. } => Some(key),
-        Command::Del(keys) | Command::Exists(keys) | Command::Mget(keys) => keys.first(),
-        Command::Mset(pairs) => pairs.first().map(|(k, _)| k),
+        | Command::Zpopmax { key, .. }
+        | Command::Type(key)
+        | Command::Setnx { key, .. }
+        | Command::Getset { key, .. }
+        | Command::Getdel(key)
+        | Command::Append { key, .. }
+        | Command::Strlen(key)
+        | Command::Rename { key, .. } => Some(key),
+        Command::Touch(keys) | Command::Del(keys) | Command::Exists(keys) | Command::Mget(keys) => keys.first(),
+        Command::Mset(pairs) | Command::Msetnx(pairs) => pairs.first().map(|(k, _)| k),
         _ => None,
     }
 }
@@ -267,6 +274,19 @@ async fn execute_command(
         Command::Zrange { .. } => "ZRANGE",
         Command::Zpopmin { .. } => "ZPOPMIN",
         Command::Zpopmax { .. } => "ZPOPMAX",
+        Command::Type(_) => "TYPE",
+        Command::Dbsize => "DBSIZE",
+        Command::Flushdb => "FLUSHDB",
+        Command::Flushall => "FLUSHALL",
+        Command::Touch(_) => "TOUCH",
+        Command::Rename { nx: false, .. } => "RENAME",
+        Command::Rename { nx: true, .. } => "RENAMENX",
+        Command::Setnx { .. } => "SETNX",
+        Command::Getset { .. } => "GETSET",
+        Command::Getdel(_) => "GETDEL",
+        Command::Append { .. } => "APPEND",
+        Command::Strlen(_) => "STRLEN",
+        Command::Msetnx(_) => "MSETNX",
         Command::Save => "SAVE",
         Command::Bgsave => "BGSAVE",
         Command::Ping(_) => "PING",
@@ -618,7 +638,13 @@ async fn execute_command(
         | Command::Zincrby { .. }
         | Command::Zrange { .. }
         | Command::Zpopmin { .. }
-        | Command::Zpopmax { .. } => {
+        | Command::Zpopmax { .. }
+        | Command::Type(_)
+        | Command::Setnx { .. }
+        | Command::Getset { .. }
+        | Command::Getdel(_)
+        | Command::Append { .. }
+        | Command::Strlen(_) => {
             if let Some(target) = target_shard_of_cmd(&cmd, router.num_shards) {
                 if target == router.shard_id {
                     execute_local_command(
@@ -631,6 +657,76 @@ async fn execute_command(
                     let res = router.execute_remote(target, cmd).await;
                     out.extend_from_slice(&res);
                 }
+            }
+            false
+        }
+        Command::Dbsize => {
+            let count = router.dbsize().await;
+            out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+            false
+        }
+        Command::Flushdb | Command::Flushall => {
+            router.flushdb().await;
+            out.extend_from_slice(b"+OK\r\n");
+            false
+        }
+        Command::Touch(keys) => {
+            let mut count = 0usize;
+            for k in keys {
+                let target = router.target_shard(&k);
+                if target == router.shard_id {
+                    count += router.local_db.borrow_mut().touch(&[k]);
+                } else {
+                    let res = router.execute_remote(target, Command::Touch(vec![k])).await;
+                    if res == b":1\r\n" {
+                        count += 1;
+                    }
+                }
+            }
+            out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+            false
+        }
+        Command::Rename { ref key, ref newkey, .. } => {
+            let target_src = router.target_shard(key);
+            let target_dst = router.target_shard(newkey);
+            if target_src != target_dst {
+                out.extend_from_slice(b"-CROSSSLOT Keys in request don't hash to the same slot\r\n");
+                return false;
+            }
+            if target_src == router.shard_id {
+                execute_local_command(
+                    &cmd,
+                    &mut router.local_db.borrow_mut(),
+                    out,
+                    router.aof.as_deref(),
+                );
+            } else {
+                let res = router.execute_remote(target_src, cmd).await;
+                out.extend_from_slice(&res);
+            }
+            false
+        }
+        Command::Msetnx(ref pairs) => {
+            if pairs.is_empty() {
+                out.extend_from_slice(b":0\r\n");
+                return false;
+            }
+            let first_shard = router.target_shard(&pairs[0].0);
+            let all_same_shard = pairs.iter().all(|(k, _)| router.target_shard(k) == first_shard);
+            if !all_same_shard {
+                out.extend_from_slice(b"-CROSSSLOT Keys in request don't hash to the same slot\r\n");
+                return false;
+            }
+            if first_shard == router.shard_id {
+                execute_local_command(
+                    &cmd,
+                    &mut router.local_db.borrow_mut(),
+                    out,
+                    router.aof.as_deref(),
+                );
+            } else {
+                let res = router.execute_remote(first_shard, cmd).await;
+                out.extend_from_slice(&res);
             }
             false
         }
@@ -920,8 +1016,23 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Zincrby { key, .. }
         | Command::Zrange { key, .. }
         | Command::Zpopmin { key, .. }
-        | Command::Zpopmax { key, .. } => Some(target_shard(key, num_shards)),
-        Command::Del(keys) | Command::Exists(keys) if keys.len() == 1 => {
+        | Command::Zpopmax { key, .. }
+        | Command::Type(key)
+        | Command::Setnx { key, .. }
+        | Command::Getset { key, .. }
+        | Command::Getdel(key)
+        | Command::Append { key, .. }
+        | Command::Strlen(key) => Some(target_shard(key, num_shards)),
+        Command::Rename { key, newkey, .. } => {
+            let s1 = target_shard(key, num_shards);
+            let s2 = target_shard(newkey, num_shards);
+            if s1 == s2 {
+                Some(s1)
+            } else {
+                None
+            }
+        }
+        Command::Touch(keys) | Command::Del(keys) | Command::Exists(keys) if keys.len() == 1 => {
             Some(target_shard(&keys[0], num_shards))
         }
         _ => None,
@@ -1706,6 +1817,163 @@ pub fn execute_local_command(
             }
             false
         }
+        // GENERIC & DATABASE COMMANDS
+        Command::Type(key) => {
+            let t = db.type_of(key);
+            out.extend_from_slice(format!("+{}\r\n", t).as_bytes());
+            false
+        }
+        Command::Dbsize => {
+            let n = db.dbsize();
+            out.extend_from_slice(format!(":{}\r\n", n).as_bytes());
+            false
+        }
+        Command::Flushdb | Command::Flushall => {
+            db.flushdb();
+            if let Some(aof) = aof {
+                if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                    aof.borrow_mut().append(&bytes);
+                }
+            }
+            out.extend_from_slice(b"+OK\r\n");
+            false
+        }
+        Command::Touch(keys) => {
+            let n = db.touch(keys);
+            out.extend_from_slice(format!(":{}\r\n", n).as_bytes());
+            false
+        }
+        Command::Rename { key, newkey, nx } => {
+            match db.rename(key, newkey.clone(), *nx) {
+                Ok(success) => {
+                    if success {
+                        if let Some(aof) = aof {
+                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        }
+                        if *nx {
+                            out.extend_from_slice(b":1\r\n");
+                        } else {
+                            out.extend_from_slice(b"+OK\r\n");
+                        }
+                    } else {
+                        out.extend_from_slice(b":0\r\n");
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        // EXTENDED STRING COMMANDS
+        Command::Setnx { key, value } => {
+            let set = db.setnx(key.clone(), value.clone());
+            if set {
+                if let Some(aof) = aof {
+                    if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                        aof.borrow_mut().append(&bytes);
+                    }
+                }
+                out.extend_from_slice(b":1\r\n");
+            } else {
+                out.extend_from_slice(b":0\r\n");
+            }
+            false
+        }
+        Command::Getset { key, value } => {
+            match db.getset(key.clone(), value.clone()) {
+                Ok(old) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
+                    match old {
+                        Some(v) => {
+                            out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                            out.extend_from_slice(&v);
+                            out.extend_from_slice(b"\r\n");
+                        }
+                        None => out.extend_from_slice(b"$-1\r\n"),
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Getdel(key) => {
+            match db.getdel(key) {
+                Ok(old) => {
+                    if old.is_some() {
+                        if let Some(aof) = aof {
+                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        }
+                    }
+                    match old {
+                        Some(v) => {
+                            out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                            out.extend_from_slice(&v);
+                            out.extend_from_slice(b"\r\n");
+                        }
+                        None => out.extend_from_slice(b"$-1\r\n"),
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Append { key, value } => {
+            match db.append(key.clone(), value) {
+                Ok(new_len) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
+                    out.extend_from_slice(format!(":{}\r\n", new_len).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Strlen(key) => {
+            match db.strlen(key) {
+                Ok(len) => {
+                    out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Msetnx(pairs) => {
+            let any_exists = pairs.iter().any(|(k, _)| db.exists(k));
+            if any_exists {
+                out.extend_from_slice(b":0\r\n");
+            } else {
+                for (k, v) in pairs {
+                    db.set(k.clone(), v.clone(), None);
+                }
+                if let Some(aof) = aof {
+                    if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                        aof.borrow_mut().append(&bytes);
+                    }
+                }
+                out.extend_from_slice(b":1\r\n");
+            }
+            false
+        }
         Command::Ping(msg) => {
             match msg {
                 Some(m) => {
@@ -1820,6 +2088,19 @@ async fn execute_commands_squashed(
                 Command::Zrange { .. } => "ZRANGE",
                 Command::Zpopmin { .. } => "ZPOPMIN",
                 Command::Zpopmax { .. } => "ZPOPMAX",
+                Command::Type(_) => "TYPE",
+                Command::Dbsize => "DBSIZE",
+                Command::Flushdb => "FLUSHDB",
+                Command::Flushall => "FLUSHALL",
+                Command::Touch(_) => "TOUCH",
+                Command::Rename { nx: false, .. } => "RENAME",
+                Command::Rename { nx: true, .. } => "RENAMENX",
+                Command::Setnx { .. } => "SETNX",
+                Command::Getset { .. } => "GETSET",
+                Command::Getdel(_) => "GETDEL",
+                Command::Append { .. } => "APPEND",
+                Command::Strlen(_) => "STRLEN",
+                Command::Msetnx(_) => "MSETNX",
                 Command::Save => "SAVE",
                 Command::Bgsave => "BGSAVE",
                 Command::Ping(_) => "PING",
