@@ -299,6 +299,20 @@ pub enum Command {
     },
     Replconf(Vec<Bytes>),
     Role,
+    // LUA SCRIPTING COMMANDS
+    Eval {
+        script: Bytes,
+        keys: Vec<Bytes>,
+        args: Vec<Bytes>,
+    },
+    Evalsha {
+        sha: Bytes,
+        keys: Vec<Bytes>,
+        args: Vec<Bytes>,
+    },
+    ScriptLoad(Bytes),
+    ScriptExists(Vec<Bytes>),
+    ScriptFlush,
     Quit,
     // PUBSUB COMMANDS
     Subscribe(Vec<Bytes>),
@@ -703,7 +717,7 @@ fn parse_inline_command(buf: &mut BytesMut) -> Result<Option<Command>, String> {
     build_command(parts)
 }
 
-fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
+pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
     if args.is_empty() {
         return Ok(None);
     }
@@ -2223,6 +2237,62 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::Replconf(args[1..].to_vec())))
         }
         "ROLE" => Ok(Some(Command::Role)),
+        "EVAL" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'eval' command".to_string());
+            }
+            let script = args[1].clone();
+            let numkeys: usize = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<usize>().ok()) {
+                Some(n) => n,
+                None => return Err("ERR value is not an integer or out of range".to_string()),
+            };
+            if 3 + numkeys > args.len() {
+                return Err("ERR Number of keys can't be greater than number of args".to_string());
+            }
+            let keys = args[3..3 + numkeys].to_vec();
+            let script_args = args[3 + numkeys..].to_vec();
+            Ok(Some(Command::Eval { script, keys, args: script_args }))
+        }
+        "EVALSHA" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'evalsha' command".to_string());
+            }
+            let sha = args[1].clone();
+            let numkeys: usize = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<usize>().ok()) {
+                Some(n) => n,
+                None => return Err("ERR value is not an integer or out of range".to_string()),
+            };
+            if 3 + numkeys > args.len() {
+                return Err("ERR Number of keys can't be greater than number of args".to_string());
+            }
+            let keys = args[3..3 + numkeys].to_vec();
+            let script_args = args[3 + numkeys..].to_vec();
+            Ok(Some(Command::Evalsha { sha, keys, args: script_args }))
+        }
+        "SCRIPT" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'script' command".to_string());
+            }
+            let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
+            match sub.as_str() {
+                "LOAD" => {
+                    if args.len() != 3 {
+                        return Err("wrong number of arguments for 'script|load' command".to_string());
+                    }
+                    Ok(Some(Command::ScriptLoad(args[2].clone())))
+                }
+                "EXISTS" => {
+                    if args.len() < 3 {
+                        return Err("wrong number of arguments for 'script|exists' command".to_string());
+                    }
+                    Ok(Some(Command::ScriptExists(args[2..].to_vec())))
+                }
+                "FLUSH" => {
+                    Ok(Some(Command::ScriptFlush))
+                }
+                _ => Err(format!("ERR Unknown SCRIPT subcommand or wrong number of arguments for '{}'", sub)),
+            }
+        }
         "QUIT" => Ok(Some(Command::Quit)),
         "SUBSCRIBE" => {
             if args.len() < 2 {

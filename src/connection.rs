@@ -852,6 +852,7 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         }
         Command::Mset(pairs) | Command::Msetnx(pairs) => pairs.first().map(|(k, _)| k),
         Command::Bitop { destkey, .. } | Command::Pfmerge { destkey, .. } => Some(destkey),
+        Command::Eval { keys, .. } | Command::Evalsha { keys, .. } => keys.first(),
         _ => None,
     }
 }
@@ -992,6 +993,9 @@ pub fn cmd_keys<'a>(cmd: &'a Command) -> Vec<&'a [u8]> {
         }
 
         Command::Hmget { key, .. } | Command::Hdel { key, .. } => vec![key.as_ref()],
+        Command::Eval { keys, .. } | Command::Evalsha { keys, .. } => {
+            keys.iter().map(|k| k.as_ref()).collect()
+        }
 
         _ => Vec::new(),
     }
@@ -1454,6 +1458,9 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Xreadgroup { .. } => "XREADGROUP",
         Command::Xack { .. } => "XACK",
         Command::Xpending { .. } => "XPENDING",
+        Command::Eval { .. } => "EVAL",
+        Command::Evalsha { .. } => "EVALSHA",
+        Command::ScriptLoad(_) | Command::ScriptExists(_) | Command::ScriptFlush => "SCRIPT",
         Command::Unknown(_) => "UNKNOWN",
     }
 }
@@ -3305,6 +3312,67 @@ async fn execute_command(
         }
         Command::Discard => {
             out.extend_from_slice(b"-ERR DISCARD without MULTI\r\n");
+            false
+        }
+        Command::Eval { script, keys, args } => {
+            let script_str = String::from_utf8_lossy(&script);
+            crate::scripting::load_script(&script);
+            match crate::scripting::eval_script(
+                &script_str,
+                &keys,
+                &args,
+                &router.local_db,
+                router.aof.as_deref(),
+            ) {
+                Ok(resp) => out.extend_from_slice(&resp),
+                Err(e) => {
+                    let err_resp = format!("-{}\r\n", e);
+                    out.extend_from_slice(err_resp.as_bytes());
+                }
+            }
+            false
+        }
+        Command::Evalsha { sha, keys, args } => {
+            let sha_str = String::from_utf8_lossy(&sha);
+            if let Some(script) = crate::scripting::get_script(&sha_str) {
+                match crate::scripting::eval_script(
+                    &script,
+                    &keys,
+                    &args,
+                    &router.local_db,
+                    router.aof.as_deref(),
+                ) {
+                    Ok(resp) => out.extend_from_slice(&resp),
+                    Err(e) => {
+                        let err_resp = format!("-{}\r\n", e);
+                        out.extend_from_slice(err_resp.as_bytes());
+                    }
+                }
+            } else {
+                out.extend_from_slice(b"-NOSCRIPT No matching script. Please use EVAL.\r\n");
+            }
+            false
+        }
+        Command::ScriptLoad(script) => {
+            let sha = crate::scripting::load_script(&script);
+            write_resp_bulk(out, sha.as_bytes());
+            false
+        }
+        Command::ScriptExists(shas) => {
+            let exists = crate::scripting::script_exists(&shas);
+            out.extend_from_slice(format!("*{}\r\n", exists.len()).as_bytes());
+            for b in exists {
+                if b {
+                    out.extend_from_slice(b":1\r\n");
+                } else {
+                    out.extend_from_slice(b":0\r\n");
+                }
+            }
+            false
+        }
+        Command::ScriptFlush => {
+            crate::scripting::flush_scripts();
+            out.extend_from_slice(b"+OK\r\n");
             false
         }
         Command::Quit => {

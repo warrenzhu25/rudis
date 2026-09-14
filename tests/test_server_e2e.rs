@@ -2590,6 +2590,116 @@ fn test_primary_replica_replication_e2e() {
     assert_eq!(send_and_read(&mut replica_client, b"GET promoted_key\r\n"), "$14\r\npromoted_value\r\n");
 }
 
+#[test]
+fn test_lua_scripting_engine_e2e() {
+    let port = 16430;
+    let _server = start_test_server(port, 2);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    fn send_cmd(stream: &mut TcpStream, args: &[&str]) -> String {
+        let mut out = format!("*{}\r\n", args.len());
+        for a in args {
+            out.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+        }
+        send_and_read(stream, out.as_bytes())
+    }
+
+    // 1. Primitive Return Values
+    assert_eq!(send_cmd(&mut client, &["EVAL", "return 42", "0"]), ":42\r\n");
+    assert_eq!(send_cmd(&mut client, &["EVAL", "return 'hello world'", "0"]), "$11\r\nhello world\r\n");
+    assert_eq!(send_cmd(&mut client, &["EVAL", "return true", "0"]), ":1\r\n");
+    assert_eq!(send_cmd(&mut client, &["EVAL", "return false", "0"]), "$-1\r\n");
+    assert_eq!(send_cmd(&mut client, &["EVAL", "return {10, 'rudis', false}", "0"]), "*3\r\n:10\r\n$5\r\nrudis\r\n$-1\r\n");
+
+    // 2. KEYS and ARGV Passing
+    let keys_argv_resp = send_cmd(&mut client, &[
+        "EVAL",
+        "return {KEYS[1], KEYS[2], ARGV[1], ARGV[2]}",
+        "2",
+        "keyA",
+        "keyB",
+        "val1",
+        "val2",
+    ]);
+    assert_eq!(keys_argv_resp, "*4\r\n$4\r\nkeyA\r\n$4\r\nkeyB\r\n$4\r\nval1\r\n$4\r\nval2\r\n");
+
+    // 3. redis.call SET and GET
+    let set_resp = send_cmd(&mut client, &[
+        "EVAL",
+        "return redis.call('SET', KEYS[1], ARGV[1])",
+        "1",
+        "lua_key",
+        "lua_val",
+    ]);
+    assert_eq!(set_resp, "+OK\r\n");
+
+    let get_resp = send_cmd(&mut client, &[
+        "EVAL",
+        "return redis.call('GET', KEYS[1])",
+        "1",
+        "lua_key",
+    ]);
+    assert_eq!(get_resp, "$7\r\nlua_val\r\n");
+
+    // Multiple operations and table inspection
+    let multi_resp = send_cmd(&mut client, &[
+        "EVAL",
+        "redis.call('SET', KEYS[1], ARGV[1]); return redis.call('INCRBY', KEYS[2], ARGV[2])",
+        "2",
+        "k_str",
+        "k_num",
+        "hello",
+        "50",
+    ]);
+    assert_eq!(multi_resp, ":50\r\n");
+
+    // 4. redis.pcall error handling
+    let pcall_resp = send_cmd(&mut client, &[
+        "EVAL",
+        "local res = redis.pcall('INCRBY', KEYS[1], 'not_a_num'); if res['err'] then return res['err'] else return 'ok' end",
+        "1",
+        "k_num",
+    ]);
+    assert!(pcall_resp.starts_with("$"), "Expected bulk string error returned from pcall, got {}", pcall_resp);
+    assert!(pcall_resp.contains("integer") || pcall_resp.contains("ERR"));
+
+    // 5. redis.sha1hex helper
+    let sha_calc = send_cmd(&mut client, &[
+        "EVAL",
+        "return redis.sha1hex('test-string')",
+        "0",
+    ]);
+    // sha1 of 'test-string' is 4f49d69613b186e71104c7ca1b26c1e5b78c9193
+    assert_eq!(sha_calc, "$40\r\n4f49d69613b186e71104c7ca1b26c1e5b78c9193\r\n");
+
+    // 6. SCRIPT LOAD, SCRIPT EXISTS, EVALSHA, SCRIPT FLUSH
+    let script_code = "return redis.call('GET', KEYS[1])";
+    let load_resp = send_cmd(&mut client, &["SCRIPT", "LOAD", script_code]);
+    assert!(load_resp.starts_with("$40\r\n"));
+    let sha = load_resp.trim_start_matches("$40\r\n").trim_end_matches("\r\n");
+
+    // SCRIPT EXISTS
+    let exists_resp = send_cmd(&mut client, &["SCRIPT", "EXISTS", sha, "0000000000000000000000000000000000000000"]);
+    assert_eq!(exists_resp, "*2\r\n:1\r\n:0\r\n");
+
+    // EVALSHA execution
+    let evalsha_resp = send_cmd(&mut client, &["EVALSHA", sha, "1", "k_str"]);
+    assert_eq!(evalsha_resp, "$5\r\nhello\r\n");
+
+    // SCRIPT FLUSH
+    let flush_resp = send_cmd(&mut client, &["SCRIPT", "FLUSH"]);
+    assert_eq!(flush_resp, "+OK\r\n");
+
+    let exists_after_flush = send_cmd(&mut client, &["SCRIPT", "EXISTS", sha]);
+    assert_eq!(exists_after_flush, "*1\r\n:0\r\n");
+
+    // EVALSHA after flush should return NOSCRIPT error
+    let evalsha_err = send_cmd(&mut client, &["EVALSHA", sha, "1", "k_str"]);
+    assert!(evalsha_err.starts_with("-NOSCRIPT"), "Expected -NOSCRIPT error, got {}", evalsha_err);
+}
+
+
 
 
 

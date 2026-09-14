@@ -6,6 +6,7 @@ pub mod pubsub;
 pub mod replication;
 pub mod resp;
 pub mod router;
+pub mod scripting;
 pub mod server;
 pub mod shard;
 pub mod table;
