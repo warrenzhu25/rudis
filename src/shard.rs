@@ -107,6 +107,13 @@ pub enum ShardMessage {
         in_millis: bool,
         responder: flume::Sender<i64>,
     },
+    AcquireTxLock {
+        tx_id: u64,
+        responder: flume::Sender<()>,
+    },
+    ReleaseTxLock {
+        tx_id: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

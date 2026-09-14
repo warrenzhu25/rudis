@@ -130,6 +130,8 @@ pub fn run_shard_worker(
         let cross_shard_slot_owners = router.slot_owners.clone();
         let cross_shard_aof = aof_writer.clone();
         let cross_shard_pubsub = pubsub.clone();
+        let cross_shard_tx_lock = router.tx_lock.clone();
+        let cross_shard_tx_waiters = router.tx_waiters.clone();
         monoio::spawn(async move {
             while let Ok(msg) = rx.recv_async().await {
                 match msg {
@@ -349,6 +351,28 @@ pub fn run_shard_worker(
                     } => {
                         let res = cross_shard_db.borrow_mut().expiretime(&key, in_millis);
                         let _ = responder.send(res);
+                    }
+                    ShardMessage::AcquireTxLock { tx_id, responder } => {
+                        let mut lock = cross_shard_tx_lock.borrow_mut();
+                        if lock.is_none() {
+                            *lock = Some(tx_id);
+                            let _ = responder.send(());
+                        } else {
+                            cross_shard_tx_waiters.borrow_mut().push_back((tx_id, responder));
+                        }
+                    }
+                    ShardMessage::ReleaseTxLock { tx_id } => {
+                        let mut lock = cross_shard_tx_lock.borrow_mut();
+                        if *lock == Some(tx_id) {
+                            if let Some((next_tx, next_resp)) =
+                                cross_shard_tx_waiters.borrow_mut().pop_front()
+                            {
+                                *lock = Some(next_tx);
+                                let _ = next_resp.send(());
+                            } else {
+                                *lock = None;
+                            }
+                        }
                     }
                 }
             }

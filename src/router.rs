@@ -56,6 +56,8 @@ pub struct Router {
     pub slot_owners: Rc<RefCell<Vec<usize>>>,
     pub aof: Option<Rc<RefCell<crate::aof::AofWriter>>>,
     pub pubsub: Rc<RefCell<crate::pubsub::PubSubHub>>,
+    pub tx_lock: Rc<RefCell<Option<u64>>>,
+    pub tx_waiters: Rc<RefCell<std::collections::VecDeque<(u64, flume::Sender<()>)>>>,
 }
 
 impl Router {
@@ -84,6 +86,8 @@ impl Router {
             slot_owners: Rc::new(RefCell::new(slot_owners)),
             aof,
             pubsub,
+            tx_lock: Rc::new(RefCell::new(None)),
+            tx_waiters: Rc::new(RefCell::new(std::collections::VecDeque::new())),
         }
     }
 
@@ -690,6 +694,54 @@ impl Router {
                 rx.recv_async().await.unwrap_or(-2)
             } else {
                 -2
+            }
+        }
+    }
+
+    pub async fn acquire_tx_locks(&self, shard_ids: &[usize], tx_id: u64) {
+        for &sid in shard_ids {
+            if sid == self.shard_id {
+                let rx = {
+                    let mut lock = self.tx_lock.borrow_mut();
+                    if lock.is_none() {
+                        *lock = Some(tx_id);
+                        None
+                    } else {
+                        let (tx, rx) = flume::bounded(1);
+                        self.tx_waiters.borrow_mut().push_back((tx_id, tx));
+                        Some(rx)
+                    }
+                };
+                if let Some(rx) = rx {
+                    let _ = rx.recv_async().await;
+                }
+            } else {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::AcquireTxLock {
+                    tx_id,
+                    responder: tx,
+                };
+                if self.senders[sid].send(msg).is_ok() {
+                    let _ = rx.recv_async().await;
+                }
+            }
+        }
+    }
+
+    pub async fn release_tx_locks(&self, shard_ids: &[usize], tx_id: u64) {
+        for &sid in shard_ids.iter().rev() {
+            if sid == self.shard_id {
+                let mut lock = self.tx_lock.borrow_mut();
+                if *lock == Some(tx_id) {
+                    if let Some((next_tx, next_resp)) = self.tx_waiters.borrow_mut().pop_front() {
+                        *lock = Some(next_tx);
+                        let _ = next_resp.send(());
+                    } else {
+                        *lock = None;
+                    }
+                }
+            } else {
+                let _ = self.senders[sid].send(ShardMessage::ReleaseTxLock { tx_id });
             }
         }
     }

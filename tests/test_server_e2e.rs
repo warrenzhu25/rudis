@@ -1557,3 +1557,100 @@ fn test_transactions_multi_exec_e2e() {
         "$-1\r\n"
     );
 }
+
+#[test]
+fn test_vll_multi_shard_transactions_e2e() {
+    let port = 16390;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut client1 =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect client1");
+    let mut client2 =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect client2");
+
+    // Find keys that hit different shards
+    let mut keys_by_shard = vec![String::new(); num_shards];
+    let mut found = 0;
+    let mut i = 0;
+    while found < num_shards {
+        let k = format!("vll_key_{}", i);
+        let s = target_shard(k.as_bytes(), num_shards);
+        if keys_by_shard[s].is_empty() {
+            keys_by_shard[s] = k;
+            found += 1;
+        }
+        i += 1;
+    }
+
+    let k0 = &keys_by_shard[0];
+    let k1 = &keys_by_shard[1];
+    let k2 = &keys_by_shard[2];
+    let k3 = &keys_by_shard[3];
+
+    // Multi-shard transaction touching all 4 shards
+    assert_eq!(send_and_read(&mut client1, b"MULTI\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client1, format!("SET {} val0\r\n", k0).as_bytes()),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, format!("SET {} val1\r\n", k1).as_bytes()),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, format!("SET {} val2\r\n", k2).as_bytes()),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, format!("SET {} val3\r\n", k3).as_bytes()),
+        "+QUEUED\r\n"
+    );
+
+    let resp = send_and_read(&mut client1, b"EXEC\r\n");
+    assert_eq!(resp, "*4\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n");
+
+    // Verify all keys set across all shards
+    assert_eq!(
+        send_and_read(&mut client2, format!("GET {}\r\n", k0).as_bytes()),
+        "$4\r\nval0\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client2, format!("GET {}\r\n", k1).as_bytes()),
+        "$4\r\nval1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client2, format!("GET {}\r\n", k2).as_bytes()),
+        "$4\r\nval2\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client2, format!("GET {}\r\n", k3).as_bytes()),
+        "$4\r\nval3\r\n"
+    );
+
+    // Concurrent multi-shard transactions with reverse shard keys (tests deterministic deadlock prevention)
+    assert_eq!(send_and_read(&mut client1, b"MULTI\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client1, format!("SET {} new0\r\n", k0).as_bytes()),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, format!("SET {} new3\r\n", k3).as_bytes()),
+        "+QUEUED\r\n"
+    );
+
+    assert_eq!(send_and_read(&mut client2, b"MULTI\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client2, format!("SET {} rev3\r\n", k3).as_bytes()),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client2, format!("SET {} rev0\r\n", k0).as_bytes()),
+        "+QUEUED\r\n"
+    );
+
+    let resp1 = send_and_read(&mut client1, b"EXEC\r\n");
+    let resp2 = send_and_read(&mut client2, b"EXEC\r\n");
+    assert_eq!(resp1, "*2\r\n+OK\r\n+OK\r\n");
+    assert_eq!(resp2, "*2\r\n+OK\r\n+OK\r\n");
+}

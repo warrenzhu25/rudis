@@ -183,6 +183,28 @@ pub async fn handle_connection(
                                                 b"-EXECABORT Transaction discarded because of previous errors.\r\n",
                                             );
                                         } else {
+                                            let mut shards = hashbrown::HashSet::new();
+                                            for cmd in &tx_queue {
+                                                for k in cmd_keys(cmd) {
+                                                    shards.insert(router.target_shard(k));
+                                                }
+                                            }
+                                            let mut sorted_shards: Vec<usize> =
+                                                shards.into_iter().collect();
+                                            sorted_shards.sort_unstable();
+
+                                            let use_vll = sorted_shards.len() > 1;
+                                            let tx_id = if use_vll {
+                                                static NEXT_TX: std::sync::atomic::AtomicU64 =
+                                                    std::sync::atomic::AtomicU64::new(1);
+                                                let id = NEXT_TX
+                                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                                router.acquire_tx_locks(&sorted_shards, id).await;
+                                                id
+                                            } else {
+                                                0
+                                            };
+
                                             let count = tx_queue.len();
                                             out_buf.extend_from_slice(
                                                 format!("*{}\r\n", count).as_bytes(),
@@ -202,6 +224,10 @@ pub async fn handle_connection(
                                                     should_quit = true;
                                                     break;
                                                 }
+                                            }
+
+                                            if use_vll {
+                                                router.release_tx_locks(&sorted_shards, tx_id).await;
                                             }
                                         }
                                     }
@@ -596,6 +622,73 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         }
         Command::Mset(pairs) | Command::Msetnx(pairs) => pairs.first().map(|(k, _)| k),
         _ => None,
+    }
+}
+
+pub fn cmd_keys<'a>(cmd: &'a Command) -> Vec<&'a [u8]> {
+    match cmd {
+        Command::Get(k)
+        | Command::IncrBy(k, _)
+        | Command::Expire(k, _)
+        | Command::Persist(k)
+        | Command::Ttl(k, _)
+        | Command::Hlen(k)
+        | Command::Hgetall(k)
+        | Command::Hkeys(k)
+        | Command::Hvals(k)
+        | Command::Llen(k)
+        | Command::Smembers(k)
+        | Command::Scard(k)
+        | Command::Zcard(k)
+        | Command::Type(k)
+        | Command::Getdel(k)
+        | Command::Strlen(k)
+        | Command::Expiretime(k, _) => vec![k.as_ref()],
+
+        Command::Set { key, .. }
+        | Command::Hget { key, .. }
+        | Command::Lpop { key, .. }
+        | Command::Rpop { key, .. }
+        | Command::Lrange { key, .. }
+        | Command::Lindex { key, .. }
+        | Command::Sismember { key, .. }
+        | Command::Spop { key, .. }
+        | Command::Zscore { key, .. }
+        | Command::Zrank { key, .. }
+        | Command::Zrevrank { key, .. }
+        | Command::Zcount { key, .. }
+        | Command::Zincrby { key, .. }
+        | Command::Zrange { key, .. }
+        | Command::Zpopmin { key, .. }
+        | Command::Zpopmax { key, .. }
+        | Command::Setnx { key, .. }
+        | Command::Getset { key, .. }
+        | Command::Append { key, .. }
+        | Command::Hset { key, .. }
+        | Command::Hmset { key, .. }
+        | Command::Hexists { key, .. }
+        | Command::Lpush { key, .. }
+        | Command::Rpush { key, .. }
+        | Command::Sadd { key, .. }
+        | Command::Srem { key, .. }
+        | Command::Zadd { key, .. }
+        | Command::Zrem { key, .. } => vec![key.as_ref()],
+
+        Command::Mget(keys) | Command::Del(keys) | Command::Exists(keys) | Command::Touch(keys) => {
+            keys.iter().map(|k| k.as_ref()).collect()
+        }
+
+        Command::Mset(pairs) | Command::Msetnx(pairs) => {
+            pairs.iter().map(|(k, _)| k.as_ref()).collect()
+        }
+
+        Command::Rename { key, newkey, .. } => {
+            vec![key.as_ref(), newkey.as_ref()]
+        }
+
+        Command::Hmget { key, .. } | Command::Hdel { key, .. } => vec![key.as_ref()],
+
+        _ => Vec::new(),
     }
 }
 
