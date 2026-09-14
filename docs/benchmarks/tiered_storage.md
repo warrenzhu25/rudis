@@ -83,3 +83,40 @@ During the benchmark, `TIER INFO` recorded real-time operational telemetry acros
 1. **Read Performance with OpManager**: Despite $>95\%$ of data residing on NVMe, Rudis achieved **827,826 GET ops/sec** with a **median latency of 0.66 ms**, closely tracking pure DRAM latency ($0.66\text{ ms}$ vs $0.65\text{ ms}$). OpManager's read coalescing successfully aggregated 56,581 concurrent requests onto shared 4KB disk page transfers.
 2. **Dense SmallBins Packing**: SmallBins aggregated 512-byte payloads into 486,144 4KB pages with zero Slack space amplification, achieving direct I/O compatibility without 4KB per-record overhead.
 3. **Massive Memory Expansion**: Rudis maintained stable operations with $71.3\times$ more data stored than the physical DRAM allocation (2.43 GB on NVMe within a 32 MB limit), confirming effective backpressure and watermark control.
+
+---
+
+## 7. Head-to-Head Comparison: Rudis vs. Dragonfly (4 Threads)
+
+A direct comparative evaluation between **Rudis v0.1.0** and **Dragonfly v1.39.0** on 4 worker threads (pinned to CPU cores `0-3`) with `--maxmemory 1024mb` on NVMe storage:
+
+### Workload Configuration
+* **Server**: 4 worker threads (`taskset -c 0-3`), `maxmemory=1024mb`, NVMe tiered storage enabled
+  * **Rudis**: `--threads 4 --port 6395 --maxmemory 1024mb --tiered-offload-threshold 60 --tiered-upload-threshold 80`
+  * **Dragonfly**: `--proactor_threads=4 --port=6395 --maxmemory=1024mb --tiered_prefix=/tmp/df/tier --tiered_experimental_cooling=true --pipeline_squash=0`
+* **Client**: `memtier_benchmark` (4 threads, 4 connections/thread, pipeline depth 50, 1KB payload, 1,500,000 keys)
+
+### Head-to-Head Summary
+
+| Workload | Payload | Rudis (Ops/sec) | Dragonfly (Ops/sec) | Rudis Speedup | Winner |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **SET** | 1KB | **1,062,330** | 290,892 | **+265.2% (3.65x)** | **Rudis** |
+| **GET** | 1KB | **567,540** | 207,463 | **+173.6% (2.74x)** | **Rudis** |
+| **SET/GET 1:1** | 1KB | 46,528 | **272,537** | -82.9% (0.17x) | Dragonfly |
+
+### Latency Percentiles Comparison
+
+| Engine | Workload | Ops/sec | Bandwidth | Avg Latency | p50 | p90 | p95 | p99 | p99.9 |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Rudis** | **SET (1KB)** | **1,062,330** | 1,112.0 MB/s | **0.74 ms** | **0.58 ms** | 1.00 ms | 1.21 ms | **1.73 ms** | 15.23 ms |
+| Dragonfly | **SET (1KB)** | 290,892 | 304.4 MB/s | 2.74 ms | 2.61 ms | 3.28 ms | 3.66 ms | 5.22 ms | 16.51 ms |
+| **Rudis** | **GET (1KB)** | **567,540** | 582.3 MB/s | **1.41 ms** | **1.04 ms** | 2.93 ms | 4.38 ms | 7.97 ms | **16.77 ms** |
+| Dragonfly | **GET (1KB)** | 207,463 | 216.0 MB/s | 3.86 ms | 3.78 ms | 4.35 ms | 4.61 ms | 6.40 ms | 23.42 ms |
+| Rudis | **SET/GET 1:1**| 46,528 | 48.5 MB/s | 17.14 ms | 7.36 ms | 24.19 ms | 95.74 ms | 202.75 ms | 290.82 ms |
+| **Dragonfly**| **SET/GET 1:1**| **272,537** | 284.3 MB/s | 2.93 ms | 2.82 ms | 3.50 ms | 3.84 ms | 5.15 ms | 18.56 ms |
+
+### Analysis
+1. **Write & Spill Throughput**: Rudis outperforms Dragonfly by **3.65x** on `SET` operations under memory limits (1.06M ops/s vs 291K ops/s), benefiting from thread-local `io_uring` direct submission with zero cross-thread locking or fiber context switches.
+2. **Read & Fetch Throughput**: Rudis outperforms Dragonfly by **2.74x** on `GET` operations (568K ops/s vs 207K ops/s) with a **2.7x lower average latency** (1.41 ms vs 3.86 ms), driven by `OpManager`'s fast-path read coalescing and direct buffer handoff.
+3. **Interleaved Pipeline Contention**: On 1:1 mixed pipelined workloads, Dragonfly's fiber architecture decouples background flushes asynchronously, while Rudis enforces strict write backpressure barriers when small bins are pending disk flush.
+
