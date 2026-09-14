@@ -1747,7 +1747,7 @@ fn test_bitmaps_and_hyperloglog_e2e() {
 
 #[test]
 fn test_dump_and_restore_e2e() {
-    let port = 16392;
+    let port = 16394;
     let _server = start_test_server(port, 4);
 
     let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
@@ -1812,4 +1812,99 @@ fn test_dump_and_restore_e2e() {
     assert_eq!(send_and_read(&mut client, b"EXISTS ttlkey\r\n"), ":1\r\n");
     thread::sleep(Duration::from_millis(200));
     assert_eq!(send_and_read(&mut client, b"EXISTS ttlkey\r\n"), ":0\r\n");
+}
+
+#[test]
+fn test_streams_engine_e2e() {
+    let port = 16395;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("Failed to connect to rudis server");
+
+    // 1. NOMKSTREAM on non-existent stream -> nil ($-1\r\n)
+    assert_eq!(
+        send_and_read(&mut client, b"XADD nonexist NOMKSTREAM * f1 v1\r\n"),
+        "$-1\r\n"
+    );
+
+    // 2. XADD with explicit ID
+    let r1 = send_and_read(&mut client, b"XADD mystream 1000-1 sensor temp val 25\r\n");
+    assert_eq!(r1, "$6\r\n1000-1\r\n");
+
+    // 3. TYPE mystream -> "stream"
+    assert_eq!(send_and_read(&mut client, b"TYPE mystream\r\n"), "+stream\r\n");
+
+    // 4. Monotonicity validation: specified ID <= top item
+    let r_err = send_and_read(&mut client, b"XADD mystream 1000-1 f v\r\n");
+    assert!(r_err.starts_with("-ERR"));
+
+    // 5. XADD auto ID sequence
+    let r2 = send_and_read(&mut client, b"XADD mystream 1000-* val 26\r\n");
+    assert_eq!(r2, "$6\r\n1000-2\r\n");
+
+    let r3 = send_and_read(&mut client, b"XADD mystream 1001-* val 27\r\n");
+    assert_eq!(r3, "$6\r\n1001-0\r\n");
+
+    // 6. XLEN
+    assert_eq!(send_and_read(&mut client, b"XLEN mystream\r\n"), ":3\r\n");
+
+    // 7. XRANGE full
+    let range_all = send_and_read(&mut client, b"XRANGE mystream - +\r\n");
+    assert!(range_all.starts_with("*3\r\n"));
+    assert!(range_all.contains("1000-1"));
+    assert!(range_all.contains("1000-2"));
+    assert!(range_all.contains("1001-0"));
+
+    // 8. XRANGE with COUNT 2
+    let range_cnt = send_and_read(&mut client, b"XRANGE mystream - + COUNT 2\r\n");
+    assert!(range_cnt.starts_with("*2\r\n"));
+    assert!(range_cnt.contains("1000-1"));
+    assert!(range_cnt.contains("1000-2"));
+    assert!(!range_cnt.contains("1001-0"));
+
+    // 9. XREVRANGE
+    let rev_all = send_and_read(&mut client, b"XREVRANGE mystream + - COUNT 2\r\n");
+    assert!(rev_all.starts_with("*2\r\n"));
+    assert!(rev_all.contains("1001-0"));
+    assert!(rev_all.contains("1000-2"));
+
+    // 10. XREAD
+    let read_resp = send_and_read(&mut client, b"XREAD STREAMS mystream 1000-1\r\n");
+    assert!(read_resp.starts_with("*1\r\n"));
+    assert!(read_resp.contains("mystream"));
+    assert!(read_resp.contains("1000-2"));
+    assert!(read_resp.contains("1001-0"));
+
+    // XREAD with $
+    let read_dollar = send_and_read(&mut client, b"XREAD STREAMS mystream $\r\n");
+    assert_eq!(read_dollar, "$-1\r\n");
+
+    // 11. XDEL
+    assert_eq!(send_and_read(&mut client, b"XDEL mystream 1000-2\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"XLEN mystream\r\n"), ":2\r\n");
+
+    // 12. XTRIM with MAXLEN
+    for i in 10..20 {
+        let cmd = format!("XADD mystream {}-0 item {}\r\n", 2000 + i, i);
+        let _ = send_and_read(&mut client, cmd.as_bytes());
+    }
+    assert_eq!(send_and_read(&mut client, b"XLEN mystream\r\n"), ":12\r\n");
+    assert_eq!(send_and_read(&mut client, b"XTRIM mystream MAXLEN = 5\r\n"), ":7\r\n");
+    assert_eq!(send_and_read(&mut client, b"XLEN mystream\r\n"), ":5\r\n");
+
+    // 13. DUMP & RESTORE of stream
+    let dump_resp = send_and_read_bytes(&mut client, b"DUMP mystream\r\n");
+    assert!(dump_resp.starts_with(b"$"));
+    let crlf_pos = dump_resp.windows(2).position(|w| w == b"\r\n").unwrap();
+    let payload = &dump_resp[crlf_pos + 2..dump_resp.len() - 2];
+
+    let mut restore_cmd = Vec::new();
+    restore_cmd.extend_from_slice(format!("*4\r\n$7\r\nRESTORE\r\n$11\r\nstream_copy\r\n$1\r\n0\r\n${}\r\n", payload.len()).as_bytes());
+    restore_cmd.extend_from_slice(payload);
+    restore_cmd.extend_from_slice(b"\r\n");
+    assert_eq!(send_and_read(&mut client, &restore_cmd), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"XLEN stream_copy\r\n"), ":5\r\n");
+    assert_eq!(send_and_read(&mut client, b"TYPE stream_copy\r\n"), "+stream\r\n");
 }

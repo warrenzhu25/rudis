@@ -81,10 +81,16 @@ pub fn run_shard_worker(
                         let mut ticker = 0u64;
                         loop {
                             monoio::time::sleep(std::time::Duration::from_millis(50)).await;
-                            let _ = flush_writer.borrow_mut().flush().await;
+                            let flush_chunk = flush_writer.borrow_mut().take_flush_chunk();
+                            if let Some((file, chunk, offset)) = flush_chunk {
+                                let _ = file.write_all_at(chunk, offset).await;
+                            }
                             ticker += 1;
                             if fsync_every_sec && ticker % 20 == 0 {
-                                let _ = flush_writer.borrow_mut().sync().await;
+                                let file = flush_writer.borrow().get_file();
+                                if let Some(file) = file {
+                                    let _ = file.sync_data().await;
+                                }
                             }
                         }
                     });
@@ -290,8 +296,22 @@ pub fn run_shard_worker(
                         let _ = responder.send(entry);
                     }
                     ShardMessage::SyncAof { responder } => {
-                        if let Some(aof) = &cross_shard_aof {
-                            let _ = aof.borrow_mut().sync().await;
+                        let (file, chunk, offset) = if let Some(aof) = &cross_shard_aof {
+                            let mut writer = aof.borrow_mut();
+                            let file = writer.get_file();
+                            if let Some((f, c, o)) = writer.take_flush_chunk() {
+                                (Some(f), c, o)
+                            } else {
+                                (file, Vec::new(), 0)
+                            }
+                        } else {
+                            (None, Vec::new(), 0)
+                        };
+                        if let Some(file) = file {
+                            if !chunk.is_empty() {
+                                let _ = file.write_all_at(chunk, offset).await;
+                            }
+                            let _ = file.sync_data().await;
                         }
                         let _ = responder.send(());
                     }

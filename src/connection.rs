@@ -623,11 +623,18 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Bitpos { key, .. }
         | Command::Pfadd { key, .. }
         | Command::Dump(key)
-        | Command::Restore { key, .. } => Some(key),
+        | Command::Restore { key, .. }
+        | Command::Xadd { key, .. }
+        | Command::Xlen(key)
+        | Command::Xrange { key, .. }
+        | Command::Xrevrange { key, .. }
+        | Command::Xdel { key, .. }
+        | Command::Xtrim { key, .. } => Some(key),
         Command::Touch(keys) | Command::Del(keys) | Command::Exists(keys) | Command::Mget(keys) => {
             keys.first()
         }
         Command::Pfcount { keys } => keys.first(),
+        Command::Xread { keys, .. } => keys.first(),
         Command::Mset(pairs) | Command::Msetnx(pairs) => pairs.first().map(|(k, _)| k),
         Command::Bitop { destkey, .. } | Command::Pfmerge { destkey, .. } => Some(destkey),
         _ => None,
@@ -653,7 +660,8 @@ pub fn cmd_keys<'a>(cmd: &'a Command) -> Vec<&'a [u8]> {
         | Command::Getdel(k)
         | Command::Strlen(k)
         | Command::Expiretime(k, _)
-        | Command::Dump(k) => vec![k.as_ref()],
+        | Command::Dump(k)
+        | Command::Xlen(k) => vec![k.as_ref()],
 
         Command::Set { key, .. }
         | Command::Hget { key, .. }
@@ -688,12 +696,18 @@ pub fn cmd_keys<'a>(cmd: &'a Command) -> Vec<&'a [u8]> {
         | Command::Bitcount { key, .. }
         | Command::Bitpos { key, .. }
         | Command::Pfadd { key, .. }
-        | Command::Restore { key, .. } => vec![key.as_ref()],
+        | Command::Restore { key, .. }
+        | Command::Xadd { key, .. }
+        | Command::Xrange { key, .. }
+        | Command::Xrevrange { key, .. }
+        | Command::Xdel { key, .. }
+        | Command::Xtrim { key, .. } => vec![key.as_ref()],
 
         Command::Mget(keys) | Command::Del(keys) | Command::Exists(keys) | Command::Touch(keys) => {
             keys.iter().map(|k| k.as_ref()).collect()
         }
         Command::Pfcount { keys } => keys.iter().map(|k| k.as_ref()).collect(),
+        Command::Xread { keys, .. } => keys.iter().map(|k| k.as_ref()).collect(),
 
         Command::Mset(pairs) | Command::Msetnx(pairs) => {
             pairs.iter().map(|(k, _)| k.as_ref()).collect()
@@ -817,6 +831,13 @@ async fn execute_command(
         Command::Pfmerge { .. } => "PFMERGE",
         Command::Dump(_) => "DUMP",
         Command::Restore { .. } => "RESTORE",
+        Command::Xadd { .. } => "XADD",
+        Command::Xlen(_) => "XLEN",
+        Command::Xrange { .. } => "XRANGE",
+        Command::Xrevrange { .. } => "XREVRANGE",
+        Command::Xread { .. } => "XREAD",
+        Command::Xdel { .. } => "XDEL",
+        Command::Xtrim { .. } => "XTRIM",
         Command::Unknown(_) => "UNKNOWN",
     };
     if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
@@ -1178,7 +1199,13 @@ async fn execute_command(
         | Command::Bitpos { .. }
         | Command::Pfadd { .. }
         | Command::Dump(_)
-        | Command::Restore { .. } => {
+        | Command::Restore { .. }
+        | Command::Xadd { .. }
+        | Command::Xlen(_)
+        | Command::Xrange { .. }
+        | Command::Xrevrange { .. }
+        | Command::Xdel { .. }
+        | Command::Xtrim { .. } => {
             if let Some(target) = target_shard_of_cmd(&cmd, router.num_shards) {
                 if target == router.shard_id {
                     execute_local_command(
@@ -1191,6 +1218,38 @@ async fn execute_command(
                     let res = router.execute_remote(target, cmd).await;
                     out.extend_from_slice(&res);
                 }
+            }
+            false
+        }
+        Command::Xread {
+            count: _,
+            block_ms: _,
+            ref keys,
+            ids: _,
+        } => {
+            if keys.is_empty() {
+                out.extend_from_slice(b"$-1\r\n");
+                return false;
+            }
+            let first_target = router.target_shard(&keys[0]);
+            for k in &keys[1..] {
+                if router.target_shard(k) != first_target {
+                    out.extend_from_slice(
+                        b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                    );
+                    return false;
+                }
+            }
+            if first_target == router.shard_id {
+                execute_local_command(
+                    &cmd,
+                    &mut router.local_db.borrow_mut(),
+                    out,
+                    router.aof.as_deref(),
+                );
+            } else {
+                let res = router.execute_remote(first_target, cmd).await;
+                out.extend_from_slice(&res);
             }
             false
         }
@@ -1581,6 +1640,43 @@ async fn execute_command(
                             );
                         }
                     }
+                    crate::table::RudisValue::Stream(stream) => {
+                        for (id, fields) in &stream.entries {
+                            tx_buf.extend_from_slice(
+                                format!(
+                                    "*{}\r\n$4\r\nXADD\r\n${}\r\n",
+                                    3 + fields.len() * 2,
+                                    k.len()
+                                )
+                                .as_bytes(),
+                            );
+                            tx_buf.extend_from_slice(k);
+                            tx_buf.extend_from_slice(b"\r\n");
+                            let id_str = id.to_string();
+                            tx_buf.extend_from_slice(
+                                format!("${}\r\n{}\r\n", id_str.len(), id_str).as_bytes(),
+                            );
+                            for (f, v) in fields {
+                                tx_buf.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
+                                tx_buf.extend_from_slice(f);
+                                tx_buf.extend_from_slice(b"\r\n");
+                                tx_buf.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                                tx_buf.extend_from_slice(v);
+                                tx_buf.extend_from_slice(b"\r\n");
+                            }
+                        }
+                        if let Some(dur) = ttl {
+                            let ms = dur.as_millis().max(1);
+                            let ms_str = ms.to_string();
+                            tx_buf.extend_from_slice(
+                                format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
+                            );
+                            tx_buf.extend_from_slice(k);
+                            tx_buf.extend_from_slice(
+                                format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
+                            );
+                        }
+                    }
                 }
             }
 
@@ -1773,7 +1869,13 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Bitpos { key, .. }
         | Command::Pfadd { key, .. }
         | Command::Dump(key)
-        | Command::Restore { key, .. } => Some(target_shard(key, num_shards)),
+        | Command::Restore { key, .. }
+        | Command::Xadd { key, .. }
+        | Command::Xlen(key)
+        | Command::Xrange { key, .. }
+        | Command::Xrevrange { key, .. }
+        | Command::Xdel { key, .. }
+        | Command::Xtrim { key, .. } => Some(target_shard(key, num_shards)),
         Command::Pfcount { keys } if keys.len() == 1 => Some(target_shard(&keys[0], num_shards)),
         Command::Rename { key, newkey, .. } => {
             let s1 = target_shard(key, num_shards);
@@ -1795,6 +1897,14 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
             Some(target_shard(destkey, num_shards))
         }
         Command::Touch(keys) | Command::Del(keys) | Command::Exists(keys) if keys.len() == 1 => {
+            Some(target_shard(&keys[0], num_shards))
+        }
+        Command::Xread { keys, .. }
+            if !keys.is_empty()
+                && keys
+                    .iter()
+                    .all(|k| target_shard(k, num_shards) == target_shard(&keys[0], num_shards)) =>
+        {
             Some(target_shard(&keys[0], num_shards))
         }
         _ => None,
@@ -2991,6 +3101,228 @@ pub fn execute_local_command(
             }
             false
         }
+        Command::Xadd {
+            key,
+            nomkstream,
+            maxlen,
+            minid,
+            id,
+            fields,
+        } => {
+            match db.xadd(
+                key.clone(),
+                id.clone(),
+                fields.clone(),
+                *nomkstream,
+                *maxlen,
+                *minid,
+            ) {
+                Ok(Some(generated_id)) => {
+                    if let Some(aof) = aof {
+                        let explicit_cmd = Command::Xadd {
+                            key: key.clone(),
+                            nomkstream: *nomkstream,
+                            maxlen: *maxlen,
+                            minid: *minid,
+                            id: crate::table::StreamAddId::Explicit(generated_id),
+                            fields: fields.clone(),
+                        };
+                        if let Some(bytes) = crate::aof::command_to_resp(&explicit_cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
+                    let s = generated_id.to_string();
+                    out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
+                }
+                Ok(None) => {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Xlen(key) => {
+            match db.xlen(key) {
+                Ok(len) => {
+                    out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Xrange {
+            key,
+            start,
+            end,
+            count,
+        } => {
+            match db.xrange(key, start, end, *count) {
+                Ok(items) => {
+                    out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                    for (id, fields) in items {
+                        let id_str = id.to_string();
+                        out.extend_from_slice(
+                            format!(
+                                "*2\r\n${}\r\n{}\r\n*{}\r\n",
+                                id_str.len(),
+                                id_str,
+                                fields.len() * 2
+                            )
+                            .as_bytes(),
+                        );
+                        for (f, v) in fields {
+                            out.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
+                            out.extend_from_slice(&f);
+                            out.extend_from_slice(b"\r\n");
+                            out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                            out.extend_from_slice(&v);
+                            out.extend_from_slice(b"\r\n");
+                        }
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Xrevrange {
+            key,
+            end,
+            start,
+            count,
+        } => {
+            match db.xrevrange(key, end, start, *count) {
+                Ok(items) => {
+                    out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                    for (id, fields) in items {
+                        let id_str = id.to_string();
+                        out.extend_from_slice(
+                            format!(
+                                "*2\r\n${}\r\n{}\r\n*{}\r\n",
+                                id_str.len(),
+                                id_str,
+                                fields.len() * 2
+                            )
+                            .as_bytes(),
+                        );
+                        for (f, v) in fields {
+                            out.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
+                            out.extend_from_slice(&f);
+                            out.extend_from_slice(b"\r\n");
+                            out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                            out.extend_from_slice(&v);
+                            out.extend_from_slice(b"\r\n");
+                        }
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Xread {
+            count,
+            keys,
+            ids,
+            ..
+        } => {
+            match db.xread(keys, ids, *count) {
+                Ok(streams) => {
+                    if streams.is_empty() {
+                        out.extend_from_slice(b"$-1\r\n");
+                    } else {
+                        out.extend_from_slice(format!("*{}\r\n", streams.len()).as_bytes());
+                        for (stream_key, entries) in streams {
+                            out.extend_from_slice(
+                                format!(
+                                    "*2\r\n${}\r\n",
+                                    stream_key.len()
+                                )
+                                .as_bytes(),
+                            );
+                            out.extend_from_slice(&stream_key);
+                            out.extend_from_slice(
+                                format!("\r\n*{}\r\n", entries.len()).as_bytes(),
+                            );
+                            for (id, fields) in entries {
+                                let id_str = id.to_string();
+                                out.extend_from_slice(
+                                    format!(
+                                        "*2\r\n${}\r\n{}\r\n*{}\r\n",
+                                        id_str.len(),
+                                        id_str,
+                                        fields.len() * 2
+                                    )
+                                    .as_bytes(),
+                                );
+                                for (f, v) in fields {
+                                    out.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
+                                    out.extend_from_slice(&f);
+                                    out.extend_from_slice(b"\r\n");
+                                    out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                                    out.extend_from_slice(&v);
+                                    out.extend_from_slice(b"\r\n");
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Xdel { key, ids } => {
+            match db.xdel(key, ids) {
+                Ok(count) => {
+                    if count > 0 {
+                        if let Some(aof) = aof {
+                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        }
+                    }
+                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Xtrim {
+            key,
+            maxlen,
+            minid,
+        } => {
+            match db.xtrim(key, *maxlen, *minid) {
+                Ok(count) => {
+                    if count > 0 {
+                        if let Some(aof) = aof {
+                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        }
+                    }
+                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
         Command::Quit => {
             out.extend_from_slice(b"+OK\r\n");
             true
@@ -3133,6 +3465,13 @@ async fn execute_commands_squashed(
                 Command::Pfmerge { .. } => "PFMERGE",
                 Command::Dump(_) => "DUMP",
                 Command::Restore { .. } => "RESTORE",
+                Command::Xadd { .. } => "XADD",
+                Command::Xlen(_) => "XLEN",
+                Command::Xrange { .. } => "XRANGE",
+                Command::Xrevrange { .. } => "XREVRANGE",
+                Command::Xread { .. } => "XREAD",
+                Command::Xdel { .. } => "XDEL",
+                Command::Xtrim { .. } => "XTRIM",
                 Command::Unknown(_) => "UNKNOWN",
             };
             c.last_cmd = cmd_name.to_string();

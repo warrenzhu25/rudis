@@ -330,8 +330,22 @@ impl Router {
     }
 
     pub async fn sync_aof(&self) {
-        if let Some(aof) = &self.aof {
-            let _ = aof.borrow_mut().sync().await;
+        let (file, chunk, offset) = if let Some(aof) = &self.aof {
+            let mut writer = aof.borrow_mut();
+            let file = writer.get_file();
+            if let Some((f, c, o)) = writer.take_flush_chunk() {
+                (Some(f), c, o)
+            } else {
+                (file, Vec::new(), 0)
+            }
+        } else {
+            (None, Vec::new(), 0)
+        };
+        if let Some(file) = file {
+            if !chunk.is_empty() {
+                let _ = file.write_all_at(chunk, offset).await;
+            }
+            let _ = file.sync_data().await;
         }
         let mut responders = Vec::new();
         for (sid, sender) in self.senders.iter().enumerate() {

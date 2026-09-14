@@ -550,4 +550,69 @@ impl ShardDb {
     ) -> Result<(), &'static str> {
         self.table.restore(key, ttl_ms, serialized, replace, absttl)
     }
+
+    #[inline]
+    pub fn xadd(
+        &mut self,
+        key: Bytes,
+        add_id: crate::table::StreamAddId,
+        fields: Vec<(Bytes, Bytes)>,
+        nomkstream: bool,
+        maxlen: Option<usize>,
+        minid: Option<crate::table::StreamId>,
+    ) -> Result<Option<crate::table::StreamId>, &'static str> {
+        self.table.xadd(key, add_id, fields, nomkstream, maxlen, minid)
+    }
+
+    #[inline]
+    pub fn xlen(&mut self, key: &[u8]) -> Result<usize, &'static str> {
+        self.table.xlen(key)
+    }
+
+    #[inline]
+    pub fn xrange(
+        &mut self,
+        key: &[u8],
+        start: &str,
+        end: &str,
+        count: Option<usize>,
+    ) -> Result<Vec<(crate::table::StreamId, Vec<(Bytes, Bytes)>)>, &'static str> {
+        self.table.xrange(key, start, end, count)
+    }
+
+    #[inline]
+    pub fn xrevrange(
+        &mut self,
+        key: &[u8],
+        end: &str,
+        start: &str,
+        count: Option<usize>,
+    ) -> Result<Vec<(crate::table::StreamId, Vec<(Bytes, Bytes)>)>, &'static str> {
+        self.table.xrevrange(key, end, start, count)
+    }
+
+    #[inline]
+    pub fn xread(
+        &mut self,
+        keys: &[Bytes],
+        ids: &[String],
+        count: Option<usize>,
+    ) -> Result<Vec<(Bytes, Vec<(crate::table::StreamId, Vec<(Bytes, Bytes)>)>)>, &'static str> {
+        self.table.xread(keys, ids, count)
+    }
+
+    #[inline]
+    pub fn xdel(&mut self, key: &[u8], ids: &[crate::table::StreamId]) -> Result<usize, &'static str> {
+        self.table.xdel(key, ids)
+    }
+
+    #[inline]
+    pub fn xtrim(
+        &mut self,
+        key: &[u8],
+        maxlen: Option<usize>,
+        minid: Option<crate::table::StreamId>,
+    ) -> Result<usize, &'static str> {
+        self.table.xtrim(key, maxlen, minid)
+    }
 }

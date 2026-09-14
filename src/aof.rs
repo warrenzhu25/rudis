@@ -23,7 +23,7 @@ impl Default for AofConfig {
 
 pub struct AofWriter {
     buffer: Vec<u8>,
-    file: Option<monoio::fs::File>,
+    file: Option<std::rc::Rc<monoio::fs::File>>,
     path: PathBuf,
     offset: u64,
 }
@@ -41,7 +41,7 @@ impl AofWriter {
         let offset = file.metadata().await.map(|m| m.len()).unwrap_or(0);
         Ok(Self {
             buffer: Vec::with_capacity(65536),
-            file: Some(file),
+            file: Some(std::rc::Rc::new(file)),
             path,
             offset,
         })
@@ -57,16 +57,27 @@ impl AofWriter {
         self.buffer.extend_from_slice(data);
     }
 
-    pub async fn flush(&mut self) -> std::io::Result<()> {
+    #[inline]
+    pub fn take_flush_chunk(&mut self) -> Option<(std::rc::Rc<monoio::fs::File>, Vec<u8>, u64)> {
         if self.buffer.is_empty() {
-            return Ok(());
+            return None;
         }
-        if let Some(file) = &self.file {
-            let chunk = std::mem::replace(&mut self.buffer, Vec::with_capacity(65536));
-            let len = chunk.len() as u64;
-            let (res, _) = file.write_all_at(chunk, self.offset).await;
+        let file = self.file.clone()?;
+        let chunk = std::mem::replace(&mut self.buffer, Vec::with_capacity(65536));
+        let off = self.offset;
+        self.offset += chunk.len() as u64;
+        Some((file, chunk, off))
+    }
+
+    #[inline]
+    pub fn get_file(&self) -> Option<std::rc::Rc<monoio::fs::File>> {
+        self.file.clone()
+    }
+
+    pub async fn flush(&mut self) -> std::io::Result<()> {
+        if let Some((file, chunk, offset)) = self.take_flush_chunk() {
+            let (res, _) = file.write_all_at(chunk, offset).await;
             res?;
-            self.offset += len;
         }
         Ok(())
     }
@@ -494,6 +505,99 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             if *absttl {
                 buf.extend_from_slice(b"$6\r\nABSTTL\r\n");
+            }
+            Some(buf)
+        }
+        Command::Xadd {
+            key,
+            nomkstream,
+            maxlen,
+            minid,
+            id,
+            fields,
+        } => {
+            let mut num_args = 2 + 1 + fields.len() * 2;
+            if *nomkstream {
+                num_args += 1;
+            }
+            if maxlen.is_some() {
+                num_args += 2;
+            }
+            if minid.is_some() {
+                num_args += 2;
+            }
+            buf.extend_from_slice(
+                format!("*{}\r\n$4\r\nXADD\r\n${}\r\n", num_args, key.len()).as_bytes(),
+            );
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(b"\r\n");
+            if *nomkstream {
+                buf.extend_from_slice(b"$10\r\nNOMKSTREAM\r\n");
+            }
+            if let Some(max) = maxlen {
+                let max_str = max.to_string();
+                buf.extend_from_slice(b"$6\r\nMAXLEN\r\n");
+                buf.extend_from_slice(format!("${}\r\n{}\r\n", max_str.len(), max_str).as_bytes());
+            }
+            if let Some(min) = minid {
+                let min_str = min.to_string();
+                buf.extend_from_slice(b"$5\r\nMINID\r\n");
+                buf.extend_from_slice(format!("${}\r\n{}\r\n", min_str.len(), min_str).as_bytes());
+            }
+            let id_str = match id {
+                crate::table::StreamAddId::Explicit(sid) => sid.to_string(),
+                crate::table::StreamAddId::AutoSeq(ms) => format!("{}-*", ms),
+                crate::table::StreamAddId::Auto => "*".to_string(),
+            };
+            buf.extend_from_slice(format!("${}\r\n{}\r\n", id_str.len(), id_str).as_bytes());
+            for (k, v) in fields {
+                buf.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                buf.extend_from_slice(k);
+                buf.extend_from_slice(b"\r\n");
+                buf.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                buf.extend_from_slice(v);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
+        Command::Xdel { key, ids } => {
+            buf.extend_from_slice(
+                format!("*{}\r\n$4\r\nXDEL\r\n${}\r\n", 2 + ids.len(), key.len()).as_bytes(),
+            );
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(b"\r\n");
+            for id in ids {
+                let s = id.to_string();
+                buf.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
+            }
+            Some(buf)
+        }
+        Command::Xtrim {
+            key,
+            maxlen,
+            minid,
+        } => {
+            let mut num_args = 2;
+            if maxlen.is_some() {
+                num_args += 2;
+            }
+            if minid.is_some() {
+                num_args += 2;
+            }
+            buf.extend_from_slice(
+                format!("*{}\r\n$5\r\nXTRIM\r\n${}\r\n", num_args, key.len()).as_bytes(),
+            );
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(b"\r\n");
+            if let Some(max) = maxlen {
+                let max_str = max.to_string();
+                buf.extend_from_slice(b"$6\r\nMAXLEN\r\n");
+                buf.extend_from_slice(format!("${}\r\n{}\r\n", max_str.len(), max_str).as_bytes());
+            }
+            if let Some(min) = minid {
+                let min_str = min.to_string();
+                buf.extend_from_slice(b"$5\r\nMINID\r\n");
+                buf.extend_from_slice(format!("${}\r\n{}\r\n", min_str.len(), min_str).as_bytes());
             }
             Some(buf)
         }

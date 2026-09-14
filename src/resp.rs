@@ -283,6 +283,43 @@ pub enum Command {
         replace: bool,
         absttl: bool,
     },
+    // STREAM COMMANDS
+    Xadd {
+        key: Bytes,
+        nomkstream: bool,
+        maxlen: Option<usize>,
+        minid: Option<crate::table::StreamId>,
+        id: crate::table::StreamAddId,
+        fields: Vec<(Bytes, Bytes)>,
+    },
+    Xlen(Bytes),
+    Xrange {
+        key: Bytes,
+        start: String,
+        end: String,
+        count: Option<usize>,
+    },
+    Xrevrange {
+        key: Bytes,
+        end: String,
+        start: String,
+        count: Option<usize>,
+    },
+    Xread {
+        count: Option<usize>,
+        block_ms: Option<u64>,
+        keys: Vec<Bytes>,
+        ids: Vec<String>,
+    },
+    Xdel {
+        key: Bytes,
+        ids: Vec<crate::table::StreamId>,
+    },
+    Xtrim {
+        key: Bytes,
+        maxlen: Option<usize>,
+        minid: Option<crate::table::StreamId>,
+    },
     Unknown(String),
 }
 
@@ -1887,6 +1924,278 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 absttl,
             }))
         }
+        "XADD" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'xadd' command".to_string());
+            }
+            let key = args[1].clone();
+            let mut nomkstream = false;
+            let mut maxlen = None;
+            let mut minid = None;
+            let mut i = 2;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "NOMKSTREAM" => {
+                        nomkstream = true;
+                        i += 1;
+                    }
+                    "MAXLEN" => {
+                        i += 1;
+                        if i < args.len() && (args[i].as_ref() == b"=" || args[i].as_ref() == b"~") {
+                            i += 1;
+                        }
+                        if i >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let len: usize = std::str::from_utf8(&args[i])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        maxlen = Some(len);
+                        i += 1;
+                    }
+                    "MINID" => {
+                        i += 1;
+                        if i < args.len() && (args[i].as_ref() == b"=" || args[i].as_ref() == b"~") {
+                            i += 1;
+                        }
+                        if i >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let id_str = std::str::from_utf8(&args[i])
+                            .map_err(|_| "Invalid stream ID specified as stream command argument")?;
+                        let parsed_id = crate::table::StreamId::parse_exact(id_str)
+                            .map_err(|e| e.to_string())?;
+                        minid = Some(parsed_id);
+                        i += 1;
+                    }
+                    "LIMIT" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        i += 2;
+                    }
+                    _ => break,
+                }
+            }
+            if i >= args.len() {
+                return Err("wrong number of arguments for 'xadd' command".to_string());
+            }
+            let id_str = std::str::from_utf8(&args[i])
+                .map_err(|_| "Invalid stream ID specified as stream command argument")?;
+            let id = crate::table::StreamAddId::parse(id_str)
+                .map_err(|e| e.to_string())?;
+            i += 1;
+            let rem = args.len() - i;
+            if rem == 0 || rem % 2 != 0 {
+                return Err("wrong number of arguments for 'xadd' command".to_string());
+            }
+            let mut fields = Vec::with_capacity(rem / 2);
+            while i < args.len() {
+                fields.push((args[i].clone(), args[i + 1].clone()));
+                i += 2;
+            }
+            Ok(Some(Command::Xadd {
+                key,
+                nomkstream,
+                maxlen,
+                minid,
+                id,
+                fields,
+            }))
+        }
+        "XLEN" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'xlen' command".to_string());
+            }
+            Ok(Some(Command::Xlen(args[1].clone())))
+        }
+        "XRANGE" => {
+            if args.len() < 4 || args.len() > 6 {
+                return Err("wrong number of arguments for 'xrange' command".to_string());
+            }
+            let key = args[1].clone();
+            let start = String::from_utf8_lossy(&args[2]).to_string();
+            let end = String::from_utf8_lossy(&args[3]).to_string();
+            let mut count = None;
+            if args.len() == 6 {
+                let opt = String::from_utf8_lossy(&args[4]).to_uppercase();
+                if opt != "COUNT" {
+                    return Err("syntax error".to_string());
+                }
+                let cnt: usize = std::str::from_utf8(&args[5])
+                    .map_err(|_| "value is not an integer or out of range")?
+                    .parse()
+                    .map_err(|_| "value is not an integer or out of range")?;
+                count = Some(cnt);
+            } else if args.len() == 5 {
+                return Err("syntax error".to_string());
+            }
+            Ok(Some(Command::Xrange {
+                key,
+                start,
+                end,
+                count,
+            }))
+        }
+        "XREVRANGE" => {
+            if args.len() < 4 || args.len() > 6 {
+                return Err("wrong number of arguments for 'xrevrange' command".to_string());
+            }
+            let key = args[1].clone();
+            let end = String::from_utf8_lossy(&args[2]).to_string();
+            let start = String::from_utf8_lossy(&args[3]).to_string();
+            let mut count = None;
+            if args.len() == 6 {
+                let opt = String::from_utf8_lossy(&args[4]).to_uppercase();
+                if opt != "COUNT" {
+                    return Err("syntax error".to_string());
+                }
+                let cnt: usize = std::str::from_utf8(&args[5])
+                    .map_err(|_| "value is not an integer or out of range")?
+                    .parse()
+                    .map_err(|_| "value is not an integer or out of range")?;
+                count = Some(cnt);
+            } else if args.len() == 5 {
+                return Err("syntax error".to_string());
+            }
+            Ok(Some(Command::Xrevrange {
+                key,
+                end,
+                start,
+                count,
+            }))
+        }
+        "XREAD" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'xread' command".to_string());
+            }
+            let mut count = None;
+            let mut block_ms = None;
+            let mut i = 1;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "COUNT" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let cnt: usize = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        count = Some(cnt);
+                        i += 2;
+                    }
+                    "BLOCK" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let b: u64 = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        block_ms = Some(b);
+                        i += 2;
+                    }
+                    "STREAMS" => {
+                        i += 1;
+                        break;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            let rem = args.len() - i;
+            if rem < 2 || rem % 2 != 0 {
+                return Err("ERR Unbalanced XREAD list of streams and IDs".to_string());
+            }
+            let n = rem / 2;
+            let keys: Vec<Bytes> = args[i..i + n].to_vec();
+            let ids: Vec<String> = args[i + n..]
+                .iter()
+                .map(|b| String::from_utf8_lossy(b).to_string())
+                .collect();
+            Ok(Some(Command::Xread {
+                count,
+                block_ms,
+                keys,
+                ids,
+            }))
+        }
+        "XDEL" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'xdel' command".to_string());
+            }
+            let key = args[1].clone();
+            let mut ids = Vec::with_capacity(args.len() - 2);
+            for arg in &args[2..] {
+                let s = std::str::from_utf8(arg)
+                    .map_err(|_| "Invalid stream ID specified as stream command argument")?;
+                let id = crate::table::StreamId::parse_exact(s)
+                    .map_err(|e| e.to_string())?;
+                ids.push(id);
+            }
+            Ok(Some(Command::Xdel { key, ids }))
+        }
+        "XTRIM" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'xtrim' command".to_string());
+            }
+            let key = args[1].clone();
+            let mut maxlen = None;
+            let mut minid = None;
+            let mut i = 2;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "MAXLEN" => {
+                        i += 1;
+                        if i < args.len() && (args[i].as_ref() == b"=" || args[i].as_ref() == b"~") {
+                            i += 1;
+                        }
+                        if i >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let len: usize = std::str::from_utf8(&args[i])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        maxlen = Some(len);
+                        i += 1;
+                    }
+                    "MINID" => {
+                        i += 1;
+                        if i < args.len() && (args[i].as_ref() == b"=" || args[i].as_ref() == b"~") {
+                            i += 1;
+                        }
+                        if i >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let id_str = std::str::from_utf8(&args[i])
+                            .map_err(|_| "Invalid stream ID specified as stream command argument")?;
+                        let parsed_id = crate::table::StreamId::parse_exact(id_str)
+                            .map_err(|e| e.to_string())?;
+                        minid = Some(parsed_id);
+                        i += 1;
+                    }
+                    "LIMIT" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        i += 2;
+                    }
+                    _ => {
+                        i += 1;
+                    }
+                }
+            }
+            Ok(Some(Command::Xtrim {
+                key,
+                maxlen,
+                minid,
+            }))
+        }
         _ => Ok(Some(Command::Unknown(cmd_name))),
     }
 }
@@ -2242,6 +2551,104 @@ mod tests {
                 serialized: Bytes::from_static(b"data"),
                 replace: true,
                 absttl: true,
+            }
+        );
+    }
+
+    #[test]
+    fn test_resp_streams() {
+        // XADD with auto ID
+        let mut buf = BytesMut::from("XADD s1 * field1 val1\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Xadd {
+                key: Bytes::from_static(b"s1"),
+                nomkstream: false,
+                maxlen: None,
+                minid: None,
+                id: crate::table::StreamAddId::Auto,
+                fields: vec![(Bytes::from_static(b"field1"), Bytes::from_static(b"val1"))],
+            }
+        );
+
+        // XADD with NOMKSTREAM and MAXLEN
+        let mut buf = BytesMut::from("XADD s1 NOMKSTREAM MAXLEN ~ 1000 100-0 f1 v1\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Xadd {
+                key: Bytes::from_static(b"s1"),
+                nomkstream: true,
+                maxlen: Some(1000),
+                minid: None,
+                id: crate::table::StreamAddId::Explicit(crate::table::StreamId::new(100, 0)),
+                fields: vec![(Bytes::from_static(b"f1"), Bytes::from_static(b"v1"))],
+            }
+        );
+
+        // XLEN
+        let mut buf = BytesMut::from("XLEN s1\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Xlen(Bytes::from_static(b"s1"))
+        );
+
+        // XRANGE
+        let mut buf = BytesMut::from("XRANGE s1 - + COUNT 10\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Xrange {
+                key: Bytes::from_static(b"s1"),
+                start: "-".to_string(),
+                end: "+".to_string(),
+                count: Some(10),
+            }
+        );
+
+        // XREVRANGE
+        let mut buf = BytesMut::from("XREVRANGE s1 + - COUNT 5\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Xrevrange {
+                key: Bytes::from_static(b"s1"),
+                end: "+".to_string(),
+                start: "-".to_string(),
+                count: Some(5),
+            }
+        );
+
+        // XREAD
+        let mut buf = BytesMut::from("XREAD COUNT 2 STREAMS s1 s2 0-0 $\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Xread {
+                count: Some(2),
+                block_ms: None,
+                keys: vec![Bytes::from_static(b"s1"), Bytes::from_static(b"s2")],
+                ids: vec!["0-0".to_string(), "$".to_string()],
+            }
+        );
+
+        // XDEL
+        let mut buf = BytesMut::from("XDEL s1 100-1 100-2\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Xdel {
+                key: Bytes::from_static(b"s1"),
+                ids: vec![
+                    crate::table::StreamId::new(100, 1),
+                    crate::table::StreamId::new(100, 2)
+                ],
+            }
+        );
+
+        // XTRIM
+        let mut buf = BytesMut::from("XTRIM s1 MAXLEN = 50\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Xtrim {
+                key: Bytes::from_static(b"s1"),
+                maxlen: Some(50),
+                minid: None,
             }
         );
     }

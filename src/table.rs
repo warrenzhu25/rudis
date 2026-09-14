@@ -92,6 +92,126 @@ impl RudisZSet {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StreamId {
+    pub ms: u64,
+    pub seq: u64,
+}
+
+impl StreamId {
+    pub fn new(ms: u64, seq: u64) -> Self {
+        Self { ms, seq }
+    }
+
+    pub fn to_string(&self) -> String {
+        format!("{}-{}", self.ms, self.seq)
+    }
+
+    pub fn parse_exact(s: &str) -> Result<Self, &'static str> {
+        let parts: Vec<&str> = s.split('-').collect();
+        if parts.len() != 2 {
+            return Err("Invalid stream ID specified as stream command argument");
+        }
+        let ms: u64 = parts[0]
+            .parse()
+            .map_err(|_| "Invalid stream ID specified as stream command argument")?;
+        let seq: u64 = parts[1]
+            .parse()
+            .map_err(|_| "Invalid stream ID specified as stream command argument")?;
+        Ok(Self { ms, seq })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamAddId {
+    Auto,
+    AutoSeq(u64),
+    Explicit(StreamId),
+}
+
+impl StreamAddId {
+    pub fn parse(s: &str) -> Result<Self, &'static str> {
+        if s == "*" {
+            return Ok(StreamAddId::Auto);
+        }
+        if let Some((ms_str, seq_str)) = s.split_once('-') {
+            let ms: u64 = ms_str
+                .parse()
+                .map_err(|_| "Invalid stream ID specified as stream command argument")?;
+            if seq_str == "*" {
+                return Ok(StreamAddId::AutoSeq(ms));
+            }
+            let seq: u64 = seq_str
+                .parse()
+                .map_err(|_| "Invalid stream ID specified as stream command argument")?;
+            return Ok(StreamAddId::Explicit(StreamId::new(ms, seq)));
+        }
+        Err("Invalid stream ID specified as stream command argument")
+    }
+}
+
+pub fn parse_range_bound(
+    s: &str,
+    is_start: bool,
+) -> Result<std::ops::Bound<StreamId>, &'static str> {
+    if s == "-" {
+        return Ok(std::ops::Bound::Unbounded);
+    }
+    if s == "+" {
+        return Ok(std::ops::Bound::Unbounded);
+    }
+    let (s_trim, exclusive) = if let Some(stripped) = s.strip_prefix('(') {
+        (stripped, true)
+    } else {
+        (s, false)
+    };
+    let id = if let Some((ms_str, seq_str)) = s_trim.split_once('-') {
+        let ms: u64 = ms_str
+            .parse()
+            .map_err(|_| "Invalid stream ID specified as stream command argument")?;
+        let seq: u64 = seq_str
+            .parse()
+            .map_err(|_| "Invalid stream ID specified as stream command argument")?;
+        StreamId::new(ms, seq)
+    } else {
+        let ms: u64 = s_trim
+            .parse()
+            .map_err(|_| "Invalid stream ID specified as stream command argument")?;
+        let seq = if is_start { 0 } else { u64::MAX };
+        StreamId::new(ms, seq)
+    };
+    if exclusive {
+        Ok(std::ops::Bound::Excluded(id))
+    } else {
+        Ok(std::ops::Bound::Included(id))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RudisStream {
+    pub entries: std::collections::BTreeMap<StreamId, Vec<(Bytes, Bytes)>>,
+    pub last_id: StreamId,
+}
+
+impl RudisStream {
+    pub fn new() -> Self {
+        Self {
+            entries: std::collections::BTreeMap::new(),
+            last_id: StreamId::default(),
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RudisValue {
     String(Bytes),
@@ -100,6 +220,7 @@ pub enum RudisValue {
     Set(hashbrown::HashSet<Bytes>),
     ZSet(RudisZSet),
     HyperLogLog(Box<[u8; 16384]>),
+    Stream(RudisStream),
 }
 
 #[derive(Clone, Debug)]
@@ -715,6 +836,7 @@ impl RudisTable {
                     RudisValue::Set(_) => "set",
                     RudisValue::ZSet(_) => "zset",
                     RudisValue::HyperLogLog(_) => "string",
+                    RudisValue::Stream(_) => "stream",
                 }
             } else {
                 "none"
@@ -2649,6 +2771,391 @@ impl RudisTable {
         Ok(())
     }
 
+    fn compute_stream_id(
+        stream: &mut RudisStream,
+        add_id: StreamAddId,
+    ) -> Result<StreamId, &'static str> {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let final_id = match add_id {
+            StreamAddId::Auto => {
+                let ms = if now_ms > stream.last_id.ms {
+                    now_ms
+                } else {
+                    stream.last_id.ms
+                };
+                let seq = if ms == stream.last_id.ms {
+                    if stream.last_id == StreamId::default() && stream.entries.is_empty() {
+                        if ms == 0 { 1 } else { 0 }
+                    } else {
+                        stream.last_id.seq + 1
+                    }
+                } else {
+                    if ms == 0 { 1 } else { 0 }
+                };
+                StreamId::new(ms, seq)
+            }
+            StreamAddId::AutoSeq(ms) => {
+                if ms < stream.last_id.ms {
+                    return Err(
+                        "ERR The ID specified in XADD is equal or smaller than the target stream top item",
+                    );
+                }
+                let seq = if ms == stream.last_id.ms {
+                    if stream.last_id == StreamId::default() && stream.entries.is_empty() {
+                        if ms == 0 { 1 } else { 0 }
+                    } else {
+                        stream.last_id.seq + 1
+                    }
+                } else {
+                    if ms == 0 { 1 } else { 0 }
+                };
+                StreamId::new(ms, seq)
+            }
+            StreamAddId::Explicit(id) => {
+                if id.ms == 0 && id.seq == 0 {
+                    return Err("ERR The ID specified in XADD must be greater than 0-0");
+                }
+                if !stream.entries.is_empty() || stream.last_id != StreamId::default() {
+                    if id <= stream.last_id {
+                        return Err(
+                            "ERR The ID specified in XADD is equal or smaller than the target stream top item",
+                        );
+                    }
+                }
+                id
+            }
+        };
+        Ok(final_id)
+    }
+
+    fn apply_stream_trim(
+        stream: &mut RudisStream,
+        maxlen: Option<usize>,
+        minid: Option<StreamId>,
+    ) -> usize {
+        let mut trimmed = 0;
+        if let Some(max) = maxlen {
+            while stream.entries.len() > max {
+                if let Some(first_key) = stream.entries.keys().next().copied() {
+                    stream.entries.remove(&first_key);
+                    trimmed += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        if let Some(min_id) = minid {
+            while let Some(first_key) = stream.entries.keys().next().copied() {
+                if first_key < min_id {
+                    stream.entries.remove(&first_key);
+                    trimmed += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        trimmed
+    }
+
+    pub fn xadd(
+        &mut self,
+        key: Bytes,
+        add_id: StreamAddId,
+        fields: Vec<(Bytes, Bytes)>,
+        nomkstream: bool,
+        maxlen: Option<usize>,
+        minid: Option<StreamId>,
+    ) -> Result<Option<StreamId>, &'static str> {
+        let h = hash_key(&key);
+        if let Some(idx) = self.table.find(&key, h) {
+            if self.check_expired_slot(idx) {
+                if nomkstream {
+                    return Ok(None);
+                }
+                let mut stream = RudisStream::new();
+                let final_id = Self::compute_stream_id(&mut stream, add_id)?;
+                stream.last_id = final_id;
+                stream.entries.insert(final_id, fields);
+                Self::apply_stream_trim(&mut stream, maxlen, minid);
+
+                let slot = crate::router::key_slot(&key);
+                self.slot_to_keys
+                    .entry(slot)
+                    .or_default()
+                    .insert(key.clone());
+                let entry = RudisEntry {
+                    key,
+                    val: RudisValue::Stream(stream),
+                    expire_at: None,
+                };
+                self.table.insert(entry);
+                return Ok(Some(final_id));
+            }
+
+            if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::Stream(stream) => {
+                        let final_id = Self::compute_stream_id(stream, add_id)?;
+                        stream.last_id = final_id;
+                        stream.entries.insert(final_id, fields);
+                        Self::apply_stream_trim(stream, maxlen, minid);
+                        return Ok(Some(final_id));
+                    }
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
+                }
+            }
+        }
+
+        if nomkstream {
+            return Ok(None);
+        }
+
+        let mut stream = RudisStream::new();
+        let final_id = Self::compute_stream_id(&mut stream, add_id)?;
+        stream.last_id = final_id;
+        stream.entries.insert(final_id, fields);
+        Self::apply_stream_trim(&mut stream, maxlen, minid);
+
+        let slot = crate::router::key_slot(&key);
+        self.slot_to_keys
+            .entry(slot)
+            .or_default()
+            .insert(key.clone());
+        let entry = RudisEntry {
+            key,
+            val: RudisValue::Stream(stream),
+            expire_at: None,
+        };
+        self.table.insert(entry);
+        Ok(Some(final_id))
+    }
+
+    pub fn xlen(&mut self, key: &[u8]) -> Result<usize, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(0);
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::Stream(stream) => Ok(stream.len()),
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(0)
+            }
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn xrange(
+        &mut self,
+        key: &[u8],
+        start: &str,
+        end: &str,
+        count: Option<usize>,
+    ) -> Result<Vec<(StreamId, Vec<(Bytes, Bytes)>)>, &'static str> {
+        let start_bound = parse_range_bound(start, true)?;
+        let end_bound = parse_range_bound(end, false)?;
+
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(Vec::new());
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::Stream(stream) => {
+                        let limit = count.unwrap_or(usize::MAX);
+                        let mut items = Vec::new();
+                        for (id, fields) in stream.entries.range((start_bound, end_bound)) {
+                            items.push((*id, fields.clone()));
+                            if items.len() >= limit {
+                                break;
+                            }
+                        }
+                        Ok(items)
+                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(Vec::new())
+            }
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub fn xrevrange(
+        &mut self,
+        key: &[u8],
+        end: &str,
+        start: &str,
+        count: Option<usize>,
+    ) -> Result<Vec<(StreamId, Vec<(Bytes, Bytes)>)>, &'static str> {
+        let start_bound = parse_range_bound(start, true)?;
+        let end_bound = parse_range_bound(end, false)?;
+
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(Vec::new());
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::Stream(stream) => {
+                        let limit = count.unwrap_or(usize::MAX);
+                        let mut items = Vec::new();
+                        for (id, fields) in stream.entries.range((start_bound, end_bound)).rev() {
+                            items.push((*id, fields.clone()));
+                            if items.len() >= limit {
+                                break;
+                            }
+                        }
+                        Ok(items)
+                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(Vec::new())
+            }
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub fn xread(
+        &mut self,
+        keys: &[Bytes],
+        ids: &[String],
+        count: Option<usize>,
+    ) -> Result<Vec<(Bytes, Vec<(StreamId, Vec<(Bytes, Bytes)>)>)>, &'static str> {
+        if keys.len() != ids.len() {
+            return Err("ERR Unbalanced XREAD list of streams and IDs");
+        }
+        let mut results = Vec::new();
+        let limit = count.unwrap_or(usize::MAX);
+
+        for (k, id_str) in keys.iter().zip(ids.iter()) {
+            let h = hash_key(k);
+            if let Some(idx) = self.table.find(k, h) {
+                if self.check_expired_slot(idx) {
+                    continue;
+                }
+                if let Some(entry) = self.table.get_slot(idx) {
+                    match &entry.val {
+                        RudisValue::Stream(stream) => {
+                            let lower_bound = if id_str == "$" {
+                                std::ops::Bound::Excluded(stream.last_id)
+                            } else if id_str == "+" {
+                                std::ops::Bound::Excluded(StreamId::new(u64::MAX, u64::MAX))
+                            } else {
+                                let bound_id = if let Some((ms_s, seq_s)) = id_str.split_once('-') {
+                                    let ms: u64 = ms_s.parse().map_err(|_| {
+                                        "Invalid stream ID specified as stream command argument"
+                                    })?;
+                                    let seq: u64 = seq_s.parse().map_err(|_| {
+                                        "Invalid stream ID specified as stream command argument"
+                                    })?;
+                                    StreamId::new(ms, seq)
+                                } else {
+                                    let ms: u64 = id_str.parse().map_err(|_| {
+                                        "Invalid stream ID specified as stream command argument"
+                                    })?;
+                                    StreamId::new(ms, 0)
+                                };
+                                std::ops::Bound::Excluded(bound_id)
+                            };
+
+                            let mut entries = Vec::new();
+                            for (id, fields) in stream
+                                .entries
+                                .range((lower_bound, std::ops::Bound::Unbounded))
+                            {
+                                entries.push((*id, fields.clone()));
+                                if entries.len() >= limit {
+                                    break;
+                                }
+                            }
+                            if !entries.is_empty() {
+                                results.push((k.clone(), entries));
+                            }
+                        }
+                        _ => {
+                            return Err(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    pub fn xdel(&mut self, key: &[u8], ids: &[StreamId]) -> Result<usize, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(0);
+            }
+            if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::Stream(stream) => {
+                        let mut count = 0;
+                        for id in ids {
+                            if stream.entries.remove(id).is_some() {
+                                count += 1;
+                            }
+                        }
+                        Ok(count)
+                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(0)
+            }
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn xtrim(
+        &mut self,
+        key: &[u8],
+        maxlen: Option<usize>,
+        minid: Option<StreamId>,
+    ) -> Result<usize, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(0);
+            }
+            if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::Stream(stream) => {
+                        let trimmed = Self::apply_stream_trim(stream, maxlen, minid);
+                        Ok(trimmed)
+                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(0)
+            }
+        } else {
+            Ok(0)
+        }
+    }
+
     // RDB SERIALIZATION & DUMP / RESTORE
     pub fn dump(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         let h = hash_key(key);
@@ -2702,6 +3209,23 @@ impl RudisTable {
             RudisValue::HyperLogLog(regs) => {
                 payload.push(5u8);
                 payload.extend_from_slice(regs.as_ref());
+            }
+            RudisValue::Stream(stream) => {
+                payload.push(6u8);
+                payload.extend_from_slice(&(stream.entries.len() as u32).to_le_bytes());
+                payload.extend_from_slice(&stream.last_id.ms.to_le_bytes());
+                payload.extend_from_slice(&stream.last_id.seq.to_le_bytes());
+                for (id, fields) in &stream.entries {
+                    payload.extend_from_slice(&id.ms.to_le_bytes());
+                    payload.extend_from_slice(&id.seq.to_le_bytes());
+                    payload.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+                    for (k, v) in fields {
+                        payload.extend_from_slice(&(k.len() as u32).to_le_bytes());
+                        payload.extend_from_slice(k);
+                        payload.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                        payload.extend_from_slice(v);
+                    }
+                }
             }
         }
 
@@ -2889,6 +3413,75 @@ impl RudisTable {
                 let mut regs = Box::new([0u8; 16384]);
                 regs.copy_from_slice(&serialized[cursor..cursor + 16384]);
                 RudisValue::HyperLogLog(regs)
+            }
+            6 => {
+                // Stream
+                if cursor + 4 + 8 + 8 > payload_len {
+                    return Err("DUMP payload version or checksum are wrong");
+                }
+                let count = u32::from_le_bytes(
+                    serialized[cursor..cursor + 4].try_into().unwrap(),
+                ) as usize;
+                cursor += 4;
+                let last_ms = u64::from_le_bytes(
+                    serialized[cursor..cursor + 8].try_into().unwrap(),
+                );
+                cursor += 8;
+                let last_seq = u64::from_le_bytes(
+                    serialized[cursor..cursor + 8].try_into().unwrap(),
+                );
+                cursor += 8;
+                let mut entries = std::collections::BTreeMap::new();
+                for _ in 0..count {
+                    if cursor + 8 + 8 + 4 > payload_len {
+                        return Err("DUMP payload version or checksum are wrong");
+                    }
+                    let ms = u64::from_le_bytes(
+                        serialized[cursor..cursor + 8].try_into().unwrap(),
+                    );
+                    cursor += 8;
+                    let seq = u64::from_le_bytes(
+                        serialized[cursor..cursor + 8].try_into().unwrap(),
+                    );
+                    cursor += 8;
+                    let f_count = u32::from_le_bytes(
+                        serialized[cursor..cursor + 4].try_into().unwrap(),
+                    ) as usize;
+                    cursor += 4;
+                    let mut fields = Vec::with_capacity(f_count);
+                    for _ in 0..f_count {
+                        if cursor + 4 > payload_len {
+                            return Err("DUMP payload version or checksum are wrong");
+                        }
+                        let k_len = u32::from_le_bytes(
+                            serialized[cursor..cursor + 4].try_into().unwrap(),
+                        ) as usize;
+                        cursor += 4;
+                        if cursor + k_len > payload_len {
+                            return Err("DUMP payload version or checksum are wrong");
+                        }
+                        let k = Bytes::copy_from_slice(&serialized[cursor..cursor + k_len]);
+                        cursor += k_len;
+                        if cursor + 4 > payload_len {
+                            return Err("DUMP payload version or checksum are wrong");
+                        }
+                        let v_len = u32::from_le_bytes(
+                            serialized[cursor..cursor + 4].try_into().unwrap(),
+                        ) as usize;
+                        cursor += 4;
+                        if cursor + v_len > payload_len {
+                            return Err("DUMP payload version or checksum are wrong");
+                        }
+                        let v = Bytes::copy_from_slice(&serialized[cursor..cursor + v_len]);
+                        cursor += v_len;
+                        fields.push((k, v));
+                    }
+                    entries.insert(StreamId::new(ms, seq), fields);
+                }
+                RudisValue::Stream(RudisStream {
+                    entries,
+                    last_id: StreamId::new(last_ms, last_seq),
+                })
             }
             _ => return Err("DUMP payload version or checksum are wrong"),
         };
@@ -3387,5 +3980,178 @@ mod tests {
             .unwrap();
         assert_eq!(table.zscore(b"restored_z", b"m1").unwrap(), Some(10.5));
         assert_eq!(table.zscore(b"restored_z", b"m2").unwrap(), Some(20.0));
+    }
+
+    #[test]
+    fn test_streams_table() {
+        let mut table = RudisTable::new();
+
+        // 1. Invalid ID checks
+        let err0 = table.xadd(
+            Bytes::from_static(b"mystream"),
+            StreamAddId::Explicit(StreamId::new(0, 0)),
+            vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))],
+            false,
+            None,
+            None,
+        );
+        assert_eq!(
+            err0,
+            Err("ERR The ID specified in XADD must be greater than 0-0")
+        );
+
+        // 2. NOMKSTREAM when stream doesn't exist
+        let res_nomk = table
+            .xadd(
+                Bytes::from_static(b"nonexistent"),
+                StreamAddId::Auto,
+                vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))],
+                true,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(res_nomk, None);
+
+        // 3. XADD with explicit ID
+        let id1 = table
+            .xadd(
+                Bytes::from_static(b"s1"),
+                StreamAddId::Explicit(StreamId::new(1000, 1)),
+                vec![
+                    (Bytes::from_static(b"sensor"), Bytes::from_static(b"temp")),
+                    (Bytes::from_static(b"val"), Bytes::from_static(b"25")),
+                ],
+                false,
+                None,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(id1, StreamId::new(1000, 1));
+        assert_eq!(table.xlen(b"s1").unwrap(), 1);
+
+        // Monotonicity error
+        let err_mono = table.xadd(
+            Bytes::from_static(b"s1"),
+            StreamAddId::Explicit(StreamId::new(1000, 1)),
+            vec![(Bytes::from_static(b"a"), Bytes::from_static(b"b"))],
+            false,
+            None,
+            None,
+        );
+        assert_eq!(
+            err_mono,
+            Err("ERR The ID specified in XADD is equal or smaller than the target stream top item")
+        );
+
+        // 4. AutoSeq
+        let id2 = table
+            .xadd(
+                Bytes::from_static(b"s1"),
+                StreamAddId::AutoSeq(1000),
+                vec![(Bytes::from_static(b"val"), Bytes::from_static(b"26"))],
+                false,
+                None,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(id2, StreamId::new(1000, 2));
+
+        let id3 = table
+            .xadd(
+                Bytes::from_static(b"s1"),
+                StreamAddId::AutoSeq(1001),
+                vec![(Bytes::from_static(b"val"), Bytes::from_static(b"27"))],
+                false,
+                None,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(id3, StreamId::new(1001, 0));
+        assert_eq!(table.xlen(b"s1").unwrap(), 3);
+
+        // 5. XRANGE
+        let range = table.xrange(b"s1", "-", "+", None).unwrap();
+        assert_eq!(range.len(), 3);
+        assert_eq!(range[0].0, id1);
+        assert_eq!(range[1].0, id2);
+        assert_eq!(range[2].0, id3);
+
+        // XRANGE with count
+        let range_limited = table.xrange(b"s1", "-", "+", Some(2)).unwrap();
+        assert_eq!(range_limited.len(), 2);
+        assert_eq!(range_limited[0].0, id1);
+        assert_eq!(range_limited[1].0, id2);
+
+        // XRANGE exclusive prefix
+        let range_ex = table.xrange(b"s1", "(1000-1", "+", None).unwrap();
+        assert_eq!(range_ex.len(), 2);
+        assert_eq!(range_ex[0].0, id2);
+
+        // 6. XREVRANGE
+        let rev = table.xrevrange(b"s1", "+", "-", None).unwrap();
+        assert_eq!(rev.len(), 3);
+        assert_eq!(rev[0].0, id3);
+        assert_eq!(rev[1].0, id2);
+        assert_eq!(rev[2].0, id1);
+
+        // 7. XREAD
+        let read_res = table
+            .xread(&[Bytes::from_static(b"s1")], &[id1.to_string()], None)
+            .unwrap();
+        assert_eq!(read_res.len(), 1);
+        assert_eq!(read_res[0].1.len(), 2);
+        assert_eq!(read_res[0].1[0].0, id2);
+        assert_eq!(read_res[0].1[1].0, id3);
+
+        // XREAD with $
+        let read_dollar = table
+            .xread(&[Bytes::from_static(b"s1")], &[String::from("$")], None)
+            .unwrap();
+        assert_eq!(read_dollar.len(), 0);
+
+        // 8. XDEL
+        let del_cnt = table.xdel(b"s1", &[id2]).unwrap();
+        assert_eq!(del_cnt, 1);
+        assert_eq!(table.xlen(b"s1").unwrap(), 2);
+
+        // 9. XTRIM
+        // Add more entries
+        for i in 10..20 {
+            table
+                .xadd(
+                    Bytes::from_static(b"s1"),
+                    StreamAddId::Explicit(StreamId::new(2000 + i, 0)),
+                    vec![(Bytes::from_static(b"i"), Bytes::from(i.to_string()))],
+                    false,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        assert_eq!(table.xlen(b"s1").unwrap(), 12);
+        let trimmed = table.xtrim(b"s1", Some(5), None).unwrap();
+        assert_eq!(trimmed, 7);
+        assert_eq!(table.xlen(b"s1").unwrap(), 5);
+
+        // 10. DUMP and RESTORE stream
+        let stream_dump = table.dump(b"s1").unwrap();
+        table
+            .restore(
+                Bytes::from_static(b"restored_stream"),
+                0,
+                &stream_dump,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(table.xlen(b"restored_stream").unwrap(), 5);
+        let restored_range = table
+            .xrange(b"restored_stream", "-", "+", None)
+            .unwrap();
+        assert_eq!(restored_range.len(), 5);
     }
 }
