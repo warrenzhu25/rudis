@@ -298,6 +298,37 @@ impl ShardDb {
         self.table.hvals(key)
     }
 
+    #[inline]
+    pub fn hincrby(&mut self, key: Bytes, field: Bytes, delta: i64) -> Result<i64, &'static str> {
+        self.table.hincrby(key, field, delta)
+    }
+
+    #[inline]
+    pub fn hincrbyfloat(&mut self, key: Bytes, field: Bytes, delta: f64) -> Result<f64, &'static str> {
+        self.table.hincrbyfloat(key, field, delta)
+    }
+
+    #[inline]
+    pub fn hrandfield(
+        &mut self,
+        key: &[u8],
+        count: Option<i64>,
+        with_values: bool,
+    ) -> Result<Vec<Bytes>, &'static str> {
+        self.table.hrandfield(key, count, with_values)
+    }
+
+    #[inline]
+    pub fn hscan(
+        &mut self,
+        key: &[u8],
+        cursor: usize,
+        pattern: Option<&[u8]>,
+        count: usize,
+    ) -> Result<(usize, Vec<Bytes>), &'static str> {
+        self.table.hscan(key, cursor, pattern, count)
+    }
+
     // LIST METHODS
     #[inline]
     pub fn lpush(&mut self, key: Bytes, values: Vec<Bytes>) -> Result<usize, &'static str> {
@@ -337,6 +368,55 @@ impl ShardDb {
         stop: i64,
     ) -> Result<Vec<Bytes>, &'static str> {
         self.table.lrange(key, start, stop)
+    }
+
+    #[inline]
+    pub fn ltrim(&mut self, key: &[u8], start: i64, stop: i64) -> Result<(), &'static str> {
+        self.table.ltrim(key, start, stop)
+    }
+
+    #[inline]
+    pub fn lset(&mut self, key: &[u8], index: i64, element: Bytes) -> Result<(), &'static str> {
+        self.table.lset(key, index, element)
+    }
+
+    #[inline]
+    pub fn lrem(&mut self, key: &[u8], count: i64, element: &[u8]) -> Result<usize, &'static str> {
+        self.table.lrem(key, count, element)
+    }
+
+    #[inline]
+    pub fn lpos(
+        &mut self,
+        key: &[u8],
+        element: &[u8],
+        rank: i64,
+        count: Option<usize>,
+        maxlen: Option<usize>,
+    ) -> Result<Vec<usize>, &'static str> {
+        self.table.lpos(key, element, rank, count, maxlen)
+    }
+
+    #[inline]
+    pub fn linsert(
+        &mut self,
+        key: Bytes,
+        before: bool,
+        pivot: &[u8],
+        element: Bytes,
+    ) -> Result<i64, &'static str> {
+        self.table.linsert(key, before, pivot, element)
+    }
+
+    #[inline]
+    pub fn lmove(
+        &mut self,
+        source: &[u8],
+        destination: Bytes,
+        where_from: crate::table::ListDirection,
+        where_to: crate::table::ListDirection,
+    ) -> Result<Option<Bytes>, &'static str> {
+        self.table.lmove(source, destination, where_from, where_to)
     }
 
     // SET METHODS
@@ -398,6 +478,32 @@ impl ShardDb {
     #[inline]
     pub fn sdiffstore(&mut self, dest: Bytes, keys: &[Bytes]) -> Result<usize, &'static str> {
         self.table.sdiffstore(dest, keys)
+    }
+
+    #[inline]
+    pub fn smismember(&mut self, key: &[u8], members: &[Bytes]) -> Result<Vec<bool>, &'static str> {
+        self.table.smismember(key, members)
+    }
+
+    #[inline]
+    pub fn srandmember(&mut self, key: &[u8], count: Option<i64>) -> Result<Vec<Bytes>, &'static str> {
+        self.table.srandmember(key, count)
+    }
+
+    #[inline]
+    pub fn smove(&mut self, source: &[u8], destination: Bytes, member: Bytes) -> Result<bool, &'static str> {
+        self.table.smove(source, destination, member)
+    }
+
+    #[inline]
+    pub fn sscan(
+        &mut self,
+        key: &[u8],
+        cursor: usize,
+        pattern: Option<&[u8]>,
+        count: usize,
+    ) -> Result<(usize, Vec<Bytes>), &'static str> {
+        self.table.sscan(key, cursor, pattern, count)
     }
 
     #[inline]
@@ -526,6 +632,69 @@ impl ShardDb {
     }
 
     #[inline]
+    pub fn zmscore(&mut self, key: &[u8], members: &[Bytes]) -> Result<Vec<Option<f64>>, &'static str> {
+        self.table.zmscore(key, members)
+    }
+
+    #[inline]
+    pub fn zrandmember(
+        &mut self,
+        key: &[u8],
+        count: Option<i64>,
+        with_scores: bool,
+    ) -> Result<Vec<(Bytes, f64)>, &'static str> {
+        self.table.zrandmember(key, count, with_scores)
+    }
+
+    #[inline]
+    pub fn zremrangebyrank(&mut self, key: &[u8], start: i64, stop: i64) -> Result<usize, &'static str> {
+        self.table.zremrangebyrank(key, start, stop)
+    }
+
+    #[inline]
+    pub fn zremrangebyscore(
+        &mut self,
+        key: &[u8],
+        min: f64,
+        min_inc: bool,
+        max: f64,
+        max_inc: bool,
+    ) -> Result<usize, &'static str> {
+        self.table.zremrangebyscore(key, min, min_inc, max, max_inc)
+    }
+
+    #[inline]
+    pub fn zremrangebylex(
+        &mut self,
+        key: &[u8],
+        min: &crate::table::LexBound,
+        max: &crate::table::LexBound,
+    ) -> Result<usize, &'static str> {
+        self.table.zremrangebylex(key, min, max)
+    }
+
+    #[inline]
+    pub fn zlexcount(
+        &mut self,
+        key: &[u8],
+        min: &crate::table::LexBound,
+        max: &crate::table::LexBound,
+    ) -> Result<usize, &'static str> {
+        self.table.zlexcount(key, min, max)
+    }
+
+    #[inline]
+    pub fn zscan(
+        &mut self,
+        key: &[u8],
+        cursor: usize,
+        pattern: Option<&[u8]>,
+        count: usize,
+    ) -> Result<(usize, Vec<(Bytes, f64)>), &'static str> {
+        self.table.zscan(key, cursor, pattern, count)
+    }
+
+    #[inline]
     pub fn flushdb(&mut self) {
         self.table.flushdb();
     }
@@ -573,6 +742,21 @@ impl ShardDb {
     #[inline]
     pub fn strlen(&mut self, key: &[u8]) -> Result<usize, &'static str> {
         self.table.strlen(key)
+    }
+
+    #[inline]
+    pub fn incrbyfloat(&mut self, key: Bytes, delta: f64) -> Result<f64, &'static str> {
+        self.table.incrbyfloat(key, delta)
+    }
+
+    #[inline]
+    pub fn setrange(&mut self, key: Bytes, offset: usize, value: &[u8]) -> Result<usize, &'static str> {
+        self.table.setrange(key, offset, value)
+    }
+
+    #[inline]
+    pub fn getrange(&mut self, key: &[u8], start: i64, end: i64) -> Result<Bytes, &'static str> {
+        self.table.getrange(key, start, end)
     }
 
     #[inline]

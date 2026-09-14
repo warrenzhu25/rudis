@@ -438,6 +438,147 @@ pub enum Command {
         group: Bytes,
         range: Option<(crate::table::StreamId, crate::table::StreamId, usize, Option<Bytes>)>,
     },
+    // VALKEY EXTENDED COMMANDS
+    Hello {
+        proto: Option<u8>,
+        auth: Option<(String, String)>,
+        setname: Option<String>,
+    },
+    Reset,
+    Time,
+    Echo(Bytes),
+    Hincrby {
+        key: Bytes,
+        field: Bytes,
+        increment: i64,
+    },
+    Hincrbyfloat {
+        key: Bytes,
+        field: Bytes,
+        increment: f64,
+    },
+    Hrandfield {
+        key: Bytes,
+        count: Option<i64>,
+        with_values: bool,
+    },
+    Hscan {
+        key: Bytes,
+        cursor: usize,
+        pattern: Option<Bytes>,
+        count: Option<usize>,
+    },
+    Smismember {
+        key: Bytes,
+        members: Vec<Bytes>,
+    },
+    Srandmember {
+        key: Bytes,
+        count: Option<i64>,
+    },
+    Smove {
+        source: Bytes,
+        destination: Bytes,
+        member: Bytes,
+    },
+    Sscan {
+        key: Bytes,
+        cursor: usize,
+        pattern: Option<Bytes>,
+        count: Option<usize>,
+    },
+    Zmscore {
+        key: Bytes,
+        members: Vec<Bytes>,
+    },
+    Zrandmember {
+        key: Bytes,
+        count: Option<i64>,
+        with_scores: bool,
+    },
+    Zremrangebyrank {
+        key: Bytes,
+        start: i64,
+        stop: i64,
+    },
+    Zremrangebyscore {
+        key: Bytes,
+        min_score: f64,
+        min_inc: bool,
+        max_score: f64,
+        max_inc: bool,
+    },
+    Zremrangebylex {
+        key: Bytes,
+        min: crate::table::LexBound,
+        max: crate::table::LexBound,
+    },
+    Zlexcount {
+        key: Bytes,
+        min: crate::table::LexBound,
+        max: crate::table::LexBound,
+    },
+    Zscan {
+        key: Bytes,
+        cursor: usize,
+        pattern: Option<Bytes>,
+        count: Option<usize>,
+    },
+    Ltrim {
+        key: Bytes,
+        start: i64,
+        stop: i64,
+    },
+    Lset {
+        key: Bytes,
+        index: i64,
+        element: Bytes,
+    },
+    Lrem {
+        key: Bytes,
+        count: i64,
+        element: Bytes,
+    },
+    Lpos {
+        key: Bytes,
+        element: Bytes,
+        rank: Option<i64>,
+        count: Option<usize>,
+        maxlen: Option<usize>,
+    },
+    Linsert {
+        key: Bytes,
+        before: bool,
+        pivot: Bytes,
+        element: Bytes,
+    },
+    Lmove {
+        source: Bytes,
+        destination: Bytes,
+        where_from: crate::table::ListDirection,
+        where_to: crate::table::ListDirection,
+    },
+    Blmove {
+        source: Bytes,
+        destination: Bytes,
+        where_from: crate::table::ListDirection,
+        where_to: crate::table::ListDirection,
+        timeout: f64,
+    },
+    Incrbyfloat {
+        key: Bytes,
+        increment: f64,
+    },
+    Setrange {
+        key: Bytes,
+        offset: usize,
+        value: Bytes,
+    },
+    Getrange {
+        key: Bytes,
+        start: i64,
+        end: i64,
+    },
     Unknown(String),
 }
 
@@ -2806,6 +2947,588 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }))
             }
         }
+        "HELLO" => {
+            let mut proto = None;
+            let mut auth = None;
+            let mut setname = None;
+            let mut i = 1;
+            if i < args.len() {
+                if let Ok(p) = String::from_utf8_lossy(&args[i]).parse::<u8>() {
+                    proto = Some(p);
+                    i += 1;
+                }
+            }
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "AUTH" => {
+                        if i + 2 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let u = String::from_utf8_lossy(&args[i + 1]).to_string();
+                        let p = String::from_utf8_lossy(&args[i + 2]).to_string();
+                        auth = Some((u, p));
+                        i += 3;
+                    }
+                    "SETNAME" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let name = String::from_utf8_lossy(&args[i + 1]).to_string();
+                        setname = Some(name);
+                        i += 2;
+                    }
+                    _ => {
+                        i += 1;
+                    }
+                }
+            }
+            Ok(Some(Command::Hello { proto, auth, setname }))
+        }
+        "RESET" => Ok(Some(Command::Reset)),
+        "TIME" => Ok(Some(Command::Time)),
+        "ECHO" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'echo' command".to_string());
+            }
+            Ok(Some(Command::Echo(args[1].clone())))
+        }
+        "HINCRBY" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'hincrby' command".to_string());
+            }
+            let increment: i64 = std::str::from_utf8(&args[3])
+                .map_err(|_| "value is not an integer or out of range".to_string())?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range".to_string())?;
+            Ok(Some(Command::Hincrby {
+                key: args[1].clone(),
+                field: args[2].clone(),
+                increment,
+            }))
+        }
+        "HINCRBYFLOAT" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'hincrbyfloat' command".to_string());
+            }
+            let increment: f64 = std::str::from_utf8(&args[3])
+                .map_err(|_| "value is not a valid float".to_string())?
+                .parse()
+                .map_err(|_| "value is not a valid float".to_string())?;
+            if increment.is_nan() || increment.is_infinite() {
+                return Err("value is not a valid float".to_string());
+            }
+            Ok(Some(Command::Hincrbyfloat {
+                key: args[1].clone(),
+                field: args[2].clone(),
+                increment,
+            }))
+        }
+        "HRANDFIELD" => {
+            if args.len() < 2 || args.len() > 4 {
+                return Err("wrong number of arguments for 'hrandfield' command".to_string());
+            }
+            let count = if args.len() >= 3 {
+                let c: i64 = std::str::from_utf8(&args[2])
+                    .map_err(|_| "value is not an integer or out of range".to_string())?
+                    .parse()
+                    .map_err(|_| "value is not an integer or out of range".to_string())?;
+                Some(c)
+            } else {
+                None
+            };
+            let mut with_values = false;
+            if args.len() == 4 {
+                if String::from_utf8_lossy(&args[3]).eq_ignore_ascii_case("WITHVALUES") {
+                    with_values = true;
+                } else {
+                    return Err("syntax error".to_string());
+                }
+            }
+            Ok(Some(Command::Hrandfield {
+                key: args[1].clone(),
+                count,
+                with_values,
+            }))
+        }
+        "HSCAN" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'hscan' command".to_string());
+            }
+            let cursor: usize = std::str::from_utf8(&args[2])
+                .map_err(|_| "value is not an integer or out of range".to_string())?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range".to_string())?;
+            let mut pattern = None;
+            let mut count = None;
+            let mut i = 3;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "MATCH" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        pattern = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "COUNT" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let c: usize = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        count = Some(c);
+                        i += 2;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            Ok(Some(Command::Hscan {
+                key: args[1].clone(),
+                cursor,
+                pattern,
+                count,
+            }))
+        }
+        "SMISMEMBER" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'smismember' command".to_string());
+            }
+            Ok(Some(Command::Smismember {
+                key: args[1].clone(),
+                members: args[2..].to_vec(),
+            }))
+        }
+        "SRANDMEMBER" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Err("wrong number of arguments for 'srandmember' command".to_string());
+            }
+            let count = if args.len() == 3 {
+                let c: i64 = std::str::from_utf8(&args[2])
+                    .map_err(|_| "value is not an integer or out of range".to_string())?
+                    .parse()
+                    .map_err(|_| "value is not an integer or out of range".to_string())?;
+                Some(c)
+            } else {
+                None
+            };
+            Ok(Some(Command::Srandmember {
+                key: args[1].clone(),
+                count,
+            }))
+        }
+        "SMOVE" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'smove' command".to_string());
+            }
+            Ok(Some(Command::Smove {
+                source: args[1].clone(),
+                destination: args[2].clone(),
+                member: args[3].clone(),
+            }))
+        }
+        "SSCAN" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'sscan' command".to_string());
+            }
+            let cursor: usize = std::str::from_utf8(&args[2])
+                .map_err(|_| "value is not an integer or out of range".to_string())?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range".to_string())?;
+            let mut pattern = None;
+            let mut count = None;
+            let mut i = 3;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "MATCH" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        pattern = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "COUNT" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let c: usize = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        count = Some(c);
+                        i += 2;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            Ok(Some(Command::Sscan {
+                key: args[1].clone(),
+                cursor,
+                pattern,
+                count,
+            }))
+        }
+        "ZMSCORE" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'zmscore' command".to_string());
+            }
+            Ok(Some(Command::Zmscore {
+                key: args[1].clone(),
+                members: args[2..].to_vec(),
+            }))
+        }
+        "ZRANDMEMBER" => {
+            if args.len() < 2 || args.len() > 4 {
+                return Err("wrong number of arguments for 'zrandmember' command".to_string());
+            }
+            let count = if args.len() >= 3 {
+                let c: i64 = std::str::from_utf8(&args[2])
+                    .map_err(|_| "value is not an integer or out of range".to_string())?
+                    .parse()
+                    .map_err(|_| "value is not an integer or out of range".to_string())?;
+                Some(c)
+            } else {
+                None
+            };
+            let mut with_scores = false;
+            if args.len() == 4 {
+                if String::from_utf8_lossy(&args[3]).eq_ignore_ascii_case("WITHSCORES") {
+                    with_scores = true;
+                } else {
+                    return Err("syntax error".to_string());
+                }
+            }
+            Ok(Some(Command::Zrandmember {
+                key: args[1].clone(),
+                count,
+                with_scores,
+            }))
+        }
+        "ZREMRANGEBYRANK" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'zremrangebyrank' command".to_string());
+            }
+            let start: i64 = std::str::from_utf8(&args[2])
+                .map_err(|_| "value is not an integer or out of range".to_string())?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range".to_string())?;
+            let stop: i64 = std::str::from_utf8(&args[3])
+                .map_err(|_| "value is not an integer or out of range".to_string())?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range".to_string())?;
+            Ok(Some(Command::Zremrangebyrank {
+                key: args[1].clone(),
+                start,
+                stop,
+            }))
+        }
+        "ZREMRANGEBYSCORE" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'zremrangebyscore' command".to_string());
+            }
+            let (min_score, min_inc) = parse_score_bound(&args[2])?;
+            let (max_score, max_inc) = parse_score_bound(&args[3])?;
+            Ok(Some(Command::Zremrangebyscore {
+                key: args[1].clone(),
+                min_score,
+                min_inc,
+                max_score,
+                max_inc,
+            }))
+        }
+        "ZREMRANGEBYLEX" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'zremrangebylex' command".to_string());
+            }
+            let min = crate::table::parse_lex_bound(&args[2]).map_err(|e| e.to_string())?;
+            let max = crate::table::parse_lex_bound(&args[3]).map_err(|e| e.to_string())?;
+            Ok(Some(Command::Zremrangebylex {
+                key: args[1].clone(),
+                min,
+                max,
+            }))
+        }
+        "ZLEXCOUNT" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'zlexcount' command".to_string());
+            }
+            let min = crate::table::parse_lex_bound(&args[2]).map_err(|e| e.to_string())?;
+            let max = crate::table::parse_lex_bound(&args[3]).map_err(|e| e.to_string())?;
+            Ok(Some(Command::Zlexcount {
+                key: args[1].clone(),
+                min,
+                max,
+            }))
+        }
+        "ZSCAN" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'zscan' command".to_string());
+            }
+            let cursor: usize = std::str::from_utf8(&args[2])
+                .map_err(|_| "value is not an integer or out of range".to_string())?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range".to_string())?;
+            let mut pattern = None;
+            let mut count = None;
+            let mut i = 3;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "MATCH" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        pattern = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "COUNT" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let c: usize = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        count = Some(c);
+                        i += 2;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            Ok(Some(Command::Zscan {
+                key: args[1].clone(),
+                cursor,
+                pattern,
+                count,
+            }))
+        }
+        "LTRIM" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'ltrim' command".to_string());
+            }
+            let start: i64 = std::str::from_utf8(&args[2])
+                .map_err(|_| "value is not an integer or out of range".to_string())?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range".to_string())?;
+            let stop: i64 = std::str::from_utf8(&args[3])
+                .map_err(|_| "value is not an integer or out of range".to_string())?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range".to_string())?;
+            Ok(Some(Command::Ltrim {
+                key: args[1].clone(),
+                start,
+                stop,
+            }))
+        }
+        "LSET" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'lset' command".to_string());
+            }
+            let index: i64 = std::str::from_utf8(&args[2])
+                .map_err(|_| "value is not an integer or out of range".to_string())?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range".to_string())?;
+            Ok(Some(Command::Lset {
+                key: args[1].clone(),
+                index,
+                element: args[3].clone(),
+            }))
+        }
+        "LREM" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'lrem' command".to_string());
+            }
+            let count: i64 = std::str::from_utf8(&args[2])
+                .map_err(|_| "value is not an integer or out of range".to_string())?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range".to_string())?;
+            Ok(Some(Command::Lrem {
+                key: args[1].clone(),
+                count,
+                element: args[3].clone(),
+            }))
+        }
+        "LPOS" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'lpos' command".to_string());
+            }
+            let mut rank = None;
+            let mut count = None;
+            let mut maxlen = None;
+            let mut i = 3;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "RANK" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let r: i64 = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        if r == 0 {
+                            return Err("RANK can't be zero: use 1 to start from the first match, use -1 from the last".to_string());
+                        }
+                        rank = Some(r);
+                        i += 2;
+                    }
+                    "COUNT" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let c: usize = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        count = Some(c);
+                        i += 2;
+                    }
+                    "MAXLEN" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let m: usize = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        maxlen = Some(m);
+                        i += 2;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            Ok(Some(Command::Lpos {
+                key: args[1].clone(),
+                element: args[2].clone(),
+                rank,
+                count,
+                maxlen,
+            }))
+        }
+        "LINSERT" => {
+            if args.len() != 5 {
+                return Err("wrong number of arguments for 'linsert' command".to_string());
+            }
+            let dir_str = String::from_utf8_lossy(&args[2]).to_uppercase();
+            let before = match dir_str.as_str() {
+                "BEFORE" => true,
+                "AFTER" => false,
+                _ => return Err("syntax error".to_string()),
+            };
+            Ok(Some(Command::Linsert {
+                key: args[1].clone(),
+                before,
+                pivot: args[3].clone(),
+                element: args[4].clone(),
+            }))
+        }
+        "LMOVE" => {
+            if args.len() != 5 {
+                return Err("wrong number of arguments for 'lmove' command".to_string());
+            }
+            let from_str = String::from_utf8_lossy(&args[3]).to_uppercase();
+            let where_from = match from_str.as_str() {
+                "LEFT" => crate::table::ListDirection::Left,
+                "RIGHT" => crate::table::ListDirection::Right,
+                _ => return Err("syntax error".to_string()),
+            };
+            let to_str = String::from_utf8_lossy(&args[4]).to_uppercase();
+            let where_to = match to_str.as_str() {
+                "LEFT" => crate::table::ListDirection::Left,
+                "RIGHT" => crate::table::ListDirection::Right,
+                _ => return Err("syntax error".to_string()),
+            };
+            Ok(Some(Command::Lmove {
+                source: args[1].clone(),
+                destination: args[2].clone(),
+                where_from,
+                where_to,
+            }))
+        }
+        "BLMOVE" => {
+            if args.len() != 6 {
+                return Err("wrong number of arguments for 'blmove' command".to_string());
+            }
+            let from_str = String::from_utf8_lossy(&args[3]).to_uppercase();
+            let where_from = match from_str.as_str() {
+                "LEFT" => crate::table::ListDirection::Left,
+                "RIGHT" => crate::table::ListDirection::Right,
+                _ => return Err("syntax error".to_string()),
+            };
+            let to_str = String::from_utf8_lossy(&args[4]).to_uppercase();
+            let where_to = match to_str.as_str() {
+                "LEFT" => crate::table::ListDirection::Left,
+                "RIGHT" => crate::table::ListDirection::Right,
+                _ => return Err("syntax error".to_string()),
+            };
+            let timeout: f64 = std::str::from_utf8(&args[5])
+                .map_err(|_| "timeout is not a float or out of range".to_string())?
+                .parse()
+                .map_err(|_| "timeout is not a float or out of range".to_string())?;
+            if timeout < 0.0 {
+                return Err("timeout is negative".to_string());
+            }
+            Ok(Some(Command::Blmove {
+                source: args[1].clone(),
+                destination: args[2].clone(),
+                where_from,
+                where_to,
+                timeout,
+            }))
+        }
+        "INCRBYFLOAT" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'incrbyfloat' command".to_string());
+            }
+            let increment: f64 = std::str::from_utf8(&args[2])
+                .map_err(|_| "value is not a valid float".to_string())?
+                .parse()
+                .map_err(|_| "value is not a valid float".to_string())?;
+            if increment.is_nan() || increment.is_infinite() {
+                return Err("value is not a valid float".to_string());
+            }
+            Ok(Some(Command::Incrbyfloat {
+                key: args[1].clone(),
+                increment,
+            }))
+        }
+        "SETRANGE" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'setrange' command".to_string());
+            }
+            let offset: usize = std::str::from_utf8(&args[2])
+                .map_err(|_| "value is not an integer or out of range".to_string())?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range".to_string())?;
+            Ok(Some(Command::Setrange {
+                key: args[1].clone(),
+                offset,
+                value: args[3].clone(),
+            }))
+        }
+        "GETRANGE" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'getrange' command".to_string());
+            }
+            let start: i64 = std::str::from_utf8(&args[2])
+                .map_err(|_| "value is not an integer or out of range".to_string())?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range".to_string())?;
+            let end: i64 = std::str::from_utf8(&args[3])
+                .map_err(|_| "value is not an integer or out of range".to_string())?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range".to_string())?;
+            Ok(Some(Command::Getrange {
+                key: args[1].clone(),
+                start,
+                end,
+            }))
+        }
         _ => Ok(Some(Command::Unknown(cmd_name))),
     }
 }
@@ -3261,5 +3984,87 @@ mod tests {
                 minid: None,
             }
         );
+    }
+
+    #[test]
+    fn test_valkey_extended_parsers() {
+        // HELLO
+        let mut buf = BytesMut::from("HELLO 3 AUTH alice secret SETNAME client1\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Hello {
+                proto: Some(3),
+                auth: Some(("alice".to_string(), "secret".to_string())),
+                setname: Some("client1".to_string()),
+            }
+        );
+
+        // RESET, TIME, ECHO
+        let mut buf = BytesMut::from("RESET\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Reset);
+        let mut buf = BytesMut::from("TIME\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Time);
+        let mut buf = BytesMut::from("ECHO hi\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Echo(Bytes::from_static(b"hi")));
+
+        // HASHES: HINCRBY, HINCRBYFLOAT, HRANDFIELD, HSCAN
+        let mut buf = BytesMut::from("HINCRBY h f 5\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Hincrby { key: Bytes::from_static(b"h"), field: Bytes::from_static(b"f"), increment: 5 });
+        let mut buf = BytesMut::from("HINCRBYFLOAT h f 2.5\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Hincrbyfloat { key: Bytes::from_static(b"h"), field: Bytes::from_static(b"f"), increment: 2.5 });
+        let mut buf = BytesMut::from("HRANDFIELD h 3 WITHVALUES\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Hrandfield { key: Bytes::from_static(b"h"), count: Some(3), with_values: true });
+        let mut buf = BytesMut::from("HSCAN h 0 MATCH pat* COUNT 20\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Hscan { key: Bytes::from_static(b"h"), cursor: 0, pattern: Some(Bytes::from_static(b"pat*")), count: Some(20) });
+
+        // SETS: SMISMEMBER, SRANDMEMBER, SMOVE, SSCAN
+        let mut buf = BytesMut::from("SMISMEMBER s m1 m2\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Smismember { key: Bytes::from_static(b"s"), members: vec![Bytes::from_static(b"m1"), Bytes::from_static(b"m2")] });
+        let mut buf = BytesMut::from("SRANDMEMBER s 2\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Srandmember { key: Bytes::from_static(b"s"), count: Some(2) });
+        let mut buf = BytesMut::from("SMOVE s1 s2 m\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Smove { source: Bytes::from_static(b"s1"), destination: Bytes::from_static(b"s2"), member: Bytes::from_static(b"m") });
+        let mut buf = BytesMut::from("SSCAN s 0\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Sscan { key: Bytes::from_static(b"s"), cursor: 0, pattern: None, count: None });
+
+        // ZSETS: ZMSCORE, ZRANDMEMBER, ZREMRANGEBYRANK, ZREMRANGEBYSCORE, ZREMRANGEBYLEX, ZLEXCOUNT, ZSCAN
+        let mut buf = BytesMut::from("ZMSCORE z m1 m2\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Zmscore { key: Bytes::from_static(b"z"), members: vec![Bytes::from_static(b"m1"), Bytes::from_static(b"m2")] });
+        let mut buf = BytesMut::from("ZRANDMEMBER z 2 WITHSCORES\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Zrandmember { key: Bytes::from_static(b"z"), count: Some(2), with_scores: true });
+        let mut buf = BytesMut::from("ZREMRANGEBYRANK z 0 2\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Zremrangebyrank { key: Bytes::from_static(b"z"), start: 0, stop: 2 });
+        let mut buf = BytesMut::from("ZREMRANGEBYSCORE z (1.5 5.0\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Zremrangebyscore { key: Bytes::from_static(b"z"), min_score: 1.5, min_inc: false, max_score: 5.0, max_inc: true });
+        let mut buf = BytesMut::from("ZREMRANGEBYLEX z [a (c\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Zremrangebylex { key: Bytes::from_static(b"z"), min: crate::table::LexBound::Inclusive(Bytes::from_static(b"a")), max: crate::table::LexBound::Exclusive(Bytes::from_static(b"c")) });
+        let mut buf = BytesMut::from("ZLEXCOUNT z - +\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Zlexcount { key: Bytes::from_static(b"z"), min: crate::table::LexBound::UnboundedMin, max: crate::table::LexBound::UnboundedMax });
+        let mut buf = BytesMut::from("ZSCAN z 0\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Zscan { key: Bytes::from_static(b"z"), cursor: 0, pattern: None, count: None });
+
+        // LISTS: LTRIM, LSET, LREM, LPOS, LINSERT, LMOVE, BLMOVE
+        let mut buf = BytesMut::from("LTRIM l 1 2\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Ltrim { key: Bytes::from_static(b"l"), start: 1, stop: 2 });
+        let mut buf = BytesMut::from("LSET l 0 val\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Lset { key: Bytes::from_static(b"l"), index: 0, element: Bytes::from_static(b"val") });
+        let mut buf = BytesMut::from("LREM l 2 val\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Lrem { key: Bytes::from_static(b"l"), count: 2, element: Bytes::from_static(b"val") });
+        let mut buf = BytesMut::from("LPOS l val RANK 2 COUNT 3 MAXLEN 100\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Lpos { key: Bytes::from_static(b"l"), element: Bytes::from_static(b"val"), rank: Some(2), count: Some(3), maxlen: Some(100) });
+        let mut buf = BytesMut::from("LINSERT l AFTER p e\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Linsert { key: Bytes::from_static(b"l"), before: false, pivot: Bytes::from_static(b"p"), element: Bytes::from_static(b"e") });
+        let mut buf = BytesMut::from("LMOVE l1 l2 LEFT RIGHT\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Lmove { source: Bytes::from_static(b"l1"), destination: Bytes::from_static(b"l2"), where_from: crate::table::ListDirection::Left, where_to: crate::table::ListDirection::Right });
+        let mut buf = BytesMut::from("BLMOVE l1 l2 RIGHT LEFT 1.5\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Blmove { source: Bytes::from_static(b"l1"), destination: Bytes::from_static(b"l2"), where_from: crate::table::ListDirection::Right, where_to: crate::table::ListDirection::Left, timeout: 1.5 });
+
+        // STRINGS: INCRBYFLOAT, SETRANGE, GETRANGE
+        let mut buf = BytesMut::from("INCRBYFLOAT num 1.25\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Incrbyfloat { key: Bytes::from_static(b"num"), increment: 1.25 });
+        let mut buf = BytesMut::from("SETRANGE k 2 world\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Setrange { key: Bytes::from_static(b"k"), offset: 2, value: Bytes::from_static(b"world") });
+        let mut buf = BytesMut::from("GETRANGE k 0 -1\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Getrange { key: Bytes::from_static(b"k"), start: 0, end: -1 });
     }
 }

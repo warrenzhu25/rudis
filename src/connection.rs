@@ -66,6 +66,14 @@ pub fn write_resp_integer(out: &mut Vec<u8>, val: i64) {
     }
 }
 
+#[inline(always)]
+pub fn write_resp_bulk(out: &mut Vec<u8>, val: &[u8]) {
+    out.extend_from_slice(format!("${}\r\n", val.len()).as_bytes());
+    out.extend_from_slice(val);
+    out.extend_from_slice(b"\r\n");
+}
+
+
 pub async fn handle_connection(
     mut stream: TcpStream,
     client_addr: SocketAddr,
@@ -219,6 +227,12 @@ pub async fn handle_connection(
                                         tx_queue.clear();
                                         tx_has_error = false;
                                         out_buf.extend_from_slice(b"+OK\r\n");
+                                    }
+                                    Command::Reset => {
+                                        in_multi = false;
+                                        tx_queue.clear();
+                                        tx_has_error = false;
+                                        out_buf.extend_from_slice(b"+RESET\r\n");
                                     }
                                     Command::Exec => {
                                         in_multi = false;
@@ -691,7 +705,32 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::XgroupCreateConsumer { key, .. }
         | Command::XgroupDelConsumer { key, .. }
         | Command::Xack { key, .. }
-        | Command::Xpending { key, .. } => Some(key),
+        | Command::Xpending { key, .. }
+        | Command::Hincrby { key, .. }
+        | Command::Hincrbyfloat { key, .. }
+        | Command::Hrandfield { key, .. }
+        | Command::Hscan { key, .. }
+        | Command::Smismember { key, .. }
+        | Command::Srandmember { key, .. }
+        | Command::Sscan { key, .. }
+        | Command::Zmscore { key, .. }
+        | Command::Zrandmember { key, .. }
+        | Command::Zremrangebyrank { key, .. }
+        | Command::Zremrangebyscore { key, .. }
+        | Command::Zremrangebylex { key, .. }
+        | Command::Zlexcount { key, .. }
+        | Command::Zscan { key, .. }
+        | Command::Ltrim { key, .. }
+        | Command::Lset { key, .. }
+        | Command::Lrem { key, .. }
+        | Command::Lpos { key, .. }
+        | Command::Linsert { key, .. }
+        | Command::Incrbyfloat { key, .. }
+        | Command::Setrange { key, .. }
+        | Command::Getrange { key, .. } => Some(key),
+        Command::Smove { source, .. }
+        | Command::Lmove { source, .. }
+        | Command::Blmove { source, .. } => Some(source),
         Command::Touch(keys) | Command::Del(keys) | Command::Exists(keys) | Command::Mget(keys) => {
             keys.first()
         }
@@ -780,7 +819,35 @@ pub fn cmd_keys<'a>(cmd: &'a Command) -> Vec<&'a [u8]> {
         | Command::XgroupCreateConsumer { key, .. }
         | Command::XgroupDelConsumer { key, .. }
         | Command::Xack { key, .. }
-        | Command::Xpending { key, .. } => vec![key.as_ref()],
+        | Command::Xpending { key, .. }
+        | Command::Hincrby { key, .. }
+        | Command::Hincrbyfloat { key, .. }
+        | Command::Hrandfield { key, .. }
+        | Command::Hscan { key, .. }
+        | Command::Smismember { key, .. }
+        | Command::Srandmember { key, .. }
+        | Command::Sscan { key, .. }
+        | Command::Zmscore { key, .. }
+        | Command::Zrandmember { key, .. }
+        | Command::Zremrangebyrank { key, .. }
+        | Command::Zremrangebyscore { key, .. }
+        | Command::Zremrangebylex { key, .. }
+        | Command::Zlexcount { key, .. }
+        | Command::Zscan { key, .. }
+        | Command::Ltrim { key, .. }
+        | Command::Lset { key, .. }
+        | Command::Lrem { key, .. }
+        | Command::Lpos { key, .. }
+        | Command::Linsert { key, .. }
+        | Command::Incrbyfloat { key, .. }
+        | Command::Setrange { key, .. }
+        | Command::Getrange { key, .. } => vec![key.as_ref()],
+
+        Command::Smove { source, destination, .. }
+        | Command::Lmove { source, destination, .. }
+        | Command::Blmove { source, destination, .. } => {
+            vec![source.as_ref(), destination.as_ref()]
+        }
 
         Command::Mget(keys) | Command::Del(keys) | Command::Exists(keys) | Command::Touch(keys) => {
             keys.iter().map(|k| k.as_ref()).collect()
@@ -1125,17 +1192,8 @@ fn parse_bulk_str_from_resp(res: &[u8]) -> Option<Bytes> {
     None
 }
 
-async fn execute_command(
-    cmd: Command,
-    router: &Router,
-    client_id: u64,
-    client_registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
-    out: &mut Vec<u8>,
-    asking: &mut bool,
-    authenticated: &mut bool,
-    auth_user: &mut String,
-) -> bool {
-    let cmd_name = match &cmd {
+pub fn get_cmd_name(cmd: &Command) -> &'static str {
+    match cmd {
         Command::Auth { .. } => "AUTH",
         Command::Acl(_) => "ACL",
         Command::Blpop { .. } => "BLPOP",
@@ -1176,6 +1234,10 @@ async fn execute_command(
         Command::Hgetall(_) => "HGETALL",
         Command::Hkeys(_) => "HKEYS",
         Command::Hvals(_) => "HVALS",
+        Command::Hincrby { .. } => "HINCRBY",
+        Command::Hincrbyfloat { .. } => "HINCRBYFLOAT",
+        Command::Hrandfield { .. } => "HRANDFIELD",
+        Command::Hscan { .. } => "HSCAN",
         Command::Lpush { .. } => "LPUSH",
         Command::Rpush { .. } => "RPUSH",
         Command::Lpop { .. } => "LPOP",
@@ -1183,23 +1245,48 @@ async fn execute_command(
         Command::Lrange { .. } => "LRANGE",
         Command::Llen(_) => "LLEN",
         Command::Lindex { .. } => "LINDEX",
+        Command::Ltrim { .. } => "LTRIM",
+        Command::Lset { .. } => "LSET",
+        Command::Lrem { .. } => "LREM",
+        Command::Lpos { .. } => "LPOS",
+        Command::Linsert { .. } => "LINSERT",
+        Command::Lmove { .. } => "LMOVE",
+        Command::Blmove { .. } => "BLMOVE",
         Command::Sadd { .. } => "SADD",
         Command::Srem { .. } => "SREM",
         Command::Smembers(_) => "SMEMBERS",
         Command::Sismember { .. } => "SISMEMBER",
+        Command::Smismember { .. } => "SMISMEMBER",
         Command::Scard(_) => "SCARD",
         Command::Spop { .. } => "SPOP",
+        Command::Srandmember { .. } => "SRANDMEMBER",
+        Command::Smove { .. } => "SMOVE",
+        Command::Sscan { .. } => "SSCAN",
         Command::Zadd { .. } => "ZADD",
         Command::Zrem { .. } => "ZREM",
         Command::Zscore { .. } => "ZSCORE",
+        Command::Zmscore { .. } => "ZMSCORE",
         Command::Zcard(_) => "ZCARD",
         Command::Zrank { .. } => "ZRANK",
         Command::Zrevrank { .. } => "ZREVRANK",
         Command::Zcount { .. } => "ZCOUNT",
+        Command::Zlexcount { .. } => "ZLEXCOUNT",
         Command::Zincrby { .. } => "ZINCRBY",
         Command::Zrange { .. } => "ZRANGE",
         Command::Zpopmin { .. } => "ZPOPMIN",
         Command::Zpopmax { .. } => "ZPOPMAX",
+        Command::Zrandmember { .. } => "ZRANDMEMBER",
+        Command::Zremrangebyrank { .. } => "ZREMRANGEBYRANK",
+        Command::Zremrangebyscore { .. } => "ZREMRANGEBYSCORE",
+        Command::Zremrangebylex { .. } => "ZREMRANGEBYLEX",
+        Command::Zscan { .. } => "ZSCAN",
+        Command::Incrbyfloat { .. } => "INCRBYFLOAT",
+        Command::Setrange { .. } => "SETRANGE",
+        Command::Getrange { .. } => "GETRANGE",
+        Command::Hello { .. } => "HELLO",
+        Command::Reset => "RESET",
+        Command::Time => "TIME",
+        Command::Echo(_) => "ECHO",
         Command::Type(_) => "TYPE",
         Command::Dbsize => "DBSIZE",
         Command::Flushdb => "FLUSHDB",
@@ -1261,13 +1348,26 @@ async fn execute_command(
         Command::Xack { .. } => "XACK",
         Command::Xpending { .. } => "XPENDING",
         Command::Unknown(_) => "UNKNOWN",
-    };
+    }
+}
+
+async fn execute_command(
+    cmd: Command,
+    router: &Router,
+    client_id: u64,
+    client_registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
+    out: &mut Vec<u8>,
+    asking: &mut bool,
+    authenticated: &mut bool,
+    auth_user: &mut String,
+) -> bool {
+    let cmd_name = get_cmd_name(&cmd);
     if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
         c.last_active = Instant::now();
         c.last_cmd = cmd_name.to_string();
     }
 
-    if !*authenticated && !matches!(cmd, Command::Auth { .. } | Command::Quit) {
+    if !*authenticated && !matches!(cmd, Command::Auth { .. } | Command::Hello { .. } | Command::Quit) {
         out.extend_from_slice(b"-NOAUTH Authentication required.\r\n");
         return false;
     }
@@ -1711,7 +1811,29 @@ async fn execute_command(
         | Command::XgroupCreateConsumer { .. }
         | Command::XgroupDelConsumer { .. }
         | Command::Xack { .. }
-        | Command::Xpending { .. } => {
+        | Command::Xpending { .. }
+        | Command::Hincrby { .. }
+        | Command::Hincrbyfloat { .. }
+        | Command::Hrandfield { .. }
+        | Command::Hscan { .. }
+        | Command::Ltrim { .. }
+        | Command::Lset { .. }
+        | Command::Lrem { .. }
+        | Command::Lpos { .. }
+        | Command::Linsert { .. }
+        | Command::Smismember { .. }
+        | Command::Srandmember { .. }
+        | Command::Sscan { .. }
+        | Command::Zmscore { .. }
+        | Command::Zlexcount { .. }
+        | Command::Zrandmember { .. }
+        | Command::Zremrangebyrank { .. }
+        | Command::Zremrangebyscore { .. }
+        | Command::Zremrangebylex { .. }
+        | Command::Zscan { .. }
+        | Command::Incrbyfloat { .. }
+        | Command::Setrange { .. }
+        | Command::Getrange { .. } => {
             if let Some(target) = target_shard_of_cmd(&cmd, router.num_shards) {
                 if target == router.shard_id {
                     execute_local_command(
@@ -2032,6 +2154,235 @@ async fn execute_command(
             } else {
                 out.extend_from_slice(b"*-1\r\n");
             }
+            false
+        }
+        Command::Smove {
+            ref source,
+            ref destination,
+            ..
+        } => {
+            let s_target = router.target_shard(source);
+            let d_target = router.target_shard(destination);
+            if s_target != d_target {
+                out.extend_from_slice(b"-CROSSSLOT Keys in request don't hash to the same slot\r\n");
+                return false;
+            }
+            if s_target == router.shard_id {
+                execute_local_command(
+                    &cmd,
+                    &mut router.local_db.borrow_mut(),
+                    out,
+                    router.aof.as_deref(),
+                );
+            } else {
+                let res = router.execute_remote(s_target, cmd).await;
+                out.extend_from_slice(&res);
+            }
+            false
+        }
+        Command::Lmove {
+            ref source,
+            ref destination,
+            ..
+        } => {
+            let s_target = router.target_shard(source);
+            let d_target = router.target_shard(destination);
+            if s_target != d_target {
+                out.extend_from_slice(b"-CROSSSLOT Keys in request don't hash to the same slot\r\n");
+                return false;
+            }
+            if s_target == router.shard_id {
+                execute_local_command(
+                    &cmd,
+                    &mut router.local_db.borrow_mut(),
+                    out,
+                    router.aof.as_deref(),
+                );
+            } else {
+                let res = router.execute_remote(s_target, cmd).await;
+                out.extend_from_slice(&res);
+            }
+            false
+        }
+        Command::Blmove {
+            ref source,
+            ref destination,
+            where_from,
+            where_to,
+            timeout,
+        } => {
+            let s_target = router.target_shard(source);
+            let d_target = router.target_shard(destination);
+            if s_target != d_target {
+                out.extend_from_slice(b"-CROSSSLOT Keys in request don't hash to the same slot\r\n");
+                return false;
+            }
+            let start_len = out.len();
+            if s_target == router.shard_id {
+                execute_local_command(
+                    &Command::Lmove {
+                        source: source.clone(),
+                        destination: destination.clone(),
+                        where_from,
+                        where_to,
+                    },
+                    &mut router.local_db.borrow_mut(),
+                    out,
+                    router.aof.as_deref(),
+                );
+            } else {
+                let res = router
+                    .execute_remote(
+                        s_target,
+                        Command::Lmove {
+                            source: source.clone(),
+                            destination: destination.clone(),
+                            where_from,
+                            where_to,
+                        },
+                    )
+                    .await;
+                out.extend_from_slice(&res);
+            }
+
+            if &out[start_len..] != b"$-1\r\n" {
+                return false;
+            }
+            out.truncate(start_len);
+
+            let (tx, rx) = flume::bounded(1);
+            {
+                let hub_arc = crate::block::get_block_hub_for_port(router.port);
+                let mut hub = hub_arc.lock().unwrap();
+                let pop_type = match where_from {
+                    crate::table::ListDirection::Left => crate::block::ListPopType::Left,
+                    crate::table::ListDirection::Right => crate::block::ListPopType::Right,
+                };
+                hub.register_list_waiter(source.clone(), pop_type, tx);
+            }
+
+            let recv_res = if timeout > 0.0 {
+                let dur = std::time::Duration::from_secs_f64(timeout);
+                match monoio::time::timeout(dur, rx.recv_async()).await {
+                    Ok(Ok((_, val))) => Some(val),
+                    _ => None,
+                }
+            } else {
+                rx.recv_async().await.ok().map(|(_, val)| val)
+            };
+
+            if let Some(val) = recv_res {
+                let push_cmd = match where_to {
+                    crate::table::ListDirection::Left => Command::Lpush {
+                        key: destination.clone(),
+                        values: vec![val.clone()],
+                    },
+                    crate::table::ListDirection::Right => Command::Rpush {
+                        key: destination.clone(),
+                        values: vec![val.clone()],
+                    },
+                };
+                if d_target == router.shard_id {
+                    let mut dummy = Vec::new();
+                    execute_local_command(
+                        &push_cmd,
+                        &mut router.local_db.borrow_mut(),
+                        &mut dummy,
+                        router.aof.as_deref(),
+                    );
+                } else {
+                    router.execute_remote(d_target, push_cmd).await;
+                }
+                write_resp_bulk(out, &val);
+            } else {
+                out.extend_from_slice(b"$-1\r\n");
+            }
+            false
+        }
+        Command::Hello {
+            proto,
+            ref auth,
+            ref setname,
+        } => {
+            let acl = crate::acl::get_acl_for_port(router.port);
+            let default_requires_auth = acl
+                .read()
+                .unwrap()
+                .get_user("default")
+                .map(|u| !u.passwords.is_empty())
+                .unwrap_or(false);
+
+            if let Some((uname, pass)) = auth {
+                if let Ok(user) = acl.read().unwrap().check_auth(Some(uname), pass) {
+                    *authenticated = true;
+                    *auth_user = user;
+                } else {
+                    out.extend_from_slice(
+                        b"-WRONGPASS invalid username-password pair or user is disabled.\r\n",
+                    );
+                    return false;
+                }
+            } else if !*authenticated && default_requires_auth {
+                out.extend_from_slice(
+                    b"-NOAUTH HELLO must be called with the client already authenticated, otherwise the HELLO <proto> AUTH <user> <pass> option can be used to authenticate the client and set the protocol.\r\n",
+                );
+                return false;
+            }
+
+            if let Some(name) = setname {
+                if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                    c.name = Some(name.clone());
+                }
+            }
+
+            let proto_ver = proto.unwrap_or(2);
+            out.extend_from_slice(b"*14\r\n");
+            out.extend_from_slice(b"$6\r\nserver\r\n$6\r\nvalkey\r\n");
+            out.extend_from_slice(b"$7\r\nversion\r\n$5\r\n7.2.0\r\n");
+            out.extend_from_slice(format!("$5\r\nproto\r\n:{}\r\n", proto_ver).as_bytes());
+            out.extend_from_slice(format!("$2\r\nid\r\n:{}\r\n", client_id).as_bytes());
+            out.extend_from_slice(b"$4\r\nmode\r\n$10\r\nstandalone\r\n");
+            out.extend_from_slice(b"$4\r\nrole\r\n$6\r\nmaster\r\n");
+            out.extend_from_slice(b"$7\r\nmodules\r\n*0\r\n");
+            false
+        }
+        Command::Reset => {
+            if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                c.name = None;
+            }
+            *asking = false;
+            let acl = crate::acl::get_acl_for_port(router.port);
+            let default_requires_auth = acl
+                .read()
+                .unwrap()
+                .get_user("default")
+                .map(|u| !u.passwords.is_empty())
+                .unwrap_or(false);
+            *authenticated = !default_requires_auth;
+            *auth_user = "default".to_string();
+            out.extend_from_slice(b"+RESET\r\n");
+            false
+        }
+        Command::Time => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let secs = now.as_secs();
+            let micros = now.subsec_micros();
+            out.extend_from_slice(
+                format!(
+                    "*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    secs.to_string().len(),
+                    secs,
+                    micros.to_string().len(),
+                    micros
+                )
+                .as_bytes(),
+            );
+            false
+        }
+        Command::Echo(ref msg) => {
+            write_resp_bulk(out, msg);
             false
         }
         Command::Sinter(ref keys)
@@ -2820,7 +3171,39 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::XgroupCreateConsumer { key, .. }
         | Command::XgroupDelConsumer { key, .. }
         | Command::Xack { key, .. }
-        | Command::Xpending { key, .. } => Some(target_shard(key, num_shards)),
+        | Command::Xpending { key, .. }
+        | Command::Hincrby { key, .. }
+        | Command::Hincrbyfloat { key, .. }
+        | Command::Hrandfield { key, .. }
+        | Command::Hscan { key, .. }
+        | Command::Smismember { key, .. }
+        | Command::Srandmember { key, .. }
+        | Command::Sscan { key, .. }
+        | Command::Zmscore { key, .. }
+        | Command::Zrandmember { key, .. }
+        | Command::Zremrangebyrank { key, .. }
+        | Command::Zremrangebyscore { key, .. }
+        | Command::Zremrangebylex { key, .. }
+        | Command::Zlexcount { key, .. }
+        | Command::Zscan { key, .. }
+        | Command::Ltrim { key, .. }
+        | Command::Lset { key, .. }
+        | Command::Lrem { key, .. }
+        | Command::Lpos { key, .. }
+        | Command::Linsert { key, .. }
+        | Command::Incrbyfloat { key, .. }
+        | Command::Setrange { key, .. }
+        | Command::Getrange { key, .. } => Some(target_shard(key, num_shards)),
+        Command::Smove { source, destination, .. } => {
+            let s1 = target_shard(source, num_shards);
+            let s2 = target_shard(destination, num_shards);
+            if s1 == s2 { Some(s1) } else { None }
+        }
+        Command::Lmove { source, destination, .. } => {
+            let s1 = target_shard(source, num_shards);
+            let s2 = target_shard(destination, num_shards);
+            if s1 == s2 { Some(s1) } else { None }
+        }
         Command::Pfcount { keys } if keys.len() == 1 => Some(target_shard(&keys[0], num_shards)),
         Command::Rename { key, newkey, .. } => {
             let s1 = target_shard(key, num_shards);
@@ -4794,6 +5177,554 @@ pub fn execute_local_command(
             }
             false
         }
+        Command::Hincrby { key, field, increment } => {
+            match db.hincrby(key.clone(), field.clone(), *increment) {
+                Ok(val) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
+                    write_resp_integer(out, val);
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Hincrbyfloat { key, field, increment } => {
+            match db.hincrbyfloat(key.clone(), field.clone(), *increment) {
+                Ok(val) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
+                    write_resp_bulk(out, val.to_string().as_bytes());
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Hrandfield { key, count, with_values } => {
+            match db.hrandfield(key, *count, *with_values) {
+                Ok(items) => {
+                    if count.is_none() {
+                        if let Some(f) = items.first() {
+                            write_resp_bulk(out, f);
+                        } else {
+                            out.extend_from_slice(b"$-1\r\n");
+                        }
+                    } else {
+                        out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                        for item in items {
+                            write_resp_bulk(out, &item);
+                        }
+                    }
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Hscan { key, cursor, pattern, count } => {
+            match db.hscan(key, *cursor, pattern.as_deref().map(|p| p.as_ref()), count.unwrap_or(10)) {
+                Ok((next_cursor, entries)) => {
+                    out.extend_from_slice(b"*2\r\n");
+                    let cur_str = next_cursor.to_string();
+                    write_resp_bulk(out, cur_str.as_bytes());
+                    out.extend_from_slice(format!("*{}\r\n", entries.len()).as_bytes());
+                    for item in entries {
+                        write_resp_bulk(out, &item);
+                    }
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Smismember { key, members } => {
+            match db.smismember(key, members) {
+                Ok(bools) => {
+                    out.extend_from_slice(format!("*{}\r\n", bools.len()).as_bytes());
+                    for b in bools {
+                        write_resp_integer(out, if b { 1 } else { 0 });
+                    }
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Srandmember { key, count } => {
+            match db.srandmember(key, *count) {
+                Ok(items) => {
+                    if count.is_none() {
+                        if let Some(item) = items.first() {
+                            write_resp_bulk(out, item);
+                        } else {
+                            out.extend_from_slice(b"$-1\r\n");
+                        }
+                    } else {
+                        out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                        for item in items {
+                            write_resp_bulk(out, &item);
+                        }
+                    }
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Smove { source, destination, member } => {
+            match db.smove(source, destination.clone(), member.clone()) {
+                Ok(moved) => {
+                    if moved {
+                        if let Some(aof) = aof {
+                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        }
+                    }
+                    write_resp_integer(out, if moved { 1 } else { 0 });
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Sscan { key, cursor, pattern, count } => {
+            match db.sscan(key, *cursor, pattern.as_deref().map(|p| p.as_ref()), count.unwrap_or(10)) {
+                Ok((next_cursor, entries)) => {
+                    out.extend_from_slice(b"*2\r\n");
+                    let cur_str = next_cursor.to_string();
+                    write_resp_bulk(out, cur_str.as_bytes());
+                    out.extend_from_slice(format!("*{}\r\n", entries.len()).as_bytes());
+                    for item in entries {
+                        write_resp_bulk(out, &item);
+                    }
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Zmscore { key, members } => {
+            match db.zmscore(key, members) {
+                Ok(scores) => {
+                    out.extend_from_slice(format!("*{}\r\n", scores.len()).as_bytes());
+                    for s in scores {
+                        match s {
+                            Some(val) => write_resp_bulk(out, val.to_string().as_bytes()),
+                            None => out.extend_from_slice(b"$-1\r\n"),
+                        }
+                    }
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Zrandmember { key, count, with_scores } => {
+            match db.zrandmember(key, *count, *with_scores) {
+                Ok(items) => {
+                    if count.is_none() {
+                        if let Some((m, _)) = items.first() {
+                            write_resp_bulk(out, m);
+                        } else {
+                            out.extend_from_slice(b"$-1\r\n");
+                        }
+                    } else if *with_scores {
+                        out.extend_from_slice(format!("*{}\r\n", items.len() * 2).as_bytes());
+                        for (m, s) in items {
+                            write_resp_bulk(out, &m);
+                            write_resp_bulk(out, s.to_string().as_bytes());
+                        }
+                    } else {
+                        out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                        for (m, _) in items {
+                            write_resp_bulk(out, &m);
+                        }
+                    }
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Zremrangebyrank { key, start, stop } => {
+            match db.zremrangebyrank(key, *start, *stop) {
+                Ok(removed) => {
+                    if removed > 0 {
+                        if let Some(aof) = aof {
+                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        }
+                    }
+                    write_resp_integer(out, removed as i64);
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Zremrangebyscore { key, min_score, min_inc, max_score, max_inc } => {
+            match db.zremrangebyscore(key, *min_score, *min_inc, *max_score, *max_inc) {
+                Ok(removed) => {
+                    if removed > 0 {
+                        if let Some(aof) = aof {
+                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        }
+                    }
+                    write_resp_integer(out, removed as i64);
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Zremrangebylex { key, min, max } => {
+            match db.zremrangebylex(key, min, max) {
+                Ok(removed) => {
+                    if removed > 0 {
+                        if let Some(aof) = aof {
+                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        }
+                    }
+                    write_resp_integer(out, removed as i64);
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Zlexcount { key, min, max } => {
+            match db.zlexcount(key, min, max) {
+                Ok(count) => {
+                    write_resp_integer(out, count as i64);
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Zscan { key, cursor, pattern, count } => {
+            match db.zscan(key, *cursor, pattern.as_deref().map(|p| p.as_ref()), count.unwrap_or(10)) {
+                Ok((next_cursor, entries)) => {
+                    out.extend_from_slice(b"*2\r\n");
+                    let cur_str = next_cursor.to_string();
+                    write_resp_bulk(out, cur_str.as_bytes());
+                    out.extend_from_slice(format!("*{}\r\n", entries.len() * 2).as_bytes());
+                    for (m, s) in entries {
+                        write_resp_bulk(out, &m);
+                        write_resp_bulk(out, s.to_string().as_bytes());
+                    }
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Ltrim { key, start, stop } => {
+            match db.ltrim(key, *start, *stop) {
+                Ok(()) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Lset { key, index, element } => {
+            match db.lset(key, *index, element.clone()) {
+                Ok(()) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Lrem { key, count, element } => {
+            match db.lrem(key, *count, element) {
+                Ok(removed) => {
+                    if removed > 0 {
+                        if let Some(aof) = aof {
+                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        }
+                    }
+                    write_resp_integer(out, removed as i64);
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Lpos { key, element, rank, count, maxlen } => {
+            match db.lpos(key, element, rank.unwrap_or(1), *count, *maxlen) {
+                Ok(indices) => {
+                    if count.is_none() {
+                        if let Some(idx) = indices.first() {
+                            write_resp_integer(out, *idx as i64);
+                        } else {
+                            out.extend_from_slice(b"$-1\r\n");
+                        }
+                    } else {
+                        out.extend_from_slice(format!("*{}\r\n", indices.len()).as_bytes());
+                        for idx in indices {
+                            write_resp_integer(out, idx as i64);
+                        }
+                    }
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Linsert { key, before, pivot, element } => {
+            match db.linsert(key.clone(), *before, pivot, element.clone()) {
+                Ok(len) => {
+                    if len > 0 {
+                        if let Some(aof) = aof {
+                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        }
+                        crate::block::get_block_hub_for_port(db.port)
+                            .lock()
+                            .unwrap()
+                            .notify_list(&mut db.table, key);
+                    }
+                    write_resp_integer(out, len);
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Lmove { source, destination, where_from, where_to } => {
+            match db.lmove(source, destination.clone(), *where_from, *where_to) {
+                Ok(Some(val)) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
+                    crate::block::get_block_hub_for_port(db.port)
+                        .lock()
+                        .unwrap()
+                        .notify_list(&mut db.table, destination);
+                    write_resp_bulk(out, &val);
+                }
+                Ok(None) => {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Incrbyfloat { key, increment } => {
+            match db.incrbyfloat(key.clone(), *increment) {
+                Ok(val) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
+                    write_resp_bulk(out, val.to_string().as_bytes());
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Setrange { key, offset, value } => {
+            match db.setrange(key.clone(), *offset, value) {
+                Ok(len) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
+                    write_resp_integer(out, len as i64);
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Getrange { key, start, end } => {
+            match db.getrange(key, *start, *end) {
+                Ok(slice) => {
+                    write_resp_bulk(out, &slice);
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Time => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let secs = now.as_secs();
+            let micros = now.subsec_micros();
+            out.extend_from_slice(
+                format!(
+                    "*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    secs.to_string().len(),
+                    secs,
+                    micros.to_string().len(),
+                    micros
+                )
+                .as_bytes(),
+            );
+            false
+        }
+        Command::Echo(msg) => {
+            write_resp_bulk(out, msg);
+            false
+        }
         Command::Quit => {
             out.extend_from_slice(b"+OK\r\n");
             true
@@ -4821,6 +5752,9 @@ async fn execute_commands_squashed(
                 cmd,
                 Command::Blpop { .. }
                     | Command::Brpop { .. }
+                    | Command::Blmove { .. }
+                    | Command::Hello { .. }
+                    | Command::Reset
                     | Command::Auth { .. }
                     | Command::Acl(_)
                     | Command::Xread { block_ms: Some(_), .. }
@@ -4835,7 +5769,7 @@ async fn execute_commands_squashed(
                     can_squash = false;
                     break;
                 }
-            } else if !matches!(cmd, Command::Ping(_) | Command::CommandDocs | Command::Quit) {
+            } else if !matches!(cmd, Command::Ping(_) | Command::CommandDocs | Command::Quit | Command::Time | Command::Echo(_)) {
                 can_squash = false;
                 break;
             }
@@ -4869,133 +5803,7 @@ async fn execute_commands_squashed(
     if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
         c.last_active = Instant::now();
         if let Some(last_cmd) = commands.last() {
-            let cmd_name = match last_cmd {
-                Command::Auth { .. } => "AUTH",
-                Command::Acl(_) => "ACL",
-                Command::Blpop { .. } => "BLPOP",
-                Command::Brpop { .. } => "BRPOP",
-                Command::Sinter(_) => "SINTER",
-                Command::Sunion(_) => "SUNION",
-                Command::Sdiff(_) => "SDIFF",
-                Command::Sinterstore { .. } => "SINTERSTORE",
-                Command::Sunionstore { .. } => "SUNIONSTORE",
-                Command::Sdiffstore { .. } => "SDIFFSTORE",
-                Command::Zunionstore { .. } => "ZUNIONSTORE",
-                Command::Zinterstore { .. } => "ZINTERSTORE",
-                Command::Zdiffstore { .. } => "ZDIFFSTORE",
-                Command::Zdiff { .. } => "ZDIFF",
-                Command::Zinter { .. } => "ZINTER",
-                Command::Zunion { .. } => "ZUNION",
-                Command::Get(_) => "GET",
-                Command::Set { .. } => "SET",
-                Command::Mget(_) => "MGET",
-                Command::Mset(_) => "MSET",
-                Command::Del(_) => "DEL",
-                Command::Exists(_) => "EXISTS",
-                Command::IncrBy(_, _) => "INCRBY",
-                Command::Expire(_, _) => "EXPIRE",
-                Command::Persist(_) => "PERSIST",
-                Command::Ttl(_, _) => "TTL",
-                Command::Cluster(_) => "CLUSTER",
-                Command::Client(_) => "CLIENT",
-                Command::Asking => "ASKING",
-                Command::Migrate { .. } => "MIGRATE",
-                Command::Hset { .. } => "HSET",
-                Command::Hmset { .. } => "HMSET",
-                Command::Hget { .. } => "HGET",
-                Command::Hmget { .. } => "HMGET",
-                Command::Hdel { .. } => "HDEL",
-                Command::Hexists { .. } => "HEXISTS",
-                Command::Hlen(_) => "HLEN",
-                Command::Hgetall(_) => "HGETALL",
-                Command::Hkeys(_) => "HKEYS",
-                Command::Hvals(_) => "HVALS",
-                Command::Lpush { .. } => "LPUSH",
-                Command::Rpush { .. } => "RPUSH",
-                Command::Lpop { .. } => "LPOP",
-                Command::Rpop { .. } => "RPOP",
-                Command::Lrange { .. } => "LRANGE",
-                Command::Llen(_) => "LLEN",
-                Command::Lindex { .. } => "LINDEX",
-                Command::Sadd { .. } => "SADD",
-                Command::Srem { .. } => "SREM",
-                Command::Smembers(_) => "SMEMBERS",
-                Command::Sismember { .. } => "SISMEMBER",
-                Command::Scard(_) => "SCARD",
-                Command::Spop { .. } => "SPOP",
-                Command::Zadd { .. } => "ZADD",
-                Command::Zrem { .. } => "ZREM",
-                Command::Zscore { .. } => "ZSCORE",
-                Command::Zcard(_) => "ZCARD",
-                Command::Zrank { .. } => "ZRANK",
-                Command::Zrevrank { .. } => "ZREVRANK",
-                Command::Zcount { .. } => "ZCOUNT",
-                Command::Zincrby { .. } => "ZINCRBY",
-                Command::Zrange { .. } => "ZRANGE",
-                Command::Zpopmin { .. } => "ZPOPMIN",
-                Command::Zpopmax { .. } => "ZPOPMAX",
-                Command::Type(_) => "TYPE",
-                Command::Dbsize => "DBSIZE",
-                Command::Flushdb => "FLUSHDB",
-                Command::Flushall => "FLUSHALL",
-                Command::Touch(_) => "TOUCH",
-                Command::Rename { nx: false, .. } => "RENAME",
-                Command::Rename { nx: true, .. } => "RENAMENX",
-                Command::Setnx { .. } => "SETNX",
-                Command::Getset { .. } => "GETSET",
-                Command::Getdel(_) => "GETDEL",
-                Command::Append { .. } => "APPEND",
-                Command::Strlen(_) => "STRLEN",
-                Command::Msetnx(_) => "MSETNX",
-                Command::Save => "SAVE",
-                Command::Bgsave => "BGSAVE",
-                Command::Lastsave => "LASTSAVE",
-                Command::Ping(_) => "PING",
-                Command::CommandDocs => "COMMAND",
-                Command::Info => "INFO",
-                Command::Quit => "QUIT",
-                Command::Subscribe(_) => "SUBSCRIBE",
-                Command::Unsubscribe(_) => "UNSUBSCRIBE",
-                Command::Psubscribe(_) => "PSUBSCRIBE",
-                Command::Punsubscribe(_) => "PUNSUBSCRIBE",
-                Command::Publish { .. } => "PUBLISH",
-                Command::PubsubChannels(_) => "PUBSUB CHANNELS",
-                Command::PubsubNumsub(_) => "PUBSUB NUMSUB",
-                Command::PubsubNumpat => "PUBSUB NUMPAT",
-                Command::Keys(_) => "KEYS",
-                Command::Scan { .. } => "SCAN",
-                Command::Randomkey => "RANDOMKEY",
-                Command::Expiretime(_, false) => "EXPIRETIME",
-                Command::Expiretime(_, true) => "PEXPIRETIME",
-                Command::Multi => "MULTI",
-                Command::Exec => "EXEC",
-                Command::Discard => "DISCARD",
-                Command::Setbit { .. } => "SETBIT",
-                Command::Getbit { .. } => "GETBIT",
-                Command::Bitcount { .. } => "BITCOUNT",
-                Command::Bitpos { .. } => "BITPOS",
-                Command::Bitop { .. } => "BITOP",
-                Command::Pfadd { .. } => "PFADD",
-                Command::Pfcount { .. } => "PFCOUNT",
-                Command::Pfmerge { .. } => "PFMERGE",
-                Command::Dump(_) => "DUMP",
-                Command::Restore { .. } => "RESTORE",
-                Command::Xadd { .. } => "XADD",
-                Command::Xlen(_) => "XLEN",
-                Command::Xrange { .. } => "XRANGE",
-                Command::Xrevrange { .. } => "XREVRANGE",
-                Command::Xread { .. } => "XREAD",
-                Command::Xdel { .. } => "XDEL",
-                Command::Xtrim { .. } => "XTRIM",
-                Command::XgroupCreate { .. }
-                | Command::XgroupDestroy { .. }
-                | Command::XgroupCreateConsumer { .. }
-                | Command::XgroupDelConsumer { .. } => "XGROUP",
-                Command::Xreadgroup { .. } => "XREADGROUP",
-                Command::Xack { .. } => "XACK",
-                Command::Xpending { .. } => "XPENDING",
-                Command::Unknown(_) => "UNKNOWN",
-            };
+            let cmd_name = get_cmd_name(last_cmd);
             c.last_cmd = cmd_name.to_string();
         }
     }

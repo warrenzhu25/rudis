@@ -64,6 +64,60 @@ impl Default for Aggregate {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListDirection {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LexBound {
+    UnboundedMin,
+    UnboundedMax,
+    Inclusive(Bytes),
+    Exclusive(Bytes),
+}
+
+impl LexBound {
+    pub fn matches(&self, val: &[u8], is_min: bool) -> bool {
+        match self {
+            LexBound::UnboundedMin => is_min,
+            LexBound::UnboundedMax => !is_min,
+            LexBound::Inclusive(b) => {
+                if is_min {
+                    val >= b.as_ref()
+                } else {
+                    val <= b.as_ref()
+                }
+            }
+            LexBound::Exclusive(b) => {
+                if is_min {
+                    val > b.as_ref()
+                } else {
+                    val < b.as_ref()
+                }
+            }
+        }
+    }
+}
+
+pub fn parse_lex_bound(s: &[u8]) -> Result<LexBound, &'static str> {
+    if s.is_empty() {
+        return Err("ERR min or max not valid string range item");
+    }
+    if s == b"-" {
+        Ok(LexBound::UnboundedMin)
+    } else if s == b"+" {
+        Ok(LexBound::UnboundedMax)
+    } else if s[0] == b'[' {
+        Ok(LexBound::Inclusive(Bytes::copy_from_slice(&s[1..])))
+    } else if s[0] == b'(' {
+        Ok(LexBound::Exclusive(Bytes::copy_from_slice(&s[1..])))
+    } else {
+        Err("ERR min or max not valid string range item")
+    }
+}
+
 const SMALL_ZSET_LIMIT: usize = 64;
 
 #[derive(Clone, Debug)]
@@ -320,6 +374,129 @@ impl RudisZSet {
                     f(m, *s);
                 }
             }
+        }
+    }
+
+    pub fn to_vec(&self) -> Vec<(Bytes, f64)> {
+        match self {
+            RudisZSet::Small(v) => v
+                .iter()
+                .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                .collect(),
+            RudisZSet::Full { tree, .. } => tree
+                .iter()
+                .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                .collect(),
+        }
+    }
+
+    pub fn rem_range_by_rank(&mut self, start: i64, stop: i64) -> usize {
+        let n = self.len() as i64;
+        if n == 0 {
+            return 0;
+        }
+        let mut s = start;
+        let mut e = stop;
+        if s < 0 {
+            s = (n + s).max(0);
+        }
+        if e < 0 {
+            e = n + e;
+        }
+        if s > e || s >= n {
+            return 0;
+        }
+        let start_u = s.max(0) as usize;
+        let stop_u = (e.min(n - 1) as usize).max(start_u);
+        let to_remove: Vec<Bytes> = match self {
+            RudisZSet::Small(v) => v
+                .iter()
+                .skip(start_u)
+                .take(stop_u - start_u + 1)
+                .map(|(_, m)| m.clone())
+                .collect(),
+            RudisZSet::Full { tree, .. } => tree
+                .iter()
+                .skip(start_u)
+                .take(stop_u - start_u + 1)
+                .map(|(_, m)| m.clone())
+                .collect(),
+        };
+        let count = to_remove.len();
+        for m in &to_remove {
+            self.remove(m);
+        }
+        count
+    }
+
+    pub fn rem_range_by_score(
+        &mut self,
+        min: f64,
+        min_inc: bool,
+        max: f64,
+        max_inc: bool,
+    ) -> usize {
+        let to_remove: Vec<Bytes> = match self {
+            RudisZSet::Small(v) => v
+                .iter()
+                .filter(|(OrderedScore(s), _)| {
+                    let ge = if min_inc { *s >= min } else { *s > min };
+                    let le = if max_inc { *s <= max } else { *s < max };
+                    ge && le
+                })
+                .map(|(_, m)| m.clone())
+                .collect(),
+            RudisZSet::Full { tree, .. } => tree
+                .iter()
+                .filter(|(OrderedScore(s), _)| {
+                    let ge = if min_inc { *s >= min } else { *s > min };
+                    let le = if max_inc { *s <= max } else { *s < max };
+                    ge && le
+                })
+                .map(|(_, m)| m.clone())
+                .collect(),
+        };
+        let count = to_remove.len();
+        for m in &to_remove {
+            self.remove(m);
+        }
+        count
+    }
+
+    pub fn rem_range_by_lex(&mut self, min: &LexBound, max: &LexBound) -> usize {
+        let to_remove: Vec<Bytes> = match self {
+            RudisZSet::Small(v) => v
+                .iter()
+                .filter(|(_, m)| {
+                    min.matches(m.as_ref(), true) && max.matches(m.as_ref(), false)
+                })
+                .map(|(_, m)| m.clone())
+                .collect(),
+            RudisZSet::Full { tree, .. } => tree
+                .iter()
+                .filter(|(_, m)| {
+                    min.matches(m.as_ref(), true) && max.matches(m.as_ref(), false)
+                })
+                .map(|(_, m)| m.clone())
+                .collect(),
+        };
+        let count = to_remove.len();
+        for m in &to_remove {
+            self.remove(m);
+        }
+        count
+    }
+
+    pub fn lex_count(&self, min: &LexBound, max: &LexBound) -> usize {
+        match self {
+            RudisZSet::Small(v) => v
+                .iter()
+                .filter(|(_, m)| min.matches(m.as_ref(), true) && max.matches(m.as_ref(), false))
+                .count(),
+            RudisZSet::Full { tree, .. } => tree
+                .iter()
+                .filter(|(_, m)| min.matches(m.as_ref(), true) && max.matches(m.as_ref(), false))
+                .count(),
         }
     }
 }
@@ -1369,6 +1546,12 @@ impl RudisTable {
         None
     }
 
+    #[inline(always)]
+    pub fn next_rand(&mut self) -> usize {
+        self.sample_cursor = self.sample_cursor.wrapping_mul(6364136223846793005).wrapping_add(1);
+        self.sample_cursor
+    }
+
     pub fn flushdb(&mut self) {
         self.table.clear();
     }
@@ -1598,6 +1781,120 @@ impl RudisTable {
         } else {
             Ok(0)
         }
+    }
+
+    fn slice_range(slice: &[u8], mut start: i64, mut end: i64) -> Result<Bytes, &'static str> {
+        let n = slice.len() as i64;
+        if n == 0 {
+            return Ok(Bytes::new());
+        }
+        if start < 0 {
+            start = (n + start).max(0);
+        }
+        if end < 0 {
+            end = n + end;
+        }
+        if start > end || start >= n {
+            return Ok(Bytes::new());
+        }
+        let start_u = start.max(0) as usize;
+        let end_u = (end.min(n - 1) as usize).max(start_u);
+        Ok(Bytes::copy_from_slice(&slice[start_u..=end_u]))
+    }
+
+    pub fn getrange(&mut self, key: &[u8], start: i64, end: i64) -> Result<Bytes, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(Bytes::new());
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                let slice = match &entry.val {
+                    RudisValue::String(s) => s.as_ref(),
+                    RudisValue::Int(n) => {
+                        let formatted = Self::format_i64(*n);
+                        return Self::slice_range(&formatted, start, end);
+                    }
+                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                };
+                return Self::slice_range(slice, start, end);
+            }
+        }
+        Ok(Bytes::new())
+    }
+
+    pub fn setrange(&mut self, key: Bytes, offset: usize, value: &[u8]) -> Result<usize, &'static str> {
+        if offset.saturating_add(value.len()) > 536870912 {
+            return Err("ERR string exceeds maximum allowed size (512MB)");
+        }
+        let h = hash_key(&key);
+        let (existing, _) = self.table.find_or_prepare_insert(&key, h);
+        if let Some(idx) = existing {
+            if !self.check_expired_slot(idx) {
+                if let Some(entry) = self.table.get_slot_mut(idx) {
+                    let mut bytes: Vec<u8> = match &entry.val {
+                        RudisValue::String(s) => s.to_vec(),
+                        RudisValue::Int(n) => Self::format_i64(*n).to_vec(),
+                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    };
+                    if offset > bytes.len() {
+                        bytes.resize(offset, 0);
+                    }
+                    if offset + value.len() > bytes.len() {
+                        bytes.resize(offset + value.len(), 0);
+                    }
+                    bytes[offset..offset + value.len()].copy_from_slice(value);
+                    let len = bytes.len();
+                    entry.val = RudisValue::String(Bytes::from(bytes));
+                    return Ok(len);
+                }
+            }
+        }
+        let mut bytes = vec![0u8; offset];
+        bytes.extend_from_slice(value);
+        let len = bytes.len();
+        let entry = RudisEntry {
+            key,
+            val: RudisValue::String(Bytes::from(bytes)),
+            expire_at: None,
+        };
+        self.table.insert(entry);
+        Ok(len)
+    }
+
+    pub fn incrbyfloat(&mut self, key: Bytes, delta: f64) -> Result<f64, &'static str> {
+        let h = hash_key(&key);
+        let (existing, _) = self.table.find_or_prepare_insert(&key, h);
+        if let Some(idx) = existing {
+            if !self.check_expired_slot(idx) {
+                if let Some(entry) = self.table.get_slot_mut(idx) {
+                    let curr: f64 = match &entry.val {
+                        RudisValue::String(s) => {
+                            let str_val = std::str::from_utf8(s).map_err(|_| "ERR value is not a valid float")?;
+                            str_val.parse::<f64>().map_err(|_| "ERR value is not a valid float")?
+                        }
+                        RudisValue::Int(n) => *n as f64,
+                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    };
+                    let new_val = curr + delta;
+                    if new_val.is_nan() || new_val.is_infinite() {
+                        return Err("ERR increment would produce NaN or Infinity");
+                    }
+                    entry.val = RudisValue::String(Bytes::from(new_val.to_string()));
+                    return Ok(new_val);
+                }
+            }
+        }
+        if delta.is_nan() || delta.is_infinite() {
+            return Err("ERR increment would produce NaN or Infinity");
+        }
+        let entry = RudisEntry {
+            key,
+            val: RudisValue::String(Bytes::from(delta.to_string())),
+            expire_at: None,
+        };
+        self.table.insert(entry);
+        Ok(delta)
     }
 
     pub fn hset(&mut self, key: Bytes, fields: Vec<(Bytes, Bytes)>) -> Result<usize, &'static str> {
@@ -1862,6 +2159,235 @@ impl RudisTable {
         }
     }
 
+    pub fn hincrby(&mut self, key: Bytes, field: Bytes, delta: i64) -> Result<i64, &'static str> {
+        let h = hash_key(&key);
+        let (existing, _) = self.table.find_or_prepare_insert(&key, h);
+        if let Some(idx) = existing {
+            if !self.check_expired_slot(idx) {
+                if let Some(entry) = self.table.get_slot_mut(idx) {
+                    match &mut entry.val {
+                        RudisValue::SmallHash(pairs) => {
+                            let curr = if let Some((_, v)) = pairs.iter().find(|(k, _)| k == &field) {
+                                let s = std::str::from_utf8(v).map_err(|_| "ERR hash value is not an integer")?;
+                                s.parse::<i64>().map_err(|_| "ERR hash value is not an integer")?
+                            } else {
+                                0
+                            };
+                            let new_val = curr.checked_add(delta).ok_or("ERR increment or decrement would overflow")?;
+                            let new_bytes = Bytes::from(new_val.to_string());
+                            if let Some(pos) = pairs.iter().position(|(k, _)| k == &field) {
+                                pairs[pos].1 = new_bytes;
+                            } else {
+                                pairs.push((field, new_bytes));
+                                if pairs.len() > 64 {
+                                    let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
+                                    entry.val = RudisValue::Hash(map);
+                                }
+                            }
+                            return Ok(new_val);
+                        }
+                        RudisValue::Hash(map) => {
+                            let curr = if let Some(v) = map.get(&field) {
+                                let s = std::str::from_utf8(v).map_err(|_| "ERR hash value is not an integer")?;
+                                s.parse::<i64>().map_err(|_| "ERR hash value is not an integer")?
+                            } else {
+                                0
+                            };
+                            let new_val = curr.checked_add(delta).ok_or("ERR increment or decrement would overflow")?;
+                            let new_bytes = Bytes::from(new_val.to_string());
+                            map.insert(field, new_bytes);
+                            return Ok(new_val);
+                        }
+                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    }
+                }
+            }
+        }
+        let val_bytes = Bytes::from(delta.to_string());
+        let entry = RudisEntry {
+            key,
+            val: RudisValue::SmallHash(vec![(field, val_bytes)]),
+            expire_at: None,
+        };
+        self.table.insert(entry);
+        Ok(delta)
+    }
+
+    pub fn hincrbyfloat(&mut self, key: Bytes, field: Bytes, delta: f64) -> Result<f64, &'static str> {
+        let h = hash_key(&key);
+        let (existing, _) = self.table.find_or_prepare_insert(&key, h);
+        if let Some(idx) = existing {
+            if !self.check_expired_slot(idx) {
+                if let Some(entry) = self.table.get_slot_mut(idx) {
+                    match &mut entry.val {
+                        RudisValue::SmallHash(pairs) => {
+                            let curr = if let Some((_, v)) = pairs.iter().find(|(k, _)| k == &field) {
+                                let s = std::str::from_utf8(v).map_err(|_| "ERR hash value is not a valid float")?;
+                                s.parse::<f64>().map_err(|_| "ERR hash value is not a valid float")?
+                            } else {
+                                0.0
+                            };
+                            let new_val = curr + delta;
+                            if new_val.is_nan() || new_val.is_infinite() {
+                                return Err("ERR increment would produce NaN or Infinity");
+                            }
+                            let new_bytes = Bytes::from(new_val.to_string());
+                            if let Some(pos) = pairs.iter().position(|(k, _)| k == &field) {
+                                pairs[pos].1 = new_bytes;
+                            } else {
+                                pairs.push((field, new_bytes));
+                                if pairs.len() > 64 {
+                                    let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
+                                    entry.val = RudisValue::Hash(map);
+                                }
+                            }
+                            return Ok(new_val);
+                        }
+                        RudisValue::Hash(map) => {
+                            let curr = if let Some(v) = map.get(&field) {
+                                let s = std::str::from_utf8(v).map_err(|_| "ERR hash value is not a valid float")?;
+                                s.parse::<f64>().map_err(|_| "ERR hash value is not a valid float")?
+                            } else {
+                                0.0
+                            };
+                            let new_val = curr + delta;
+                            if new_val.is_nan() || new_val.is_infinite() {
+                                return Err("ERR increment would produce NaN or Infinity");
+                            }
+                            let new_bytes = Bytes::from(new_val.to_string());
+                            map.insert(field, new_bytes);
+                            return Ok(new_val);
+                        }
+                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    }
+                }
+            }
+        }
+        if delta.is_nan() || delta.is_infinite() {
+            return Err("ERR increment would produce NaN or Infinity");
+        }
+        let val_bytes = Bytes::from(delta.to_string());
+        let entry = RudisEntry {
+            key,
+            val: RudisValue::SmallHash(vec![(field, val_bytes)]),
+            expire_at: None,
+        };
+        self.table.insert(entry);
+        Ok(delta)
+    }
+
+    pub fn hrandfield(
+        &mut self,
+        key: &[u8],
+        count: Option<i64>,
+        with_values: bool,
+    ) -> Result<Vec<Bytes>, &'static str> {
+        let h = hash_key(key);
+        let pairs: Vec<(Bytes, Bytes)> = if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(Vec::new());
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::SmallHash(p) => p.clone(),
+                    RudisValue::Hash(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                return Ok(Vec::new());
+            }
+        } else {
+            return Ok(Vec::new());
+        };
+
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let total = pairs.len();
+        match count {
+            None => {
+                let idx = self.next_rand() % total;
+                Ok(vec![pairs[idx].0.clone()])
+            }
+            Some(c) if c >= 0 => {
+                let k = (c as usize).min(total);
+                let mut indices: Vec<usize> = (0..total).collect();
+                for i in 0..k {
+                    let r = i + (self.next_rand() % (total - i));
+                    indices.swap(i, r);
+                }
+                let mut res = Vec::with_capacity(k * if with_values { 2 } else { 1 });
+                for &idx in &indices[..k] {
+                    res.push(pairs[idx].0.clone());
+                    if with_values {
+                        res.push(pairs[idx].1.clone());
+                    }
+                }
+                Ok(res)
+            }
+            Some(c) => {
+                let k = (-c) as usize;
+                let mut res = Vec::with_capacity(k * if with_values { 2 } else { 1 });
+                for _ in 0..k {
+                    let idx = self.next_rand() % total;
+                    res.push(pairs[idx].0.clone());
+                    if with_values {
+                        res.push(pairs[idx].1.clone());
+                    }
+                }
+                Ok(res)
+            }
+        }
+    }
+
+    pub fn hscan(
+        &mut self,
+        key: &[u8],
+        cursor: usize,
+        pattern: Option<&[u8]>,
+        count: usize,
+    ) -> Result<(usize, Vec<Bytes>), &'static str> {
+        let h = hash_key(key);
+        let pairs: Vec<(Bytes, Bytes)> = if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok((0, Vec::new()));
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::SmallHash(p) => p.clone(),
+                    RudisValue::Hash(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                return Ok((0, Vec::new()));
+            }
+        } else {
+            return Ok((0, Vec::new()));
+        };
+
+        if cursor >= pairs.len() || pairs.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+
+        let mut res = Vec::new();
+        let mut idx = cursor;
+        while idx < pairs.len() && res.len() < count * 2 {
+            let (f, v) = &pairs[idx];
+            let matches = match pattern {
+                Some(pat) => crate::pubsub::glob_match(pat, f),
+                None => true,
+            };
+            if matches {
+                res.push(f.clone());
+                res.push(v.clone());
+            }
+            idx += 1;
+        }
+        let next_cursor = if idx >= pairs.len() { 0 } else { idx };
+        Ok((next_cursor, res))
+    }
+
     // LIST METHODS
     pub fn lpush(&mut self, key: Bytes, values: Vec<Bytes>) -> Result<usize, &'static str> {
         let h = hash_key(&key);
@@ -2104,6 +2630,312 @@ impl RudisTable {
         } else {
             Ok(Vec::new())
         }
+    }
+
+    pub fn ltrim(&mut self, key: &[u8], mut start: i64, mut stop: i64) -> Result<(), &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(());
+            }
+            let is_empty = if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::List(deque) => {
+                        let n = deque.len() as i64;
+                        if n == 0 {
+                            true
+                        } else {
+                            if start < 0 {
+                                start = (n + start).max(0);
+                            }
+                            if stop < 0 {
+                                stop = n + stop;
+                            }
+                            if start > stop || start >= n {
+                                deque.clear();
+                                true
+                            } else {
+                                let start_u = start.max(0) as usize;
+                                let stop_u = (stop.min(n - 1) as usize).max(start_u);
+                                *deque = deque.drain(..).skip(start_u).take(stop_u - start_u + 1).collect();
+                                deque.is_empty()
+                            }
+                        }
+                    }
+                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                false
+            };
+            if is_empty {
+                self.table.remove(idx);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn lset(&mut self, key: &[u8], index: i64, element: Bytes) -> Result<(), &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Err("ERR no such key");
+            }
+            if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::List(deque) => {
+                        let n = deque.len() as i64;
+                        let actual = if index < 0 { n + index } else { index };
+                        if actual < 0 || actual >= n {
+                            return Err("ERR index out of range");
+                        }
+                        deque[actual as usize] = element;
+                        Ok(())
+                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Err("ERR no such key")
+            }
+        } else {
+            Err("ERR no such key")
+        }
+    }
+
+    pub fn lrem(&mut self, key: &[u8], count: i64, element: &[u8]) -> Result<usize, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(0);
+            }
+            let (removed, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::List(deque) => {
+                        let mut removed = 0;
+                        if count == 0 {
+                            let mut i = 0;
+                            while i < deque.len() {
+                                if deque[i].as_ref() == element {
+                                    deque.remove(i);
+                                    removed += 1;
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                        } else if count > 0 {
+                            let limit = count as usize;
+                            let mut i = 0;
+                            while i < deque.len() && removed < limit {
+                                if deque[i].as_ref() == element {
+                                    deque.remove(i);
+                                    removed += 1;
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                        } else {
+                            let limit = (-count) as usize;
+                            let mut i = deque.len();
+                            while i > 0 && removed < limit {
+                                i -= 1;
+                                if deque[i].as_ref() == element {
+                                    deque.remove(i);
+                                    removed += 1;
+                                }
+                            }
+                        }
+                        (removed, deque.is_empty())
+                    }
+                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                (0, false)
+            };
+            if is_empty {
+                self.table.remove(idx);
+            }
+            Ok(removed)
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn lpos(
+        &mut self,
+        key: &[u8],
+        element: &[u8],
+        rank: i64,
+        count: Option<usize>,
+        maxlen: Option<usize>,
+    ) -> Result<Vec<usize>, &'static str> {
+        if rank == 0 {
+            return Err("ERR RANK can't be zero: use 1 to start from the first match, use -1 from the last");
+        }
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(Vec::new());
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::List(deque) => {
+                        let total = deque.len();
+                        let max_inspect = maxlen.unwrap_or(total).min(total);
+                        let mut matches = Vec::new();
+
+                        if rank > 0 {
+                            let skip_rank = (rank - 1) as usize;
+                            let mut match_idx = 0;
+                            for (pos, item) in deque.iter().take(max_inspect).enumerate() {
+                                if item.as_ref() == element {
+                                    if match_idx >= skip_rank {
+                                        matches.push(pos);
+                                        if let Some(c) = count {
+                                            if c > 0 && matches.len() >= c {
+                                                break;
+                                            }
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    match_idx += 1;
+                                }
+                            }
+                        } else {
+                            let skip_rank = (-rank - 1) as usize;
+                            let mut match_idx = 0;
+                            let start_back = total.saturating_sub(max_inspect);
+                            for pos in (start_back..total).rev() {
+                                if deque[pos].as_ref() == element {
+                                    if match_idx >= skip_rank {
+                                        matches.push(pos);
+                                        if let Some(c) = count {
+                                            if c > 0 && matches.len() >= c {
+                                                break;
+                                            }
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                    match_idx += 1;
+                                }
+                            }
+                        }
+                        Ok(matches)
+                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(Vec::new())
+            }
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub fn linsert(
+        &mut self,
+        key: Bytes,
+        before: bool,
+        pivot: &[u8],
+        element: Bytes,
+    ) -> Result<i64, &'static str> {
+        let h = hash_key(&key);
+        if let Some(idx) = self.table.find(&key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(0);
+            }
+            if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::List(deque) => {
+                        if let Some(pos) = deque.iter().position(|m| m.as_ref() == pivot) {
+                            let insert_pos = if before { pos } else { pos + 1 };
+                            deque.insert(insert_pos, element);
+                            Ok(deque.len() as i64)
+                        } else {
+                            Ok(-1)
+                        }
+                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(0)
+            }
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn lmove(
+        &mut self,
+        source: &[u8],
+        destination: Bytes,
+        where_from: ListDirection,
+        where_to: ListDirection,
+    ) -> Result<Option<Bytes>, &'static str> {
+        let h_src = hash_key(source);
+        let src_idx = match self.table.find(source, h_src) {
+            Some(idx) => {
+                if self.check_expired_slot(idx) {
+                    return Ok(None);
+                }
+                idx
+            }
+            None => return Ok(None),
+        };
+
+        let (popped, is_empty) = match self.table.get_slot_mut(src_idx) {
+            Some(entry) => match &mut entry.val {
+                RudisValue::List(deque) => {
+                    let elem = match where_from {
+                        ListDirection::Left => deque.pop_front(),
+                        ListDirection::Right => deque.pop_back(),
+                    };
+                    (elem, deque.is_empty())
+                }
+                _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+            },
+            None => return Ok(None),
+        };
+
+        let val = match popped {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        if is_empty {
+            self.table.remove(src_idx);
+        }
+
+        let h_dst = hash_key(&destination);
+        let (existing, _) = self.table.find_or_prepare_insert(&destination, h_dst);
+        if let Some(dst_idx) = existing {
+            if !self.check_expired_slot(dst_idx) {
+                if let Some(entry) = self.table.get_slot_mut(dst_idx) {
+                    match &mut entry.val {
+                        RudisValue::List(deque) => {
+                            match where_to {
+                                ListDirection::Left => deque.push_front(val.clone()),
+                                ListDirection::Right => deque.push_back(val.clone()),
+                            }
+                            return Ok(Some(val));
+                        }
+                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    }
+                }
+            }
+        }
+
+        let mut deque = std::collections::VecDeque::new();
+        match where_to {
+            ListDirection::Left => deque.push_front(val.clone()),
+            ListDirection::Right => deque.push_back(val.clone()),
+        }
+        self.table.insert(RudisEntry {
+            key: destination,
+            val: RudisValue::List(deque),
+            expire_at: None,
+        });
+        Ok(Some(val))
     }
 
     // SET METHODS
@@ -2418,6 +3250,185 @@ impl RudisTable {
             self.sadd(dest, members)?;
         }
         Ok(count)
+    }
+
+    pub fn smismember(&mut self, key: &[u8], members: &[Bytes]) -> Result<Vec<bool>, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(vec![false; members.len()]);
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::Set(set) => {
+                        Ok(members.iter().map(|m| set.contains(m.as_ref())).collect())
+                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(vec![false; members.len()])
+            }
+        } else {
+            Ok(vec![false; members.len()])
+        }
+    }
+
+    pub fn srandmember(&mut self, key: &[u8], count: Option<i64>) -> Result<Vec<Bytes>, &'static str> {
+        let h = hash_key(key);
+        let items: Vec<Bytes> = if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(Vec::new());
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::Set(set) => set.to_vec(),
+                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                return Ok(Vec::new());
+            }
+        } else {
+            return Ok(Vec::new());
+        };
+
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let total = items.len();
+        match count {
+            None => {
+                let idx = self.next_rand() % total;
+                Ok(vec![items[idx].clone()])
+            }
+            Some(c) if c >= 0 => {
+                let k = (c as usize).min(total);
+                let mut indices: Vec<usize> = (0..total).collect();
+                for i in 0..k {
+                    let r = i + (self.next_rand() % (total - i));
+                    indices.swap(i, r);
+                }
+                let res = indices[..k].iter().map(|&i| items[i].clone()).collect();
+                Ok(res)
+            }
+            Some(c) => {
+                let k = (-c) as usize;
+                let mut res = Vec::with_capacity(k);
+                for _ in 0..k {
+                    let idx = self.next_rand() % total;
+                    res.push(items[idx].clone());
+                }
+                Ok(res)
+            }
+        }
+    }
+
+    pub fn smove(&mut self, source: &[u8], destination: Bytes, member: Bytes) -> Result<bool, &'static str> {
+        let h_src = hash_key(source);
+        let src_idx = match self.table.find(source, h_src) {
+            Some(idx) => {
+                if self.check_expired_slot(idx) {
+                    return Ok(false);
+                }
+                idx
+            }
+            None => return Ok(false),
+        };
+
+        let contains_member = match self.table.get_slot(src_idx).map(|e| &e.val) {
+            Some(RudisValue::Set(s)) => s.contains(member.as_ref()),
+            Some(_) => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+            None => return Ok(false),
+        };
+
+        if !contains_member {
+            return Ok(false);
+        }
+
+        let empty_after = if let Some(entry) = self.table.get_slot_mut(src_idx) {
+            if let RudisValue::Set(s) = &mut entry.val {
+                s.remove(member.as_ref());
+                s.is_empty()
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if empty_after {
+            self.table.remove(src_idx);
+        }
+
+        let h_dst = hash_key(&destination);
+        let (existing, _) = self.table.find_or_prepare_insert(&destination, h_dst);
+        if let Some(dst_idx) = existing {
+            if !self.check_expired_slot(dst_idx) {
+                if let Some(entry) = self.table.get_slot_mut(dst_idx) {
+                    match &mut entry.val {
+                        RudisValue::Set(s) => {
+                            s.insert(member);
+                            return Ok(true);
+                        }
+                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    }
+                }
+            }
+        }
+
+        let mut new_set = RudisSet::new();
+        new_set.insert(member);
+        self.table.insert(RudisEntry {
+            key: destination,
+            val: RudisValue::Set(new_set),
+            expire_at: None,
+        });
+        Ok(true)
+    }
+
+    pub fn sscan(
+        &mut self,
+        key: &[u8],
+        cursor: usize,
+        pattern: Option<&[u8]>,
+        count: usize,
+    ) -> Result<(usize, Vec<Bytes>), &'static str> {
+        let h = hash_key(key);
+        let items: Vec<Bytes> = if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok((0, Vec::new()));
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::Set(s) => s.to_vec(),
+                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                return Ok((0, Vec::new()));
+            }
+        } else {
+            return Ok((0, Vec::new()));
+        };
+
+        if cursor >= items.len() || items.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+
+        let mut res = Vec::new();
+        let mut idx = cursor;
+        while idx < items.len() && res.len() < count {
+            let m = &items[idx];
+            let matches = match pattern {
+                Some(pat) => crate::pubsub::glob_match(pat, m),
+                None => true,
+            };
+            if matches {
+                res.push(m.clone());
+            }
+            idx += 1;
+        }
+        let next_cursor = if idx >= items.len() { 0 } else { idx };
+        Ok((next_cursor, res))
     }
 
     pub fn zunionstore(
@@ -3076,6 +4087,241 @@ impl RudisTable {
         } else {
             Ok(Vec::new())
         }
+    }
+
+    pub fn zmscore(&mut self, key: &[u8], members: &[Bytes]) -> Result<Vec<Option<f64>>, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(vec![None; members.len()]);
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::ZSet(zset) => {
+                        Ok(members.iter().map(|m| zset.get_score(m.as_ref())).collect())
+                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(vec![None; members.len()])
+            }
+        } else {
+            Ok(vec![None; members.len()])
+        }
+    }
+
+    pub fn zrandmember(
+        &mut self,
+        key: &[u8],
+        count: Option<i64>,
+        _with_scores: bool,
+    ) -> Result<Vec<(Bytes, f64)>, &'static str> {
+        let h = hash_key(key);
+        let items: Vec<(Bytes, f64)> = if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(Vec::new());
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::ZSet(zset) => zset.to_vec(),
+                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                return Ok(Vec::new());
+            }
+        } else {
+            return Ok(Vec::new());
+        };
+
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let total = items.len();
+        match count {
+            None => {
+                let idx = self.next_rand() % total;
+                Ok(vec![items[idx].clone()])
+            }
+            Some(c) if c >= 0 => {
+                let k = (c as usize).min(total);
+                let mut indices: Vec<usize> = (0..total).collect();
+                for i in 0..k {
+                    let r = i + (self.next_rand() % (total - i));
+                    indices.swap(i, r);
+                }
+                let res = indices[..k].iter().map(|&i| items[i].clone()).collect();
+                Ok(res)
+            }
+            Some(c) => {
+                let k = (-c) as usize;
+                let mut res = Vec::with_capacity(k);
+                for _ in 0..k {
+                    let idx = self.next_rand() % total;
+                    res.push(items[idx].clone());
+                }
+                Ok(res)
+            }
+        }
+    }
+
+    pub fn zremrangebyrank(&mut self, key: &[u8], start: i64, stop: i64) -> Result<usize, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(0);
+            }
+            if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::ZSet(zset) => {
+                        let removed = zset.rem_range_by_rank(start, stop);
+                        let is_empty = zset.is_empty();
+                        if is_empty {
+                            self.table.remove(idx);
+                        }
+                        Ok(removed)
+                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(0)
+            }
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn zremrangebyscore(
+        &mut self,
+        key: &[u8],
+        min: f64,
+        min_inc: bool,
+        max: f64,
+        max_inc: bool,
+    ) -> Result<usize, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(0);
+            }
+            if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::ZSet(zset) => {
+                        let removed = zset.rem_range_by_score(min, min_inc, max, max_inc);
+                        let is_empty = zset.is_empty();
+                        if is_empty {
+                            self.table.remove(idx);
+                        }
+                        Ok(removed)
+                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(0)
+            }
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn zremrangebylex(
+        &mut self,
+        key: &[u8],
+        min: &LexBound,
+        max: &LexBound,
+    ) -> Result<usize, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(0);
+            }
+            if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::ZSet(zset) => {
+                        let removed = zset.rem_range_by_lex(min, max);
+                        let is_empty = zset.is_empty();
+                        if is_empty {
+                            self.table.remove(idx);
+                        }
+                        Ok(removed)
+                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(0)
+            }
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn zlexcount(
+        &mut self,
+        key: &[u8],
+        min: &LexBound,
+        max: &LexBound,
+    ) -> Result<usize, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(0);
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::ZSet(zset) => Ok(zset.lex_count(min, max)),
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(0)
+            }
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn zscan(
+        &mut self,
+        key: &[u8],
+        cursor: usize,
+        pattern: Option<&[u8]>,
+        count: usize,
+    ) -> Result<(usize, Vec<(Bytes, f64)>), &'static str> {
+        let h = hash_key(key);
+        let items: Vec<(Bytes, f64)> = if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok((0, Vec::new()));
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::ZSet(zset) => zset.to_vec(),
+                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                return Ok((0, Vec::new()));
+            }
+        } else {
+            return Ok((0, Vec::new()));
+        };
+
+        if cursor >= items.len() || items.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+
+        let mut res = Vec::new();
+        let mut idx = cursor;
+        while idx < items.len() && res.len() < count {
+            let (m, s) = &items[idx];
+            let matches = match pattern {
+                Some(pat) => crate::pubsub::glob_match(pat, m),
+                None => true,
+            };
+            if matches {
+                res.push((m.clone(), *s));
+            }
+            idx += 1;
+        }
+        let next_cursor = if idx >= items.len() { 0 } else { idx };
+        Ok((next_cursor, res))
     }
 
     /// Active sampling cycle: samples up to 20 slots starting from cursor and evicts expired keys.

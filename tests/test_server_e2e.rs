@@ -2363,5 +2363,169 @@ fn test_auth_and_acl_e2e() {
     );
 }
 
+#[test]
+fn test_valkey_missing_features_e2e() {
+    let port = 16410;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("Failed to connect to rudis server");
+
+    // 1. Handshake & System commands: HELLO, RESET, TIME, ECHO
+    let hello = send_and_read(&mut client, b"HELLO\r\n");
+    assert!(hello.contains("server\r\n$6\r\nvalkey\r\n"));
+    assert!(hello.contains("version\r\n$5\r\n7.2.0\r\n"));
+
+    let hello_proto = send_and_read(&mut client, b"HELLO 3 SETNAME myapp\r\n");
+    assert!(hello_proto.contains("proto\r\n:3\r\n"));
+    let getname = send_and_read(&mut client, b"CLIENT GETNAME\r\n");
+    assert_eq!(getname, "$5\r\nmyapp\r\n");
+
+    let echo_resp = send_and_read(&mut client, b"ECHO hello_valkey\r\n");
+    assert_eq!(echo_resp, "$12\r\nhello_valkey\r\n");
+
+    let time_resp = send_and_read(&mut client, b"TIME\r\n");
+    assert!(time_resp.starts_with("*2\r\n$"));
+
+    let reset_resp = send_and_read(&mut client, b"RESET\r\n");
+    assert_eq!(reset_resp, "+RESET\r\n");
+    let getname_after_reset = send_and_read(&mut client, b"CLIENT GETNAME\r\n");
+    assert_eq!(getname_after_reset, "$-1\r\n");
+
+    // 2. Hash commands: HINCRBY, HINCRBYFLOAT, HRANDFIELD, HSCAN
+    send_and_read(&mut client, b"HSET {h1} f1 10\r\n");
+    let hincrby_resp = send_and_read(&mut client, b"HINCRBY {h1} f1 5\r\n");
+    assert_eq!(hincrby_resp, ":15\r\n");
+
+    let hincrbyfloat_resp = send_and_read(&mut client, b"HINCRBYFLOAT {h1} f1 2.5\r\n");
+    assert_eq!(hincrbyfloat_resp, "$4\r\n17.5\r\n");
+
+    send_and_read(&mut client, b"HSET {h1} f2 20\r\n");
+    let hrand_single = send_and_read(&mut client, b"HRANDFIELD {h1}\r\n");
+    assert!(hrand_single == "$2\r\nf1\r\n" || hrand_single == "$2\r\nf2\r\n");
+
+    let hrand_count = send_and_read(&mut client, b"HRANDFIELD {h1} 2\r\n");
+    assert_eq!(hrand_count.lines().next().unwrap(), "*2");
+
+    let hrand_values = send_and_read(&mut client, b"HRANDFIELD {h1} 2 WITHVALUES\r\n");
+    assert_eq!(hrand_values.lines().next().unwrap(), "*4");
+
+    let hscan_resp = send_and_read(&mut client, b"HSCAN {h1} 0 MATCH f* COUNT 10\r\n");
+    assert!(hscan_resp.starts_with("*2\r\n$1\r\n0\r\n"));
+
+    // 3. Set commands: SMISMEMBER, SRANDMEMBER, SMOVE, SSCAN
+    send_and_read(&mut client, b"SADD {s1} a b c\r\n");
+    let smismember_resp = send_and_read(&mut client, b"SMISMEMBER {s1} a d b\r\n");
+    assert_eq!(smismember_resp, "*3\r\n:1\r\n:0\r\n:1\r\n");
+
+    let srand_single = send_and_read(&mut client, b"SRANDMEMBER {s1}\r\n");
+    assert!(srand_single == "$1\r\na\r\n" || srand_single == "$1\r\nb\r\n" || srand_single == "$1\r\nc\r\n");
+
+    let srand_count = send_and_read(&mut client, b"SRANDMEMBER {s1} 2\r\n");
+    assert_eq!(srand_count.lines().next().unwrap(), "*2");
+
+    let sscan_resp = send_and_read(&mut client, b"SSCAN {s1} 0\r\n");
+    assert!(sscan_resp.starts_with("*2\r\n$1\r\n0\r\n"));
+
+    // SMOVE same slot (using hash tags {s1})
+    let smove_ok = send_and_read(&mut client, b"SMOVE {s1} {s1}_dst a\r\n");
+    assert_eq!(smove_ok, ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"SISMEMBER {s1} a\r\n"), ":0\r\n");
+    assert_eq!(send_and_read(&mut client, b"SISMEMBER {s1}_dst a\r\n"), ":1\r\n");
+
+    // SMOVE cross-slot error
+    let smove_cross = send_and_read(&mut client, b"SMOVE {s1} cross_slot_dest b\r\n");
+    assert!(smove_cross.starts_with("-CROSSSLOT"));
+
+    // 4. Sorted Set commands: ZMSCORE, ZRANDMEMBER, ZREMRANGEBYRANK, ZREMRANGEBYSCORE, ZREMRANGEBYLEX, ZLEXCOUNT, ZSCAN
+    send_and_read(&mut client, b"ZADD {z1} 10 m1 20 m2 30 m3\r\n");
+    let zmscore_resp = send_and_read(&mut client, b"ZMSCORE {z1} m1 non_existing m3\r\n");
+    assert_eq!(zmscore_resp, "*3\r\n$2\r\n10\r\n$-1\r\n$2\r\n30\r\n");
+
+    let zrand_single = send_and_read(&mut client, b"ZRANDMEMBER {z1}\r\n");
+    assert!(zrand_single.starts_with("$2\r\nm"));
+
+    let zrand_scores = send_and_read(&mut client, b"ZRANDMEMBER {z1} 2 WITHSCORES\r\n");
+    assert_eq!(zrand_scores.lines().next().unwrap(), "*4");
+
+    let zlexcount_resp = send_and_read(&mut client, b"ZLEXCOUNT {z1} [m1 (m3\r\n");
+    assert_eq!(zlexcount_resp, ":2\r\n");
+
+    let zscan_resp = send_and_read(&mut client, b"ZSCAN {z1} 0\r\n");
+    assert!(zscan_resp.starts_with("*2\r\n$1\r\n0\r\n"));
+
+    let zrem_rank = send_and_read(&mut client, b"ZREMRANGEBYRANK {z1} 0 0\r\n");
+    assert_eq!(zrem_rank, ":1\r\n"); // removes m1
+
+    let zrem_score = send_and_read(&mut client, b"ZREMRANGEBYSCORE {z1} 20 20\r\n");
+    assert_eq!(zrem_score, ":1\r\n"); // removes m2
+
+    let zrem_lex = send_and_read(&mut client, b"ZREMRANGEBYLEX {z1} [m3 [m3\r\n");
+    assert_eq!(zrem_lex, ":1\r\n"); // removes m3
+    assert_eq!(send_and_read(&mut client, b"ZCARD {z1}\r\n"), ":0\r\n");
+
+    // 5. List commands: LTRIM, LSET, LREM, LPOS, LINSERT, LMOVE, BLMOVE
+    send_and_read(&mut client, b"RPUSH {l1} zero one two three four five\r\n");
+    let ltrim_resp = send_and_read(&mut client, b"LTRIM {l1} 1 4\r\n");
+    assert_eq!(ltrim_resp, "+OK\r\n"); // now: one two three four
+
+    let lset_resp = send_and_read(&mut client, b"LSET {l1} 1 updated\r\n");
+    assert_eq!(lset_resp, "+OK\r\n"); // now: one updated three four
+
+    let lpos_resp = send_and_read(&mut client, b"LPOS {l1} updated\r\n");
+    assert_eq!(lpos_resp, ":1\r\n");
+
+    let lrem_resp = send_and_read(&mut client, b"LREM {l1} 1 updated\r\n");
+    assert_eq!(lrem_resp, ":1\r\n"); // now: one three four
+
+    let linsert_resp = send_and_read(&mut client, b"LINSERT {l1} BEFORE three inserted\r\n");
+    assert_eq!(linsert_resp, ":4\r\n"); // now: one inserted three four
+
+    let lmove_resp = send_and_read(&mut client, b"LMOVE {l1} {l1}_dst LEFT RIGHT\r\n");
+    assert_eq!(lmove_resp, "$3\r\none\r\n");
+
+    let lmove_cross = send_and_read(&mut client, b"LMOVE {l1} cross_slot LEFT RIGHT\r\n");
+    assert!(lmove_cross.starts_with("-CROSSSLOT"));
+
+    // BLMOVE immediate
+    let blmove_immediate = send_and_read(&mut client, b"BLMOVE {l1}_dst {l1} LEFT LEFT 0.1\r\n");
+    assert_eq!(blmove_immediate, "$3\r\none\r\n");
+
+    // BLMOVE timeout
+    let blmove_timeout = send_and_read(&mut client, b"BLMOVE {empty_q} {empty_q}_dst LEFT RIGHT 0.1\r\n");
+    assert_eq!(blmove_timeout, "$-1\r\n");
+
+    // BLMOVE blocking cross-thread notification
+    let pusher_port = port;
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        let mut pusher = TcpStream::connect(format!("127.0.0.1:{}", pusher_port)).unwrap();
+        send_and_read(&mut pusher, b"LPUSH {blmove_q} blocked_item\r\n");
+    });
+
+    let blmove_blocked = send_and_read(&mut client, b"BLMOVE {blmove_q} {blmove_q}_dst LEFT RIGHT 2.0\r\n");
+    assert_eq!(blmove_blocked, "$12\r\nblocked_item\r\n");
+    let dest_pop = send_and_read(&mut client, b"RPOP {blmove_q}_dst\r\n");
+    assert_eq!(dest_pop, "$12\r\nblocked_item\r\n");
+
+    // 6. String commands: INCRBYFLOAT, SETRANGE, GETRANGE
+    send_and_read(&mut client, b"SET str1 hello_valkey\r\n");
+    let getrange_resp = send_and_read(&mut client, b"GETRANGE str1 0 4\r\n");
+    assert_eq!(getrange_resp, "$5\r\nhello\r\n");
+
+    let getrange_neg = send_and_read(&mut client, b"GETRANGE str1 -6 -1\r\n");
+    assert_eq!(getrange_neg, "$6\r\nvalkey\r\n");
+
+    let setrange_resp = send_and_read(&mut client, b"SETRANGE str1 6 world\r\n");
+    assert_eq!(setrange_resp, ":12\r\n");
+    assert_eq!(send_and_read(&mut client, b"GET str1\r\n"), "$12\r\nhello_worldy\r\n");
+
+    send_and_read(&mut client, b"SET num 10.5\r\n");
+    let incrbyfloat_resp = send_and_read(&mut client, b"INCRBYFLOAT num 2.25\r\n");
+    assert_eq!(incrbyfloat_resp, "$5\r\n12.75\r\n");
+}
+
+
 
 
