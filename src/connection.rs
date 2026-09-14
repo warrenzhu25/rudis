@@ -1691,7 +1691,7 @@ async fn execute_command(
                 stats.tiered_keys.load(std::sync::atomic::Ordering::Relaxed),
             );
             let storage_str = format!(
-                "# Storage\r\ntier_enabled:1\r\nmaxmemory:{}\r\nmaxmemory_human:{}\r\nused_memory:{}\r\nused_memory_human:{}\r\ncooled_keys:{}\r\ntiered_keys:{}\r\ntiered_bytes:{}\r\nram_saved_bytes:{}\r\ndisk_reads:{}\r\ndisk_writes:{}\r\ndead_bytes:{}\r\ndecommit_count:{}\r\n",
+                "# Storage\r\ntier_enabled:1\r\nmaxmemory:{}\r\nmaxmemory_human:{}\r\nused_memory:{}\r\nused_memory_human:{}\r\ncooled_keys:{}\r\ntiered_keys:{}\r\ntiered_bytes:{}\r\nram_saved_bytes:{}\r\ndisk_reads:{}\r\ndisk_writes:{}\r\ndead_bytes:{}\r\ndecommit_count:{}\r\ncoalesced_reads:{}\r\nbin_pages:{}\r\ntotal_stashes:{}\r\ntotal_fetches:{}\r\ntotal_deletes:{}\r\nram_hits:{}\r\nram_misses:{}\r\nstreaming_reads:{}\r\noffload_threshold_pct:{}\r\nupload_threshold_pct:{}\r\n",
                 max_mem,
                 crate::tiering::format_bytes_human(max_mem),
                 used_mem,
@@ -1704,12 +1704,22 @@ async fn execute_command(
                 stats.disk_writes.load(std::sync::atomic::Ordering::Relaxed),
                 stats.dead_bytes.load(std::sync::atomic::Ordering::Relaxed),
                 stats.decommit_count.load(std::sync::atomic::Ordering::Relaxed),
+                stats.coalesced_reads.load(std::sync::atomic::Ordering::Relaxed),
+                stats.bin_pages.load(std::sync::atomic::Ordering::Relaxed),
+                stats.total_stashes.load(std::sync::atomic::Ordering::Relaxed),
+                stats.total_fetches.load(std::sync::atomic::Ordering::Relaxed),
+                stats.total_deletes.load(std::sync::atomic::Ordering::Relaxed),
+                stats.ram_hits.load(std::sync::atomic::Ordering::Relaxed),
+                stats.ram_misses.load(std::sync::atomic::Ordering::Relaxed),
+                stats.streaming_reads.load(std::sync::atomic::Ordering::Relaxed),
+                stats.offload_threshold_pct.load(std::sync::atomic::Ordering::Relaxed),
+                stats.upload_threshold_pct.load(std::sync::atomic::Ordering::Relaxed),
             );
             let info_str = match section.as_deref() {
                 Some(b"replication") | Some(b"REPLICATION") => {
                     hub.format_info_replication()
                 }
-                Some(b"storage") | Some(b"STORAGE") => {
+                Some(b"storage") | Some(b"STORAGE") | Some(b"tiered") | Some(b"TIERED") => {
                     storage_str
                 }
                 Some(b"memory") | Some(b"MEMORY") => {
@@ -1835,7 +1845,7 @@ async fn execute_command(
                     let max_mem = crate::tiering::get_max_memory(router.port);
                     let used_mem = router.get_total_used_memory().await;
                     let info = format!(
-                        "# Tiered Storage (io_uring NVMe)\r\ntier_enabled:1\r\nmaxmemory:{}\r\nmaxmemory_human:{}\r\nused_memory:{}\r\nused_memory_human:{}\r\ncooled_keys:{}\r\ntiered_keys:{}\r\ntiered_bytes:{}\r\nram_saved_bytes:{}\r\ndisk_reads:{}\r\ndisk_writes:{}\r\ndead_bytes:{}\r\ndecommit_count:{}\r\n",
+                        "# Tiered Storage (io_uring NVMe)\r\ntier_enabled:1\r\nmaxmemory:{}\r\nmaxmemory_human:{}\r\nused_memory:{}\r\nused_memory_human:{}\r\ncooled_keys:{}\r\ntiered_keys:{}\r\ntiered_bytes:{}\r\nram_saved_bytes:{}\r\ndisk_reads:{}\r\ndisk_writes:{}\r\ndead_bytes:{}\r\ndecommit_count:{}\r\ncoalesced_reads:{}\r\nbin_pages:{}\r\ntotal_stashes:{}\r\ntotal_fetches:{}\r\ntotal_deletes:{}\r\nram_hits:{}\r\nram_misses:{}\r\nstreaming_reads:{}\r\noffload_threshold_pct:{}\r\nupload_threshold_pct:{}\r\n",
                         max_mem,
                         crate::tiering::format_bytes_human(max_mem),
                         used_mem,
@@ -1848,6 +1858,16 @@ async fn execute_command(
                         stats.disk_writes.load(std::sync::atomic::Ordering::Relaxed),
                         stats.dead_bytes.load(std::sync::atomic::Ordering::Relaxed),
                         stats.decommit_count.load(std::sync::atomic::Ordering::Relaxed),
+                        stats.coalesced_reads.load(std::sync::atomic::Ordering::Relaxed),
+                        stats.bin_pages.load(std::sync::atomic::Ordering::Relaxed),
+                        stats.total_stashes.load(std::sync::atomic::Ordering::Relaxed),
+                        stats.total_fetches.load(std::sync::atomic::Ordering::Relaxed),
+                        stats.total_deletes.load(std::sync::atomic::Ordering::Relaxed),
+                        stats.ram_hits.load(std::sync::atomic::Ordering::Relaxed),
+                        stats.ram_misses.load(std::sync::atomic::Ordering::Relaxed),
+                        stats.streaming_reads.load(std::sync::atomic::Ordering::Relaxed),
+                        stats.offload_threshold_pct.load(std::sync::atomic::Ordering::Relaxed),
+                        stats.upload_threshold_pct.load(std::sync::atomic::Ordering::Relaxed),
                     );
                     out.extend_from_slice(format!("${}\r\n{}\r\n", info.len(), info).as_bytes());
                 }
@@ -1856,12 +1876,42 @@ async fn execute_command(
         }
         Command::ConfigGet(param) => {
             let p_str = String::from_utf8_lossy(&param).to_lowercase();
-            if p_str == "maxmemory" || p_str == "*" {
+            if p_str == "maxmemory" {
                 let max_mem = crate::tiering::get_max_memory(router.port).to_string();
                 let resp = format!(
                     "*2\r\n$9\r\nmaxmemory\r\n${}\r\n{}\r\n",
                     max_mem.len(),
                     max_mem
+                );
+                out.extend_from_slice(resp.as_bytes());
+            } else if p_str == "tiered-offload-threshold" {
+                let val = crate::tiering::get_offload_threshold_pct(router.port).to_string();
+                let resp = format!(
+                    "*2\r\n$24\r\ntiered-offload-threshold\r\n${}\r\n{}\r\n",
+                    val.len(),
+                    val
+                );
+                out.extend_from_slice(resp.as_bytes());
+            } else if p_str == "tiered-upload-threshold" {
+                let val = crate::tiering::get_upload_threshold_pct(router.port).to_string();
+                let resp = format!(
+                    "*2\r\n$23\r\ntiered-upload-threshold\r\n${}\r\n{}\r\n",
+                    val.len(),
+                    val
+                );
+                out.extend_from_slice(resp.as_bytes());
+            } else if p_str == "*" {
+                let max_mem = crate::tiering::get_max_memory(router.port).to_string();
+                let offload = crate::tiering::get_offload_threshold_pct(router.port).to_string();
+                let upload = crate::tiering::get_upload_threshold_pct(router.port).to_string();
+                let resp = format!(
+                    "*6\r\n$9\r\nmaxmemory\r\n${}\r\n{}\r\n$24\r\ntiered-offload-threshold\r\n${}\r\n{}\r\n$23\r\ntiered-upload-threshold\r\n${}\r\n{}\r\n",
+                    max_mem.len(),
+                    max_mem,
+                    offload.len(),
+                    offload,
+                    upload.len(),
+                    upload
                 );
                 out.extend_from_slice(resp.as_bytes());
             } else {
@@ -1871,13 +1921,27 @@ async fn execute_command(
         }
         Command::ConfigSet(param, val) => {
             let p_str = String::from_utf8_lossy(&param).to_lowercase();
+            let val_str = String::from_utf8_lossy(&val);
             if p_str == "maxmemory" {
-                let val_str = String::from_utf8_lossy(&val);
                 if let Some(bytes) = crate::tiering::parse_memory_bytes(&val_str) {
                     crate::tiering::set_max_memory(router.port, bytes);
                     out.extend_from_slice(b"+OK\r\n");
                 } else {
                     out.extend_from_slice(b"-ERR Invalid argument for CONFIG SET maxmemory\r\n");
+                }
+            } else if p_str == "tiered-offload-threshold" {
+                if let Ok(pct) = val_str.parse::<u64>() {
+                    crate::tiering::set_offload_threshold_pct(router.port, pct);
+                    out.extend_from_slice(b"+OK\r\n");
+                } else {
+                    out.extend_from_slice(b"-ERR Invalid argument for CONFIG SET tiered-offload-threshold\r\n");
+                }
+            } else if p_str == "tiered-upload-threshold" {
+                if let Ok(pct) = val_str.parse::<u64>() {
+                    crate::tiering::set_upload_threshold_pct(router.port, pct);
+                    out.extend_from_slice(b"+OK\r\n");
+                } else {
+                    out.extend_from_slice(b"-ERR Invalid argument for CONFIG SET tiered-upload-threshold\r\n");
                 }
             } else {
                 out.extend_from_slice(b"+OK\r\n");

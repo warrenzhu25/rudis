@@ -2997,6 +2997,91 @@ fn test_auto_tiering_memory_pressure_e2e() {
     );
 }
 
+#[test]
+fn test_tiered_storage_tracks_e2e() {
+    let port = 16415;
+    let num_shards = 2;
+    start_test_server(port, num_shards);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("Failed to connect to rudis test server");
+
+    // 1. Dynamic Watermark Thresholds via CONFIG GET/SET
+    let offload_get = send_and_read(&mut client, b"CONFIG GET tiered-offload-threshold\r\n");
+    assert!(offload_get.contains("60"));
+
+    let upload_get = send_and_read(&mut client, b"CONFIG GET tiered-upload-threshold\r\n");
+    assert!(upload_get.contains("80"));
+
+    assert_eq!(
+        send_and_read(&mut client, b"CONFIG SET tiered-offload-threshold 75\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"CONFIG SET tiered-upload-threshold 65\r\n"),
+        "+OK\r\n"
+    );
+
+    let offload_get2 = send_and_read(&mut client, b"CONFIG GET tiered-offload-threshold\r\n");
+    assert!(offload_get2.contains("75"));
+
+    let upload_get2 = send_and_read(&mut client, b"CONFIG GET tiered-upload-threshold\r\n");
+    assert!(upload_get2.contains("65"));
+
+    // 2. Verify TIER INFO telemetry fields
+    let info = send_and_read(&mut client, b"TIER INFO\r\n");
+    assert!(info.contains("offload_threshold_pct:75"));
+    assert!(info.contains("upload_threshold_pct:65"));
+    assert!(info.contains("bin_pages:"));
+    assert!(info.contains("coalesced_reads:"));
+    assert!(info.contains("ram_hits:"));
+    assert!(info.contains("ram_misses:"));
+    assert!(info.contains("total_stashes:"));
+    assert!(info.contains("total_fetches:"));
+    assert!(info.contains("total_deletes:"));
+
+    // 3. SmallBins aggregation: pack multiple small records (<2KB)
+    for i in 0..15 {
+        let val = format!("small_val_{:03}_{}", i, "A".repeat(150));
+        let set_cmd = format!("SET sb_key:{} {}\r\n", i, val);
+        assert_eq!(send_and_read(&mut client, set_cmd.as_bytes()), "+OK\r\n");
+
+        let cool_cmd = format!("TIER COOL sb_key:{}\r\n", i);
+        assert_eq!(send_and_read(&mut client, cool_cmd.as_bytes()), ":1\r\n");
+    }
+
+    let info_after_cool = send_and_read(&mut client, b"TIER INFO\r\n");
+    assert!(info_after_cool.contains("cooled_keys:15"));
+    assert!(info_after_cool.contains("total_stashes:15"));
+
+    // 4. Instant Decommit: Cooled -> Cold
+    let decommit_resp = send_and_read(&mut client, b"TIER DECOMMIT\r\n");
+    assert_eq!(decommit_resp, ":15\r\n");
+
+    let info_after_decommit = send_and_read(&mut client, b"TIER INFO\r\n");
+    assert!(info_after_decommit.contains("cooled_keys:0"));
+    assert!(info_after_decommit.contains("tiered_keys:15"));
+
+    // 5. Read back keys - verifying fetch promotion and data integrity
+    for i in 0..15 {
+        let expected = format!("small_val_{:03}_{}", i, "A".repeat(150));
+        let get_cmd = format!("GET sb_key:{}\r\n", i);
+        let resp = send_and_read(&mut client, get_cmd.as_bytes());
+        assert_eq!(resp, format!("${}\r\n{}\r\n", expected.len(), expected));
+    }
+
+    let info_after_get = send_and_read(&mut client, b"TIER INFO\r\n");
+    assert!(info_after_get.contains("total_fetches:15"));
+
+    // 6. Overwrite a key and verify total_deletes increments
+    assert_eq!(
+        send_and_read(&mut client, b"SET sb_key:0 new_val\r\n"),
+        "+OK\r\n"
+    );
+    let info_after_overwrite = send_and_read(&mut client, b"TIER INFO\r\n");
+    assert!(info_after_overwrite.contains("total_deletes:1"));
+}
+
 
 
 

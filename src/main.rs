@@ -30,6 +30,14 @@ struct Args {
     /// Max memory limit for tiered storage auto-tiering (e.g. 512mb, 1gb)
     #[arg(long)]
     maxmemory: Option<String>,
+
+    /// Offload memory threshold percentage (default: 60)
+    #[arg(long, default_value_t = 60)]
+    tiered_offload_threshold: u64,
+
+    /// Upload streaming memory threshold percentage (default: 80)
+    #[arg(long, default_value_t = 80)]
+    tiered_upload_threshold: u64,
 }
 
 fn main() {
@@ -40,6 +48,8 @@ fn main() {
             rudis::tiering::set_max_memory(args.port, bytes);
         }
     }
+    rudis::tiering::set_offload_threshold_pct(args.port, args.tiered_offload_threshold);
+    rudis::tiering::set_upload_threshold_pct(args.port, args.tiered_upload_threshold);
 
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
     let num_cores = if !core_ids.is_empty() {

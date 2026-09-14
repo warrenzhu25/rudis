@@ -1,0 +1,122 @@
+{
+  "in_memory": {
+    "set": {
+      "type": "Sets",
+      "ops_sec": 2796631.37,
+      "avg_latency": 0.56373,
+      "p50": 0.495,
+      "p90": 0.847,
+      "p95": 0.991,
+      "p99": 1.559,
+      "p99_9": 6.303,
+      "kb_sec": 1523626.95
+    },
+    "get": {
+      "type": "Gets",
+      "ops_sec": 2292259.96,
+      "avg_latency": 0.69633,
+      "p50": 0.655,
+      "p90": 0.839,
+      "p95": 0.935,
+      "p99": 1.455,
+      "p99_9": 6.943,
+      "kb_sec": 1237649.38
+    },
+    "mix": {
+      "type": "Totals",
+      "ops_sec": 2633706.07,
+      "avg_latency": 0.60426,
+      "p50": 0.543,
+      "p90": 0.903,
+      "p95": 1.063,
+      "p99": 1.535,
+      "p99_9": 5.823,
+      "kb_sec": 1428416.25
+    }
+  },
+  "tiered": {
+    "set": {
+      "type": "Sets",
+      "ops_sec": 220641.2,
+      "avg_latency": 7.22944,
+      "p50": 0.511,
+      "p90": 15.871,
+      "p95": 34.815,
+      "p99": 74.239,
+      "p99_9": 872.447,
+      "kb_sec": 120197.54
+    },
+    "get": {
+      "type": "Gets",
+      "ops_sec": 827825.62,
+      "avg_latency": 1.93017,
+      "p50": 0.663,
+      "p90": 4.863,
+      "p95": 5.919,
+      "p99": 8.639,
+      "p99_9": 26.111,
+      "kb_sec": 414428.13
+    },
+    "mix": {
+      "type": "Totals",
+      "ops_sec": 213232.53,
+      "avg_latency": 7.49718,
+      "p50": 3.263,
+      "p90": 18.047,
+      "p95": 22.783,
+      "p99": 37.887,
+      "p99_9": 84.479,
+      "kb_sec": 115420.12
+    },
+    "info_after_set": {
+      "tier_enabled": "1",
+      "maxmemory": "33554432",
+      "maxmemory_human": "32.00M",
+      "used_memory": "33620431",
+      "used_memory_human": "32.06M",
+      "cooled_keys": "0",
+      "tiered_keys": "2906200",
+      "tiered_bytes": "1697146501",
+      "ram_saved_bytes": "1592628323",
+      "disk_reads": "0",
+      "disk_writes": "3424280",
+      "dead_bytes": "112068714",
+      "decommit_count": "0",
+      "coalesced_reads": "0",
+      "bin_pages": "343761",
+      "total_stashes": "3080519",
+      "total_fetches": "0",
+      "total_deletes": "174319",
+      "ram_hits": "0",
+      "ram_misses": "0",
+      "streaming_reads": "0",
+      "offload_threshold_pct": "60",
+      "upload_threshold_pct": "80"
+    },
+    "info_final": {
+      "tier_enabled": "1",
+      "maxmemory": "33554432",
+      "maxmemory_human": "32.00M",
+      "used_memory": "33551135",
+      "used_memory_human": "32.00M",
+      "cooled_keys": "494",
+      "tiered_keys": "3827609",
+      "tiered_bytes": "2429661184",
+      "ram_saved_bytes": "2278180905",
+      "disk_reads": "279462",
+      "disk_writes": "4896772",
+      "dead_bytes": "395703562",
+      "decommit_count": "222365",
+      "coalesced_reads": "56581",
+      "bin_pages": "486144",
+      "total_stashes": "4410628",
+      "total_fetches": "224303",
+      "total_deletes": "582525",
+      "ram_hits": "530671",
+      "ram_misses": "74397",
+      "streaming_reads": "74397",
+      "offload_threshold_pct": "60",
+      "upload_threshold_pct": "80"
+    }
+  }
+}

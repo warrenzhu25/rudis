@@ -221,7 +221,7 @@ pub enum SlotState {
 pub struct ShardDb {
     pub table: crate::table::RudisTable,
     pub port: u16,
-    pub tier_manager: Option<crate::tiering::ShardTierManager>,
+    pub tier_manager: Option<std::rc::Rc<crate::tiering::ShardTierManager>>,
 }
 
 impl ShardDb {
@@ -248,15 +248,20 @@ impl ShardDb {
 
     #[inline]
     pub fn set(&mut self, key: Bytes, value: Bytes, expire_in: Option<Duration>) {
+        if let Some(tm) = &self.tier_manager {
+            tm.op_manager.cancel_pending_stash(&key);
+        }
         if let Some(ptr) = self.table.is_tiered(&key) {
             if let Some(tm) = &self.tier_manager {
+                tm.on_key_deleted(ptr);
                 tm.stats.tiered_keys.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                tm.stats.dead_bytes.fetch_add(ptr.length as u64, std::sync::atomic::Ordering::Relaxed);
+                tm.stats.total_deletes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         } else if let Some(ptr) = self.table.is_cooled(&key) {
             if let Some(tm) = &self.tier_manager {
+                tm.on_key_deleted(ptr);
                 tm.stats.cooled_keys.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                tm.stats.dead_bytes.fetch_add(ptr.length as u64, std::sync::atomic::Ordering::Relaxed);
+                tm.stats.total_deletes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
         self.table.set(key, value, expire_in);
@@ -264,19 +269,24 @@ impl ShardDb {
 
     #[inline]
     pub fn del(&mut self, key: &[u8]) -> bool {
+        if let Some(tm) = &self.tier_manager {
+            tm.op_manager.cancel_pending_stash(key);
+        }
         let ptr = self.table.is_tiered(key);
         let cooled_ptr = if ptr.is_none() { self.table.is_cooled(key) } else { None };
         let deleted = self.table.del(key);
         if deleted {
             if let Some(ptr) = ptr {
                 if let Some(tm) = &self.tier_manager {
+                    tm.on_key_deleted(ptr);
                     tm.stats.tiered_keys.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    tm.stats.dead_bytes.fetch_add(ptr.length as u64, std::sync::atomic::Ordering::Relaxed);
+                    tm.stats.total_deletes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             } else if let Some(ptr) = cooled_ptr {
                 if let Some(tm) = &self.tier_manager {
+                    tm.on_key_deleted(ptr);
                     tm.stats.cooled_keys.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    tm.stats.dead_bytes.fetch_add(ptr.length as u64, std::sync::atomic::Ordering::Relaxed);
+                    tm.stats.total_deletes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }

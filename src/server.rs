@@ -134,7 +134,7 @@ pub fn run_shard_worker(
             .unwrap_or_else(|_| std::env::temp_dir().join(format!("rudis_tier_{}", port)));
         match crate::tiering::ShardTierManager::open(shard_id, port, &tier_dir).await {
             Ok(tm) => {
-                local_db.borrow_mut().tier_manager = Some(tm);
+                local_db.borrow_mut().tier_manager = Some(Rc::new(tm));
             }
             Err(e) => {
                 eprintln!("[Shard {}] Failed to open Tier manager: {}", shard_id, e);
@@ -163,6 +163,15 @@ pub fn run_shard_worker(
             loop {
                 monoio::time::sleep(std::time::Duration::from_millis(100)).await;
                 active_db.borrow_mut().active_expire_cycle();
+            }
+        });
+
+        // Background Tiered Storage Offload cycle: run every 100ms
+        let offload_router = router.clone();
+        monoio::spawn(async move {
+            loop {
+                monoio::time::sleep(std::time::Duration::from_millis(100)).await;
+                offload_router.check_auto_tier().await;
             }
         });
 

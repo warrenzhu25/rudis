@@ -168,40 +168,25 @@ impl Router {
             None => return false,
         };
 
-        let (file, offset, stats, shard_id) = {
-            let mut db = self.local_db.borrow_mut();
-            if let Some(tm) = &mut db.tier_manager {
-                let off = tm.current_offset;
-                (tm.file.clone(), off, tm.stats.clone(), tm.shard_id)
-            } else {
-                return false;
-            }
+        let tm = match self.local_db.borrow().tier_manager.clone() {
+            Some(tm) => tm,
+            None => return false,
         };
 
-        let record = crate::tiering::encode_tiered_record(key, &entry_data, val_type);
-        let record_len = record.len() as u32;
-
-        let (res, _) = file.write_all_at(record, offset).await;
-        if res.is_err() {
-            return false;
-        }
-
-        let ptr = crate::table::TieredPointer {
-            file_id: shard_id as u32,
-            offset,
-            length: record_len,
-            value_type: val_type,
+        let key_bytes = Bytes::copy_from_slice(key);
+        let ptr = match tm.stash_record(&key_bytes, &entry_data, val_type).await {
+            Ok(p) => p,
+            Err(_) => return false,
         };
 
         let mut db = self.local_db.borrow_mut();
-        if let Some(tm) = &mut db.tier_manager {
-            tm.current_offset += record_len as u64;
-        }
+        let stats = db.tier_manager.as_ref().map(|tm| tm.stats.clone());
         if db.table.set_tiered_pointer(key, ptr) {
-            stats.disk_writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            stats.tiered_keys.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            stats.tiered_bytes.fetch_add(record_len as u64, std::sync::atomic::Ordering::Relaxed);
-            stats.ram_saved_bytes.fetch_add(entry_data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            if let Some(stats) = stats {
+                stats.tiered_keys.fetch_add(1, Ordering::Relaxed);
+                stats.tiered_bytes.fetch_add(ptr.length as u64, Ordering::Relaxed);
+                stats.ram_saved_bytes.fetch_add(entry_data.len() as u64, Ordering::Relaxed);
+            }
             true
         } else {
             false
@@ -215,16 +200,16 @@ impl Router {
             None => return false,
         };
 
-        let (file, stats) = {
+        let (file, stats, op_manager) = {
             let db = self.local_db.borrow();
             if let Some(tm) = &db.tier_manager {
-                (tm.file.clone(), tm.stats.clone())
+                (tm.file.clone(), tm.stats.clone(), tm.op_manager.clone())
             } else {
                 return false;
             }
         };
 
-        let (record_key, val_payload) = match crate::tiering::read_tiered_record(&file, ptr).await {
+        let (record_key, val_payload) = match crate::tiering::read_tiered_record(&file, &op_manager, ptr, &stats).await {
             Ok(pair) => pair,
             Err(_) => return false,
         };
@@ -236,10 +221,10 @@ impl Router {
 
         let mut db = self.local_db.borrow_mut();
         if db.table.restore_tiered_value(&record_key, val) {
-            stats.disk_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            stats.tiered_keys.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            stats.cooled_keys.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            stats.ram_saved_bytes.fetch_sub(val_payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            stats.total_fetches.fetch_add(1, Ordering::Relaxed);
+            stats.tiered_keys.fetch_sub(1, Ordering::Relaxed);
+            stats.cooled_keys.fetch_add(1, Ordering::Relaxed);
+            stats.ram_saved_bytes.fetch_sub(val_payload.len() as u64, Ordering::Relaxed);
             true
         } else {
             false
@@ -258,42 +243,44 @@ impl Router {
             None => return false,
         };
 
-        let (file, offset, stats, shard_id) = {
-            let mut db = self.local_db.borrow_mut();
-            if let Some(tm) = &mut db.tier_manager {
-                let off = tm.current_offset;
-                (tm.file.clone(), off, tm.stats.clone(), tm.shard_id)
-            } else {
-                return false;
-            }
+        let tm = match self.local_db.borrow().tier_manager.clone() {
+            Some(tm) => tm,
+            None => return false,
         };
 
-        let record = crate::tiering::encode_tiered_record(key, &entry_data, val_type);
-        let record_len = record.len() as u32;
-
-        let (res, _) = file.write_all_at(record, offset).await;
-        if res.is_err() {
-            return false;
-        }
-
-        let ptr = crate::table::TieredPointer {
-            file_id: shard_id as u32,
-            offset,
-            length: record_len,
-            value_type: val_type,
+        let key_bytes = Bytes::copy_from_slice(key);
+        let ptr = match tm.stash_record(&key_bytes, &entry_data, val_type).await {
+            Ok(p) => p,
+            Err(_) => return false,
         };
 
         let mut db = self.local_db.borrow_mut();
-        if let Some(tm) = &mut db.tier_manager {
-            tm.current_offset += record_len as u64;
-        }
+        let stats = db.tier_manager.as_ref().map(|tm| tm.stats.clone());
         if db.table.set_cooled_pointer(key, ptr) {
-            stats.disk_writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            stats.cooled_keys.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            stats.tiered_bytes.fetch_add(record_len as u64, std::sync::atomic::Ordering::Relaxed);
+            if let Some(stats) = stats {
+                stats.cooled_keys.fetch_add(1, Ordering::Relaxed);
+                stats.tiered_bytes.fetch_add(ptr.length as u64, Ordering::Relaxed);
+            }
             true
         } else {
             false
+        }
+    }
+
+    pub async fn stream_cold_read_local(&self, key: &[u8]) -> Option<Bytes> {
+        let ptr = self.local_db.borrow_mut().table.is_tiered(key)?;
+        let (file, stats, op_manager) = {
+            let db = self.local_db.borrow();
+            let tm = db.tier_manager.as_ref()?;
+            (tm.file.clone(), tm.stats.clone(), tm.op_manager.clone())
+        };
+
+        let (_, val_payload) = crate::tiering::read_tiered_record(&file, &op_manager, ptr, &stats).await.ok()?;
+        let (val, _) = crate::table::RudisTable::deserialize_val_payload(&val_payload).ok()?;
+        match val {
+            crate::table::RudisValue::String(s) => Some(s),
+            crate::table::RudisValue::Int(n) => Some(Bytes::from(crate::table::RudisTable::format_i64(n))),
+            _ => None,
         }
     }
 
@@ -474,10 +461,33 @@ impl Router {
     }
 
     pub async fn get(&self, key: Bytes) -> Option<Bytes> {
-        self.ensure_loaded(&key).await;
+        let max_mem = crate::tiering::get_max_memory(self.port);
+        let upload_pct = crate::tiering::get_upload_threshold_pct(self.port);
+        let used_mem = self.local_db.borrow().table.used_memory;
+        let shard_threshold = if max_mem > 0 {
+            (max_mem / self.num_shards.max(1) as u64) as usize
+        } else {
+            usize::MAX
+        };
+
         let target = target_shard(&key, self.num_shards);
+        if target == self.shard_id && max_mem > 0 && used_mem >= (shard_threshold * upload_pct as usize) / 100 {
+            if let Some(val) = self.stream_cold_read_local(&key).await {
+                let stats = crate::tiering::get_tier_stats(self.port);
+                stats.streaming_reads.fetch_add(1, Ordering::Relaxed);
+                stats.ram_misses.fetch_add(1, Ordering::Relaxed);
+                return Some(val);
+            }
+        }
+
+        self.ensure_loaded(&key).await;
         if target == self.shard_id {
-            self.local_db.borrow_mut().get(&key)
+            let val = self.local_db.borrow_mut().get(&key);
+            let stats = crate::tiering::get_tier_stats(self.port);
+            if val.is_some() {
+                stats.ram_hits.fetch_add(1, Ordering::Relaxed);
+            }
+            val
         } else {
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::Get { key, responder: tx };
