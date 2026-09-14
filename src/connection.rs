@@ -118,6 +118,11 @@ pub async fn handle_connection(
     let mut in_multi = false;
     let mut tx_queue: Vec<Command> = Vec::new();
     let mut tx_has_error = false;
+    let mut authenticated = !crate::acl::get_acl_for_port(router.port)
+        .read()
+        .unwrap()
+        .is_auth_required_for_default();
+    let mut auth_user = "default".to_string();
 
     loop {
         // Rent buffer to monoio's io_uring driver
@@ -170,6 +175,8 @@ pub async fn handle_connection(
                             &client_registry,
                             &mut out_buf,
                             &mut asking,
+                            &mut authenticated,
+                            &mut auth_user,
                         )
                         .await;
                     }
@@ -257,6 +264,8 @@ pub async fn handle_connection(
                                                     &client_registry,
                                                     &mut out_buf,
                                                     &mut asking,
+                                                    &mut authenticated,
+                                                    &mut auth_user,
                                                 )
                                                 .await;
                                                 if quit {
@@ -305,6 +314,8 @@ pub async fn handle_connection(
                                             &client_registry,
                                             &mut out_buf,
                                             &mut asking,
+                                            &mut authenticated,
+                                            &mut auth_user,
                                         )
                                         .await;
                                         if quit {
@@ -323,6 +334,8 @@ pub async fn handle_connection(
                             &client_registry,
                             &mut out_buf,
                             &mut asking,
+                            &mut authenticated,
+                            &mut auth_user,
                         )
                         .await;
                         if quit {
@@ -338,6 +351,8 @@ pub async fn handle_connection(
                             &client_registry,
                             &mut out_buf,
                             &mut asking,
+                            &mut authenticated,
+                            &mut auth_user,
                         )
                         .await;
                         if quit {
@@ -682,6 +697,17 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         }
         Command::Pfcount { keys } => keys.first(),
         Command::Xread { keys, .. } | Command::Xreadgroup { keys, .. } => keys.first(),
+        Command::Blpop { keys, .. } | Command::Brpop { keys, .. } => keys.first(),
+        Command::Sinter(keys) | Command::Sunion(keys) | Command::Sdiff(keys) => keys.first(),
+        Command::Sinterstore { destination, .. }
+        | Command::Sunionstore { destination, .. }
+        | Command::Sdiffstore { destination, .. } => Some(destination),
+        Command::Zunionstore { destination, .. }
+        | Command::Zinterstore { destination, .. }
+        | Command::Zdiffstore { destination, .. } => Some(destination),
+        Command::Zdiff { keys, .. } | Command::Zinter { keys, .. } | Command::Zunion { keys, .. } => {
+            keys.first()
+        }
         Command::Mset(pairs) | Command::Msetnx(pairs) => pairs.first().map(|(k, _)| k),
         Command::Bitop { destkey, .. } | Command::Pfmerge { destkey, .. } => Some(destkey),
         _ => None,
@@ -761,6 +787,25 @@ pub fn cmd_keys<'a>(cmd: &'a Command) -> Vec<&'a [u8]> {
         }
         Command::Pfcount { keys } => keys.iter().map(|k| k.as_ref()).collect(),
         Command::Xread { keys, .. } | Command::Xreadgroup { keys, .. } => keys.iter().map(|k| k.as_ref()).collect(),
+        Command::Blpop { keys, .. } | Command::Brpop { keys, .. } => keys.iter().map(|k| k.as_ref()).collect(),
+        Command::Sinter(keys) | Command::Sunion(keys) | Command::Sdiff(keys) => keys.iter().map(|k| k.as_ref()).collect(),
+        Command::Sinterstore { destination, keys }
+        | Command::Sunionstore { destination, keys }
+        | Command::Sdiffstore { destination, keys } => {
+            let mut v = vec![destination.as_ref()];
+            v.extend(keys.iter().map(|k| k.as_ref()));
+            v
+        }
+        Command::Zunionstore { destination, keys, .. }
+        | Command::Zinterstore { destination, keys, .. }
+        | Command::Zdiffstore { destination, keys } => {
+            let mut v = vec![destination.as_ref()];
+            v.extend(keys.iter().map(|k| k.as_ref()));
+            v
+        }
+        Command::Zdiff { keys, .. } | Command::Zinter { keys, .. } | Command::Zunion { keys, .. } => {
+            keys.iter().map(|k| k.as_ref()).collect()
+        }
 
         Command::Mset(pairs) | Command::Msetnx(pairs) => {
             pairs.iter().map(|(k, _)| k.as_ref()).collect()
@@ -1066,6 +1111,20 @@ async fn migrate_keys_to_node(
     Ok(count)
 }
 
+fn parse_bulk_str_from_resp(res: &[u8]) -> Option<Bytes> {
+    if res.starts_with(b"$") && !res.starts_with(b"$-1") {
+        let mut parts = res[1..].splitn(2, |&b| b == b'\r');
+        let len_str = std::str::from_utf8(parts.next()?).ok()?;
+        let len: usize = len_str.parse().ok()?;
+        let rest = parts.next()?;
+        let val_slice = rest.strip_prefix(b"\n")?;
+        if val_slice.len() >= len {
+            return Some(Bytes::copy_from_slice(&val_slice[..len]));
+        }
+    }
+    None
+}
+
 async fn execute_command(
     cmd: Command,
     router: &Router,
@@ -1073,8 +1132,26 @@ async fn execute_command(
     client_registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
     out: &mut Vec<u8>,
     asking: &mut bool,
+    authenticated: &mut bool,
+    auth_user: &mut String,
 ) -> bool {
     let cmd_name = match &cmd {
+        Command::Auth { .. } => "AUTH",
+        Command::Acl(_) => "ACL",
+        Command::Blpop { .. } => "BLPOP",
+        Command::Brpop { .. } => "BRPOP",
+        Command::Sinter(_) => "SINTER",
+        Command::Sunion(_) => "SUNION",
+        Command::Sdiff(_) => "SDIFF",
+        Command::Sinterstore { .. } => "SINTERSTORE",
+        Command::Sunionstore { .. } => "SUNIONSTORE",
+        Command::Sdiffstore { .. } => "SDIFFSTORE",
+        Command::Zunionstore { .. } => "ZUNIONSTORE",
+        Command::Zinterstore { .. } => "ZINTERSTORE",
+        Command::Zdiffstore { .. } => "ZDIFFSTORE",
+        Command::Zdiff { .. } => "ZDIFF",
+        Command::Zinter { .. } => "ZINTER",
+        Command::Zunion { .. } => "ZUNION",
         Command::Get(_) => "GET",
         Command::Set { .. } => "SET",
         Command::Mget(_) => "MGET",
@@ -1188,6 +1265,11 @@ async fn execute_command(
     if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
         c.last_active = Instant::now();
         c.last_cmd = cmd_name.to_string();
+    }
+
+    if !*authenticated && !matches!(cmd, Command::Auth { .. } | Command::Quit) {
+        out.extend_from_slice(b"-NOAUTH Authentication required.\r\n");
+        return false;
     }
 
     if let Command::Asking = cmd {
@@ -1647,14 +1729,319 @@ async fn execute_command(
         }
         Command::Xread {
             ref keys,
+            block_ms,
             ..
         }
         | Command::Xreadgroup {
             ref keys,
+            block_ms,
             ..
         } => {
             if keys.is_empty() {
                 out.extend_from_slice(b"$-1\r\n");
+                return false;
+            }
+            let first_target = router.target_shard(&keys[0]);
+            for k in &keys[1..] {
+                if router.target_shard(k) != first_target {
+                    out.extend_from_slice(
+                        b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                    );
+                    return false;
+                }
+            }
+
+            let start_len = out.len();
+            if first_target == router.shard_id {
+                execute_local_command(
+                    &cmd,
+                    &mut router.local_db.borrow_mut(),
+                    out,
+                    router.aof.as_deref(),
+                );
+            } else {
+                let res = router.execute_remote(first_target, cmd.clone()).await;
+                out.extend_from_slice(&res);
+            }
+
+            let produced_empty = &out[start_len..] == b"$-1\r\n" || &out[start_len..] == b"*0\r\n";
+            if let Some(wait_ms) = block_ms {
+                if produced_empty {
+                    out.truncate(start_len);
+                    let (tx, rx) = flume::bounded(1);
+                    {
+                        let hub_arc = crate::block::get_block_hub_for_port(router.port);
+                        let mut hub = hub_arc.lock().unwrap();
+                        for k in keys {
+                            hub.register_stream_waiter(k.clone(), tx.clone());
+                        }
+                    }
+                    let wait_res = if wait_ms > 0 {
+                        let dur = std::time::Duration::from_millis(wait_ms);
+                        monoio::time::timeout(dur, rx.recv_async()).await.is_ok()
+                    } else {
+                        rx.recv_async().await.is_ok()
+                    };
+                    if wait_res {
+                        let mut unblocked_cmd = cmd.clone();
+                        match &mut unblocked_cmd {
+                            Command::Xread { block_ms: b, .. }
+                            | Command::Xreadgroup { block_ms: b, .. } => {
+                                *b = None;
+                            }
+                            _ => {}
+                        }
+                        if first_target == router.shard_id {
+                            execute_local_command(
+                                &unblocked_cmd,
+                                &mut router.local_db.borrow_mut(),
+                                out,
+                                router.aof.as_deref(),
+                            );
+                        } else {
+                            let res = router.execute_remote(first_target, unblocked_cmd).await;
+                            out.extend_from_slice(&res);
+                        }
+                    } else {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+            }
+            false
+        }
+        Command::Auth { username, password } => {
+            let uname = username.as_deref().unwrap_or("default");
+            let pass = password.as_str();
+            let acl = crate::acl::get_acl_for_port(router.port);
+            let acl_guard = acl.read().unwrap();
+            if let Ok(authed_user) = acl_guard.check_auth(Some(uname), pass) {
+                *authenticated = true;
+                *auth_user = authed_user;
+                out.extend_from_slice(b"+OK\r\n");
+            } else {
+                out.extend_from_slice(
+                    b"-WRONGPASS invalid username-password pair or user is disabled.\r\n",
+                );
+            }
+            false
+        }
+        Command::Acl(subcmd) => {
+            let acl = crate::acl::get_acl_for_port(router.port);
+            match subcmd {
+                crate::resp::AclSubcommand::WhoAmI => {
+                    out.extend_from_slice(
+                        format!("${}\r\n{}\r\n", auth_user.len(), auth_user).as_bytes(),
+                    );
+                }
+                crate::resp::AclSubcommand::Users => {
+                    let users = acl.read().unwrap().users();
+                    out.extend_from_slice(format!("*{}\r\n", users.len()).as_bytes());
+                    for u in users {
+                        out.extend_from_slice(format!("${}\r\n{}\r\n", u.len(), u).as_bytes());
+                    }
+                }
+                crate::resp::AclSubcommand::List => {
+                    let list = acl.read().unwrap().list();
+                    out.extend_from_slice(format!("*{}\r\n", list.len()).as_bytes());
+                    for line in list {
+                        out.extend_from_slice(format!("${}\r\n{}\r\n", line.len(), line).as_bytes());
+                    }
+                }
+                crate::resp::AclSubcommand::GetUser(username) => {
+                    if let Some(user) = acl.read().unwrap().get_user(&username) {
+                        out.extend_from_slice(b"*8\r\n");
+                        out.extend_from_slice(b"$5\r\nflags\r\n");
+                        let flags = user.flags();
+                        out.extend_from_slice(format!("*{}\r\n", flags.len()).as_bytes());
+                        for f in flags {
+                            out.extend_from_slice(format!("${}\r\n{}\r\n", f.len(), f).as_bytes());
+                        }
+                        out.extend_from_slice(b"$9\r\npasswords\r\n");
+                        out.extend_from_slice(format!("*{}\r\n", user.passwords.len()).as_bytes());
+                        for p in &user.passwords {
+                            out.extend_from_slice(format!("${}\r\n{}\r\n", p.len(), p).as_bytes());
+                        }
+                        out.extend_from_slice(b"$8\r\ncommands\r\n");
+                        let cmd_str = if user.all_commands { "+@all" } else { "-@all" };
+                        out.extend_from_slice(format!("${}\r\n{}\r\n", cmd_str.len(), cmd_str).as_bytes());
+                        out.extend_from_slice(b"$4\r\nkeys\r\n");
+                        let key_str = if user.all_keys { "~*" } else { "" };
+                        out.extend_from_slice(format!("${}\r\n{}\r\n", key_str.len(), key_str).as_bytes());
+                    } else {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+                crate::resp::AclSubcommand::SetUser { username, rules } => {
+                    match acl.write().unwrap().set_user(&username, &rules) {
+                        Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                        Err(e) => out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes()),
+                    }
+                }
+                crate::resp::AclSubcommand::DelUser(usernames) => {
+                    let count = acl.write().unwrap().del_user(&usernames);
+                    write_resp_integer(out, count as i64);
+                }
+                crate::resp::AclSubcommand::Cat => {
+                    let cats = [
+                        "keyspace", "read", "write", "set", "sortedset", "list", "hash",
+                        "string", "bitmap", "hyperloglog", "geo", "stream", "pubsub",
+                        "admin", "fast", "slow", "blocking", "dangerous", "connection",
+                        "transaction", "scripting",
+                    ];
+                    out.extend_from_slice(format!("*{}\r\n", cats.len()).as_bytes());
+                    for cat in cats {
+                        out.extend_from_slice(format!("${}\r\n{}\r\n", cat.len(), cat).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Blpop { keys, timeout } => {
+            let mut popped: Option<(Bytes, Bytes)> = None;
+            for k in &keys {
+                let target = router.target_shard(k);
+                if target == router.shard_id {
+                    if let Ok(mut vals) = router.local_db.borrow_mut().lpop(k, 1) {
+                        if let Some(v) = vals.pop() {
+                            popped = Some((k.clone(), v));
+                            break;
+                        }
+                    }
+                } else {
+                    let remote_res = router
+                        .execute_remote(target, Command::Lpop { key: k.clone(), count: None })
+                        .await;
+                    if let Some(v) = parse_bulk_str_from_resp(&remote_res) {
+                        popped = Some((k.clone(), v));
+                        break;
+                    }
+                }
+            }
+
+            if let Some((k, v)) = popped {
+                out.extend_from_slice(b"*2\r\n$");
+                out.extend_from_slice(k.len().to_string().as_bytes());
+                out.extend_from_slice(b"\r\n");
+                out.extend_from_slice(&k);
+                out.extend_from_slice(b"\r\n$");
+                out.extend_from_slice(v.len().to_string().as_bytes());
+                out.extend_from_slice(b"\r\n");
+                out.extend_from_slice(&v);
+                out.extend_from_slice(b"\r\n");
+                return false;
+            }
+
+            let (tx, rx) = flume::bounded(1);
+            {
+                let hub_arc = crate::block::get_block_hub_for_port(router.port);
+                let mut hub = hub_arc.lock().unwrap();
+                for k in &keys {
+                    hub.register_list_waiter(k.clone(), crate::block::ListPopType::Left, tx.clone());
+                }
+            }
+
+            let recv_res = if timeout > 0.0 {
+                let dur = std::time::Duration::from_secs_f64(timeout);
+                match monoio::time::timeout(dur, rx.recv_async()).await {
+                    Ok(Ok((k, v))) => Some((k, v)),
+                    _ => None,
+                }
+            } else {
+                rx.recv_async().await.ok()
+            };
+
+            if let Some((k, v)) = recv_res {
+                out.extend_from_slice(b"*2\r\n$");
+                out.extend_from_slice(k.len().to_string().as_bytes());
+                out.extend_from_slice(b"\r\n");
+                out.extend_from_slice(&k);
+                out.extend_from_slice(b"\r\n$");
+                out.extend_from_slice(v.len().to_string().as_bytes());
+                out.extend_from_slice(b"\r\n");
+                out.extend_from_slice(&v);
+                out.extend_from_slice(b"\r\n");
+            } else {
+                out.extend_from_slice(b"*-1\r\n");
+            }
+            false
+        }
+        Command::Brpop { keys, timeout } => {
+            let mut popped: Option<(Bytes, Bytes)> = None;
+            for k in &keys {
+                let target = router.target_shard(k);
+                if target == router.shard_id {
+                    if let Ok(mut vals) = router.local_db.borrow_mut().rpop(k, 1) {
+                        if let Some(v) = vals.pop() {
+                            popped = Some((k.clone(), v));
+                            break;
+                        }
+                    }
+                } else {
+                    let remote_res = router
+                        .execute_remote(target, Command::Rpop { key: k.clone(), count: None })
+                        .await;
+                    if let Some(v) = parse_bulk_str_from_resp(&remote_res) {
+                        popped = Some((k.clone(), v));
+                        break;
+                    }
+                }
+            }
+
+            if let Some((k, v)) = popped {
+                out.extend_from_slice(b"*2\r\n$");
+                out.extend_from_slice(k.len().to_string().as_bytes());
+                out.extend_from_slice(b"\r\n");
+                out.extend_from_slice(&k);
+                out.extend_from_slice(b"\r\n$");
+                out.extend_from_slice(v.len().to_string().as_bytes());
+                out.extend_from_slice(b"\r\n");
+                out.extend_from_slice(&v);
+                out.extend_from_slice(b"\r\n");
+                return false;
+            }
+
+            let (tx, rx) = flume::bounded(1);
+            {
+                let hub_arc = crate::block::get_block_hub_for_port(router.port);
+                let mut hub = hub_arc.lock().unwrap();
+                for k in &keys {
+                    hub.register_list_waiter(k.clone(), crate::block::ListPopType::Right, tx.clone());
+                }
+            }
+
+            let recv_res = if timeout > 0.0 {
+                let dur = std::time::Duration::from_secs_f64(timeout);
+                match monoio::time::timeout(dur, rx.recv_async()).await {
+                    Ok(Ok((k, v))) => Some((k, v)),
+                    _ => None,
+                }
+            } else {
+                rx.recv_async().await.ok()
+            };
+
+            if let Some((k, v)) = recv_res {
+                out.extend_from_slice(b"*2\r\n$");
+                out.extend_from_slice(k.len().to_string().as_bytes());
+                out.extend_from_slice(b"\r\n");
+                out.extend_from_slice(&k);
+                out.extend_from_slice(b"\r\n$");
+                out.extend_from_slice(v.len().to_string().as_bytes());
+                out.extend_from_slice(b"\r\n");
+                out.extend_from_slice(&v);
+                out.extend_from_slice(b"\r\n");
+            } else {
+                out.extend_from_slice(b"*-1\r\n");
+            }
+            false
+        }
+        Command::Sinter(ref keys)
+        | Command::Sunion(ref keys)
+        | Command::Sdiff(ref keys)
+        | Command::Zdiff { ref keys, .. }
+        | Command::Zinter { ref keys, .. }
+        | Command::Zunion { ref keys, .. } => {
+            if keys.is_empty() {
+                out.extend_from_slice(b"*0\r\n");
                 return false;
             }
             let first_target = router.target_shard(&keys[0]);
@@ -1675,6 +2062,54 @@ async fn execute_command(
                 );
             } else {
                 let res = router.execute_remote(first_target, cmd).await;
+                out.extend_from_slice(&res);
+            }
+            false
+        }
+        Command::Sinterstore {
+            ref destination,
+            ref keys,
+        }
+        | Command::Sunionstore {
+            ref destination,
+            ref keys,
+        }
+        | Command::Sdiffstore {
+            ref destination,
+            ref keys,
+        }
+        | Command::Zunionstore {
+            ref destination,
+            ref keys,
+            ..
+        }
+        | Command::Zinterstore {
+            ref destination,
+            ref keys,
+            ..
+        }
+        | Command::Zdiffstore {
+            ref destination,
+            ref keys,
+        } => {
+            let dest_target = router.target_shard(destination);
+            for k in keys {
+                if router.target_shard(k) != dest_target {
+                    out.extend_from_slice(
+                        b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                    );
+                    return false;
+                }
+            }
+            if dest_target == router.shard_id {
+                execute_local_command(
+                    &cmd,
+                    &mut router.local_db.borrow_mut(),
+                    out,
+                    router.aof.as_deref(),
+                );
+            } else {
+                let res = router.execute_remote(dest_target, cmd).await;
                 out.extend_from_slice(&res);
             }
             false
@@ -2417,6 +2852,31 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         {
             Some(target_shard(&keys[0], num_shards))
         }
+        Command::Sinter(keys)
+        | Command::Sunion(keys)
+        | Command::Sdiff(keys)
+        | Command::Zdiff { keys, .. }
+        | Command::Zinter { keys, .. }
+        | Command::Zunion { keys, .. }
+            if !keys.is_empty()
+                && keys
+                    .iter()
+                    .all(|k| target_shard(k, num_shards) == target_shard(&keys[0], num_shards)) =>
+        {
+            Some(target_shard(&keys[0], num_shards))
+        }
+        Command::Sinterstore { destination, keys }
+        | Command::Sunionstore { destination, keys }
+        | Command::Sdiffstore { destination, keys }
+        | Command::Zunionstore { destination, keys, .. }
+        | Command::Zinterstore { destination, keys, .. }
+        | Command::Zdiffstore { destination, keys }
+            if keys
+                .iter()
+                .all(|k| target_shard(k, num_shards) == target_shard(destination, num_shards)) =>
+        {
+            Some(target_shard(destination, num_shards))
+        }
         _ => None,
     }
 }
@@ -2734,6 +3194,10 @@ pub fn execute_local_command(
                             aof.borrow_mut().append(&bytes);
                         }
                     }
+                    crate::block::get_block_hub_for_port(db.port)
+                        .lock()
+                        .unwrap()
+                        .notify_list(&mut db.table, key);
                     write_resp_integer(out, len as i64);
                 }
                 Err(err) => {
@@ -2750,6 +3214,10 @@ pub fn execute_local_command(
                             aof.borrow_mut().append(&bytes);
                         }
                     }
+                    crate::block::get_block_hub_for_port(db.port)
+                        .lock()
+                        .unwrap()
+                        .notify_list(&mut db.table, key);
                     write_resp_integer(out, len as i64);
                 }
                 Err(err) => {
@@ -2973,6 +3441,102 @@ pub fn execute_local_command(
                     } else {
                         out.extend_from_slice(b"$-1\r\n");
                     }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Sinter(keys) => {
+            match db.sinter(keys) {
+                Ok(members) => {
+                    out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
+                    for m in members {
+                        out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                        out.extend_from_slice(&m);
+                        out.extend_from_slice(b"\r\n");
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Sunion(keys) => {
+            match db.sunion(keys) {
+                Ok(members) => {
+                    out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
+                    for m in members {
+                        out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                        out.extend_from_slice(&m);
+                        out.extend_from_slice(b"\r\n");
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Sdiff(keys) => {
+            match db.sdiff(keys) {
+                Ok(members) => {
+                    out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
+                    for m in members {
+                        out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                        out.extend_from_slice(&m);
+                        out.extend_from_slice(b"\r\n");
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Sinterstore { destination, keys } => {
+            match db.sinterstore(destination.clone(), keys) {
+                Ok(count) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
+                    write_resp_integer(out, count as i64);
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Sunionstore { destination, keys } => {
+            match db.sunionstore(destination.clone(), keys) {
+                Ok(count) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
+                    write_resp_integer(out, count as i64);
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Sdiffstore { destination, keys } => {
+            match db.sdiffstore(destination.clone(), keys) {
+                Ok(count) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
+                    write_resp_integer(out, count as i64);
                 }
                 Err(err) => {
                     out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
@@ -3207,6 +3771,161 @@ pub fn execute_local_command(
                         out.extend_from_slice(
                             format!("${}\r\n{}\r\n", s_str.len(), s_str).as_bytes(),
                         );
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Zunionstore {
+            destination,
+            keys,
+            weights,
+            aggregate,
+        } => {
+            match db.zunionstore(destination.clone(), keys, weights, *aggregate) {
+                Ok(count) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
+                    write_resp_integer(out, count as i64);
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Zinterstore {
+            destination,
+            keys,
+            weights,
+            aggregate,
+        } => {
+            match db.zinterstore(destination.clone(), keys, weights, *aggregate) {
+                Ok(count) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
+                    write_resp_integer(out, count as i64);
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Zdiffstore { destination, keys } => {
+            match db.zdiffstore(destination.clone(), keys) {
+                Ok(count) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
+                    write_resp_integer(out, count as i64);
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Zdiff { keys, with_scores } => {
+            match db.zdiff(keys, *with_scores) {
+                Ok(items) => {
+                    if *with_scores {
+                        out.extend_from_slice(format!("*{}\r\n", items.len() * 2).as_bytes());
+                        for (m, s) in items {
+                            out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                            out.extend_from_slice(&m);
+                            out.extend_from_slice(b"\r\n");
+                            let s_str = s.to_string();
+                            out.extend_from_slice(
+                                format!("${}\r\n{}\r\n", s_str.len(), s_str).as_bytes(),
+                            );
+                        }
+                    } else {
+                        out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                        for (m, _) in items {
+                            out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                            out.extend_from_slice(&m);
+                            out.extend_from_slice(b"\r\n");
+                        }
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Zinter {
+            keys,
+            weights,
+            aggregate,
+            with_scores,
+        } => {
+            match db.zinter(keys, weights, *aggregate, *with_scores) {
+                Ok(items) => {
+                    if *with_scores {
+                        out.extend_from_slice(format!("*{}\r\n", items.len() * 2).as_bytes());
+                        for (m, s) in items {
+                            out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                            out.extend_from_slice(&m);
+                            out.extend_from_slice(b"\r\n");
+                            let s_str = s.to_string();
+                            out.extend_from_slice(
+                                format!("${}\r\n{}\r\n", s_str.len(), s_str).as_bytes(),
+                            );
+                        }
+                    } else {
+                        out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                        for (m, _) in items {
+                            out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                            out.extend_from_slice(&m);
+                            out.extend_from_slice(b"\r\n");
+                        }
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Zunion {
+            keys,
+            weights,
+            aggregate,
+            with_scores,
+        } => {
+            match db.zunion(keys, weights, *aggregate, *with_scores) {
+                Ok(items) => {
+                    if *with_scores {
+                        out.extend_from_slice(format!("*{}\r\n", items.len() * 2).as_bytes());
+                        for (m, s) in items {
+                            out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                            out.extend_from_slice(&m);
+                            out.extend_from_slice(b"\r\n");
+                            let s_str = s.to_string();
+                            out.extend_from_slice(
+                                format!("${}\r\n{}\r\n", s_str.len(), s_str).as_bytes(),
+                            );
+                        }
+                    } else {
+                        out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                        for (m, _) in items {
+                            out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                            out.extend_from_slice(&m);
+                            out.extend_from_slice(b"\r\n");
+                        }
                     }
                 }
                 Err(err) => {
@@ -3642,6 +4361,10 @@ pub fn execute_local_command(
                         }
                     }
                     let s = generated_id.to_string();
+                    crate::block::get_block_hub_for_port(db.port)
+                        .lock()
+                        .unwrap()
+                        .notify_stream(key);
                     out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
                 }
                 Ok(None) => {
@@ -4088,25 +4811,52 @@ async fn execute_commands_squashed(
     client_registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
     out: &mut Vec<u8>,
     asking: &mut bool,
+    authenticated: &mut bool,
+    auth_user: &mut String,
 ) -> bool {
-    let mut can_squash = true;
-    for cmd in &commands {
-        if let Some(k) = cmd_primary_key(cmd) {
-            let slot = key_slot(k);
-            if router.slot_states.borrow()[slot as usize] != crate::shard::SlotState::Stable {
+    let mut can_squash = *authenticated;
+    if can_squash {
+        for cmd in &commands {
+            if matches!(
+                cmd,
+                Command::Blpop { .. }
+                    | Command::Brpop { .. }
+                    | Command::Auth { .. }
+                    | Command::Acl(_)
+                    | Command::Xread { block_ms: Some(_), .. }
+                    | Command::Xreadgroup { block_ms: Some(_), .. }
+            ) {
                 can_squash = false;
                 break;
             }
-        } else if !matches!(cmd, Command::Ping(_) | Command::CommandDocs | Command::Quit) {
-            can_squash = false;
-            break;
+            if let Some(k) = cmd_primary_key(cmd) {
+                let slot = key_slot(k);
+                if router.slot_states.borrow()[slot as usize] != crate::shard::SlotState::Stable {
+                    can_squash = false;
+                    break;
+                }
+            } else if !matches!(cmd, Command::Ping(_) | Command::CommandDocs | Command::Quit) {
+                can_squash = false;
+                break;
+            }
         }
     }
 
     if !can_squash {
         let mut should_close = false;
         for cmd in commands {
-            if execute_command(cmd, router, client_id, client_registry, out, asking).await {
+            if execute_command(
+                cmd,
+                router,
+                client_id,
+                client_registry,
+                out,
+                asking,
+                authenticated,
+                auth_user,
+            )
+            .await
+            {
                 should_close = true;
             }
         }
@@ -4120,6 +4870,22 @@ async fn execute_commands_squashed(
         c.last_active = Instant::now();
         if let Some(last_cmd) = commands.last() {
             let cmd_name = match last_cmd {
+                Command::Auth { .. } => "AUTH",
+                Command::Acl(_) => "ACL",
+                Command::Blpop { .. } => "BLPOP",
+                Command::Brpop { .. } => "BRPOP",
+                Command::Sinter(_) => "SINTER",
+                Command::Sunion(_) => "SUNION",
+                Command::Sdiff(_) => "SDIFF",
+                Command::Sinterstore { .. } => "SINTERSTORE",
+                Command::Sunionstore { .. } => "SUNIONSTORE",
+                Command::Sdiffstore { .. } => "SDIFFSTORE",
+                Command::Zunionstore { .. } => "ZUNIONSTORE",
+                Command::Zinterstore { .. } => "ZINTERSTORE",
+                Command::Zdiffstore { .. } => "ZDIFFSTORE",
+                Command::Zdiff { .. } => "ZDIFF",
+                Command::Zinter { .. } => "ZINTER",
+                Command::Zunion { .. } => "ZUNION",
                 Command::Get(_) => "GET",
                 Command::Set { .. } => "SET",
                 Command::Mget(_) => "MGET",

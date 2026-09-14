@@ -32,8 +32,27 @@ pub enum ClientSubcommand {
     Id,
 }
 
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum AclSubcommand {
+    List,
+    Users,
+    GetUser(String),
+    SetUser {
+        username: String,
+        rules: Vec<String>,
+    },
+    DelUser(Vec<String>),
+    WhoAmI,
+    Cat,
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum Command {
+    Auth {
+        username: Option<String>,
+        password: String,
+    },
+    Acl(AclSubcommand),
     Get(Bytes),
     Set {
         key: Bytes,
@@ -116,6 +135,14 @@ pub enum Command {
         key: Bytes,
         index: i64,
     },
+    Blpop {
+        keys: Vec<Bytes>,
+        timeout: f64,
+    },
+    Brpop {
+        keys: Vec<Bytes>,
+        timeout: f64,
+    },
     // SET COMMANDS
     Sadd {
         key: Bytes,
@@ -134,6 +161,21 @@ pub enum Command {
     Spop {
         key: Bytes,
         count: Option<usize>,
+    },
+    Sinter(Vec<Bytes>),
+    Sunion(Vec<Bytes>),
+    Sdiff(Vec<Bytes>),
+    Sinterstore {
+        destination: Bytes,
+        keys: Vec<Bytes>,
+    },
+    Sunionstore {
+        destination: Bytes,
+        keys: Vec<Bytes>,
+    },
+    Sdiffstore {
+        destination: Bytes,
+        keys: Vec<Bytes>,
     },
     // ZSET COMMANDS
     Zadd {
@@ -181,6 +223,38 @@ pub enum Command {
     Zpopmax {
         key: Bytes,
         count: usize,
+    },
+    Zunionstore {
+        destination: Bytes,
+        keys: Vec<Bytes>,
+        weights: Vec<f64>,
+        aggregate: crate::table::Aggregate,
+    },
+    Zinterstore {
+        destination: Bytes,
+        keys: Vec<Bytes>,
+        weights: Vec<f64>,
+        aggregate: crate::table::Aggregate,
+    },
+    Zdiffstore {
+        destination: Bytes,
+        keys: Vec<Bytes>,
+    },
+    Zdiff {
+        keys: Vec<Bytes>,
+        with_scores: bool,
+    },
+    Zinter {
+        keys: Vec<Bytes>,
+        weights: Vec<f64>,
+        aggregate: crate::table::Aggregate,
+        with_scores: bool,
+    },
+    Zunion {
+        keys: Vec<Bytes>,
+        weights: Vec<f64>,
+        aggregate: crate::table::Aggregate,
+        with_scores: bool,
     },
     // GENERIC & DATABASE COMMANDS
     Type(Bytes),
@@ -486,6 +560,53 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
     let cmd_name = String::from_utf8_lossy(&args[0]).to_uppercase();
 
     match cmd_name.as_str() {
+        "AUTH" => {
+            if args.len() == 2 {
+                let password = String::from_utf8_lossy(&args[1]).to_string();
+                Ok(Some(Command::Auth { username: None, password }))
+            } else if args.len() == 3 {
+                let username = String::from_utf8_lossy(&args[1]).to_string();
+                let password = String::from_utf8_lossy(&args[2]).to_string();
+                Ok(Some(Command::Auth { username: Some(username), password }))
+            } else {
+                Err("wrong number of arguments for 'auth' command".to_string())
+            }
+        }
+        "ACL" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'acl' command".to_string());
+            }
+            let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
+            match sub.as_str() {
+                "LIST" => Ok(Some(Command::Acl(AclSubcommand::List))),
+                "USERS" => Ok(Some(Command::Acl(AclSubcommand::Users))),
+                "WHOAMI" => Ok(Some(Command::Acl(AclSubcommand::WhoAmI))),
+                "CAT" => Ok(Some(Command::Acl(AclSubcommand::Cat))),
+                "GETUSER" => {
+                    if args.len() != 3 {
+                        return Err("wrong number of arguments for 'acl|getuser' command".to_string());
+                    }
+                    let username = String::from_utf8_lossy(&args[2]).to_string();
+                    Ok(Some(Command::Acl(AclSubcommand::GetUser(username))))
+                }
+                "SETUSER" => {
+                    if args.len() < 3 {
+                        return Err("wrong number of arguments for 'acl|setuser' command".to_string());
+                    }
+                    let username = String::from_utf8_lossy(&args[2]).to_string();
+                    let rules = args[3..].iter().map(|a| String::from_utf8_lossy(a).to_string()).collect();
+                    Ok(Some(Command::Acl(AclSubcommand::SetUser { username, rules })))
+                }
+                "DELUSER" => {
+                    if args.len() < 3 {
+                        return Err("wrong number of arguments for 'acl|deluser' command".to_string());
+                    }
+                    let usernames = args[2..].iter().map(|a| String::from_utf8_lossy(a).to_string()).collect();
+                    Ok(Some(Command::Acl(AclSubcommand::DelUser(usernames))))
+                }
+                _ => Err(format!("unknown subcommand '{}' for 'acl'", sub)),
+            }
+        }
         "GET" => {
             if args.len() < 2 {
                 return Err("wrong number of arguments for 'get' command".to_string());
@@ -1076,6 +1197,28 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 index,
             }))
         }
+        "BLPOP" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'blpop' command".to_string());
+            }
+            let timeout: f64 = std::str::from_utf8(args.last().unwrap())
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "timeout is not a float or out of range".to_string())?;
+            let keys = args[1..args.len() - 1].to_vec();
+            Ok(Some(Command::Blpop { keys, timeout }))
+        }
+        "BRPOP" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'brpop' command".to_string());
+            }
+            let timeout: f64 = std::str::from_utf8(args.last().unwrap())
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "timeout is not a float or out of range".to_string())?;
+            let keys = args[1..args.len() - 1].to_vec();
+            Ok(Some(Command::Brpop { keys, timeout }))
+        }
         "SADD" => {
             if args.len() < 3 {
                 return Err("wrong number of arguments for 'sadd' command".to_string());
@@ -1131,6 +1274,51 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::Spop {
                 key: args[1].clone(),
                 count,
+            }))
+        }
+        "SINTER" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'sinter' command".to_string());
+            }
+            Ok(Some(Command::Sinter(args[1..].to_vec())))
+        }
+        "SUNION" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'sunion' command".to_string());
+            }
+            Ok(Some(Command::Sunion(args[1..].to_vec())))
+        }
+        "SDIFF" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'sdiff' command".to_string());
+            }
+            Ok(Some(Command::Sdiff(args[1..].to_vec())))
+        }
+        "SINTERSTORE" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'sinterstore' command".to_string());
+            }
+            Ok(Some(Command::Sinterstore {
+                destination: args[1].clone(),
+                keys: args[2..].to_vec(),
+            }))
+        }
+        "SUNIONSTORE" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'sunionstore' command".to_string());
+            }
+            Ok(Some(Command::Sunionstore {
+                destination: args[1].clone(),
+                keys: args[2..].to_vec(),
+            }))
+        }
+        "SDIFFSTORE" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'sdiffstore' command".to_string());
+            }
+            Ok(Some(Command::Sdiffstore {
+                destination: args[1].clone(),
+                keys: args[2..].to_vec(),
             }))
         }
         "ZADD" => {
@@ -1538,6 +1726,155 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 key: args[1].clone(),
                 count,
             }))
+        }
+        "ZUNIONSTORE" | "ZINTERSTORE" => {
+            let is_union = cmd_name == "ZUNIONSTORE";
+            if args.len() < 4 {
+                return Err(format!("wrong number of arguments for '{}' command", cmd_name.to_lowercase()));
+            }
+            let destination = args[1].clone();
+            let numkeys: usize = std::str::from_utf8(&args[2])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            if numkeys == 0 || args.len() < 3 + numkeys {
+                return Err("syntax error".to_string());
+            }
+            let keys = args[3..3 + numkeys].to_vec();
+            let mut weights = Vec::new();
+            let mut aggregate = crate::table::Aggregate::Sum;
+            let mut i = 3 + numkeys;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                if opt == "WEIGHTS" {
+                    i += 1;
+                    for _ in 0..numkeys {
+                        if i >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let w: f64 = std::str::from_utf8(&args[i])
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .ok_or_else(|| "weight value is not a float".to_string())?;
+                        weights.push(w);
+                        i += 1;
+                    }
+                } else if opt == "AGGREGATE" {
+                    if i + 1 >= args.len() {
+                        return Err("syntax error".to_string());
+                    }
+                    let agg_str = String::from_utf8_lossy(&args[i + 1]).to_uppercase();
+                    aggregate = match agg_str.as_str() {
+                        "SUM" => crate::table::Aggregate::Sum,
+                        "MIN" => crate::table::Aggregate::Min,
+                        "MAX" => crate::table::Aggregate::Max,
+                        _ => return Err("syntax error".to_string()),
+                    };
+                    i += 2;
+                } else {
+                    return Err("syntax error".to_string());
+                }
+            }
+            if is_union {
+                Ok(Some(Command::Zunionstore { destination, keys, weights, aggregate }))
+            } else {
+                Ok(Some(Command::Zinterstore { destination, keys, weights, aggregate }))
+            }
+        }
+        "ZDIFFSTORE" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'zdiffstore' command".to_string());
+            }
+            let destination = args[1].clone();
+            let numkeys: usize = std::str::from_utf8(&args[2])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            if numkeys == 0 || args.len() != 3 + numkeys {
+                return Err("syntax error".to_string());
+            }
+            let keys = args[3..3 + numkeys].to_vec();
+            Ok(Some(Command::Zdiffstore { destination, keys }))
+        }
+        "ZDIFF" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'zdiff' command".to_string());
+            }
+            let numkeys: usize = std::str::from_utf8(&args[1])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            if numkeys == 0 || args.len() < 2 + numkeys {
+                return Err("syntax error".to_string());
+            }
+            let keys = args[2..2 + numkeys].to_vec();
+            let mut with_scores = false;
+            if args.len() > 2 + numkeys {
+                let opt = String::from_utf8_lossy(&args[2 + numkeys]).to_uppercase();
+                if opt == "WITHSCORES" {
+                    with_scores = true;
+                } else {
+                    return Err("syntax error".to_string());
+                }
+            }
+            Ok(Some(Command::Zdiff { keys, with_scores }))
+        }
+        "ZUNION" | "ZINTER" => {
+            let is_union = cmd_name == "ZUNION";
+            if args.len() < 3 {
+                return Err(format!("wrong number of arguments for '{}' command", cmd_name.to_lowercase()));
+            }
+            let numkeys: usize = std::str::from_utf8(&args[1])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            if numkeys == 0 || args.len() < 2 + numkeys {
+                return Err("syntax error".to_string());
+            }
+            let keys = args[2..2 + numkeys].to_vec();
+            let mut weights = Vec::new();
+            let mut aggregate = crate::table::Aggregate::Sum;
+            let mut with_scores = false;
+            let mut i = 2 + numkeys;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                if opt == "WEIGHTS" {
+                    i += 1;
+                    for _ in 0..numkeys {
+                        if i >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let w: f64 = std::str::from_utf8(&args[i])
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .ok_or_else(|| "weight value is not a float".to_string())?;
+                        weights.push(w);
+                        i += 1;
+                    }
+                } else if opt == "AGGREGATE" {
+                    if i + 1 >= args.len() {
+                        return Err("syntax error".to_string());
+                    }
+                    let agg_str = String::from_utf8_lossy(&args[i + 1]).to_uppercase();
+                    aggregate = match agg_str.as_str() {
+                        "SUM" => crate::table::Aggregate::Sum,
+                        "MIN" => crate::table::Aggregate::Min,
+                        "MAX" => crate::table::Aggregate::Max,
+                        _ => return Err("syntax error".to_string()),
+                    };
+                    i += 2;
+                } else if opt == "WITHSCORES" {
+                    with_scores = true;
+                    i += 1;
+                } else {
+                    return Err("syntax error".to_string());
+                }
+            }
+            if is_union {
+                Ok(Some(Command::Zunion { keys, weights, aggregate, with_scores }))
+            } else {
+                Ok(Some(Command::Zinter { keys, weights, aggregate, with_scores }))
+            }
         }
         "TYPE" => {
             if args.len() != 2 {

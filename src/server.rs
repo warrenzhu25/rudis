@@ -51,7 +51,7 @@ pub fn run_shard_worker(
             .expect("Failed to convert socket into Monoio TcpListener");
 
         // 2. Pure thread-local Shard DB (no Mutex, no Arc)
-        let local_db = Rc::new(RefCell::new(ShardDb::new()));
+        let local_db = Rc::new(RefCell::new(ShardDb::new(port)));
 
         // 2.5 RDB Snapshot Restore on startup
         // Follow Redis specification: if AOF is enabled, AOF is authoritative; otherwise load RDB.

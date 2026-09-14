@@ -2193,4 +2193,175 @@ fn test_cluster_migrate_slot_e2e() {
     assert_eq!(rebal_resp, ":2\r\n");
 }
 
+#[test]
+fn test_blocking_operations_e2e() {
+    let port = 16405;
+    start_test_server(port, 2);
+
+    let mut client1 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    client1.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+
+    // 1. Immediate BLPOP and BRPOP
+    assert_eq!(send_and_read(&mut client1, b"RPUSH {t}:list a b c\r\n"), ":3\r\n");
+    let resp = send_and_read(&mut client1, b"BLPOP {t}:list 1\r\n");
+    assert_eq!(resp, "*2\r\n$8\r\n{t}:list\r\n$1\r\na\r\n");
+
+    let resp = send_and_read(&mut client1, b"BRPOP {t}:list 1\r\n");
+    assert_eq!(resp, "*2\r\n$8\r\n{t}:list\r\n$1\r\nc\r\n");
+
+    // Pop the remaining element 'b'
+    assert_eq!(send_and_read(&mut client1, b"LPOP {t}:list\r\n"), "$1\r\nb\r\n");
+
+    // 2. BLPOP timeout on empty list
+    let start = std::time::Instant::now();
+    let resp = send_and_read(&mut client1, b"BLPOP {t}:list 0.5\r\n");
+    assert_eq!(resp, "*-1\r\n");
+    assert!(start.elapsed() >= Duration::from_millis(400));
+
+    // 3. BLPOP unblocked by concurrent LPUSH
+    let handle = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(150));
+        let mut client2 = TcpStream::connect(("127.0.0.1", 16405)).unwrap();
+        let r = send_and_read(&mut client2, b"LPUSH {t}:list \"woken_val\"\r\n");
+        assert_eq!(r, ":1\r\n");
+    });
+
+    let resp = send_and_read(&mut client1, b"BLPOP {t}:list 3\r\n");
+    assert_eq!(resp, "*2\r\n$8\r\n{t}:list\r\n$11\r\n\"woken_val\"\r\n");
+    handle.join().unwrap();
+
+    // 4. XREAD BLOCK timeout on non-existent stream
+    let start = std::time::Instant::now();
+    let resp = send_and_read(&mut client1, b"XREAD BLOCK 400 STREAMS {t}:stream $\r\n");
+    assert_eq!(resp, "$-1\r\n");
+    assert!(start.elapsed() >= Duration::from_millis(300));
+}
+
+#[test]
+fn test_multi_key_set_and_zset_e2e() {
+    let port = 16406;
+    start_test_server(port, 2);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    // 1. SET MULTI-KEY OPERATIONS
+    assert_eq!(send_and_read(&mut client, b"SADD {s}:1 a b c\r\n"), ":3\r\n");
+    assert_eq!(send_and_read(&mut client, b"SADD {s}:2 b c d\r\n"), ":3\r\n");
+    assert_eq!(send_and_read(&mut client, b"SADD {s}:3 c d e\r\n"), ":3\r\n");
+
+    // SINTER {s}:1 {s}:2 -> b, c (order independent check)
+    let sinter_resp = send_and_read(&mut client, b"SINTER {s}:1 {s}:2\r\n");
+    assert!(sinter_resp.contains("$1\r\nb\r\n"));
+    assert!(sinter_resp.contains("$1\r\nc\r\n"));
+    assert!(!sinter_resp.contains("$1\r\na\r\n"));
+
+    // SDIFF {s}:1 {s}:2 -> a
+    assert_eq!(send_and_read(&mut client, b"SDIFF {s}:1 {s}:2\r\n"), "*1\r\n$1\r\na\r\n");
+
+    // SUNION {s}:1 {s}:2 -> a, b, c, d
+    let sunion_resp = send_and_read(&mut client, b"SUNION {s}:1 {s}:2\r\n");
+    assert_eq!(sunion_resp.lines().next().unwrap(), "*4");
+
+    // SINTERSTORE
+    assert_eq!(send_and_read(&mut client, b"SINTERSTORE {s}:inter {s}:1 {s}:2\r\n"), ":2\r\n");
+    assert_eq!(send_and_read(&mut client, b"SCARD {s}:inter\r\n"), ":2\r\n");
+
+    // SUNIONSTORE
+    assert_eq!(send_and_read(&mut client, b"SUNIONSTORE {s}:union {s}:1 {s}:2\r\n"), ":4\r\n");
+    assert_eq!(send_and_read(&mut client, b"SCARD {s}:union\r\n"), ":4\r\n");
+
+    // SDIFFSTORE
+    assert_eq!(send_and_read(&mut client, b"SDIFFSTORE {s}:diff {s}:1 {s}:2\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"SMEMBERS {s}:diff\r\n"), "*1\r\n$1\r\na\r\n");
+
+    // 2. ZSET MULTI-KEY OPERATIONS
+    assert_eq!(send_and_read(&mut client, b"ZADD {z}:1 1.0 a 2.0 b 3.0 c\r\n"), ":3\r\n");
+    assert_eq!(send_and_read(&mut client, b"ZADD {z}:2 2.0 b 3.0 c 4.0 d\r\n"), ":3\r\n");
+
+    // ZDIFF {z}:1 {z}:2 -> a
+    assert_eq!(send_and_read(&mut client, b"ZDIFF 2 {z}:1 {z}:2\r\n"), "*1\r\n$1\r\na\r\n");
+
+    // ZINTER {z}:1 {z}:2 WITHSCORES -> b:4, c:6
+    let zinter_resp = send_and_read(&mut client, b"ZINTER 2 {z}:1 {z}:2 WITHSCORES\r\n");
+    assert_eq!(zinter_resp, "*4\r\n$1\r\nb\r\n$1\r\n4\r\n$1\r\nc\r\n$1\r\n6\r\n");
+
+    // ZUNION {z}:1 {z}:2 -> a, b, c, d
+    let zunion_resp = send_and_read(&mut client, b"ZUNION 2 {z}:1 {z}:2\r\n");
+    assert_eq!(zunion_resp.lines().next().unwrap(), "*4");
+
+    // ZUNIONSTORE with WEIGHTS and AGGREGATE MAX
+    assert_eq!(
+        send_and_read(&mut client, b"ZUNIONSTORE {z}:out 2 {z}:1 {z}:2 WEIGHTS 2 3 AGGREGATE MAX\r\n"),
+        ":4\r\n"
+    );
+    // c was (3.0*2=6 vs 3.0*3=9) -> MAX is 9.0
+    assert_eq!(send_and_read(&mut client, b"ZSCORE {z}:out c\r\n"), "$1\r\n9\r\n");
+
+    // ZINTERSTORE
+    assert_eq!(send_and_read(&mut client, b"ZINTERSTORE {z}:inter 2 {z}:1 {z}:2\r\n"), ":2\r\n");
+    assert_eq!(send_and_read(&mut client, b"ZCARD {z}:inter\r\n"), ":2\r\n");
+
+    // ZDIFFSTORE
+    assert_eq!(send_and_read(&mut client, b"ZDIFFSTORE {z}:diff 2 {z}:1 {z}:2\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"ZCARD {z}:diff\r\n"), ":1\r\n");
+}
+
+#[test]
+fn test_auth_and_acl_e2e() {
+    let port = 16407;
+    start_test_server(port, 2);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    // 1. Check default user info
+    assert_eq!(send_and_read(&mut client, b"ACL WHOAMI\r\n"), "$7\r\ndefault\r\n");
+    let users = send_and_read(&mut client, b"ACL USERS\r\n");
+    assert!(users.contains("$7\r\ndefault\r\n"));
+
+    let list = send_and_read(&mut client, b"ACL LIST\r\n");
+    assert!(list.contains("default on nopass"));
+
+    // 2. Create user alice
+    assert_eq!(
+        send_and_read(&mut client, b"ACL SETUSER alice on >secret123 +@all ~*\r\n"),
+        "+OK\r\n"
+    );
+
+    let getuser = send_and_read(&mut client, b"ACL GETUSER alice\r\n");
+    assert!(getuser.contains("$9\r\nsecret123\r\n"));
+
+    // 3. Authenticate as alice
+    assert_eq!(send_and_read(&mut client, b"AUTH alice secret123\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"ACL WHOAMI\r\n"), "$5\r\nalice\r\n");
+
+    // Wrong password check
+    assert!(send_and_read(&mut client, b"AUTH alice wrongpass\r\n").starts_with("-WRONGPASS"));
+
+    // 4. Delete user alice
+    assert_eq!(send_and_read(&mut client, b"ACL DELUSER alice\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"ACL GETUSER alice\r\n"), "$-1\r\n");
+
+    // 5. Enforce password on default user and verify NOAUTH
+    assert_eq!(
+        send_and_read(&mut client, b"ACL SETUSER default >defpass -nopass\r\n"),
+        "+OK\r\n"
+    );
+
+    // Open new connection - must be unauthenticated now
+    let mut new_client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let noauth_resp = send_and_read(&mut new_client, b"PING\r\n");
+    assert_eq!(noauth_resp, "-NOAUTH Authentication required.\r\n");
+
+    // Authenticate
+    assert_eq!(send_and_read(&mut new_client, b"AUTH default defpass\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut new_client, b"PING\r\n"), "+PONG\r\n");
+
+    // Restore default user to nopass for subsequent tests
+    assert_eq!(
+        send_and_read(&mut new_client, b"ACL SETUSER default nopass\r\n"),
+        "+OK\r\n"
+    );
+}
+
+
 

@@ -51,6 +51,19 @@ pub struct ZRangeOpts {
     pub count: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Aggregate {
+    Sum,
+    Min,
+    Max,
+}
+
+impl Default for Aggregate {
+    fn default() -> Self {
+        Aggregate::Sum
+    }
+}
+
 const SMALL_ZSET_LIMIT: usize = 64;
 
 #[derive(Clone, Debug)]
@@ -2269,6 +2282,410 @@ impl RudisTable {
         } else {
             Ok(Vec::new())
         }
+    }
+
+    pub fn sinter(&mut self, keys: &[Bytes]) -> Result<Vec<Bytes>, &'static str> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut sets: Vec<RudisSet> = Vec::new();
+        for k in keys {
+            let h = hash_key(k);
+            if let Some(idx) = self.table.find(k, h) {
+                if self.check_expired_slot(idx) {
+                    return Ok(Vec::new());
+                }
+                if let Some(entry) = self.table.get_slot(idx) {
+                    match &entry.val {
+                        RudisValue::Set(s) => sets.push(s.clone()),
+                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    }
+                }
+            } else {
+                return Ok(Vec::new());
+            }
+        }
+        if sets.is_empty() {
+            return Ok(Vec::new());
+        }
+        sets.sort_by_key(|s| s.len());
+        let first = &sets[0];
+        let mut result = Vec::new();
+        for m in first.iter() {
+            if sets[1..].iter().all(|s| s.contains(m.as_ref())) {
+                result.push(m.clone());
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn sunion(&mut self, keys: &[Bytes]) -> Result<Vec<Bytes>, &'static str> {
+        let mut union_set = hashbrown::HashSet::new();
+        for k in keys {
+            let h = hash_key(k);
+            if let Some(idx) = self.table.find(k, h) {
+                if self.check_expired_slot(idx) {
+                    continue;
+                }
+                if let Some(entry) = self.table.get_slot(idx) {
+                    match &entry.val {
+                        RudisValue::Set(s) => {
+                            for m in s.iter() {
+                                union_set.insert(m.clone());
+                            }
+                        }
+                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    }
+                }
+            }
+        }
+        Ok(union_set.into_iter().collect())
+    }
+
+    pub fn sdiff(&mut self, keys: &[Bytes]) -> Result<Vec<Bytes>, &'static str> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let first_set = {
+            let h = hash_key(&keys[0]);
+            if let Some(idx) = self.table.find(&keys[0], h) {
+                if self.check_expired_slot(idx) {
+                    return Ok(Vec::new());
+                }
+                if let Some(entry) = self.table.get_slot(idx) {
+                    match &entry.val {
+                        RudisValue::Set(s) => s.clone(),
+                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    }
+                } else {
+                    return Ok(Vec::new());
+                }
+            } else {
+                return Ok(Vec::new());
+            }
+        };
+
+        let mut other_sets: Vec<RudisSet> = Vec::new();
+        for k in &keys[1..] {
+            let h = hash_key(k);
+            if let Some(idx) = self.table.find(k, h) {
+                if self.check_expired_slot(idx) {
+                    continue;
+                }
+                if let Some(entry) = self.table.get_slot(idx) {
+                    match &entry.val {
+                        RudisValue::Set(s) => other_sets.push(s.clone()),
+                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    }
+                }
+            }
+        }
+
+        let mut diff = Vec::new();
+        for m in first_set.iter() {
+            if !other_sets.iter().any(|s| s.contains(m.as_ref())) {
+                diff.push(m.clone());
+            }
+        }
+        Ok(diff)
+    }
+
+    pub fn sinterstore(&mut self, dest: Bytes, keys: &[Bytes]) -> Result<usize, &'static str> {
+        let members = self.sinter(keys)?;
+        let count = members.len();
+        self.del(dest.as_ref());
+        if count > 0 {
+            self.sadd(dest, members)?;
+        }
+        Ok(count)
+    }
+
+    pub fn sunionstore(&mut self, dest: Bytes, keys: &[Bytes]) -> Result<usize, &'static str> {
+        let members = self.sunion(keys)?;
+        let count = members.len();
+        self.del(dest.as_ref());
+        if count > 0 {
+            self.sadd(dest, members)?;
+        }
+        Ok(count)
+    }
+
+    pub fn sdiffstore(&mut self, dest: Bytes, keys: &[Bytes]) -> Result<usize, &'static str> {
+        let members = self.sdiff(keys)?;
+        let count = members.len();
+        self.del(dest.as_ref());
+        if count > 0 {
+            self.sadd(dest, members)?;
+        }
+        Ok(count)
+    }
+
+    pub fn zunionstore(
+        &mut self,
+        dest: Bytes,
+        keys: &[Bytes],
+        weights: &[f64],
+        agg: Aggregate,
+    ) -> Result<usize, &'static str> {
+        let items = self.zunion(keys, weights, agg, true)?;
+        let count = items.len();
+        self.del(dest.as_ref());
+        if count > 0 {
+            let mut zset = RudisZSet::new();
+            for (m, s) in items {
+                zset.insert(s, m);
+            }
+            let entry = RudisEntry {
+                key: dest,
+                val: RudisValue::ZSet(zset),
+                expire_at: None,
+            };
+            self.table.insert(entry);
+        }
+        Ok(count)
+    }
+
+    pub fn zinterstore(
+        &mut self,
+        dest: Bytes,
+        keys: &[Bytes],
+        weights: &[f64],
+        agg: Aggregate,
+    ) -> Result<usize, &'static str> {
+        let items = self.zinter(keys, weights, agg, true)?;
+        let count = items.len();
+        self.del(dest.as_ref());
+        if count > 0 {
+            let mut zset = RudisZSet::new();
+            for (m, s) in items {
+                zset.insert(s, m);
+            }
+            let entry = RudisEntry {
+                key: dest,
+                val: RudisValue::ZSet(zset),
+                expire_at: None,
+            };
+            self.table.insert(entry);
+        }
+        Ok(count)
+    }
+
+    pub fn zdiffstore(&mut self, dest: Bytes, keys: &[Bytes]) -> Result<usize, &'static str> {
+        let items = self.zdiff(keys, true)?;
+        let count = items.len();
+        self.del(dest.as_ref());
+        if count > 0 {
+            let mut zset = RudisZSet::new();
+            for (m, s) in items {
+                zset.insert(s, m);
+            }
+            let entry = RudisEntry {
+                key: dest,
+                val: RudisValue::ZSet(zset),
+                expire_at: None,
+            };
+            self.table.insert(entry);
+        }
+        Ok(count)
+    }
+
+    pub fn zunion(
+        &mut self,
+        keys: &[Bytes],
+        weights: &[f64],
+        agg: Aggregate,
+        _with_scores: bool,
+    ) -> Result<Vec<(Bytes, f64)>, &'static str> {
+        let mut acc: hashbrown::HashMap<Bytes, f64> = hashbrown::HashMap::new();
+        for (i, k) in keys.iter().enumerate() {
+            let weight = weights.get(i).copied().unwrap_or(1.0);
+            let h = hash_key(k);
+            if let Some(idx) = self.table.find(k, h) {
+                if self.check_expired_slot(idx) {
+                    continue;
+                }
+                if let Some(entry) = self.table.get_slot(idx) {
+                    match &entry.val {
+                        RudisValue::ZSet(zs) => {
+                            zs.for_each(|m, s| {
+                                let val = s * weight;
+                                acc.entry(m.clone())
+                                    .and_modify(|cur| {
+                                        *cur = match agg {
+                                            Aggregate::Sum => *cur + val,
+                                            Aggregate::Min => cur.min(val),
+                                            Aggregate::Max => cur.max(val),
+                                        };
+                                    })
+                                    .or_insert(val);
+                            });
+                        }
+                        RudisValue::Set(s) => {
+                            for m in s.iter() {
+                                let val = 1.0 * weight;
+                                acc.entry(m.clone())
+                                    .and_modify(|cur| {
+                                        *cur = match agg {
+                                            Aggregate::Sum => *cur + val,
+                                            Aggregate::Min => cur.min(val),
+                                            Aggregate::Max => cur.max(val),
+                                        };
+                                    })
+                                    .or_insert(val);
+                            }
+                        }
+                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    }
+                }
+            }
+        }
+        let mut res: Vec<(Bytes, f64)> = acc.into_iter().collect();
+        res.sort_by(|(m1, s1), (m2, s2)| {
+            s1.partial_cmp(s2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| m1.cmp(m2))
+        });
+        Ok(res)
+    }
+
+    pub fn zinter(
+        &mut self,
+        keys: &[Bytes],
+        weights: &[f64],
+        agg: Aggregate,
+        _with_scores: bool,
+    ) -> Result<Vec<(Bytes, f64)>, &'static str> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut key_maps: Vec<hashbrown::HashMap<Bytes, f64>> = Vec::new();
+        for (i, k) in keys.iter().enumerate() {
+            let weight = weights.get(i).copied().unwrap_or(1.0);
+            let h = hash_key(k);
+            if let Some(idx) = self.table.find(k, h) {
+                if self.check_expired_slot(idx) {
+                    return Ok(Vec::new());
+                }
+                if let Some(entry) = self.table.get_slot(idx) {
+                    let mut map = hashbrown::HashMap::new();
+                    match &entry.val {
+                        RudisValue::ZSet(zs) => {
+                            zs.for_each(|m, s| {
+                                map.insert(m.clone(), s * weight);
+                            });
+                        }
+                        RudisValue::Set(s) => {
+                            for m in s.iter() {
+                                map.insert(m.clone(), 1.0 * weight);
+                            }
+                        }
+                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    }
+                    key_maps.push(map);
+                } else {
+                    return Ok(Vec::new());
+                }
+            } else {
+                return Ok(Vec::new());
+            }
+        }
+        key_maps.sort_by_key(|m| m.len());
+        let first = &key_maps[0];
+        let mut result = Vec::new();
+        for (m, initial_score) in first {
+            let mut score = *initial_score;
+            let mut present = true;
+            for other in &key_maps[1..] {
+                if let Some(other_score) = other.get(m) {
+                    score = match agg {
+                        Aggregate::Sum => score + *other_score,
+                        Aggregate::Min => score.min(*other_score),
+                        Aggregate::Max => score.max(*other_score),
+                    };
+                } else {
+                    present = false;
+                    break;
+                }
+            }
+            if present {
+                result.push((m.clone(), score));
+            }
+        }
+        result.sort_by(|(m1, s1), (m2, s2)| {
+            s1.partial_cmp(s2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| m1.cmp(m2))
+        });
+        Ok(result)
+    }
+
+    pub fn zdiff(&mut self, keys: &[Bytes], _with_scores: bool) -> Result<Vec<(Bytes, f64)>, &'static str> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let first = {
+            let h = hash_key(&keys[0]);
+            if let Some(idx) = self.table.find(&keys[0], h) {
+                if self.check_expired_slot(idx) {
+                    return Ok(Vec::new());
+                }
+                if let Some(entry) = self.table.get_slot(idx) {
+                    let mut items = Vec::new();
+                    match &entry.val {
+                        RudisValue::ZSet(zs) => {
+                            zs.for_each(|m, s| items.push((m.clone(), s)));
+                        }
+                        RudisValue::Set(s) => {
+                            for m in s.iter() {
+                                items.push((m.clone(), 1.0));
+                            }
+                        }
+                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    }
+                    items
+                } else {
+                    return Ok(Vec::new());
+                }
+            } else {
+                return Ok(Vec::new());
+            }
+        };
+
+        let mut other_members = hashbrown::HashSet::new();
+        for k in &keys[1..] {
+            let h = hash_key(k);
+            if let Some(idx) = self.table.find(k, h) {
+                if self.check_expired_slot(idx) {
+                    continue;
+                }
+                if let Some(entry) = self.table.get_slot(idx) {
+                    match &entry.val {
+                        RudisValue::ZSet(zs) => {
+                            zs.for_each(|m, _| {
+                                other_members.insert(m.clone());
+                            });
+                        }
+                        RudisValue::Set(s) => {
+                            for m in s.iter() {
+                                other_members.insert(m.clone());
+                            }
+                        }
+                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    }
+                }
+            }
+        }
+
+        let mut diff: Vec<(Bytes, f64)> = first
+            .into_iter()
+            .filter(|(m, _)| !other_members.contains(m))
+            .collect();
+        diff.sort_by(|(m1, s1), (m2, s2)| {
+            s1.partial_cmp(s2)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| m1.cmp(m2))
+        });
+        Ok(diff)
     }
 
     pub fn count_keys_in_slot(&mut self, slot: u16) -> usize {

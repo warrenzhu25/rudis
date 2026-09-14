@@ -190,12 +190,14 @@ pub enum SlotState {
 /// it requires NO Mutex and NO cross-thread synchronization.
 pub struct ShardDb {
     pub table: crate::table::RudisTable,
+    pub port: u16,
 }
 
 impl ShardDb {
-    pub fn new() -> Self {
+    pub fn new(port: u16) -> Self {
         Self {
             table: crate::table::RudisTable::new(),
+            port,
         }
     }
 
@@ -369,6 +371,36 @@ impl ShardDb {
     }
 
     #[inline]
+    pub fn sinter(&mut self, keys: &[Bytes]) -> Result<Vec<Bytes>, &'static str> {
+        self.table.sinter(keys)
+    }
+
+    #[inline]
+    pub fn sunion(&mut self, keys: &[Bytes]) -> Result<Vec<Bytes>, &'static str> {
+        self.table.sunion(keys)
+    }
+
+    #[inline]
+    pub fn sdiff(&mut self, keys: &[Bytes]) -> Result<Vec<Bytes>, &'static str> {
+        self.table.sdiff(keys)
+    }
+
+    #[inline]
+    pub fn sinterstore(&mut self, dest: Bytes, keys: &[Bytes]) -> Result<usize, &'static str> {
+        self.table.sinterstore(dest, keys)
+    }
+
+    #[inline]
+    pub fn sunionstore(&mut self, dest: Bytes, keys: &[Bytes]) -> Result<usize, &'static str> {
+        self.table.sunionstore(dest, keys)
+    }
+
+    #[inline]
+    pub fn sdiffstore(&mut self, dest: Bytes, keys: &[Bytes]) -> Result<usize, &'static str> {
+        self.table.sdiffstore(dest, keys)
+    }
+
+    #[inline]
     pub fn zadd(
         &mut self,
         key: Bytes,
@@ -437,6 +469,60 @@ impl ShardDb {
     #[inline]
     pub fn zpopmax(&mut self, key: &[u8], count: usize) -> Result<Vec<(Bytes, f64)>, &'static str> {
         self.table.zpopmax(key, count)
+    }
+
+    #[inline]
+    pub fn zunionstore(
+        &mut self,
+        dest: Bytes,
+        keys: &[Bytes],
+        weights: &[f64],
+        agg: crate::table::Aggregate,
+    ) -> Result<usize, &'static str> {
+        self.table.zunionstore(dest, keys, weights, agg)
+    }
+
+    #[inline]
+    pub fn zinterstore(
+        &mut self,
+        dest: Bytes,
+        keys: &[Bytes],
+        weights: &[f64],
+        agg: crate::table::Aggregate,
+    ) -> Result<usize, &'static str> {
+        self.table.zinterstore(dest, keys, weights, agg)
+    }
+
+    #[inline]
+    pub fn zdiffstore(&mut self, dest: Bytes, keys: &[Bytes]) -> Result<usize, &'static str> {
+        self.table.zdiffstore(dest, keys)
+    }
+
+    #[inline]
+    pub fn zdiff(&mut self, keys: &[Bytes], with_scores: bool) -> Result<Vec<(Bytes, f64)>, &'static str> {
+        self.table.zdiff(keys, with_scores)
+    }
+
+    #[inline]
+    pub fn zinter(
+        &mut self,
+        keys: &[Bytes],
+        weights: &[f64],
+        agg: crate::table::Aggregate,
+        with_scores: bool,
+    ) -> Result<Vec<(Bytes, f64)>, &'static str> {
+        self.table.zinter(keys, weights, agg, with_scores)
+    }
+
+    #[inline]
+    pub fn zunion(
+        &mut self,
+        keys: &[Bytes],
+        weights: &[f64],
+        agg: crate::table::Aggregate,
+        with_scores: bool,
+    ) -> Result<Vec<(Bytes, f64)>, &'static str> {
+        self.table.zunion(keys, weights, agg, with_scores)
     }
 
     #[inline]
