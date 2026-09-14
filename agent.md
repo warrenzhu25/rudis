@@ -32,7 +32,7 @@ This document defines the mandatory operating guidelines, architectural invarian
 
 ## 2. Commit Requirements & Quality Gates
 
-Every commit to `main` must strictly adhere to the following three rules:
+Every commit to `main` must strictly adhere to the following four rules:
 
 ### Rule 1: All Tests Must Pass
 * Every commit must pass the full test suite cleanly:
@@ -57,7 +57,14 @@ Every commit to `main` must strictly adhere to the following three rules:
   * `fix:` bug fixes
   * `test:` test additions or improvements
   * `docs:` benchmark records and documentation
-* Always push completed commits to `origin main`.
+
+### Rule 4: Every Commit Must Be Pushed Immediately
+* **Every commit created must be pushed immediately to `origin main`**:
+  ```bash
+  git push origin main
+  ```
+* Never leave completed commits unpushed. Local `main` and `origin/main` must remain synchronized at all times.
+
 
 ---
 
