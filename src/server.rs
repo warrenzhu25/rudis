@@ -2,8 +2,10 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::sync::atomic::Ordering;
 
 use crate::connection::{execute_local_command, handle_connection};
+use crate::resp::Command;
 use crate::router::Router;
 use crate::shard::{ShardDb, ShardMessage};
 
@@ -189,17 +191,38 @@ pub fn run_shard_worker(
             while let Ok(msg) = rx.recv_async().await {
                 match msg {
                     ShardMessage::Get { key, responder } => {
-                        let is_tiered = cross_shard_db.borrow_mut().table.is_tiered(&key).is_some();
-                        if is_tiered {
+                        let val = cross_shard_db.borrow_mut().get(&key);
+                        if let Some(v) = val {
+                            let _ = responder.send(Some(v));
+                        } else if cross_shard_db.borrow_mut().table.is_tiered(&key).is_some() {
                             let r = cross_shard_router.clone();
                             monoio::spawn(async move {
-                                r.ensure_loaded(&key).await;
-                                let val = r.local_db.borrow_mut().get(&key);
-                                let _ = responder.send(val);
+                                let max_mem = crate::tiering::get_max_memory(r.port);
+                                let offload_pct = crate::tiering::get_offload_threshold_pct(r.port);
+                                let is_constrained = if max_mem > 0 {
+                                    let used = r.local_db.borrow().table.used_memory;
+                                    let shard_threshold = (max_mem / r.num_shards.max(1) as u64) as usize;
+                                    used >= (shard_threshold * offload_pct as usize) / 100
+                                } else {
+                                    false
+                                };
+
+                                if is_constrained {
+                                    let val = r.stream_cold_read_local(&key).await;
+                                    if val.is_some() {
+                                        let stats = crate::tiering::get_tier_stats(r.port);
+                                        stats.streaming_reads.fetch_add(1, Ordering::Relaxed);
+                                        stats.ram_misses.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    let _ = responder.send(val);
+                                } else {
+                                    r.ensure_loaded(&key).await;
+                                    let val = r.local_db.borrow_mut().get(&key);
+                                    let _ = responder.send(val);
+                                }
                             });
                         } else {
-                            let val = cross_shard_db.borrow_mut().get(&key);
-                            let _ = responder.send(val);
+                            let _ = responder.send(None);
                         }
                     }
                     ShardMessage::Set {
@@ -334,16 +357,73 @@ pub fn run_shard_worker(
                         let _ = responder.send(out);
                     }
                     ShardMessage::Batch { items, responder } => {
-                        let mut db = cross_shard_db.borrow_mut();
-                        let mut results = Vec::with_capacity(items.len());
-                        let aof_ref = cross_shard_aof.as_deref();
-                        let mut temp_buf = Vec::with_capacity(128);
-                        for (idx, cmd) in items {
-                            temp_buf.clear();
-                            let _ = execute_local_command(&cmd, &mut db, &mut temp_buf, aof_ref);
-                            results.push((idx, crate::shard::CompactResp::from_slice(&temp_buf)));
+                        let r = cross_shard_router.clone();
+                        let aof_ref = cross_shard_aof.clone();
+                        let needs_async = items.iter().any(|(_, cmd)| {
+                            if let Command::Get(key) = cmd {
+                                r.local_db.borrow_mut().get(key).is_none()
+                                    && r.local_db.borrow_mut().table.is_tiered(key).is_some()
+                            } else {
+                                false
+                            }
+                        });
+
+                        if needs_async {
+                            monoio::spawn(async move {
+                                let mut results = Vec::with_capacity(items.len());
+                                let mut temp_buf = Vec::with_capacity(128);
+                                let mut has_writes = false;
+                                for (idx, cmd) in items {
+                                    temp_buf.clear();
+                                    if let Command::Get(ref key) = cmd {
+                                        let val = r.local_db.borrow_mut().get(key);
+                                        if let Some(v) = val {
+                                            crate::connection::write_resp_bulk(&mut temp_buf, &v);
+                                        } else if r.local_db.borrow_mut().table.is_tiered(key).is_some() {
+                                            if let Some(v) = r.stream_cold_read_local(key).await {
+                                                crate::connection::write_resp_bulk(&mut temp_buf, &v);
+                                            } else {
+                                                temp_buf.extend_from_slice(b"$-1\r\n");
+                                            }
+                                        } else {
+                                            temp_buf.extend_from_slice(b"$-1\r\n");
+                                        }
+                                    } else {
+                                        if matches!(cmd, Command::Set { .. } | Command::Del(_) | Command::IncrBy { .. }) {
+                                            has_writes = true;
+                                        }
+                                        let mut db = r.local_db.borrow_mut();
+                                        let _ = execute_local_command(&cmd, &mut db, &mut temp_buf, aof_ref.as_deref());
+                                    }
+                                    results.push((idx, crate::shard::CompactResp::from_slice(&temp_buf)));
+                                }
+                                if has_writes {
+                                    r.check_auto_tier().await;
+                                }
+                                let _ = responder.send(results);
+                            });
+                        } else {
+                            let mut db = cross_shard_db.borrow_mut();
+                            let mut results = Vec::with_capacity(items.len());
+                            let aof_ref = cross_shard_aof.as_deref();
+                            let mut temp_buf = Vec::with_capacity(128);
+                            let mut has_writes = false;
+                            for (idx, cmd) in items {
+                                temp_buf.clear();
+                                if matches!(cmd, Command::Set { .. } | Command::Del(_) | Command::IncrBy { .. }) {
+                                    has_writes = true;
+                                }
+                                let _ = execute_local_command(&cmd, &mut db, &mut temp_buf, aof_ref);
+                                results.push((idx, crate::shard::CompactResp::from_slice(&temp_buf)));
+                            }
+                            if has_writes {
+                                let r = cross_shard_router.clone();
+                                monoio::spawn(async move {
+                                    r.check_auto_tier().await;
+                                });
+                            }
+                            let _ = responder.send(results);
                         }
-                        let _ = responder.send(results);
                     }
                     ShardMessage::SetSlotState { slot, state } => {
                         cross_shard_slot_states.borrow_mut()[slot as usize] = state;

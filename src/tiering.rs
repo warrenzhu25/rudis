@@ -404,7 +404,7 @@ impl ShardTierManager {
                 let ab = bins.active_bin.as_mut().unwrap();
                 let page_idx = ab.page_index;
                 let item = ab.append(key.clone(), &record, val_type);
-                let should_flush = !ab.can_fit(SMALL_VALUE_LIMIT);
+                let should_flush = !ab.can_fit(64);
                 let ptr = TieredPointer {
                     file_id: self.shard_id as u32,
                     offset: page_idx * PAGE_SIZE as u64 + item.offset_in_page as u64,

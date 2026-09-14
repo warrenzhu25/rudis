@@ -68,7 +68,21 @@ pub fn write_resp_integer(out: &mut Vec<u8>, val: i64) {
 
 #[inline(always)]
 pub fn write_resp_bulk(out: &mut Vec<u8>, val: &[u8]) {
-    out.extend_from_slice(format!("${}\r\n", val.len()).as_bytes());
+    out.push(b'$');
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    let mut uval = val.len();
+    if uval == 0 {
+        out.extend_from_slice(b"0\r\n");
+    } else {
+        while uval > 0 {
+            i -= 1;
+            buf[i] = b'0' + (uval % 10) as u8;
+            uval /= 10;
+        }
+        out.extend_from_slice(&buf[i..]);
+        out.extend_from_slice(b"\r\n");
+    }
     out.extend_from_slice(val);
     out.extend_from_slice(b"\r\n");
 }
@@ -3805,9 +3819,7 @@ pub fn execute_local_command(
         Command::Get(key) => {
             match db.get(key) {
                 Some(v) => {
-                    out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                    out.extend_from_slice(&v);
-                    out.extend_from_slice(b"\r\n");
+                    write_resp_bulk(out, &v);
                 }
                 None => {
                     out.extend_from_slice(b"$-1\r\n");
@@ -6069,10 +6081,6 @@ async fn execute_commands_squashed(
                     can_squash = false;
                     break;
                 }
-                if router.local_db.borrow_mut().table.is_tiered(k).is_some() {
-                    can_squash = false;
-                    break;
-                }
             } else if !matches!(cmd, Command::Ping(_) | Command::CommandDocs | Command::Quit | Command::Time | Command::Echo(_)) {
                 can_squash = false;
                 break;
@@ -6120,17 +6128,36 @@ async fn execute_commands_squashed(
     }
 
     // 1. Process local shard commands immediately; bucket remote commands by shard
+    let mut has_local_writes = false;
     for (idx, cmd) in commands.into_iter().enumerate() {
         if let Some(target) = target_shard_of_cmd(&cmd, router.num_shards) {
             if target == router.shard_id {
                 local_buf.clear();
-                if execute_local_command(
-                    &cmd,
-                    &mut router.local_db.borrow_mut(),
-                    &mut local_buf,
-                    router.aof.as_deref(),
-                ) {
-                    should_close = true;
+                if let Command::Get(ref key) = cmd {
+                    let val = router.local_db.borrow_mut().get(key);
+                    if let Some(v) = val {
+                        write_resp_bulk(&mut local_buf, &v);
+                    } else if router.local_db.borrow_mut().table.is_tiered(key).is_some() {
+                        if let Some(v) = router.stream_cold_read_local(key).await {
+                            write_resp_bulk(&mut local_buf, &v);
+                        } else {
+                            local_buf.extend_from_slice(b"$-1\r\n");
+                        }
+                    } else {
+                        local_buf.extend_from_slice(b"$-1\r\n");
+                    }
+                } else {
+                    if matches!(cmd, Command::Set { .. } | Command::Del(_) | Command::IncrBy { .. }) {
+                        has_local_writes = true;
+                    }
+                    if execute_local_command(
+                        &cmd,
+                        &mut router.local_db.borrow_mut(),
+                        &mut local_buf,
+                        router.aof.as_deref(),
+                    ) {
+                        should_close = true;
+                    }
                 }
                 responses[idx] = CompactResp::from_slice(&local_buf);
             } else {
@@ -6149,6 +6176,13 @@ async fn execute_commands_squashed(
             }
             responses[idx] = CompactResp::from_slice(&local_buf);
         }
+    }
+
+    if has_local_writes {
+        let r = router.clone();
+        monoio::spawn(async move {
+            r.check_auto_tier().await;
+        });
     }
 
     // 2. Dispatch batched hops to all remote shards in parallel using pre-allocated channels

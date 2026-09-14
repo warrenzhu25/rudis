@@ -161,6 +161,10 @@ impl Router {
     }
 
     pub async fn spill_local(&self, key: &[u8]) -> bool {
+        self.spill_local_internal(key, true).await
+    }
+
+    pub async fn spill_local_internal(&self, key: &[u8], flush_bin: bool) -> bool {
         if self.local_db.borrow_mut().table.is_cooled(key).is_some() {
             return self.decommit_local(Some(key)) > 0;
         }
@@ -190,7 +194,9 @@ impl Router {
                 stats.ram_saved_bytes.fetch_add(entry_data.len() as u64, Ordering::Relaxed);
             }
             drop(db);
-            let _ = tm.flush_active_bin().await;
+            if flush_bin {
+                let _ = tm.flush_active_bin().await;
+            }
             true
         } else {
             false
@@ -429,9 +435,9 @@ impl Router {
         }
 
         // Phase 2: Spill Hot keys to NVMe disk until under shard_max_mem
-        let hot_keys = self.local_db.borrow_mut().table.get_hot_keys_for_spill(64);
+        let hot_keys = self.local_db.borrow_mut().table.get_hot_keys_for_spill(256);
         for k in hot_keys {
-            let _ = self.spill_local(&k).await;
+            let _ = self.spill_local_internal(&k, false).await;
             if self.local_db.borrow().table.used_memory <= shard_max_mem {
                 break;
             }
@@ -503,52 +509,41 @@ impl Router {
     }
 
     pub async fn get(&self, key: Bytes) -> Option<Bytes> {
-        let max_mem = crate::tiering::get_max_memory(self.port);
-        let offload_pct = crate::tiering::get_offload_threshold_pct(self.port);
         let target = target_shard(&key, self.num_shards);
-
-        let is_constrained = if max_mem > 0 {
-            let used_mem = self.local_db.borrow().table.used_memory;
-            let shard_threshold = (max_mem / self.num_shards.max(1) as u64) as usize;
-            used_mem >= (shard_threshold * offload_pct as usize) / 100
-        } else {
-            false
-        };
-
-        if is_constrained {
-            if target == self.shard_id {
-                if let Some(val) = self.stream_cold_read_local(&key).await {
-                    let stats = crate::tiering::get_tier_stats(self.port);
-                    stats.streaming_reads.fetch_add(1, Ordering::Relaxed);
-                    stats.ram_misses.fetch_add(1, Ordering::Relaxed);
-                    return Some(val);
-                }
-            } else {
-                let (tx, rx) = flume::bounded(1);
-                let msg = ShardMessage::StreamColdRead {
-                    key: key.clone(),
-                    responder: tx,
+        if target == self.shard_id {
+            // 1. Fast DRAM path
+            let val = self.local_db.borrow_mut().get(&key);
+            if let Some(v) = val {
+                let stats = crate::tiering::get_tier_stats(self.port);
+                stats.ram_hits.fetch_add(1, Ordering::Relaxed);
+                return Some(v);
+            }
+            // 2. Cold tiered path
+            if self.local_db.borrow_mut().table.is_tiered(&key).is_some() {
+                let max_mem = crate::tiering::get_max_memory(self.port);
+                let offload_pct = crate::tiering::get_offload_threshold_pct(self.port);
+                let is_constrained = if max_mem > 0 {
+                    let used_mem = self.local_db.borrow().table.used_memory;
+                    let shard_threshold = (max_mem / self.num_shards.max(1) as u64) as usize;
+                    used_mem >= (shard_threshold * offload_pct as usize) / 100
+                } else {
+                    false
                 };
-                if self.senders[target].send(msg).is_ok() {
-                    if let Ok(Some(val)) = rx.recv_async().await {
+                if is_constrained {
+                    if let Some(val) = self.stream_cold_read_local(&key).await {
                         let stats = crate::tiering::get_tier_stats(self.port);
                         stats.streaming_reads.fetch_add(1, Ordering::Relaxed);
                         stats.ram_misses.fetch_add(1, Ordering::Relaxed);
                         return Some(val);
                     }
+                } else {
+                    self.load_local(&key).await;
+                    return self.local_db.borrow_mut().get(&key);
                 }
             }
-        }
-
-        self.ensure_loaded(&key).await;
-        if target == self.shard_id {
-            let val = self.local_db.borrow_mut().get(&key);
-            let stats = crate::tiering::get_tier_stats(self.port);
-            if val.is_some() {
-                stats.ram_hits.fetch_add(1, Ordering::Relaxed);
-            }
-            val
+            None
         } else {
+            // Unified remote shard Get (handles DRAM and tiered in a single message)
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::Get { key, responder: tx };
             if self.senders[target].send(msg).is_ok() {

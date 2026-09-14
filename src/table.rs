@@ -1169,6 +1169,7 @@ impl RudisFlatTable {
 pub struct RudisTable {
     table: RudisFlatTable,
     sample_cursor: usize,
+    spill_cursor: usize,
     pub used_memory: usize,
 }
 
@@ -1178,6 +1179,7 @@ impl RudisTable {
         Self {
             table: RudisFlatTable::new(64),
             sample_cursor: 0,
+            spill_cursor: 0,
             used_memory: base_mem,
         }
     }
@@ -1787,16 +1789,25 @@ impl RudisTable {
 
     pub fn get_hot_keys_for_spill(&mut self, limit: usize) -> Vec<Bytes> {
         let mut hot = Vec::with_capacity(limit);
-        for opt in &self.table.slots {
-            if let Some(entry) = opt {
+        let total_slots = self.table.slots.len();
+        if total_slots == 0 {
+            return hot;
+        }
+        let start = self.spill_cursor % total_slots;
+        let mut idx = start;
+        for _ in 0..total_slots {
+            if let Some(entry) = &self.table.slots[idx] {
                 if !matches!(entry.val, RudisValue::Tiered(_) | RudisValue::Cooled { .. }) {
                     hot.push(entry.key.clone());
                     if hot.len() >= limit {
-                        break;
+                        self.spill_cursor = (idx + 1) % total_slots;
+                        return hot;
                     }
                 }
             }
+            idx = (idx + 1) % total_slots;
         }
+        self.spill_cursor = idx;
         hot
     }
 
