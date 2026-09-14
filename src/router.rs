@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::time::Duration;
 use bytes::Bytes;
 
 use crate::shard::{ShardDb, ShardMessage};
@@ -13,7 +14,7 @@ pub fn target_shard(key: &[u8], num_shards: usize) -> usize {
     (crc16::State::<crc16::XMODEM>::calculate(key) as usize) % num_shards
 }
 
-/// The router handles dispatching GET and SET operations.
+/// The router handles dispatching operations.
 /// If the key belongs to the current shard, it directly touches `local_db` without locking.
 /// If the key belongs to a peer shard, it routes the message across cores via the mesh.
 pub struct Router {
@@ -41,10 +42,8 @@ impl Router {
     pub async fn get(&self, key: Bytes) -> Option<Bytes> {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
-            // Local fast-path: zero lock overhead, zero cross-core communication
-            self.local_db.borrow().get(&key)
+            self.local_db.borrow_mut().get(&key)
         } else {
-            // Remote path: route request to peer core via channel
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::Get {
                 key,
@@ -58,17 +57,16 @@ impl Router {
         }
     }
 
-    pub async fn set(&self, key: Bytes, value: Bytes) {
+    pub async fn set(&self, key: Bytes, value: Bytes, expire_in: Option<Duration>) {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
-            // Local fast-path
-            self.local_db.borrow_mut().set(key, value);
+            self.local_db.borrow_mut().set(key, value, expire_in);
         } else {
-            // Remote path
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::Set {
                 key,
                 value,
+                expire_in,
                 responder: tx,
             };
             if self.senders[target].send(msg).is_ok() {
@@ -98,7 +96,7 @@ impl Router {
     pub async fn exists(&self, key: Bytes) -> bool {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
-            self.local_db.borrow().exists(&key)
+            self.local_db.borrow_mut().exists(&key)
         } else {
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::Exists {
@@ -130,6 +128,62 @@ impl Router {
                     .unwrap_or_else(|_| Err("shard disconnected".to_string()))
             } else {
                 Err("failed to route to shard".to_string())
+            }
+        }
+    }
+
+    pub async fn expire(&self, key: Bytes, duration: Duration) -> bool {
+        let target = target_shard(&key, self.num_shards);
+        if target == self.shard_id {
+            self.local_db.borrow_mut().expire(&key, duration)
+        } else {
+            let (tx, rx) = flume::bounded(1);
+            let msg = ShardMessage::Expire {
+                key,
+                duration,
+                responder: tx,
+            };
+            if self.senders[target].send(msg).is_ok() {
+                rx.recv_async().await.unwrap_or(false)
+            } else {
+                false
+            }
+        }
+    }
+
+    pub async fn persist(&self, key: Bytes) -> bool {
+        let target = target_shard(&key, self.num_shards);
+        if target == self.shard_id {
+            self.local_db.borrow_mut().persist(&key)
+        } else {
+            let (tx, rx) = flume::bounded(1);
+            let msg = ShardMessage::Persist {
+                key,
+                responder: tx,
+            };
+            if self.senders[target].send(msg).is_ok() {
+                rx.recv_async().await.unwrap_or(false)
+            } else {
+                false
+            }
+        }
+    }
+
+    pub async fn ttl(&self, key: Bytes, in_millis: bool) -> i64 {
+        let target = target_shard(&key, self.num_shards);
+        if target == self.shard_id {
+            self.local_db.borrow_mut().ttl(&key, in_millis)
+        } else {
+            let (tx, rx) = flume::bounded(1);
+            let msg = ShardMessage::Ttl {
+                key,
+                in_millis,
+                responder: tx,
+            };
+            if self.senders[target].send(msg).is_ok() {
+                rx.recv_async().await.unwrap_or(-2)
+            } else {
+                -2
             }
         }
     }

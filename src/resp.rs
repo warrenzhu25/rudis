@@ -1,14 +1,22 @@
+use std::time::Duration;
 use bytes::{Buf, Bytes, BytesMut};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Command {
     Get(Bytes),
-    Set(Bytes, Bytes),
+    Set {
+        key: Bytes,
+        value: Bytes,
+        expire_in: Option<Duration>,
+    },
     Mget(Vec<Bytes>),
     Mset(Vec<(Bytes, Bytes)>),
     Del(Vec<Bytes>),
     Exists(Vec<Bytes>),
     IncrBy(Bytes, i64),
+    Expire(Bytes, Duration),
+    Persist(Bytes),
+    Ttl(Bytes, bool), // true for PTTL (milliseconds), false for TTL (seconds)
     Ping(Option<Bytes>),
     CommandDocs,
     Info,
@@ -48,7 +56,6 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
 
     // First check if the full frame is present before consuming any bytes from buf
     let mut scan_cursor = newline_pos + 2;
-    let mut arg_meta = Vec::with_capacity(num_args);
 
     for _ in 0..num_args {
         if scan_cursor >= buf.len() {
@@ -83,7 +90,6 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
             return Err("Expected CRLF after bulk string data".to_string());
         }
 
-        arg_meta.push((next_crlf + 2, arg_len));
         scan_cursor = data_end + 2;
     }
 
@@ -117,7 +123,7 @@ fn parse_inline_command(buf: &mut BytesMut) -> Result<Option<Command>, String> {
     let parts: Vec<Bytes> = line
         .split(|&b| b == b' ' || b == b'\t')
         .filter(|part| !part.is_empty())
-        .map(|part| Bytes::copy_from_slice(part))
+        .map(Bytes::copy_from_slice)
         .collect();
 
     buf.advance(newline_pos + 2);
@@ -147,7 +153,43 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() < 3 {
                 return Err("wrong number of arguments for 'set'/'put' command".to_string());
             }
-            Ok(Some(Command::Set(args[1].clone(), args[2].clone())))
+            let mut expire_in = None;
+            let mut i = 3;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "EX" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let secs: u64 = std::str::from_utf8(&args[i + 1])
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                        expire_in = Some(Duration::from_secs(secs));
+                        i += 2;
+                    }
+                    "PX" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let ms: u64 = std::str::from_utf8(&args[i + 1])
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                        expire_in = Some(Duration::from_millis(ms));
+                        i += 2;
+                    }
+                    _ => {
+                        i += 1;
+                    }
+                }
+            }
+            Ok(Some(Command::Set {
+                key: args[1].clone(),
+                value: args[2].clone(),
+                expire_in,
+            }))
         }
         "MGET" => {
             if args.len() < 2 {
@@ -211,6 +253,44 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 .ok_or_else(|| "value is not an integer or out of range".to_string())?;
             Ok(Some(Command::IncrBy(args[1].clone(), -delta)))
         }
+        "EXPIRE" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'expire' command".to_string());
+            }
+            let secs: u64 = std::str::from_utf8(&args[2])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            Ok(Some(Command::Expire(args[1].clone(), Duration::from_secs(secs))))
+        }
+        "PEXPIRE" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'pexpire' command".to_string());
+            }
+            let ms: u64 = std::str::from_utf8(&args[2])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            Ok(Some(Command::Expire(args[1].clone(), Duration::from_millis(ms))))
+        }
+        "PERSIST" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'persist' command".to_string());
+            }
+            Ok(Some(Command::Persist(args[1].clone())))
+        }
+        "TTL" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'ttl' command".to_string());
+            }
+            Ok(Some(Command::Ttl(args[1].clone(), false)))
+        }
+        "PTTL" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'pttl' command".to_string());
+            }
+            Ok(Some(Command::Ttl(args[1].clone(), true)))
+        }
         "PING" => {
             let msg = if args.len() > 1 {
                 Some(args[1].clone())
@@ -258,10 +338,11 @@ mod tests {
         let cmd = parse_command(&mut buf).unwrap().unwrap();
         assert_eq!(
             cmd,
-            Command::Set(
-                Bytes::from_static(b"mykey"),
-                Bytes::from_static(b"myvalue")
-            )
+            Command::Set {
+                key: Bytes::from_static(b"mykey"),
+                value: Bytes::from_static(b"myvalue"),
+                expire_in: None,
+            }
         );
         assert!(buf.is_empty());
 
@@ -269,9 +350,25 @@ mod tests {
         let cmd = parse_command(&mut buf).unwrap().unwrap();
         assert_eq!(
             cmd,
-            Command::Set(Bytes::from_static(b"k"), Bytes::from_static(b"v"))
+            Command::Set {
+                key: Bytes::from_static(b"k"),
+                value: Bytes::from_static(b"v"),
+                expire_in: None,
+            }
         );
         assert!(buf.is_empty());
+
+        // SET with EX
+        let mut buf = BytesMut::from("*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$2\r\n10\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::Set {
+                key: Bytes::from_static(b"k"),
+                value: Bytes::from_static(b"v"),
+                expire_in: Some(Duration::from_secs(10)),
+            }
+        );
     }
 
     #[test]
@@ -284,21 +381,19 @@ mod tests {
         let cmd = parse_command(&mut buf).unwrap().unwrap();
         assert_eq!(
             cmd,
-            Command::Set(Bytes::from_static(b"foo"), Bytes::from_static(b"bar"))
+            Command::Set {
+                key: Bytes::from_static(b"foo"),
+                value: Bytes::from_static(b"bar"),
+                expire_in: None,
+            }
         );
 
-        let mut buf = BytesMut::from("PUT hello world\r\n");
+        let mut buf = BytesMut::from("EXPIRE foo 60\r\n");
         let cmd = parse_command(&mut buf).unwrap().unwrap();
-        assert_eq!(
-            cmd,
-            Command::Set(
-                Bytes::from_static(b"hello"),
-                Bytes::from_static(b"world")
-            )
-        );
+        assert_eq!(cmd, Command::Expire(Bytes::from_static(b"foo"), Duration::from_secs(60)));
 
-        let mut buf = BytesMut::from("PING\r\n");
+        let mut buf = BytesMut::from("TTL foo\r\n");
         let cmd = parse_command(&mut buf).unwrap().unwrap();
-        assert_eq!(cmd, Command::Ping(None));
+        assert_eq!(cmd, Command::Ttl(Bytes::from_static(b"foo"), false));
     }
 }

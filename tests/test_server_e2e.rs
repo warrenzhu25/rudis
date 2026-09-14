@@ -140,4 +140,46 @@ fn test_multithread_shared_nothing_e2e() {
     let resp = send_and_read(&mut stream, b"MGET mkey1 mkey2 mkey3 non_existent\r\n");
     let expected = "*4\r\n$5\r\nalpha\r\n$4\r\nbeta\r\n$5\r\ngamma\r\n$-1\r\n";
     assert_eq!(resp, expected);
+
+    // 10. Test TTL, PTTL, EXPIRE, and PERSIST
+    // 10a. SET with EX (1 second expiration)
+    let resp = send_and_read(&mut stream, b"*5\r\n$3\r\nSET\r\n$6\r\nex_key\r\n$8\r\ntemp_val\r\n$2\r\nEX\r\n$1\r\n1\r\n");
+    assert_eq!(resp, "+OK\r\n");
+
+    let resp = send_and_read(&mut stream, b"TTL ex_key\r\n");
+    assert!(resp == ":1\r\n" || resp == ":0\r\n", "Expected TTL 1 or 0, got {}", resp);
+
+    let resp = send_and_read(&mut stream, b"GET ex_key\r\n");
+    assert_eq!(resp, "$8\r\ntemp_val\r\n");
+
+    // Wait for key to expire
+    thread::sleep(Duration::from_millis(1100));
+
+    let resp = send_and_read(&mut stream, b"GET ex_key\r\n");
+    assert_eq!(resp, "$-1\r\n", "Key should have expired");
+
+    let resp = send_and_read(&mut stream, b"TTL ex_key\r\n");
+    assert_eq!(resp, ":-2\r\n", "TTL of expired key should be -2");
+
+    // 10b. EXPIRE and PERSIST commands
+    let resp = send_and_read(&mut stream, b"SET persist_key pval\r\n");
+    assert_eq!(resp, "+OK\r\n");
+
+    let resp = send_and_read(&mut stream, b"TTL persist_key\r\n");
+    assert_eq!(resp, ":-1\r\n", "TTL of non-expiring key should be -1");
+
+    let resp = send_and_read(&mut stream, b"EXPIRE persist_key 10\r\n");
+    assert_eq!(resp, ":1\r\n");
+
+    let resp = send_and_read(&mut stream, b"PERSIST persist_key\r\n");
+    assert_eq!(resp, ":1\r\n");
+
+    let resp = send_and_read(&mut stream, b"TTL persist_key\r\n");
+    assert_eq!(resp, ":-1\r\n", "TTL after PERSIST should be -1");
+
+    let resp = send_and_read(&mut stream, b"PERSIST nonexistent\r\n");
+    assert_eq!(resp, ":0\r\n");
+
+    let resp = send_and_read(&mut stream, b"EXPIRE nonexistent 10\r\n");
+    assert_eq!(resp, ":0\r\n");
 }

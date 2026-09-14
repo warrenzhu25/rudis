@@ -20,7 +20,7 @@ pub fn run_shard_worker(
     }
 
     let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-        .enable_all()
+        .enable_timer()
         .build()
         .expect("Failed to initialize Monoio io_uring runtime");
 
@@ -46,21 +46,31 @@ pub fn run_shard_worker(
         // 2. Pure thread-local Shard DB (no Mutex, no Arc)
         let local_db = Rc::new(RefCell::new(ShardDb::new()));
 
+        // Active expiration cycle: run every 100ms
+        let active_db = local_db.clone();
+        monoio::spawn(async move {
+            loop {
+                monoio::time::sleep(std::time::Duration::from_millis(100)).await;
+                active_db.borrow_mut().active_expire_cycle();
+            }
+        });
+
         // 3. Spawn background worker to handle incoming cross-shard messages from peer cores
         let cross_shard_db = local_db.clone();
         monoio::spawn(async move {
             while let Ok(msg) = rx.recv_async().await {
                 match msg {
                     ShardMessage::Get { key, responder } => {
-                        let val = cross_shard_db.borrow().get(&key);
+                        let val = cross_shard_db.borrow_mut().get(&key);
                         let _ = responder.send(val);
                     }
                     ShardMessage::Set {
                         key,
                         value,
+                        expire_in,
                         responder,
                     } => {
-                        cross_shard_db.borrow_mut().set(key, value);
+                        cross_shard_db.borrow_mut().set(key, value, expire_in);
                         let _ = responder.send(());
                     }
                     ShardMessage::Del { key, responder } => {
@@ -68,7 +78,7 @@ pub fn run_shard_worker(
                         let _ = responder.send(deleted);
                     }
                     ShardMessage::Exists { key, responder } => {
-                        let exists = cross_shard_db.borrow().exists(&key);
+                        let exists = cross_shard_db.borrow_mut().exists(&key);
                         let _ = responder.send(exists);
                     }
                     ShardMessage::IncrBy {
@@ -77,6 +87,26 @@ pub fn run_shard_worker(
                         responder,
                     } => {
                         let res = cross_shard_db.borrow_mut().incr_by(key, delta);
+                        let _ = responder.send(res);
+                    }
+                    ShardMessage::Expire {
+                        key,
+                        duration,
+                        responder,
+                    } => {
+                        let res = cross_shard_db.borrow_mut().expire(&key, duration);
+                        let _ = responder.send(res);
+                    }
+                    ShardMessage::Persist { key, responder } => {
+                        let res = cross_shard_db.borrow_mut().persist(&key);
+                        let _ = responder.send(res);
+                    }
+                    ShardMessage::Ttl {
+                        key,
+                        in_millis,
+                        responder,
+                    } => {
+                        let res = cross_shard_db.borrow_mut().ttl(&key, in_millis);
                         let _ = responder.send(res);
                     }
                 }

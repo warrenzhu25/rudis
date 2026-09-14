@@ -97,8 +97,12 @@ async fn execute_command(cmd: Command, router: &Router, out: &mut Vec<u8>) -> bo
             }
             false
         }
-        Command::Set(key, value) => {
-            router.set(key, value).await;
+        Command::Set {
+            key,
+            value,
+            expire_in,
+        } => {
+            router.set(key, value, expire_in).await;
             out.extend_from_slice(b"+OK\r\n");
             false
         }
@@ -120,7 +124,7 @@ async fn execute_command(cmd: Command, router: &Router, out: &mut Vec<u8>) -> bo
         }
         Command::Mset(pairs) => {
             for (key, val) in pairs {
-                router.set(key, val).await;
+                router.set(key, val, None).await;
             }
             out.extend_from_slice(b"+OK\r\n");
             false
@@ -154,6 +158,29 @@ async fn execute_command(cmd: Command, router: &Router, out: &mut Vec<u8>) -> bo
                     out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
                 }
             }
+            false
+        }
+        Command::Expire(key, duration) => {
+            let res = router.expire(key, duration).await;
+            if res {
+                out.extend_from_slice(b":1\r\n");
+            } else {
+                out.extend_from_slice(b":0\r\n");
+            }
+            false
+        }
+        Command::Persist(key) => {
+            let res = router.persist(key).await;
+            if res {
+                out.extend_from_slice(b":1\r\n");
+            } else {
+                out.extend_from_slice(b":0\r\n");
+            }
+            false
+        }
+        Command::Ttl(key, in_millis) => {
+            let res = router.ttl(key, in_millis).await;
+            out.extend_from_slice(format!(":{}\r\n", res).as_bytes());
             false
         }
         Command::Ping(msg) => {
