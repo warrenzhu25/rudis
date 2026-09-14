@@ -102,6 +102,29 @@ async fn execute_command(cmd: Command, router: &Router, out: &mut Vec<u8>) -> bo
             out.extend_from_slice(b"+OK\r\n");
             false
         }
+        Command::Mget(keys) => {
+            out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
+            for key in keys {
+                match router.get(key).await {
+                    Some(v) => {
+                        out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                        out.extend_from_slice(&v);
+                        out.extend_from_slice(b"\r\n");
+                    }
+                    None => {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+            }
+            false
+        }
+        Command::Mset(pairs) => {
+            for (key, val) in pairs {
+                router.set(key, val).await;
+            }
+            out.extend_from_slice(b"+OK\r\n");
+            false
+        }
         Command::Del(keys) => {
             let mut count = 0usize;
             for key in keys {

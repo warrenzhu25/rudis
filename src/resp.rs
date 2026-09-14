@@ -4,6 +4,8 @@ use bytes::{Buf, Bytes, BytesMut};
 pub enum Command {
     Get(Bytes),
     Set(Bytes, Bytes),
+    Mget(Vec<Bytes>),
+    Mset(Vec<(Bytes, Bytes)>),
     Del(Vec<Bytes>),
     Exists(Vec<Bytes>),
     IncrBy(Bytes, i64),
@@ -146,6 +148,24 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'set'/'put' command".to_string());
             }
             Ok(Some(Command::Set(args[1].clone(), args[2].clone())))
+        }
+        "MGET" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'mget' command".to_string());
+            }
+            Ok(Some(Command::Mget(args[1..].to_vec())))
+        }
+        "MSET" => {
+            if args.len() < 3 || (args.len() - 1) % 2 != 0 {
+                return Err("wrong number of arguments for 'mset' command".to_string());
+            }
+            let mut pairs = Vec::with_capacity((args.len() - 1) / 2);
+            let mut i = 1;
+            while i < args.len() {
+                pairs.push((args[i].clone(), args[i + 1].clone()));
+                i += 2;
+            }
+            Ok(Some(Command::Mset(pairs)))
         }
         "DEL" => {
             if args.len() < 2 {

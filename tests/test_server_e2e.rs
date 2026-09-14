@@ -132,4 +132,12 @@ fn test_multithread_shared_nothing_e2e() {
 
     let resp = send_and_read(&mut stream, b"GET counter\r\n");
     assert_eq!(resp, "$1\r\n6\r\n");
+
+    // 9. Test MSET and MGET (scatter-gather across shards)
+    let resp = send_and_read(&mut stream, b"MSET mkey1 alpha mkey2 beta mkey3 gamma\r\n");
+    assert_eq!(resp, "+OK\r\n");
+
+    let resp = send_and_read(&mut stream, b"MGET mkey1 mkey2 mkey3 non_existent\r\n");
+    let expected = "*4\r\n$5\r\nalpha\r\n$4\r\nbeta\r\n$5\r\ngamma\r\n$-1\r\n";
+    assert_eq!(resp, expected);
 }
