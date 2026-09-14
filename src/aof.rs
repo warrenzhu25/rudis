@@ -407,6 +407,58 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             Some(buf)
         }
+        Command::Setbit { key, offset, value } => {
+            let off_str = offset.to_string();
+            let val_str = value.to_string();
+            buf.extend_from_slice(format!("*4\r\n$6\r\nSETBIT\r\n${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", off_str.len(), off_str).as_bytes());
+            buf.extend_from_slice(format!("${}\r\n{}\r\n", val_str.len(), val_str).as_bytes());
+            Some(buf)
+        }
+        Command::Bitop {
+            op,
+            destkey,
+            srckeys,
+        } => {
+            buf.extend_from_slice(
+                format!("*{}\r\n$5\r\nBITOP\r\n${}\r\n{}\r\n${}\r\n", 3 + srckeys.len(), op.len(), op, destkey.len()).as_bytes(),
+            );
+            buf.extend_from_slice(destkey);
+            buf.extend_from_slice(b"\r\n");
+            for k in srckeys {
+                buf.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                buf.extend_from_slice(k);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
+        Command::Pfadd { key, elements } => {
+            buf.extend_from_slice(
+                format!("*{}\r\n$5\r\nPFADD\r\n${}\r\n", 2 + elements.len(), key.len()).as_bytes(),
+            );
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(b"\r\n");
+            for e in elements {
+                buf.extend_from_slice(format!("${}\r\n", e.len()).as_bytes());
+                buf.extend_from_slice(e);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
+        Command::Pfmerge { destkey, srckeys } => {
+            buf.extend_from_slice(
+                format!("*{}\r\n$7\r\nPFMERGE\r\n${}\r\n", 2 + srckeys.len(), destkey.len()).as_bytes(),
+            );
+            buf.extend_from_slice(destkey);
+            buf.extend_from_slice(b"\r\n");
+            for k in srckeys {
+                buf.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                buf.extend_from_slice(k);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
         _ => None,
     }
 }

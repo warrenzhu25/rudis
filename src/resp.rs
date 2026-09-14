@@ -236,6 +236,44 @@ pub enum Command {
     Multi,
     Exec,
     Discard,
+    // BITMAP COMMANDS
+    Setbit {
+        key: Bytes,
+        offset: usize,
+        value: u8,
+    },
+    Getbit {
+        key: Bytes,
+        offset: usize,
+    },
+    Bitcount {
+        key: Bytes,
+        start: Option<i64>,
+        end: Option<i64>,
+    },
+    Bitpos {
+        key: Bytes,
+        bit: u8,
+        start: Option<i64>,
+        end: Option<i64>,
+    },
+    Bitop {
+        op: String,
+        destkey: Bytes,
+        srckeys: Vec<Bytes>,
+    },
+    // HYPERLOGLOG COMMANDS
+    Pfadd {
+        key: Bytes,
+        elements: Vec<Bytes>,
+    },
+    Pfcount {
+        keys: Vec<Bytes>,
+    },
+    Pfmerge {
+        destkey: Bytes,
+        srckeys: Vec<Bytes>,
+    },
     Unknown(String),
 }
 
@@ -1654,6 +1692,145 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             Ok(Some(Command::Discard))
         }
+        "SETBIT" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'setbit' command".to_string());
+            }
+            let offset: usize = std::str::from_utf8(&args[2])
+                .map_err(|_| "bit offset is not an integer or out of range")?
+                .parse()
+                .map_err(|_| "bit offset is not an integer or out of range")?;
+            let val_str = std::str::from_utf8(&args[3])
+                .map_err(|_| "bit is not an integer or out of range")?;
+            let value: u8 = val_str
+                .parse()
+                .map_err(|_| "bit is not an integer or out of range")?;
+            if value > 1 {
+                return Err("bit is not an integer or out of range".to_string());
+            }
+            Ok(Some(Command::Setbit {
+                key: args[1].clone(),
+                offset,
+                value,
+            }))
+        }
+        "GETBIT" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'getbit' command".to_string());
+            }
+            let offset: usize = std::str::from_utf8(&args[2])
+                .map_err(|_| "bit offset is not an integer or out of range")?
+                .parse()
+                .map_err(|_| "bit offset is not an integer or out of range")?;
+            Ok(Some(Command::Getbit {
+                key: args[1].clone(),
+                offset,
+            }))
+        }
+        "BITCOUNT" => {
+            if args.len() != 2 && args.len() != 4 && args.len() != 5 {
+                return Err("wrong number of arguments for 'bitcount' command".to_string());
+            }
+            let mut start = None;
+            let mut end = None;
+            if args.len() >= 4 {
+                start = Some(
+                    std::str::from_utf8(&args[2])
+                        .map_err(|_| "value is not an integer or out of range")?
+                        .parse()
+                        .map_err(|_| "value is not an integer or out of range")?,
+                );
+                end = Some(
+                    std::str::from_utf8(&args[3])
+                        .map_err(|_| "value is not an integer or out of range")?
+                        .parse()
+                        .map_err(|_| "value is not an integer or out of range")?,
+                );
+            }
+            Ok(Some(Command::Bitcount {
+                key: args[1].clone(),
+                start,
+                end,
+            }))
+        }
+        "BITPOS" => {
+            if args.len() < 3 || args.len() > 5 {
+                return Err("wrong number of arguments for 'bitpos' command".to_string());
+            }
+            let bit_str =
+                std::str::from_utf8(&args[2]).map_err(|_| "The bit argument must be 1 or 0.")?;
+            let bit: u8 = bit_str
+                .parse()
+                .map_err(|_| "The bit argument must be 1 or 0.")?;
+            if bit > 1 {
+                return Err("The bit argument must be 1 or 0.".to_string());
+            }
+            let start = if args.len() >= 4 {
+                Some(
+                    std::str::from_utf8(&args[3])
+                        .map_err(|_| "value is not an integer or out of range")?
+                        .parse()
+                        .map_err(|_| "value is not an integer or out of range")?,
+                )
+            } else {
+                None
+            };
+            let end = if args.len() == 5 {
+                Some(
+                    std::str::from_utf8(&args[4])
+                        .map_err(|_| "value is not an integer or out of range")?
+                        .parse()
+                        .map_err(|_| "value is not an integer or out of range")?,
+                )
+            } else {
+                None
+            };
+            Ok(Some(Command::Bitpos {
+                key: args[1].clone(),
+                bit,
+                start,
+                end,
+            }))
+        }
+        "BITOP" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'bitop' command".to_string());
+            }
+            let op = String::from_utf8_lossy(&args[1]).to_uppercase();
+            let destkey = args[2].clone();
+            let srckeys = args[3..].to_vec();
+            if op == "NOT" && srckeys.len() != 1 {
+                return Err("BITOP NOT takes only one source key".to_string());
+            }
+            Ok(Some(Command::Bitop {
+                op,
+                destkey,
+                srckeys,
+            }))
+        }
+        "PFADD" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'pfadd' command".to_string());
+            }
+            let key = args[1].clone();
+            let elements = args[2..].to_vec();
+            Ok(Some(Command::Pfadd { key, elements }))
+        }
+        "PFCOUNT" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'pfcount' command".to_string());
+            }
+            let keys = args[1..].to_vec();
+            Ok(Some(Command::Pfcount { keys }))
+        }
+        "PFMERGE" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'pfmerge' command".to_string());
+            }
+            let destkey = args[1].clone();
+            let srckeys = args[2..].to_vec();
+            Ok(Some(Command::Pfmerge { destkey, srckeys }))
+        }
         _ => Ok(Some(Command::Unknown(cmd_name))),
     }
 }
@@ -1888,5 +2065,92 @@ mod tests {
         assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Exec);
         let mut buf = BytesMut::from("DISCARD\r\n");
         assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Discard);
+    }
+
+    #[test]
+    fn test_resp_bitmaps_and_hll() {
+        // SETBIT
+        let mut buf = BytesMut::from("SETBIT mykey 10 1\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Setbit {
+                key: Bytes::from_static(b"mykey"),
+                offset: 10,
+                value: 1,
+            }
+        );
+
+        // GETBIT
+        let mut buf = BytesMut::from("GETBIT mykey 10\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Getbit {
+                key: Bytes::from_static(b"mykey"),
+                offset: 10,
+            }
+        );
+
+        // BITCOUNT
+        let mut buf = BytesMut::from("BITCOUNT mykey 0 5\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Bitcount {
+                key: Bytes::from_static(b"mykey"),
+                start: Some(0),
+                end: Some(5),
+            }
+        );
+
+        // BITPOS
+        let mut buf = BytesMut::from("BITPOS mykey 1 2 4\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Bitpos {
+                key: Bytes::from_static(b"mykey"),
+                bit: 1,
+                start: Some(2),
+                end: Some(4),
+            }
+        );
+
+        // BITOP
+        let mut buf = BytesMut::from("BITOP AND dest k1 k2\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Bitop {
+                op: "AND".to_string(),
+                destkey: Bytes::from_static(b"dest"),
+                srckeys: vec![Bytes::from_static(b"k1"), Bytes::from_static(b"k2")],
+            }
+        );
+
+        // PFADD
+        let mut buf = BytesMut::from("PFADD hll elem1 elem2\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Pfadd {
+                key: Bytes::from_static(b"hll"),
+                elements: vec![Bytes::from_static(b"elem1"), Bytes::from_static(b"elem2")],
+            }
+        );
+
+        // PFCOUNT
+        let mut buf = BytesMut::from("PFCOUNT hll1 hll2\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Pfcount {
+                keys: vec![Bytes::from_static(b"hll1"), Bytes::from_static(b"hll2")],
+            }
+        );
+
+        // PFMERGE
+        let mut buf = BytesMut::from("PFMERGE dest hll1 hll2\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Pfmerge {
+                destkey: Bytes::from_static(b"dest"),
+                srckeys: vec![Bytes::from_static(b"hll1"), Bytes::from_static(b"hll2")],
+            }
+        );
     }
 }

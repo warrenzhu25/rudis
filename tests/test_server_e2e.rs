@@ -51,6 +51,13 @@ fn send_and_read(stream: &mut TcpStream, cmd: &[u8]) -> String {
     String::from_utf8_lossy(&buf[..n]).to_string()
 }
 
+fn send_and_read_bytes(stream: &mut TcpStream, cmd: &[u8]) -> Vec<u8> {
+    stream.write_all(cmd).unwrap();
+    let mut buf = [0u8; 1024];
+    let n = stream.read(&mut buf).unwrap();
+    buf[..n].to_vec()
+}
+
 #[test]
 fn test_multithread_shared_nothing_e2e() {
     let port = 16380;
@@ -1653,4 +1660,87 @@ fn test_vll_multi_shard_transactions_e2e() {
     let resp2 = send_and_read(&mut client2, b"EXEC\r\n");
     assert_eq!(resp1, "*2\r\n+OK\r\n+OK\r\n");
     assert_eq!(resp2, "*2\r\n+OK\r\n+OK\r\n");
+}
+
+#[test]
+fn test_bitmaps_and_hyperloglog_e2e() {
+    let port = 16391;
+    let _server = start_test_server(port, 4);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. SETBIT and GETBIT
+    // Set bits to produce byte 'a' (0b01100001: bits 1, 2, 7)
+    assert_eq!(send_and_read(&mut client, b"SETBIT mybm 1 1\r\n"), ":0\r\n");
+    assert_eq!(send_and_read(&mut client, b"SETBIT mybm 2 1\r\n"), ":0\r\n");
+    assert_eq!(send_and_read(&mut client, b"SETBIT mybm 7 1\r\n"), ":0\r\n");
+    // Setting bit 1 again should return old bit 1
+    assert_eq!(send_and_read(&mut client, b"SETBIT mybm 1 1\r\n"), ":1\r\n");
+
+    assert_eq!(send_and_read(&mut client, b"GETBIT mybm 1\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"GETBIT mybm 2\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"GETBIT mybm 3\r\n"), ":0\r\n");
+    assert_eq!(send_and_read(&mut client, b"GETBIT mybm 7\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"GETBIT mybm 100\r\n"), ":0\r\n");
+    assert_eq!(send_and_read(&mut client, b"GET mybm\r\n"), "$1\r\na\r\n");
+
+    // 2. BITCOUNT
+    assert_eq!(send_and_read(&mut client, b"BITCOUNT mybm\r\n"), ":3\r\n");
+    // Set offset 15 (byte 1, bit 7)
+    assert_eq!(send_and_read(&mut client, b"SETBIT mybm 15 1\r\n"), ":0\r\n");
+    assert_eq!(send_and_read(&mut client, b"BITCOUNT mybm\r\n"), ":4\r\n");
+    assert_eq!(send_and_read(&mut client, b"BITCOUNT mybm 0 0\r\n"), ":3\r\n");
+    assert_eq!(send_and_read(&mut client, b"BITCOUNT mybm 1 1\r\n"), ":1\r\n");
+
+    // 3. BITPOS
+    assert_eq!(send_and_read(&mut client, b"BITPOS mybm 1\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"BITPOS mybm 0\r\n"), ":0\r\n");
+    assert_eq!(send_and_read(&mut client, b"BITPOS mybm 1 1\r\n"), ":15\r\n");
+
+    // 4. BITOP (AND, OR, XOR, NOT) using same hashtag to guarantee same shard
+    assert_eq!(send_and_read(&mut client, b"SET {t}k1 \x0f\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"SET {t}k2 \x33\r\n"), "+OK\r\n");
+
+    assert_eq!(send_and_read(&mut client, b"BITOP AND {t}and {t}k1 {t}k2\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"GET {t}and\r\n"), "$1\r\n\x03\r\n");
+
+    assert_eq!(send_and_read(&mut client, b"BITOP OR {t}or {t}k1 {t}k2\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"GET {t}or\r\n"), "$1\r\n\x3f\r\n");
+
+    assert_eq!(send_and_read(&mut client, b"BITOP XOR {t}xor {t}k1 {t}k2\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"GET {t}xor\r\n"), "$1\r\n\x3c\r\n");
+
+    assert_eq!(send_and_read(&mut client, b"BITOP NOT {t}not {t}k1\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read_bytes(&mut client, b"GET {t}not\r\n"),
+        b"$1\r\n\xf0\r\n".to_vec()
+    );
+
+    // 5. HYPERLOGLOG: PFADD, PFCOUNT, PFMERGE
+    assert_eq!(
+        send_and_read(&mut client, b"PFADD {h}1 foo bar zap a\r\n"),
+        ":1\r\n"
+    );
+    // Adding duplicates returns 0
+    assert_eq!(
+        send_and_read(&mut client, b"PFADD {h}1 foo bar\r\n"),
+        ":0\r\n"
+    );
+    assert_eq!(send_and_read(&mut client, b"PFCOUNT {h}1\r\n"), ":4\r\n");
+
+    assert_eq!(
+        send_and_read(&mut client, b"PFADD {h}2 a b c foo\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(send_and_read(&mut client, b"PFCOUNT {h}2\r\n"), ":4\r\n");
+
+    // Combined PFCOUNT across same shard keys
+    assert_eq!(send_and_read(&mut client, b"PFCOUNT {h}1 {h}2\r\n"), ":6\r\n");
+
+    // PFMERGE
+    assert_eq!(send_and_read(&mut client, b"PFMERGE {h}dest {h}1 {h}2\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"PFCOUNT {h}dest\r\n"), ":6\r\n");
+
+    // TYPE of HLL returns string
+    assert_eq!(send_and_read(&mut client, b"TYPE {h}dest\r\n"), "+string\r\n");
 }

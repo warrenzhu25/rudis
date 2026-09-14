@@ -91,6 +91,7 @@ pub enum RudisValue {
     List(std::collections::VecDeque<Bytes>),
     Set(hashbrown::HashSet<Bytes>),
     ZSet(RudisZSet),
+    HyperLogLog(Box<[u8; 16384]>),
 }
 
 #[derive(Clone, Debug)]
@@ -384,6 +385,7 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
                     RudisValue::String(b) => Ok(Some(b.clone())),
+                    RudisValue::HyperLogLog(regs) => Ok(Some(Bytes::copy_from_slice(&regs[..]))),
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
@@ -704,6 +706,7 @@ impl RudisTable {
                     RudisValue::List(_) => "list",
                     RudisValue::Set(_) => "set",
                     RudisValue::ZSet(_) => "zset",
+                    RudisValue::HyperLogLog(_) => "string",
                 }
             } else {
                 "none"
@@ -2139,6 +2142,504 @@ impl RudisTable {
     pub fn is_empty(&self) -> bool {
         self.table.len() == 0
     }
+
+    // BITMAP OPERATIONS
+    pub fn setbit(&mut self, key: Bytes, offset: usize, value: u8) -> Result<u8, &'static str> {
+        if value > 1 {
+            return Err("bit is not an integer or out of range");
+        }
+        let byte_idx = offset / 8;
+        let bit_idx = 7 - (offset % 8);
+
+        let h = hash_key(&key);
+        if let Some(idx) = self.table.find(&key, h) {
+            let was_exp = self.check_expired_slot(idx);
+            if !was_exp {
+                if let Some(entry) = self.table.get_slot_mut(idx) {
+                    match &mut entry.val {
+                        RudisValue::String(b) => {
+                            let mut vec = b.to_vec();
+                            if vec.len() <= byte_idx {
+                                vec.resize(byte_idx + 1, 0);
+                            }
+                            let old_byte = vec[byte_idx];
+                            let old_bit = (old_byte >> bit_idx) & 1;
+                            if value == 1 {
+                                vec[byte_idx] |= 1 << bit_idx;
+                            } else {
+                                vec[byte_idx] &= !(1 << bit_idx);
+                            }
+                            *b = Bytes::from(vec);
+                            return Ok(old_bit);
+                        }
+                        _ => {
+                            return Err(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut vec = vec![0u8; byte_idx + 1];
+        if value == 1 {
+            vec[byte_idx] |= 1 << bit_idx;
+        }
+        let slot = crate::router::key_slot(&key);
+        self.slot_to_keys
+            .entry(slot)
+            .or_default()
+            .insert(key.clone());
+        let entry = RudisEntry {
+            key,
+            val: RudisValue::String(Bytes::from(vec)),
+            expire_at: None,
+        };
+        self.table.insert(entry);
+        Ok(0)
+    }
+
+    pub fn getbit(&mut self, key: &[u8], offset: usize) -> Result<u8, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(0);
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::String(b) => {
+                        let byte_idx = offset / 8;
+                        if byte_idx >= b.len() {
+                            return Ok(0);
+                        }
+                        let bit_idx = 7 - (offset % 8);
+                        let bit = (b[byte_idx] >> bit_idx) & 1;
+                        return Ok(bit);
+                    }
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        )
+                    }
+                }
+            }
+        }
+        Ok(0)
+    }
+
+    pub fn bitcount(
+        &mut self,
+        key: &[u8],
+        start: Option<i64>,
+        end: Option<i64>,
+    ) -> Result<usize, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(0);
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::String(b) => {
+                        let len = b.len() as i64;
+                        if len == 0 {
+                            return Ok(0);
+                        }
+                        let s = match start {
+                            Some(v) => {
+                                if v < 0 {
+                                    (len + v).max(0) as usize
+                                } else {
+                                    v.min(len) as usize
+                                }
+                            }
+                            None => 0,
+                        };
+                        let e = match end {
+                            Some(v) => {
+                                if v < 0 {
+                                    (len + v).max(0) as usize
+                                } else {
+                                    v.min(len - 1) as usize
+                                }
+                            }
+                            None => (len - 1) as usize,
+                        };
+                        if s > e || s >= b.len() {
+                            return Ok(0);
+                        }
+                        let slice = &b[s..=e.min(b.len() - 1)];
+                        let count: usize =
+                            slice.iter().map(|byte| byte.count_ones() as usize).sum();
+                        return Ok(count);
+                    }
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        )
+                    }
+                }
+            }
+        }
+        Ok(0)
+    }
+
+    pub fn bitpos(
+        &mut self,
+        key: &[u8],
+        bit: u8,
+        start: Option<i64>,
+        end: Option<i64>,
+    ) -> Result<i64, &'static str> {
+        if bit > 1 {
+            return Err("The bit argument must be 1 or 0.");
+        }
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(if bit == 0 { 0 } else { -1 });
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::String(b) => {
+                        let len = b.len() as i64;
+                        if len == 0 {
+                            return Ok(if bit == 0 { 0 } else { -1 });
+                        }
+                        let s = match start {
+                            Some(v) => {
+                                if v < 0 {
+                                    (len + v).max(0) as usize
+                                } else {
+                                    v.min(len) as usize
+                                }
+                            }
+                            None => 0,
+                        };
+                        let e = match end {
+                            Some(v) => {
+                                if v < 0 {
+                                    (len + v).max(0) as usize
+                                } else {
+                                    v.min(len - 1) as usize
+                                }
+                            }
+                            None => (len - 1) as usize,
+                        };
+                        if s > e || s >= b.len() {
+                            return Ok(-1);
+                        }
+                        for (i, &byte) in b[s..=e.min(b.len() - 1)].iter().enumerate() {
+                            let byte_offset = s + i;
+                            for bit_idx in 0..8 {
+                                let curr_bit = (byte >> (7 - bit_idx)) & 1;
+                                if curr_bit == bit {
+                                    return Ok((byte_offset * 8 + bit_idx) as i64);
+                                }
+                            }
+                        }
+                        if bit == 0 && end.is_none() {
+                            return Ok((b.len() * 8) as i64);
+                        }
+                        return Ok(-1);
+                    }
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        )
+                    }
+                }
+            }
+        }
+        Ok(if bit == 0 { 0 } else { -1 })
+    }
+
+    pub fn bitop(
+        &mut self,
+        op: &str,
+        destkey: Bytes,
+        srckeys: &[Bytes],
+    ) -> Result<usize, &'static str> {
+        let op = op.to_uppercase();
+        if srckeys.is_empty() {
+            return Err("wrong number of arguments for 'bitop' command");
+        }
+        let mut buffers = Vec::with_capacity(srckeys.len());
+        let mut max_len = 0;
+        for k in srckeys {
+            let h = hash_key(k);
+            let b = if let Some(idx) = self.table.find(k, h) {
+                if self.check_expired_slot(idx) {
+                    Vec::new()
+                } else if let Some(entry) = self.table.get_slot(idx) {
+                    match &entry.val {
+                        RudisValue::String(bytes) => bytes.to_vec(),
+                        _ => {
+                            return Err(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            )
+                        }
+                    }
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+            max_len = max_len.max(b.len());
+            buffers.push(b);
+        }
+
+        let mut result = vec![0u8; max_len];
+        match op.as_str() {
+            "AND" => {
+                for i in 0..max_len {
+                    let mut b = 0xFF;
+                    for buf in &buffers {
+                        b &= buf.get(i).copied().unwrap_or(0);
+                    }
+                    result[i] = b;
+                }
+            }
+            "OR" => {
+                for i in 0..max_len {
+                    let mut b = 0;
+                    for buf in &buffers {
+                        b |= buf.get(i).copied().unwrap_or(0);
+                    }
+                    result[i] = b;
+                }
+            }
+            "XOR" => {
+                for i in 0..max_len {
+                    let mut b = 0;
+                    for buf in &buffers {
+                        b ^= buf.get(i).copied().unwrap_or(0);
+                    }
+                    result[i] = b;
+                }
+            }
+            "NOT" => {
+                if buffers.len() != 1 {
+                    return Err("BITOP NOT takes only one source key");
+                }
+                for i in 0..max_len {
+                    result[i] = !buffers[0].get(i).copied().unwrap_or(0);
+                }
+            }
+            _ => return Err("syntax error"),
+        }
+
+        let len = result.len();
+        self.set(destkey, Bytes::from(result), None);
+        Ok(len)
+    }
+
+    // HYPERLOGLOG OPERATIONS
+    pub fn pfadd(&mut self, key: Bytes, elements: &[Bytes]) -> Result<bool, &'static str> {
+        let mut updated = false;
+        let h = hash_key(&key);
+        let mut existing_registers = if let Some(idx) = self.table.find(&key, h) {
+            let was_exp = self.check_expired_slot(idx);
+            if !was_exp {
+                if let Some(entry) = self.table.get_slot_mut(idx) {
+                    match &mut entry.val {
+                        RudisValue::HyperLogLog(regs) => Some(regs),
+                        RudisValue::String(s) if s.len() == 16384 => {
+                            let mut arr = Box::new([0u8; 16384]);
+                            arr.copy_from_slice(s);
+                            entry.val = RudisValue::HyperLogLog(arr);
+                            match &mut entry.val {
+                                RudisValue::HyperLogLog(regs) => Some(regs),
+                                _ => unreachable!(),
+                            }
+                        }
+                        _ => {
+                            return Err(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            )
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(regs) = existing_registers.as_deref_mut() {
+            for elem in elements {
+                let h = hash_key(elem);
+                let reg_idx = (h & 0x3FFF) as usize; // 14 bits (0..16383)
+                let rho = ((h >> 14).leading_zeros() as u8 + 1).min(51);
+                if rho > regs[reg_idx] {
+                    regs[reg_idx] = rho;
+                    updated = true;
+                }
+            }
+            return Ok(updated);
+        }
+
+        let mut regs = Box::new([0u8; 16384]);
+        for elem in elements {
+            let h = hash_key(elem);
+            let reg_idx = (h & 0x3FFF) as usize;
+            let rho = ((h >> 14).leading_zeros() as u8 + 1).min(51);
+            if rho > regs[reg_idx] {
+                regs[reg_idx] = rho;
+                updated = true;
+            }
+        }
+        let slot = crate::router::key_slot(&key);
+        self.slot_to_keys
+            .entry(slot)
+            .or_default()
+            .insert(key.clone());
+        let entry = RudisEntry {
+            key,
+            val: RudisValue::HyperLogLog(regs),
+            expire_at: None,
+        };
+        self.table.insert(entry);
+        Ok(updated)
+    }
+
+    pub fn pfcount(&mut self, keys: &[Bytes]) -> Result<u64, &'static str> {
+        let mut merged = [0u8; 16384];
+        let mut has_hll = false;
+
+        for k in keys {
+            let h = hash_key(k);
+            if let Some(idx) = self.table.find(k, h) {
+                if !self.check_expired_slot(idx) {
+                    if let Some(entry) = self.table.get_slot(idx) {
+                        match &entry.val {
+                            RudisValue::HyperLogLog(regs) => {
+                                has_hll = true;
+                                for i in 0..16384 {
+                                    merged[i] = merged[i].max(regs[i]);
+                                }
+                            }
+                            RudisValue::String(s) if s.len() == 16384 => {
+                                has_hll = true;
+                                for i in 0..16384 {
+                                    merged[i] = merged[i].max(s[i]);
+                                }
+                            }
+                            _ => {
+                                return Err(
+                                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !has_hll {
+            return Ok(0);
+        }
+
+        const M: f64 = 16384.0;
+        const ALPHA: f64 = 0.7213475;
+        let mut sum = 0.0;
+        let mut zeros = 0;
+        for &val in merged.iter() {
+            sum += 2.0_f64.powi(-(val as i32));
+            if val == 0 {
+                zeros += 1;
+            }
+        }
+
+        let raw_estimate = ALPHA * M * M / sum;
+        if raw_estimate <= 2.5 * M && zeros > 0 {
+            let count = M * (M / zeros as f64).ln();
+            Ok(count.round() as u64)
+        } else {
+            Ok(raw_estimate.round() as u64)
+        }
+    }
+
+    pub fn pfmerge(&mut self, destkey: Bytes, srckeys: &[Bytes]) -> Result<(), &'static str> {
+        let mut merged = [0u8; 16384];
+        let h = hash_key(&destkey);
+        if let Some(idx) = self.table.find(&destkey, h) {
+            if !self.check_expired_slot(idx) {
+                if let Some(entry) = self.table.get_slot(idx) {
+                    match &entry.val {
+                        RudisValue::HyperLogLog(regs) => {
+                            for i in 0..16384 {
+                                merged[i] = merged[i].max(regs[i]);
+                            }
+                        }
+                        RudisValue::String(s) if s.len() == 16384 => {
+                            for i in 0..16384 {
+                                merged[i] = merged[i].max(s[i]);
+                            }
+                        }
+                        _ => {
+                            return Err(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        for k in srckeys {
+            let h = hash_key(k);
+            if let Some(idx) = self.table.find(k, h) {
+                if !self.check_expired_slot(idx) {
+                    if let Some(entry) = self.table.get_slot(idx) {
+                        match &entry.val {
+                            RudisValue::HyperLogLog(regs) => {
+                                for i in 0..16384 {
+                                    merged[i] = merged[i].max(regs[i]);
+                                }
+                            }
+                            RudisValue::String(s) if s.len() == 16384 => {
+                                for i in 0..16384 {
+                                    merged[i] = merged[i].max(s[i]);
+                                }
+                            }
+                            _ => {
+                                return Err(
+                                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let h = hash_key(&destkey);
+        if let Some(idx) = self.table.find(&destkey, h) {
+            if let Some(entry) = self.table.get_slot_mut(idx) {
+                entry.val = RudisValue::HyperLogLog(Box::new(merged));
+                return Ok(());
+            }
+        }
+
+        let slot = crate::router::key_slot(&destkey);
+        self.slot_to_keys
+            .entry(slot)
+            .or_default()
+            .insert(destkey.clone());
+        let entry = RudisEntry {
+            key: destkey,
+            val: RudisValue::HyperLogLog(Box::new(merged)),
+            expire_at: None,
+        };
+        self.table.insert(entry);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2367,5 +2868,108 @@ mod tests {
         table.expire(b"alpha:1", Duration::from_secs(50));
         let exp = table.expiretime(b"alpha:1", false);
         assert!(exp > 0);
+    }
+
+    #[test]
+    fn test_rudis_table_bitmaps_and_hll() {
+        let mut table = RudisTable::new();
+
+        // 1. SETBIT & GETBIT
+        // 'a' in ASCII is 0b01100001 (byte 0: bit 1, 2, 7 are 1)
+        assert_eq!(table.setbit(Bytes::from_static(b"bm"), 1, 1).unwrap(), 0);
+        assert_eq!(table.setbit(Bytes::from_static(b"bm"), 2, 1).unwrap(), 0);
+        assert_eq!(table.setbit(Bytes::from_static(b"bm"), 7, 1).unwrap(), 0);
+        assert_eq!(table.getbit(b"bm", 1).unwrap(), 1);
+        assert_eq!(table.getbit(b"bm", 2).unwrap(), 1);
+        assert_eq!(table.getbit(b"bm", 3).unwrap(), 0);
+        assert_eq!(table.getbit(b"bm", 7).unwrap(), 1);
+        assert_eq!(table.getbit(b"bm", 100).unwrap(), 0);
+        assert_eq!(table.get(b"bm").unwrap(), Some(Bytes::from_static(b"a")));
+
+        // 2. BITCOUNT
+        assert_eq!(table.bitcount(b"bm", None, None).unwrap(), 3);
+        // Set bit in byte 1 (offset 15 = bit 7 of byte 1)
+        assert_eq!(table.setbit(Bytes::from_static(b"bm"), 15, 1).unwrap(), 0);
+        assert_eq!(table.bitcount(b"bm", None, None).unwrap(), 4);
+        assert_eq!(table.bitcount(b"bm", Some(0), Some(0)).unwrap(), 3);
+        assert_eq!(table.bitcount(b"bm", Some(1), Some(1)).unwrap(), 1);
+
+        // 3. BITPOS
+        assert_eq!(table.bitpos(b"bm", 1, None, None).unwrap(), 1);
+        assert_eq!(table.bitpos(b"bm", 0, None, None).unwrap(), 0);
+        assert_eq!(table.bitpos(b"bm", 1, Some(1), None).unwrap(), 15);
+
+        // 4. BITOP
+        table.set(Bytes::from_static(b"k1"), Bytes::from_static(b"\x0f"), None); // 00001111
+        table.set(Bytes::from_static(b"k2"), Bytes::from_static(b"\x33"), None); // 00110011
+        assert_eq!(
+            table
+                .bitop("AND", Bytes::from_static(b"kand"), &[Bytes::from_static(b"k1"), Bytes::from_static(b"k2")])
+                .unwrap(),
+            1
+        );
+        assert_eq!(table.get(b"kand").unwrap(), Some(Bytes::from_static(b"\x03")));
+
+        assert_eq!(
+            table
+                .bitop("OR", Bytes::from_static(b"kor"), &[Bytes::from_static(b"k1"), Bytes::from_static(b"k2")])
+                .unwrap(),
+            1
+        );
+        assert_eq!(table.get(b"kor").unwrap(), Some(Bytes::from_static(b"\x3f")));
+
+        assert_eq!(
+            table
+                .bitop("XOR", Bytes::from_static(b"kxor"), &[Bytes::from_static(b"k1"), Bytes::from_static(b"k2")])
+                .unwrap(),
+            1
+        );
+        assert_eq!(table.get(b"kxor").unwrap(), Some(Bytes::from_static(b"\x3c")));
+
+        assert_eq!(
+            table
+                .bitop("NOT", Bytes::from_static(b"knot"), &[Bytes::from_static(b"k1")])
+                .unwrap(),
+            1
+        );
+        assert_eq!(table.get(b"knot").unwrap(), Some(Bytes::from_static(b"\xf0")));
+
+        // 5. HYPERLOGLOG: PFADD & PFCOUNT
+        let elements_a = vec![
+            Bytes::from_static(b"foo"),
+            Bytes::from_static(b"bar"),
+            Bytes::from_static(b"zap"),
+            Bytes::from_static(b"a"),
+        ];
+        assert_eq!(table.pfadd(Bytes::from_static(b"hll1"), &elements_a).unwrap(), true);
+        assert_eq!(table.pfadd(Bytes::from_static(b"hll1"), &elements_a).unwrap(), false); // No updates
+        let c1 = table.pfcount(&[Bytes::from_static(b"hll1")]).unwrap();
+        assert_eq!(c1, 4);
+
+        let elements_b = vec![
+            Bytes::from_static(b"a"),
+            Bytes::from_static(b"b"),
+            Bytes::from_static(b"c"),
+            Bytes::from_static(b"foo"),
+        ];
+        assert_eq!(table.pfadd(Bytes::from_static(b"hll2"), &elements_b).unwrap(), true);
+        let c2 = table.pfcount(&[Bytes::from_static(b"hll2")]).unwrap();
+        assert_eq!(c2, 4);
+
+        // Multiple keys pfcount (union)
+        let c_union = table
+            .pfcount(&[Bytes::from_static(b"hll1"), Bytes::from_static(b"hll2")])
+            .unwrap();
+        assert_eq!(c_union, 6); // foo, bar, zap, a, b, c = 6 distinct elements
+
+        // 6. PFMERGE
+        table
+            .pfmerge(
+                Bytes::from_static(b"hll_merged"),
+                &[Bytes::from_static(b"hll1"), Bytes::from_static(b"hll2")],
+            )
+            .unwrap();
+        let c_merged = table.pfcount(&[Bytes::from_static(b"hll_merged")]).unwrap();
+        assert_eq!(c_merged, 6);
     }
 }

@@ -477,4 +477,60 @@ impl ShardDb {
     pub fn expiretime(&mut self, key: &[u8], in_millis: bool) -> i64 {
         self.table.expiretime(key, in_millis)
     }
+
+    #[inline]
+    pub fn setbit(&mut self, key: Bytes, offset: usize, value: u8) -> Result<u8, &'static str> {
+        self.table.setbit(key, offset, value)
+    }
+
+    #[inline]
+    pub fn getbit(&mut self, key: &[u8], offset: usize) -> Result<u8, &'static str> {
+        self.table.getbit(key, offset)
+    }
+
+    #[inline]
+    pub fn bitcount(
+        &mut self,
+        key: &[u8],
+        start: Option<i64>,
+        end: Option<i64>,
+    ) -> Result<usize, &'static str> {
+        self.table.bitcount(key, start, end)
+    }
+
+    #[inline]
+    pub fn bitpos(
+        &mut self,
+        key: &[u8],
+        bit: u8,
+        start: Option<i64>,
+        end: Option<i64>,
+    ) -> Result<i64, &'static str> {
+        self.table.bitpos(key, bit, start, end)
+    }
+
+    #[inline]
+    pub fn bitop(
+        &mut self,
+        op: &str,
+        destkey: Bytes,
+        srckeys: &[Bytes],
+    ) -> Result<usize, &'static str> {
+        self.table.bitop(op, destkey, srckeys)
+    }
+
+    #[inline]
+    pub fn pfadd(&mut self, key: Bytes, elements: &[Bytes]) -> Result<bool, &'static str> {
+        self.table.pfadd(key, elements)
+    }
+
+    #[inline]
+    pub fn pfcount(&mut self, keys: &[Bytes]) -> Result<u64, &'static str> {
+        self.table.pfcount(keys)
+    }
+
+    #[inline]
+    pub fn pfmerge(&mut self, destkey: Bytes, srckeys: &[Bytes]) -> Result<(), &'static str> {
+        self.table.pfmerge(destkey, srckeys)
+    }
 }

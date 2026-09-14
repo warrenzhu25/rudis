@@ -616,11 +616,18 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Append { key, .. }
         | Command::Strlen(key)
         | Command::Expiretime(key, _)
-        | Command::Rename { key, .. } => Some(key),
+        | Command::Rename { key, .. }
+        | Command::Setbit { key, .. }
+        | Command::Getbit { key, .. }
+        | Command::Bitcount { key, .. }
+        | Command::Bitpos { key, .. }
+        | Command::Pfadd { key, .. } => Some(key),
         Command::Touch(keys) | Command::Del(keys) | Command::Exists(keys) | Command::Mget(keys) => {
             keys.first()
         }
+        Command::Pfcount { keys } => keys.first(),
         Command::Mset(pairs) | Command::Msetnx(pairs) => pairs.first().map(|(k, _)| k),
+        Command::Bitop { destkey, .. } | Command::Pfmerge { destkey, .. } => Some(destkey),
         _ => None,
     }
 }
@@ -672,11 +679,17 @@ pub fn cmd_keys<'a>(cmd: &'a Command) -> Vec<&'a [u8]> {
         | Command::Sadd { key, .. }
         | Command::Srem { key, .. }
         | Command::Zadd { key, .. }
-        | Command::Zrem { key, .. } => vec![key.as_ref()],
+        | Command::Zrem { key, .. }
+        | Command::Setbit { key, .. }
+        | Command::Getbit { key, .. }
+        | Command::Bitcount { key, .. }
+        | Command::Bitpos { key, .. }
+        | Command::Pfadd { key, .. } => vec![key.as_ref()],
 
         Command::Mget(keys) | Command::Del(keys) | Command::Exists(keys) | Command::Touch(keys) => {
             keys.iter().map(|k| k.as_ref()).collect()
         }
+        Command::Pfcount { keys } => keys.iter().map(|k| k.as_ref()).collect(),
 
         Command::Mset(pairs) | Command::Msetnx(pairs) => {
             pairs.iter().map(|(k, _)| k.as_ref()).collect()
@@ -684,6 +697,12 @@ pub fn cmd_keys<'a>(cmd: &'a Command) -> Vec<&'a [u8]> {
 
         Command::Rename { key, newkey, .. } => {
             vec![key.as_ref(), newkey.as_ref()]
+        }
+
+        Command::Bitop { destkey, srckeys, .. } | Command::Pfmerge { destkey, srckeys } => {
+            let mut v = vec![destkey.as_ref()];
+            v.extend(srckeys.iter().map(|k| k.as_ref()));
+            v
         }
 
         Command::Hmget { key, .. } | Command::Hdel { key, .. } => vec![key.as_ref()],
@@ -784,6 +803,14 @@ async fn execute_command(
         Command::Multi => "MULTI",
         Command::Exec => "EXEC",
         Command::Discard => "DISCARD",
+        Command::Setbit { .. } => "SETBIT",
+        Command::Getbit { .. } => "GETBIT",
+        Command::Bitcount { .. } => "BITCOUNT",
+        Command::Bitpos { .. } => "BITPOS",
+        Command::Bitop { .. } => "BITOP",
+        Command::Pfadd { .. } => "PFADD",
+        Command::Pfcount { .. } => "PFCOUNT",
+        Command::Pfmerge { .. } => "PFMERGE",
         Command::Unknown(_) => "UNKNOWN",
     };
     if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
@@ -1138,7 +1165,12 @@ async fn execute_command(
         | Command::Getset { .. }
         | Command::Getdel(_)
         | Command::Append { .. }
-        | Command::Strlen(_) => {
+        | Command::Strlen(_)
+        | Command::Setbit { .. }
+        | Command::Getbit { .. }
+        | Command::Bitcount { .. }
+        | Command::Bitpos { .. }
+        | Command::Pfadd { .. } => {
             if let Some(target) = target_shard_of_cmd(&cmd, router.num_shards) {
                 if target == router.shard_id {
                     execute_local_command(
@@ -1216,6 +1248,87 @@ async fn execute_command(
                 .iter()
                 .all(|(k, _)| router.target_shard(k) == first_shard);
             if !all_same_shard {
+                out.extend_from_slice(
+                    b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                );
+                return false;
+            }
+            if first_shard == router.shard_id {
+                execute_local_command(
+                    &cmd,
+                    &mut router.local_db.borrow_mut(),
+                    out,
+                    router.aof.as_deref(),
+                );
+            } else {
+                let res = router.execute_remote(first_shard, cmd).await;
+                out.extend_from_slice(&res);
+            }
+            false
+        }
+        Command::Pfcount { ref keys } => {
+            if keys.is_empty() {
+                out.extend_from_slice(b":0\r\n");
+                return false;
+            }
+            let first_shard = router.target_shard(&keys[0]);
+            let all_same = keys.iter().all(|k| router.target_shard(k) == first_shard);
+            if !all_same {
+                out.extend_from_slice(
+                    b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                );
+                return false;
+            }
+            if first_shard == router.shard_id {
+                execute_local_command(
+                    &cmd,
+                    &mut router.local_db.borrow_mut(),
+                    out,
+                    router.aof.as_deref(),
+                );
+            } else {
+                let res = router.execute_remote(first_shard, cmd).await;
+                out.extend_from_slice(&res);
+            }
+            false
+        }
+        Command::Bitop {
+            ref destkey,
+            ref srckeys,
+            ..
+        } => {
+            let first_shard = router.target_shard(destkey);
+            let all_same = srckeys
+                .iter()
+                .all(|k| router.target_shard(k) == first_shard);
+            if !all_same {
+                out.extend_from_slice(
+                    b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                );
+                return false;
+            }
+            if first_shard == router.shard_id {
+                execute_local_command(
+                    &cmd,
+                    &mut router.local_db.borrow_mut(),
+                    out,
+                    router.aof.as_deref(),
+                );
+            } else {
+                let res = router.execute_remote(first_shard, cmd).await;
+                out.extend_from_slice(&res);
+            }
+            false
+        }
+        Command::Pfmerge {
+            ref destkey,
+            ref srckeys,
+        } => {
+            let first_shard = router.target_shard(destkey);
+            let all_same = srckeys
+                .iter()
+                .all(|k| router.target_shard(k) == first_shard);
+            if !all_same {
                 out.extend_from_slice(
                     b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
                 );
@@ -1440,6 +1553,26 @@ async fn execute_command(
                             );
                         }
                     }
+                    crate::table::RudisValue::HyperLogLog(regs) => {
+                        tx_buf.extend_from_slice(
+                            format!("*3\r\n$3\r\nSET\r\n${}\r\n", k.len()).as_bytes(),
+                        );
+                        tx_buf.extend_from_slice(k);
+                        tx_buf.extend_from_slice(b"\r\n$16384\r\n");
+                        tx_buf.extend_from_slice(regs.as_ref());
+                        tx_buf.extend_from_slice(b"\r\n");
+                        if let Some(dur) = ttl {
+                            let ms = dur.as_millis().max(1);
+                            let ms_str = ms.to_string();
+                            tx_buf.extend_from_slice(
+                                format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
+                            );
+                            tx_buf.extend_from_slice(k);
+                            tx_buf.extend_from_slice(
+                                format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
+                            );
+                        }
+                    }
                 }
             }
 
@@ -1625,11 +1758,31 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Getdel(key)
         | Command::Append { key, .. }
         | Command::Strlen(key)
-        | Command::Expiretime(key, _) => Some(target_shard(key, num_shards)),
+        | Command::Expiretime(key, _)
+        | Command::Setbit { key, .. }
+        | Command::Getbit { key, .. }
+        | Command::Bitcount { key, .. }
+        | Command::Bitpos { key, .. }
+        | Command::Pfadd { key, .. } => Some(target_shard(key, num_shards)),
+        Command::Pfcount { keys } if keys.len() == 1 => Some(target_shard(&keys[0], num_shards)),
         Command::Rename { key, newkey, .. } => {
             let s1 = target_shard(key, num_shards);
             let s2 = target_shard(newkey, num_shards);
             if s1 == s2 { Some(s1) } else { None }
+        }
+        Command::Pfmerge { destkey, srckeys }
+            if srckeys
+                .iter()
+                .all(|k| target_shard(k, num_shards) == target_shard(destkey, num_shards)) =>
+        {
+            Some(target_shard(destkey, num_shards))
+        }
+        Command::Bitop { destkey, srckeys, .. }
+            if srckeys
+                .iter()
+                .all(|k| target_shard(k, num_shards) == target_shard(destkey, num_shards)) =>
+        {
+            Some(target_shard(destkey, num_shards))
         }
         Command::Touch(keys) | Command::Del(keys) | Command::Exists(keys) if keys.len() == 1 => {
             Some(target_shard(&keys[0], num_shards))
@@ -2668,6 +2821,127 @@ pub fn execute_local_command(
             out.extend_from_slice(b"-ERR DISCARD without MULTI\r\n");
             false
         }
+        Command::Setbit { key, offset, value } => {
+            match db.setbit(key.clone(), *offset, *value) {
+                Ok(old) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
+                    out.extend_from_slice(format!(":{}\r\n", old).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Getbit { key, offset } => {
+            match db.getbit(key, *offset) {
+                Ok(bit) => {
+                    out.extend_from_slice(format!(":{}\r\n", bit).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Bitcount { key, start, end } => {
+            match db.bitcount(key, *start, *end) {
+                Ok(count) => {
+                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Bitpos {
+            key,
+            bit,
+            start,
+            end,
+        } => {
+            match db.bitpos(key, *bit, *start, *end) {
+                Ok(pos) => {
+                    out.extend_from_slice(format!(":{}\r\n", pos).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Bitop {
+            op,
+            destkey,
+            srckeys,
+        } => {
+            match db.bitop(op, destkey.clone(), srckeys) {
+                Ok(len) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
+                    out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Pfadd { key, elements } => {
+            match db.pfadd(key.clone(), elements) {
+                Ok(updated) => {
+                    if updated {
+                        if let Some(aof) = aof {
+                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        }
+                        out.extend_from_slice(b":1\r\n");
+                    } else {
+                        out.extend_from_slice(b":0\r\n");
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Pfcount { keys } => {
+            match db.pfcount(keys) {
+                Ok(count) => {
+                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Pfmerge { destkey, srckeys } => {
+            match db.pfmerge(destkey.clone(), srckeys) {
+                Ok(()) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
         Command::Quit => {
             out.extend_from_slice(b"+OK\r\n");
             true
@@ -2800,6 +3074,14 @@ async fn execute_commands_squashed(
                 Command::Multi => "MULTI",
                 Command::Exec => "EXEC",
                 Command::Discard => "DISCARD",
+                Command::Setbit { .. } => "SETBIT",
+                Command::Getbit { .. } => "GETBIT",
+                Command::Bitcount { .. } => "BITCOUNT",
+                Command::Bitpos { .. } => "BITPOS",
+                Command::Bitop { .. } => "BITOP",
+                Command::Pfadd { .. } => "PFADD",
+                Command::Pfcount { .. } => "PFCOUNT",
+                Command::Pfmerge { .. } => "PFMERGE",
                 Command::Unknown(_) => "UNKNOWN",
             };
             c.last_cmd = cmd_name.to_string();
