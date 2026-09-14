@@ -182,4 +182,31 @@ fn test_multithread_shared_nothing_e2e() {
 
     let resp = send_and_read(&mut stream, b"EXPIRE nonexistent 10\r\n");
     assert_eq!(resp, ":0\r\n");
+
+    // 11. Test Pipelined Squashing across multiple shards in a single write
+    let mut pipeline_req = Vec::new();
+    let mut expected_resp = String::new();
+    for i in 0..50 {
+        pipeline_req.extend_from_slice(format!("SET pipe_{} val_{}\r\n", i, i).as_bytes());
+        expected_resp.push_str("+OK\r\n");
+    }
+    for i in 0..50 {
+        pipeline_req.extend_from_slice(format!("GET pipe_{}\r\n", i).as_bytes());
+        expected_resp.push_str(&format!("${}\r\nval_{}\r\n", format!("val_{}", i).len(), i));
+    }
+
+    stream.write_all(&pipeline_req).unwrap();
+    let mut actual_resp = Vec::new();
+    let mut total_read = 0;
+    let expected_len = expected_resp.len();
+    while total_read < expected_len {
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        actual_resp.extend_from_slice(&buf[..n]);
+        total_read += n;
+    }
+    assert_eq!(String::from_utf8_lossy(&actual_resp), expected_resp);
 }

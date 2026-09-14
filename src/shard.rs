@@ -2,6 +2,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use hashbrown::HashMap;
 
+use crate::resp::Command;
+
 /// Messages passed across CPU cores to access or mutate a shard's data.
 pub enum ShardMessage {
     Get {
@@ -40,6 +42,10 @@ pub enum ShardMessage {
         key: Bytes,
         in_millis: bool,
         responder: flume::Sender<i64>,
+    },
+    Batch {
+        items: Vec<(usize, Command)>,
+        responder: flume::Sender<Vec<(usize, Vec<u8>)>>,
     },
 }
 

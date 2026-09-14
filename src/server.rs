@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use socket2::{Domain, Protocol, Socket, Type};
 
-use crate::connection::handle_connection;
+use crate::connection::{execute_local_command, handle_connection};
 use crate::router::Router;
 use crate::shard::{ShardDb, ShardMessage};
 
@@ -108,6 +108,16 @@ pub fn run_shard_worker(
                     } => {
                         let res = cross_shard_db.borrow_mut().ttl(&key, in_millis);
                         let _ = responder.send(res);
+                    }
+                    ShardMessage::Batch { items, responder } => {
+                        let mut db = cross_shard_db.borrow_mut();
+                        let mut results = Vec::with_capacity(items.len());
+                        for (idx, cmd) in items {
+                            let mut out = Vec::new();
+                            let _ = execute_local_command(&cmd, &mut db, &mut out);
+                            results.push((idx, out));
+                        }
+                        let _ = responder.send(results);
                     }
                 }
             }
