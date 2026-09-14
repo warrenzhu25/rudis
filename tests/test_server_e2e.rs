@@ -539,7 +539,22 @@ fn test_migrate_command_e2e() {
     let resp = send_and_read(&mut stream2, b"SCARD mig_set\r\n");
     assert_eq!(resp, ":2\r\n");
 
-    // 6. Test MIGRATE on non-existing key returns +NOKEY
+    // 6. Migrate mig_zset from server 1 to server 2
+    let resp = send_and_read(&mut stream1, b"ZADD mig_zset 1.5 item1 2.5 item2\r\n");
+    assert_eq!(resp, ":2\r\n");
+    let resp = send_and_read(
+        &mut stream1,
+        format!("MIGRATE 127.0.0.1 {} mig_zset 0 5000\r\n", port2).as_bytes(),
+    );
+    assert_eq!(resp, "+OK\r\n");
+    let resp = send_and_read(&mut stream1, b"EXISTS mig_zset\r\n");
+    assert_eq!(resp, ":0\r\n");
+    let resp = send_and_read(&mut stream2, b"ZCARD mig_zset\r\n");
+    assert_eq!(resp, ":2\r\n");
+    let resp = send_and_read(&mut stream2, b"ZSCORE mig_zset item1\r\n");
+    assert_eq!(resp, "$3\r\n1.5\r\n");
+
+    // 7. Test MIGRATE on non-existing key returns +NOKEY
     let resp = send_and_read(
         &mut stream1,
         format!("MIGRATE 127.0.0.1 {} non_existing_key 0 5000\r\n", port2).as_bytes(),
@@ -750,6 +765,14 @@ fn test_aof_persistence_and_replay_e2e() {
     let resp = send_and_read(&mut stream1, b"SET ttl_key temp_val PX 60000\r\n");
     assert_eq!(resp, "+OK\r\n");
 
+    // Write Sorted Set
+    let resp = send_and_read(&mut stream1, b"ZADD myzset 100 alice 200 bob 300 charlie\r\n");
+    assert_eq!(resp, ":3\r\n");
+    let resp = send_and_read(&mut stream1, b"ZINCRBY myzset 50 alice\r\n");
+    assert_eq!(resp, "$3\r\n150\r\n");
+    let resp = send_and_read(&mut stream1, b"ZPOPMIN myzset\r\n");
+    assert_eq!(resp, "*2\r\n$5\r\nalice\r\n$3\r\n150\r\n");
+
     // Sync all shards to disk via SAVE
     let resp = send_and_read(&mut stream1, b"SAVE\r\n");
     assert_eq!(resp, "+OK\r\n");
@@ -821,8 +844,138 @@ fn test_aof_persistence_and_replay_e2e() {
     let ttl_val: i64 = resp.trim_start_matches(':').trim_end().parse().unwrap();
     assert!(ttl_val > 0, "TTL should be positive");
 
+    // Verify Sorted Set
+    let resp = send_and_read(&mut stream2, b"ZCARD myzset\r\n");
+    assert_eq!(resp, ":2\r\n");
+    let resp = send_and_read(&mut stream2, b"ZSCORE myzset bob\r\n");
+    assert_eq!(resp, "$3\r\n200\r\n");
+    let resp = send_and_read(&mut stream2, b"ZSCORE myzset charlie\r\n");
+    assert_eq!(resp, "$3\r\n300\r\n");
+    let resp = send_and_read(&mut stream2, b"ZSCORE myzset alice\r\n");
+    assert_eq!(resp, "$-1\r\n");
+
     // Cleanup
     drop(stream2);
     let _ = std::fs::remove_dir_all(&aof_dir);
 }
+
+#[test]
+fn test_sorted_sets_zset_e2e() {
+    let port = 16385;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("Failed to connect to rudis server");
+
+    // 1. ZADD multiple elements
+    let resp = send_and_read(&mut stream, b"ZADD myzset 10 one 20 two 30 three 40 four\r\n");
+    assert_eq!(resp, ":4\r\n");
+
+    // 2. ZCARD
+    let resp = send_and_read(&mut stream, b"ZCARD myzset\r\n");
+    assert_eq!(resp, ":4\r\n");
+
+    // 3. ZSCORE
+    let resp = send_and_read(&mut stream, b"ZSCORE myzset two\r\n");
+    assert_eq!(resp, "$2\r\n20\r\n");
+    let resp = send_and_read(&mut stream, b"ZSCORE myzset nonexistent\r\n");
+    assert_eq!(resp, "$-1\r\n");
+
+    // 4. ZRANK and ZREVRANK
+    let resp = send_and_read(&mut stream, b"ZRANK myzset one\r\n");
+    assert_eq!(resp, ":0\r\n");
+    let resp = send_and_read(&mut stream, b"ZRANK myzset two\r\n");
+    assert_eq!(resp, ":1\r\n");
+    let resp = send_and_read(&mut stream, b"ZREVRANK myzset four\r\n");
+    assert_eq!(resp, ":0\r\n");
+    let resp = send_and_read(&mut stream, b"ZREVRANK myzset three\r\n");
+    assert_eq!(resp, ":1\r\n");
+
+    // 5. ZCOUNT
+    let resp = send_and_read(&mut stream, b"ZCOUNT myzset 15 35\r\n");
+    assert_eq!(resp, ":2\r\n");
+    let resp = send_and_read(&mut stream, b"ZCOUNT myzset (10 30\r\n");
+    assert_eq!(resp, ":2\r\n"); // 20 and 30
+    let resp = send_and_read(&mut stream, b"ZCOUNT myzset -inf +inf\r\n");
+    assert_eq!(resp, ":4\r\n");
+
+    // 6. ZINCRBY
+    let resp = send_and_read(&mut stream, b"ZINCRBY myzset 15 one\r\n");
+    assert_eq!(resp, "$2\r\n25\r\n");
+    // New rank of 'one' is 1 (order: two=20, one=25, three=30, four=40)
+    let resp = send_and_read(&mut stream, b"ZRANK myzset one\r\n");
+    assert_eq!(resp, ":1\r\n");
+
+    // 7. ZRANGE basic & WITHSCORES & REV
+    let resp = send_and_read(&mut stream, b"ZRANGE myzset 0 -1\r\n");
+    assert_eq!(resp, "*4\r\n$3\r\ntwo\r\n$3\r\none\r\n$5\r\nthree\r\n$4\r\nfour\r\n");
+
+    let resp = send_and_read(&mut stream, b"ZRANGE myzset 0 1 WITHSCORES\r\n");
+    assert_eq!(resp, "*4\r\n$3\r\ntwo\r\n$2\r\n20\r\n$3\r\none\r\n$2\r\n25\r\n");
+
+    let resp = send_and_read(&mut stream, b"ZRANGE myzset 0 1 REV\r\n");
+    assert_eq!(resp, "*2\r\n$4\r\nfour\r\n$5\r\nthree\r\n");
+
+    // 8. ZRANGE BYSCORE
+    let resp = send_and_read(&mut stream, b"ZRANGE myzset 20 30 BYSCORE\r\n");
+    assert_eq!(resp, "*3\r\n$3\r\ntwo\r\n$3\r\none\r\n$5\r\nthree\r\n");
+
+    // 9. Legacy commands: ZREVRANGE and ZRANGEBYSCORE
+    let resp = send_and_read(&mut stream, b"ZREVRANGE myzset 0 1\r\n");
+    assert_eq!(resp, "*2\r\n$4\r\nfour\r\n$5\r\nthree\r\n");
+
+    let resp = send_and_read(&mut stream, b"ZRANGEBYSCORE myzset 20 25\r\n");
+    assert_eq!(resp, "*2\r\n$3\r\ntwo\r\n$3\r\none\r\n");
+
+    // 10. ZPOPMIN and ZPOPMAX
+    let resp = send_and_read(&mut stream, b"ZPOPMIN myzset\r\n");
+    assert_eq!(resp, "*2\r\n$3\r\ntwo\r\n$2\r\n20\r\n");
+
+    let resp = send_and_read(&mut stream, b"ZPOPMAX myzset 1\r\n");
+    assert_eq!(resp, "*2\r\n$4\r\nfour\r\n$2\r\n40\r\n");
+
+    let resp = send_and_read(&mut stream, b"ZCARD myzset\r\n");
+    assert_eq!(resp, ":2\r\n");
+
+    // 11. ZREM
+    let resp = send_and_read(&mut stream, b"ZREM myzset one three\r\n");
+    assert_eq!(resp, ":2\r\n");
+    let resp = send_and_read(&mut stream, b"ZCARD myzset\r\n");
+    assert_eq!(resp, ":0\r\n");
+
+    // 12. ZADD flags (NX, XX, GT, LT, CH, INCR)
+    let resp = send_and_read(&mut stream, b"ZADD flagz 10 a\r\n");
+    assert_eq!(resp, ":1\r\n");
+    let resp = send_and_read(&mut stream, b"ZADD flagz NX 20 a\r\n");
+    assert_eq!(resp, ":0\r\n"); // NX: already exists, no update
+    let resp = send_and_read(&mut stream, b"ZADD flagz XX 20 a\r\n");
+    assert_eq!(resp, ":0\r\n"); // XX: updated, but not new element (CH not set)
+    let resp = send_and_read(&mut stream, b"ZADD flagz XX CH 30 a\r\n");
+    assert_eq!(resp, ":1\r\n"); // CH set: changed element counted
+    let resp = send_and_read(&mut stream, b"ZADD flagz GT 20 a\r\n");
+    assert_eq!(resp, ":0\r\n"); // GT: 20 not > 30, no update
+    let resp = send_and_read(&mut stream, b"ZADD flagz GT CH 40 a\r\n");
+    assert_eq!(resp, ":1\r\n"); // GT: 40 > 30, updated
+    let resp = send_and_read(&mut stream, b"ZADD flagz INCR 5 a\r\n");
+    assert_eq!(resp, "$2\r\n45\r\n"); // INCR: 40 + 5 = 45
+
+    // 13. Cross-shard routing test
+    for i in 0..20 {
+        let key = format!("zset_shard_key_{}", i);
+        let cmd = format!("ZADD {} 10.5 mem_{}\r\n", key, i);
+        let resp = send_and_read(&mut stream, cmd.as_bytes());
+        assert_eq!(resp, ":1\r\n");
+
+        let cmd = format!("ZSCORE {} mem_{}\r\n", key, i);
+        let resp = send_and_read(&mut stream, cmd.as_bytes());
+        assert_eq!(resp, "$4\r\n10.5\r\n");
+    }
+
+    // 14. WRONGTYPE error check
+    send_and_read(&mut stream, b"SET str_test_key foo\r\n");
+    let resp = send_and_read(&mut stream, b"ZADD str_test_key 10 m\r\n");
+    assert!(resp.starts_with("-ERR WRONGTYPE"));
+}
+
 

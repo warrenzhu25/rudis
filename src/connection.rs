@@ -192,7 +192,18 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Smembers(key)
         | Command::Sismember { key, .. }
         | Command::Scard(key)
-        | Command::Spop { key, .. } => Some(key),
+        | Command::Spop { key, .. }
+        | Command::Zadd { key, .. }
+        | Command::Zrem { key, .. }
+        | Command::Zscore { key, .. }
+        | Command::Zcard(key)
+        | Command::Zrank { key, .. }
+        | Command::Zrevrank { key, .. }
+        | Command::Zcount { key, .. }
+        | Command::Zincrby { key, .. }
+        | Command::Zrange { key, .. }
+        | Command::Zpopmin { key, .. }
+        | Command::Zpopmax { key, .. } => Some(key),
         Command::Del(keys) | Command::Exists(keys) | Command::Mget(keys) => keys.first(),
         Command::Mset(pairs) => pairs.first().map(|(k, _)| k),
         _ => None,
@@ -245,6 +256,17 @@ async fn execute_command(
         Command::Sismember { .. } => "SISMEMBER",
         Command::Scard(_) => "SCARD",
         Command::Spop { .. } => "SPOP",
+        Command::Zadd { .. } => "ZADD",
+        Command::Zrem { .. } => "ZREM",
+        Command::Zscore { .. } => "ZSCORE",
+        Command::Zcard(_) => "ZCARD",
+        Command::Zrank { .. } => "ZRANK",
+        Command::Zrevrank { .. } => "ZREVRANK",
+        Command::Zcount { .. } => "ZCOUNT",
+        Command::Zincrby { .. } => "ZINCRBY",
+        Command::Zrange { .. } => "ZRANGE",
+        Command::Zpopmin { .. } => "ZPOPMIN",
+        Command::Zpopmax { .. } => "ZPOPMAX",
         Command::Save => "SAVE",
         Command::Bgsave => "BGSAVE",
         Command::Ping(_) => "PING",
@@ -585,7 +607,18 @@ async fn execute_command(
         | Command::Smembers(_)
         | Command::Sismember { .. }
         | Command::Scard(_)
-        | Command::Spop { .. } => {
+        | Command::Spop { .. }
+        | Command::Zadd { .. }
+        | Command::Zrem { .. }
+        | Command::Zscore { .. }
+        | Command::Zcard(_)
+        | Command::Zrank { .. }
+        | Command::Zrevrank { .. }
+        | Command::Zcount { .. }
+        | Command::Zincrby { .. }
+        | Command::Zrange { .. }
+        | Command::Zpopmin { .. }
+        | Command::Zpopmax { .. } => {
             if let Some(target) = target_shard_of_cmd(&cmd, router.num_shards) {
                 if target == router.shard_id {
                     execute_local_command(
@@ -780,6 +813,32 @@ async fn execute_command(
                             );
                         }
                     }
+                    crate::table::RudisValue::ZSet(zset) => {
+                        tx_buf.extend_from_slice(
+                            format!("*{}\r\n$4\r\nZADD\r\n${}\r\n", 2 + zset.len() * 2, k.len())
+                                .as_bytes(),
+                        );
+                        tx_buf.extend_from_slice(k);
+                        tx_buf.extend_from_slice(b"\r\n");
+                        for (m, score) in &zset.dict {
+                            let s = score.to_string();
+                            tx_buf.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
+                            tx_buf.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                            tx_buf.extend_from_slice(m);
+                            tx_buf.extend_from_slice(b"\r\n");
+                        }
+                        if let Some(dur) = ttl {
+                            let ms = dur.as_millis().max(1);
+                            let ms_str = ms.to_string();
+                            tx_buf.extend_from_slice(
+                                format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
+                            );
+                            tx_buf.extend_from_slice(k);
+                            tx_buf.extend_from_slice(
+                                format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
+                            );
+                        }
+                    }
                 }
             }
 
@@ -850,7 +909,18 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Smembers(key)
         | Command::Sismember { key, .. }
         | Command::Scard(key)
-        | Command::Spop { key, .. } => Some(target_shard(key, num_shards)),
+        | Command::Spop { key, .. }
+        | Command::Zadd { key, .. }
+        | Command::Zrem { key, .. }
+        | Command::Zscore { key, .. }
+        | Command::Zcard(key)
+        | Command::Zrank { key, .. }
+        | Command::Zrevrank { key, .. }
+        | Command::Zcount { key, .. }
+        | Command::Zincrby { key, .. }
+        | Command::Zrange { key, .. }
+        | Command::Zpopmin { key, .. }
+        | Command::Zpopmax { key, .. } => Some(target_shard(key, num_shards)),
         Command::Del(keys) | Command::Exists(keys) if keys.len() == 1 => {
             Some(target_shard(&keys[0], num_shards))
         }
@@ -1417,6 +1487,225 @@ pub fn execute_local_command(
             }
             false
         }
+        // ZSET COMMANDS
+        Command::Zadd { key, elements, flags } => {
+            match db.zadd(key.clone(), elements.clone(), *flags) {
+                Ok((count, incr_score)) => {
+                    if let Some(aof) = aof {
+                        if flags.incr {
+                            if incr_score.is_some() {
+                                if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                                    aof.borrow_mut().append(&bytes);
+                                }
+                            }
+                        } else if count > 0 {
+                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        }
+                    }
+                    if flags.incr {
+                        if let Some(score) = incr_score {
+                            let s = score.to_string();
+                            out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
+                        } else {
+                            out.extend_from_slice(b"$-1\r\n");
+                        }
+                    } else {
+                        out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Zrem { key, members } => {
+            match db.zrem(key, members) {
+                Ok(count) => {
+                    if count > 0 {
+                        if let Some(aof) = aof {
+                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        }
+                    }
+                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Zscore { key, member } => {
+            match db.zscore(key, member) {
+                Ok(Some(score)) => {
+                    let s = score.to_string();
+                    out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
+                }
+                Ok(None) => {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Zcard(key) => {
+            match db.zcard(key) {
+                Ok(card) => {
+                    out.extend_from_slice(format!(":{}\r\n", card).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Zrank { key, member } => {
+            match db.zrank(key, member, false) {
+                Ok(Some(rank)) => {
+                    out.extend_from_slice(format!(":{}\r\n", rank).as_bytes());
+                }
+                Ok(None) => {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Zrevrank { key, member } => {
+            match db.zrank(key, member, true) {
+                Ok(Some(rank)) => {
+                    out.extend_from_slice(format!(":{}\r\n", rank).as_bytes());
+                }
+                Ok(None) => {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Zcount { key, min, min_inc, max, max_inc } => {
+            match db.zcount(key, *min, *min_inc, *max, *max_inc) {
+                Ok(count) => {
+                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Zincrby { key, delta, member } => {
+            match db.zincrby(key.clone(), *delta, member.clone()) {
+                Ok(score) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
+                    let s = score.to_string();
+                    out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Zrange { key, opts } => {
+            match db.zrange(key, opts) {
+                Ok(items) => {
+                    if opts.with_scores {
+                        out.extend_from_slice(format!("*{}\r\n", items.len() * 2).as_bytes());
+                        for (m, s) in items {
+                            out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                            out.extend_from_slice(&m);
+                            out.extend_from_slice(b"\r\n");
+                            let s_str = s.to_string();
+                            out.extend_from_slice(format!("${}\r\n{}\r\n", s_str.len(), s_str).as_bytes());
+                        }
+                    } else {
+                        out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                        for (m, _) in items {
+                            out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                            out.extend_from_slice(&m);
+                            out.extend_from_slice(b"\r\n");
+                        }
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Zpopmin { key, count } => {
+            match db.zpopmin(key, *count) {
+                Ok(popped) => {
+                    if !popped.is_empty() {
+                        if let Some(aof) = aof {
+                            let zrem_cmd = Command::Zrem {
+                                key: key.clone(),
+                                members: popped.iter().map(|(m, _)| m.clone()).collect(),
+                            };
+                            if let Some(bytes) = crate::aof::command_to_resp(&zrem_cmd) {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        }
+                    }
+                    out.extend_from_slice(format!("*{}\r\n", popped.len() * 2).as_bytes());
+                    for (m, s) in popped {
+                        out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                        out.extend_from_slice(&m);
+                        out.extend_from_slice(b"\r\n");
+                        let s_str = s.to_string();
+                        out.extend_from_slice(format!("${}\r\n{}\r\n", s_str.len(), s_str).as_bytes());
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Zpopmax { key, count } => {
+            match db.zpopmax(key, *count) {
+                Ok(popped) => {
+                    if !popped.is_empty() {
+                        if let Some(aof) = aof {
+                            let zrem_cmd = Command::Zrem {
+                                key: key.clone(),
+                                members: popped.iter().map(|(m, _)| m.clone()).collect(),
+                            };
+                            if let Some(bytes) = crate::aof::command_to_resp(&zrem_cmd) {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        }
+                    }
+                    out.extend_from_slice(format!("*{}\r\n", popped.len() * 2).as_bytes());
+                    for (m, s) in popped {
+                        out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                        out.extend_from_slice(&m);
+                        out.extend_from_slice(b"\r\n");
+                        let s_str = s.to_string();
+                        out.extend_from_slice(format!("${}\r\n{}\r\n", s_str.len(), s_str).as_bytes());
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
         Command::Ping(msg) => {
             match msg {
                 Some(m) => {
@@ -1520,6 +1809,17 @@ async fn execute_commands_squashed(
                 Command::Sismember { .. } => "SISMEMBER",
                 Command::Scard(_) => "SCARD",
                 Command::Spop { .. } => "SPOP",
+                Command::Zadd { .. } => "ZADD",
+                Command::Zrem { .. } => "ZREM",
+                Command::Zscore { .. } => "ZSCORE",
+                Command::Zcard(_) => "ZCARD",
+                Command::Zrank { .. } => "ZRANK",
+                Command::Zrevrank { .. } => "ZREVRANK",
+                Command::Zcount { .. } => "ZCOUNT",
+                Command::Zincrby { .. } => "ZINCRBY",
+                Command::Zrange { .. } => "ZRANGE",
+                Command::Zpopmin { .. } => "ZPOPMIN",
+                Command::Zpopmax { .. } => "ZPOPMAX",
                 Command::Save => "SAVE",
                 Command::Bgsave => "BGSAVE",
                 Command::Ping(_) => "PING",

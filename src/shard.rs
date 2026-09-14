@@ -255,6 +255,56 @@ impl ShardDb {
     }
 
     #[inline]
+    pub fn zadd(&mut self, key: Bytes, elements: Vec<(f64, Bytes)>, flags: crate::table::ZAddFlags) -> Result<(usize, Option<f64>), &'static str> {
+        self.table.zadd(key, elements, flags)
+    }
+
+    #[inline]
+    pub fn zrem(&mut self, key: &[u8], members: &[Bytes]) -> Result<usize, &'static str> {
+        self.table.zrem(key, members)
+    }
+
+    #[inline]
+    pub fn zscore(&mut self, key: &[u8], member: &[u8]) -> Result<Option<f64>, &'static str> {
+        self.table.zscore(key, member)
+    }
+
+    #[inline]
+    pub fn zcard(&mut self, key: &[u8]) -> Result<usize, &'static str> {
+        self.table.zcard(key)
+    }
+
+    #[inline]
+    pub fn zrank(&mut self, key: &[u8], member: &[u8], rev: bool) -> Result<Option<usize>, &'static str> {
+        self.table.zrank(key, member, rev)
+    }
+
+    #[inline]
+    pub fn zcount(&mut self, key: &[u8], min: f64, min_inc: bool, max: f64, max_inc: bool) -> Result<usize, &'static str> {
+        self.table.zcount(key, min, min_inc, max, max_inc)
+    }
+
+    #[inline]
+    pub fn zincrby(&mut self, key: Bytes, delta: f64, member: Bytes) -> Result<f64, &'static str> {
+        self.table.zincrby(key, delta, member)
+    }
+
+    #[inline]
+    pub fn zrange(&mut self, key: &[u8], opts: &crate::table::ZRangeOpts) -> Result<Vec<(Bytes, f64)>, &'static str> {
+        self.table.zrange(key, opts)
+    }
+
+    #[inline]
+    pub fn zpopmin(&mut self, key: &[u8], count: usize) -> Result<Vec<(Bytes, f64)>, &'static str> {
+        self.table.zpopmin(key, count)
+    }
+
+    #[inline]
+    pub fn zpopmax(&mut self, key: &[u8], count: usize) -> Result<Vec<(Bytes, f64)>, &'static str> {
+        self.table.zpopmax(key, count)
+    }
+
+    #[inline]
     pub fn count_keys_in_slot(&mut self, slot: u16) -> usize {
         self.table.count_keys_in_slot(slot)
     }

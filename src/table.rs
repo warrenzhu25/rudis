@@ -7,12 +7,90 @@ pub const GROUP_SIZE: usize = 16;
 pub const EMPTY: u8 = 0xFF;
 pub const DELETED: u8 = 0xFE;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OrderedScore(pub f64);
+
+impl Eq for OrderedScore {}
+
+impl PartialOrd for OrderedScore {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedScore {
+    #[inline]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ZAddFlags {
+    pub nx: bool,
+    pub xx: bool,
+    pub gt: bool,
+    pub lt: bool,
+    pub ch: bool,
+    pub incr: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ZRangeOpts {
+    pub start: i64,
+    pub stop: i64,
+    pub min_score: f64,
+    pub min_inc: bool,
+    pub max_score: f64,
+    pub max_inc: bool,
+    pub by_score: bool,
+    pub rev: bool,
+    pub with_scores: bool,
+    pub offset: usize,
+    pub count: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RudisZSet {
+    pub dict: hashbrown::HashMap<Bytes, f64>,
+    pub tree: std::collections::BTreeSet<(OrderedScore, Bytes)>,
+}
+
+impl Eq for RudisZSet {}
+
+impl Default for RudisZSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RudisZSet {
+    pub fn new() -> Self {
+        Self {
+            dict: hashbrown::HashMap::new(),
+            tree: std::collections::BTreeSet::new(),
+        }
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.dict.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.dict.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RudisValue {
     String(Bytes),
     Hash(HashMap<Bytes, Bytes>),
     List(std::collections::VecDeque<Bytes>),
     Set(hashbrown::HashSet<Bytes>),
+    ZSet(RudisZSet),
 }
 
 #[derive(Clone, Debug)]
@@ -1187,6 +1265,436 @@ impl RudisTable {
         }
     }
 
+    // =========================================================================
+    // SORTED SET (ZSET) OPERATIONS
+    // =========================================================================
+
+    pub fn zadd(
+        &mut self,
+        key: Bytes,
+        elements: Vec<(f64, Bytes)>,
+        flags: ZAddFlags,
+    ) -> Result<(usize, Option<f64>), &'static str> {
+        let h = hash_key(&key);
+        if let Some(idx) = self.table.find(&key, h) {
+            if self.check_expired_slot(idx) {
+                // Expired slot has been cleaned up, will insert as new below
+            } else if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::ZSet(zset) => {
+                        let mut added_count = 0usize;
+                        let mut changed_count = 0usize;
+                        let mut new_score_incr = None;
+
+                        for (score, member) in elements {
+                            if let Some(&old_score) = zset.dict.get(&member) {
+                                if flags.nx {
+                                    continue;
+                                }
+                                let new_score = if flags.incr {
+                                    old_score + score
+                                } else {
+                                    score
+                                };
+                                if flags.gt && new_score <= old_score {
+                                    continue;
+                                }
+                                if flags.lt && new_score >= old_score {
+                                    continue;
+                                }
+                                if new_score != old_score {
+                                    zset.tree.remove(&(OrderedScore(old_score), member.clone()));
+                                    zset.tree.insert((OrderedScore(new_score), member.clone()));
+                                    zset.dict.insert(member, new_score);
+                                    changed_count += 1;
+                                }
+                                if flags.incr {
+                                    new_score_incr = Some(new_score);
+                                }
+                            } else {
+                                if flags.xx {
+                                    continue;
+                                }
+                                zset.tree.insert((OrderedScore(score), member.clone()));
+                                zset.dict.insert(member, score);
+                                added_count += 1;
+                                changed_count += 1;
+                                if flags.incr {
+                                    new_score_incr = Some(score);
+                                }
+                            }
+                        }
+
+                        let ret_count = if flags.ch { changed_count } else { added_count };
+                        return Ok((ret_count, new_score_incr));
+                    }
+                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            }
+        }
+
+        // Key does not exist
+        if flags.xx {
+            return Ok((0, None));
+        }
+
+        let mut zset = RudisZSet::new();
+        let mut added_count = 0usize;
+        let mut new_score_incr = None;
+
+        for (score, member) in elements {
+            zset.tree.insert((OrderedScore(score), member.clone()));
+            zset.dict.insert(member, score);
+            added_count += 1;
+            if flags.incr {
+                new_score_incr = Some(score);
+            }
+        }
+
+        let entry = RudisEntry {
+            key,
+            val: RudisValue::ZSet(zset),
+            expire_at: None,
+        };
+        self.table.insert(entry);
+        Ok((added_count, new_score_incr))
+    }
+
+    pub fn zscore(&mut self, key: &[u8], member: &[u8]) -> Result<Option<f64>, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(None);
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::ZSet(zset) => Ok(zset.dict.get(member).copied()),
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(None)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn zcard(&mut self, key: &[u8]) -> Result<usize, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(0);
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::ZSet(zset) => Ok(zset.len()),
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(0)
+            }
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn zrank(&mut self, key: &[u8], member: &[u8], rev: bool) -> Result<Option<usize>, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(None);
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::ZSet(zset) => {
+                        if !zset.dict.contains_key(member) {
+                            return Ok(None);
+                        }
+                        if rev {
+                            let rank = zset.tree.iter().rev().position(|(_, m)| m == member);
+                            Ok(rank)
+                        } else {
+                            let rank = zset.tree.iter().position(|(_, m)| m == member);
+                            Ok(rank)
+                        }
+                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(None)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn zcount(
+        &mut self,
+        key: &[u8],
+        min: f64,
+        min_inc: bool,
+        max: f64,
+        max_inc: bool,
+    ) -> Result<usize, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(0);
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::ZSet(zset) => {
+                        let count = zset
+                            .tree
+                            .iter()
+                            .filter(|(OrderedScore(s), _)| {
+                                let ge_min = if min_inc { *s >= min } else { *s > min };
+                                let le_max = if max_inc { *s <= max } else { *s < max };
+                                ge_min && le_max
+                            })
+                            .count();
+                        Ok(count)
+                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(0)
+            }
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn zincrby(&mut self, key: Bytes, delta: f64, member: Bytes) -> Result<f64, &'static str> {
+        let h = hash_key(&key);
+        if let Some(idx) = self.table.find(&key, h) {
+            if self.check_expired_slot(idx) {
+                // Expired slot has been cleaned up, will insert as new below
+            } else if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::ZSet(zset) => {
+                        let new_score = if let Some(&old_score) = zset.dict.get(&member) {
+                            zset.tree.remove(&(OrderedScore(old_score), member.clone()));
+                            let s = old_score + delta;
+                            zset.tree.insert((OrderedScore(s), member.clone()));
+                            zset.dict.insert(member, s);
+                            s
+                        } else {
+                            zset.tree.insert((OrderedScore(delta), member.clone()));
+                            zset.dict.insert(member, delta);
+                            delta
+                        };
+                        return Ok(new_score);
+                    }
+                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            }
+        }
+
+        let mut zset = RudisZSet::new();
+        zset.tree.insert((OrderedScore(delta), member.clone()));
+        zset.dict.insert(member, delta);
+        let entry = RudisEntry {
+            key,
+            val: RudisValue::ZSet(zset),
+            expire_at: None,
+        };
+        self.table.insert(entry);
+        Ok(delta)
+    }
+
+    pub fn zrange(&mut self, key: &[u8], opts: &ZRangeOpts) -> Result<Vec<(Bytes, f64)>, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(Vec::new());
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::ZSet(zset) => {
+                        let n = zset.len();
+                        if n == 0 {
+                            return Ok(Vec::new());
+                        }
+
+                        if opts.by_score {
+                            let min = opts.min_score;
+                            let min_inc = opts.min_inc;
+                            let max = opts.max_score;
+                            let max_inc = opts.max_inc;
+
+                            let make_iter = || {
+                                zset.tree.iter().filter(move |(OrderedScore(s), _)| {
+                                    let ge_min = if min_inc { *s >= min } else { *s > min };
+                                    let le_max = if max_inc { *s <= max } else { *s < max };
+                                    ge_min && le_max
+                                })
+                            };
+
+                            let res: Vec<(Bytes, f64)> = if opts.rev {
+                                let rev_items: Vec<_> = make_iter().collect();
+                                let skipped = rev_items.into_iter().rev().skip(opts.offset);
+                                if let Some(c) = opts.count {
+                                    skipped.take(c).map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                                } else {
+                                    skipped.map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                                }
+                            } else {
+                                let skipped = make_iter().skip(opts.offset);
+                                if let Some(c) = opts.count {
+                                    skipped.take(c).map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                                } else {
+                                    skipped.map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                                }
+                            };
+                            Ok(res)
+                        } else {
+                            let mut start = opts.start;
+                            let mut stop = opts.stop;
+                            let n_i = n as i64;
+                            if start < 0 {
+                                start = (n_i + start).max(0);
+                            }
+                            if stop < 0 {
+                                stop = n_i + stop;
+                            }
+                            if start > stop || start >= n_i {
+                                return Ok(Vec::new());
+                            }
+                            let start_u = start.max(0) as usize;
+                            let stop_u = (stop.min(n_i - 1) as usize).max(start_u);
+                            let limit = stop_u - start_u + 1;
+
+                            let res: Vec<(Bytes, f64)> = if opts.rev {
+                                zset.tree
+                                    .iter()
+                                    .rev()
+                                    .skip(start_u)
+                                    .take(limit)
+                                    .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                                    .collect()
+                            } else {
+                                zset.tree
+                                    .iter()
+                                    .skip(start_u)
+                                    .take(limit)
+                                    .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                                    .collect()
+                            };
+                            Ok(res)
+                        }
+                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(Vec::new())
+            }
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub fn zrem(&mut self, key: &[u8], members: &[Bytes]) -> Result<usize, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(0);
+            }
+            let (removed_count, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::ZSet(zset) => {
+                        let mut count = 0usize;
+                        for m in members {
+                            if let Some(old_score) = zset.dict.remove(m) {
+                                zset.tree.remove(&(OrderedScore(old_score), m.clone()));
+                                count += 1;
+                            }
+                        }
+                        (count, zset.is_empty())
+                    }
+                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                (0, false)
+            };
+
+            if is_empty {
+                self.table.remove(idx);
+            }
+            Ok(removed_count)
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn zpopmin(&mut self, key: &[u8], count: usize) -> Result<Vec<(Bytes, f64)>, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(Vec::new());
+            }
+            let (res, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::ZSet(zset) => {
+                        let n = count.min(zset.len());
+                        let mut popped = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            if let Some((OrderedScore(s), m)) = zset.tree.pop_first() {
+                                zset.dict.remove(&m);
+                                popped.push((m, s));
+                            }
+                        }
+                        (popped, zset.is_empty())
+                    }
+                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                (Vec::new(), false)
+            };
+
+            if is_empty {
+                self.table.remove(idx);
+            }
+            Ok(res)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub fn zpopmax(&mut self, key: &[u8], count: usize) -> Result<Vec<(Bytes, f64)>, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(Vec::new());
+            }
+            let (res, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::ZSet(zset) => {
+                        let n = count.min(zset.len());
+                        let mut popped = Vec::with_capacity(n);
+                        for _ in 0..n {
+                            if let Some((OrderedScore(s), m)) = zset.tree.pop_last() {
+                                zset.dict.remove(&m);
+                                popped.push((m, s));
+                            }
+                        }
+                        (popped, zset.is_empty())
+                    }
+                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                (Vec::new(), false)
+            };
+
+            if is_empty {
+                self.table.remove(idx);
+            }
+            Ok(res)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
     /// Active sampling cycle: samples up to 20 slots starting from cursor and evicts expired keys.
     pub fn active_expire_cycle(&mut self) -> usize {
         let cap = self.table.capacity();
@@ -1314,5 +1822,83 @@ mod tests {
         // WRONGTYPE test
         assert!(table.get(b"user:1").is_err());
         assert!(table.hget(b"k1", b"field").is_err());
+    }
+
+    #[test]
+    fn test_rudis_table_zset_operations() {
+        let mut table = RudisTable::new();
+
+        // 1. ZADD
+        let (added, _) = table
+            .zadd(
+                Bytes::from_static(b"myzset"),
+                vec![
+                    (10.0, Bytes::from_static(b"m1")),
+                    (20.5, Bytes::from_static(b"m2")),
+                    (5.0, Bytes::from_static(b"m3")),
+                ],
+                ZAddFlags::default(),
+            )
+            .unwrap();
+        assert_eq!(added, 3);
+        assert_eq!(table.zcard(b"myzset").unwrap(), 3);
+
+        // 2. ZSCORE & ZRANK
+        assert_eq!(table.zscore(b"myzset", b"m2").unwrap(), Some(20.5));
+        assert_eq!(table.zscore(b"myzset", b"nonexistent").unwrap(), None);
+        assert_eq!(table.zrank(b"myzset", b"m3", false).unwrap(), Some(0)); // 5.0
+        assert_eq!(table.zrank(b"myzset", b"m1", false).unwrap(), Some(1)); // 10.0
+        assert_eq!(table.zrank(b"myzset", b"m2", false).unwrap(), Some(2)); // 20.5
+        assert_eq!(table.zrank(b"myzset", b"m3", true).unwrap(), Some(2));  // rev rank
+
+        // 3. ZRANGE by index
+        let opts = ZRangeOpts {
+            start: 0,
+            stop: -1,
+            min_score: 0.0,
+            min_inc: true,
+            max_score: 0.0,
+            max_inc: true,
+            by_score: false,
+            rev: false,
+            with_scores: true,
+            offset: 0,
+            count: None,
+        };
+        let res = table.zrange(b"myzset", &opts).unwrap();
+        assert_eq!(res.len(), 3);
+        assert_eq!(res[0].0, b"m3".as_slice());
+        assert_eq!(res[1].0, b"m1".as_slice());
+        assert_eq!(res[2].0, b"m2".as_slice());
+
+        // 4. ZCOUNT
+        assert_eq!(table.zcount(b"myzset", 5.0, true, 15.0, true).unwrap(), 2);
+        assert_eq!(table.zcount(b"myzset", 5.0, false, 15.0, true).unwrap(), 1);
+
+        // 5. ZINCRBY
+        let new_score = table.zincrby(Bytes::from_static(b"myzset"), 15.0, Bytes::from_static(b"m3")).unwrap();
+        assert_eq!(new_score, 20.0);
+        assert_eq!(table.zscore(b"myzset", b"m3").unwrap(), Some(20.0));
+
+        // 6. ZPOPMIN & ZPOPMAX
+        let popped_min = table.zpopmin(b"myzset", 1).unwrap();
+        assert_eq!(popped_min.len(), 1);
+        assert_eq!(popped_min[0].0, b"m1".as_slice()); // 10.0
+
+        let popped_max = table.zpopmax(b"myzset", 1).unwrap();
+        assert_eq!(popped_max.len(), 1);
+        assert_eq!(popped_max[0].0, b"m2".as_slice()); // 20.5
+
+        // Remaining should be m3 (20.0)
+        assert_eq!(table.zcard(b"myzset").unwrap(), 1);
+
+        // 7. ZREM
+        let removed = table.zrem(b"myzset", &[Bytes::from_static(b"m3")]).unwrap();
+        assert_eq!(removed, 1);
+        assert_eq!(table.zcard(b"myzset").unwrap(), 0);
+
+        // WRONGTYPE test
+        table.set(Bytes::from_static(b"str_key"), Bytes::from_static(b"val"), None);
+        assert!(table.zcard(b"str_key").is_err());
     }
 }

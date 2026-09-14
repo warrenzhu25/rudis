@@ -28,7 +28,7 @@ pub enum ClientSubcommand {
     Id,
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Command {
     Get(Bytes),
     Set {
@@ -130,6 +130,53 @@ pub enum Command {
     Spop {
         key: Bytes,
         count: Option<usize>,
+    },
+    // ZSET COMMANDS
+    Zadd {
+        key: Bytes,
+        elements: Vec<(f64, Bytes)>,
+        flags: crate::table::ZAddFlags,
+    },
+    Zrem {
+        key: Bytes,
+        members: Vec<Bytes>,
+    },
+    Zscore {
+        key: Bytes,
+        member: Bytes,
+    },
+    Zcard(Bytes),
+    Zrank {
+        key: Bytes,
+        member: Bytes,
+    },
+    Zrevrank {
+        key: Bytes,
+        member: Bytes,
+    },
+    Zcount {
+        key: Bytes,
+        min: f64,
+        min_inc: bool,
+        max: f64,
+        max_inc: bool,
+    },
+    Zincrby {
+        key: Bytes,
+        delta: f64,
+        member: Bytes,
+    },
+    Zrange {
+        key: Bytes,
+        opts: crate::table::ZRangeOpts,
+    },
+    Zpopmin {
+        key: Bytes,
+        count: usize,
+    },
+    Zpopmax {
+        key: Bytes,
+        count: usize,
     },
     Save,
     Bgsave,
@@ -809,12 +856,435 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 count,
             }))
         }
+        "ZADD" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'zadd' command".to_string());
+            }
+            let mut i = 2;
+            let mut flags = crate::table::ZAddFlags::default();
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "NX" => {
+                        flags.nx = true;
+                        i += 1;
+                    }
+                    "XX" => {
+                        flags.xx = true;
+                        i += 1;
+                    }
+                    "GT" => {
+                        flags.gt = true;
+                        i += 1;
+                    }
+                    "LT" => {
+                        flags.lt = true;
+                        i += 1;
+                    }
+                    "CH" => {
+                        flags.ch = true;
+                        i += 1;
+                    }
+                    "INCR" => {
+                        flags.incr = true;
+                        i += 1;
+                    }
+                    _ => break,
+                }
+            }
+            if flags.nx && flags.xx {
+                return Err("XX and NX options at the same time are not compatible".to_string());
+            }
+            if flags.gt && flags.lt {
+                return Err("GT and LT options at the same time are not compatible".to_string());
+            }
+            if flags.nx && (flags.gt || flags.lt) {
+                return Err("NX and GT, LT options are not compatible".to_string());
+            }
+            let remaining = &args[i..];
+            if remaining.is_empty() || remaining.len() % 2 != 0 {
+                return Err("syntax error".to_string());
+            }
+            if flags.incr && remaining.len() != 2 {
+                return Err("INCR option supports a single increment-element pair".to_string());
+            }
+            let mut elements = Vec::with_capacity(remaining.len() / 2);
+            let mut j = 0;
+            while j < remaining.len() {
+                let score_str = std::str::from_utf8(&remaining[j]).map_err(|_| "value is not a valid float")?;
+                let score: f64 = score_str.parse().map_err(|_| "value is not a valid float")?;
+                if score.is_nan() {
+                    return Err("value is not a valid float".to_string());
+                }
+                let member = remaining[j + 1].clone();
+                elements.push((score, member));
+                j += 2;
+            }
+            Ok(Some(Command::Zadd {
+                key: args[1].clone(),
+                elements,
+                flags,
+            }))
+        }
+        "ZREM" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'zrem' command".to_string());
+            }
+            Ok(Some(Command::Zrem {
+                key: args[1].clone(),
+                members: args[2..].to_vec(),
+            }))
+        }
+        "ZSCORE" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'zscore' command".to_string());
+            }
+            Ok(Some(Command::Zscore {
+                key: args[1].clone(),
+                member: args[2].clone(),
+            }))
+        }
+        "ZCARD" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'zcard' command".to_string());
+            }
+            Ok(Some(Command::Zcard(args[1].clone())))
+        }
+        "ZRANK" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'zrank' command".to_string());
+            }
+            Ok(Some(Command::Zrank {
+                key: args[1].clone(),
+                member: args[2].clone(),
+            }))
+        }
+        "ZREVRANK" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'zrevrank' command".to_string());
+            }
+            Ok(Some(Command::Zrevrank {
+                key: args[1].clone(),
+                member: args[2].clone(),
+            }))
+        }
+        "ZCOUNT" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'zcount' command".to_string());
+            }
+            let (min, min_inc) = parse_score_bound(&args[2])?;
+            let (max, max_inc) = parse_score_bound(&args[3])?;
+            Ok(Some(Command::Zcount {
+                key: args[1].clone(),
+                min,
+                min_inc,
+                max,
+                max_inc,
+            }))
+        }
+        "ZINCRBY" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'zincrby' command".to_string());
+            }
+            let delta_str = std::str::from_utf8(&args[2]).map_err(|_| "value is not a valid float")?;
+            let delta: f64 = delta_str.parse().map_err(|_| "value is not a valid float")?;
+            if delta.is_nan() {
+                return Err("value is not a valid float".to_string());
+            }
+            Ok(Some(Command::Zincrby {
+                key: args[1].clone(),
+                delta,
+                member: args[3].clone(),
+            }))
+        }
+        "ZRANGE" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'zrange' command".to_string());
+            }
+            let mut by_score = false;
+            let mut rev = false;
+            let mut with_scores = false;
+            let mut offset = 0;
+            let mut count = None;
+
+            let mut i = 4;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "BYSCORE" => {
+                        by_score = true;
+                        i += 1;
+                    }
+                    "REV" => {
+                        rev = true;
+                        i += 1;
+                    }
+                    "WITHSCORES" => {
+                        with_scores = true;
+                        i += 1;
+                    }
+                    "LIMIT" => {
+                        if i + 2 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let off_str = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        let cnt_str = std::str::from_utf8(&args[i + 2])
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        offset = off_str
+                            .parse::<usize>()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        let c = cnt_str
+                            .parse::<i64>()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        count = if c < 0 { None } else { Some(c as usize) };
+                        i += 3;
+                    }
+                    _ => {
+                        return Err("syntax error".to_string());
+                    }
+                }
+            }
+
+            let (start, stop, min_score, min_inc, max_score, max_inc) = if by_score {
+                let (min, min_i) = parse_score_bound(&args[2])?;
+                let (max, max_i) = parse_score_bound(&args[3])?;
+                (0, 0, min, min_i, max, max_i)
+            } else {
+                let start: i64 = std::str::from_utf8(&args[2])
+                    .map_err(|_| "value is not an integer or out of range")?
+                    .parse()
+                    .map_err(|_| "value is not an integer or out of range")?;
+                let stop: i64 = std::str::from_utf8(&args[3])
+                    .map_err(|_| "value is not an integer or out of range")?
+                    .parse()
+                    .map_err(|_| "value is not an integer or out of range")?;
+                (start, stop, 0.0, true, 0.0, true)
+            };
+
+            Ok(Some(Command::Zrange {
+                key: args[1].clone(),
+                opts: crate::table::ZRangeOpts {
+                    start,
+                    stop,
+                    min_score,
+                    min_inc,
+                    max_score,
+                    max_inc,
+                    by_score,
+                    rev,
+                    with_scores,
+                    offset,
+                    count,
+                },
+            }))
+        }
+        "ZREVRANGE" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'zrevrange' command".to_string());
+            }
+            let start: i64 = std::str::from_utf8(&args[2])
+                .map_err(|_| "value is not an integer or out of range")?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range")?;
+            let stop: i64 = std::str::from_utf8(&args[3])
+                .map_err(|_| "value is not an integer or out of range")?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range")?;
+            let mut with_scores = false;
+            if args.len() == 5 {
+                if args[4].eq_ignore_ascii_case(b"WITHSCORES") {
+                    with_scores = true;
+                } else {
+                    return Err("syntax error".to_string());
+                }
+            } else if args.len() > 5 {
+                return Err("syntax error".to_string());
+            }
+            Ok(Some(Command::Zrange {
+                key: args[1].clone(),
+                opts: crate::table::ZRangeOpts {
+                    start,
+                    stop,
+                    min_score: 0.0,
+                    min_inc: true,
+                    max_score: 0.0,
+                    max_inc: true,
+                    by_score: false,
+                    rev: true,
+                    with_scores,
+                    offset: 0,
+                    count: None,
+                },
+            }))
+        }
+        "ZRANGEBYSCORE" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'zrangebyscore' command".to_string());
+            }
+            let (min, min_inc) = parse_score_bound(&args[2])?;
+            let (max, max_inc) = parse_score_bound(&args[3])?;
+            let mut with_scores = false;
+            let mut offset = 0;
+            let mut count = None;
+            let mut i = 4;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "WITHSCORES" => {
+                        with_scores = true;
+                        i += 1;
+                    }
+                    "LIMIT" => {
+                        if i + 2 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        offset = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        let c: i64 = std::str::from_utf8(&args[i + 2])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        count = if c < 0 { None } else { Some(c as usize) };
+                        i += 3;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            Ok(Some(Command::Zrange {
+                key: args[1].clone(),
+                opts: crate::table::ZRangeOpts {
+                    start: 0,
+                    stop: 0,
+                    min_score: min,
+                    min_inc,
+                    max_score: max,
+                    max_inc,
+                    by_score: true,
+                    rev: false,
+                    with_scores,
+                    offset,
+                    count,
+                },
+            }))
+        }
+        "ZREVRANGEBYSCORE" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'zrevrangebyscore' command".to_string());
+            }
+            let (max, max_inc) = parse_score_bound(&args[2])?;
+            let (min, min_inc) = parse_score_bound(&args[3])?;
+            let mut with_scores = false;
+            let mut offset = 0;
+            let mut count = None;
+            let mut i = 4;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "WITHSCORES" => {
+                        with_scores = true;
+                        i += 1;
+                    }
+                    "LIMIT" => {
+                        if i + 2 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        offset = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        let c: i64 = std::str::from_utf8(&args[i + 2])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        count = if c < 0 { None } else { Some(c as usize) };
+                        i += 3;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            Ok(Some(Command::Zrange {
+                key: args[1].clone(),
+                opts: crate::table::ZRangeOpts {
+                    start: 0,
+                    stop: 0,
+                    min_score: min,
+                    min_inc,
+                    max_score: max,
+                    max_inc,
+                    by_score: true,
+                    rev: true,
+                    with_scores,
+                    offset,
+                    count,
+                },
+            }))
+        }
+        "ZPOPMIN" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'zpopmin' command".to_string());
+            }
+            let count = if args.len() > 2 {
+                std::str::from_utf8(&args[2])
+                    .map_err(|_| "value is not an integer or out of range")?
+                    .parse::<usize>()
+                    .map_err(|_| "value is not an integer or out of range")?
+            } else {
+                1
+            };
+            Ok(Some(Command::Zpopmin {
+                key: args[1].clone(),
+                count,
+            }))
+        }
+        "ZPOPMAX" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'zpopmax' command".to_string());
+            }
+            let count = if args.len() > 2 {
+                std::str::from_utf8(&args[2])
+                    .map_err(|_| "value is not an integer or out of range")?
+                    .parse::<usize>()
+                    .map_err(|_| "value is not an integer or out of range")?
+            } else {
+                1
+            };
+            Ok(Some(Command::Zpopmax {
+                key: args[1].clone(),
+                count,
+            }))
+        }
         "SAVE" => Ok(Some(Command::Save)),
         "BGSAVE" => Ok(Some(Command::Bgsave)),
         "COMMAND" => Ok(Some(Command::CommandDocs)),
         "INFO" => Ok(Some(Command::Info)),
         "QUIT" => Ok(Some(Command::Quit)),
         _ => Ok(Some(Command::Unknown(cmd_name))),
+    }
+}
+
+pub fn parse_score_bound(arg: &[u8]) -> Result<(f64, bool), String> {
+    if arg.is_empty() {
+        return Err("min or max not specified".to_string());
+    }
+    let (slice, inc) = if arg[0] == b'(' {
+        (&arg[1..], false)
+    } else {
+        (arg, true)
+    };
+    let s = std::str::from_utf8(slice).map_err(|_| "value is not a valid float".to_string())?;
+    if s.eq_ignore_ascii_case("-inf") {
+        Ok((f64::NEG_INFINITY, inc))
+    } else if s.eq_ignore_ascii_case("+inf") || s.eq_ignore_ascii_case("inf") {
+        Ok((f64::INFINITY, inc))
+    } else {
+        let val: f64 = s.parse().map_err(|_| "value is not a valid float".to_string())?;
+        if val.is_nan() {
+            return Err("value is not a valid float".to_string());
+        }
+        Ok((val, inc))
     }
 }
 

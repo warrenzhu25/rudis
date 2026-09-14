@@ -287,6 +287,55 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             Some(buf)
         }
+        Command::Zadd { key, elements, flags } => {
+            let mut num_args = 2 + elements.len() * 2;
+            if flags.nx { num_args += 1; }
+            if flags.xx { num_args += 1; }
+            if flags.gt { num_args += 1; }
+            if flags.lt { num_args += 1; }
+            if flags.ch { num_args += 1; }
+            if flags.incr { num_args += 1; }
+            buf.extend_from_slice(format!("*{}\r\n$4\r\nZADD\r\n${}\r\n", num_args, key.len()).as_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(b"\r\n");
+            if flags.nx { buf.extend_from_slice(b"$2\r\nNX\r\n"); }
+            if flags.xx { buf.extend_from_slice(b"$2\r\nXX\r\n"); }
+            if flags.gt { buf.extend_from_slice(b"$2\r\nGT\r\n"); }
+            if flags.lt { buf.extend_from_slice(b"$2\r\nLT\r\n"); }
+            if flags.ch { buf.extend_from_slice(b"$2\r\nCH\r\n"); }
+            if flags.incr { buf.extend_from_slice(b"$4\r\nINCR\r\n"); }
+            for (s, m) in elements {
+                let s_str = s.to_string();
+                buf.extend_from_slice(format!("${}\r\n{}\r\n", s_str.len(), s_str).as_bytes());
+                buf.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                buf.extend_from_slice(m);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
+        Command::Zrem { key, members } => {
+            buf.extend_from_slice(
+                format!("*{}\r\n$4\r\nZREM\r\n${}\r\n", 2 + members.len(), key.len()).as_bytes(),
+            );
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(b"\r\n");
+            for m in members {
+                buf.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                buf.extend_from_slice(m);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
+        Command::Zincrby { key, delta, member } => {
+            let d_str = delta.to_string();
+            buf.extend_from_slice(format!("*4\r\n$7\r\nZINCRBY\r\n${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", d_str.len(), d_str).as_bytes());
+            buf.extend_from_slice(format!("${}\r\n", member.len()).as_bytes());
+            buf.extend_from_slice(member);
+            buf.extend_from_slice(b"\r\n");
+            Some(buf)
+        }
         _ => None,
     }
 }
