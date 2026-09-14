@@ -131,6 +131,8 @@ pub enum Command {
         key: Bytes,
         count: Option<usize>,
     },
+    Save,
+    Bgsave,
     Ping(Option<Bytes>),
     CommandDocs,
     Info,
@@ -807,6 +809,8 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 count,
             }))
         }
+        "SAVE" => Ok(Some(Command::Save)),
+        "BGSAVE" => Ok(Some(Command::Bgsave)),
         "COMMAND" => Ok(Some(Command::CommandDocs)),
         "INFO" => Ok(Some(Command::Info)),
         "QUIT" => Ok(Some(Command::Quit)),

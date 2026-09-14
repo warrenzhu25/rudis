@@ -54,6 +54,7 @@ pub struct Router {
     pub senders: Vec<flume::Sender<ShardMessage>>,
     pub slot_states: Rc<RefCell<Vec<crate::shard::SlotState>>>,
     pub slot_owners: Rc<RefCell<Vec<usize>>>,
+    pub aof: Option<Rc<RefCell<crate::aof::AofWriter>>>,
 }
 
 impl Router {
@@ -63,6 +64,7 @@ impl Router {
         port: u16,
         local_db: Rc<RefCell<ShardDb>>,
         senders: Vec<flume::Sender<ShardMessage>>,
+        aof: Option<Rc<RefCell<crate::aof::AofWriter>>>,
     ) -> Self {
         let mut slot_states = Vec::with_capacity(16384);
         let mut slot_owners = Vec::with_capacity(16384);
@@ -78,6 +80,7 @@ impl Router {
             senders,
             slot_states: Rc::new(RefCell::new(slot_states)),
             slot_owners: Rc::new(RefCell::new(slot_owners)),
+            aof,
         }
     }
 
@@ -172,7 +175,16 @@ impl Router {
     pub async fn set(&self, key: Bytes, value: Bytes, expire_in: Option<Duration>) {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
-            self.local_db.borrow_mut().set(key, value, expire_in);
+            self.local_db.borrow_mut().set(key.clone(), value.clone(), expire_in);
+            if let Some(aof) = &self.aof {
+                if let Some(bytes) = crate::aof::command_to_resp(&Command::Set {
+                    key,
+                    value,
+                    expire_in,
+                }) {
+                    aof.borrow_mut().append(&bytes);
+                }
+            }
         } else {
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::Set {
@@ -190,7 +202,15 @@ impl Router {
     pub async fn del(&self, key: Bytes) -> bool {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
-            self.local_db.borrow_mut().del(&key)
+            let deleted = self.local_db.borrow_mut().del(&key);
+            if deleted {
+                if let Some(aof) = &self.aof {
+                    if let Some(bytes) = crate::aof::command_to_resp(&Command::Del(vec![key])) {
+                        aof.borrow_mut().append(&bytes);
+                    }
+                }
+            }
+            deleted
         } else {
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::Del {
@@ -226,7 +246,15 @@ impl Router {
     pub async fn incr_by(&self, key: Bytes, delta: i64) -> Result<i64, String> {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
-            self.local_db.borrow_mut().incr_by(key, delta)
+            let res = self.local_db.borrow_mut().incr_by(key.clone(), delta);
+            if res.is_ok() {
+                if let Some(aof) = &self.aof {
+                    if let Some(bytes) = crate::aof::command_to_resp(&Command::IncrBy(key, delta)) {
+                        aof.borrow_mut().append(&bytes);
+                    }
+                }
+            }
+            res
         } else {
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::IncrBy {
@@ -247,7 +275,15 @@ impl Router {
     pub async fn expire(&self, key: Bytes, duration: Duration) -> bool {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
-            self.local_db.borrow_mut().expire(&key, duration)
+            let res = self.local_db.borrow_mut().expire(&key, duration);
+            if res {
+                if let Some(aof) = &self.aof {
+                    if let Some(bytes) = crate::aof::command_to_resp(&Command::Expire(key, duration)) {
+                        aof.borrow_mut().append(&bytes);
+                    }
+                }
+            }
+            res
         } else {
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::Expire {
@@ -266,7 +302,15 @@ impl Router {
     pub async fn persist(&self, key: Bytes) -> bool {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
-            self.local_db.borrow_mut().persist(&key)
+            let res = self.local_db.borrow_mut().persist(&key);
+            if res {
+                if let Some(aof) = &self.aof {
+                    if let Some(bytes) = crate::aof::command_to_resp(&Command::Persist(key)) {
+                        aof.borrow_mut().append(&bytes);
+                    }
+                }
+            }
+            res
         } else {
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::Persist {
@@ -278,6 +322,25 @@ impl Router {
             } else {
                 false
             }
+        }
+    }
+
+    pub async fn sync_aof(&self) {
+        if let Some(aof) = &self.aof {
+            let _ = aof.borrow_mut().sync().await;
+        }
+        let mut responders = Vec::new();
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::SyncAof { responder: tx };
+                if sender.send(msg).is_ok() {
+                    responders.push(rx);
+                }
+            }
+        }
+        for rx in responders {
+            let _ = rx.recv_async().await;
         }
     }
 

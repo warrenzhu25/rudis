@@ -245,6 +245,8 @@ async fn execute_command(
         Command::Sismember { .. } => "SISMEMBER",
         Command::Scard(_) => "SCARD",
         Command::Spop { .. } => "SPOP",
+        Command::Save => "SAVE",
+        Command::Bgsave => "BGSAVE",
         Command::Ping(_) => "PING",
         Command::CommandDocs => "COMMAND",
         Command::Info => "INFO",
@@ -586,12 +588,22 @@ async fn execute_command(
         | Command::Spop { .. } => {
             if let Some(target) = target_shard_of_cmd(&cmd, router.num_shards) {
                 if target == router.shard_id {
-                    execute_local_command(&cmd, &mut router.local_db.borrow_mut(), out);
+                    execute_local_command(
+                        &cmd,
+                        &mut router.local_db.borrow_mut(),
+                        out,
+                        router.aof.as_deref(),
+                    );
                 } else {
                     let res = router.execute_remote(target, cmd).await;
                     out.extend_from_slice(&res);
                 }
             }
+            false
+        }
+        Command::Save | Command::Bgsave => {
+            router.sync_aof().await;
+            out.extend_from_slice(b"+OK\r\n");
             false
         }
         Command::Asking => {
@@ -846,7 +858,12 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
     }
 }
 
-pub fn execute_local_command(cmd: &Command, db: &mut ShardDb, out: &mut Vec<u8>) -> bool {
+pub fn execute_local_command(
+    cmd: &Command,
+    db: &mut ShardDb,
+    out: &mut Vec<u8>,
+    aof: Option<&RefCell<crate::aof::AofWriter>>,
+) -> bool {
     match cmd {
         Command::Get(key) => {
             match db.get(key) {
@@ -861,12 +878,45 @@ pub fn execute_local_command(cmd: &Command, db: &mut ShardDb, out: &mut Vec<u8>)
             }
             false
         }
+        Command::Mget(keys) => {
+            out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
+            for k in keys {
+                match db.get(k) {
+                    Some(v) => {
+                        out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                        out.extend_from_slice(&v);
+                        out.extend_from_slice(b"\r\n");
+                    }
+                    None => {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+            }
+            false
+        }
         Command::Set {
             key,
             value,
             expire_in,
         } => {
             db.set(key.clone(), value.clone(), *expire_in);
+            if let Some(aof) = aof {
+                if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                    aof.borrow_mut().append(&bytes);
+                }
+            }
+            out.extend_from_slice(b"+OK\r\n");
+            false
+        }
+        Command::Mset(pairs) => {
+            for (k, v) in pairs {
+                db.set(k.clone(), v.clone(), None);
+            }
+            if let Some(aof) = aof {
+                if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                    aof.borrow_mut().append(&bytes);
+                }
+            }
             out.extend_from_slice(b"+OK\r\n");
             false
         }
@@ -875,6 +925,13 @@ pub fn execute_local_command(cmd: &Command, db: &mut ShardDb, out: &mut Vec<u8>)
             for k in keys {
                 if db.del(k) {
                     count += 1;
+                }
+            }
+            if count > 0 {
+                if let Some(aof) = aof {
+                    if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                        aof.borrow_mut().append(&bytes);
+                    }
                 }
             }
             out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
@@ -893,6 +950,11 @@ pub fn execute_local_command(cmd: &Command, db: &mut ShardDb, out: &mut Vec<u8>)
         Command::IncrBy(key, delta) => {
             match db.incr_by(key.clone(), *delta) {
                 Ok(val) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
                     out.extend_from_slice(format!(":{}\r\n", val).as_bytes());
                 }
                 Err(err) => {
@@ -904,6 +966,11 @@ pub fn execute_local_command(cmd: &Command, db: &mut ShardDb, out: &mut Vec<u8>)
         Command::Expire(key, duration) => {
             let res = db.expire(key, *duration);
             if res {
+                if let Some(aof) = aof {
+                    if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                        aof.borrow_mut().append(&bytes);
+                    }
+                }
                 out.extend_from_slice(b":1\r\n");
             } else {
                 out.extend_from_slice(b":0\r\n");
@@ -913,6 +980,11 @@ pub fn execute_local_command(cmd: &Command, db: &mut ShardDb, out: &mut Vec<u8>)
         Command::Persist(key) => {
             let res = db.persist(key);
             if res {
+                if let Some(aof) = aof {
+                    if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                        aof.borrow_mut().append(&bytes);
+                    }
+                }
                 out.extend_from_slice(b":1\r\n");
             } else {
                 out.extend_from_slice(b":0\r\n");
@@ -927,6 +999,11 @@ pub fn execute_local_command(cmd: &Command, db: &mut ShardDb, out: &mut Vec<u8>)
         Command::Hset { key, fields } => {
             match db.hset(key.clone(), fields.clone()) {
                 Ok(count) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
                     out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
                 }
                 Err(err) => {
@@ -938,6 +1015,11 @@ pub fn execute_local_command(cmd: &Command, db: &mut ShardDb, out: &mut Vec<u8>)
         Command::Hmset { key, fields } => {
             match db.hset(key.clone(), fields.clone()) {
                 Ok(_) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 Err(err) => {
@@ -988,6 +1070,13 @@ pub fn execute_local_command(cmd: &Command, db: &mut ShardDb, out: &mut Vec<u8>)
         Command::Hdel { key, fields } => {
             match db.hdel(key, fields) {
                 Ok(count) => {
+                    if count > 0 {
+                        if let Some(aof) = aof {
+                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        }
+                    }
                     out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
                 }
                 Err(err) => {
@@ -1077,6 +1166,11 @@ pub fn execute_local_command(cmd: &Command, db: &mut ShardDb, out: &mut Vec<u8>)
         Command::Lpush { key, values } => {
             match db.lpush(key.clone(), values.clone()) {
                 Ok(len) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
                     out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
                 }
                 Err(err) => {
@@ -1088,6 +1182,11 @@ pub fn execute_local_command(cmd: &Command, db: &mut ShardDb, out: &mut Vec<u8>)
         Command::Rpush { key, values } => {
             match db.rpush(key.clone(), values.clone()) {
                 Ok(len) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
                     out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
                 }
                 Err(err) => {
@@ -1100,6 +1199,13 @@ pub fn execute_local_command(cmd: &Command, db: &mut ShardDb, out: &mut Vec<u8>)
             let n = count.unwrap_or(1);
             match db.lpop(key, n) {
                 Ok(popped) => {
+                    if !popped.is_empty() {
+                        if let Some(aof) = aof {
+                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        }
+                    }
                     if count.is_some() {
                         out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
                         for v in popped {
@@ -1125,6 +1231,13 @@ pub fn execute_local_command(cmd: &Command, db: &mut ShardDb, out: &mut Vec<u8>)
             let n = count.unwrap_or(1);
             match db.rpop(key, n) {
                 Ok(popped) => {
+                    if !popped.is_empty() {
+                        if let Some(aof) = aof {
+                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        }
+                    }
                     if count.is_some() {
                         out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
                         for v in popped {
@@ -1193,6 +1306,13 @@ pub fn execute_local_command(cmd: &Command, db: &mut ShardDb, out: &mut Vec<u8>)
         Command::Sadd { key, members } => {
             match db.sadd(key.clone(), members.clone()) {
                 Ok(added) => {
+                    if added > 0 {
+                        if let Some(aof) = aof {
+                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        }
+                    }
                     out.extend_from_slice(format!(":{}\r\n", added).as_bytes());
                 }
                 Err(err) => {
@@ -1204,6 +1324,13 @@ pub fn execute_local_command(cmd: &Command, db: &mut ShardDb, out: &mut Vec<u8>)
         Command::Srem { key, members } => {
             match db.srem(key, members) {
                 Ok(count) => {
+                    if count > 0 {
+                        if let Some(aof) = aof {
+                            if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        }
+                    }
                     out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
                 }
                 Err(err) => {
@@ -1258,6 +1385,17 @@ pub fn execute_local_command(cmd: &Command, db: &mut ShardDb, out: &mut Vec<u8>)
             let n = count.unwrap_or(1);
             match db.spop(key, n) {
                 Ok(popped) => {
+                    if !popped.is_empty() {
+                        if let Some(aof) = aof {
+                            let srem_cmd = Command::Srem {
+                                key: key.clone(),
+                                members: popped.clone(),
+                            };
+                            if let Some(bytes) = crate::aof::command_to_resp(&srem_cmd) {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        }
+                    }
                     if count.is_some() {
                         out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
                         for m in popped {
@@ -1382,6 +1520,8 @@ async fn execute_commands_squashed(
                 Command::Sismember { .. } => "SISMEMBER",
                 Command::Scard(_) => "SCARD",
                 Command::Spop { .. } => "SPOP",
+                Command::Save => "SAVE",
+                Command::Bgsave => "BGSAVE",
                 Command::Ping(_) => "PING",
                 Command::CommandDocs => "COMMAND",
                 Command::Info => "INFO",
@@ -1402,7 +1542,12 @@ async fn execute_commands_squashed(
     for (idx, cmd) in commands.into_iter().enumerate() {
         if let Some(target) = target_shard_of_cmd(&cmd, router.num_shards) {
             if target == router.shard_id {
-                if execute_local_command(&cmd, &mut router.local_db.borrow_mut(), &mut responses[idx]) {
+                if execute_local_command(
+                    &cmd,
+                    &mut router.local_db.borrow_mut(),
+                    &mut responses[idx],
+                    router.aof.as_deref(),
+                ) {
                     should_close = true;
                 }
             } else {
@@ -1410,7 +1555,12 @@ async fn execute_commands_squashed(
             }
         } else {
             // Non-sharded simple commands (PING, QUIT, COMMAND DOCS) run locally
-            if execute_local_command(&cmd, &mut router.local_db.borrow_mut(), &mut responses[idx]) {
+            if execute_local_command(
+                &cmd,
+                &mut router.local_db.borrow_mut(),
+                &mut responses[idx],
+                None,
+            ) {
                 should_close = true;
             }
         }

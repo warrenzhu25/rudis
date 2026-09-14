@@ -8,6 +8,10 @@ use rudis::server::run_shard_worker;
 use rudis::shard::ShardMessage;
 
 fn start_test_server(port: u16, num_shards: usize) {
+    start_test_server_with_aof(port, num_shards, rudis::aof::AofConfig::default());
+}
+
+fn start_test_server_with_aof(port: u16, num_shards: usize, aof_config: rudis::aof::AofConfig) {
     let mut senders = Vec::with_capacity(num_shards);
     let mut receivers = Vec::with_capacity(num_shards);
 
@@ -19,10 +23,11 @@ fn start_test_server(port: u16, num_shards: usize) {
 
     for (shard_id, rx) in receivers.into_iter().enumerate() {
         let shard_senders = senders.clone();
+        let shard_aof_config = aof_config.clone();
         thread::Builder::new()
             .name(format!("test-shard-{}", shard_id))
             .spawn(move || {
-                run_shard_worker(shard_id, num_shards, port, shard_senders, rx, None);
+                run_shard_worker(shard_id, num_shards, port, shard_senders, rx, None, shard_aof_config);
             })
             .expect("Failed to spawn test shard");
     }
@@ -688,3 +693,136 @@ fn test_lists_and_sets_e2e() {
     }
     assert_eq!(String::from_utf8_lossy(&actual_resp), expected_prefix);
 }
+
+#[test]
+fn test_aof_persistence_and_replay_e2e() {
+    let aof_dir = std::env::temp_dir().join(format!("rudis-aof-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&aof_dir);
+    std::fs::create_dir_all(&aof_dir).unwrap();
+
+    let port_server1 = 16392;
+    let num_shards = 4;
+    let aof_config1 = rudis::aof::AofConfig {
+        enabled: true,
+        dir: aof_dir.clone(),
+        fsync_every_sec: true,
+    };
+
+    // 1. Start Server 1 with AOF enabled
+    start_test_server_with_aof(port_server1, num_shards, aof_config1);
+
+    let mut stream1 = TcpStream::connect(format!("127.0.0.1:{}", port_server1))
+        .expect("Failed to connect to rudis server 1");
+
+    // Write String data
+    let resp = send_and_read(&mut stream1, b"SET user:a alice\r\n");
+    assert_eq!(resp, "+OK\r\n");
+    let resp = send_and_read(&mut stream1, b"SET user:b bob\r\n");
+    assert_eq!(resp, "+OK\r\n");
+    let resp = send_and_read(&mut stream1, b"SET to_delete val\r\n");
+    assert_eq!(resp, "+OK\r\n");
+    let resp = send_and_read(&mut stream1, b"DEL to_delete\r\n");
+    assert_eq!(resp, ":1\r\n");
+
+    // Write Counter
+    let resp = send_and_read(&mut stream1, b"INCRBY page_views 100\r\n");
+    assert_eq!(resp, ":100\r\n");
+
+    // Write Hash
+    let resp = send_and_read(&mut stream1, b"HSET myhash name rudis version 1\r\n");
+    assert_eq!(resp, ":2\r\n");
+    let resp = send_and_read(&mut stream1, b"HDEL myhash version\r\n");
+    assert_eq!(resp, ":1\r\n");
+
+    // Write List
+    let resp = send_and_read(&mut stream1, b"RPUSH mylist a b c d\r\n");
+    assert_eq!(resp, ":4\r\n");
+    let resp = send_and_read(&mut stream1, b"LPOP mylist\r\n");
+    assert_eq!(resp, "$1\r\na\r\n");
+
+    // Write Set
+    let resp = send_and_read(&mut stream1, b"SADD myset s1 s2 s3\r\n");
+    assert_eq!(resp, ":3\r\n");
+    let resp = send_and_read(&mut stream1, b"SREM myset s1\r\n");
+    assert_eq!(resp, ":1\r\n");
+
+    // Write key with TTL (60 seconds)
+    let resp = send_and_read(&mut stream1, b"SET ttl_key temp_val PX 60000\r\n");
+    assert_eq!(resp, "+OK\r\n");
+
+    // Sync all shards to disk via SAVE
+    let resp = send_and_read(&mut stream1, b"SAVE\r\n");
+    assert_eq!(resp, "+OK\r\n");
+
+    drop(stream1);
+    thread::sleep(Duration::from_millis(200));
+
+    // Verify AOF files were created
+    let mut aof_files_found = 0;
+    for sid in 0..num_shards {
+        let p = aof_dir.join(format!("appendonly-{}.aof", sid));
+        if p.exists() && p.metadata().map(|m| m.len()).unwrap_or(0) > 0 {
+            aof_files_found += 1;
+        }
+    }
+    assert!(aof_files_found > 0, "At least one shard AOF file should exist and contain data");
+
+    // 2. Start Server 2 on a new port using the SAME AOF directory
+    let port_server2 = 16393;
+    let aof_config2 = rudis::aof::AofConfig {
+        enabled: true,
+        dir: aof_dir.clone(),
+        fsync_every_sec: true,
+    };
+    start_test_server_with_aof(port_server2, num_shards, aof_config2);
+
+    let mut stream2 = TcpStream::connect(format!("127.0.0.1:{}", port_server2))
+        .expect("Failed to connect to rudis server 2");
+
+    // Verify Strings
+    let resp = send_and_read(&mut stream2, b"GET user:a\r\n");
+    assert_eq!(resp, "$5\r\nalice\r\n");
+    let resp = send_and_read(&mut stream2, b"GET user:b\r\n");
+    assert_eq!(resp, "$3\r\nbob\r\n");
+    let resp = send_and_read(&mut stream2, b"GET to_delete\r\n");
+    assert_eq!(resp, "$-1\r\n");
+
+    // Verify Counter
+    let resp = send_and_read(&mut stream2, b"GET page_views\r\n");
+    assert_eq!(resp, "$3\r\n100\r\n");
+
+    // Verify Hash
+    let resp = send_and_read(&mut stream2, b"HGET myhash name\r\n");
+    assert_eq!(resp, "$5\r\nrudis\r\n");
+    let resp = send_and_read(&mut stream2, b"HEXISTS myhash version\r\n");
+    assert_eq!(resp, ":0\r\n");
+
+    // Verify List
+    let resp = send_and_read(&mut stream2, b"LLEN mylist\r\n");
+    assert_eq!(resp, ":3\r\n");
+    let resp = send_and_read(&mut stream2, b"LRANGE mylist 0 -1\r\n");
+    assert_eq!(resp, "*3\r\n$1\r\nb\r\n$1\r\nc\r\n$1\r\nd\r\n");
+
+    // Verify Set
+    let resp = send_and_read(&mut stream2, b"SCARD myset\r\n");
+    assert_eq!(resp, ":2\r\n");
+    let resp = send_and_read(&mut stream2, b"SISMEMBER myset s1\r\n");
+    assert_eq!(resp, ":0\r\n");
+    let resp = send_and_read(&mut stream2, b"SISMEMBER myset s2\r\n");
+    assert_eq!(resp, ":1\r\n");
+    let resp = send_and_read(&mut stream2, b"SISMEMBER myset s3\r\n");
+    assert_eq!(resp, ":1\r\n");
+
+    // Verify TTL
+    let resp = send_and_read(&mut stream2, b"GET ttl_key\r\n");
+    assert_eq!(resp, "$8\r\ntemp_val\r\n");
+    let resp = send_and_read(&mut stream2, b"TTL ttl_key\r\n");
+    assert!(resp.starts_with(':'));
+    let ttl_val: i64 = resp.trim_start_matches(':').trim_end().parse().unwrap();
+    assert!(ttl_val > 0, "TTL should be positive");
+
+    // Cleanup
+    drop(stream2);
+    let _ = std::fs::remove_dir_all(&aof_dir);
+}
+

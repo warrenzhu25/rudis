@@ -14,6 +14,14 @@ struct Args {
     /// Number of worker threads / shards (defaults to number of CPU cores)
     #[arg(short, long)]
     threads: Option<usize>,
+
+    /// Enable Append-Only File (AOF) persistence
+    #[arg(long, default_value_t = false)]
+    aof: bool,
+
+    /// Directory to store AOF files
+    #[arg(long, default_value = ".")]
+    aof_dir: std::path::PathBuf,
 }
 
 fn main() {
@@ -32,12 +40,19 @@ fn main() {
         num_cores.min(8)
     });
 
+    let aof_config = rudis::aof::AofConfig {
+        enabled: args.aof,
+        dir: args.aof_dir,
+        fsync_every_sec: true,
+    };
+
     println!("============================================================");
     println!("  rudis v0.1.0 (Redis in Rust)");
     println!("  Architecture: Multi-threaded Shared-Nothing (Thread-per-Core)");
     println!("  I/O Backend:  Linux io_uring (Monoio)");
     println!("  Listening:    0.0.0.0:{}", args.port);
     println!("  Shards:       {} worker threads (pinned to CPU cores)", num_shards);
+    println!("  AOF Persist:  {}", if aof_config.enabled { "ENABLED" } else { "disabled" });
     println!("============================================================");
 
     // Create cross-shard communication mesh
@@ -55,6 +70,7 @@ fn main() {
     for (shard_id, rx) in receivers.into_iter().enumerate() {
         let port = args.port;
         let shard_senders = senders.clone();
+        let shard_aof_config = aof_config.clone();
         let core_id = if shard_id < core_ids.len() {
             Some(core_ids[shard_id])
         } else {
@@ -64,7 +80,7 @@ fn main() {
         let handle = thread::Builder::new()
             .name(format!("rudis-shard-{}", shard_id))
             .spawn(move || {
-                run_shard_worker(shard_id, num_shards, port, shard_senders, rx, core_id);
+                run_shard_worker(shard_id, num_shards, port, shard_senders, rx, core_id, shard_aof_config);
             })
             .expect("Failed to spawn shard worker thread");
 

@@ -1,3 +1,4 @@
+pub mod aof;
 pub mod connection;
 pub mod resp;
 pub mod router;

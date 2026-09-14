@@ -70,6 +70,9 @@ pub enum ShardMessage {
         key: Bytes,
         responder: flume::Sender<Option<(crate::table::RudisValue, Option<Duration>)>>,
     },
+    SyncAof {
+        responder: flume::Sender<()>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
