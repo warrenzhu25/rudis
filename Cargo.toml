@@ -19,4 +19,7 @@ sha1 = "0.11.0"
 libc = "0.2"
 tikv-jemallocator = { version = "0.7.0", features = ["stats", "background_threads_runtime_support"] }
 tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats", "use_std"] }
+rustls = "0.23.45"
+rustls-pki-types = { version = "1.15.1", features = ["std"] }
+rcgen = "0.14.10"
 

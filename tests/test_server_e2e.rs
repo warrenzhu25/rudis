@@ -3241,6 +3241,111 @@ fn test_option4_jemalloc_memory_profiling_e2e() {
     assert!(info_resp.contains("mem_fragmentation_ratio:"));
 }
 
+#[test]
+fn test_crdt_multi_region_replication_and_gc_e2e() {
+    let port1 = 16550;
+    let port2 = 16551;
+    start_test_server(port1, 2);
+    start_test_server(port2, 2);
+
+    let mut client1 = TcpStream::connect(format!("127.0.0.1:{}", port1)).unwrap();
+    let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", port2)).unwrap();
+
+    // 1. LWW-Register on Node 1
+    let set_resp = send_and_read(&mut client1, b"CRDT.SET geo_key region_us_east\r\n");
+    assert!(set_resp.starts_with("+OK"));
+    assert_eq!(send_and_read(&mut client1, b"CRDT.GET geo_key\r\n"), "$14\r\nregion_us_east\r\n");
+
+    // 2. PN-Counters across both nodes
+    assert_eq!(send_and_read(&mut client1, b"CRDT.INCRBY user_counter 42\r\n"), ":42\r\n");
+    assert_eq!(send_and_read(&mut client2, b"CRDT.INCRBY user_counter 8\r\n"), ":8\r\n");
+
+    // 3. OR-Sets across both nodes
+    assert_eq!(send_and_read(&mut client1, b"CRDT.SADD active_tags tag_gaming\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client1, b"CRDT.SADD active_tags tag_social\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client2, b"CRDT.SADD active_tags tag_mobile\r\n"), ":1\r\n");
+
+    // 4. Cross-Region Replication: Dump Node 1 state and merge into Node 2
+    let dump_bytes = send_and_read_bytes(&mut client1, b"CRDT.DUMP\r\n");
+    // Parse bulk string payload
+    assert!(dump_bytes.starts_with(b"$"));
+    let first_newline = dump_bytes.iter().position(|&b| b == b'\n').unwrap();
+    let payload = &dump_bytes[first_newline + 1..dump_bytes.len() - 2];
+
+    let mut merge_cmd = Vec::new();
+    merge_cmd.extend_from_slice(format!("*2\r\n$10\r\nCRDT.MERGE\r\n${}\r\n", payload.len()).as_bytes());
+    merge_cmd.extend_from_slice(payload);
+    merge_cmd.extend_from_slice(b"\r\n");
+    let merge_resp = send_and_read(&mut client2, &merge_cmd);
+    assert!(merge_resp.starts_with(":"));
+
+    // Verify converged state on Node 2
+    assert_eq!(send_and_read(&mut client2, b"CRDT.GET geo_key\r\n"), "$14\r\nregion_us_east\r\n");
+    assert_eq!(send_and_read(&mut client2, b"CRDT.INCRBY user_counter 0\r\n"), ":50\r\n"); // 42 + 8 = 50
+    let members = send_and_read(&mut client2, b"CRDT.SMEMBERS active_tags\r\n");
+    assert!(members.contains("tag_gaming"));
+    assert!(members.contains("tag_social"));
+    assert!(members.contains("tag_mobile"));
+
+    // 5. Automated Tombstone TTL Garbage Collection
+    assert_eq!(send_and_read(&mut client1, b"CRDT.DEL geo_key\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client1, b"CRDT.GET geo_key\r\n"), "$-1\r\n");
+    // Run CRDT.GC with 0ms cutoff to instantly reclaim tombstones
+    let gc_resp = send_and_read(&mut client1, b"CRDT.GC 0\r\n");
+    assert!(gc_resp.contains("registers_pruned"));
+    assert!(gc_resp.contains("set_tombstones_pruned"));
+}
+
+#[test]
+fn test_sq8_quantized_vector_and_rerank_e2e() {
+    let port = 16560;
+    start_test_server(port, 2);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Ingest vectors with SQ8 quantization and tiered storage flag
+    assert_eq!(
+        send_and_read(&mut client, b"VADD doc_sq8 docA 1.0 0.0 0.0 QUANTIZE TIERED\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"VADD doc_sq8 docB 0.0 1.0 0.0 QUANTIZE TIERED\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"VADD doc_sq8 docC 0.88 0.12 0.0 QUANTIZE TIERED\r\n"),
+        "+OK\r\n"
+    );
+
+    // 2. Query with full precision reranking
+    let query_resp = send_and_read(&mut client, b"VQUERY doc_sq8 2 1.0 0.0 0.0 RERANK\r\n");
+    assert!(query_resp.contains("docA"));
+    assert!(query_resp.contains("docC"));
+
+    // 3. Verify VINFO reflects elements
+    let info = send_and_read(&mut client, b"VINFO doc_sq8\r\n");
+    assert!(info.contains(":3\r\n"));
+}
+
+#[test]
+fn test_tls_in_memory_cert_and_ktls_e2e() {
+    // 1. Test in-memory self-signed certificate generation
+    let (cert_der, key_der) = rudis::tls::generate_self_signed_cert(vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+    ]).expect("Failed to generate test self-signed cert");
+    assert!(!cert_der.is_empty());
+    assert!(!key_der.is_empty());
+
+    // 2. Test rustls ServerConfig creation
+    let config = rudis::tls::create_server_config(&cert_der, &key_der)
+        .expect("Failed to build rustls ServerConfig");
+
+    // 3. Test TlsSession wrapper instantiation
+    let session = rudis::tls::TlsSession::new(config);
+    assert!(session.is_ok());
+}
+
+
 
 
 

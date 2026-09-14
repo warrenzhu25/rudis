@@ -1585,6 +1585,16 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Vsim { .. } => "VSIM",
         Command::Vdel { .. } => "VDEL",
         Command::Vinfo(_) => "VINFO",
+        Command::CrdtSet { .. }
+        | Command::CrdtGet(_)
+        | Command::CrdtDel(_)
+        | Command::CrdtIncrby { .. }
+        | Command::CrdtSadd { .. }
+        | Command::CrdtSmembers(_)
+        | Command::CrdtSrem { .. }
+        | Command::CrdtDump
+        | Command::CrdtMerge(_)
+        | Command::CrdtGc(_) => "CRDT",
         Command::FunctionLoad { .. }
         | Command::FunctionList
         | Command::FunctionDelete(_) => "FUNCTION",
@@ -3791,8 +3801,8 @@ async fn execute_command(
             out.extend_from_slice(b"+OK\r\n");
             false
         }
-        Command::Vadd { index, key, vector, metric } => {
-            match router.local_db.borrow_mut().vadd(&index, key.clone(), vector, metric) {
+        Command::Vadd { index, key, vector, metric, quantize, tiered } => {
+            match router.local_db.borrow_mut().vadd(&index, key.clone(), vector, metric, quantize, tiered) {
                 Ok(()) => {
                     notify_key_invalidation(router.port, key.as_ref(), client_id);
                     out.extend_from_slice(b"+OK\r\n");
@@ -3803,8 +3813,8 @@ async fn execute_command(
             }
             false
         }
-        Command::Vquery { index, k, query } => {
-            let results = router.local_db.borrow().vquery(&index, &query, k);
+        Command::Vquery { index, k, query, rerank } => {
+            let results = router.local_db.borrow().vquery(&index, &query, k, rerank);
             out.extend_from_slice(format!("*{}\r\n", results.len() * 2).as_bytes());
             for (key, dist) in results {
                 write_resp_bulk(out, &key);
@@ -3849,6 +3859,89 @@ async fn execute_command(
             } else {
                 out.extend_from_slice(b"$-1\r\n");
             }
+            false
+        }
+        Command::CrdtSet { key, val } => {
+            let ts = router.local_db.borrow_mut().crdt_set(key.clone(), val);
+            notify_key_invalidation(router.port, key.as_ref(), client_id);
+            let s = format!("+OK {}:{}:{}\r\n", ts.physical_ms, ts.logical, ts.node_id);
+            out.extend_from_slice(s.as_bytes());
+            false
+        }
+        Command::CrdtGet(key) => {
+            record_client_read(router.port, client_id, key.as_ref());
+            if let Some(val) = router.local_db.borrow().crdt_get(&key) {
+                write_resp_bulk(out, &val);
+            } else {
+                out.extend_from_slice(b"$-1\r\n");
+            }
+            false
+        }
+        Command::CrdtDel(key) => {
+            let removed = router.local_db.borrow_mut().crdt_del(&key);
+            if removed {
+                notify_key_invalidation(router.port, key.as_ref(), client_id);
+                write_resp_integer(out, 1);
+            } else {
+                write_resp_integer(out, 0);
+            }
+            false
+        }
+        Command::CrdtIncrby { key, delta } => {
+            let val = router.local_db.borrow_mut().crdt_incrby(key.clone(), delta);
+            notify_key_invalidation(router.port, key.as_ref(), client_id);
+            write_resp_integer(out, val);
+            false
+        }
+        Command::CrdtSadd { key, member } => {
+            let added = router.local_db.borrow_mut().crdt_sadd(key.clone(), member);
+            notify_key_invalidation(router.port, key.as_ref(), client_id);
+            write_resp_integer(out, if added { 1 } else { 0 });
+            false
+        }
+        Command::CrdtSmembers(key) => {
+            record_client_read(router.port, client_id, key.as_ref());
+            let members = router.local_db.borrow().crdt_smembers(&key);
+            out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
+            for m in members {
+                write_resp_bulk(out, &m);
+            }
+            false
+        }
+        Command::CrdtSrem { key, member } => {
+            let removed = router.local_db.borrow_mut().crdt_srem(&key, &member);
+            if removed {
+                notify_key_invalidation(router.port, key.as_ref(), client_id);
+                write_resp_integer(out, 1);
+            } else {
+                write_resp_integer(out, 0);
+            }
+            false
+        }
+        Command::CrdtDump => {
+            let payload = router.local_db.borrow().crdt_dump();
+            write_resp_bulk(out, &payload);
+            false
+        }
+        Command::CrdtMerge(payload) => {
+            match router.local_db.borrow_mut().crdt_merge(&payload) {
+                Ok(count) => {
+                    write_resp_integer(out, count as i64);
+                }
+                Err(e) => {
+                    let err_resp = format!("-ERR {}\r\n", e);
+                    out.extend_from_slice(err_resp.as_bytes());
+                }
+            }
+            false
+        }
+        Command::CrdtGc(ttl_ms) => {
+            let (regs, set_tombstones) = router.local_db.borrow_mut().crdt_gc(ttl_ms);
+            out.extend_from_slice(b"*4\r\n");
+            write_resp_bulk(out, b"registers_pruned");
+            write_resp_integer(out, regs as i64);
+            write_resp_bulk(out, b"set_tombstones_pruned");
+            write_resp_integer(out, set_tombstones as i64);
             false
         }
         Command::FunctionLoad { replace, code } => {

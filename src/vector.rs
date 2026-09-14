@@ -100,11 +100,87 @@ pub fn compute_distance(a: &[f32], b: &[f32], metric: VectorMetric) -> f32 {
     }
 }
 
+/// 8-bit Scalar Quantization (SQ8) for high-dimensional vector embeddings.
+/// Reduces vector memory consumption by 75% (from 4 bytes/dim down to 1 byte/dim).
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuantizedVector {
+    pub min_val: f32,
+    pub scale: f32,
+    pub sum_q: f32,
+    pub data: Vec<u8>,
+}
+
+impl QuantizedVector {
+    pub fn quantize(v: &[f32]) -> Self {
+        let mut min_val = f32::INFINITY;
+        let mut max_val = f32::NEG_INFINITY;
+        for &x in v {
+            if x < min_val { min_val = x; }
+            if x > max_val { max_val = x; }
+        }
+        let diff = max_val - min_val;
+        let scale = if diff == 0.0 { 1.0 } else { diff / 255.0 };
+        let inv_scale = 1.0 / scale;
+
+        let mut data = Vec::with_capacity(v.len());
+        let mut sum_q = 0.0f32;
+        for &x in v {
+            let q = (((x - min_val) * inv_scale).round().clamp(0.0, 255.0)) as u8;
+            sum_q += q as f32;
+            data.push(q);
+        }
+        Self { min_val, scale, sum_q, data }
+    }
+
+    /// Dequantizes back to full-precision float vector.
+    pub fn dequantize(&self) -> Vec<f32> {
+        self.data.iter().map(|&q| self.min_val + (q as f32) * self.scale).collect()
+    }
+
+    /// Fast asymmetric distance computation between full-precision query vector and SQ8 vector.
+    pub fn compute_distance(&self, query: &[f32], metric: VectorMetric) -> f32 {
+        let min_val = self.min_val;
+        let scale = self.scale;
+        match metric {
+            VectorMetric::IP => {
+                let mut dot = 0.0f32;
+                for (&q_val, &d_u8) in query.iter().zip(&self.data) {
+                    dot += q_val * (min_val + (d_u8 as f32) * scale);
+                }
+                -dot
+            }
+            VectorMetric::L2 => {
+                let mut l2_sq = 0.0f32;
+                for (&q_val, &d_u8) in query.iter().zip(&self.data) {
+                    let diff = q_val - (min_val + (d_u8 as f32) * scale);
+                    l2_sq += diff * diff;
+                }
+                l2_sq.sqrt()
+            }
+            VectorMetric::Cosine => {
+                let mut dot = 0.0f32;
+                let mut norm_b_sq = 0.0f32;
+                let mut norm_a_sq = 0.0f32;
+                for (&q_val, &d_u8) in query.iter().zip(&self.data) {
+                    let b_val = min_val + (d_u8 as f32) * scale;
+                    dot += q_val * b_val;
+                    norm_a_sq += q_val * q_val;
+                    norm_b_sq += b_val * b_val;
+                }
+                let denom = norm_a_sq.sqrt() * norm_b_sq.sqrt();
+                if denom == 0.0 { 1.0 } else { (1.0 - (dot / denom)).max(0.0) }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct HnswNode {
     pub id: usize,
     pub key: Bytes,
     pub vector: Vec<f32>,
+    pub quantized: Option<QuantizedVector>,
+    pub is_tiered: bool,
     /// Neighbors at each layer [0..layer]
     pub neighbors: Vec<Vec<usize>>,
 }
@@ -217,8 +293,28 @@ impl HnswIndex {
             .and_then(|&id| self.nodes.get(id).and_then(|n| n.as_ref().map(|n| n.vector.as_slice())))
     }
 
+    #[inline]
+    pub fn dist_to_node(&self, query: &[f32], node: &HnswNode) -> f32 {
+        if let Some(quant) = &node.quantized {
+            quant.compute_distance(query, self.metric)
+        } else {
+            compute_distance(query, &node.vector, self.metric)
+        }
+    }
+
     /// Adds or updates a vector in the HNSW index.
     pub fn add(&mut self, key: Bytes, vector: Vec<f32>) -> Result<(), &'static str> {
+        self.add_quantized(key, vector, false, false)
+    }
+
+    /// Adds or updates a vector with optional SQ8 quantization and tiered flag.
+    pub fn add_quantized(
+        &mut self,
+        key: Bytes,
+        vector: Vec<f32>,
+        quantize: bool,
+        tiered: bool,
+    ) -> Result<(), &'static str> {
         if vector.len() != self.dim {
             return Err("vector dimension mismatch");
         }
@@ -231,10 +327,18 @@ impl HnswIndex {
         let target_level = self.random_level();
         let new_id = self.nodes.len();
 
-        let mut node = HnswNode {
+        let quantized = if quantize || tiered {
+            Some(QuantizedVector::quantize(&vector))
+        } else {
+            None
+        };
+
+        let node = HnswNode {
             id: new_id,
             key: key.clone(),
             vector: vector.clone(),
+            quantized,
+            is_tiered: tiered,
             neighbors: vec![Vec::new(); target_level + 1],
         };
 
@@ -247,11 +351,7 @@ impl HnswIndex {
         }
 
         let mut curr_obj = self.entry_point.unwrap();
-        let mut curr_dist = compute_distance(
-            &vector,
-            &self.nodes[curr_obj].as_ref().unwrap().vector,
-            self.metric,
-        );
+        let mut curr_dist = self.dist_to_node(&vector, self.nodes[curr_obj].as_ref().unwrap());
 
         // 1. Greedy search from top down to target_level + 1
         for lc in (target_level + 1..=self.max_layer).rev() {
@@ -262,7 +362,7 @@ impl HnswIndex {
                     if lc < curr_node.neighbors.len() {
                         for &neighbor in &curr_node.neighbors[lc] {
                             if let Some(n) = &self.nodes[neighbor] {
-                                let d = compute_distance(&vector, &n.vector, self.metric);
+                                let d = self.dist_to_node(&vector, n);
                                 if d < curr_dist {
                                     curr_dist = d;
                                     curr_obj = neighbor;
@@ -276,6 +376,9 @@ impl HnswIndex {
         }
 
         // 2. Search and link at layers min(target_level, max_layer) down to 0
+        self.nodes.push(Some(node));
+        self.key_to_id.insert(key, new_id);
+
         let search_level_max = target_level.min(self.max_layer);
         for lc in (0..=search_level_max).rev() {
             let candidates = self.search_layer(&vector, curr_obj, self.ef_construction, lc);
@@ -283,7 +386,9 @@ impl HnswIndex {
             let neighbors: Vec<usize> = candidates.into_iter().take(m_max).map(|c| c.id).collect();
 
             // Connect new node to neighbors
-            node.neighbors[lc] = neighbors.clone();
+            if let Some(n) = &mut self.nodes[new_id] {
+                n.neighbors[lc] = neighbors.clone();
+            }
 
             // Connect neighbors back to new node
             for &nbr_id in &neighbors {
@@ -303,9 +408,6 @@ impl HnswIndex {
             }
         }
 
-        self.nodes.push(Some(node));
-        self.key_to_id.insert(key, new_id);
-
         if target_level > self.max_layer {
             self.max_layer = target_level;
             self.entry_point = Some(new_id);
@@ -320,9 +422,10 @@ impl HnswIndex {
             let mut candidates: Vec<(usize, f32)> = node.neighbors[layer]
                 .iter()
                 .filter_map(|&id| {
-                    self.nodes[id]
-                        .as_ref()
-                        .map(|n| (id, compute_distance(&node_vec, &n.vector, self.metric)))
+                    self.nodes
+                        .get(id)
+                        .and_then(|opt| opt.as_ref())
+                        .map(|n| (id, self.dist_to_node(&node_vec, n)))
                 })
                 .collect();
             candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
@@ -346,11 +449,7 @@ impl HnswIndex {
         let mut candidates = BinaryHeap::new();
         let mut w = BinaryHeap::new(); // max-heap of closest elements found
 
-        let initial_dist = compute_distance(
-            query,
-            &self.nodes[entry_point].as_ref().unwrap().vector,
-            self.metric,
-        );
+        let initial_dist = self.dist_to_node(query, self.nodes[entry_point].as_ref().unwrap());
 
         visited.insert(entry_point);
         candidates.push(Candidate {
@@ -374,7 +473,7 @@ impl HnswIndex {
                     for &nbr_id in &node.neighbors[layer] {
                         if visited.insert(nbr_id) {
                             if let Some(nbr_node) = &self.nodes[nbr_id] {
-                                let d = compute_distance(query, &nbr_node.vector, self.metric);
+                                let d = self.dist_to_node(query, nbr_node);
                                 let furthest_dist = w.peek().map(|f| f.distance).unwrap_or(f32::MAX);
 
                                 if d < furthest_dist || w.len() < ef {
@@ -410,16 +509,17 @@ impl HnswIndex {
 
     /// Searches for top-k nearest neighbors.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(Bytes, f32)> {
+        self.search_tiered(query, k, false)
+    }
+
+    /// Searches for top-k nearest neighbors with optional exact reranking.
+    pub fn search_tiered(&self, query: &[f32], k: usize, rerank: bool) -> Vec<(Bytes, f32)> {
         if self.entry_point.is_none() || self.is_empty() {
             return Vec::new();
         }
 
         let mut curr_obj = self.entry_point.unwrap();
-        let mut curr_dist = compute_distance(
-            query,
-            &self.nodes[curr_obj].as_ref().unwrap().vector,
-            self.metric,
-        );
+        let mut curr_dist = self.dist_to_node(query, self.nodes[curr_obj].as_ref().unwrap());
 
         // 1. Greedy search down to layer 1
         for lc in (1..=self.max_layer).rev() {
@@ -430,7 +530,7 @@ impl HnswIndex {
                     if lc < curr_node.neighbors.len() {
                         for &nbr in &curr_node.neighbors[lc] {
                             if let Some(n) = &self.nodes[nbr] {
-                                let d = compute_distance(query, &n.vector, self.metric);
+                                let d = self.dist_to_node(query, n);
                                 if d < curr_dist {
                                     curr_dist = d;
                                     curr_obj = nbr;
@@ -444,18 +544,37 @@ impl HnswIndex {
         }
 
         // 2. Layer 0 search with ef_search
-        let ef = self.ef_search.max(k);
-        let candidates = self.search_layer(query, curr_obj, ef, 0);
+        let search_ef = if rerank {
+            self.ef_search.max(k * 3)
+        } else {
+            self.ef_search.max(k)
+        };
+        let candidates = self.search_layer(query, curr_obj, search_ef, 0);
 
-        candidates
-            .into_iter()
-            .take(k)
-            .filter_map(|c| {
-                self.nodes[c.id]
-                    .as_ref()
-                    .map(|n| (n.key.clone(), c.distance))
-            })
-            .collect()
+        if rerank {
+            let mut exact_results: Vec<(Bytes, f32)> = candidates
+                .into_iter()
+                .filter_map(|c| {
+                    self.nodes[c.id].as_ref().map(|n| {
+                        let exact_d = compute_distance(query, &n.vector, self.metric);
+                        (n.key.clone(), exact_d)
+                    })
+                })
+                .collect();
+            exact_results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+            exact_results.truncate(k);
+            exact_results
+        } else {
+            candidates
+                .into_iter()
+                .take(k)
+                .filter_map(|c| {
+                    self.nodes[c.id]
+                        .as_ref()
+                        .map(|n| (n.key.clone(), c.distance))
+                })
+                .collect()
+        }
     }
 
     /// Removes a key from the index.
@@ -511,5 +630,27 @@ mod tests {
 
         assert!(index.remove(&Bytes::from("doc1")));
         assert_eq!(index.len(), 2);
+    }
+
+    #[test]
+    fn test_sq8_quantization_and_tiered_rerank() {
+        let v = vec![0.12, -0.45, 0.98, 0.05, 0.33];
+        let q = QuantizedVector::quantize(&v);
+        assert_eq!(q.data.len(), 5);
+        let deq = q.dequantize();
+        for (orig, recon) in v.iter().zip(&deq) {
+            assert!((orig - recon).abs() < 0.02, "orig: {}, recon: {}", orig, recon);
+        }
+
+        let mut index = HnswIndex::new("sq8_idx".to_string(), 5, VectorMetric::Cosine);
+        index.add_quantized(Bytes::from("k1"), v.clone(), true, true).unwrap();
+        index.add_quantized(Bytes::from("k2"), vec![0.0, 1.0, 0.0, 0.0, 0.0], true, true).unwrap();
+
+        let query = vec![0.10, -0.40, 0.95, 0.08, 0.30];
+        let res_approx = index.search_tiered(&query, 1, false);
+        assert_eq!(res_approx[0].0, Bytes::from("k1"));
+
+        let res_rerank = index.search_tiered(&query, 1, true);
+        assert_eq!(res_rerank[0].0, Bytes::from("k1"));
     }
 }

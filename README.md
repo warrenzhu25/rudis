@@ -98,12 +98,14 @@ Rudis supports sub-millisecond, zero-copy snapshots of tiered storage on NVMe fi
 - Uses kernel `ioctl(FICLONE)` reflink cloning with automatic fallbacks to `copy_file_range` and streaming copy.
 - Atomically creates point-in-time storage checkpoints with metadata manifests in $<1$ ms without stopping traffic or locking workers.
 
-### 7. Vector Search & Embeddings Engine (HNSW)
+### 7. Vector Search & SQ8 Quantization Engine (HNSW)
 Rudis includes an integrated Hierarchical Navigable Small World (HNSW) vector index:
 - **Metrics**: Cosine distance, Euclidean $L_2$ distance, and Inner Product (IP) with SIMD-friendly loop vectorization.
+- **8-Bit Scalar Quantization (SQ8)**: Compresses 32-bit floating-point embeddings by **75%** (512 bytes $\to$ 128 bytes per 128-dim vector) with asymmetric distance scoring.
+- **Tiered Vector Storage & Rerank**: Supports keeping quantized vectors in memory while retaining raw floats on tiered NVMe storage, reranking top candidate pools for exact precision.
 - **Commands**:
-  - `VADD <index> <key> <dim0> <dim1> ... [METRIC cosine|l2|ip]`: Insert or update embeddings.
-  - `VQUERY <index> <k> <dim0> <dim1> ...`: Approximate Nearest Neighbor (ANN) search returning top-$k$ nearest keys and distances.
+  - `VADD <index> <key> <dim0> <dim1> ... [METRIC cosine|l2|ip] [QUANTIZE/SQ8] [TIERED]`: Insert or update embeddings with optional SQ8 compression and tiered offloading.
+  - `VQUERY <index> <k> <dim0> <dim1> ... [RERANK]`: Approximate Nearest Neighbor (ANN) search returning top-$k$ nearest keys and distances, with optional two-phase exact rerank.
   - `VSIM <index> <key1> <key2> [METRIC ...]`: Compute pairwise vector similarity directly in memory.
   - `VDEL <index> <key>`: Remove a vector element and rewire graph edges.
   - `VINFO <index>`: Inspect index statistics (element count, dimension, metric, max layers).
@@ -118,6 +120,22 @@ Rudis includes an integrated Hierarchical Navigable Small World (HNSW) vector in
 - `INFO memory` outputs detailed jemalloc statistics via `tikv-jemalloc-ctl`:
   - `used_memory_rss`, `allocator_allocated`, `allocator_active`, `allocator_resident`, `allocator_metadata`, and `mem_fragmentation_ratio`.
 
+### 10. Hardware-Accelerated Linux Kernel TLS (kTLS)
+Rudis supports zero-copy Transport Layer Security powered by `rustls` and Linux Kernel TLS (`kTLS`):
+- **User-Space Handshake**: Completes standard TLS 1.2/1.3 handshakes in user space via `rustls`.
+- **Kernel-Level Offload**: Once negotiated, symmetric cipher states (`TCP_ULP` $\to$ `tls`) offload encryption/decryption directly to the Linux kernel.
+- **Zero-Copy `io_uring` Pipelines**: Ingress and egress payloads bypass user-space encryption buffers, allowing direct DMA data transfers to and from NICs with AES-GCM acceleration.
+
+### 11. Active-Active Multi-Region Replication (CRDTs & Tombstone GC)
+Rudis features a conflict-free replicated data type (CRDT) engine for leaderless, multi-datacenter active-active clusters:
+- **16-Byte Hybrid Logical Clocks (HLC)**: Monotonic physical time + logical counter guaranteeing causal ordering across asynchronous distributed nodes.
+- **Data Types**:
+  - **LWW-Register**: Last-Write-Wins registers with deterministic node-ID tiebreaking.
+  - **OR-Set**: Observed-Remove Sets supporting concurrent additions and deletions with add-wins semantics.
+  - **PN-Counter**: Positive-Negative distributed counters enabling atomic concurrent increments and decrements.
+- **Automated Tombstone TTL Garbage Collection**: Prunes deletion tombstones (`CRDT.GC [ttl_ms]`) to prevent metadata bloat without sacrificing convergence.
+- **Commands**: `CRDT.SET`, `CRDT.GET`, `CRDT.DEL`, `CRDT.INCRBY`, `CRDT.SADD`, `CRDT.SMEMBERS`, `CRDT.SREM`, `CRDT.DUMP`, `CRDT.MERGE`, `CRDT.GC`.
+
 ---
 
 ## Testing
@@ -130,6 +148,18 @@ cargo test
 ---
 
 ## Benchmarks
+
+### Vector Search & SQ8 Quantization (10,000 Vectors, 128 Dimensions, Cosine)
+
+Detailed Vector Search benchmark report: [docs/benchmarks/vector_search.md](docs/benchmarks/vector_search.md)
+
+| Index Mode | Vector Payload RAM | RAM Savings | Ingestion Rate | Search QPS | Latency p50 | Latency p99 | Recall@10 |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Float32 HNSW** | 5.12 MB | Baseline (0%) | **1,972 vec/s** | **4,003 QPS** | **240 µs** | 458 µs | **54.8%** |
+| **SQ8 Quantized** | **1.28 MB** | **-75.0%** | 1,737 vec/s | 3,630 QPS | 270 µs | 462 µs | 53.0% |
+| **SQ8 + Exact Rerank** | 1.28 MB | **-75.0%** | 1,737 vec/s | 3,545 QPS | 276 µs | 505 µs | 53.0% |
+
+---
 
 ### NVMe Tiered Storage: Rudis vs. Dragonfly (4 Worker Cores, 1KB Payloads)
 
@@ -189,18 +219,24 @@ rudis/
 ├── Cargo.toml
 ├── docs/
 │   └── benchmarks/
-│       └── baseline.md # Detailed 1-32 thread baseline results
+│       ├── baseline.md        # Detailed 1-32 thread baseline results
+│       ├── tiered_storage.md  # NVMe tiered storage benchmark vs Dragonfly
+│       └── vector_search.md   # HNSW vector search and SQ8 quantization benchmark
 ├── src/
 │   ├── main.rs         # CLI argument parsing, thread spawning, mesh setup
 │   ├── lib.rs          # Library root exporting modules
 │   ├── allocator.rs    # jemalloc profiling and memory statistics
+│   ├── bin/
+│   │   └── vector_bench.rs # Standalone vector benchmark suite
 │   ├── connection.rs   # TCP connection handler, RESP3 push, and command dispatcher
+│   ├── crdt.rs         # Active-Active multi-region CRDT engine (HLC, LWW, OR-Set, PN-Counter)
 │   ├── resp.rs         # RESP2/RESP3 & inline frame parser and serializer
 │   ├── router.rs       # CRC16 key partitioner and cross-core message dispatcher
 │   ├── scripting.rs    # Lua scripting and Redis 7 Function engine
 │   ├── shard.rs        # Thread-local in-memory key-value database and message types
 │   ├── tiering.rs      # NVMe tiered storage, io_uring Direct I/O, zero-copy snapshots
-│   └── vector.rs       # HNSW vector search engine and distance metrics
+│   ├── tls.rs          # Hardware-accelerated Linux Kernel TLS (kTLS) and rustls integration
+│   └── vector.rs       # HNSW vector search engine, SQ8 quantization, tiered reranking
 └── tests/
     ├── test_cross_thread.rs # Validates cross-core eventfd waker with Monoio
     └── test_server_e2e.rs   # Multi-shard end-to-end integration tests

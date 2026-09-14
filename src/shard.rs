@@ -235,6 +235,7 @@ pub struct ShardDb {
     pub port: u16,
     pub tier_manager: Option<std::rc::Rc<crate::tiering::ShardTierManager>>,
     pub vector_indexes: std::collections::HashMap<String, crate::vector::HnswIndex>,
+    pub crdt_store: crate::crdt::CrdtStore,
 }
 
 impl ShardDb {
@@ -244,6 +245,7 @@ impl ShardDb {
             port,
             tier_manager: None,
             vector_indexes: std::collections::HashMap::new(),
+            crdt_store: crate::crdt::CrdtStore::new(port),
         }
     }
 
@@ -1129,6 +1131,8 @@ impl ShardDb {
         key: Bytes,
         vector: Vec<f32>,
         metric: Option<crate::vector::VectorMetric>,
+        quantize: bool,
+        tiered: bool,
     ) -> Result<(), &'static str> {
         let dim = vector.len();
         let idx = self.vector_indexes.entry(index_name.to_string()).or_insert_with(|| {
@@ -1138,12 +1142,12 @@ impl ShardDb {
                 metric.unwrap_or(crate::vector::VectorMetric::Cosine),
             )
         });
-        idx.add(key, vector)
+        idx.add_quantized(key, vector, quantize, tiered)
     }
 
-    pub fn vquery(&self, index_name: &str, query: &[f32], k: usize) -> Vec<(Bytes, f32)> {
+    pub fn vquery(&self, index_name: &str, query: &[f32], k: usize, rerank: bool) -> Vec<(Bytes, f32)> {
         if let Some(idx) = self.vector_indexes.get(index_name) {
-            idx.search(query, k)
+            idx.search_tiered(query, k, rerank)
         } else {
             Vec::new()
         }
@@ -1178,6 +1182,52 @@ impl ShardDb {
         self.vector_indexes.get(index_name).map(|idx| {
             (idx.len(), idx.dim, idx.metric.as_str(), idx.max_layer)
         })
+    }
+
+    // Active-Active CRDT operations
+    pub fn crdt_set(&mut self, key: Bytes, val: Bytes) -> crate::crdt::HlcTimestamp {
+        self.crdt_store.set(key, val)
+    }
+
+    pub fn crdt_get(&self, key: &Bytes) -> Option<Bytes> {
+        self.crdt_store.get(key)
+    }
+
+    pub fn crdt_del(&mut self, key: &Bytes) -> bool {
+        self.crdt_store.del(key)
+    }
+
+    pub fn crdt_incrby(&mut self, key: Bytes, delta: i64) -> i64 {
+        self.crdt_store.counter_incr(key, delta)
+    }
+
+    pub fn crdt_counter_get(&self, key: &Bytes) -> i64 {
+        self.crdt_store.counter_get(key)
+    }
+
+    pub fn crdt_sadd(&mut self, key: Bytes, member: Bytes) -> bool {
+        self.crdt_store.set_add(key, member)
+    }
+
+    pub fn crdt_smembers(&self, key: &Bytes) -> Vec<Bytes> {
+        self.crdt_store.set_members(key)
+    }
+
+    pub fn crdt_srem(&mut self, key: &Bytes, member: &Bytes) -> bool {
+        self.crdt_store.set_rem(key, member)
+    }
+
+    pub fn crdt_dump(&self) -> Vec<u8> {
+        self.crdt_store.export_sync_payload()
+    }
+
+    pub fn crdt_merge(&mut self, payload: &[u8]) -> Result<usize, String> {
+        self.crdt_store.merge_sync_payload(payload)
+    }
+
+    pub fn crdt_gc(&mut self, ttl_ms: Option<u64>) -> (usize, usize) {
+        let ttl = ttl_ms.unwrap_or(86_400_000); // 24 hours default
+        self.crdt_store.gc_tombstones(ttl)
     }
 }
 

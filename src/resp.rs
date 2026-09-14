@@ -639,11 +639,14 @@ pub enum Command {
         key: Bytes,
         vector: Vec<f32>,
         metric: Option<crate::vector::VectorMetric>,
+        quantize: bool,
+        tiered: bool,
     },
     Vquery {
         index: String,
         k: usize,
         query: Vec<f32>,
+        rerank: bool,
     },
     Vsim {
         index: String,
@@ -656,6 +659,29 @@ pub enum Command {
         key: Bytes,
     },
     Vinfo(String),
+    // CRDT MULTI-REGION COMMANDS
+    CrdtSet {
+        key: Bytes,
+        val: Bytes,
+    },
+    CrdtGet(Bytes),
+    CrdtDel(Bytes),
+    CrdtIncrby {
+        key: Bytes,
+        delta: i64,
+    },
+    CrdtSadd {
+        key: Bytes,
+        member: Bytes,
+    },
+    CrdtSmembers(Bytes),
+    CrdtSrem {
+        key: Bytes,
+        member: Bytes,
+    },
+    CrdtDump,
+    CrdtMerge(Bytes),
+    CrdtGc(Option<u64>),
     // REDIS 7 FUNCTIONS
     FunctionLoad {
         replace: bool,
@@ -3856,16 +3882,26 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let index = String::from_utf8_lossy(&args[1]).to_string();
             let key = args[2].clone();
             let mut vector = Vec::with_capacity(args.len() - 3);
+            let mut quantize = false;
+            let mut tiered = false;
             for a in &args[3..] {
-                let s = std::str::from_utf8(a).map_err(|_| "not a valid float")?;
-                let val: f32 = s.parse().map_err(|_| "not a valid float")?;
-                vector.push(val);
+                let s = String::from_utf8_lossy(a).to_uppercase();
+                if s == "QUANTIZE" || s == "SQ8" {
+                    quantize = true;
+                } else if s == "TIERED" {
+                    tiered = true;
+                } else {
+                    let val: f32 = s.parse().map_err(|_| "not a valid float")?;
+                    vector.push(val);
+                }
             }
             Ok(Some(Command::Vadd {
                 index,
                 key,
                 vector,
                 metric: None,
+                quantize,
+                tiered,
             }))
         }
         "VQUERY" => {
@@ -3878,12 +3914,84 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 .parse()
                 .map_err(|_| "value is not an integer or out of range")?;
             let mut query = Vec::with_capacity(args.len() - 3);
+            let mut rerank = false;
             for a in &args[3..] {
-                let s = std::str::from_utf8(a).map_err(|_| "not a valid float")?;
-                let val: f32 = s.parse().map_err(|_| "not a valid float")?;
-                query.push(val);
+                let s = String::from_utf8_lossy(a).to_uppercase();
+                if s == "RERANK" {
+                    rerank = true;
+                } else {
+                    let val: f32 = s.parse().map_err(|_| "not a valid float")?;
+                    query.push(val);
+                }
             }
-            Ok(Some(Command::Vquery { index, k, query }))
+            Ok(Some(Command::Vquery { index, k, query, rerank }))
+        }
+        "CRDT.SET" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'crdt.set' command".to_string());
+            }
+            Ok(Some(Command::CrdtSet { key: args[1].clone(), val: args[2].clone() }))
+        }
+        "CRDT.GET" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'crdt.get' command".to_string());
+            }
+            Ok(Some(Command::CrdtGet(args[1].clone())))
+        }
+        "CRDT.DEL" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'crdt.del' command".to_string());
+            }
+            Ok(Some(Command::CrdtDel(args[1].clone())))
+        }
+        "CRDT.INCRBY" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'crdt.incrby' command".to_string());
+            }
+            let delta: i64 = std::str::from_utf8(&args[2])
+                .map_err(|_| "value is not an integer or out of range")?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range")?;
+            Ok(Some(Command::CrdtIncrby { key: args[1].clone(), delta }))
+        }
+        "CRDT.SADD" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'crdt.sadd' command".to_string());
+            }
+            Ok(Some(Command::CrdtSadd { key: args[1].clone(), member: args[2].clone() }))
+        }
+        "CRDT.SMEMBERS" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'crdt.smembers' command".to_string());
+            }
+            Ok(Some(Command::CrdtSmembers(args[1].clone())))
+        }
+        "CRDT.SREM" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'crdt.srem' command".to_string());
+            }
+            Ok(Some(Command::CrdtSrem { key: args[1].clone(), member: args[2].clone() }))
+        }
+        "CRDT.DUMP" => {
+            Ok(Some(Command::CrdtDump))
+        }
+        "CRDT.MERGE" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'crdt.merge' command".to_string());
+            }
+            Ok(Some(Command::CrdtMerge(args[1].clone())))
+        }
+        "CRDT.GC" => {
+            let ttl = if args.len() > 1 {
+                let s = std::str::from_utf8(&args[1])
+                    .map_err(|_| "value is not an integer or out of range")?
+                    .parse()
+                    .map_err(|_| "value is not an integer or out of range")?;
+                Some(s)
+            } else {
+                None
+            };
+            Ok(Some(Command::CrdtGc(ttl)))
         }
         "VSIM" => {
             if args.len() < 4 {

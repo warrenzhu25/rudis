@@ -12,8 +12,10 @@ pub mod router;
 pub mod scripting;
 pub mod server;
 pub mod shard;
+pub mod crdt;
 pub mod table;
 pub mod tiering;
+pub mod tls;
 pub mod vector;
 
 
