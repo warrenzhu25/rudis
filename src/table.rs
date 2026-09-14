@@ -51,13 +51,16 @@ pub struct ZRangeOpts {
     pub count: Option<usize>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct RudisZSet {
-    pub dict: hashbrown::HashMap<Bytes, f64>,
-    pub tree: std::collections::BTreeSet<(OrderedScore, Bytes)>,
-}
+const SMALL_ZSET_LIMIT: usize = 64;
 
-impl Eq for RudisZSet {}
+#[derive(Clone, Debug)]
+pub enum RudisZSet {
+    Small(Vec<(OrderedScore, Bytes)>),
+    Full {
+        dict: hashbrown::HashMap<Bytes, f64>,
+        tree: std::collections::BTreeSet<(OrderedScore, Bytes)>,
+    },
+}
 
 impl Default for RudisZSet {
     fn default() -> Self {
@@ -67,30 +70,268 @@ impl Default for RudisZSet {
 
 impl RudisZSet {
     pub fn new() -> Self {
-        Self {
-            dict: hashbrown::HashMap::new(),
-            tree: std::collections::BTreeSet::new(),
-        }
+        RudisZSet::Small(Vec::new())
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.dict.len()
+        match self {
+            RudisZSet::Small(v) => v.len(),
+            RudisZSet::Full { dict, .. } => dict.len(),
+        }
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.dict.is_empty()
+        self.len() == 0
     }
 
     #[inline]
-    pub fn insert(&mut self, score: f64, member: Bytes) {
-        if let Some(old_score) = self.dict.insert(member.clone(), score) {
-            self.tree.remove(&(OrderedScore(old_score), member.clone()));
+    pub fn get_score(&self, member: &[u8]) -> Option<f64> {
+        match self {
+            RudisZSet::Small(v) => v.iter().find(|(_, m)| m.as_ref() == member).map(|(s, _)| s.0),
+            RudisZSet::Full { dict, .. } => dict.get(member).copied(),
         }
-        self.tree.insert((OrderedScore(score), member));
+    }
+
+    pub fn insert(&mut self, score: f64, member: Bytes) {
+        match self {
+            RudisZSet::Small(v) => {
+                if let Some(pos) = v.iter().position(|(_, m)| m == &member) {
+                    v.remove(pos);
+                }
+                let ord = (OrderedScore(score), member);
+                let insert_idx = match v.binary_search(&ord) {
+                    Ok(idx) | Err(idx) => idx,
+                };
+                v.insert(insert_idx, ord);
+
+                if v.len() > SMALL_ZSET_LIMIT {
+                    let mut dict = hashbrown::HashMap::with_capacity(v.len());
+                    let mut tree = std::collections::BTreeSet::new();
+                    for (s, m) in v.drain(..) {
+                        dict.insert(m.clone(), s.0);
+                        tree.insert((s, m));
+                    }
+                    *self = RudisZSet::Full { dict, tree };
+                }
+            }
+            RudisZSet::Full { dict, tree } => {
+                if let Some(old_score) = dict.insert(member.clone(), score) {
+                    tree.remove(&(OrderedScore(old_score), member.clone()));
+                }
+                tree.insert((OrderedScore(score), member));
+            }
+        }
+    }
+
+    pub fn remove(&mut self, member: &[u8]) -> Option<f64> {
+        match self {
+            RudisZSet::Small(v) => {
+                if let Some(pos) = v.iter().position(|(_, m)| m.as_ref() == member) {
+                    Some(v.remove(pos).0.0)
+                } else {
+                    None
+                }
+            }
+            RudisZSet::Full { dict, tree } => {
+                if let Some(old_score) = dict.remove(member) {
+                    tree.remove(&(OrderedScore(old_score), Bytes::copy_from_slice(member)));
+                    Some(old_score)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    pub fn rank(&self, member: &[u8], rev: bool) -> Option<usize> {
+        match self {
+            RudisZSet::Small(v) => {
+                if rev {
+                    v.iter().rev().position(|(_, m)| m.as_ref() == member)
+                } else {
+                    v.iter().position(|(_, m)| m.as_ref() == member)
+                }
+            }
+            RudisZSet::Full { dict, tree } => {
+                if !dict.contains_key(member) {
+                    return None;
+                }
+                if rev {
+                    tree.iter().rev().position(|(_, m)| m.as_ref() == member)
+                } else {
+                    tree.iter().position(|(_, m)| m.as_ref() == member)
+                }
+            }
+        }
+    }
+
+    pub fn count(&self, min: f64, min_inc: bool, max: f64, max_inc: bool) -> usize {
+        match self {
+            RudisZSet::Small(v) => v.iter().filter(|(OrderedScore(s), _)| {
+                let ge_min = if min_inc { *s >= min } else { *s > min };
+                let le_max = if max_inc { *s <= max } else { *s < max };
+                ge_min && le_max
+            }).count(),
+            RudisZSet::Full { tree, .. } => tree.iter().filter(|(OrderedScore(s), _)| {
+                let ge_min = if min_inc { *s >= min } else { *s > min };
+                let le_max = if max_inc { *s <= max } else { *s < max };
+                ge_min && le_max
+            }).count(),
+        }
+    }
+
+    pub fn range(&self, opts: &ZRangeOpts) -> Vec<(Bytes, f64)> {
+        let n = self.len();
+        if n == 0 {
+            return Vec::new();
+        }
+
+        if opts.by_score {
+            let min = opts.min_score;
+            let min_inc = opts.min_inc;
+            let max = opts.max_score;
+            let max_inc = opts.max_inc;
+            let filter_fn = move |item: &&(OrderedScore, Bytes)| {
+                let s = item.0.0;
+                let ge_min = if min_inc { s >= min } else { s > min };
+                let le_max = if max_inc { s <= max } else { s < max };
+                ge_min && le_max
+            };
+
+            let get_items: Box<dyn Iterator<Item = &(OrderedScore, Bytes)>> = match self {
+                RudisZSet::Small(v) => Box::new(v.iter().filter(filter_fn)),
+                RudisZSet::Full { tree, .. } => Box::new(tree.iter().filter(filter_fn)),
+            };
+
+            if opts.rev {
+                let rev_items: Vec<_> = get_items.collect();
+                let skipped = rev_items.into_iter().rev().skip(opts.offset);
+                if let Some(c) = opts.count {
+                    skipped.take(c).map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                } else {
+                    skipped.map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                }
+            } else {
+                let skipped = get_items.skip(opts.offset);
+                if let Some(c) = opts.count {
+                    skipped.take(c).map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                } else {
+                    skipped.map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                }
+            }
+        } else {
+            let mut start = opts.start;
+            let mut stop = opts.stop;
+            let n_i = n as i64;
+            if start < 0 { start = (n_i + start).max(0); }
+            if stop < 0 { stop = n_i + stop; }
+            if start > stop || start >= n_i { return Vec::new(); }
+            let start_u = start.max(0) as usize;
+            let stop_u = (stop.min(n_i - 1) as usize).max(start_u);
+            let limit = stop_u - start_u + 1;
+
+            match self {
+                RudisZSet::Small(v) => {
+                    if opts.rev {
+                        v.iter().rev().skip(start_u).take(limit).map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                    } else {
+                        v.iter().skip(start_u).take(limit).map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                    }
+                }
+                RudisZSet::Full { tree, .. } => {
+                    if opts.rev {
+                        tree.iter().rev().skip(start_u).take(limit).map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                    } else {
+                        tree.iter().skip(start_u).take(limit).map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn pop_min(&mut self, count: usize) -> Vec<(Bytes, f64)> {
+        let n = count.min(self.len());
+        let mut popped = Vec::with_capacity(n);
+        match self {
+            RudisZSet::Small(v) => {
+                for _ in 0..n {
+                    let (OrderedScore(s), m) = v.remove(0);
+                    popped.push((m, s));
+                }
+            }
+            RudisZSet::Full { dict, tree } => {
+                for _ in 0..n {
+                    if let Some((OrderedScore(s), m)) = tree.pop_first() {
+                        dict.remove(&m);
+                        popped.push((m, s));
+                    }
+                }
+            }
+        }
+        popped
+    }
+
+    pub fn pop_max(&mut self, count: usize) -> Vec<(Bytes, f64)> {
+        let n = count.min(self.len());
+        let mut popped = Vec::with_capacity(n);
+        match self {
+            RudisZSet::Small(v) => {
+                for _ in 0..n {
+                    let (OrderedScore(s), m) = v.pop().unwrap();
+                    popped.push((m, s));
+                }
+            }
+            RudisZSet::Full { dict, tree } => {
+                for _ in 0..n {
+                    if let Some((OrderedScore(s), m)) = tree.pop_last() {
+                        dict.remove(&m);
+                        popped.push((m, s));
+                    }
+                }
+            }
+        }
+        popped
+    }
+
+    pub fn for_each<F: FnMut(&Bytes, f64)>(&self, mut f: F) {
+        match self {
+            RudisZSet::Small(v) => {
+                for (OrderedScore(s), m) in v {
+                    f(m, *s);
+                }
+            }
+            RudisZSet::Full { dict, .. } => {
+                for (m, s) in dict {
+                    f(m, *s);
+                }
+            }
+        }
     }
 }
+
+impl PartialEq for RudisZSet {
+    fn eq(&self, other: &Self) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        match (self, other) {
+            (RudisZSet::Small(a), RudisZSet::Small(b)) => a == b,
+            _ => {
+                let mut a_items: Vec<(OrderedScore, Bytes)> = Vec::with_capacity(self.len());
+                self.for_each(|m, s| a_items.push((OrderedScore(s), m.clone())));
+                a_items.sort();
+                let mut b_items: Vec<(OrderedScore, Bytes)> = Vec::with_capacity(other.len());
+                other.for_each(|m, s| b_items.push((OrderedScore(s), m.clone())));
+                b_items.sort();
+                a_items == b_items
+            }
+        }
+    }
+}
+
+impl Eq for RudisZSet {}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StreamId {
@@ -315,11 +556,12 @@ fn match_control_bytes(ctrl: &[u8], offset: usize, target: u8) -> u16 {
 /// with inlined values and expiration metadata.
 pub struct RudisFlatTable {
     ctrl: Vec<u8>,
-    slots: Vec<Option<RudisEntry>>,
-    capacity: usize,
+    pub slots: Vec<Option<RudisEntry>>,
+    pub capacity: usize,
     mask: usize,
     items: usize,
     growth_left: usize,
+    pub slot_counts: Box<[u32; 16384]>,
 }
 
 impl RudisFlatTable {
@@ -340,6 +582,7 @@ impl RudisFlatTable {
             mask: cap - 1,
             items: 0,
             growth_left: cap * 7 / 8,
+            slot_counts: vec![0u32; 16384].into_boxed_slice().try_into().unwrap(),
         }
     }
 
@@ -441,6 +684,7 @@ impl RudisFlatTable {
                 new_table.growth_left = new_table.growth_left.saturating_sub(1);
             }
         }
+        new_table.slot_counts = self.slot_counts.clone();
         *self = new_table;
     }
 
@@ -458,6 +702,8 @@ impl RudisFlatTable {
         } else {
             let tag = fingerprint(h);
             self.set_ctrl(insert_idx, tag);
+            let slot = crate::router::key_slot(&entry.key) as usize;
+            self.slot_counts[slot] += 1;
             self.slots[insert_idx] = Some(entry);
             self.items += 1;
             self.growth_left = self.growth_left.saturating_sub(1);
@@ -468,8 +714,14 @@ impl RudisFlatTable {
     pub fn remove(&mut self, slot_idx: usize) -> Option<RudisEntry> {
         self.set_ctrl(slot_idx, DELETED);
         self.items -= 1;
-        self.slots[slot_idx].take()
+        let entry = self.slots[slot_idx].take();
+        if let Some(ref e) = entry {
+            let slot = crate::router::key_slot(&e.key) as usize;
+            self.slot_counts[slot] = self.slot_counts[slot].saturating_sub(1);
+        }
+        entry
     }
+
 
     #[inline(always)]
     pub fn get_slot(&self, idx: usize) -> Option<&RudisEntry> {
@@ -491,6 +743,7 @@ impl RudisFlatTable {
         self.capacity
     }
 
+    #[inline(always)]
     pub fn clear(&mut self) {
         let cap = self.capacity;
         self.ctrl.fill(EMPTY);
@@ -498,6 +751,7 @@ impl RudisFlatTable {
         self.slots.fill(None);
         self.items = 0;
         self.growth_left = (cap * 7) / 8;
+        self.slot_counts.fill(0);
     }
 }
 
@@ -507,7 +761,6 @@ impl RudisFlatTable {
 /// 3. Secondary cluster slot index
 pub struct RudisTable {
     table: RudisFlatTable,
-    slot_to_keys: HashMap<u16, hashbrown::HashSet<Bytes>>,
     sample_cursor: usize,
 }
 
@@ -515,7 +768,6 @@ impl RudisTable {
     pub fn new() -> Self {
         Self {
             table: RudisFlatTable::new(64),
-            slot_to_keys: HashMap::new(),
             sample_cursor: 0,
         }
     }
@@ -533,12 +785,7 @@ impl RudisTable {
         };
 
         if is_exp {
-            if let Some(removed) = self.table.remove(slot_idx) {
-                let slot = crate::router::key_slot(&removed.key);
-                if let Some(set) = self.slot_to_keys.get_mut(&slot) {
-                    set.remove(&removed.key);
-                }
-            }
+            self.table.remove(slot_idx);
             true
         } else {
             false
@@ -679,12 +926,6 @@ impl RudisTable {
             }
         }
 
-        let slot = crate::router::key_slot(&key);
-        self.slot_to_keys
-            .entry(slot)
-            .or_default()
-            .insert(key.clone());
-
         let entry = RudisEntry {
             key,
             val,
@@ -700,11 +941,7 @@ impl RudisTable {
             if was_exp {
                 return false;
             }
-            if let Some(removed) = self.table.remove(idx) {
-                let slot = crate::router::key_slot(&removed.key);
-                if let Some(set) = self.slot_to_keys.get_mut(&slot) {
-                    set.remove(&removed.key);
-                }
+            if self.table.remove(idx).is_some() {
                 return true;
             }
         }
@@ -758,11 +995,6 @@ impl RudisTable {
         }
 
         let new_val = delta;
-        let slot = crate::router::key_slot(&key);
-        self.slot_to_keys
-            .entry(slot)
-            .or_default()
-            .insert(key.clone());
         let entry = RudisEntry {
             key,
             val: RudisValue::Int(new_val),
@@ -940,7 +1172,6 @@ impl RudisTable {
 
     pub fn flushdb(&mut self) {
         self.table.clear();
-        self.slot_to_keys.clear();
     }
 
     pub fn dbsize(&mut self) -> usize {
@@ -1017,26 +1248,15 @@ impl RudisTable {
 
         // Remove src
         let mut entry = self.table.remove(src_idx).unwrap();
-        let src_slot = crate::router::key_slot(&entry.key);
-        if let Some(set) = self.slot_to_keys.get_mut(&src_slot) {
-            set.remove(&entry.key);
-        }
 
-        // If dst exists, remove it from slot_to_keys first
+        // If dst exists, remove it first
         let h_dst = hash_key(&dst);
         if let Some(dst_idx) = self.table.find(&dst, h_dst) {
-            if let Some(old_dst) = self.table.remove(dst_idx) {
-                let dst_slot = crate::router::key_slot(&old_dst.key);
-                if let Some(set) = self.slot_to_keys.get_mut(&dst_slot) {
-                    set.remove(&old_dst.key);
-                }
-            }
+            self.table.remove(dst_idx);
         }
 
         // Update entry key to dst and insert
-        entry.key = dst.clone();
-        let dst_slot = crate::router::key_slot(&dst);
-        self.slot_to_keys.entry(dst_slot).or_default().insert(dst);
+        entry.key = dst;
         self.table.insert(entry);
 
         Ok(true)
@@ -1099,19 +1319,11 @@ impl RudisTable {
                 match &entry.val {
                     RudisValue::String(s) => {
                         let val = s.clone();
-                        let slot = crate::router::key_slot(key);
-                        if let Some(set) = self.slot_to_keys.get_mut(&slot) {
-                            set.remove(key);
-                        }
                         self.table.remove(idx);
                         Ok(Some(val))
                     }
                     RudisValue::Int(n) => {
                         let val = Self::format_i64(*n);
-                        let slot = crate::router::key_slot(key);
-                        if let Some(set) = self.slot_to_keys.get_mut(&slot) {
-                            set.remove(key);
-                        }
                         self.table.remove(idx);
                         Ok(Some(val))
                     }
@@ -1231,12 +1443,6 @@ impl RudisTable {
             }
         }
 
-        let slot = crate::router::key_slot(&key);
-        self.slot_to_keys
-            .entry(slot)
-            .or_default()
-            .insert(key.clone());
-
         let (val, added) = if fields.len() <= 64 {
             let added = fields.len();
             (RudisValue::SmallHash(fields), added)
@@ -1347,12 +1553,7 @@ impl RudisTable {
             };
 
             if is_empty {
-                if let Some(removed) = self.table.remove(idx) {
-                    let slot = crate::router::key_slot(&removed.key);
-                    if let Some(set) = self.slot_to_keys.get_mut(&slot) {
-                        set.remove(&removed.key);
-                    }
-                }
+                self.table.remove(idx);
             }
             Ok(count)
         } else {
@@ -1490,11 +1691,6 @@ impl RudisTable {
             deque.push_front(v);
         }
         let len = deque.len();
-        let slot = crate::router::key_slot(&key);
-        self.slot_to_keys
-            .entry(slot)
-            .or_default()
-            .insert(key.clone());
         let entry = RudisEntry {
             key,
             val: RudisValue::List(deque),
@@ -1531,11 +1727,6 @@ impl RudisTable {
             deque.push_back(v);
         }
         let len = deque.len();
-        let slot = crate::router::key_slot(&key);
-        self.slot_to_keys
-            .entry(slot)
-            .or_default()
-            .insert(key.clone());
         let entry = RudisEntry {
             key,
             val: RudisValue::List(deque),
@@ -1576,12 +1767,7 @@ impl RudisTable {
             };
 
             if is_empty {
-                if let Some(removed) = self.table.remove(idx) {
-                    let slot = crate::router::key_slot(&removed.key);
-                    if let Some(set) = self.slot_to_keys.get_mut(&slot) {
-                        set.remove(&removed.key);
-                    }
-                }
+                self.table.remove(idx);
             }
             Ok(popped)
         } else {
@@ -1620,12 +1806,7 @@ impl RudisTable {
             };
 
             if is_empty {
-                if let Some(removed) = self.table.remove(idx) {
-                    let slot = crate::router::key_slot(&removed.key);
-                    if let Some(set) = self.slot_to_keys.get_mut(&slot) {
-                        set.remove(&removed.key);
-                    }
-                }
+                self.table.remove(idx);
             }
             Ok(popped)
         } else {
@@ -1759,11 +1940,6 @@ impl RudisTable {
                 added += 1;
             }
         }
-        let slot = crate::router::key_slot(&key);
-        self.slot_to_keys
-            .entry(slot)
-            .or_default()
-            .insert(key.clone());
         let entry = RudisEntry {
             key,
             val: RudisValue::Set(set),
@@ -1802,12 +1978,7 @@ impl RudisTable {
             };
 
             if is_empty {
-                if let Some(removed) = self.table.remove(idx) {
-                    let slot = crate::router::key_slot(&removed.key);
-                    if let Some(set) = self.slot_to_keys.get_mut(&slot) {
-                        set.remove(&removed.key);
-                    }
-                }
+                self.table.remove(idx);
             }
             Ok(removed_count)
         } else {
@@ -1904,12 +2075,7 @@ impl RudisTable {
             };
 
             if is_empty {
-                if let Some(removed) = self.table.remove(idx) {
-                    let slot = crate::router::key_slot(&removed.key);
-                    if let Some(set) = self.slot_to_keys.get_mut(&slot) {
-                        set.remove(&removed.key);
-                    }
-                }
+                self.table.remove(idx);
             }
             Ok(popped)
         } else {
@@ -1918,59 +2084,55 @@ impl RudisTable {
     }
 
     pub fn count_keys_in_slot(&mut self, slot: u16) -> usize {
-        if let Some(keys) = self.slot_to_keys.get_mut(&slot) {
-            let mut expired = Vec::new();
-            for k in keys.iter() {
-                let h = hash_key(k);
-                if let Some(idx) = self.table.find(k, h) {
-                    if let Some(entry) = self.table.get_slot(idx) {
-                        if let Some(exp) = entry.expire_at {
-                            if Instant::now() >= exp {
-                                expired.push(k.clone());
-                            }
+        if self.table.slot_counts[slot as usize] == 0 {
+            return 0;
+        }
+        let now = Instant::now();
+        let mut count = 0;
+        let mut expired_indices = Vec::new();
+        for (idx, opt) in self.table.slots.iter().enumerate() {
+            if let Some(entry) = opt {
+                if crate::router::key_slot(&entry.key) == slot {
+                    if let Some(exp) = entry.expire_at {
+                        if now >= exp {
+                            expired_indices.push(idx);
+                            continue;
                         }
                     }
+                    count += 1;
                 }
             }
-            for k in expired {
-                keys.remove(&k);
-                let h = hash_key(&k);
-                if let Some(idx) = self.table.find(&k, h) {
-                    self.table.remove(idx);
-                }
-            }
-            keys.len()
-        } else {
-            0
         }
+        for idx in expired_indices {
+            self.table.remove(idx);
+        }
+        count
     }
 
     pub fn get_keys_in_slot(&mut self, slot: u16, count: usize) -> Vec<Bytes> {
-        if let Some(keys) = self.slot_to_keys.get_mut(&slot) {
-            let mut expired = Vec::new();
-            for k in keys.iter() {
-                let h = hash_key(k);
-                if let Some(idx) = self.table.find(k, h) {
-                    if let Some(entry) = self.table.get_slot(idx) {
-                        if let Some(exp) = entry.expire_at {
-                            if Instant::now() >= exp {
-                                expired.push(k.clone());
-                            }
+        let now = Instant::now();
+        let mut result = Vec::new();
+        let mut expired_indices = Vec::new();
+        for (idx, opt) in self.table.slots.iter().enumerate() {
+            if let Some(entry) = opt {
+                if crate::router::key_slot(&entry.key) == slot {
+                    if let Some(exp) = entry.expire_at {
+                        if now >= exp {
+                            expired_indices.push(idx);
+                            continue;
                         }
+                    }
+                    result.push(entry.key.clone());
+                    if result.len() >= count {
+                        break;
                     }
                 }
             }
-            for k in expired {
-                keys.remove(&k);
-                let h = hash_key(&k);
-                if let Some(idx) = self.table.find(&k, h) {
-                    self.table.remove(idx);
-                }
-            }
-            keys.iter().take(count).cloned().collect()
-        } else {
-            Vec::new()
         }
+        for idx in expired_indices {
+            self.table.remove(idx);
+        }
+        result
     }
 
     // =========================================================================
@@ -1995,7 +2157,7 @@ impl RudisTable {
                         let mut new_score_incr = None;
 
                         for (score, member) in elements {
-                            if let Some(&old_score) = zset.dict.get(&member) {
+                            if let Some(old_score) = zset.get_score(&member) {
                                 if flags.nx {
                                     continue;
                                 }
@@ -2007,9 +2169,7 @@ impl RudisTable {
                                     continue;
                                 }
                                 if new_score != old_score {
-                                    zset.tree.remove(&(OrderedScore(old_score), member.clone()));
-                                    zset.tree.insert((OrderedScore(new_score), member.clone()));
-                                    zset.dict.insert(member, new_score);
+                                    zset.insert(new_score, member);
                                     changed_count += 1;
                                 }
                                 if flags.incr {
@@ -2019,8 +2179,7 @@ impl RudisTable {
                                 if flags.xx {
                                     continue;
                                 }
-                                zset.tree.insert((OrderedScore(score), member.clone()));
-                                zset.dict.insert(member, score);
+                                zset.insert(score, member);
                                 added_count += 1;
                                 changed_count += 1;
                                 if flags.incr {
@@ -2051,8 +2210,7 @@ impl RudisTable {
         let mut new_score_incr = None;
 
         for (score, member) in elements {
-            zset.tree.insert((OrderedScore(score), member.clone()));
-            zset.dict.insert(member, score);
+            zset.insert(score, member);
             added_count += 1;
             if flags.incr {
                 new_score_incr = Some(score);
@@ -2076,7 +2234,7 @@ impl RudisTable {
             }
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
-                    RudisValue::ZSet(zset) => Ok(zset.dict.get(member).copied()),
+                    RudisValue::ZSet(zset) => Ok(zset.get_score(member)),
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
@@ -2119,18 +2277,7 @@ impl RudisTable {
             }
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
-                    RudisValue::ZSet(zset) => {
-                        if !zset.dict.contains_key(member) {
-                            return Ok(None);
-                        }
-                        if rev {
-                            let rank = zset.tree.iter().rev().position(|(_, m)| m == member);
-                            Ok(rank)
-                        } else {
-                            let rank = zset.tree.iter().position(|(_, m)| m == member);
-                            Ok(rank)
-                        }
-                    }
+                    RudisValue::ZSet(zset) => Ok(zset.rank(member, rev)),
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
@@ -2156,18 +2303,7 @@ impl RudisTable {
             }
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
-                    RudisValue::ZSet(zset) => {
-                        let count = zset
-                            .tree
-                            .iter()
-                            .filter(|(OrderedScore(s), _)| {
-                                let ge_min = if min_inc { *s >= min } else { *s > min };
-                                let le_max = if max_inc { *s <= max } else { *s < max };
-                                ge_min && le_max
-                            })
-                            .count();
-                        Ok(count)
-                    }
+                    RudisValue::ZSet(zset) => Ok(zset.count(min, min_inc, max, max_inc)),
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
@@ -2186,15 +2322,12 @@ impl RudisTable {
             } else if let Some(entry) = self.table.get_slot_mut(idx) {
                 match &mut entry.val {
                     RudisValue::ZSet(zset) => {
-                        let new_score = if let Some(&old_score) = zset.dict.get(&member) {
-                            zset.tree.remove(&(OrderedScore(old_score), member.clone()));
+                        let new_score = if let Some(old_score) = zset.get_score(&member) {
                             let s = old_score + delta;
-                            zset.tree.insert((OrderedScore(s), member.clone()));
-                            zset.dict.insert(member, s);
+                            zset.insert(s, member);
                             s
                         } else {
-                            zset.tree.insert((OrderedScore(delta), member.clone()));
-                            zset.dict.insert(member, delta);
+                            zset.insert(delta, member);
                             delta
                         };
                         return Ok(new_score);
@@ -2209,8 +2342,7 @@ impl RudisTable {
         }
 
         let mut zset = RudisZSet::new();
-        zset.tree.insert((OrderedScore(delta), member.clone()));
-        zset.dict.insert(member, delta);
+        zset.insert(delta, member);
         let entry = RudisEntry {
             key,
             val: RudisValue::ZSet(zset),
@@ -2232,89 +2364,7 @@ impl RudisTable {
             }
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
-                    RudisValue::ZSet(zset) => {
-                        let n = zset.len();
-                        if n == 0 {
-                            return Ok(Vec::new());
-                        }
-
-                        if opts.by_score {
-                            let min = opts.min_score;
-                            let min_inc = opts.min_inc;
-                            let max = opts.max_score;
-                            let max_inc = opts.max_inc;
-
-                            let make_iter = || {
-                                zset.tree.iter().filter(move |(OrderedScore(s), _)| {
-                                    let ge_min = if min_inc { *s >= min } else { *s > min };
-                                    let le_max = if max_inc { *s <= max } else { *s < max };
-                                    ge_min && le_max
-                                })
-                            };
-
-                            let res: Vec<(Bytes, f64)> = if opts.rev {
-                                let rev_items: Vec<_> = make_iter().collect();
-                                let skipped = rev_items.into_iter().rev().skip(opts.offset);
-                                if let Some(c) = opts.count {
-                                    skipped
-                                        .take(c)
-                                        .map(|(OrderedScore(s), m)| (m.clone(), *s))
-                                        .collect()
-                                } else {
-                                    skipped
-                                        .map(|(OrderedScore(s), m)| (m.clone(), *s))
-                                        .collect()
-                                }
-                            } else {
-                                let skipped = make_iter().skip(opts.offset);
-                                if let Some(c) = opts.count {
-                                    skipped
-                                        .take(c)
-                                        .map(|(OrderedScore(s), m)| (m.clone(), *s))
-                                        .collect()
-                                } else {
-                                    skipped
-                                        .map(|(OrderedScore(s), m)| (m.clone(), *s))
-                                        .collect()
-                                }
-                            };
-                            Ok(res)
-                        } else {
-                            let mut start = opts.start;
-                            let mut stop = opts.stop;
-                            let n_i = n as i64;
-                            if start < 0 {
-                                start = (n_i + start).max(0);
-                            }
-                            if stop < 0 {
-                                stop = n_i + stop;
-                            }
-                            if start > stop || start >= n_i {
-                                return Ok(Vec::new());
-                            }
-                            let start_u = start.max(0) as usize;
-                            let stop_u = (stop.min(n_i - 1) as usize).max(start_u);
-                            let limit = stop_u - start_u + 1;
-
-                            let res: Vec<(Bytes, f64)> = if opts.rev {
-                                zset.tree
-                                    .iter()
-                                    .rev()
-                                    .skip(start_u)
-                                    .take(limit)
-                                    .map(|(OrderedScore(s), m)| (m.clone(), *s))
-                                    .collect()
-                            } else {
-                                zset.tree
-                                    .iter()
-                                    .skip(start_u)
-                                    .take(limit)
-                                    .map(|(OrderedScore(s), m)| (m.clone(), *s))
-                                    .collect()
-                            };
-                            Ok(res)
-                        }
-                    }
+                    RudisValue::ZSet(zset) => Ok(zset.range(opts)),
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
@@ -2336,8 +2386,7 @@ impl RudisTable {
                     RudisValue::ZSet(zset) => {
                         let mut count = 0usize;
                         for m in members {
-                            if let Some(old_score) = zset.dict.remove(m) {
-                                zset.tree.remove(&(OrderedScore(old_score), m.clone()));
+                            if zset.remove(m).is_some() {
                                 count += 1;
                             }
                         }
@@ -2371,14 +2420,7 @@ impl RudisTable {
             let (res, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
                 match &mut entry.val {
                     RudisValue::ZSet(zset) => {
-                        let n = count.min(zset.len());
-                        let mut popped = Vec::with_capacity(n);
-                        for _ in 0..n {
-                            if let Some((OrderedScore(s), m)) = zset.tree.pop_first() {
-                                zset.dict.remove(&m);
-                                popped.push((m, s));
-                            }
-                        }
+                        let popped = zset.pop_min(count);
                         (popped, zset.is_empty())
                     }
                     _ => {
@@ -2409,14 +2451,7 @@ impl RudisTable {
             let (res, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
                 match &mut entry.val {
                     RudisValue::ZSet(zset) => {
-                        let n = count.min(zset.len());
-                        let mut popped = Vec::with_capacity(n);
-                        for _ in 0..n {
-                            if let Some((OrderedScore(s), m)) = zset.tree.pop_last() {
-                                zset.dict.remove(&m);
-                                popped.push((m, s));
-                            }
-                        }
+                        let popped = zset.pop_max(count);
                         (popped, zset.is_empty())
                     }
                     _ => {
@@ -2526,11 +2561,6 @@ impl RudisTable {
         if value == 1 {
             vec[byte_idx] |= 1 << bit_idx;
         }
-        let slot = crate::router::key_slot(&key);
-        self.slot_to_keys
-            .entry(slot)
-            .or_default()
-            .insert(key.clone());
         let entry = RudisEntry {
             key,
             val: RudisValue::String(Bytes::from(vec)),
@@ -2850,11 +2880,6 @@ impl RudisTable {
                 updated = true;
             }
         }
-        let slot = crate::router::key_slot(&key);
-        self.slot_to_keys
-            .entry(slot)
-            .or_default()
-            .insert(key.clone());
         let entry = RudisEntry {
             key,
             val: RudisValue::HyperLogLog(regs),
@@ -2983,11 +3008,6 @@ impl RudisTable {
             }
         }
 
-        let slot = crate::router::key_slot(&destkey);
-        self.slot_to_keys
-            .entry(slot)
-            .or_default()
-            .insert(destkey.clone());
         let entry = RudisEntry {
             key: destkey,
             val: RudisValue::HyperLogLog(Box::new(merged)),
@@ -3108,11 +3128,6 @@ impl RudisTable {
                 stream.entries.insert(final_id, fields);
                 Self::apply_stream_trim(&mut stream, maxlen, minid);
 
-                let slot = crate::router::key_slot(&key);
-                self.slot_to_keys
-                    .entry(slot)
-                    .or_default()
-                    .insert(key.clone());
                 let entry = RudisEntry {
                     key,
                     val: RudisValue::Stream(stream),
@@ -3150,11 +3165,6 @@ impl RudisTable {
         stream.entries.insert(final_id, fields);
         Self::apply_stream_trim(&mut stream, maxlen, minid);
 
-        let slot = crate::router::key_slot(&key);
-        self.slot_to_keys
-            .entry(slot)
-            .or_default()
-            .insert(key.clone());
         let entry = RudisEntry {
             key,
             val: RudisValue::Stream(stream),
@@ -3415,11 +3425,11 @@ impl RudisTable {
             RudisValue::ZSet(z) => {
                 payload.push(3u8);
                 payload.extend_from_slice(&(z.len() as u32).to_le_bytes());
-                for (m, score) in &z.dict {
+                z.for_each(|m, score| {
                     payload.extend_from_slice(&(m.len() as u32).to_le_bytes());
                     payload.extend_from_slice(m);
                     payload.extend_from_slice(&score.to_bits().to_le_bytes());
-                }
+                });
             }
             RudisValue::SmallHash(pairs) => {
                 payload.push(4u8);
@@ -3777,8 +3787,6 @@ impl RudisTable {
             Some(Instant::now() + Duration::from_millis(ttl_ms))
         };
 
-        let slot = crate::router::key_slot(&key);
-        self.slot_to_keys.entry(slot).or_default().insert(key.clone());
         let entry = RudisEntry {
             key,
             val: decoded_value,
@@ -3856,8 +3864,6 @@ impl RudisTable {
             data = &data[consumed..];
 
             self.del(&key);
-            let slot = crate::router::key_slot(&key);
-            self.slot_to_keys.entry(slot).or_default().insert(key.clone());
             self.table.insert(RudisEntry {
                 key,
                 val,
@@ -3892,8 +3898,6 @@ impl RudisTable {
                 return Err("ERR The XGROUP subcommand requires the key to exist");
             }
             let stream = RudisStream::new();
-            let slot = crate::router::key_slot(&key);
-            self.slot_to_keys.entry(slot).or_default().insert(key.clone());
             let entry = RudisEntry {
                 key: key.clone(),
                 val: RudisValue::Stream(stream),
@@ -4237,6 +4241,138 @@ pub fn crc64(data: &[u8]) -> u64 {
         }
     }
     crc
+}
+
+pub fn load_rdb(
+    path: &std::path::Path,
+    db: &mut crate::shard::ShardDb,
+    shard_id: usize,
+    num_shards: usize,
+) -> std::io::Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let data = std::fs::read(path)?;
+    if data.len() < 18 {
+        return Ok(0);
+    }
+    if !data.starts_with(b"REDIS") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid RDB magic header",
+        ));
+    }
+    let content_len = data.len() - 8;
+    let expected_crc = u64::from_le_bytes(data[content_len..].try_into().unwrap());
+    let actual_crc = crc64(&data[..content_len]);
+    if expected_crc != actual_crc {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "CRC64 checksum mismatch in RDB file",
+        ));
+    }
+
+    let unix_now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let mut cursor = 9; // Skip REDIS0011
+    let mut count = 0;
+
+    while cursor < content_len {
+        let op = data[cursor];
+        if op == 0xFF {
+            // EOF
+            break;
+        }
+        if op == 0xFE {
+            // SELECTDB
+            cursor += 1;
+            if cursor < content_len {
+                cursor += 1; // DB number
+            }
+            continue;
+        }
+
+        let mut expire_at = None;
+        if op == 0xFC {
+            // EXPIRETIME_MS
+            cursor += 1;
+            if cursor + 8 > content_len {
+                break;
+            }
+            let exp_unix_ms = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+            cursor += 8;
+            if exp_unix_ms <= unix_now {
+                // Expired - skip key and value
+                if cursor + 4 > content_len { break; }
+                let k_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                cursor += 4;
+                if cursor + k_len > content_len { break; }
+                cursor += k_len;
+                if let Ok((_, consumed)) = RudisTable::deserialize_val_payload(&data[cursor..content_len]) {
+                    cursor += consumed;
+                } else {
+                    break;
+                }
+                continue;
+            }
+            expire_at = Some(Instant::now() + Duration::from_millis(exp_unix_ms - unix_now));
+        } else if op == 0xFD {
+            // EXPIRETIME_SEC
+            cursor += 1;
+            if cursor + 4 > content_len {
+                break;
+            }
+            let exp_unix_sec = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as u64;
+            cursor += 4;
+            let exp_unix_ms = exp_unix_sec * 1000;
+            if exp_unix_ms <= unix_now {
+                if cursor + 4 > content_len { break; }
+                let k_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                cursor += 4;
+                if cursor + k_len > content_len { break; }
+                cursor += k_len;
+                if let Ok((_, consumed)) = RudisTable::deserialize_val_payload(&data[cursor..content_len]) {
+                    cursor += consumed;
+                } else {
+                    break;
+                }
+                continue;
+            }
+            expire_at = Some(Instant::now() + Duration::from_millis(exp_unix_ms - unix_now));
+        }
+
+        if cursor + 4 > content_len {
+            break;
+        }
+        let k_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+        cursor += 4;
+        if cursor + k_len > content_len {
+            break;
+        }
+        let key = Bytes::copy_from_slice(&data[cursor..cursor + k_len]);
+        cursor += k_len;
+
+        let (val, consumed) = match RudisTable::deserialize_val_payload(&data[cursor..content_len]) {
+            Ok(res) => res,
+            Err(_) => break,
+        };
+        cursor += consumed;
+
+        if crate::router::target_shard(&key, num_shards) == shard_id {
+            db.table.del(&key);
+            db.table.table.insert(RudisEntry {
+                key,
+                val,
+                expire_at,
+            });
+            count += 1;
+        }
+    }
+
+    Ok(count)
 }
 
 #[cfg(test)]

@@ -20,6 +20,8 @@ pub enum ClusterSubcommand {
     Info,
     Meet { ip: String, port: u16 },
     MyId,
+    MigrateSlot { slot: u16, host: String, port: u16 },
+    Rebalance { host: String, port: u16, slots: Option<usize> },
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -765,6 +767,51 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         .and_then(|s| s.parse().ok())
                         .ok_or_else(|| "value is not an integer or out of range".to_string())?;
                     Ok(Some(Command::Cluster(ClusterSubcommand::Meet { ip, port })))
+                }
+                "MIGRATE-SLOT" | "MIGRATESLOT" => {
+                    if args.len() < 5 {
+                        return Err(
+                            "wrong number of arguments for 'cluster migrate-slot' command"
+                                .to_string(),
+                        );
+                    }
+                    let slot: u16 = std::str::from_utf8(&args[2])
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                    let host = String::from_utf8_lossy(&args[3]).to_string();
+                    let port: u16 = std::str::from_utf8(&args[4])
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                    Ok(Some(Command::Cluster(ClusterSubcommand::MigrateSlot {
+                        slot,
+                        host,
+                        port,
+                    })))
+                }
+                "REBALANCE" => {
+                    if args.len() < 4 {
+                        return Err(
+                            "wrong number of arguments for 'cluster rebalance' command"
+                                .to_string(),
+                        );
+                    }
+                    let host = String::from_utf8_lossy(&args[2]).to_string();
+                    let port: u16 = std::str::from_utf8(&args[3])
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                    let slots = if args.len() > 4 {
+                        std::str::from_utf8(&args[4]).ok().and_then(|s| s.parse().ok())
+                    } else {
+                        None
+                    };
+                    Ok(Some(Command::Cluster(ClusterSubcommand::Rebalance {
+                        host,
+                        port,
+                        slots,
+                    })))
                 }
                 _ => Ok(Some(Command::Unknown(format!("CLUSTER {}", sub)))),
             }

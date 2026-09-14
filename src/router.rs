@@ -81,6 +81,7 @@ pub struct Router {
     pub tx_waiters: Rc<RefCell<std::collections::VecDeque<(u64, flume::Sender<()>)>>>,
     pub is_saving: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub last_save_time: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub db_dir: std::path::PathBuf,
 }
 
 impl Router {
@@ -92,6 +93,7 @@ impl Router {
         senders: Vec<flume::Sender<ShardMessage>>,
         aof: Option<Rc<RefCell<crate::aof::AofWriter>>>,
         pubsub: Rc<RefCell<crate::pubsub::PubSubHub>>,
+        db_dir: std::path::PathBuf,
     ) -> Self {
         let mut slot_states = Vec::with_capacity(16384);
         let mut slot_owners = Vec::with_capacity(16384);
@@ -113,6 +115,7 @@ impl Router {
             tx_waiters: Rc::new(RefCell::new(std::collections::VecDeque::new())),
             is_saving: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_save_time: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            db_dir,
         }
     }
 
@@ -486,7 +489,7 @@ impl Router {
         if self.senders[target].send(msg).is_ok() {
             if let Ok(mut res) = rx.recv_async().await {
                 if let Some((_, out)) = res.pop() {
-                    return out;
+                    return out.into_vec();
                 }
             }
         }
@@ -849,14 +852,16 @@ impl Router {
 
         static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let tmp_id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let filename = "dump.rdb";
-        let tmp_filename = format!("{}.tmp.{}_{}", filename, std::process::id(), tmp_id);
+        let filename = self.db_dir.join("dump.rdb");
+        let tmp_filename = self
+            .db_dir
+            .join(format!("dump.rdb.tmp.{}_{}", std::process::id(), tmp_id));
         let res = (|| -> Result<(), String> {
             use std::io::Write;
             let mut file = std::fs::File::create(&tmp_filename).map_err(|e| e.to_string())?;
             file.write_all(&full_rdb).map_err(|e| e.to_string())?;
             file.sync_all().map_err(|e| e.to_string())?;
-            std::fs::rename(&tmp_filename, filename).map_err(|e| e.to_string())?;
+            std::fs::rename(&tmp_filename, &filename).map_err(|e| e.to_string())?;
             Ok(())
         })();
 
@@ -923,10 +928,12 @@ impl Router {
         }
         if let Ok(mut remote_nodes) = REMOTE_CLUSTER_NODES.write() {
             for node in remote_nodes.iter_mut() {
-                if now.saturating_sub(node.ping_sent) > 10000 {
+                if now.saturating_sub(node.pong_recv) > 10000 {
                     node.flags = "fail".to_string();
-                } else if now.saturating_sub(node.ping_sent) > 5000 {
+                } else if now.saturating_sub(node.pong_recv) > 5000 {
                     node.flags = "fail?".to_string();
+                } else {
+                    node.flags = "master".to_string();
                 }
                 nodes.push_str(&format!(
                     "{} {}:{}@{} {} {} {} {} {} {}\n",
@@ -956,5 +963,62 @@ impl Router {
             "cluster_state:{}\r\ncluster_slots_assigned:16384\r\ncluster_slots_ok:16384\r\ncluster_slots_pfail:{}\r\ncluster_slots_fail:{}\r\ncluster_known_nodes:{}\r\ncluster_size:{}\r\ncluster_current_epoch:1\r\ncluster_my_epoch:1\r\ncluster_stats_messages_sent:0\r\ncluster_stats_messages_received:0\r\n",
             state, pfail_count, fail_count, total_nodes, total_nodes
         )
+    }
+}
+
+pub async fn cluster_gossip_tick() {
+    let nodes_to_ping: Vec<(String, u16)> = if let Ok(nodes) = REMOTE_CLUSTER_NODES.read() {
+        nodes.iter().map(|n| (n.ip.clone(), n.port)).collect()
+    } else {
+        return;
+    };
+
+    if nodes_to_ping.is_empty() {
+        return;
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    for (ip, port) in nodes_to_ping {
+        if let Ok(mut nodes) = REMOTE_CLUSTER_NODES.write() {
+            if let Some(node) = nodes.iter_mut().find(|n| n.ip == ip && n.port == port) {
+                node.ping_sent = now;
+            }
+        }
+
+        let addr = format!("{}:{}", ip, port);
+        let success = match monoio::net::TcpStream::connect(&addr).await {
+            Ok(mut stream) => {
+                use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
+                let (res, _) = stream.write_all(b"*1\r\n$4\r\nPING\r\n".to_vec()).await;
+                if res.is_ok() {
+                    let buf = vec![0u8; 64];
+                    let (res, read_buf) = stream.read(buf).await;
+                    if let Ok(n) = res {
+                        read_buf[..n].starts_with(b"+PONG")
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        };
+
+        if let Ok(mut nodes) = REMOTE_CLUSTER_NODES.write() {
+            if let Some(node) = nodes.iter_mut().find(|n| n.ip == ip && n.port == port) {
+                if success {
+                    node.pong_recv = now;
+                    node.link_state = "connected".to_string();
+                    node.flags = "master".to_string();
+                } else {
+                    node.link_state = "disconnected".to_string();
+                }
+            }
+        }
     }
 }

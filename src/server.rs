@@ -53,6 +53,24 @@ pub fn run_shard_worker(
         // 2. Pure thread-local Shard DB (no Mutex, no Arc)
         let local_db = Rc::new(RefCell::new(ShardDb::new()));
 
+        // 2.5 RDB Snapshot Restore on startup
+        // Follow Redis specification: if AOF is enabled, AOF is authoritative; otherwise load RDB.
+        if !aof_config.enabled {
+            let rdb_path = aof_config.dir.join("dump.rdb");
+            if rdb_path.exists() {
+                match crate::table::load_rdb(&rdb_path, &mut local_db.borrow_mut(), shard_id, num_shards) {
+                    Ok(n) => {
+                        if n > 0 {
+                            println!("[Shard {}/{}] Restored {} keys from {:?}", shard_id, num_shards, n, rdb_path);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[Shard {}/{}] Failed to restore from RDB: {}", shard_id, num_shards, e);
+                    }
+                }
+            }
+        }
+
         // 3. AOF Replay on startup & Open AofWriter
         let aof_path = aof_config.dir.join(format!("appendonly-{}.aof", shard_id));
         if aof_config.enabled {
@@ -105,6 +123,16 @@ pub fn run_shard_worker(
             None
         };
 
+        // 4. Background Cluster Gossip Ping/Pong Daemon (on Shard 0)
+        if shard_id == 0 {
+            monoio::spawn(async move {
+                loop {
+                    monoio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                    crate::router::cluster_gossip_tick().await;
+                }
+            });
+        }
+
         let client_registry = Rc::new(RefCell::new(hashbrown::HashMap::<
             u64,
             crate::connection::ClientInfo,
@@ -118,6 +146,7 @@ pub fn run_shard_worker(
             senders,
             aof_writer.clone(),
             pubsub.clone(),
+            aof_config.dir.clone(),
         ));
 
         // Active expiration cycle: run every 100ms
@@ -276,10 +305,11 @@ pub fn run_shard_worker(
                         let mut db = cross_shard_db.borrow_mut();
                         let mut results = Vec::with_capacity(items.len());
                         let aof_ref = cross_shard_aof.as_deref();
+                        let mut temp_buf = Vec::with_capacity(128);
                         for (idx, cmd) in items {
-                            let mut out = Vec::new();
-                            let _ = execute_local_command(&cmd, &mut db, &mut out, aof_ref);
-                            results.push((idx, out));
+                            temp_buf.clear();
+                            let _ = execute_local_command(&cmd, &mut db, &mut temp_buf, aof_ref);
+                            results.push((idx, crate::shard::CompactResp::from_slice(&temp_buf)));
                         }
                         let _ = responder.send(results);
                     }

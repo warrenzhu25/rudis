@@ -1913,7 +1913,14 @@ fn test_streams_engine_e2e() {
 fn test_rdb_snapshot_forkless_e2e() {
     let port = 16396;
     let num_shards = 4;
-    start_test_server(port, num_shards);
+    let rdb_dir = std::env::temp_dir().join(format!("rudis-rdb-e2e-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&rdb_dir);
+    let aof_config = rudis::aof::AofConfig {
+        enabled: false,
+        dir: rdb_dir.clone(),
+        fsync_every_sec: false,
+    };
+    start_test_server_with_aof(port, num_shards, aof_config);
 
     let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
 
@@ -1934,17 +1941,17 @@ fn test_rdb_snapshot_forkless_e2e() {
     assert_eq!(save_resp, "+OK\r\n");
 
     // 4. Verify dump.rdb file was created and has valid header
-    let rdb_path = std::path::Path::new("dump.rdb");
+    let rdb_path = rdb_dir.join("dump.rdb");
     assert!(rdb_path.exists(), "dump.rdb should exist after SAVE");
-    let content = std::fs::read(rdb_path).unwrap();
+    let content = std::fs::read(&rdb_path).unwrap();
     assert!(content.starts_with(b"REDIS0011"), "RDB file should have REDIS0011 header");
 
     // 5. Test asynchronous BGSAVE
     let bgsave_resp = send_and_read(&mut client, b"BGSAVE\r\n");
     assert_eq!(bgsave_resp, "+Background saving started\r\n");
 
-    // Clean up dump file
-    let _ = std::fs::remove_file("dump.rdb");
+    // Clean up dump file & dir
+    let _ = std::fs::remove_dir_all(&rdb_dir);
 }
 
 #[test]
@@ -2098,4 +2105,92 @@ fn test_cluster_gossip_and_meet_e2e() {
     assert!(nodes.contains("myself,master"), "Should show myself as master");
     assert!(nodes.contains(&format!("127.0.0.1:{}", port2)), "Should list the met remote node");
 }
+
+#[test]
+fn test_rdb_cold_start_restore_e2e() {
+    let port1 = 16401;
+    let num_shards = 4;
+    let rdb_dir = std::env::temp_dir().join(format!("rudis-cold-start-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&rdb_dir);
+    let aof_config1 = rudis::aof::AofConfig {
+        enabled: false,
+        dir: rdb_dir.clone(),
+        fsync_every_sec: false,
+    };
+    start_test_server_with_aof(port1, num_shards, aof_config1);
+
+    let mut client1 = TcpStream::connect(("127.0.0.1", port1)).unwrap();
+
+    // Populate keys across shards
+    assert_eq!(send_and_read(&mut client1, b"SET cold_str \"rudis_is_fast\"\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client1, b"SET cold_int 424242\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client1, b"HSET cold_hash name rudis speed maximum\r\n"), ":2\r\n");
+    assert_eq!(send_and_read(&mut client1, b"RPUSH cold_list alpha beta gamma\r\n"), ":3\r\n");
+    assert_eq!(send_and_read(&mut client1, b"SADD cold_set s1 s2 s3\r\n"), ":3\r\n");
+    assert_eq!(send_and_read(&mut client1, b"ZADD cold_zset 100 z1 200 z2\r\n"), ":2\r\n");
+
+    // Save RDB snapshot
+    assert_eq!(send_and_read(&mut client1, b"SAVE\r\n"), "+OK\r\n");
+    let rdb_path = rdb_dir.join("dump.rdb");
+    assert!(rdb_path.exists(), "dump.rdb must exist");
+
+    drop(client1);
+    thread::sleep(Duration::from_millis(200));
+
+    // Start Server 2 on port 16402 with the SAME rdb_dir and AOF disabled
+    let port2 = 16402;
+    let aof_config2 = rudis::aof::AofConfig {
+        enabled: false,
+        dir: rdb_dir.clone(),
+        fsync_every_sec: false,
+    };
+    start_test_server_with_aof(port2, num_shards, aof_config2);
+
+    let mut client2 = TcpStream::connect(("127.0.0.1", port2)).unwrap();
+
+    // Verify all keys restored cleanly across shards
+    assert_eq!(send_and_read(&mut client2, b"GET cold_str\r\n"), "$15\r\n\"rudis_is_fast\"\r\n");
+    assert_eq!(send_and_read(&mut client2, b"GET cold_int\r\n"), "$6\r\n424242\r\n");
+    assert_eq!(send_and_read(&mut client2, b"HGET cold_hash name\r\n"), "$5\r\nrudis\r\n");
+    assert_eq!(send_and_read(&mut client2, b"HGET cold_hash speed\r\n"), "$7\r\nmaximum\r\n");
+    assert_eq!(send_and_read(&mut client2, b"LLEN cold_list\r\n"), ":3\r\n");
+    assert_eq!(send_and_read(&mut client2, b"LRANGE cold_list 0 -1\r\n"), "*3\r\n$5\r\nalpha\r\n$4\r\nbeta\r\n$5\r\ngamma\r\n");
+    assert_eq!(send_and_read(&mut client2, b"SCARD cold_set\r\n"), ":3\r\n");
+    assert_eq!(send_and_read(&mut client2, b"ZCARD cold_zset\r\n"), ":2\r\n");
+
+    let _ = std::fs::remove_dir_all(&rdb_dir);
+}
+
+#[test]
+fn test_cluster_migrate_slot_e2e() {
+    let port1 = 16403;
+    let port2 = 16404;
+    start_test_server(port1, 2);
+    start_test_server(port2, 2);
+
+    let mut client1 = TcpStream::connect(("127.0.0.1", port1)).unwrap();
+    let mut client2 = TcpStream::connect(("127.0.0.1", port2)).unwrap();
+
+    // Write a key on server1
+    let key = "migrated_key";
+    let slot = rudis::router::key_slot(key.as_bytes());
+    assert_eq!(send_and_read(&mut client1, format!("SET {} \"transferred\"\r\n", key).as_bytes()), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client1, format!("GET {}\r\n", key).as_bytes()), "$13\r\n\"transferred\"\r\n");
+
+    // Migrate this slot to server2
+    let migrate_cmd = format!("CLUSTER MIGRATE-SLOT {} 127.0.0.1 {}\r\n", slot, port2);
+    assert_eq!(send_and_read(&mut client1, migrate_cmd.as_bytes()), "+OK\r\n");
+
+    // Server 1 should now redirect with MOVED for this slot
+    let moved_resp = send_and_read(&mut client1, format!("GET {}\r\n", key).as_bytes());
+    assert_eq!(moved_resp, format!("-MOVED {} 127.0.0.1:{}\r\n", slot, port2));
+
+    // Server 2 should now have the key
+    assert_eq!(send_and_read(&mut client2, format!("GET {}\r\n", key).as_bytes()), "$13\r\n\"transferred\"\r\n");
+
+    // Test CLUSTER REBALANCE
+    let rebal_resp = send_and_read(&mut client1, format!("CLUSTER REBALANCE 127.0.0.1 {} 2\r\n", port2).as_bytes());
+    assert_eq!(rebal_resp, ":2\r\n");
+}
+
 

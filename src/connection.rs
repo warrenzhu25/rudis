@@ -1,4 +1,4 @@
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt, Splitable};
 use monoio::net::TcpStream;
 use std::cell::RefCell;
@@ -8,13 +8,13 @@ use std::time::Instant;
 
 use crate::resp::{ClientSubcommand, ClusterSubcommand, Command, SetSlotSubcommand, parse_command};
 use crate::router::{Router, key_slot, target_shard};
-use crate::shard::{ShardDb, ShardMessage};
+use crate::shard::{CompactResp, ShardDb, ShardMessage};
 
 const READ_BUFFER_SIZE: usize = 65536;
 
 pub type ResponderChannel = (
-    flume::Sender<Vec<(usize, Vec<u8>)>>,
-    flume::Receiver<Vec<(usize, Vec<u8>)>>,
+    flume::Sender<Vec<(usize, CompactResp)>>,
+    flume::Receiver<Vec<(usize, CompactResp)>>,
 );
 
 #[derive(Clone, Debug)]
@@ -348,8 +348,10 @@ pub async fn handle_connection(
 
                 // 4. Batch flush all accumulated responses in one io_uring write
                 if !out_buf.is_empty() {
-                    let write_chunk = std::mem::replace(&mut out_buf, Vec::with_capacity(65536));
-                    if let Err(_e) = stream.write_all(write_chunk).await.0 {
+                    let (write_res, returned_buf) = stream.write_all(out_buf).await;
+                    out_buf = returned_buf;
+                    out_buf.clear();
+                    if write_res.is_err() {
                         return;
                     }
                 }
@@ -780,6 +782,290 @@ pub fn cmd_keys<'a>(cmd: &'a Command) -> Vec<&'a [u8]> {
     }
 }
 
+async fn migrate_keys_to_node(
+    router: &Router,
+    keys: &[Bytes],
+    host: &str,
+    port: u16,
+    copy: bool,
+) -> Result<usize, String> {
+    let mut dumps = Vec::new();
+    for k in keys {
+        if let Some(entry) = router.dump_key(k.clone()).await {
+            dumps.push((k.clone(), entry));
+        }
+    }
+
+    if dumps.is_empty() {
+        return Ok(0);
+    }
+
+    let target_addr = format!("{}:{}", host, port);
+    let socket_addr = match std::net::ToSocketAddrs::to_socket_addrs(&target_addr) {
+        Ok(mut iter) => match iter.next() {
+            Some(a) => a,
+            None => return Err("cannot resolve destination host".to_string()),
+        },
+        Err(e) => return Err(format!("invalid destination address: {}", e)),
+    };
+
+    let mut stream = match TcpStream::connect(socket_addr).await {
+        Ok(s) => s,
+        Err(err) => return Err(format!("IOERR error connecting to destination: {}", err)),
+    };
+
+    let mut tx_buf = Vec::new();
+    tx_buf.extend_from_slice(b"*1\r\n$6\r\nASKING\r\n");
+    for (k, (val, ttl)) in &dumps {
+        match val {
+            crate::table::RudisValue::String(s) => {
+                if let Some(dur) = ttl {
+                    let ms = dur.as_millis().max(1);
+                    let ms_str = ms.to_string();
+                    tx_buf.extend_from_slice(
+                        format!("*5\r\n$3\r\nSET\r\n${}\r\n", k.len()).as_bytes(),
+                    );
+                    tx_buf.extend_from_slice(k);
+                    tx_buf.extend_from_slice(format!("\r\n${}\r\n", s.len()).as_bytes());
+                    tx_buf.extend_from_slice(s);
+                    tx_buf.extend_from_slice(
+                        format!("\r\n$2\r\nPX\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
+                    );
+                } else {
+                    tx_buf.extend_from_slice(
+                        format!("*3\r\n$3\r\nSET\r\n${}\r\n", k.len()).as_bytes(),
+                    );
+                    tx_buf.extend_from_slice(k);
+                    tx_buf.extend_from_slice(format!("\r\n${}\r\n", s.len()).as_bytes());
+                    tx_buf.extend_from_slice(s);
+                    tx_buf.extend_from_slice(b"\r\n");
+                }
+            }
+            crate::table::RudisValue::Int(n) => {
+                let s = crate::table::RudisTable::format_i64(*n);
+                if let Some(dur) = ttl {
+                    let ms = dur.as_millis().max(1);
+                    let ms_str = ms.to_string();
+                    tx_buf.extend_from_slice(
+                        format!("*5\r\n$3\r\nSET\r\n${}\r\n", k.len()).as_bytes(),
+                    );
+                    tx_buf.extend_from_slice(k);
+                    tx_buf.extend_from_slice(format!("\r\n${}\r\n", s.len()).as_bytes());
+                    tx_buf.extend_from_slice(&s);
+                    tx_buf.extend_from_slice(
+                        format!("\r\n$2\r\nPX\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
+                    );
+                } else {
+                    tx_buf.extend_from_slice(
+                        format!("*3\r\n$3\r\nSET\r\n${}\r\n", k.len()).as_bytes(),
+                    );
+                    tx_buf.extend_from_slice(k);
+                    tx_buf.extend_from_slice(format!("\r\n${}\r\n", s.len()).as_bytes());
+                    tx_buf.extend_from_slice(&s);
+                    tx_buf.extend_from_slice(b"\r\n");
+                }
+            }
+            crate::table::RudisValue::SmallHash(entries) => {
+                tx_buf.extend_from_slice(
+                    format!("*{}\r\n$4\r\nHSET\r\n${}\r\n", 2 + entries.len() * 2, k.len())
+                        .as_bytes(),
+                );
+                tx_buf.extend_from_slice(k);
+                tx_buf.extend_from_slice(b"\r\n");
+                for (f, v) in entries {
+                    tx_buf.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
+                    tx_buf.extend_from_slice(f);
+                    tx_buf.extend_from_slice(format!("\r\n${}\r\n", v.len()).as_bytes());
+                    tx_buf.extend_from_slice(v);
+                    tx_buf.extend_from_slice(b"\r\n");
+                }
+                if let Some(dur) = ttl {
+                    let ms = dur.as_millis().max(1);
+                    let ms_str = ms.to_string();
+                    tx_buf.extend_from_slice(
+                        format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
+                    );
+                    tx_buf.extend_from_slice(k);
+                    tx_buf.extend_from_slice(
+                        format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
+                    );
+                }
+            }
+            crate::table::RudisValue::Hash(h) => {
+                tx_buf.extend_from_slice(
+                    format!("*{}\r\n$4\r\nHSET\r\n${}\r\n", 2 + h.len() * 2, k.len()).as_bytes(),
+                );
+                tx_buf.extend_from_slice(k);
+                tx_buf.extend_from_slice(b"\r\n");
+                for (f, v) in h {
+                    tx_buf.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
+                    tx_buf.extend_from_slice(f);
+                    tx_buf.extend_from_slice(format!("\r\n${}\r\n", v.len()).as_bytes());
+                    tx_buf.extend_from_slice(v);
+                    tx_buf.extend_from_slice(b"\r\n");
+                }
+                if let Some(dur) = ttl {
+                    let ms = dur.as_millis().max(1);
+                    let ms_str = ms.to_string();
+                    tx_buf.extend_from_slice(
+                        format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
+                    );
+                    tx_buf.extend_from_slice(k);
+                    tx_buf.extend_from_slice(
+                        format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
+                    );
+                }
+            }
+            crate::table::RudisValue::List(l) => {
+                tx_buf.extend_from_slice(
+                    format!("*{}\r\n$5\r\nRPUSH\r\n${}\r\n", 2 + l.len(), k.len()).as_bytes(),
+                );
+                tx_buf.extend_from_slice(k);
+                tx_buf.extend_from_slice(b"\r\n");
+                for item in l {
+                    tx_buf.extend_from_slice(format!("${}\r\n", item.len()).as_bytes());
+                    tx_buf.extend_from_slice(item);
+                    tx_buf.extend_from_slice(b"\r\n");
+                }
+                if let Some(dur) = ttl {
+                    let ms = dur.as_millis().max(1);
+                    let ms_str = ms.to_string();
+                    tx_buf.extend_from_slice(
+                        format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
+                    );
+                    tx_buf.extend_from_slice(k);
+                    tx_buf.extend_from_slice(
+                        format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
+                    );
+                }
+            }
+            crate::table::RudisValue::Set(s) => {
+                tx_buf.extend_from_slice(
+                    format!("*{}\r\n$4\r\nSADD\r\n${}\r\n", 2 + s.len(), k.len()).as_bytes(),
+                );
+                tx_buf.extend_from_slice(k);
+                tx_buf.extend_from_slice(b"\r\n");
+                for item in s {
+                    tx_buf.extend_from_slice(format!("${}\r\n", item.len()).as_bytes());
+                    tx_buf.extend_from_slice(item);
+                    tx_buf.extend_from_slice(b"\r\n");
+                }
+                if let Some(dur) = ttl {
+                    let ms = dur.as_millis().max(1);
+                    let ms_str = ms.to_string();
+                    tx_buf.extend_from_slice(
+                        format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
+                    );
+                    tx_buf.extend_from_slice(k);
+                    tx_buf.extend_from_slice(
+                        format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
+                    );
+                }
+            }
+            crate::table::RudisValue::ZSet(zset) => {
+                tx_buf.extend_from_slice(
+                    format!("*{}\r\n$4\r\nZADD\r\n${}\r\n", 2 + zset.len() * 2, k.len())
+                        .as_bytes(),
+                );
+                tx_buf.extend_from_slice(k);
+                tx_buf.extend_from_slice(b"\r\n");
+                zset.for_each(|m, score| {
+                    let s = score.to_string();
+                    tx_buf.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
+                    tx_buf.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                    tx_buf.extend_from_slice(m);
+                    tx_buf.extend_from_slice(b"\r\n");
+                });
+                if let Some(dur) = ttl {
+                    let ms = dur.as_millis().max(1);
+                    let ms_str = ms.to_string();
+                    tx_buf.extend_from_slice(
+                        format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
+                    );
+                    tx_buf.extend_from_slice(k);
+                    tx_buf.extend_from_slice(
+                        format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
+                    );
+                }
+            }
+            crate::table::RudisValue::HyperLogLog(regs) => {
+                tx_buf.extend_from_slice(
+                    format!("*3\r\n$3\r\nSET\r\n${}\r\n", k.len()).as_bytes(),
+                );
+                tx_buf.extend_from_slice(k);
+                tx_buf.extend_from_slice(b"\r\n$16384\r\n");
+                tx_buf.extend_from_slice(regs.as_ref());
+                tx_buf.extend_from_slice(b"\r\n");
+                if let Some(dur) = ttl {
+                    let ms = dur.as_millis().max(1);
+                    let ms_str = ms.to_string();
+                    tx_buf.extend_from_slice(
+                        format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
+                    );
+                    tx_buf.extend_from_slice(k);
+                    tx_buf.extend_from_slice(
+                        format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
+                    );
+                }
+            }
+            crate::table::RudisValue::Stream(stream) => {
+                for (id, fields) in &stream.entries {
+                    tx_buf.extend_from_slice(
+                        format!(
+                            "*{}\r\n$4\r\nXADD\r\n${}\r\n",
+                            3 + fields.len() * 2,
+                            k.len()
+                        )
+                        .as_bytes(),
+                    );
+                    tx_buf.extend_from_slice(k);
+                    let id_str = id.to_string();
+                    tx_buf.extend_from_slice(
+                        format!("\r\n${}\r\n{}\r\n", id_str.len(), id_str).as_bytes(),
+                    );
+                    for (f, v) in fields {
+                        tx_buf.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
+                        tx_buf.extend_from_slice(f);
+                        tx_buf.extend_from_slice(format!("\r\n${}\r\n", v.len()).as_bytes());
+                        tx_buf.extend_from_slice(v);
+                        tx_buf.extend_from_slice(b"\r\n");
+                    }
+                }
+                if let Some(dur) = ttl {
+                    let ms = dur.as_millis().max(1);
+                    let ms_str = ms.to_string();
+                    tx_buf.extend_from_slice(
+                        format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
+                    );
+                    tx_buf.extend_from_slice(k);
+                    tx_buf.extend_from_slice(
+                        format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
+                    );
+                }
+            }
+        }
+    }
+
+    if let Err(e) = stream.write_all(tx_buf).await.0 {
+        return Err(format!("IOERR error sending to destination: {}", e));
+    }
+
+    let resp_buf = vec![0u8; 1024];
+    let (read_res, _) = stream.read(resp_buf).await;
+    if let Err(e) = read_res {
+        return Err(format!("IOERR error reading from destination: {}", e));
+    }
+
+    let count = dumps.len();
+    if !copy {
+        for (k, _) in &dumps {
+            let _ = router.del(k.clone()).await;
+        }
+    }
+
+    Ok(count)
+}
+
 async fn execute_command(
     cmd: Command,
     router: &Router,
@@ -1165,6 +1451,87 @@ async fn execute_command(
                         out.extend_from_slice(b"+OK\r\n");
                     }
                 },
+                ClusterSubcommand::MigrateSlot { slot, host, port } => {
+                    let target_addr = format!("{}:{}", host, port);
+                    // 1. Mark local slot as Migrating
+                    router.set_slot_state(slot, crate::shard::SlotState::Migrating(target_addr.clone()));
+
+                    // 2. Notify remote node: CLUSTER SETSLOT <slot> IMPORTING <my_id>
+                    let my_id = router.my_id();
+                    let target_sock = match std::net::ToSocketAddrs::to_socket_addrs(&target_addr) {
+                        Ok(mut iter) => iter.next(),
+                        Err(_) => None,
+                    };
+                    if let Some(sock_addr) = target_sock {
+                        if let Ok(mut stream) = monoio::net::TcpStream::connect(sock_addr).await {
+                            let slot_str = slot.to_string();
+                            let setslot_import = format!(
+                                "*4\r\n$7\r\nCLUSTER\r\n$7\r\nSETSLOT\r\n${}\r\n{}\r\n$9\r\nIMPORTING\r\n${}\r\n{}\r\n",
+                                slot_str.len(), slot_str, my_id.len(), my_id
+                            );
+                            let (write_res, _) = stream.write_all(setslot_import.into_bytes()).await;
+                            if write_res.is_ok() {
+                                let buf = vec![0u8; 64];
+                                let _ = stream.read(buf).await;
+                            }
+                        }
+                    }
+
+                    // 3. Migrate keys belonging to this slot in batches
+                    loop {
+                        let keys = router.get_keys_in_slot(slot, 100).await;
+                        if keys.is_empty() {
+                            break;
+                        }
+                        if let Err(e) = migrate_keys_to_node(router, &keys, &host, port, false).await {
+                            out.extend_from_slice(format!("-ERR migration failed: {}\r\n", e).as_bytes());
+                            return false;
+                        }
+                    }
+
+                    // 4. Notify remote node to take final ownership: CLUSTER SETSLOT <slot> NODE myself
+                    if let Some(sock_addr) = target_sock {
+                        if let Ok(mut stream) = monoio::net::TcpStream::connect(sock_addr).await {
+                            let slot_str = slot.to_string();
+                            let setslot_node = format!(
+                                "*4\r\n$7\r\nCLUSTER\r\n$7\r\nSETSLOT\r\n${}\r\n{}\r\n$4\r\nNODE\r\n$6\r\nmyself\r\n",
+                                slot_str.len(), slot_str
+                            );
+                            let (write_res, _) = stream.write_all(setslot_node.into_bytes()).await;
+                            if write_res.is_ok() {
+                                let buf = vec![0u8; 64];
+                                let _ = stream.read(buf).await;
+                            }
+                        }
+                    }
+
+                    // 5. Update local state to Moved
+                    router.set_slot_state(slot, crate::shard::SlotState::Moved(target_addr));
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                ClusterSubcommand::Rebalance { host, port, slots } => {
+                    let num_slots = slots.unwrap_or(1);
+                    let mut migrated_count = 0;
+                    for s in 0..16384u16 {
+                        if migrated_count >= num_slots {
+                            break;
+                        }
+                        let is_stable = matches!(
+                            router.slot_states.borrow()[s as usize],
+                            crate::shard::SlotState::Stable
+                        );
+                        if is_stable {
+                            let keys = router.get_keys_in_slot(s, 100).await;
+                            if !keys.is_empty() {
+                                let _ = migrate_keys_to_node(router, &keys, &host, port, false).await;
+                            }
+                            let target_addr = format!("{}:{}", host, port);
+                            router.set_slot_state(s, crate::shard::SlotState::Moved(target_addr));
+                            migrated_count += 1;
+                        }
+                    }
+                    out.extend_from_slice(format!(":{}\r\n", migrated_count).as_bytes());
+                }
             }
             false
         }
@@ -1737,14 +2104,14 @@ async fn execute_command(
                         );
                         tx_buf.extend_from_slice(k);
                         tx_buf.extend_from_slice(b"\r\n");
-                        for (m, score) in &zset.dict {
+                        zset.for_each(|m, score| {
                             let s = score.to_string();
                             tx_buf
                                 .extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
                             tx_buf.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
                             tx_buf.extend_from_slice(m);
                             tx_buf.extend_from_slice(b"\r\n");
-                        }
+                        });
                         if let Some(dur) = ttl {
                             let ms = dur.as_millis().max(1);
                             let ms_str = ms.to_string();
@@ -3866,7 +4233,8 @@ async fn execute_commands_squashed(
             c.last_cmd = cmd_name.to_string();
         }
     }
-    let mut responses: Vec<Vec<u8>> = vec![Vec::new(); n];
+    let mut responses: Vec<CompactResp> = vec![CompactResp::empty(); n];
+    let mut local_buf = Vec::with_capacity(128);
     let mut should_close = false;
 
     for batch in remote_batches.iter_mut() {
@@ -3877,27 +4245,31 @@ async fn execute_commands_squashed(
     for (idx, cmd) in commands.into_iter().enumerate() {
         if let Some(target) = target_shard_of_cmd(&cmd, router.num_shards) {
             if target == router.shard_id {
+                local_buf.clear();
                 if execute_local_command(
                     &cmd,
                     &mut router.local_db.borrow_mut(),
-                    &mut responses[idx],
+                    &mut local_buf,
                     router.aof.as_deref(),
                 ) {
                     should_close = true;
                 }
+                responses[idx] = CompactResp::from_slice(&local_buf);
             } else {
                 remote_batches[target].push((idx, cmd));
             }
         } else {
             // Non-sharded simple commands (PING, QUIT, COMMAND DOCS) run locally
+            local_buf.clear();
             if execute_local_command(
                 &cmd,
                 &mut router.local_db.borrow_mut(),
-                &mut responses[idx],
+                &mut local_buf,
                 None,
             ) {
                 should_close = true;
             }
+            responses[idx] = CompactResp::from_slice(&local_buf);
         }
     }
 
@@ -3926,8 +4298,8 @@ async fn execute_commands_squashed(
     }
 
     // 4. Append responses in exact FIFO pipeline order
-    for resp in responses {
-        out.extend_from_slice(&resp);
+    for resp in &responses {
+        out.extend_from_slice(resp.as_slice());
     }
 
     should_close

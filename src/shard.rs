@@ -3,6 +3,64 @@ use std::time::Duration;
 
 use crate::resp::Command;
 
+/// Inline compact representation of Redis responses for cross-core batch transfers.
+/// Avoids heap allocations for responses up to 30 bytes (integers, OK, simple errors, small bulk strings).
+#[derive(Clone, Debug)]
+pub enum CompactResp {
+    Small { len: u8, data: [u8; 30] },
+    Big(Vec<u8>),
+}
+
+impl CompactResp {
+    #[inline(always)]
+    pub const fn empty() -> Self {
+        CompactResp::Small {
+            len: 0,
+            data: [0u8; 30],
+        }
+    }
+
+    #[inline(always)]
+    pub fn from_slice(bytes: &[u8]) -> Self {
+        let len = bytes.len();
+        if len <= 30 {
+            let mut data = [0u8; 30];
+            data[..len].copy_from_slice(bytes);
+            CompactResp::Small {
+                len: len as u8,
+                data,
+            }
+        } else {
+            CompactResp::Big(bytes.to_vec())
+        }
+    }
+
+    #[inline(always)]
+    pub fn from_vec(vec: Vec<u8>) -> Self {
+        if vec.len() <= 30 {
+            Self::from_slice(&vec)
+        } else {
+            CompactResp::Big(vec)
+        }
+    }
+
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            CompactResp::Small { len, data } => &data[..*len as usize],
+            CompactResp::Big(vec) => vec.as_slice(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn into_vec(self) -> Vec<u8> {
+        match self {
+            CompactResp::Small { len, data } => data[..len as usize].to_vec(),
+            CompactResp::Big(vec) => vec,
+        }
+    }
+}
+
 /// Messages passed across CPU cores to access or mutate a shard's data.
 pub enum ShardMessage {
     Get {
@@ -56,7 +114,7 @@ pub enum ShardMessage {
     },
     Batch {
         items: Vec<(usize, Command)>,
-        responder: flume::Sender<Vec<(usize, Vec<u8>)>>,
+        responder: flume::Sender<Vec<(usize, CompactResp)>>,
     },
     SetSlotState {
         slot: u16,
@@ -131,7 +189,7 @@ pub enum SlotState {
 /// Because this shard is accessed only by the thread running on its assigned CPU core,
 /// it requires NO Mutex and NO cross-thread synchronization.
 pub struct ShardDb {
-    table: crate::table::RudisTable,
+    pub table: crate::table::RudisTable,
 }
 
 impl ShardDb {

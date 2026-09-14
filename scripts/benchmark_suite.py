@@ -69,6 +69,20 @@ COMMAND_TESTS = [
         "type_prefix": "Lpushs",
     },
     {
+        "name": "LRANGE",
+        "warmup": [
+            '--command=LPUSH __key__ __data__', '--command-ratio=1', '--command-key-pattern=S',
+            "--data-size", "1024",
+            "--pipeline", "100", "--key-minimum", "1", "--key-maximum", "1000000",
+            "--test-time", "3", "--hide-histogram",
+        ],
+        "memtier_args": [
+            '--command=LRANGE __key__ 0 10', '--command-ratio=1', '--command-key-pattern=S',
+            "--pipeline", "100", "--key-minimum", "1", "--key-maximum", "1000000",
+        ],
+        "type_prefix": "Lranges",
+    },
+    {
         "name": "HSET (1KB)",
         "warmup": None,
         "memtier_args": [
@@ -93,13 +107,26 @@ COMMAND_TESTS = [
         "type_prefix": "Hgets",
     },
     {
-        "name": "INCR",
+        "name": "SADD",
         "warmup": None,
         "memtier_args": [
-            '--command=INCR __key__', '--command-ratio=1', '--command-key-pattern=S',
+            '--command=SADD __key__ member', '--command-ratio=1', '--command-key-pattern=S',
             "--pipeline", "100", "--key-minimum", "1", "--key-maximum", "1000000",
         ],
-        "type_prefix": "Incrs",
+        "type_prefix": "Sadds",
+    },
+    {
+        "name": "SISMEMBER",
+        "warmup": [
+            '--command=SADD __key__ member', '--command-ratio=1', '--command-key-pattern=S',
+            "--pipeline", "100", "--key-minimum", "1", "--key-maximum", "1000000",
+            "--test-time", "3", "--hide-histogram",
+        ],
+        "memtier_args": [
+            '--command=SISMEMBER __key__ member', '--command-ratio=1', '--command-key-pattern=S',
+            "--pipeline", "100", "--key-minimum", "1", "--key-maximum", "1000000",
+        ],
+        "type_prefix": "Sismembers",
     },
     {
         "name": "ZADD",
@@ -109,6 +136,28 @@ COMMAND_TESTS = [
             "--pipeline", "100", "--key-minimum", "1", "--key-maximum", "1000000",
         ],
         "type_prefix": "Zadds",
+    },
+    {
+        "name": "ZRANGE",
+        "warmup": [
+            '--command=ZADD __key__ 10 member', '--command-ratio=1', '--command-key-pattern=S',
+            "--pipeline", "100", "--key-minimum", "1", "--key-maximum", "1000000",
+            "--test-time", "3", "--hide-histogram",
+        ],
+        "memtier_args": [
+            '--command=ZRANGE __key__ 0 10', '--command-ratio=1', '--command-key-pattern=S',
+            "--pipeline", "100", "--key-minimum", "1", "--key-maximum", "1000000",
+        ],
+        "type_prefix": "Zranges",
+    },
+    {
+        "name": "INCR",
+        "warmup": None,
+        "memtier_args": [
+            '--command=INCR __key__', '--command-ratio=1', '--command-key-pattern=S',
+            "--pipeline", "100", "--key-minimum", "1", "--key-maximum", "1000000",
+        ],
+        "type_prefix": "Incrs",
     },
 ]
 
@@ -218,10 +267,11 @@ def main():
             print(f"  Running test: {test_name} ({duration}s)...", end="", flush=True)
 
             flushall()
-            time.sleep(0.3)
+            time.sleep(1.0)
 
             if test["warmup"]:
                 run_memtier(test["warmup"], test_time=3)
+                time.sleep(0.5)
 
             out = run_memtier(test["memtier_args"], test_time=duration)
             stats = parse_memtier_output(out, test["type_prefix"])
