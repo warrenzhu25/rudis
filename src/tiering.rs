@@ -39,6 +39,8 @@ pub struct TieringStats {
     pub coalesced_reads: AtomicU64,
     pub bin_pages: AtomicU64,
     pub streaming_reads: AtomicU64,
+    pub gc_reclaimed_bytes: AtomicU64,
+    pub gc_cycles: AtomicU64,
     pub offload_threshold_pct: AtomicU64, // e.g. 60 (trigger background offload when memory >= 60% maxmemory)
     pub upload_threshold_pct: AtomicU64,  // e.g. 80 (stream cold reads without promotion when memory >= 80% maxmemory)
 }
@@ -63,6 +65,8 @@ impl Default for TieringStats {
             coalesced_reads: AtomicU64::new(0),
             bin_pages: AtomicU64::new(0),
             streaming_reads: AtomicU64::new(0),
+            gc_reclaimed_bytes: AtomicU64::new(0),
+            gc_cycles: AtomicU64::new(0),
             offload_threshold_pct: AtomicU64::new(60),
             upload_threshold_pct: AtomicU64::new(80),
         }
@@ -306,6 +310,7 @@ impl ActiveBin {
 pub struct SmallBinsManager {
     pub active_bin: Option<ActiveBin>,
     pub page_active_counts: HashMap<u64, usize>,
+    pub dead_pages: Vec<u64>,
 }
 
 impl SmallBinsManager {
@@ -313,6 +318,7 @@ impl SmallBinsManager {
         Self {
             active_bin: None,
             page_active_counts: HashMap::new(),
+            dead_pages: Vec::new(),
         }
     }
 
@@ -322,6 +328,7 @@ impl SmallBinsManager {
                 *count -= 1;
                 if *count == 0 {
                     stats.dead_bytes.fetch_add(PAGE_SIZE as u64, Ordering::Relaxed);
+                    self.dead_pages.push(page_index);
                 }
             }
         }
@@ -337,18 +344,34 @@ pub struct ShardTierManager {
     pub stats: Arc<TieringStats>,
     pub op_manager: Rc<OpManager>,
     pub small_bins: RefCell<SmallBinsManager>,
+    pub is_direct_io: bool,
 }
 
 impl ShardTierManager {
     pub async fn open(shard_id: usize, port: u16, dir: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
         let _ = std::fs::create_dir_all(dir);
         let path = dir.join(format!("tier_shard_{}.db", shard_id));
-        let file = monoio::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(&path)
-            .await?;
+
+        let direct_io_enabled = std::env::var("RUDIS_DIRECT_IO").map(|v| v != "0").unwrap_or(false);
+        let (file, is_direct) = if direct_io_enabled {
+            let mut opts = monoio::fs::OpenOptions::new();
+            opts.read(true).write(true).create(true);
+            opts.custom_flags(libc::O_DIRECT);
+            match opts.open(&path).await {
+                Ok(f) => (f, true),
+                Err(_) => {
+                    let mut fallback = monoio::fs::OpenOptions::new();
+                    fallback.read(true).write(true).create(true);
+                    (fallback.open(&path).await?, false)
+                }
+            }
+        } else {
+            let mut opts = monoio::fs::OpenOptions::new();
+            opts.read(true).write(true).create(true);
+            (opts.open(&path).await?, false)
+        };
+
         let raw_len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
         // Align offset to 4KB page boundary
         let current_offset = (raw_len + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64 * PAGE_SIZE as u64;
@@ -362,7 +385,46 @@ impl ShardTierManager {
             stats,
             op_manager: Rc::new(OpManager::new()),
             small_bins: RefCell::new(SmallBinsManager::new()),
+            is_direct_io: is_direct,
         })
+    }
+
+    /// Punches a hole in the physical NVMe storage at the given offset and length,
+    /// releasing allocated physical disk blocks back to the OS via FALLOC_FL_PUNCH_HOLE.
+    pub fn punch_hole(file: &monoio::fs::File, offset: u64, length: u64, stats: &TieringStats) -> bool {
+        use std::os::unix::io::AsRawFd;
+        let fd = file.as_raw_fd();
+        let ret = unsafe {
+            libc::fallocate(
+                fd,
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                offset as libc::off_t,
+                length as libc::off_t,
+            )
+        };
+        if ret == 0 {
+            stats.gc_reclaimed_bytes.fetch_add(length, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Run a garbage collection cycle on completely dead SmallBins pages.
+    pub fn run_gc(&self) -> usize {
+        let dead = {
+            let mut bins = self.small_bins.borrow_mut();
+            std::mem::take(&mut bins.dead_pages)
+        };
+        let count = dead.len();
+        for page_idx in &dead {
+            let offset = page_idx * PAGE_SIZE as u64;
+            Self::punch_hole(&self.file, offset, PAGE_SIZE as u64, &self.stats);
+        }
+        if count > 0 {
+            self.stats.gc_cycles.fetch_add(1, Ordering::Relaxed);
+        }
+        count * PAGE_SIZE
     }
 
     /// Stash a single record onto disk.
@@ -472,9 +534,15 @@ impl ShardTierManager {
     }
 
     pub fn on_key_deleted(&self, ptr: TieredPointer) {
-        let page_index = ptr.offset / PAGE_SIZE as u64;
-        self.small_bins.borrow_mut().decrement_page_key(page_index, &self.stats);
-        self.stats.dead_bytes.fetch_add(ptr.length as u64, Ordering::Relaxed);
+        if (ptr.length as usize) < SMALL_VALUE_LIMIT {
+            let page_index = ptr.offset / PAGE_SIZE as u64;
+            self.small_bins.borrow_mut().decrement_page_key(page_index, &self.stats);
+            self.stats.dead_bytes.fetch_add(ptr.length as u64, Ordering::Relaxed);
+        } else {
+            let aligned_len = (ptr.length as usize + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
+            self.stats.dead_bytes.fetch_add(aligned_len as u64, Ordering::Relaxed);
+            Self::punch_hole(&self.file, ptr.offset, aligned_len as u64, &self.stats);
+        }
     }
 }
 

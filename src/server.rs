@@ -177,6 +177,15 @@ pub fn run_shard_worker(
             }
         });
 
+        // Background Tiered Storage GC & Hole Punching: run every 2s
+        let gc_router = router.clone();
+        monoio::spawn(async move {
+            loop {
+                monoio::time::sleep(std::time::Duration::from_secs(2)).await;
+                gc_router.gc_local();
+            }
+        });
+
         // 4. Spawn background worker to handle incoming cross-shard messages from peer cores
         let cross_shard_db = local_db.clone();
         let cross_shard_router = router.clone();
@@ -605,6 +614,10 @@ pub fn run_shard_worker(
                             let val = r.stream_cold_read_local(&key).await;
                             let _ = responder.send(val);
                         });
+                    }
+                    ShardMessage::TierGc { responder } => {
+                        let reclaimed = cross_shard_router.gc_local();
+                        let _ = responder.send(reclaimed);
                     }
                 }
             }

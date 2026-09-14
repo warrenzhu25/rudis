@@ -508,6 +508,28 @@ impl Router {
         count
     }
 
+    pub fn gc_local(&self) -> usize {
+        let tm = self.local_db.borrow().tier_manager.clone();
+        if let Some(tm) = tm {
+            tm.run_gc()
+        } else {
+            0
+        }
+    }
+
+    pub async fn gc_all(&self) -> usize {
+        let mut total = self.gc_local();
+        for s in 0..self.num_shards {
+            if s != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                if self.senders[s].send(ShardMessage::TierGc { responder: tx }).is_ok() {
+                    total += rx.recv_async().await.unwrap_or(0);
+                }
+            }
+        }
+        total
+    }
+
     pub async fn get(&self, key: Bytes) -> Option<Bytes> {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {

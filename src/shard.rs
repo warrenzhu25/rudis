@@ -209,6 +209,9 @@ pub enum ShardMessage {
         key: Bytes,
         responder: flume::Sender<Option<Bytes>>,
     },
+    TierGc {
+        responder: flume::Sender<usize>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -84,11 +84,13 @@ QUIT
 
 ### 5. NVMe Cold-Storage Tiering (`io_uring`)
 Rudis features a thread-per-core asynchronous storage tiering engine built natively on `io_uring`:
-- **Spill Cold Keys**: `TIER SPILL <key>` offloads payloads to disk via `io_uring` and replaces the in-memory entry with a compact 24-byte pointer.
+- **Three-State Value Lifecycle**: Values transition through `Hot` (in DRAM) $\to$ `Cooled` (persisted to NVMe, cached in DRAM) $\to$ `Cold` (persisted to NVMe, pointer in DRAM).
+- **Zero-I/O Decommit**: `TIER DECOMMIT` instantly drops in-memory copies of cooled keys without I/O.
+- **SmallBins 4KB Page Packing**: Values $<2$ KB are packed into aligned 4KB disk bins to eliminate NVMe space amplification.
+- **Direct I/O (`O_DIRECT`)**: Bypass Linux Page Cache overhead with hardware-aligned DMA writes and reads (`RUDIS_DIRECT_IO=1`).
+- **Zero-Copy Online GC / Hole-Punching**: Reclaims NVMe storage on deletion via Linux `fallocate(FALLOC_FL_PUNCH_HOLE)` (`TIER GC`).
 - **Transparent Async Retrieval**: Any access (`GET`, `DUMP`, etc.) to a tiered key transparently reads from disk via `io_uring` without blocking the event loop or other connections.
-- **Bulk Spill**: `TIER SPILLALL` spills cold keys across all shards to disk.
-- **Explicit Promotion**: `TIER LOAD <key>` promotes a tiered key back into RAM.
-- **Storage Metrics**: `TIER INFO` or `INFO storage` reports active statistics on tiered keys, disk bytes, RAM saved, and asynchronous `io_uring` disk reads/writes.
+- **Bulk Operations & Metrics**: `TIER SPILLALL`, `TIER COOLALL`, and `TIER INFO` / `INFO storage` report live telemetry on disk footprint, RAM saved, and coalesced I/O.
 
 ---
 
@@ -102,6 +104,28 @@ cargo test
 ---
 
 ## Benchmarks
+
+### NVMe Tiered Storage: Rudis vs. Dragonfly (4 Worker Cores, 1KB Payloads)
+
+Detailed Tiered Storage benchmark report: [docs/benchmarks/tiered_storage.md](docs/benchmarks/tiered_storage.md)
+
+Rudis was benchmarked against **Dragonfly v1.39.0** on 4 physical worker cores (`taskset -c 0-3`) with `--maxmemory 1024mb` on NVMe storage using `memtier_benchmark` (4 threads, 4 connections/thread, pipeline depth 50, 1.5M keys):
+
+| Workload | Payload | Rudis (Ops/sec) | Dragonfly (Ops/sec) | Rudis Speedup | Winner |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **SET** | 1KB | **1,279,856** | 286,351 | **+347.0% (4.47x)** | **Rudis** |
+| **GET** | 1KB | **670,695** | 202,615 | **+231.0% (3.31x)** | **Rudis** |
+| **SET/GET 1:1** | 1KB | **543,150** | 254,241 | **+113.6% (2.14x)** | **Rudis** |
+
+### Multi-Core NVMe Tiered Storage Scaling (4, 8, 16 Cores)
+
+| Worker Cores | SET Throughput | GET Throughput | SET/GET 1:1 Throughput | Peak Bandwidth | Median Latency (p50) |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+| **4 Cores** | 1,351,053 ops/s | 528,145 ops/s | 948,435 ops/s | 1.41 GB/s | **0.54 ms** |
+| **8 Cores** | **2,303,685 ops/s** | **1,099,510 ops/s** | **1,750,906 ops/s** | **2.41 GB/s** | **0.61 ms** |
+| **16 Cores** | 1,933,960 ops/s | 763,735 ops/s | 1,236,764 ops/s | 2.02 GB/s | **0.71 ms** |
+
+---
 
 ### Write-Batched Optimization (1 to 32 Threads, 100% SET, 1KB Payload, Pipeline 100)
 

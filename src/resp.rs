@@ -37,6 +37,7 @@ pub enum TierSubcommand {
     SpillAll,
     Cool(Bytes),
     Decommit(Option<Bytes>),
+    Gc,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -2371,8 +2372,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
                 "INFO" => Ok(Some(Command::Tier(TierSubcommand::Info))),
                 "SPILLALL" => Ok(Some(Command::Tier(TierSubcommand::SpillAll))),
+                "GC" => Ok(Some(Command::Tier(TierSubcommand::Gc))),
                 _ => Err(format!(
-                    "ERR unknown subcommand '{}'. Try TIER SPILL, TIER COOL, TIER DECOMMIT, TIER LOAD, TIER INFO, TIER SPILLALL.",
+                    "ERR unknown subcommand '{}'. Try TIER SPILL, TIER COOL, TIER DECOMMIT, TIER LOAD, TIER INFO, TIER SPILLALL, TIER GC.",
                     sub
                 )),
             }

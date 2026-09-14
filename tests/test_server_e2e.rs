@@ -3082,6 +3082,34 @@ fn test_tiered_storage_tracks_e2e() {
     assert!(info_after_overwrite.contains("total_deletes:1"));
 }
 
+#[test]
+fn test_tiered_storage_gc_and_hole_punching_e2e() {
+    let port = 16500;
+    start_test_server(port, 2);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Spill a large key (>2KB)
+    let large_val = "Z".repeat(3000);
+    assert_eq!(
+        send_and_read(&mut client, format!("SET large_key {}\r\n", large_val).as_bytes()),
+        "+OK\r\n"
+    );
+    assert_eq!(send_and_read(&mut client, b"TIER SPILL large_key\r\n"), ":1\r\n");
+
+    // 2. Delete the large key - should immediately punch hole in the physical NVMe storage!
+    assert_eq!(send_and_read(&mut client, b"DEL large_key\r\n"), ":1\r\n");
+    let info = send_and_read(&mut client, b"TIER INFO\r\n");
+    assert!(info.contains("total_deletes:1"));
+    assert!(info.contains("gc_reclaimed_bytes:4096"));
+
+    // 3. Test explicit TIER GC command
+    let gc_resp = send_and_read(&mut client, b"TIER GC\r\n");
+    assert!(gc_resp.starts_with(':'));
+
+    let _ = std::fs::remove_dir_all(format!("/tmp/rudis_tier_{}", port));
+}
+
+
 
 
 

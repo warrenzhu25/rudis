@@ -1854,12 +1854,16 @@ async fn execute_command(
                     }
                     out.extend_from_slice(format!(":{}\r\n", total).as_bytes());
                 }
+                crate::resp::TierSubcommand::Gc => {
+                    let reclaimed = router.gc_all().await;
+                    out.extend_from_slice(format!(":{}\r\n", reclaimed).as_bytes());
+                }
                 crate::resp::TierSubcommand::Info => {
                     let stats = crate::tiering::get_tier_stats(router.port);
                     let max_mem = crate::tiering::get_max_memory(router.port);
                     let used_mem = router.get_total_used_memory().await;
                     let info = format!(
-                        "# Tiered Storage (io_uring NVMe)\r\ntier_enabled:1\r\nmaxmemory:{}\r\nmaxmemory_human:{}\r\nused_memory:{}\r\nused_memory_human:{}\r\ncooled_keys:{}\r\ntiered_keys:{}\r\ntiered_bytes:{}\r\nram_saved_bytes:{}\r\ndisk_reads:{}\r\ndisk_writes:{}\r\ndead_bytes:{}\r\ndecommit_count:{}\r\ncoalesced_reads:{}\r\nbin_pages:{}\r\ntotal_stashes:{}\r\ntotal_fetches:{}\r\ntotal_deletes:{}\r\nram_hits:{}\r\nram_misses:{}\r\nstreaming_reads:{}\r\noffload_threshold_pct:{}\r\nupload_threshold_pct:{}\r\n",
+                        "# Tiered Storage (io_uring NVMe)\r\ntier_enabled:1\r\nmaxmemory:{}\r\nmaxmemory_human:{}\r\nused_memory:{}\r\nused_memory_human:{}\r\ncooled_keys:{}\r\ntiered_keys:{}\r\ntiered_bytes:{}\r\nram_saved_bytes:{}\r\ndisk_reads:{}\r\ndisk_writes:{}\r\ndead_bytes:{}\r\ngc_reclaimed_bytes:{}\r\ngc_cycles:{}\r\ndecommit_count:{}\r\ncoalesced_reads:{}\r\nbin_pages:{}\r\ntotal_stashes:{}\r\ntotal_fetches:{}\r\ntotal_deletes:{}\r\nram_hits:{}\r\nram_misses:{}\r\nstreaming_reads:{}\r\noffload_threshold_pct:{}\r\nupload_threshold_pct:{}\r\n",
                         max_mem,
                         crate::tiering::format_bytes_human(max_mem),
                         used_mem,
@@ -1871,6 +1875,8 @@ async fn execute_command(
                         stats.disk_reads.load(std::sync::atomic::Ordering::Relaxed),
                         stats.disk_writes.load(std::sync::atomic::Ordering::Relaxed),
                         stats.dead_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                        stats.gc_reclaimed_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                        stats.gc_cycles.load(std::sync::atomic::Ordering::Relaxed),
                         stats.decommit_count.load(std::sync::atomic::Ordering::Relaxed),
                         stats.coalesced_reads.load(std::sync::atomic::Ordering::Relaxed),
                         stats.bin_pages.load(std::sync::atomic::Ordering::Relaxed),
