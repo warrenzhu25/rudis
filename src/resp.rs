@@ -1,5 +1,5 @@
-use std::time::Duration;
 use bytes::{Buf, Bytes, BytesMut};
+use std::time::Duration;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum SetSlotSubcommand {
@@ -211,6 +211,18 @@ pub enum Command {
     CommandDocs,
     Info,
     Quit,
+    // PUBSUB COMMANDS
+    Subscribe(Vec<Bytes>),
+    Unsubscribe(Vec<Bytes>),
+    Psubscribe(Vec<Bytes>),
+    Punsubscribe(Vec<Bytes>),
+    Publish {
+        channel: Bytes,
+        message: Bytes,
+    },
+    PubsubChannels(Option<Bytes>),
+    PubsubNumsub(Vec<Bytes>),
+    PubsubNumpat,
     Unknown(String),
 }
 
@@ -451,7 +463,10 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-            Ok(Some(Command::Expire(args[1].clone(), Duration::from_secs(secs))))
+            Ok(Some(Command::Expire(
+                args[1].clone(),
+                Duration::from_secs(secs),
+            )))
         }
         "PEXPIRE" => {
             if args.len() < 3 {
@@ -461,7 +476,10 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-            Ok(Some(Command::Expire(args[1].clone(), Duration::from_millis(ms))))
+            Ok(Some(Command::Expire(
+                args[1].clone(),
+                Duration::from_millis(ms),
+            )))
         }
         "PERSIST" => {
             if args.len() < 2 {
@@ -497,23 +515,35 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             match sub.as_str() {
                 "KEYSLOT" => {
                     if args.len() < 3 {
-                        return Err("wrong number of arguments for 'cluster keyslot' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'cluster keyslot' command".to_string()
+                        );
                     }
-                    Ok(Some(Command::Cluster(ClusterSubcommand::KeySlot(args[2].clone()))))
+                    Ok(Some(Command::Cluster(ClusterSubcommand::KeySlot(
+                        args[2].clone(),
+                    ))))
                 }
                 "COUNTKEYSINSLOT" => {
                     if args.len() < 3 {
-                        return Err("wrong number of arguments for 'cluster countkeysinslot' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'cluster countkeysinslot' command"
+                                .to_string(),
+                        );
                     }
                     let slot: u16 = std::str::from_utf8(&args[2])
                         .ok()
                         .and_then(|s| s.parse().ok())
                         .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-                    Ok(Some(Command::Cluster(ClusterSubcommand::CountKeysInSlot(slot))))
+                    Ok(Some(Command::Cluster(ClusterSubcommand::CountKeysInSlot(
+                        slot,
+                    ))))
                 }
                 "GETKEYSINSLOT" => {
                     if args.len() < 4 {
-                        return Err("wrong number of arguments for 'cluster getkeysinslot' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'cluster getkeysinslot' command"
+                                .to_string(),
+                        );
                     }
                     let slot: u16 = std::str::from_utf8(&args[2])
                         .ok()
@@ -523,11 +553,15 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         .ok()
                         .and_then(|s| s.parse().ok())
                         .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-                    Ok(Some(Command::Cluster(ClusterSubcommand::GetKeysInSlot(slot, count))))
+                    Ok(Some(Command::Cluster(ClusterSubcommand::GetKeysInSlot(
+                        slot, count,
+                    ))))
                 }
                 "SETSLOT" => {
                     if args.len() < 4 {
-                        return Err("wrong number of arguments for 'cluster setslot' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'cluster setslot' command".to_string()
+                        );
                     }
                     let slot: u16 = std::str::from_utf8(&args[2])
                         .ok()
@@ -540,26 +574,42 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                                 return Err("wrong number of arguments for 'cluster setslot migrating' command".to_string());
                             }
                             let node = String::from_utf8_lossy(&args[4]).to_string();
-                            Ok(Some(Command::Cluster(ClusterSubcommand::SetSlot(slot, SetSlotSubcommand::Migrating(node)))))
+                            Ok(Some(Command::Cluster(ClusterSubcommand::SetSlot(
+                                slot,
+                                SetSlotSubcommand::Migrating(node),
+                            ))))
                         }
                         "IMPORTING" => {
                             if args.len() < 5 {
                                 return Err("wrong number of arguments for 'cluster setslot importing' command".to_string());
                             }
                             let node = String::from_utf8_lossy(&args[4]).to_string();
-                            Ok(Some(Command::Cluster(ClusterSubcommand::SetSlot(slot, SetSlotSubcommand::Importing(node)))))
+                            Ok(Some(Command::Cluster(ClusterSubcommand::SetSlot(
+                                slot,
+                                SetSlotSubcommand::Importing(node),
+                            ))))
                         }
-                        "STABLE" => {
-                            Ok(Some(Command::Cluster(ClusterSubcommand::SetSlot(slot, SetSlotSubcommand::Stable))))
-                        }
+                        "STABLE" => Ok(Some(Command::Cluster(ClusterSubcommand::SetSlot(
+                            slot,
+                            SetSlotSubcommand::Stable,
+                        )))),
                         "NODE" => {
                             if args.len() < 5 {
-                                return Err("wrong number of arguments for 'cluster setslot node' command".to_string());
+                                return Err(
+                                    "wrong number of arguments for 'cluster setslot node' command"
+                                        .to_string(),
+                                );
                             }
                             let node = String::from_utf8_lossy(&args[4]).to_string();
-                            Ok(Some(Command::Cluster(ClusterSubcommand::SetSlot(slot, SetSlotSubcommand::Node(node)))))
+                            Ok(Some(Command::Cluster(ClusterSubcommand::SetSlot(
+                                slot,
+                                SetSlotSubcommand::Node(node),
+                            ))))
                         }
-                        _ => Ok(Some(Command::Unknown(format!("CLUSTER SETSLOT {}", action)))),
+                        _ => Ok(Some(Command::Unknown(format!(
+                            "CLUSTER SETSLOT {}",
+                            action
+                        )))),
                     }
                 }
                 "SLOTS" => Ok(Some(Command::Cluster(ClusterSubcommand::Slots))),
@@ -639,7 +689,9 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "LIST" => Ok(Some(Command::Client(ClientSubcommand::List))),
                 "SETNAME" => {
                     if args.len() < 3 {
-                        return Err("wrong number of arguments for 'client setname' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'client setname' command".to_string()
+                        );
                     }
                     let name = String::from_utf8_lossy(&args[2]).to_string();
                     Ok(Some(Command::Client(ClientSubcommand::SetName(name))))
@@ -938,8 +990,11 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let mut elements = Vec::with_capacity(remaining.len() / 2);
             let mut j = 0;
             while j < remaining.len() {
-                let score_str = std::str::from_utf8(&remaining[j]).map_err(|_| "value is not a valid float")?;
-                let score: f64 = score_str.parse().map_err(|_| "value is not a valid float")?;
+                let score_str =
+                    std::str::from_utf8(&remaining[j]).map_err(|_| "value is not a valid float")?;
+                let score: f64 = score_str
+                    .parse()
+                    .map_err(|_| "value is not a valid float")?;
                 if score.is_nan() {
                     return Err("value is not a valid float".to_string());
                 }
@@ -1013,8 +1068,11 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() != 4 {
                 return Err("wrong number of arguments for 'zincrby' command".to_string());
             }
-            let delta_str = std::str::from_utf8(&args[2]).map_err(|_| "value is not a valid float")?;
-            let delta: f64 = delta_str.parse().map_err(|_| "value is not a valid float")?;
+            let delta_str =
+                std::str::from_utf8(&args[2]).map_err(|_| "value is not a valid float")?;
+            let delta: f64 = delta_str
+                .parse()
+                .map_err(|_| "value is not a valid float")?;
             if delta.is_nan() {
                 return Err("value is not a valid float".to_string());
             }
@@ -1445,6 +1503,55 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
         "COMMAND" => Ok(Some(Command::CommandDocs)),
         "INFO" => Ok(Some(Command::Info)),
         "QUIT" => Ok(Some(Command::Quit)),
+        "SUBSCRIBE" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'subscribe' command".to_string());
+            }
+            Ok(Some(Command::Subscribe(args[1..].to_vec())))
+        }
+        "UNSUBSCRIBE" => Ok(Some(Command::Unsubscribe(args[1..].to_vec()))),
+        "PSUBSCRIBE" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'psubscribe' command".to_string());
+            }
+            Ok(Some(Command::Psubscribe(args[1..].to_vec())))
+        }
+        "PUNSUBSCRIBE" => Ok(Some(Command::Punsubscribe(args[1..].to_vec()))),
+        "PUBLISH" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'publish' command".to_string());
+            }
+            Ok(Some(Command::Publish {
+                channel: args[1].clone(),
+                message: args[2].clone(),
+            }))
+        }
+        "PUBSUB" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'pubsub' command".to_string());
+            }
+            let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
+            match sub.as_str() {
+                "CHANNELS" => {
+                    let pat = if args.len() > 2 {
+                        Some(args[2].clone())
+                    } else {
+                        None
+                    };
+                    Ok(Some(Command::PubsubChannels(pat)))
+                }
+                "NUMSUB" => {
+                    let channels = if args.len() > 2 {
+                        args[2..].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(Some(Command::PubsubNumsub(channels)))
+                }
+                "NUMPAT" => Ok(Some(Command::PubsubNumpat)),
+                _ => Ok(Some(Command::Unknown(format!("PUBSUB {}", sub)))),
+            }
+        }
         _ => Ok(Some(Command::Unknown(cmd_name))),
     }
 }
@@ -1464,7 +1571,9 @@ pub fn parse_score_bound(arg: &[u8]) -> Result<(f64, bool), String> {
     } else if s.eq_ignore_ascii_case("+inf") || s.eq_ignore_ascii_case("inf") {
         Ok((f64::INFINITY, inc))
     } else {
-        let val: f64 = s.parse().map_err(|_| "value is not a valid float".to_string())?;
+        let val: f64 = s
+            .parse()
+            .map_err(|_| "value is not a valid float".to_string())?;
         if val.is_nan() {
             return Err("value is not a valid float".to_string());
         }
@@ -1525,7 +1634,8 @@ mod tests {
         assert!(buf.is_empty());
 
         // SET with EX
-        let mut buf = BytesMut::from("*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$2\r\n10\r\n");
+        let mut buf =
+            BytesMut::from("*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$2\r\n10\r\n");
         let cmd = parse_command(&mut buf).unwrap().unwrap();
         assert_eq!(
             cmd,
@@ -1556,7 +1666,10 @@ mod tests {
 
         let mut buf = BytesMut::from("EXPIRE foo 60\r\n");
         let cmd = parse_command(&mut buf).unwrap().unwrap();
-        assert_eq!(cmd, Command::Expire(Bytes::from_static(b"foo"), Duration::from_secs(60)));
+        assert_eq!(
+            cmd,
+            Command::Expire(Bytes::from_static(b"foo"), Duration::from_secs(60))
+        );
 
         let mut buf = BytesMut::from("TTL foo\r\n");
         let cmd = parse_command(&mut buf).unwrap().unwrap();

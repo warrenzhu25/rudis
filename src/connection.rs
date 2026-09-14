@@ -1,13 +1,13 @@
+use bytes::BytesMut;
+use monoio::io::{AsyncReadRent, AsyncWriteRentExt, Splitable};
+use monoio::net::TcpStream;
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Instant;
-use bytes::BytesMut;
-use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
-use monoio::net::TcpStream;
 
-use crate::resp::{parse_command, ClientSubcommand, ClusterSubcommand, Command, SetSlotSubcommand};
-use crate::router::{key_slot, target_shard, Router};
+use crate::resp::{ClientSubcommand, ClusterSubcommand, Command, SetSlotSubcommand, parse_command};
+use crate::router::{Router, key_slot, target_shard};
 use crate::shard::{ShardDb, ShardMessage};
 
 const READ_BUFFER_SIZE: usize = 65536;
@@ -50,15 +50,18 @@ pub async fn handle_connection(
     struct ClientCleanup {
         client_id: u64,
         registry: Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
+        pubsub: Rc<RefCell<crate::pubsub::PubSubHub>>,
     }
     impl Drop for ClientCleanup {
         fn drop(&mut self) {
             self.registry.borrow_mut().remove(&self.client_id);
+            self.pubsub.borrow_mut().remove_client(self.client_id);
         }
     }
     let _cleanup = ClientCleanup {
         client_id,
         registry: client_registry.clone(),
+        pubsub: router.pubsub.clone(),
     };
 
     let mut buf = BytesMut::with_capacity(131072);
@@ -66,11 +69,11 @@ pub async fn handle_connection(
     let mut out_buf = Vec::with_capacity(65536);
 
     // Pre-allocated reusable channel responders (1 per shard, 0 allocations per hop in steady-state)
-    let responders: Vec<ResponderChannel> = (0..router.num_shards)
-        .map(|_| flume::bounded(1))
+    let responders: Vec<ResponderChannel> =
+        (0..router.num_shards).map(|_| flume::bounded(1)).collect();
+    let mut remote_batches: Vec<Vec<(usize, Command)>> = (0..router.num_shards)
+        .map(|_| Vec::with_capacity(64))
         .collect();
-    let mut remote_batches: Vec<Vec<(usize, Command)>> =
-        (0..router.num_shards).map(|_| Vec::with_capacity(64)).collect();
 
     let mut asking = false;
 
@@ -108,7 +111,41 @@ pub async fn handle_connection(
                     }
                 }
 
-                // 2. Execute parsed commands with pipeline squashing when pipelined
+                // 2. Transition to Pub/Sub mode if SUBSCRIBE or PSUBSCRIBE is received
+                if let Some(sub_idx) = commands
+                    .iter()
+                    .position(|c| matches!(c, Command::Subscribe(_) | Command::Psubscribe(_)))
+                {
+                    for c in commands.drain(..sub_idx) {
+                        let _ = execute_command(
+                            c,
+                            &router,
+                            client_id,
+                            &client_registry,
+                            &mut out_buf,
+                            &mut asking,
+                        )
+                        .await;
+                    }
+                    if !out_buf.is_empty() {
+                        let write_chunk = std::mem::replace(&mut out_buf, Vec::new());
+                        let _ = stream.write_all(write_chunk).await.0;
+                    }
+                    let initial_sub = commands.remove(0);
+                    run_pubsub_loop(
+                        stream,
+                        client_id,
+                        client_registry,
+                        router,
+                        initial_sub,
+                        commands,
+                        buf,
+                    )
+                    .await;
+                    return;
+                }
+
+                // 3. Execute parsed commands with pipeline squashing when pipelined
                 if !commands.is_empty() {
                     if commands.len() == 1 {
                         let quit = execute_command(
@@ -141,10 +178,9 @@ pub async fn handle_connection(
                     }
                 }
 
-                // 3. Batch flush all accumulated responses in one io_uring write
+                // 4. Batch flush all accumulated responses in one io_uring write
                 if !out_buf.is_empty() {
-                    let write_chunk =
-                        std::mem::replace(&mut out_buf, Vec::with_capacity(65536));
+                    let write_chunk = std::mem::replace(&mut out_buf, Vec::with_capacity(65536));
                     if let Err(_e) = stream.write_all(write_chunk).await.0 {
                         return;
                     }
@@ -158,6 +194,246 @@ pub async fn handle_connection(
                 // Connection read error
                 break;
             }
+        }
+    }
+}
+
+async fn run_pubsub_loop(
+    stream: TcpStream,
+    client_id: u64,
+    client_registry: Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
+    router: Rc<Router>,
+    initial_sub: Command,
+    pending_cmds: Vec<Command>,
+    mut buf: BytesMut,
+) {
+    let (mut reader, mut writer) = stream.into_split();
+    let (write_tx, write_rx) = flume::unbounded::<Vec<u8>>();
+
+    monoio::spawn(async move {
+        while let Ok(data) = write_rx.recv_async().await {
+            if let Err(_) = writer.write_all(data).await.0 {
+                break;
+            }
+        }
+    });
+
+    let mut read_buf = vec![0u8; READ_BUFFER_SIZE];
+
+    let handle_cmd = |cmd: Command, out: &mut Vec<u8>| -> bool {
+        let cmd_name = match &cmd {
+            Command::Subscribe(_) => "SUBSCRIBE",
+            Command::Unsubscribe(_) => "UNSUBSCRIBE",
+            Command::Psubscribe(_) => "PSUBSCRIBE",
+            Command::Punsubscribe(_) => "PUNSUBSCRIBE",
+            Command::Ping(_) => "PING",
+            Command::Quit => "QUIT",
+            _ => "OTHER",
+        };
+        if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+            c.last_active = Instant::now();
+            c.last_cmd = cmd_name.to_string();
+        }
+        match cmd {
+            Command::Subscribe(channels) => {
+                let mut hub = router.pubsub.borrow_mut();
+                for ch in channels {
+                    let count = hub.subscribe(client_id, ch.clone(), write_tx.clone());
+                    out.extend_from_slice(b"*3\r\n$9\r\nsubscribe\r\n$");
+                    out.extend_from_slice(ch.len().to_string().as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                    out.extend_from_slice(&ch);
+                    out.extend_from_slice(b"\r\n:");
+                    out.extend_from_slice(count.to_string().as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                }
+                false
+            }
+            Command::Unsubscribe(channels) => {
+                let mut hub = router.pubsub.borrow_mut();
+                if channels.is_empty() {
+                    let unsubs = hub.unsubscribe_all(client_id);
+                    if unsubs.is_empty() {
+                        let total = hub.total_subscriptions(client_id);
+                        out.extend_from_slice(
+                            format!("*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:{}\r\n", total).as_bytes(),
+                        );
+                    } else {
+                        for (ch, remaining) in unsubs {
+                            out.extend_from_slice(b"*3\r\n$11\r\nunsubscribe\r\n$");
+                            out.extend_from_slice(ch.len().to_string().as_bytes());
+                            out.extend_from_slice(b"\r\n");
+                            out.extend_from_slice(&ch);
+                            out.extend_from_slice(b"\r\n:");
+                            out.extend_from_slice(remaining.to_string().as_bytes());
+                            out.extend_from_slice(b"\r\n");
+                        }
+                    }
+                } else {
+                    for ch in channels {
+                        let remaining = hub.unsubscribe(client_id, &ch);
+                        out.extend_from_slice(b"*3\r\n$11\r\nunsubscribe\r\n$");
+                        out.extend_from_slice(ch.len().to_string().as_bytes());
+                        out.extend_from_slice(b"\r\n");
+                        out.extend_from_slice(&ch);
+                        out.extend_from_slice(b"\r\n:");
+                        out.extend_from_slice(remaining.to_string().as_bytes());
+                        out.extend_from_slice(b"\r\n");
+                    }
+                }
+                false
+            }
+            Command::Psubscribe(patterns) => {
+                let mut hub = router.pubsub.borrow_mut();
+                for pat in patterns {
+                    let count = hub.psubscribe(client_id, pat.clone(), write_tx.clone());
+                    out.extend_from_slice(b"*3\r\n$10\r\npsubscribe\r\n$");
+                    out.extend_from_slice(pat.len().to_string().as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                    out.extend_from_slice(&pat);
+                    out.extend_from_slice(b"\r\n:");
+                    out.extend_from_slice(count.to_string().as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                }
+                false
+            }
+            Command::Punsubscribe(patterns) => {
+                let mut hub = router.pubsub.borrow_mut();
+                if patterns.is_empty() {
+                    let unsubs = hub.punsubscribe_all(client_id);
+                    if unsubs.is_empty() {
+                        let total = hub.total_subscriptions(client_id);
+                        out.extend_from_slice(
+                            format!("*3\r\n$12\r\npunsubscribe\r\n$-1\r\n:{}\r\n", total)
+                                .as_bytes(),
+                        );
+                    } else {
+                        for (pat, remaining) in unsubs {
+                            out.extend_from_slice(b"*3\r\n$12\r\npunsubscribe\r\n$");
+                            out.extend_from_slice(pat.len().to_string().as_bytes());
+                            out.extend_from_slice(b"\r\n");
+                            out.extend_from_slice(&pat);
+                            out.extend_from_slice(b"\r\n:");
+                            out.extend_from_slice(remaining.to_string().as_bytes());
+                            out.extend_from_slice(b"\r\n");
+                        }
+                    }
+                } else {
+                    for pat in patterns {
+                        let remaining = hub.punsubscribe(client_id, &pat);
+                        out.extend_from_slice(b"*3\r\n$12\r\npunsubscribe\r\n$");
+                        out.extend_from_slice(pat.len().to_string().as_bytes());
+                        out.extend_from_slice(b"\r\n");
+                        out.extend_from_slice(&pat);
+                        out.extend_from_slice(b"\r\n:");
+                        out.extend_from_slice(remaining.to_string().as_bytes());
+                        out.extend_from_slice(b"\r\n");
+                    }
+                }
+                false
+            }
+            Command::Ping(msg) => {
+                match msg {
+                    Some(m) => {
+                        out.extend_from_slice(
+                            format!("*2\r\n$4\r\npong\r\n${}\r\n", m.len()).as_bytes(),
+                        );
+                        out.extend_from_slice(&m);
+                        out.extend_from_slice(b"\r\n");
+                    }
+                    None => {
+                        out.extend_from_slice(b"*2\r\n$4\r\npong\r\n$0\r\n\r\n");
+                    }
+                }
+                false
+            }
+            Command::Quit => {
+                out.extend_from_slice(b"+OK\r\n");
+                true
+            }
+            other => {
+                let name = match &other {
+                    Command::Publish { .. } => "PUBLISH",
+                    Command::Get(_) => "GET",
+                    Command::Set { .. } => "SET",
+                    _ => "UNKNOWN",
+                };
+                out.extend_from_slice(
+                    format!("-ERR Can't execute '{}' in subscribed mode\r\n", name).as_bytes(),
+                );
+                false
+            }
+        }
+    };
+
+    let mut out = Vec::new();
+    let q = handle_cmd(initial_sub, &mut out);
+    if !out.is_empty() {
+        let _ = write_tx.send(out);
+    }
+    if q {
+        return;
+    }
+
+    for cmd in pending_cmds {
+        let mut out = Vec::new();
+        let q = handle_cmd(cmd, &mut out);
+        if !out.is_empty() {
+            let _ = write_tx.send(out);
+        }
+        if q {
+            return;
+        }
+    }
+
+    while !buf.is_empty() {
+        match parse_command(&mut buf) {
+            Ok(Some(cmd)) => {
+                let mut out = Vec::new();
+                let q = handle_cmd(cmd, &mut out);
+                if !out.is_empty() {
+                    let _ = write_tx.send(out);
+                }
+                if q {
+                    return;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                let _ = write_tx.send(format!("-ERR {}\r\n", e).into_bytes());
+                return;
+            }
+        }
+    }
+
+    loop {
+        let (res, returned_buf) = reader.read(read_buf).await;
+        read_buf = returned_buf;
+        match res {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&read_buf[..n]);
+                while !buf.is_empty() {
+                    match parse_command(&mut buf) {
+                        Ok(Some(cmd)) => {
+                            let mut out = Vec::new();
+                            let q = handle_cmd(cmd, &mut out);
+                            if !out.is_empty() {
+                                let _ = write_tx.send(out);
+                            }
+                            if q {
+                                return;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            let _ = write_tx.send(format!("-ERR {}\r\n", e).into_bytes());
+                            return;
+                        }
+                    }
+                }
+            }
+            Err(_) => break,
         }
     }
 }
@@ -211,7 +487,9 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Append { key, .. }
         | Command::Strlen(key)
         | Command::Rename { key, .. } => Some(key),
-        Command::Touch(keys) | Command::Del(keys) | Command::Exists(keys) | Command::Mget(keys) => keys.first(),
+        Command::Touch(keys) | Command::Del(keys) | Command::Exists(keys) | Command::Mget(keys) => {
+            keys.first()
+        }
         Command::Mset(pairs) | Command::Msetnx(pairs) => pairs.first().map(|(k, _)| k),
         _ => None,
     }
@@ -293,6 +571,14 @@ async fn execute_command(
         Command::CommandDocs => "COMMAND",
         Command::Info => "INFO",
         Command::Quit => "QUIT",
+        Command::Subscribe(_) => "SUBSCRIBE",
+        Command::Unsubscribe(_) => "UNSUBSCRIBE",
+        Command::Psubscribe(_) => "PSUBSCRIBE",
+        Command::Punsubscribe(_) => "PUNSUBSCRIBE",
+        Command::Publish { .. } => "PUBLISH",
+        Command::PubsubChannels(_) => "PUBSUB CHANNELS",
+        Command::PubsubNumsub(_) => "PUBSUB NUMSUB",
+        Command::PubsubNumpat => "PUBSUB NUMPAT",
         Command::Unknown(_) => "UNKNOWN",
     };
     if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
@@ -540,35 +826,35 @@ async fn execute_command(
                     out.extend_from_slice(info.as_bytes());
                     out.extend_from_slice(b"\r\n");
                 }
-                ClusterSubcommand::SetSlot(slot, sub_cmd) => {
-                    match sub_cmd {
-                        SetSlotSubcommand::Migrating(node) => {
-                            router.set_slot_state(slot, crate::shard::SlotState::Migrating(node));
-                            out.extend_from_slice(b"+OK\r\n");
-                        }
-                        SetSlotSubcommand::Importing(node) => {
-                            router.set_slot_state(slot, crate::shard::SlotState::Importing(node));
-                            out.extend_from_slice(b"+OK\r\n");
-                        }
-                        SetSlotSubcommand::Stable => {
-                            router.set_slot_state(slot, crate::shard::SlotState::Stable);
-                            out.extend_from_slice(b"+OK\r\n");
-                        }
-                        SetSlotSubcommand::Node(node) => {
-                            let is_myself = node == "myself"
-                                || (0..router.num_shards).any(|s| node == format!("{:040x}", s + 1));
-                            if is_myself {
-                                let shard = (0..router.num_shards)
-                                    .find(|&s| node == format!("{:040x}", s + 1))
-                                    .unwrap_or_else(|| crate::router::slot_to_shard(slot, router.num_shards));
-                                router.set_slot_owner(slot, shard);
-                            } else {
-                                router.set_slot_state(slot, crate::shard::SlotState::Moved(node));
-                            }
-                            out.extend_from_slice(b"+OK\r\n");
-                        }
+                ClusterSubcommand::SetSlot(slot, sub_cmd) => match sub_cmd {
+                    SetSlotSubcommand::Migrating(node) => {
+                        router.set_slot_state(slot, crate::shard::SlotState::Migrating(node));
+                        out.extend_from_slice(b"+OK\r\n");
                     }
-                }
+                    SetSlotSubcommand::Importing(node) => {
+                        router.set_slot_state(slot, crate::shard::SlotState::Importing(node));
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    SetSlotSubcommand::Stable => {
+                        router.set_slot_state(slot, crate::shard::SlotState::Stable);
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    SetSlotSubcommand::Node(node) => {
+                        let is_myself = node == "myself"
+                            || (0..router.num_shards).any(|s| node == format!("{:040x}", s + 1));
+                        if is_myself {
+                            let shard = (0..router.num_shards)
+                                .find(|&s| node == format!("{:040x}", s + 1))
+                                .unwrap_or_else(|| {
+                                    crate::router::slot_to_shard(slot, router.num_shards)
+                                });
+                            router.set_slot_owner(slot, shard);
+                        } else {
+                            router.set_slot_state(slot, crate::shard::SlotState::Moved(node));
+                        }
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                },
             }
             false
         }
@@ -587,7 +873,10 @@ async fn execute_command(
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 ClientSubcommand::GetName => {
-                    let name = client_registry.borrow().get(&client_id).and_then(|c| c.name.clone());
+                    let name = client_registry
+                        .borrow()
+                        .get(&client_id)
+                        .and_then(|c| c.name.clone());
                     match name {
                         Some(n) => {
                             out.extend_from_slice(format!("${}\r\n", n.len()).as_bytes());
@@ -686,11 +975,17 @@ async fn execute_command(
             out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
             false
         }
-        Command::Rename { ref key, ref newkey, .. } => {
+        Command::Rename {
+            ref key,
+            ref newkey,
+            ..
+        } => {
             let target_src = router.target_shard(key);
             let target_dst = router.target_shard(newkey);
             if target_src != target_dst {
-                out.extend_from_slice(b"-CROSSSLOT Keys in request don't hash to the same slot\r\n");
+                out.extend_from_slice(
+                    b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                );
                 return false;
             }
             if target_src == router.shard_id {
@@ -712,9 +1007,13 @@ async fn execute_command(
                 return false;
             }
             let first_shard = router.target_shard(&pairs[0].0);
-            let all_same_shard = pairs.iter().all(|(k, _)| router.target_shard(k) == first_shard);
+            let all_same_shard = pairs
+                .iter()
+                .all(|(k, _)| router.target_shard(k) == first_shard);
             if !all_same_shard {
-                out.extend_from_slice(b"-CROSSSLOT Keys in request don't hash to the same slot\r\n");
+                out.extend_from_slice(
+                    b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                );
                 return false;
             }
             if first_shard == router.shard_id {
@@ -833,8 +1132,12 @@ async fn execute_command(
                     }
                     crate::table::RudisValue::Hash(fields) => {
                         tx_buf.extend_from_slice(
-                            format!("*{}\r\n$4\r\nHSET\r\n${}\r\n", 2 + fields.len() * 2, k.len())
-                                .as_bytes(),
+                            format!(
+                                "*{}\r\n$4\r\nHSET\r\n${}\r\n",
+                                2 + fields.len() * 2,
+                                k.len()
+                            )
+                            .as_bytes(),
                         );
                         tx_buf.extend_from_slice(k);
                         tx_buf.extend_from_slice(b"\r\n");
@@ -850,11 +1153,7 @@ async fn execute_command(
                             let ms = dur.as_millis().max(1);
                             let ms_str = ms.to_string();
                             tx_buf.extend_from_slice(
-                                format!(
-                                    "*3\r\n$7\r\nPEXPIRE\r\n${}\r\n",
-                                    k.len()
-                                )
-                                .as_bytes(),
+                                format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
                             );
                             tx_buf.extend_from_slice(
                                 format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
@@ -918,7 +1217,8 @@ async fn execute_command(
                         tx_buf.extend_from_slice(b"\r\n");
                         for (m, score) in &zset.dict {
                             let s = score.to_string();
-                            tx_buf.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
+                            tx_buf
+                                .extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
                             tx_buf.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
                             tx_buf.extend_from_slice(m);
                             tx_buf.extend_from_slice(b"\r\n");
@@ -961,6 +1261,41 @@ async fn execute_command(
             }
 
             out.extend_from_slice(b"+OK\r\n");
+            false
+        }
+        Command::Subscribe(_)
+        | Command::Unsubscribe(_)
+        | Command::Psubscribe(_)
+        | Command::Punsubscribe(_) => false,
+        Command::Publish { channel, message } => {
+            let count = router.publish(channel, message).await;
+            out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+            false
+        }
+        Command::PubsubChannels(pattern) => {
+            let channels = router.pubsub_channels(pattern).await;
+            out.extend_from_slice(format!("*{}\r\n", channels.len()).as_bytes());
+            for ch in channels {
+                out.extend_from_slice(format!("${}\r\n", ch.len()).as_bytes());
+                out.extend_from_slice(&ch);
+                out.extend_from_slice(b"\r\n");
+            }
+            false
+        }
+        Command::PubsubNumsub(channels) => {
+            let counts = router.pubsub_numsub(channels).await;
+            out.extend_from_slice(format!("*{}\r\n", counts.len() * 2).as_bytes());
+            for (ch, cnt) in counts {
+                out.extend_from_slice(format!("${}\r\n", ch.len()).as_bytes());
+                out.extend_from_slice(&ch);
+                out.extend_from_slice(b"\r\n");
+                out.extend_from_slice(format!(":{}\r\n", cnt).as_bytes());
+            }
+            false
+        }
+        Command::PubsubNumpat => {
+            let count = router.pubsub_numpat().await;
+            out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
             false
         }
         Command::Quit => {
@@ -1026,11 +1361,7 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         Command::Rename { key, newkey, .. } => {
             let s1 = target_shard(key, num_shards);
             let s2 = target_shard(newkey, num_shards);
-            if s1 == s2 {
-                Some(s1)
-            } else {
-                None
-            }
+            if s1 == s2 { Some(s1) } else { None }
         }
         Command::Touch(keys) | Command::Del(keys) | Command::Exists(keys) if keys.len() == 1 => {
             Some(target_shard(&keys[0], num_shards))
@@ -1599,7 +1930,11 @@ pub fn execute_local_command(
             false
         }
         // ZSET COMMANDS
-        Command::Zadd { key, elements, flags } => {
+        Command::Zadd {
+            key,
+            elements,
+            flags,
+        } => {
             match db.zadd(key.clone(), elements.clone(), *flags) {
                 Ok((count, incr_score)) => {
                     if let Some(aof) = aof {
@@ -1704,7 +2039,13 @@ pub fn execute_local_command(
             }
             false
         }
-        Command::Zcount { key, min, min_inc, max, max_inc } => {
+        Command::Zcount {
+            key,
+            min,
+            min_inc,
+            max,
+            max_inc,
+        } => {
             match db.zcount(key, *min, *min_inc, *max, *max_inc) {
                 Ok(count) => {
                     out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
@@ -1742,7 +2083,9 @@ pub fn execute_local_command(
                             out.extend_from_slice(&m);
                             out.extend_from_slice(b"\r\n");
                             let s_str = s.to_string();
-                            out.extend_from_slice(format!("${}\r\n{}\r\n", s_str.len(), s_str).as_bytes());
+                            out.extend_from_slice(
+                                format!("${}\r\n{}\r\n", s_str.len(), s_str).as_bytes(),
+                            );
                         }
                     } else {
                         out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
@@ -1779,7 +2122,9 @@ pub fn execute_local_command(
                         out.extend_from_slice(&m);
                         out.extend_from_slice(b"\r\n");
                         let s_str = s.to_string();
-                        out.extend_from_slice(format!("${}\r\n{}\r\n", s_str.len(), s_str).as_bytes());
+                        out.extend_from_slice(
+                            format!("${}\r\n{}\r\n", s_str.len(), s_str).as_bytes(),
+                        );
                     }
                 }
                 Err(err) => {
@@ -1808,7 +2153,9 @@ pub fn execute_local_command(
                         out.extend_from_slice(&m);
                         out.extend_from_slice(b"\r\n");
                         let s_str = s.to_string();
-                        out.extend_from_slice(format!("${}\r\n{}\r\n", s_str.len(), s_str).as_bytes());
+                        out.extend_from_slice(
+                            format!("${}\r\n{}\r\n", s_str.len(), s_str).as_bytes(),
+                        );
                     }
                 }
                 Err(err) => {
@@ -2107,6 +2454,14 @@ async fn execute_commands_squashed(
                 Command::CommandDocs => "COMMAND",
                 Command::Info => "INFO",
                 Command::Quit => "QUIT",
+                Command::Subscribe(_) => "SUBSCRIBE",
+                Command::Unsubscribe(_) => "UNSUBSCRIBE",
+                Command::Psubscribe(_) => "PSUBSCRIBE",
+                Command::Punsubscribe(_) => "PUNSUBSCRIBE",
+                Command::Publish { .. } => "PUBLISH",
+                Command::PubsubChannels(_) => "PUBSUB CHANNELS",
+                Command::PubsubNumsub(_) => "PUBSUB NUMSUB",
+                Command::PubsubNumpat => "PUBSUB NUMPAT",
                 Command::Unknown(_) => "UNKNOWN",
             };
             c.last_cmd = cmd_name.to_string();

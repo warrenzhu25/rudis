@@ -1,5 +1,5 @@
-use std::time::Duration;
 use bytes::Bytes;
+use std::time::Duration;
 
 use crate::resp::Command;
 
@@ -73,6 +73,22 @@ pub enum ShardMessage {
     SyncAof {
         responder: flume::Sender<()>,
     },
+    Publish {
+        channel: Bytes,
+        message: Bytes,
+        responder: flume::Sender<usize>,
+    },
+    PubsubChannels {
+        pattern: Option<Bytes>,
+        responder: flume::Sender<Vec<Bytes>>,
+    },
+    PubsubNumsub {
+        channels: Vec<Bytes>,
+        responder: flume::Sender<Vec<(Bytes, usize)>>,
+    },
+    PubsubNumpat {
+        responder: flume::Sender<usize>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,7 +114,10 @@ impl ShardDb {
     }
 
     #[inline]
-    pub fn get_entry(&mut self, key: &[u8]) -> Option<(crate::table::RudisValue, Option<Duration>)> {
+    pub fn get_entry(
+        &mut self,
+        key: &[u8],
+    ) -> Option<(crate::table::RudisValue, Option<Duration>)> {
         self.table.get_entry(key)
     }
 
@@ -153,7 +172,11 @@ impl ShardDb {
     }
 
     #[inline]
-    pub fn hmget(&mut self, key: &[u8], fields: &[Bytes]) -> Result<Vec<Option<Bytes>>, &'static str> {
+    pub fn hmget(
+        &mut self,
+        key: &[u8],
+        fields: &[Bytes],
+    ) -> Result<Vec<Option<Bytes>>, &'static str> {
         self.table.hmget(key, fields)
     }
 
@@ -219,7 +242,12 @@ impl ShardDb {
     }
 
     #[inline]
-    pub fn lrange(&mut self, key: &[u8], start: i64, stop: i64) -> Result<Vec<Bytes>, &'static str> {
+    pub fn lrange(
+        &mut self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+    ) -> Result<Vec<Bytes>, &'static str> {
         self.table.lrange(key, start, stop)
     }
 
@@ -255,7 +283,12 @@ impl ShardDb {
     }
 
     #[inline]
-    pub fn zadd(&mut self, key: Bytes, elements: Vec<(f64, Bytes)>, flags: crate::table::ZAddFlags) -> Result<(usize, Option<f64>), &'static str> {
+    pub fn zadd(
+        &mut self,
+        key: Bytes,
+        elements: Vec<(f64, Bytes)>,
+        flags: crate::table::ZAddFlags,
+    ) -> Result<(usize, Option<f64>), &'static str> {
         self.table.zadd(key, elements, flags)
     }
 
@@ -275,12 +308,24 @@ impl ShardDb {
     }
 
     #[inline]
-    pub fn zrank(&mut self, key: &[u8], member: &[u8], rev: bool) -> Result<Option<usize>, &'static str> {
+    pub fn zrank(
+        &mut self,
+        key: &[u8],
+        member: &[u8],
+        rev: bool,
+    ) -> Result<Option<usize>, &'static str> {
         self.table.zrank(key, member, rev)
     }
 
     #[inline]
-    pub fn zcount(&mut self, key: &[u8], min: f64, min_inc: bool, max: f64, max_inc: bool) -> Result<usize, &'static str> {
+    pub fn zcount(
+        &mut self,
+        key: &[u8],
+        min: f64,
+        min_inc: bool,
+        max: f64,
+        max_inc: bool,
+    ) -> Result<usize, &'static str> {
         self.table.zcount(key, min, min_inc, max, max_inc)
     }
 
@@ -290,7 +335,11 @@ impl ShardDb {
     }
 
     #[inline]
-    pub fn zrange(&mut self, key: &[u8], opts: &crate::table::ZRangeOpts) -> Result<Vec<(Bytes, f64)>, &'static str> {
+    pub fn zrange(
+        &mut self,
+        key: &[u8],
+        opts: &crate::table::ZRangeOpts,
+    ) -> Result<Vec<(Bytes, f64)>, &'static str> {
         self.table.zrange(key, opts)
     }
 
@@ -379,4 +428,3 @@ impl ShardDb {
         self.table.is_empty()
     }
 }
-

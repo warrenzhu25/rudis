@@ -1,7 +1,7 @@
+use socket2::{Domain, Protocol, Socket, Type};
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
-use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::connection::{execute_local_command, handle_connection};
 use crate::router::Router;
@@ -29,9 +29,15 @@ pub fn run_shard_worker(
         // 1. Configure socket with SO_REUSEPORT and SO_REUSEADDR
         let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
             .expect("Failed to create socket");
-        socket.set_reuse_port(true).expect("Failed to set SO_REUSEPORT");
-        socket.set_reuse_address(true).expect("Failed to set SO_REUSEADDR");
-        socket.set_nonblocking(true).expect("Failed to set non-blocking");
+        socket
+            .set_reuse_port(true)
+            .expect("Failed to set SO_REUSEPORT");
+        socket
+            .set_reuse_address(true)
+            .expect("Failed to set SO_REUSEADDR");
+        socket
+            .set_nonblocking(true)
+            .expect("Failed to set non-blocking");
         let _ = socket.set_recv_buffer_size(512 * 1024);
         let _ = socket.set_send_buffer_size(512 * 1024);
 
@@ -93,8 +99,20 @@ pub fn run_shard_worker(
             None
         };
 
-        let client_registry = Rc::new(RefCell::new(hashbrown::HashMap::<u64, crate::connection::ClientInfo>::new()));
-        let router = Rc::new(Router::new(shard_id, num_shards, port, local_db.clone(), senders, aof_writer.clone()));
+        let client_registry = Rc::new(RefCell::new(hashbrown::HashMap::<
+            u64,
+            crate::connection::ClientInfo,
+        >::new()));
+        let pubsub = Rc::new(RefCell::new(crate::pubsub::PubSubHub::new()));
+        let router = Rc::new(Router::new(
+            shard_id,
+            num_shards,
+            port,
+            local_db.clone(),
+            senders,
+            aof_writer.clone(),
+            pubsub.clone(),
+        ));
 
         // Active expiration cycle: run every 100ms
         let active_db = local_db.clone();
@@ -111,6 +129,7 @@ pub fn run_shard_worker(
         let cross_shard_slot_states = router.slot_states.clone();
         let cross_shard_slot_owners = router.slot_owners.clone();
         let cross_shard_aof = aof_writer.clone();
+        let cross_shard_pubsub = pubsub.clone();
         monoio::spawn(async move {
             while let Ok(msg) = rx.recv_async().await {
                 match msg {
@@ -124,13 +143,17 @@ pub fn run_shard_worker(
                         expire_in,
                         responder,
                     } => {
-                        cross_shard_db.borrow_mut().set(key.clone(), value.clone(), expire_in);
+                        cross_shard_db
+                            .borrow_mut()
+                            .set(key.clone(), value.clone(), expire_in);
                         if let Some(aof) = &cross_shard_aof {
-                            if let Some(bytes) = crate::aof::command_to_resp(&crate::resp::Command::Set {
-                                key,
-                                value,
-                                expire_in,
-                            }) {
+                            if let Some(bytes) =
+                                crate::aof::command_to_resp(&crate::resp::Command::Set {
+                                    key,
+                                    value,
+                                    expire_in,
+                                })
+                            {
                                 aof.borrow_mut().append(&bytes);
                             }
                         }
@@ -140,7 +163,11 @@ pub fn run_shard_worker(
                         let deleted = cross_shard_db.borrow_mut().del(&key);
                         if deleted {
                             if let Some(aof) = &cross_shard_aof {
-                                if let Some(bytes) = crate::aof::command_to_resp(&crate::resp::Command::Del(vec![key])) {
+                                if let Some(bytes) =
+                                    crate::aof::command_to_resp(&crate::resp::Command::Del(vec![
+                                        key,
+                                    ]))
+                                {
                                     aof.borrow_mut().append(&bytes);
                                 }
                             }
@@ -159,7 +186,9 @@ pub fn run_shard_worker(
                         let res = cross_shard_db.borrow_mut().incr_by(key.clone(), delta);
                         if res.is_ok() {
                             if let Some(aof) = &cross_shard_aof {
-                                if let Some(bytes) = crate::aof::command_to_resp(&crate::resp::Command::IncrBy(key, delta)) {
+                                if let Some(bytes) = crate::aof::command_to_resp(
+                                    &crate::resp::Command::IncrBy(key, delta),
+                                ) {
                                     aof.borrow_mut().append(&bytes);
                                 }
                             }
@@ -174,7 +203,9 @@ pub fn run_shard_worker(
                         let res = cross_shard_db.borrow_mut().expire(&key, duration);
                         if res {
                             if let Some(aof) = &cross_shard_aof {
-                                if let Some(bytes) = crate::aof::command_to_resp(&crate::resp::Command::Expire(key, duration)) {
+                                if let Some(bytes) = crate::aof::command_to_resp(
+                                    &crate::resp::Command::Expire(key, duration),
+                                ) {
                                     aof.borrow_mut().append(&bytes);
                                 }
                             }
@@ -185,7 +216,9 @@ pub fn run_shard_worker(
                         let res = cross_shard_db.borrow_mut().persist(&key);
                         if res {
                             if let Some(aof) = &cross_shard_aof {
-                                if let Some(bytes) = crate::aof::command_to_resp(&crate::resp::Command::Persist(key)) {
+                                if let Some(bytes) =
+                                    crate::aof::command_to_resp(&crate::resp::Command::Persist(key))
+                                {
                                     aof.borrow_mut().append(&bytes);
                                 }
                             }
@@ -246,7 +279,8 @@ pub fn run_shard_worker(
                         cross_shard_slot_states.borrow_mut()[slot as usize] = state;
                     }
                     ShardMessage::SetSlotOwner { slot, owner } => {
-                        cross_shard_slot_states.borrow_mut()[slot as usize] = crate::shard::SlotState::Stable;
+                        cross_shard_slot_states.borrow_mut()[slot as usize] =
+                            crate::shard::SlotState::Stable;
                         cross_shard_slot_owners.borrow_mut()[slot as usize] = owner;
                     }
                     ShardMessage::DumpKey { key, responder } => {
@@ -258,6 +292,36 @@ pub fn run_shard_worker(
                             let _ = aof.borrow_mut().sync().await;
                         }
                         let _ = responder.send(());
+                    }
+                    ShardMessage::Publish {
+                        channel,
+                        message,
+                        responder,
+                    } => {
+                        let count = cross_shard_pubsub.borrow().publish(&channel, &message);
+                        let _ = responder.send(count);
+                    }
+                    ShardMessage::PubsubChannels { pattern, responder } => {
+                        let channels = cross_shard_pubsub.borrow().channels(pattern.as_deref());
+                        let _ = responder.send(channels);
+                    }
+                    ShardMessage::PubsubNumsub {
+                        channels,
+                        responder,
+                    } => {
+                        let hub = cross_shard_pubsub.borrow();
+                        let counts = channels
+                            .into_iter()
+                            .map(|ch| {
+                                let cnt = hub.numsub(&ch);
+                                (ch, cnt)
+                            })
+                            .collect();
+                        let _ = responder.send(counts);
+                    }
+                    ShardMessage::PubsubNumpat { responder } => {
+                        let cnt = cross_shard_pubsub.borrow().numpat();
+                        let _ = responder.send(cnt);
                     }
                 }
             }

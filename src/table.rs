@@ -1,7 +1,7 @@
-use std::time::{Duration, Instant};
 use bytes::Bytes;
 use fxhash::hash64;
 use hashbrown::HashMap;
+use std::time::{Duration, Instant};
 
 pub const GROUP_SIZE: usize = 16;
 pub const EMPTY: u8 = 0xFF;
@@ -384,9 +384,7 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
                     RudisValue::String(b) => Ok(Some(b.clone())),
-                    _ => {
-                        Err("WRONGTYPE Operation against a key holding the wrong kind of value")
-                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
                 Ok(None)
@@ -419,7 +417,10 @@ impl RudisTable {
 
     pub fn set(&mut self, key: Bytes, value: Bytes, expire_in: Option<Duration>) {
         let slot = crate::router::key_slot(&key);
-        self.slot_to_keys.entry(slot).or_default().insert(key.clone());
+        self.slot_to_keys
+            .entry(slot)
+            .or_default()
+            .insert(key.clone());
 
         let expire_at = expire_in.map(|d| Instant::now() + d);
         let entry = RudisEntry {
@@ -467,25 +468,29 @@ impl RudisTable {
             let was_exp = self.check_expired_slot(idx);
             if !was_exp {
                 let (current, old_expire) = match self.table.get_slot(idx) {
-                    Some(entry) => match &entry.val {
-                        RudisValue::String(b) => {
-                            let s = std::str::from_utf8(b)
-                                .map_err(|_| "value is not an integer or out of range".to_string())?;
-                            let val = s.parse::<i64>()
-                                .map_err(|_| "value is not an integer or out of range".to_string())?;
-                            (val, entry.expire_at)
+                    Some(entry) => {
+                        match &entry.val {
+                            RudisValue::String(b) => {
+                                let s = std::str::from_utf8(b).map_err(|_| {
+                                    "value is not an integer or out of range".to_string()
+                                })?;
+                                let val = s.parse::<i64>().map_err(|_| {
+                                    "value is not an integer or out of range".to_string()
+                                })?;
+                                (val, entry.expire_at)
+                            }
+                            _ => {
+                                return Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string());
+                            }
                         }
-                        _ => {
-                            return Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string());
-                        }
-                    },
+                    }
                     None => (0, None),
                 };
 
                 let new_val = current
                     .checked_add(delta)
                     .ok_or_else(|| "increment or decrement would overflow".to_string())?;
-                
+
                 let entry = RudisEntry {
                     key: key.clone(),
                     val: RudisValue::String(Bytes::from(new_val.to_string())),
@@ -498,7 +503,10 @@ impl RudisTable {
 
         let new_val = delta;
         let slot = crate::router::key_slot(&key);
-        self.slot_to_keys.entry(slot).or_default().insert(key.clone());
+        self.slot_to_keys
+            .entry(slot)
+            .or_default()
+            .insert(key.clone());
         let entry = RudisEntry {
             key,
             val: RudisValue::String(Bytes::from(new_val.to_string())),
@@ -810,14 +818,19 @@ impl RudisTable {
                         return Ok(added);
                     }
                     _ => {
-                        return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
                     }
                 }
             }
         }
 
         let slot = crate::router::key_slot(&key);
-        self.slot_to_keys.entry(slot).or_default().insert(key.clone());
+        self.slot_to_keys
+            .entry(slot)
+            .or_default()
+            .insert(key.clone());
 
         let mut map = HashMap::new();
         let mut added = 0;
@@ -844,9 +857,7 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
                     RudisValue::Hash(map) => Ok(map.get(field).cloned()),
-                    _ => {
-                        Err("WRONGTYPE Operation against a key holding the wrong kind of value")
-                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
                 Ok(None)
@@ -856,7 +867,11 @@ impl RudisTable {
         }
     }
 
-    pub fn hmget(&mut self, key: &[u8], fields: &[Bytes]) -> Result<Vec<Option<Bytes>>, &'static str> {
+    pub fn hmget(
+        &mut self,
+        key: &[u8],
+        fields: &[Bytes],
+    ) -> Result<Vec<Option<Bytes>>, &'static str> {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
@@ -867,9 +882,7 @@ impl RudisTable {
                     RudisValue::Hash(map) => {
                         Ok(fields.iter().map(|f| map.get(f).cloned()).collect())
                     }
-                    _ => {
-                        Err("WRONGTYPE Operation against a key holding the wrong kind of value")
-                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
                 Ok(vec![None; fields.len()])
@@ -897,7 +910,9 @@ impl RudisTable {
                         (c, map.is_empty())
                     }
                     _ => {
-                        return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
                     }
                 }
             } else {
@@ -927,9 +942,7 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
                     RudisValue::Hash(map) => Ok(map.contains_key(field)),
-                    _ => {
-                        Err("WRONGTYPE Operation against a key holding the wrong kind of value")
-                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
                 Ok(false)
@@ -948,9 +961,7 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
                     RudisValue::Hash(map) => Ok(map.len()),
-                    _ => {
-                        Err("WRONGTYPE Operation against a key holding the wrong kind of value")
-                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
                 Ok(0)
@@ -971,9 +982,7 @@ impl RudisTable {
                     RudisValue::Hash(map) => {
                         Ok(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                     }
-                    _ => {
-                        Err("WRONGTYPE Operation against a key holding the wrong kind of value")
-                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
                 Ok(Vec::new())
@@ -992,9 +1001,7 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
                     RudisValue::Hash(map) => Ok(map.keys().cloned().collect()),
-                    _ => {
-                        Err("WRONGTYPE Operation against a key holding the wrong kind of value")
-                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
                 Ok(Vec::new())
@@ -1013,9 +1020,7 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
                     RudisValue::Hash(map) => Ok(map.values().cloned().collect()),
-                    _ => {
-                        Err("WRONGTYPE Operation against a key holding the wrong kind of value")
-                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
                 Ok(Vec::new())
@@ -1039,7 +1044,11 @@ impl RudisTable {
                         }
                         return Ok(deque.len());
                     }
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
                 }
             }
         }
@@ -1050,7 +1059,10 @@ impl RudisTable {
         }
         let len = deque.len();
         let slot = crate::router::key_slot(&key);
-        self.slot_to_keys.entry(slot).or_default().insert(key.clone());
+        self.slot_to_keys
+            .entry(slot)
+            .or_default()
+            .insert(key.clone());
         let entry = RudisEntry {
             key,
             val: RudisValue::List(deque),
@@ -1073,7 +1085,11 @@ impl RudisTable {
                         }
                         return Ok(deque.len());
                     }
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
                 }
             }
         }
@@ -1084,7 +1100,10 @@ impl RudisTable {
         }
         let len = deque.len();
         let slot = crate::router::key_slot(&key);
-        self.slot_to_keys.entry(slot).or_default().insert(key.clone());
+        self.slot_to_keys
+            .entry(slot)
+            .or_default()
+            .insert(key.clone());
         let entry = RudisEntry {
             key,
             val: RudisValue::List(deque),
@@ -1114,7 +1133,11 @@ impl RudisTable {
                         let empty = deque.is_empty();
                         (res, empty)
                     }
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
                 }
             } else {
                 (Vec::new(), false)
@@ -1154,7 +1177,11 @@ impl RudisTable {
                         let empty = deque.is_empty();
                         (res, empty)
                     }
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
                 }
             } else {
                 (Vec::new(), false)
@@ -1220,7 +1247,12 @@ impl RudisTable {
         }
     }
 
-    pub fn lrange(&mut self, key: &[u8], mut start: i64, mut stop: i64) -> Result<Vec<Bytes>, &'static str> {
+    pub fn lrange(
+        &mut self,
+        key: &[u8],
+        mut start: i64,
+        mut stop: i64,
+    ) -> Result<Vec<Bytes>, &'static str> {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
@@ -1279,7 +1311,11 @@ impl RudisTable {
                         }
                         return Ok(added);
                     }
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
                 }
             }
         }
@@ -1292,7 +1328,10 @@ impl RudisTable {
             }
         }
         let slot = crate::router::key_slot(&key);
-        self.slot_to_keys.entry(slot).or_default().insert(key.clone());
+        self.slot_to_keys
+            .entry(slot)
+            .or_default()
+            .insert(key.clone());
         let entry = RudisEntry {
             key,
             val: RudisValue::Set(set),
@@ -1320,7 +1359,11 @@ impl RudisTable {
                         let empty = set.is_empty();
                         (c, empty)
                     }
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
                 }
             } else {
                 (0, false)
@@ -1418,7 +1461,11 @@ impl RudisTable {
                         let empty = set.is_empty();
                         (res, empty)
                     }
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
                 }
             } else {
                 (Vec::new(), false)
@@ -1520,11 +1567,7 @@ impl RudisTable {
                                 if flags.nx {
                                     continue;
                                 }
-                                let new_score = if flags.incr {
-                                    old_score + score
-                                } else {
-                                    score
-                                };
+                                let new_score = if flags.incr { old_score + score } else { score };
                                 if flags.gt && new_score <= old_score {
                                     continue;
                                 }
@@ -1557,7 +1600,11 @@ impl RudisTable {
                         let ret_count = if flags.ch { changed_count } else { added_count };
                         return Ok((ret_count, new_score_incr));
                     }
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
                 }
             }
         }
@@ -1627,7 +1674,12 @@ impl RudisTable {
         }
     }
 
-    pub fn zrank(&mut self, key: &[u8], member: &[u8], rev: bool) -> Result<Option<usize>, &'static str> {
+    pub fn zrank(
+        &mut self,
+        key: &[u8],
+        member: &[u8],
+        rev: bool,
+    ) -> Result<Option<usize>, &'static str> {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
@@ -1715,7 +1767,11 @@ impl RudisTable {
                         };
                         return Ok(new_score);
                     }
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
                 }
             }
         }
@@ -1732,7 +1788,11 @@ impl RudisTable {
         Ok(delta)
     }
 
-    pub fn zrange(&mut self, key: &[u8], opts: &ZRangeOpts) -> Result<Vec<(Bytes, f64)>, &'static str> {
+    pub fn zrange(
+        &mut self,
+        key: &[u8],
+        opts: &ZRangeOpts,
+    ) -> Result<Vec<(Bytes, f64)>, &'static str> {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
@@ -1764,16 +1824,26 @@ impl RudisTable {
                                 let rev_items: Vec<_> = make_iter().collect();
                                 let skipped = rev_items.into_iter().rev().skip(opts.offset);
                                 if let Some(c) = opts.count {
-                                    skipped.take(c).map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                                    skipped
+                                        .take(c)
+                                        .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                                        .collect()
                                 } else {
-                                    skipped.map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                                    skipped
+                                        .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                                        .collect()
                                 }
                             } else {
                                 let skipped = make_iter().skip(opts.offset);
                                 if let Some(c) = opts.count {
-                                    skipped.take(c).map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                                    skipped
+                                        .take(c)
+                                        .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                                        .collect()
                                 } else {
-                                    skipped.map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                                    skipped
+                                        .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                                        .collect()
                                 }
                             };
                             Ok(res)
@@ -1841,7 +1911,11 @@ impl RudisTable {
                         }
                         (count, zset.is_empty())
                     }
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
                 }
             } else {
                 (0, false)
@@ -1875,7 +1949,11 @@ impl RudisTable {
                         }
                         (popped, zset.is_empty())
                     }
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
                 }
             } else {
                 (Vec::new(), false)
@@ -1909,7 +1987,11 @@ impl RudisTable {
                         }
                         (popped, zset.is_empty())
                     }
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
                 }
             } else {
                 (Vec::new(), false)
@@ -2012,8 +2094,14 @@ mod tests {
         assert_eq!(table.get(b"nonexistent").unwrap(), None);
 
         // 2. INCRBY
-        assert_eq!(table.incr_by(Bytes::from_static(b"counter"), 10).unwrap(), 10);
-        assert_eq!(table.incr_by(Bytes::from_static(b"counter"), -3).unwrap(), 7);
+        assert_eq!(
+            table.incr_by(Bytes::from_static(b"counter"), 10).unwrap(),
+            10
+        );
+        assert_eq!(
+            table.incr_by(Bytes::from_static(b"counter"), -3).unwrap(),
+            7
+        );
 
         // 3. TTL & Expiration
         table.set(
@@ -2021,7 +2109,10 @@ mod tests {
             Bytes::from_static(b"temp"),
             Some(Duration::from_millis(50)),
         );
-        assert_eq!(table.get(b"exp_key").unwrap(), Some(Bytes::from_static(b"temp")));
+        assert_eq!(
+            table.get(b"exp_key").unwrap(),
+            Some(Bytes::from_static(b"temp"))
+        );
         assert!(table.ttl(b"exp_key", false) >= 0);
 
         thread::sleep(Duration::from_millis(60));
@@ -2078,7 +2169,7 @@ mod tests {
         assert_eq!(table.zrank(b"myzset", b"m3", false).unwrap(), Some(0)); // 5.0
         assert_eq!(table.zrank(b"myzset", b"m1", false).unwrap(), Some(1)); // 10.0
         assert_eq!(table.zrank(b"myzset", b"m2", false).unwrap(), Some(2)); // 20.5
-        assert_eq!(table.zrank(b"myzset", b"m3", true).unwrap(), Some(2));  // rev rank
+        assert_eq!(table.zrank(b"myzset", b"m3", true).unwrap(), Some(2)); // rev rank
 
         // 3. ZRANGE by index
         let opts = ZRangeOpts {
@@ -2105,7 +2196,13 @@ mod tests {
         assert_eq!(table.zcount(b"myzset", 5.0, false, 15.0, true).unwrap(), 1);
 
         // 5. ZINCRBY
-        let new_score = table.zincrby(Bytes::from_static(b"myzset"), 15.0, Bytes::from_static(b"m3")).unwrap();
+        let new_score = table
+            .zincrby(
+                Bytes::from_static(b"myzset"),
+                15.0,
+                Bytes::from_static(b"m3"),
+            )
+            .unwrap();
         assert_eq!(new_score, 20.0);
         assert_eq!(table.zscore(b"myzset", b"m3").unwrap(), Some(20.0));
 
@@ -2127,7 +2224,11 @@ mod tests {
         assert_eq!(table.zcard(b"myzset").unwrap(), 0);
 
         // WRONGTYPE test
-        table.set(Bytes::from_static(b"str_key"), Bytes::from_static(b"val"), None);
+        table.set(
+            Bytes::from_static(b"str_key"),
+            Bytes::from_static(b"val"),
+            None,
+        );
         assert!(table.zcard(b"str_key").is_err());
     }
 }

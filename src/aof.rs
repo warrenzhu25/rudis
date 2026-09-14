@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use bytes::BytesMut;
+use std::path::{Path, PathBuf};
 
 use crate::resp::Command;
 use crate::shard::ShardDb;
@@ -91,9 +91,7 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             if let Some(dur) = expire_in {
                 let ms = dur.as_millis().max(1);
                 let ms_str = ms.to_string();
-                buf.extend_from_slice(
-                    format!("*5\r\n$3\r\nSET\r\n${}\r\n", key.len()).as_bytes(),
-                );
+                buf.extend_from_slice(format!("*5\r\n$3\r\nSET\r\n${}\r\n", key.len()).as_bytes());
                 buf.extend_from_slice(key);
                 buf.extend_from_slice(format!("\r\n${}\r\n", value.len()).as_bytes());
                 buf.extend_from_slice(value);
@@ -101,9 +99,7 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                     format!("\r\n$2\r\nPX\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
                 );
             } else {
-                buf.extend_from_slice(
-                    format!("*3\r\n$3\r\nSET\r\n${}\r\n", key.len()).as_bytes(),
-                );
+                buf.extend_from_slice(format!("*3\r\n$3\r\nSET\r\n${}\r\n", key.len()).as_bytes());
                 buf.extend_from_slice(key);
                 buf.extend_from_slice(format!("\r\n${}\r\n", value.len()).as_bytes());
                 buf.extend_from_slice(value);
@@ -142,9 +138,7 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
         Command::Expire(key, dur) => {
             let ms = dur.as_millis().max(1);
             let ms_str = ms.to_string();
-            buf.extend_from_slice(
-                format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", key.len()).as_bytes(),
-            );
+            buf.extend_from_slice(format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", key.len()).as_bytes());
             buf.extend_from_slice(key);
             buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes());
             Some(buf)
@@ -157,7 +151,12 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
         }
         Command::Hset { key, fields } | Command::Hmset { key, fields } => {
             buf.extend_from_slice(
-                format!("*{}\r\n$4\r\nHSET\r\n${}\r\n", 2 + fields.len() * 2, key.len()).as_bytes(),
+                format!(
+                    "*{}\r\n$4\r\nHSET\r\n${}\r\n",
+                    2 + fields.len() * 2,
+                    key.len()
+                )
+                .as_bytes(),
             );
             buf.extend_from_slice(key);
             buf.extend_from_slice(b"\r\n");
@@ -213,15 +212,11 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
         Command::Lpop { key, count } => {
             if let Some(c) = count {
                 let c_str = c.to_string();
-                buf.extend_from_slice(
-                    format!("*3\r\n$4\r\nLPOP\r\n${}\r\n", key.len()).as_bytes(),
-                );
+                buf.extend_from_slice(format!("*3\r\n$4\r\nLPOP\r\n${}\r\n", key.len()).as_bytes());
                 buf.extend_from_slice(key);
                 buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", c_str.len(), c_str).as_bytes());
             } else {
-                buf.extend_from_slice(
-                    format!("*2\r\n$4\r\nLPOP\r\n${}\r\n", key.len()).as_bytes(),
-                );
+                buf.extend_from_slice(format!("*2\r\n$4\r\nLPOP\r\n${}\r\n", key.len()).as_bytes());
                 buf.extend_from_slice(key);
                 buf.extend_from_slice(b"\r\n");
             }
@@ -230,15 +225,11 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
         Command::Rpop { key, count } => {
             if let Some(c) = count {
                 let c_str = c.to_string();
-                buf.extend_from_slice(
-                    format!("*3\r\n$4\r\nRPOP\r\n${}\r\n", key.len()).as_bytes(),
-                );
+                buf.extend_from_slice(format!("*3\r\n$4\r\nRPOP\r\n${}\r\n", key.len()).as_bytes());
                 buf.extend_from_slice(key);
                 buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", c_str.len(), c_str).as_bytes());
             } else {
-                buf.extend_from_slice(
-                    format!("*2\r\n$4\r\nRPOP\r\n${}\r\n", key.len()).as_bytes(),
-                );
+                buf.extend_from_slice(format!("*2\r\n$4\r\nRPOP\r\n${}\r\n", key.len()).as_bytes());
                 buf.extend_from_slice(key);
                 buf.extend_from_slice(b"\r\n");
             }
@@ -273,37 +264,63 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
         Command::Spop { key, count } => {
             if let Some(c) = count {
                 let c_str = c.to_string();
-                buf.extend_from_slice(
-                    format!("*3\r\n$4\r\nSPOP\r\n${}\r\n", key.len()).as_bytes(),
-                );
+                buf.extend_from_slice(format!("*3\r\n$4\r\nSPOP\r\n${}\r\n", key.len()).as_bytes());
                 buf.extend_from_slice(key);
                 buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", c_str.len(), c_str).as_bytes());
             } else {
-                buf.extend_from_slice(
-                    format!("*2\r\n$4\r\nSPOP\r\n${}\r\n", key.len()).as_bytes(),
-                );
+                buf.extend_from_slice(format!("*2\r\n$4\r\nSPOP\r\n${}\r\n", key.len()).as_bytes());
                 buf.extend_from_slice(key);
                 buf.extend_from_slice(b"\r\n");
             }
             Some(buf)
         }
-        Command::Zadd { key, elements, flags } => {
+        Command::Zadd {
+            key,
+            elements,
+            flags,
+        } => {
             let mut num_args = 2 + elements.len() * 2;
-            if flags.nx { num_args += 1; }
-            if flags.xx { num_args += 1; }
-            if flags.gt { num_args += 1; }
-            if flags.lt { num_args += 1; }
-            if flags.ch { num_args += 1; }
-            if flags.incr { num_args += 1; }
-            buf.extend_from_slice(format!("*{}\r\n$4\r\nZADD\r\n${}\r\n", num_args, key.len()).as_bytes());
+            if flags.nx {
+                num_args += 1;
+            }
+            if flags.xx {
+                num_args += 1;
+            }
+            if flags.gt {
+                num_args += 1;
+            }
+            if flags.lt {
+                num_args += 1;
+            }
+            if flags.ch {
+                num_args += 1;
+            }
+            if flags.incr {
+                num_args += 1;
+            }
+            buf.extend_from_slice(
+                format!("*{}\r\n$4\r\nZADD\r\n${}\r\n", num_args, key.len()).as_bytes(),
+            );
             buf.extend_from_slice(key);
             buf.extend_from_slice(b"\r\n");
-            if flags.nx { buf.extend_from_slice(b"$2\r\nNX\r\n"); }
-            if flags.xx { buf.extend_from_slice(b"$2\r\nXX\r\n"); }
-            if flags.gt { buf.extend_from_slice(b"$2\r\nGT\r\n"); }
-            if flags.lt { buf.extend_from_slice(b"$2\r\nLT\r\n"); }
-            if flags.ch { buf.extend_from_slice(b"$2\r\nCH\r\n"); }
-            if flags.incr { buf.extend_from_slice(b"$4\r\nINCR\r\n"); }
+            if flags.nx {
+                buf.extend_from_slice(b"$2\r\nNX\r\n");
+            }
+            if flags.xx {
+                buf.extend_from_slice(b"$2\r\nXX\r\n");
+            }
+            if flags.gt {
+                buf.extend_from_slice(b"$2\r\nGT\r\n");
+            }
+            if flags.lt {
+                buf.extend_from_slice(b"$2\r\nLT\r\n");
+            }
+            if flags.ch {
+                buf.extend_from_slice(b"$2\r\nCH\r\n");
+            }
+            if flags.incr {
+                buf.extend_from_slice(b"$4\r\nINCR\r\n");
+            }
             for (s, m) in elements {
                 let s_str = s.to_string();
                 buf.extend_from_slice(format!("${}\r\n{}\r\n", s_str.len(), s_str).as_bytes());

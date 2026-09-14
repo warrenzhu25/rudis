@@ -27,7 +27,15 @@ fn start_test_server_with_aof(port: u16, num_shards: usize, aof_config: rudis::a
         thread::Builder::new()
             .name(format!("test-shard-{}", shard_id))
             .spawn(move || {
-                run_shard_worker(shard_id, num_shards, port, shard_senders, rx, None, shard_aof_config);
+                run_shard_worker(
+                    shard_id,
+                    num_shards,
+                    port,
+                    shard_senders,
+                    rx,
+                    None,
+                    shard_aof_config,
+                );
             })
             .expect("Failed to spawn test shard");
     }
@@ -148,11 +156,18 @@ fn test_multithread_shared_nothing_e2e() {
 
     // 10. Test TTL, PTTL, EXPIRE, and PERSIST
     // 10a. SET with EX (1 second expiration)
-    let resp = send_and_read(&mut stream, b"*5\r\n$3\r\nSET\r\n$6\r\nex_key\r\n$8\r\ntemp_val\r\n$2\r\nEX\r\n$1\r\n1\r\n");
+    let resp = send_and_read(
+        &mut stream,
+        b"*5\r\n$3\r\nSET\r\n$6\r\nex_key\r\n$8\r\ntemp_val\r\n$2\r\nEX\r\n$1\r\n1\r\n",
+    );
     assert_eq!(resp, "+OK\r\n");
 
     let resp = send_and_read(&mut stream, b"TTL ex_key\r\n");
-    assert!(resp == ":1\r\n" || resp == ":0\r\n", "Expected TTL 1 or 0, got {}", resp);
+    assert!(
+        resp == ":1\r\n" || resp == ":0\r\n",
+        "Expected TTL 1 or 0, got {}",
+        resp
+    );
 
     let resp = send_and_read(&mut stream, b"GET ex_key\r\n");
     assert_eq!(resp, "$8\r\ntemp_val\r\n");
@@ -219,7 +234,10 @@ fn test_multithread_shared_nothing_e2e() {
     // 12a. CLUSTER KEYSLOT with hash tag support
     let resp1 = send_and_read(&mut stream, b"CLUSTER KEYSLOT {user:42}:profile\r\n");
     let resp2 = send_and_read(&mut stream, b"CLUSTER KEYSLOT {user:42}:orders\r\n");
-    assert_eq!(resp1, resp2, "Keys with same hash tag must have identical slot");
+    assert_eq!(
+        resp1, resp2,
+        "Keys with same hash tag must have identical slot"
+    );
     assert!(resp1.starts_with(':'), "Slot response should be integer");
 
     // Parse the slot number
@@ -232,18 +250,30 @@ fn test_multithread_shared_nothing_e2e() {
     let _ = send_and_read(&mut stream, b"SET {user:42}:k2 val2\r\n");
     let _ = send_and_read(&mut stream, b"SET {user:42}:k3 val3\r\n");
 
-    let count_resp = send_and_read(&mut stream, format!("CLUSTER COUNTKEYSINSLOT {}\r\n", slot).as_bytes());
+    let count_resp = send_and_read(
+        &mut stream,
+        format!("CLUSTER COUNTKEYSINSLOT {}\r\n", slot).as_bytes(),
+    );
     assert_eq!(count_resp, ":3\r\n");
 
-    let get_keys_resp = send_and_read(&mut stream, format!("CLUSTER GETKEYSINSLOT {} 10\r\n", slot).as_bytes());
-    assert!(get_keys_resp.starts_with("*3\r\n"), "Expected 3 keys returned");
+    let get_keys_resp = send_and_read(
+        &mut stream,
+        format!("CLUSTER GETKEYSINSLOT {} 10\r\n", slot).as_bytes(),
+    );
+    assert!(
+        get_keys_resp.starts_with("*3\r\n"),
+        "Expected 3 keys returned"
+    );
     assert!(get_keys_resp.contains("{user:42}:k1"));
     assert!(get_keys_resp.contains("{user:42}:k2"));
     assert!(get_keys_resp.contains("{user:42}:k3"));
 
     // 12c. CLUSTER SLOTS, NODES, INFO
     let slots_resp = send_and_read(&mut stream, b"CLUSTER SLOTS\r\n");
-    assert!(slots_resp.starts_with("*4\r\n"), "Expected 4 shard slots ranges");
+    assert!(
+        slots_resp.starts_with("*4\r\n"),
+        "Expected 4 shard slots ranges"
+    );
 
     let nodes_resp = send_and_read(&mut stream, b"CLUSTER NODES\r\n");
     assert!(nodes_resp.contains("myself,master"));
@@ -255,8 +285,15 @@ fn test_multithread_shared_nothing_e2e() {
 
     // 13. Test Connection Management and Client Tracking (CLIENT ID, SETNAME, GETNAME, LIST)
     let id_resp = send_and_read(&mut stream, b"CLIENT ID\r\n");
-    assert!(id_resp.starts_with(':'), "CLIENT ID should return an integer: {}", id_resp);
-    let client_id: u64 = id_resp.trim_matches(|c| c == ':' || c == '\r' || c == '\n').parse().unwrap();
+    assert!(
+        id_resp.starts_with(':'),
+        "CLIENT ID should return an integer: {}",
+        id_resp
+    );
+    let client_id: u64 = id_resp
+        .trim_matches(|c| c == ':' || c == '\r' || c == '\n')
+        .parse()
+        .unwrap();
     assert!(client_id > 0);
 
     let getname_resp = send_and_read(&mut stream, b"CLIENT GETNAME\r\n");
@@ -275,7 +312,10 @@ fn test_multithread_shared_nothing_e2e() {
     // Connect a second client to test multi-client listing and cross-core aggregation
     let mut stream2 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     let id_resp2 = send_and_read(&mut stream2, b"CLIENT ID\r\n");
-    let client_id2: u64 = id_resp2.trim_matches(|c| c == ':' || c == '\r' || c == '\n').parse().unwrap();
+    let client_id2: u64 = id_resp2
+        .trim_matches(|c| c == ':' || c == '\r' || c == '\n')
+        .parse()
+        .unwrap();
     assert_ne!(client_id, client_id2);
 
     let _ = send_and_read(&mut stream2, b"CLIENT SETNAME test_client_2\r\n");
@@ -290,7 +330,10 @@ fn test_multithread_shared_nothing_e2e() {
     thread::sleep(Duration::from_millis(50));
     let list_resp3 = send_and_read(&mut stream, b"CLIENT LIST\r\n");
     assert!(list_resp3.contains(&format!("id={}", client_id)));
-    assert!(!list_resp3.contains(&format!("id={}", client_id2)), "Disconnected client should be removed");
+    assert!(
+        !list_resp3.contains(&format!("id={}", client_id2)),
+        "Disconnected client should be removed"
+    );
 
     // 14. Test Redis Hash data structure (HSET, HGET, HMGET, HDEL, HEXISTS, HLEN, HGETALL, HKEYS, HVALS)
     let resp = send_and_read(&mut stream, b"HSET user:100 name alice age 30 city nyc\r\n");
@@ -388,7 +431,11 @@ fn test_cluster_slot_migration_and_redirection() {
     // 2. Set slot to MIGRATING 127.0.0.1:7001
     let resp = send_and_read(
         &mut stream,
-        format!("CLUSTER SETSLOT {} MIGRATING 127.0.0.1:7001\r\n", local_slot).as_bytes(),
+        format!(
+            "CLUSTER SETSLOT {} MIGRATING 127.0.0.1:7001\r\n",
+            local_slot
+        )
+        .as_bytes(),
     );
     assert_eq!(resp, "+OK\r\n");
 
@@ -398,15 +445,25 @@ fn test_cluster_slot_migration_and_redirection() {
 
     // Non-existing key on migrating slot should return -ASK
     let tagged_missing = format!("{{local_key}}missing");
-    assert_eq!(rudis::router::key_slot(tagged_missing.as_bytes()), local_slot);
-    let resp = send_and_read(&mut stream, format!("GET {}\r\n", tagged_missing).as_bytes());
+    assert_eq!(
+        rudis::router::key_slot(tagged_missing.as_bytes()),
+        local_slot
+    );
+    let resp = send_and_read(
+        &mut stream,
+        format!("GET {}\r\n", tagged_missing).as_bytes(),
+    );
     assert_eq!(resp, format!("-ASK {} 127.0.0.1:7001\r\n", local_slot));
 
     // 3. Set slot to IMPORTING 127.0.0.1:7000
     let import_slot = 5000;
     let resp = send_and_read(
         &mut stream,
-        format!("CLUSTER SETSLOT {} IMPORTING 127.0.0.1:7000\r\n", import_slot).as_bytes(),
+        format!(
+            "CLUSTER SETSLOT {} IMPORTING 127.0.0.1:7000\r\n",
+            import_slot
+        )
+        .as_bytes(),
     );
     assert_eq!(resp, "+OK\r\n");
 
@@ -432,7 +489,11 @@ fn test_cluster_slot_migration_and_redirection() {
 
     let resp = send_and_read(
         &mut stream,
-        format!("SET {} imported_val\r\n", String::from_utf8_lossy(&target_key)).as_bytes(),
+        format!(
+            "SET {} imported_val\r\n",
+            String::from_utf8_lossy(&target_key)
+        )
+        .as_bytes(),
     );
     assert_eq!(resp, "+OK\r\n");
 
@@ -588,7 +649,10 @@ fn test_lists_and_sets_e2e() {
 
     // LRANGE
     let resp = send_and_read(&mut stream, b"LRANGE mylist 0 -1\r\n");
-    assert_eq!(resp, "*4\r\n$5\r\nhello\r\n$5\r\nworld\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
+    assert_eq!(
+        resp,
+        "*4\r\n$5\r\nhello\r\n$5\r\nworld\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"
+    );
 
     let resp = send_and_read(&mut stream, b"LRANGE mylist 1 2\r\n");
     assert_eq!(resp, "*2\r\n$5\r\nworld\r\n$3\r\nfoo\r\n");
@@ -766,7 +830,10 @@ fn test_aof_persistence_and_replay_e2e() {
     assert_eq!(resp, "+OK\r\n");
 
     // Write Sorted Set
-    let resp = send_and_read(&mut stream1, b"ZADD myzset 100 alice 200 bob 300 charlie\r\n");
+    let resp = send_and_read(
+        &mut stream1,
+        b"ZADD myzset 100 alice 200 bob 300 charlie\r\n",
+    );
     assert_eq!(resp, ":3\r\n");
     let resp = send_and_read(&mut stream1, b"ZINCRBY myzset 50 alice\r\n");
     assert_eq!(resp, "$3\r\n150\r\n");
@@ -788,7 +855,10 @@ fn test_aof_persistence_and_replay_e2e() {
             aof_files_found += 1;
         }
     }
-    assert!(aof_files_found > 0, "At least one shard AOF file should exist and contain data");
+    assert!(
+        aof_files_found > 0,
+        "At least one shard AOF file should exist and contain data"
+    );
 
     // 2. Start Server 2 on a new port using the SAME AOF directory
     let port_server2 = 16393;
@@ -869,7 +939,10 @@ fn test_sorted_sets_zset_e2e() {
         .expect("Failed to connect to rudis server");
 
     // 1. ZADD multiple elements
-    let resp = send_and_read(&mut stream, b"ZADD myzset 10 one 20 two 30 three 40 four\r\n");
+    let resp = send_and_read(
+        &mut stream,
+        b"ZADD myzset 10 one 20 two 30 three 40 four\r\n",
+    );
     assert_eq!(resp, ":4\r\n");
 
     // 2. ZCARD
@@ -909,10 +982,16 @@ fn test_sorted_sets_zset_e2e() {
 
     // 7. ZRANGE basic & WITHSCORES & REV
     let resp = send_and_read(&mut stream, b"ZRANGE myzset 0 -1\r\n");
-    assert_eq!(resp, "*4\r\n$3\r\ntwo\r\n$3\r\none\r\n$5\r\nthree\r\n$4\r\nfour\r\n");
+    assert_eq!(
+        resp,
+        "*4\r\n$3\r\ntwo\r\n$3\r\none\r\n$5\r\nthree\r\n$4\r\nfour\r\n"
+    );
 
     let resp = send_and_read(&mut stream, b"ZRANGE myzset 0 1 WITHSCORES\r\n");
-    assert_eq!(resp, "*4\r\n$3\r\ntwo\r\n$2\r\n20\r\n$3\r\none\r\n$2\r\n25\r\n");
+    assert_eq!(
+        resp,
+        "*4\r\n$3\r\ntwo\r\n$2\r\n20\r\n$3\r\none\r\n$2\r\n25\r\n"
+    );
 
     let resp = send_and_read(&mut stream, b"ZRANGE myzset 0 1 REV\r\n");
     assert_eq!(resp, "*2\r\n$4\r\nfour\r\n$5\r\nthree\r\n");
@@ -1020,44 +1099,68 @@ fn test_generic_and_string_commands_e2e() {
 
     let resp = send_and_read(&mut stream, b"APPEND k_str _world\r\n");
     assert_eq!(resp, ":11\r\n");
-    assert_eq!(send_and_read(&mut stream, b"GET k_str\r\n"), "$11\r\nhello_world\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"GET k_str\r\n"),
+        "$11\r\nhello_world\r\n"
+    );
 
     // 5. Test SETNX
     let resp = send_and_read(&mut stream, b"SETNX k_str new_val\r\n");
     assert_eq!(resp, ":0\r\n"); // already exists
     let resp = send_and_read(&mut stream, b"SETNX k_new_nx brand_new\r\n");
     assert_eq!(resp, ":1\r\n");
-    assert_eq!(send_and_read(&mut stream, b"GET k_new_nx\r\n"), "$9\r\nbrand_new\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"GET k_new_nx\r\n"),
+        "$9\r\nbrand_new\r\n"
+    );
 
     // 6. Test SETEX and PSETEX
     let resp = send_and_read(&mut stream, b"SETEX k_ex 100 ex_val\r\n");
     assert_eq!(resp, "+OK\r\n");
-    assert_eq!(send_and_read(&mut stream, b"GET k_ex\r\n"), "$6\r\nex_val\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"GET k_ex\r\n"),
+        "$6\r\nex_val\r\n"
+    );
     let resp = send_and_read(&mut stream, b"TTL k_ex\r\n");
     assert!(resp.starts_with(':'));
 
     let resp = send_and_read(&mut stream, b"PSETEX k_pex 100000 pex_val\r\n");
     assert_eq!(resp, "+OK\r\n");
-    assert_eq!(send_and_read(&mut stream, b"GET k_pex\r\n"), "$7\r\npex_val\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"GET k_pex\r\n"),
+        "$7\r\npex_val\r\n"
+    );
 
     // 7. Test GETSET
     let resp = send_and_read(&mut stream, b"GETSET k_getset initial\r\n");
     assert_eq!(resp, "$-1\r\n");
     let resp = send_and_read(&mut stream, b"GETSET k_getset updated\r\n");
     assert_eq!(resp, "$7\r\ninitial\r\n");
-    assert_eq!(send_and_read(&mut stream, b"GET k_getset\r\n"), "$7\r\nupdated\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"GET k_getset\r\n"),
+        "$7\r\nupdated\r\n"
+    );
 
     // 8. Test GETDEL
     let resp = send_and_read(&mut stream, b"GETDEL k_getset\r\n");
     assert_eq!(resp, "$7\r\nupdated\r\n");
-    assert_eq!(send_and_read(&mut stream, b"GETDEL k_getset\r\n"), "$-1\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"GETDEL k_getset\r\n"),
+        "$-1\r\n"
+    );
 
     // 9. Test RENAME and RENAMENX with hash tags (guaranteed same slot)
     send_and_read(&mut stream, b"SET {user:1}:tag_a val_a\r\n");
     let resp = send_and_read(&mut stream, b"RENAME {user:1}:tag_a {user:1}:tag_b\r\n");
     assert_eq!(resp, "+OK\r\n");
-    assert_eq!(send_and_read(&mut stream, b"GET {user:1}:tag_a\r\n"), "$-1\r\n");
-    assert_eq!(send_and_read(&mut stream, b"GET {user:1}:tag_b\r\n"), "$5\r\nval_a\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"GET {user:1}:tag_a\r\n"),
+        "$-1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"GET {user:1}:tag_b\r\n"),
+        "$5\r\nval_a\r\n"
+    );
 
     send_and_read(&mut stream, b"SET {user:1}:tag_c val_c\r\n");
     let resp = send_and_read(&mut stream, b"RENAMENX {user:1}:tag_c {user:1}:tag_b\r\n");
@@ -1068,18 +1171,28 @@ fn test_generic_and_string_commands_e2e() {
     // 10. Test MSETNX with same slot
     let resp = send_and_read(&mut stream, b"MSETNX {user:1}:m1 v1 {user:1}:m2 v2\r\n");
     assert_eq!(resp, ":1\r\n");
-    assert_eq!(send_and_read(&mut stream, b"GET {user:1}:m1\r\n"), "$2\r\nv1\r\n");
-    assert_eq!(send_and_read(&mut stream, b"GET {user:1}:m2\r\n"), "$2\r\nv2\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"GET {user:1}:m1\r\n"),
+        "$2\r\nv1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"GET {user:1}:m2\r\n"),
+        "$2\r\nv2\r\n"
+    );
 
     let resp = send_and_read(&mut stream, b"MSETNX {user:1}:m1 new {user:1}:m3 v3\r\n");
     assert_eq!(resp, ":0\r\n"); // m1 exists, aborts all
-    assert_eq!(send_and_read(&mut stream, b"EXISTS {user:1}:m3\r\n"), ":0\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"EXISTS {user:1}:m3\r\n"),
+        ":0\r\n"
+    );
 
     // 11. Test EXPIREAT and PEXPIREAT
     let future_ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs() + 300;
+        .as_secs()
+        + 300;
     let cmd = format!("EXPIREAT k_str {}\r\n", future_ts);
     let resp = send_and_read(&mut stream, cmd.as_bytes());
     assert_eq!(resp, ":1\r\n");
@@ -1091,5 +1204,103 @@ fn test_generic_and_string_commands_e2e() {
     assert_eq!(resp, ":0\r\n");
 }
 
+#[test]
+fn test_pubsub_cross_shard_e2e() {
+    let port = 16387;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
 
+    // Client 1: subscriber on channel news.sports
+    let mut sub1 =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect sub1");
+    let resp = send_and_read(
+        &mut sub1,
+        b"*2\r\n$9\r\nSUBSCRIBE\r\n$11\r\nnews.sports\r\n",
+    );
+    assert!(resp.contains("subscribe") && resp.contains("news.sports") && resp.contains(":1"));
 
+    // Client 2: subscriber on news.sports and news.tech
+    let mut sub2 =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect sub2");
+    let resp = send_and_read(
+        &mut sub2,
+        b"*3\r\n$9\r\nSUBSCRIBE\r\n$11\r\nnews.sports\r\n$9\r\nnews.tech\r\n",
+    );
+    assert!(resp.contains("news.sports") && resp.contains("news.tech"));
+
+    // Client 3: pattern subscriber on news.*
+    let mut psub =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect psub");
+    let resp = send_and_read(&mut psub, b"*2\r\n$10\r\nPSUBSCRIBE\r\n$6\r\nnews.*\r\n");
+    assert!(resp.contains("psubscribe") && resp.contains("news.*"));
+
+    // Publisher client
+    let mut pub_client =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect pub_client");
+
+    // Check PUBSUB inspection commands before publish
+    let resp = send_and_read(&mut pub_client, b"PUBSUB NUMPAT\r\n");
+    assert_eq!(resp, ":1\r\n");
+
+    let resp = send_and_read(&mut pub_client, b"PUBSUB CHANNELS news.*\r\n");
+    assert!(resp.contains("news.sports") && resp.contains("news.tech"));
+
+    let resp = send_and_read(&mut pub_client, b"PUBSUB NUMSUB news.sports news.tech\r\n");
+    assert!(
+        resp.contains("news.sports")
+            && resp.contains(":2")
+            && resp.contains("news.tech")
+            && resp.contains(":1")
+    );
+
+    // Publish to news.sports: 2 direct subscribers + 1 pattern subscriber = 3 recipients
+    let resp = send_and_read(
+        &mut pub_client,
+        b"*3\r\n$7\r\nPUBLISH\r\n$11\r\nnews.sports\r\n$4\r\ngoal\r\n",
+    );
+    assert_eq!(resp, ":3\r\n");
+
+    // Verify sub1 received the message
+    let mut buf = [0u8; 1024];
+    let n = sub1.read(&mut buf).unwrap();
+    let msg = String::from_utf8_lossy(&buf[..n]);
+    assert!(msg.contains("message") && msg.contains("news.sports") && msg.contains("goal"));
+
+    // Verify sub2 received the message
+    let n = sub2.read(&mut buf).unwrap();
+    let msg = String::from_utf8_lossy(&buf[..n]);
+    assert!(msg.contains("message") && msg.contains("news.sports") && msg.contains("goal"));
+
+    // Verify psub received the pmessage
+    let n = psub.read(&mut buf).unwrap();
+    let msg = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        msg.contains("pmessage")
+            && msg.contains("news.*")
+            && msg.contains("news.sports")
+            && msg.contains("goal")
+    );
+
+    // Test PING in subscribed mode
+    let resp = send_and_read(&mut sub1, b"PING\r\n");
+    assert!(resp.contains("pong"));
+
+    // Test UNSUBSCRIBE
+    let resp = send_and_read(
+        &mut sub2,
+        b"*2\r\n$11\r\nUNSUBSCRIBE\r\n$11\r\nnews.sports\r\n",
+    );
+    assert!(resp.contains("unsubscribe") && resp.contains("news.sports"));
+
+    // Now publishing to news.sports has 1 direct subscriber + 1 pattern subscriber = 2
+    let resp = send_and_read(&mut pub_client, b"PUBLISH news.sports update\r\n");
+    assert_eq!(resp, ":2\r\n");
+
+    // Drop sub1 to test disconnect cleanup
+    drop(sub1);
+    thread::sleep(Duration::from_millis(50));
+
+    // Now publishing to news.sports has 0 direct subscribers + 1 pattern subscriber = 1
+    let resp = send_and_read(&mut pub_client, b"PUBLISH news.sports final\r\n");
+    assert_eq!(resp, ":1\r\n");
+}

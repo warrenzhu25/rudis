@@ -1,11 +1,15 @@
-use std::thread;
 use clap::Parser;
+use std::thread;
 
 use rudis::server::run_shard_worker;
 use rudis::shard::ShardMessage;
 
 #[derive(Parser, Debug)]
-#[command(name = "rudis", version = "0.1.0", about = "Multi-threaded Shared-Nothing Redis in Rust based on io_uring")]
+#[command(
+    name = "rudis",
+    version = "0.1.0",
+    about = "Multi-threaded Shared-Nothing Redis in Rust based on io_uring"
+)]
 struct Args {
     /// Port to listen on
     #[arg(short, long, default_value_t = 6379)]
@@ -36,9 +40,7 @@ fn main() {
             .unwrap_or(1)
     };
 
-    let num_shards = args.threads.unwrap_or_else(|| {
-        num_cores.min(8)
-    });
+    let num_shards = args.threads.unwrap_or_else(|| num_cores.min(8));
 
     let aof_config = rudis::aof::AofConfig {
         enabled: args.aof,
@@ -51,8 +53,18 @@ fn main() {
     println!("  Architecture: Multi-threaded Shared-Nothing (Thread-per-Core)");
     println!("  I/O Backend:  Linux io_uring (Monoio)");
     println!("  Listening:    0.0.0.0:{}", args.port);
-    println!("  Shards:       {} worker threads (pinned to CPU cores)", num_shards);
-    println!("  AOF Persist:  {}", if aof_config.enabled { "ENABLED" } else { "disabled" });
+    println!(
+        "  Shards:       {} worker threads (pinned to CPU cores)",
+        num_shards
+    );
+    println!(
+        "  AOF Persist:  {}",
+        if aof_config.enabled {
+            "ENABLED"
+        } else {
+            "disabled"
+        }
+    );
     println!("============================================================");
 
     // Create cross-shard communication mesh
@@ -80,7 +92,15 @@ fn main() {
         let handle = thread::Builder::new()
             .name(format!("rudis-shard-{}", shard_id))
             .spawn(move || {
-                run_shard_worker(shard_id, num_shards, port, shard_senders, rx, core_id, shard_aof_config);
+                run_shard_worker(
+                    shard_id,
+                    num_shards,
+                    port,
+                    shard_senders,
+                    rx,
+                    core_id,
+                    shard_aof_config,
+                );
             })
             .expect("Failed to spawn shard worker thread");
 

@@ -1,7 +1,7 @@
+use bytes::Bytes;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
-use bytes::Bytes;
 
 use crate::resp::Command;
 use crate::shard::{ShardDb, ShardMessage};
@@ -55,6 +55,7 @@ pub struct Router {
     pub slot_states: Rc<RefCell<Vec<crate::shard::SlotState>>>,
     pub slot_owners: Rc<RefCell<Vec<usize>>>,
     pub aof: Option<Rc<RefCell<crate::aof::AofWriter>>>,
+    pub pubsub: Rc<RefCell<crate::pubsub::PubSubHub>>,
 }
 
 impl Router {
@@ -65,6 +66,7 @@ impl Router {
         local_db: Rc<RefCell<ShardDb>>,
         senders: Vec<flume::Sender<ShardMessage>>,
         aof: Option<Rc<RefCell<crate::aof::AofWriter>>>,
+        pubsub: Rc<RefCell<crate::pubsub::PubSubHub>>,
     ) -> Self {
         let mut slot_states = Vec::with_capacity(16384);
         let mut slot_owners = Vec::with_capacity(16384);
@@ -81,6 +83,7 @@ impl Router {
             slot_states: Rc::new(RefCell::new(slot_states)),
             slot_owners: Rc::new(RefCell::new(slot_owners)),
             aof,
+            pubsub,
         }
     }
 
@@ -93,7 +96,12 @@ impl Router {
         self.target_shard_for_slot(slot)
     }
 
-    pub fn check_slot_redirection(&self, slot: u16, key_exists: bool, asking: bool) -> Result<(), String> {
+    pub fn check_slot_redirection(
+        &self,
+        slot: u16,
+        key_exists: bool,
+        asking: bool,
+    ) -> Result<(), String> {
         let state = self.slot_states.borrow()[slot as usize].clone();
         match state {
             crate::shard::SlotState::Migrating(target) => {
@@ -142,10 +150,7 @@ impl Router {
             self.local_db.borrow_mut().get(&key)
         } else {
             let (tx, rx) = flume::bounded(1);
-            let msg = ShardMessage::Get {
-                key,
-                responder: tx,
-            };
+            let msg = ShardMessage::Get { key, responder: tx };
             if self.senders[target].send(msg).is_ok() {
                 rx.recv_async().await.ok().flatten()
             } else {
@@ -154,16 +159,16 @@ impl Router {
         }
     }
 
-    pub async fn dump_key(&self, key: Bytes) -> Option<(crate::table::RudisValue, Option<Duration>)> {
+    pub async fn dump_key(
+        &self,
+        key: Bytes,
+    ) -> Option<(crate::table::RudisValue, Option<Duration>)> {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
             self.local_db.borrow_mut().get_entry(&key)
         } else {
             let (tx, rx) = flume::bounded(1);
-            let msg = ShardMessage::DumpKey {
-                key,
-                responder: tx,
-            };
+            let msg = ShardMessage::DumpKey { key, responder: tx };
             if self.senders[target].send(msg).is_ok() {
                 rx.recv_async().await.ok().flatten()
             } else {
@@ -175,7 +180,9 @@ impl Router {
     pub async fn set(&self, key: Bytes, value: Bytes, expire_in: Option<Duration>) {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
-            self.local_db.borrow_mut().set(key.clone(), value.clone(), expire_in);
+            self.local_db
+                .borrow_mut()
+                .set(key.clone(), value.clone(), expire_in);
             if let Some(aof) = &self.aof {
                 if let Some(bytes) = crate::aof::command_to_resp(&Command::Set {
                     key,
@@ -213,10 +220,7 @@ impl Router {
             deleted
         } else {
             let (tx, rx) = flume::bounded(1);
-            let msg = ShardMessage::Del {
-                key,
-                responder: tx,
-            };
+            let msg = ShardMessage::Del { key, responder: tx };
             if self.senders[target].send(msg).is_ok() {
                 rx.recv_async().await.unwrap_or(false)
             } else {
@@ -231,10 +235,7 @@ impl Router {
             self.local_db.borrow_mut().exists(&key)
         } else {
             let (tx, rx) = flume::bounded(1);
-            let msg = ShardMessage::Exists {
-                key,
-                responder: tx,
-            };
+            let msg = ShardMessage::Exists { key, responder: tx };
             if self.senders[target].send(msg).is_ok() {
                 rx.recv_async().await.unwrap_or(false)
             } else {
@@ -278,7 +279,9 @@ impl Router {
             let res = self.local_db.borrow_mut().expire(&key, duration);
             if res {
                 if let Some(aof) = &self.aof {
-                    if let Some(bytes) = crate::aof::command_to_resp(&Command::Expire(key, duration)) {
+                    if let Some(bytes) =
+                        crate::aof::command_to_resp(&Command::Expire(key, duration))
+                    {
                         aof.borrow_mut().append(&bytes);
                     }
                 }
@@ -313,10 +316,7 @@ impl Router {
             res
         } else {
             let (tx, rx) = flume::bounded(1);
-            let msg = ShardMessage::Persist {
-                key,
-                responder: tx,
-            };
+            let msg = ShardMessage::Persist { key, responder: tx };
             if self.senders[target].send(msg).is_ok() {
                 rx.recv_async().await.unwrap_or(false)
             } else {
@@ -369,7 +369,10 @@ impl Router {
             self.local_db.borrow_mut().count_keys_in_slot(slot)
         } else {
             let (tx, rx) = flume::bounded(1);
-            let msg = ShardMessage::CountKeysInSlot { slot, responder: tx };
+            let msg = ShardMessage::CountKeysInSlot {
+                slot,
+                responder: tx,
+            };
             if self.senders[target].send(msg).is_ok() {
                 rx.recv_async().await.unwrap_or(0)
             } else {
@@ -453,7 +456,8 @@ impl Router {
             if sid != self.shard_id {
                 let res = self.execute_remote(sid, Command::Dbsize).await;
                 if let Ok(s) = std::str::from_utf8(&res) {
-                    if let Some(num_str) = s.strip_prefix(':').and_then(|x| x.split("\r\n").next()) {
+                    if let Some(num_str) = s.strip_prefix(':').and_then(|x| x.split("\r\n").next())
+                    {
                         if let Ok(n) = num_str.parse::<usize>() {
                             total += n;
                         }
@@ -476,5 +480,116 @@ impl Router {
                 let _ = self.execute_remote(sid, Command::Flushdb).await;
             }
         }
+    }
+
+    pub async fn publish(&self, channel: Bytes, message: Bytes) -> usize {
+        let mut total = self.pubsub.borrow().publish(&channel, &message);
+        let mut pending = Vec::new();
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::Publish {
+                    channel: channel.clone(),
+                    message: message.clone(),
+                    responder: tx,
+                };
+                if sender.send(msg).is_ok() {
+                    pending.push(rx);
+                }
+            }
+        }
+        for rx in pending {
+            if let Ok(count) = rx.recv_async().await {
+                total += count;
+            }
+        }
+        total
+    }
+
+    pub async fn pubsub_channels(&self, pattern: Option<Bytes>) -> Vec<Bytes> {
+        let mut set = hashbrown::HashSet::new();
+        for ch in self.pubsub.borrow().channels(pattern.as_deref()) {
+            set.insert(ch);
+        }
+        let mut pending = Vec::new();
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::PubsubChannels {
+                    pattern: pattern.clone(),
+                    responder: tx,
+                };
+                if sender.send(msg).is_ok() {
+                    pending.push(rx);
+                }
+            }
+        }
+        for rx in pending {
+            if let Ok(channels) = rx.recv_async().await {
+                for ch in channels {
+                    set.insert(ch);
+                }
+            }
+        }
+        let mut list: Vec<Bytes> = set.into_iter().collect();
+        list.sort();
+        list
+    }
+
+    pub async fn pubsub_numsub(&self, channels: Vec<Bytes>) -> Vec<(Bytes, usize)> {
+        let mut counts: hashbrown::HashMap<Bytes, usize> = hashbrown::HashMap::new();
+        {
+            let hub = self.pubsub.borrow();
+            for ch in &channels {
+                counts.insert(ch.clone(), hub.numsub(ch));
+            }
+        }
+        let mut pending = Vec::new();
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::PubsubNumsub {
+                    channels: channels.clone(),
+                    responder: tx,
+                };
+                if sender.send(msg).is_ok() {
+                    pending.push(rx);
+                }
+            }
+        }
+        for rx in pending {
+            if let Ok(shard_counts) = rx.recv_async().await {
+                for (ch, cnt) in shard_counts {
+                    *counts.entry(ch).or_default() += cnt;
+                }
+            }
+        }
+        channels
+            .into_iter()
+            .map(|ch| {
+                let cnt = counts.get(&ch).copied().unwrap_or(0);
+                (ch, cnt)
+            })
+            .collect()
+    }
+
+    pub async fn pubsub_numpat(&self) -> usize {
+        let mut total = self.pubsub.borrow().numpat();
+        let mut pending = Vec::new();
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::PubsubNumpat { responder: tx };
+                if sender.send(msg).is_ok() {
+                    pending.push(rx);
+                }
+            }
+        }
+        for rx in pending {
+            if let Ok(count) = rx.recv_async().await {
+                total += count;
+            }
+        }
+        total
     }
 }

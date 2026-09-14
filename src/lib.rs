@@ -1,5 +1,6 @@
 pub mod aof;
 pub mod connection;
+pub mod pubsub;
 pub mod resp;
 pub mod router;
 pub mod server;
