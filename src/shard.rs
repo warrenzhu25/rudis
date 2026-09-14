@@ -1,14 +1,15 @@
+use bytes::Bytes;
 use hashbrown::HashMap;
 
 /// Messages passed across CPU cores to access or mutate a shard's data.
 pub enum ShardMessage {
     Get {
-        key: Vec<u8>,
-        responder: flume::Sender<Option<Vec<u8>>>,
+        key: Bytes,
+        responder: flume::Sender<Option<Bytes>>,
     },
     Set {
-        key: Vec<u8>,
-        value: Vec<u8>,
+        key: Bytes,
+        value: Bytes,
         responder: flume::Sender<()>,
     },
 }
@@ -17,7 +18,7 @@ pub enum ShardMessage {
 /// Because this shard is accessed only by the thread running on its assigned CPU core,
 /// it requires NO Mutex and NO cross-thread synchronization.
 pub struct ShardDb {
-    entries: HashMap<Vec<u8>, Vec<u8>>,
+    entries: HashMap<Bytes, Bytes>,
 }
 
 impl ShardDb {
@@ -28,12 +29,12 @@ impl ShardDb {
     }
 
     #[inline]
-    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+    pub fn get(&self, key: &[u8]) -> Option<Bytes> {
         self.entries.get(key).cloned()
     }
 
     #[inline]
-    pub fn set(&mut self, key: Vec<u8>, value: Vec<u8>) {
+    pub fn set(&mut self, key: Bytes, value: Bytes) {
         self.entries.insert(key, value);
     }
 

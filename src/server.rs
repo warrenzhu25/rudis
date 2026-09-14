@@ -31,6 +31,8 @@ pub fn run_shard_worker(
         socket.set_reuse_port(true).expect("Failed to set SO_REUSEPORT");
         socket.set_reuse_address(true).expect("Failed to set SO_REUSEADDR");
         socket.set_nonblocking(true).expect("Failed to set non-blocking");
+        let _ = socket.set_recv_buffer_size(512 * 1024);
+        let _ = socket.set_send_buffer_size(512 * 1024);
 
         let addr: SocketAddr = format!("0.0.0.0:{}", port)
             .parse()
@@ -77,6 +79,7 @@ pub fn run_shard_worker(
         loop {
             match listener.accept().await {
                 Ok((stream, _client_addr)) => {
+                    let _ = stream.set_nodelay(true);
                     let r = router.clone();
                     monoio::spawn(async move {
                         handle_connection(stream, r).await;

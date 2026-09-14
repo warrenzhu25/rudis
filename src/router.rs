@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
+use bytes::Bytes;
 
 use crate::shard::{ShardDb, ShardMessage};
 
@@ -37,7 +38,7 @@ impl Router {
         }
     }
 
-    pub async fn get(&self, key: Vec<u8>) -> Option<Vec<u8>> {
+    pub async fn get(&self, key: Bytes) -> Option<Bytes> {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
             // Local fast-path: zero lock overhead, zero cross-core communication
@@ -57,7 +58,7 @@ impl Router {
         }
     }
 
-    pub async fn set(&self, key: Vec<u8>, value: Vec<u8>) {
+    pub async fn set(&self, key: Bytes, value: Bytes) {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
             // Local fast-path

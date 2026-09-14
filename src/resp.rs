@@ -1,10 +1,10 @@
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Command {
-    Get(Vec<u8>),
-    Set(Vec<u8>, Vec<u8>),
-    Ping(Option<Vec<u8>>),
+    Get(Bytes),
+    Set(Bytes, Bytes),
+    Ping(Option<Bytes>),
     CommandDocs,
     Info,
     Quit,
@@ -41,24 +41,24 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
         None => return Err("Invalid array length in RESP frame".to_string()),
     };
 
-    let mut cursor = newline_pos + 2;
-    let mut args = Vec::with_capacity(num_args);
+    // First check if the full frame is present before consuming any bytes from buf
+    let mut scan_cursor = newline_pos + 2;
+    let mut arg_meta = Vec::with_capacity(num_args);
 
     for _ in 0..num_args {
-        if cursor >= buf.len() {
+        if scan_cursor >= buf.len() {
             return Ok(None);
         }
-
-        if buf[cursor] != b'$' {
+        if buf[scan_cursor] != b'$' {
             return Err("Expected bulk string in command array".to_string());
         }
 
-        let next_crlf = match find_crlf_at(buf, cursor) {
+        let next_crlf = match find_crlf_at(buf, scan_cursor) {
             Some(pos) => pos,
             None => return Ok(None),
         };
 
-        let len_str = &buf[cursor + 1..next_crlf];
+        let len_str = &buf[scan_cursor + 1..next_crlf];
         let arg_len: usize = match std::str::from_utf8(len_str)
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
@@ -78,11 +78,27 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
             return Err("Expected CRLF after bulk string data".to_string());
         }
 
-        args.push(buf[data_start..data_end].to_vec());
-        cursor = data_end + 2;
+        arg_meta.push((next_crlf + 2, arg_len));
+        scan_cursor = data_end + 2;
     }
 
-    buf.advance(cursor);
+    // Full frame is present! Now extract args with zero-copy Bytes::freeze
+    buf.advance(newline_pos + 2); // Consume "*N\r\n"
+    let mut args = Vec::with_capacity(num_args);
+
+    for _ in 0..num_args {
+        let header_crlf = find_crlf(buf).unwrap();
+        let arg_len: usize = std::str::from_utf8(&buf[1..header_crlf])
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        buf.advance(header_crlf + 2); // Consume "$len\r\n"
+        let data = buf.split_to(arg_len).freeze(); // Zero-copy slice!
+        buf.advance(2); // Consume "\r\n"
+        args.push(data);
+    }
+
     build_command(args)
 }
 
@@ -93,10 +109,10 @@ fn parse_inline_command(buf: &mut BytesMut) -> Result<Option<Command>, String> {
     };
 
     let line = &buf[..newline_pos];
-    let parts: Vec<Vec<u8>> = line
+    let parts: Vec<Bytes> = line
         .split(|&b| b == b' ' || b == b'\t')
         .filter(|part| !part.is_empty())
-        .map(|part| part.to_vec())
+        .map(|part| Bytes::copy_from_slice(part))
         .collect();
 
     buf.advance(newline_pos + 2);
@@ -108,7 +124,7 @@ fn parse_inline_command(buf: &mut BytesMut) -> Result<Option<Command>, String> {
     build_command(parts)
 }
 
-fn build_command(args: Vec<Vec<u8>>) -> Result<Option<Command>, String> {
+fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
     if args.is_empty() {
         return Ok(None);
     }
@@ -165,7 +181,7 @@ mod tests {
     fn test_resp_get() {
         let mut buf = BytesMut::from("*2\r\n$3\r\nGET\r\n$5\r\nmykey\r\n");
         let cmd = parse_command(&mut buf).unwrap().unwrap();
-        assert_eq!(cmd, Command::Get(b"mykey".to_vec()));
+        assert_eq!(cmd, Command::Get(Bytes::from_static(b"mykey")));
         assert!(buf.is_empty());
     }
 
@@ -175,13 +191,19 @@ mod tests {
         let cmd = parse_command(&mut buf).unwrap().unwrap();
         assert_eq!(
             cmd,
-            Command::Set(b"mykey".to_vec(), b"myvalue".to_vec())
+            Command::Set(
+                Bytes::from_static(b"mykey"),
+                Bytes::from_static(b"myvalue")
+            )
         );
         assert!(buf.is_empty());
 
         let mut buf = BytesMut::from("*3\r\n$3\r\nPUT\r\n$1\r\nk\r\n$1\r\nv\r\n");
         let cmd = parse_command(&mut buf).unwrap().unwrap();
-        assert_eq!(cmd, Command::Set(b"k".to_vec(), b"v".to_vec()));
+        assert_eq!(
+            cmd,
+            Command::Set(Bytes::from_static(b"k"), Bytes::from_static(b"v"))
+        );
         assert!(buf.is_empty());
     }
 
@@ -189,15 +211,24 @@ mod tests {
     fn test_inline_commands() {
         let mut buf = BytesMut::from("GET foo\r\n");
         let cmd = parse_command(&mut buf).unwrap().unwrap();
-        assert_eq!(cmd, Command::Get(b"foo".to_vec()));
+        assert_eq!(cmd, Command::Get(Bytes::from_static(b"foo")));
 
         let mut buf = BytesMut::from("SET foo bar\r\n");
         let cmd = parse_command(&mut buf).unwrap().unwrap();
-        assert_eq!(cmd, Command::Set(b"foo".to_vec(), b"bar".to_vec()));
+        assert_eq!(
+            cmd,
+            Command::Set(Bytes::from_static(b"foo"), Bytes::from_static(b"bar"))
+        );
 
         let mut buf = BytesMut::from("PUT hello world\r\n");
         let cmd = parse_command(&mut buf).unwrap().unwrap();
-        assert_eq!(cmd, Command::Set(b"hello".to_vec(), b"world".to_vec()));
+        assert_eq!(
+            cmd,
+            Command::Set(
+                Bytes::from_static(b"hello"),
+                Bytes::from_static(b"world")
+            )
+        );
 
         let mut buf = BytesMut::from("PING\r\n");
         let cmd = parse_command(&mut buf).unwrap().unwrap();
