@@ -508,10 +508,183 @@ fn test_migrate_command_e2e() {
     let resp = send_and_read(&mut stream2, b"HGET mig_hash f2\r\n");
     assert_eq!(resp, "$2\r\nv2\r\n");
 
-    // 4. Test MIGRATE on non-existing key returns +NOKEY
+    // 4. Migrate mig_list from server 1 to server 2
+    let resp = send_and_read(&mut stream1, b"RPUSH mig_list e1 e2 e3\r\n");
+    assert_eq!(resp, ":3\r\n");
+    let resp = send_and_read(
+        &mut stream1,
+        format!("MIGRATE 127.0.0.1 {} mig_list 0 5000\r\n", port2).as_bytes(),
+    );
+    assert_eq!(resp, "+OK\r\n");
+    let resp = send_and_read(&mut stream1, b"EXISTS mig_list\r\n");
+    assert_eq!(resp, ":0\r\n");
+    let resp = send_and_read(&mut stream2, b"LRANGE mig_list 0 -1\r\n");
+    assert_eq!(resp, "*3\r\n$2\r\ne1\r\n$2\r\ne2\r\n$2\r\ne3\r\n");
+
+    // 5. Migrate mig_set from server 1 to server 2
+    let resp = send_and_read(&mut stream1, b"SADD mig_set s1 s2\r\n");
+    assert_eq!(resp, ":2\r\n");
+    let resp = send_and_read(
+        &mut stream1,
+        format!("MIGRATE 127.0.0.1 {} mig_set 0 5000\r\n", port2).as_bytes(),
+    );
+    assert_eq!(resp, "+OK\r\n");
+    let resp = send_and_read(&mut stream1, b"EXISTS mig_set\r\n");
+    assert_eq!(resp, ":0\r\n");
+    let resp = send_and_read(&mut stream2, b"SCARD mig_set\r\n");
+    assert_eq!(resp, ":2\r\n");
+
+    // 6. Test MIGRATE on non-existing key returns +NOKEY
     let resp = send_and_read(
         &mut stream1,
         format!("MIGRATE 127.0.0.1 {} non_existing_key 0 5000\r\n", port2).as_bytes(),
     );
     assert_eq!(resp, "+NOKEY\r\n");
+}
+
+#[test]
+fn test_lists_and_sets_e2e() {
+    let port = 16384;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("Failed to connect to rudis server");
+
+    // --- LIST TESTS ---
+    // LPUSH
+    let resp = send_and_read(&mut stream, b"LPUSH mylist world\r\n");
+    assert_eq!(resp, ":1\r\n");
+    let resp = send_and_read(&mut stream, b"LPUSH mylist hello\r\n");
+    assert_eq!(resp, ":2\r\n");
+
+    // RPUSH
+    let resp = send_and_read(&mut stream, b"RPUSH mylist foo bar\r\n");
+    assert_eq!(resp, ":4\r\n");
+
+    // LLEN
+    let resp = send_and_read(&mut stream, b"LLEN mylist\r\n");
+    assert_eq!(resp, ":4\r\n");
+
+    // LRANGE
+    let resp = send_and_read(&mut stream, b"LRANGE mylist 0 -1\r\n");
+    assert_eq!(resp, "*4\r\n$5\r\nhello\r\n$5\r\nworld\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
+
+    let resp = send_and_read(&mut stream, b"LRANGE mylist 1 2\r\n");
+    assert_eq!(resp, "*2\r\n$5\r\nworld\r\n$3\r\nfoo\r\n");
+
+    // LINDEX
+    let resp = send_and_read(&mut stream, b"LINDEX mylist 0\r\n");
+    assert_eq!(resp, "$5\r\nhello\r\n");
+
+    let resp = send_and_read(&mut stream, b"LINDEX mylist -1\r\n");
+    assert_eq!(resp, "$3\r\nbar\r\n");
+
+    let resp = send_and_read(&mut stream, b"LINDEX mylist 100\r\n");
+    assert_eq!(resp, "$-1\r\n");
+
+    // LPOP single
+    let resp = send_and_read(&mut stream, b"LPOP mylist\r\n");
+    assert_eq!(resp, "$5\r\nhello\r\n");
+
+    // RPOP with count
+    let resp = send_and_read(&mut stream, b"RPOP mylist 2\r\n");
+    assert_eq!(resp, "*2\r\n$3\r\nbar\r\n$3\r\nfoo\r\n");
+
+    // LLEN should be 1 now
+    let resp = send_and_read(&mut stream, b"LLEN mylist\r\n");
+    assert_eq!(resp, ":1\r\n");
+
+    // Pop remaining element
+    let resp = send_and_read(&mut stream, b"LPOP mylist\r\n");
+    assert_eq!(resp, "$5\r\nworld\r\n");
+
+    // Now empty
+    let resp = send_and_read(&mut stream, b"LLEN mylist\r\n");
+    assert_eq!(resp, ":0\r\n");
+
+    let resp = send_and_read(&mut stream, b"LPOP mylist\r\n");
+    assert_eq!(resp, "$-1\r\n");
+
+    // WRONGTYPE test
+    let resp = send_and_read(&mut stream, b"SET str_key test_val\r\n");
+    assert_eq!(resp, "+OK\r\n");
+    let resp = send_and_read(&mut stream, b"LPUSH str_key val\r\n");
+    assert!(resp.starts_with("-ERR WRONGTYPE"));
+
+    // --- SET TESTS ---
+    // SADD
+    let resp = send_and_read(&mut stream, b"SADD myset a b c a\r\n");
+    assert_eq!(resp, ":3\r\n");
+
+    // SCARD
+    let resp = send_and_read(&mut stream, b"SCARD myset\r\n");
+    assert_eq!(resp, ":3\r\n");
+
+    // SISMEMBER
+    let resp = send_and_read(&mut stream, b"SISMEMBER myset a\r\n");
+    assert_eq!(resp, ":1\r\n");
+    let resp = send_and_read(&mut stream, b"SISMEMBER myset z\r\n");
+    assert_eq!(resp, ":0\r\n");
+
+    // SMEMBERS
+    let resp = send_and_read(&mut stream, b"SMEMBERS myset\r\n");
+    assert!(resp.starts_with("*3\r\n"));
+    assert!(resp.contains("a") && resp.contains("b") && resp.contains("c"));
+
+    // SREM
+    let resp = send_and_read(&mut stream, b"SREM myset b nonexistent\r\n");
+    assert_eq!(resp, ":1\r\n");
+    let resp = send_and_read(&mut stream, b"SCARD myset\r\n");
+    assert_eq!(resp, ":2\r\n");
+
+    // SPOP single
+    let resp = send_and_read(&mut stream, b"SPOP myset\r\n");
+    assert!(resp.starts_with("$1\r\n"));
+    let resp = send_and_read(&mut stream, b"SCARD myset\r\n");
+    assert_eq!(resp, ":1\r\n");
+
+    // SPOP count
+    let resp = send_and_read(&mut stream, b"SPOP myset 5\r\n");
+    assert_eq!(resp.lines().next().unwrap(), "*1");
+    let resp = send_and_read(&mut stream, b"SCARD myset\r\n");
+    assert_eq!(resp, ":0\r\n");
+
+    let resp = send_and_read(&mut stream, b"SPOP myset\r\n");
+    assert_eq!(resp, "$-1\r\n");
+
+    // WRONGTYPE on Set
+    let resp = send_and_read(&mut stream, b"SADD str_key elem\r\n");
+    assert!(resp.starts_with("-ERR WRONGTYPE"));
+
+    // --- PIPELINED SQUASHED CROSS-SHARD OPERATIONS ---
+    let mut pipe = Vec::new();
+    let mut expected_prefix = String::new();
+    for i in 0..20 {
+        pipe.extend_from_slice(format!("RPUSH pipe_list_{} v1 v2 v3\r\n", i).as_bytes());
+        expected_prefix.push_str(":3\r\n");
+        pipe.extend_from_slice(format!("SADD pipe_set_{} m1 m2\r\n", i).as_bytes());
+        expected_prefix.push_str(":2\r\n");
+    }
+    for i in 0..20 {
+        pipe.extend_from_slice(format!("LLEN pipe_list_{}\r\n", i).as_bytes());
+        expected_prefix.push_str(":3\r\n");
+        pipe.extend_from_slice(format!("SCARD pipe_set_{}\r\n", i).as_bytes());
+        expected_prefix.push_str(":2\r\n");
+    }
+
+    stream.write_all(&pipe).unwrap();
+    let mut actual_resp = Vec::new();
+    let mut total_read = 0;
+    let expected_len = expected_prefix.len();
+    while total_read < expected_len {
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        actual_resp.extend_from_slice(&buf[..n]);
+        total_read += n;
+    }
+    assert_eq!(String::from_utf8_lossy(&actual_resp), expected_prefix);
 }

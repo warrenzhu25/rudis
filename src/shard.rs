@@ -184,6 +184,73 @@ impl ShardDb {
         self.table.hvals(key)
     }
 
+    // LIST METHODS
+    #[inline]
+    pub fn lpush(&mut self, key: Bytes, values: Vec<Bytes>) -> Result<usize, &'static str> {
+        self.table.lpush(key, values)
+    }
+
+    #[inline]
+    pub fn rpush(&mut self, key: Bytes, values: Vec<Bytes>) -> Result<usize, &'static str> {
+        self.table.rpush(key, values)
+    }
+
+    #[inline]
+    pub fn lpop(&mut self, key: &[u8], count: usize) -> Result<Vec<Bytes>, &'static str> {
+        self.table.lpop(key, count)
+    }
+
+    #[inline]
+    pub fn rpop(&mut self, key: &[u8], count: usize) -> Result<Vec<Bytes>, &'static str> {
+        self.table.rpop(key, count)
+    }
+
+    #[inline]
+    pub fn llen(&mut self, key: &[u8]) -> Result<usize, &'static str> {
+        self.table.llen(key)
+    }
+
+    #[inline]
+    pub fn lindex(&mut self, key: &[u8], index: i64) -> Result<Option<Bytes>, &'static str> {
+        self.table.lindex(key, index)
+    }
+
+    #[inline]
+    pub fn lrange(&mut self, key: &[u8], start: i64, stop: i64) -> Result<Vec<Bytes>, &'static str> {
+        self.table.lrange(key, start, stop)
+    }
+
+    // SET METHODS
+    #[inline]
+    pub fn sadd(&mut self, key: Bytes, members: Vec<Bytes>) -> Result<usize, &'static str> {
+        self.table.sadd(key, members)
+    }
+
+    #[inline]
+    pub fn srem(&mut self, key: &[u8], members: &[Bytes]) -> Result<usize, &'static str> {
+        self.table.srem(key, members)
+    }
+
+    #[inline]
+    pub fn smembers(&mut self, key: &[u8]) -> Result<Vec<Bytes>, &'static str> {
+        self.table.smembers(key)
+    }
+
+    #[inline]
+    pub fn sismember(&mut self, key: &[u8], member: &[u8]) -> Result<bool, &'static str> {
+        self.table.sismember(key, member)
+    }
+
+    #[inline]
+    pub fn scard(&mut self, key: &[u8]) -> Result<usize, &'static str> {
+        self.table.scard(key)
+    }
+
+    #[inline]
+    pub fn spop(&mut self, key: &[u8], count: usize) -> Result<Vec<Bytes>, &'static str> {
+        self.table.spop(key, count)
+    }
+
     #[inline]
     pub fn count_keys_in_slot(&mut self, slot: u16) -> usize {
         self.table.count_keys_in_slot(slot)

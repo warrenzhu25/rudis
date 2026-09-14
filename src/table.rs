@@ -11,6 +11,8 @@ pub const DELETED: u8 = 0xFE;
 pub enum RudisValue {
     String(Bytes),
     Hash(HashMap<Bytes, Bytes>),
+    List(std::collections::VecDeque<Bytes>),
+    Set(hashbrown::HashSet<Bytes>),
 }
 
 #[derive(Clone, Debug)]
@@ -295,7 +297,7 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
                     RudisValue::String(b) => Ok(Some(b.clone())),
-                    RudisValue::Hash(_) => {
+                    _ => {
                         Err("WRONGTYPE Operation against a key holding the wrong kind of value")
                     }
                 }
@@ -386,7 +388,7 @@ impl RudisTable {
                                 .map_err(|_| "value is not an integer or out of range".to_string())?;
                             (val, entry.expire_at)
                         }
-                        RudisValue::Hash(_) => {
+                        _ => {
                             return Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string());
                         }
                     },
@@ -491,9 +493,6 @@ impl RudisTable {
         if let Some(idx) = existing {
             if let Some(entry) = self.table.get_slot_mut(idx) {
                 match &mut entry.val {
-                    RudisValue::String(_) => {
-                        return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
-                    }
                     RudisValue::Hash(map) => {
                         let mut added = 0;
                         for (f, v) in fields {
@@ -502,6 +501,9 @@ impl RudisTable {
                             }
                         }
                         return Ok(added);
+                    }
+                    _ => {
+                        return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
                     }
                 }
             }
@@ -535,7 +537,7 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
                     RudisValue::Hash(map) => Ok(map.get(field).cloned()),
-                    RudisValue::String(_) => {
+                    _ => {
                         Err("WRONGTYPE Operation against a key holding the wrong kind of value")
                     }
                 }
@@ -558,7 +560,7 @@ impl RudisTable {
                     RudisValue::Hash(map) => {
                         Ok(fields.iter().map(|f| map.get(f).cloned()).collect())
                     }
-                    RudisValue::String(_) => {
+                    _ => {
                         Err("WRONGTYPE Operation against a key holding the wrong kind of value")
                     }
                 }
@@ -587,7 +589,7 @@ impl RudisTable {
                         }
                         (c, map.is_empty())
                     }
-                    RudisValue::String(_) => {
+                    _ => {
                         return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
                     }
                 }
@@ -618,7 +620,7 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
                     RudisValue::Hash(map) => Ok(map.contains_key(field)),
-                    RudisValue::String(_) => {
+                    _ => {
                         Err("WRONGTYPE Operation against a key holding the wrong kind of value")
                     }
                 }
@@ -639,7 +641,7 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
                     RudisValue::Hash(map) => Ok(map.len()),
-                    RudisValue::String(_) => {
+                    _ => {
                         Err("WRONGTYPE Operation against a key holding the wrong kind of value")
                     }
                 }
@@ -662,7 +664,7 @@ impl RudisTable {
                     RudisValue::Hash(map) => {
                         Ok(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
                     }
-                    RudisValue::String(_) => {
+                    _ => {
                         Err("WRONGTYPE Operation against a key holding the wrong kind of value")
                     }
                 }
@@ -683,7 +685,7 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
                     RudisValue::Hash(map) => Ok(map.keys().cloned().collect()),
-                    RudisValue::String(_) => {
+                    _ => {
                         Err("WRONGTYPE Operation against a key holding the wrong kind of value")
                     }
                 }
@@ -704,13 +706,426 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
                     RudisValue::Hash(map) => Ok(map.values().cloned().collect()),
-                    RudisValue::String(_) => {
+                    _ => {
                         Err("WRONGTYPE Operation against a key holding the wrong kind of value")
                     }
                 }
             } else {
                 Ok(Vec::new())
             }
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    // LIST METHODS
+    pub fn lpush(&mut self, key: Bytes, values: Vec<Bytes>) -> Result<usize, &'static str> {
+        let h = hash_key(&key);
+        if let Some(idx) = self.table.find(&key, h) {
+            if self.check_expired_slot(idx) {
+                // Key was expired and removed
+            } else if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::List(deque) => {
+                        for v in values {
+                            deque.push_front(v);
+                        }
+                        return Ok(deque.len());
+                    }
+                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            }
+        }
+
+        let mut deque = std::collections::VecDeque::with_capacity(values.len());
+        for v in values {
+            deque.push_front(v);
+        }
+        let len = deque.len();
+        let slot = crate::router::key_slot(&key);
+        self.slot_to_keys.entry(slot).or_default().insert(key.clone());
+        let entry = RudisEntry {
+            key,
+            val: RudisValue::List(deque),
+            expire_at: None,
+        };
+        self.table.insert(entry);
+        Ok(len)
+    }
+
+    pub fn rpush(&mut self, key: Bytes, values: Vec<Bytes>) -> Result<usize, &'static str> {
+        let h = hash_key(&key);
+        if let Some(idx) = self.table.find(&key, h) {
+            if self.check_expired_slot(idx) {
+                // Key was expired and removed
+            } else if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::List(deque) => {
+                        for v in values {
+                            deque.push_back(v);
+                        }
+                        return Ok(deque.len());
+                    }
+                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            }
+        }
+
+        let mut deque = std::collections::VecDeque::with_capacity(values.len());
+        for v in values {
+            deque.push_back(v);
+        }
+        let len = deque.len();
+        let slot = crate::router::key_slot(&key);
+        self.slot_to_keys.entry(slot).or_default().insert(key.clone());
+        let entry = RudisEntry {
+            key,
+            val: RudisValue::List(deque),
+            expire_at: None,
+        };
+        self.table.insert(entry);
+        Ok(len)
+    }
+
+    pub fn lpop(&mut self, key: &[u8], count: usize) -> Result<Vec<Bytes>, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(Vec::new());
+            }
+            let (popped, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::List(deque) => {
+                        let mut res = Vec::new();
+                        for _ in 0..count {
+                            if let Some(val) = deque.pop_front() {
+                                res.push(val);
+                            } else {
+                                break;
+                            }
+                        }
+                        let empty = deque.is_empty();
+                        (res, empty)
+                    }
+                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                (Vec::new(), false)
+            };
+
+            if is_empty {
+                if let Some(removed) = self.table.remove(idx) {
+                    let slot = crate::router::key_slot(&removed.key);
+                    if let Some(set) = self.slot_to_keys.get_mut(&slot) {
+                        set.remove(&removed.key);
+                    }
+                }
+            }
+            Ok(popped)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub fn rpop(&mut self, key: &[u8], count: usize) -> Result<Vec<Bytes>, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(Vec::new());
+            }
+            let (popped, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::List(deque) => {
+                        let mut res = Vec::new();
+                        for _ in 0..count {
+                            if let Some(val) = deque.pop_back() {
+                                res.push(val);
+                            } else {
+                                break;
+                            }
+                        }
+                        let empty = deque.is_empty();
+                        (res, empty)
+                    }
+                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                (Vec::new(), false)
+            };
+
+            if is_empty {
+                if let Some(removed) = self.table.remove(idx) {
+                    let slot = crate::router::key_slot(&removed.key);
+                    if let Some(set) = self.slot_to_keys.get_mut(&slot) {
+                        set.remove(&removed.key);
+                    }
+                }
+            }
+            Ok(popped)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub fn llen(&mut self, key: &[u8]) -> Result<usize, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(0);
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::List(deque) => Ok(deque.len()),
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(0)
+            }
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn lindex(&mut self, key: &[u8], index: i64) -> Result<Option<Bytes>, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(None);
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::List(deque) => {
+                        let n = deque.len() as i64;
+                        let actual_idx = if index < 0 { n + index } else { index };
+                        if actual_idx >= 0 && actual_idx < n {
+                            Ok(deque.get(actual_idx as usize).cloned())
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(None)
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn lrange(&mut self, key: &[u8], mut start: i64, mut stop: i64) -> Result<Vec<Bytes>, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(Vec::new());
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::List(deque) => {
+                        let n = deque.len() as i64;
+                        if n == 0 {
+                            return Ok(Vec::new());
+                        }
+                        if start < 0 {
+                            start = (n + start).max(0);
+                        }
+                        if stop < 0 {
+                            stop = n + stop;
+                        }
+                        if start > stop || start >= n {
+                            return Ok(Vec::new());
+                        }
+                        let start_u = start.max(0) as usize;
+                        let stop_u = (stop.min(n - 1) as usize).max(start_u);
+                        let mut res = Vec::with_capacity(stop_u - start_u + 1);
+                        for i in start_u..=stop_u {
+                            if let Some(v) = deque.get(i) {
+                                res.push(v.clone());
+                            }
+                        }
+                        Ok(res)
+                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(Vec::new())
+            }
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    // SET METHODS
+    pub fn sadd(&mut self, key: Bytes, members: Vec<Bytes>) -> Result<usize, &'static str> {
+        let h = hash_key(&key);
+        if let Some(idx) = self.table.find(&key, h) {
+            if self.check_expired_slot(idx) {
+                // Key was expired, re-create below
+            } else if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::Set(set) => {
+                        let mut added = 0;
+                        for m in members {
+                            if set.insert(m) {
+                                added += 1;
+                            }
+                        }
+                        return Ok(added);
+                    }
+                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            }
+        }
+
+        let mut set = hashbrown::HashSet::with_capacity(members.len());
+        let mut added = 0;
+        for m in members {
+            if set.insert(m) {
+                added += 1;
+            }
+        }
+        let slot = crate::router::key_slot(&key);
+        self.slot_to_keys.entry(slot).or_default().insert(key.clone());
+        let entry = RudisEntry {
+            key,
+            val: RudisValue::Set(set),
+            expire_at: None,
+        };
+        self.table.insert(entry);
+        Ok(added)
+    }
+
+    pub fn srem(&mut self, key: &[u8], members: &[Bytes]) -> Result<usize, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(0);
+            }
+            let (removed_count, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::Set(set) => {
+                        let mut c = 0;
+                        for m in members {
+                            if set.remove(m) {
+                                c += 1;
+                            }
+                        }
+                        let empty = set.is_empty();
+                        (c, empty)
+                    }
+                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                (0, false)
+            };
+
+            if is_empty {
+                if let Some(removed) = self.table.remove(idx) {
+                    let slot = crate::router::key_slot(&removed.key);
+                    if let Some(set) = self.slot_to_keys.get_mut(&slot) {
+                        set.remove(&removed.key);
+                    }
+                }
+            }
+            Ok(removed_count)
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn smembers(&mut self, key: &[u8]) -> Result<Vec<Bytes>, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(Vec::new());
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::Set(set) => Ok(set.iter().cloned().collect()),
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(Vec::new())
+            }
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub fn sismember(&mut self, key: &[u8], member: &[u8]) -> Result<bool, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(false);
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::Set(set) => Ok(set.contains(member)),
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(false)
+            }
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn scard(&mut self, key: &[u8]) -> Result<usize, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(0);
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::Set(set) => Ok(set.len()),
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(0)
+            }
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn spop(&mut self, key: &[u8], count: usize) -> Result<Vec<Bytes>, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(Vec::new());
+            }
+            let (popped, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::Set(set) => {
+                        let mut res = Vec::new();
+                        for _ in 0..count {
+                            if let Some(elem) = set.iter().next().cloned() {
+                                set.remove(&elem);
+                                res.push(elem);
+                            } else {
+                                break;
+                            }
+                        }
+                        let empty = set.is_empty();
+                        (res, empty)
+                    }
+                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                (Vec::new(), false)
+            };
+
+            if is_empty {
+                if let Some(removed) = self.table.remove(idx) {
+                    let slot = crate::router::key_slot(&removed.key);
+                    if let Some(set) = self.slot_to_keys.get_mut(&slot) {
+                        set.remove(&removed.key);
+                    }
+                }
+            }
+            Ok(popped)
         } else {
             Ok(Vec::new())
         }

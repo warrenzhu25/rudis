@@ -179,7 +179,20 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Hlen(key)
         | Command::Hgetall(key)
         | Command::Hkeys(key)
-        | Command::Hvals(key) => Some(key),
+        | Command::Hvals(key)
+        | Command::Lpush { key, .. }
+        | Command::Rpush { key, .. }
+        | Command::Lpop { key, .. }
+        | Command::Rpop { key, .. }
+        | Command::Lrange { key, .. }
+        | Command::Llen(key)
+        | Command::Lindex { key, .. }
+        | Command::Sadd { key, .. }
+        | Command::Srem { key, .. }
+        | Command::Smembers(key)
+        | Command::Sismember { key, .. }
+        | Command::Scard(key)
+        | Command::Spop { key, .. } => Some(key),
         Command::Del(keys) | Command::Exists(keys) | Command::Mget(keys) => keys.first(),
         Command::Mset(pairs) => pairs.first().map(|(k, _)| k),
         _ => None,
@@ -219,6 +232,19 @@ async fn execute_command(
         Command::Hgetall(_) => "HGETALL",
         Command::Hkeys(_) => "HKEYS",
         Command::Hvals(_) => "HVALS",
+        Command::Lpush { .. } => "LPUSH",
+        Command::Rpush { .. } => "RPUSH",
+        Command::Lpop { .. } => "LPOP",
+        Command::Rpop { .. } => "RPOP",
+        Command::Lrange { .. } => "LRANGE",
+        Command::Llen(_) => "LLEN",
+        Command::Lindex { .. } => "LINDEX",
+        Command::Sadd { .. } => "SADD",
+        Command::Srem { .. } => "SREM",
+        Command::Smembers(_) => "SMEMBERS",
+        Command::Sismember { .. } => "SISMEMBER",
+        Command::Scard(_) => "SCARD",
+        Command::Spop { .. } => "SPOP",
         Command::Ping(_) => "PING",
         Command::CommandDocs => "COMMAND",
         Command::Info => "INFO",
@@ -544,7 +570,20 @@ async fn execute_command(
         | Command::Hlen(_)
         | Command::Hgetall(_)
         | Command::Hkeys(_)
-        | Command::Hvals(_) => {
+        | Command::Hvals(_)
+        | Command::Lpush { .. }
+        | Command::Rpush { .. }
+        | Command::Lpop { .. }
+        | Command::Rpop { .. }
+        | Command::Lrange { .. }
+        | Command::Llen(_)
+        | Command::Lindex { .. }
+        | Command::Sadd { .. }
+        | Command::Srem { .. }
+        | Command::Smembers(_)
+        | Command::Sismember { .. }
+        | Command::Scard(_)
+        | Command::Spop { .. } => {
             if let Some(target) = target_shard_of_cmd(&cmd, router.num_shards) {
                 if target == router.shard_id {
                     execute_local_command(&cmd, &mut router.local_db.borrow_mut(), out);
@@ -676,6 +715,53 @@ async fn execute_command(
                                 )
                                 .as_bytes(),
                             );
+                            tx_buf.extend_from_slice(
+                                format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
+                            );
+                        }
+                    }
+                    crate::table::RudisValue::List(deque) => {
+                        tx_buf.extend_from_slice(
+                            format!("*{}\r\n$5\r\nRPUSH\r\n${}\r\n", 2 + deque.len(), k.len())
+                                .as_bytes(),
+                        );
+                        tx_buf.extend_from_slice(k);
+                        tx_buf.extend_from_slice(b"\r\n");
+                        for v in deque {
+                            tx_buf.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                            tx_buf.extend_from_slice(v);
+                            tx_buf.extend_from_slice(b"\r\n");
+                        }
+                        if let Some(dur) = ttl {
+                            let ms = dur.as_millis().max(1);
+                            let ms_str = ms.to_string();
+                            tx_buf.extend_from_slice(
+                                format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
+                            );
+                            tx_buf.extend_from_slice(k);
+                            tx_buf.extend_from_slice(
+                                format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
+                            );
+                        }
+                    }
+                    crate::table::RudisValue::Set(set) => {
+                        tx_buf.extend_from_slice(
+                            format!("*{}\r\n$4\r\nSADD\r\n${}\r\n", 2 + set.len(), k.len())
+                                .as_bytes(),
+                        );
+                        tx_buf.extend_from_slice(k);
+                        tx_buf.extend_from_slice(b"\r\n");
+                        for m in set {
+                            tx_buf.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                            tx_buf.extend_from_slice(m);
+                            tx_buf.extend_from_slice(b"\r\n");
+                        }
+                        if let Some(dur) = ttl {
+                            let ms = dur.as_millis().max(1);
+                            let ms_str = ms.to_string();
+                            tx_buf.extend_from_slice(
+                                format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
+                            );
                             tx_buf.extend_from_slice(k);
                             tx_buf.extend_from_slice(
                                 format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
@@ -739,7 +825,20 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Hlen(key)
         | Command::Hgetall(key)
         | Command::Hkeys(key)
-        | Command::Hvals(key) => Some(target_shard(key, num_shards)),
+        | Command::Hvals(key)
+        | Command::Lpush { key, .. }
+        | Command::Rpush { key, .. }
+        | Command::Lpop { key, .. }
+        | Command::Rpop { key, .. }
+        | Command::Lrange { key, .. }
+        | Command::Llen(key)
+        | Command::Lindex { key, .. }
+        | Command::Sadd { key, .. }
+        | Command::Srem { key, .. }
+        | Command::Smembers(key)
+        | Command::Sismember { key, .. }
+        | Command::Scard(key)
+        | Command::Spop { key, .. } => Some(target_shard(key, num_shards)),
         Command::Del(keys) | Command::Exists(keys) if keys.len() == 1 => {
             Some(target_shard(&keys[0], num_shards))
         }
@@ -974,6 +1073,212 @@ pub fn execute_local_command(cmd: &Command, db: &mut ShardDb, out: &mut Vec<u8>)
             }
             false
         }
+        // LIST COMMANDS
+        Command::Lpush { key, values } => {
+            match db.lpush(key.clone(), values.clone()) {
+                Ok(len) => {
+                    out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Rpush { key, values } => {
+            match db.rpush(key.clone(), values.clone()) {
+                Ok(len) => {
+                    out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Lpop { key, count } => {
+            let n = count.unwrap_or(1);
+            match db.lpop(key, n) {
+                Ok(popped) => {
+                    if count.is_some() {
+                        out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
+                        for v in popped {
+                            out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                            out.extend_from_slice(&v);
+                            out.extend_from_slice(b"\r\n");
+                        }
+                    } else if let Some(first) = popped.into_iter().next() {
+                        out.extend_from_slice(format!("${}\r\n", first.len()).as_bytes());
+                        out.extend_from_slice(&first);
+                        out.extend_from_slice(b"\r\n");
+                    } else {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Rpop { key, count } => {
+            let n = count.unwrap_or(1);
+            match db.rpop(key, n) {
+                Ok(popped) => {
+                    if count.is_some() {
+                        out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
+                        for v in popped {
+                            out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                            out.extend_from_slice(&v);
+                            out.extend_from_slice(b"\r\n");
+                        }
+                    } else if let Some(first) = popped.into_iter().next() {
+                        out.extend_from_slice(format!("${}\r\n", first.len()).as_bytes());
+                        out.extend_from_slice(&first);
+                        out.extend_from_slice(b"\r\n");
+                    } else {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Llen(key) => {
+            match db.llen(key) {
+                Ok(len) => {
+                    out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Lindex { key, index } => {
+            match db.lindex(key, *index) {
+                Ok(Some(v)) => {
+                    out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                    out.extend_from_slice(&v);
+                    out.extend_from_slice(b"\r\n");
+                }
+                Ok(None) => {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Lrange { key, start, stop } => {
+            match db.lrange(key, *start, *stop) {
+                Ok(items) => {
+                    out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                    for v in items {
+                        out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                        out.extend_from_slice(&v);
+                        out.extend_from_slice(b"\r\n");
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        // SET COMMANDS
+        Command::Sadd { key, members } => {
+            match db.sadd(key.clone(), members.clone()) {
+                Ok(added) => {
+                    out.extend_from_slice(format!(":{}\r\n", added).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Srem { key, members } => {
+            match db.srem(key, members) {
+                Ok(count) => {
+                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Smembers(key) => {
+            match db.smembers(key) {
+                Ok(members) => {
+                    out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
+                    for m in members {
+                        out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                        out.extend_from_slice(&m);
+                        out.extend_from_slice(b"\r\n");
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Sismember { key, member } => {
+            match db.sismember(key, member) {
+                Ok(is_mem) => {
+                    if is_mem {
+                        out.extend_from_slice(b":1\r\n");
+                    } else {
+                        out.extend_from_slice(b":0\r\n");
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Scard(key) => {
+            match db.scard(key) {
+                Ok(card) => {
+                    out.extend_from_slice(format!(":{}\r\n", card).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Spop { key, count } => {
+            let n = count.unwrap_or(1);
+            match db.spop(key, n) {
+                Ok(popped) => {
+                    if count.is_some() {
+                        out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
+                        for m in popped {
+                            out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                            out.extend_from_slice(&m);
+                            out.extend_from_slice(b"\r\n");
+                        }
+                    } else if let Some(first) = popped.into_iter().next() {
+                        out.extend_from_slice(format!("${}\r\n", first.len()).as_bytes());
+                        out.extend_from_slice(&first);
+                        out.extend_from_slice(b"\r\n");
+                    } else {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
         Command::Ping(msg) => {
             match msg {
                 Some(m) => {
@@ -1064,6 +1369,19 @@ async fn execute_commands_squashed(
                 Command::Hgetall(_) => "HGETALL",
                 Command::Hkeys(_) => "HKEYS",
                 Command::Hvals(_) => "HVALS",
+                Command::Lpush { .. } => "LPUSH",
+                Command::Rpush { .. } => "RPUSH",
+                Command::Lpop { .. } => "LPOP",
+                Command::Rpop { .. } => "RPOP",
+                Command::Lrange { .. } => "LRANGE",
+                Command::Llen(_) => "LLEN",
+                Command::Lindex { .. } => "LINDEX",
+                Command::Sadd { .. } => "SADD",
+                Command::Srem { .. } => "SREM",
+                Command::Smembers(_) => "SMEMBERS",
+                Command::Sismember { .. } => "SISMEMBER",
+                Command::Scard(_) => "SCARD",
+                Command::Spop { .. } => "SPOP",
                 Command::Ping(_) => "PING",
                 Command::CommandDocs => "COMMAND",
                 Command::Info => "INFO",

@@ -85,6 +85,52 @@ pub enum Command {
     Hgetall(Bytes),
     Hkeys(Bytes),
     Hvals(Bytes),
+    // LIST COMMANDS
+    Lpush {
+        key: Bytes,
+        values: Vec<Bytes>,
+    },
+    Rpush {
+        key: Bytes,
+        values: Vec<Bytes>,
+    },
+    Lpop {
+        key: Bytes,
+        count: Option<usize>,
+    },
+    Rpop {
+        key: Bytes,
+        count: Option<usize>,
+    },
+    Lrange {
+        key: Bytes,
+        start: i64,
+        stop: i64,
+    },
+    Llen(Bytes),
+    Lindex {
+        key: Bytes,
+        index: i64,
+    },
+    // SET COMMANDS
+    Sadd {
+        key: Bytes,
+        members: Vec<Bytes>,
+    },
+    Srem {
+        key: Bytes,
+        members: Vec<Bytes>,
+    },
+    Smembers(Bytes),
+    Sismember {
+        key: Bytes,
+        member: Bytes,
+    },
+    Scard(Bytes),
+    Spop {
+        key: Bytes,
+        count: Option<usize>,
+    },
     Ping(Option<Bytes>),
     CommandDocs,
     Info,
@@ -612,6 +658,154 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'hvals' command".to_string());
             }
             Ok(Some(Command::Hvals(args[1].clone())))
+        }
+        "LPUSH" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'lpush' command".to_string());
+            }
+            Ok(Some(Command::Lpush {
+                key: args[1].clone(),
+                values: args[2..].to_vec(),
+            }))
+        }
+        "RPUSH" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'rpush' command".to_string());
+            }
+            Ok(Some(Command::Rpush {
+                key: args[1].clone(),
+                values: args[2..].to_vec(),
+            }))
+        }
+        "LPOP" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'lpop' command".to_string());
+            }
+            let count = if args.len() > 2 {
+                let c = std::str::from_utf8(&args[2])
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                Some(c)
+            } else {
+                None
+            };
+            Ok(Some(Command::Lpop {
+                key: args[1].clone(),
+                count,
+            }))
+        }
+        "RPOP" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'rpop' command".to_string());
+            }
+            let count = if args.len() > 2 {
+                let c = std::str::from_utf8(&args[2])
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                Some(c)
+            } else {
+                None
+            };
+            Ok(Some(Command::Rpop {
+                key: args[1].clone(),
+                count,
+            }))
+        }
+        "LRANGE" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'lrange' command".to_string());
+            }
+            let start: i64 = std::str::from_utf8(&args[2])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            let stop: i64 = std::str::from_utf8(&args[3])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            Ok(Some(Command::Lrange {
+                key: args[1].clone(),
+                start,
+                stop,
+            }))
+        }
+        "LLEN" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'llen' command".to_string());
+            }
+            Ok(Some(Command::Llen(args[1].clone())))
+        }
+        "LINDEX" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'lindex' command".to_string());
+            }
+            let index: i64 = std::str::from_utf8(&args[2])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            Ok(Some(Command::Lindex {
+                key: args[1].clone(),
+                index,
+            }))
+        }
+        "SADD" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'sadd' command".to_string());
+            }
+            Ok(Some(Command::Sadd {
+                key: args[1].clone(),
+                members: args[2..].to_vec(),
+            }))
+        }
+        "SREM" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'srem' command".to_string());
+            }
+            Ok(Some(Command::Srem {
+                key: args[1].clone(),
+                members: args[2..].to_vec(),
+            }))
+        }
+        "SMEMBERS" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'smembers' command".to_string());
+            }
+            Ok(Some(Command::Smembers(args[1].clone())))
+        }
+        "SISMEMBER" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'sismember' command".to_string());
+            }
+            Ok(Some(Command::Sismember {
+                key: args[1].clone(),
+                member: args[2].clone(),
+            }))
+        }
+        "SCARD" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'scard' command".to_string());
+            }
+            Ok(Some(Command::Scard(args[1].clone())))
+        }
+        "SPOP" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'spop' command".to_string());
+            }
+            let count = if args.len() > 2 {
+                let c = std::str::from_utf8(&args[2])
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                Some(c)
+            } else {
+                None
+            };
+            Ok(Some(Command::Spop {
+                key: args[1].clone(),
+                count,
+            }))
         }
         "COMMAND" => Ok(Some(Command::CommandDocs)),
         "INFO" => Ok(Some(Command::Info)),
