@@ -166,11 +166,11 @@ pub fn run_shard_worker(
             }
         });
 
-        // Background Tiered Storage Offload cycle: run every 100ms
+        // Background Tiered Storage Offload cycle: run every 20ms
         let offload_router = router.clone();
         monoio::spawn(async move {
             loop {
-                monoio::time::sleep(std::time::Duration::from_millis(100)).await;
+                monoio::time::sleep(std::time::Duration::from_millis(20)).await;
                 offload_router.check_auto_tier().await;
             }
         });
@@ -518,6 +518,13 @@ pub fn run_shard_worker(
                     ShardMessage::GetUsedMemory { responder } => {
                         let used = cross_shard_db.borrow().table.used_memory;
                         let _ = responder.send(used);
+                    }
+                    ShardMessage::StreamColdRead { key, responder } => {
+                        let r = cross_shard_router.clone();
+                        monoio::spawn(async move {
+                            let val = r.stream_cold_read_local(&key).await;
+                            let _ = responder.send(val);
+                        });
                     }
                 }
             }

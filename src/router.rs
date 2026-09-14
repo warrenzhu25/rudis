@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -64,6 +64,7 @@ pub struct Router {
     pub is_saving: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub last_save_time: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub db_dir: std::path::PathBuf,
+    pub is_auto_tiering: Rc<Cell<bool>>,
 }
 
 impl Router {
@@ -98,6 +99,7 @@ impl Router {
             is_saving: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_save_time: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             db_dir,
+            is_auto_tiering: Rc::new(Cell::new(false)),
         }
     }
 
@@ -187,6 +189,8 @@ impl Router {
                 stats.tiered_bytes.fetch_add(ptr.length as u64, Ordering::Relaxed);
                 stats.ram_saved_bytes.fetch_add(entry_data.len() as u64, Ordering::Relaxed);
             }
+            drop(db);
+            let _ = tm.flush_active_bin().await;
             true
         } else {
             false
@@ -200,16 +204,22 @@ impl Router {
             None => return false,
         };
 
-        let (file, stats, op_manager) = {
+        let tm = {
             let db = self.local_db.borrow();
-            if let Some(tm) = &db.tier_manager {
-                (tm.file.clone(), tm.stats.clone(), tm.op_manager.clone())
-            } else {
-                return false;
-            }
+            db.tier_manager.clone()
+        };
+        let tm = match tm {
+            Some(tm) => tm,
+            None => return false,
         };
 
-        let (record_key, val_payload) = match crate::tiering::read_tiered_record(&file, &op_manager, ptr, &stats).await {
+        let (record_key, val_payload) = match crate::tiering::read_tiered_record(
+            &tm.file,
+            &tm.op_manager,
+            Some(&tm.small_bins),
+            ptr,
+            &tm.stats,
+        ).await {
             Ok(pair) => pair,
             Err(_) => return false,
         };
@@ -221,10 +231,10 @@ impl Router {
 
         let mut db = self.local_db.borrow_mut();
         if db.table.restore_tiered_value(&record_key, val) {
-            stats.total_fetches.fetch_add(1, Ordering::Relaxed);
-            stats.tiered_keys.fetch_sub(1, Ordering::Relaxed);
-            stats.cooled_keys.fetch_add(1, Ordering::Relaxed);
-            stats.ram_saved_bytes.fetch_sub(val_payload.len() as u64, Ordering::Relaxed);
+            tm.stats.total_fetches.fetch_add(1, Ordering::Relaxed);
+            tm.stats.tiered_keys.fetch_sub(1, Ordering::Relaxed);
+            tm.stats.cooled_keys.fetch_add(1, Ordering::Relaxed);
+            tm.stats.ram_saved_bytes.fetch_sub(val_payload.len() as u64, Ordering::Relaxed);
             true
         } else {
             false
@@ -261,6 +271,8 @@ impl Router {
                 stats.cooled_keys.fetch_add(1, Ordering::Relaxed);
                 stats.tiered_bytes.fetch_add(ptr.length as u64, Ordering::Relaxed);
             }
+            drop(db);
+            let _ = tm.flush_active_bin().await;
             true
         } else {
             false
@@ -269,13 +281,18 @@ impl Router {
 
     pub async fn stream_cold_read_local(&self, key: &[u8]) -> Option<Bytes> {
         let ptr = self.local_db.borrow_mut().table.is_tiered(key)?;
-        let (file, stats, op_manager) = {
+        let tm = {
             let db = self.local_db.borrow();
-            let tm = db.tier_manager.as_ref()?;
-            (tm.file.clone(), tm.stats.clone(), tm.op_manager.clone())
+            db.tier_manager.clone()?
         };
 
-        let (_, val_payload) = crate::tiering::read_tiered_record(&file, &op_manager, ptr, &stats).await.ok()?;
+        let (_, val_payload) = crate::tiering::read_tiered_record(
+            &tm.file,
+            &tm.op_manager,
+            Some(&tm.small_bins),
+            ptr,
+            &tm.stats,
+        ).await.ok()?;
         let (val, _) = crate::table::RudisTable::deserialize_val_payload(&val_payload).ok()?;
         match val {
             crate::table::RudisValue::String(s) => Some(s),
@@ -383,14 +400,21 @@ impl Router {
     }
 
     pub async fn check_auto_tier(&self) {
+        if self.is_auto_tiering.get() {
+            return;
+        }
+        self.is_auto_tiering.set(true);
+
         let max_mem = crate::tiering::get_max_memory(self.port);
         if max_mem == 0 {
+            self.is_auto_tiering.set(false);
             return;
         }
         let shard_max_mem = (max_mem / self.num_shards.max(1) as u64).max(1) as usize;
 
         let used = self.local_db.borrow().table.used_memory;
         if used <= shard_max_mem {
+            self.is_auto_tiering.set(false);
             return;
         }
 
@@ -399,6 +423,7 @@ impl Router {
         if decommitted > 0 {
             let used_after = self.local_db.borrow().table.used_memory;
             if used_after <= shard_max_mem {
+                self.is_auto_tiering.set(false);
                 return;
             }
         }
@@ -411,6 +436,13 @@ impl Router {
                 break;
             }
         }
+
+        let tm = self.local_db.borrow().tier_manager.clone();
+        if let Some(tm) = tm {
+            let _ = tm.flush_active_bin().await;
+        }
+
+        self.is_auto_tiering.set(false);
     }
 
     pub async fn spill_key(&self, key: &[u8]) -> bool {
@@ -432,6 +464,16 @@ impl Router {
     }
 
     pub async fn ensure_loaded(&self, key: &[u8]) -> bool {
+        let max_mem = crate::tiering::get_max_memory(self.port);
+        let offload_pct = crate::tiering::get_offload_threshold_pct(self.port);
+        if max_mem > 0 {
+            let used_mem = self.local_db.borrow().table.used_memory;
+            let shard_threshold = (max_mem / self.num_shards.max(1) as u64) as usize;
+            if used_mem >= (shard_threshold * offload_pct as usize) / 100 {
+                return false;
+            }
+        }
+
         let target = target_shard(key, self.num_shards);
         if target == self.shard_id {
             self.load_local(key).await
@@ -462,21 +504,39 @@ impl Router {
 
     pub async fn get(&self, key: Bytes) -> Option<Bytes> {
         let max_mem = crate::tiering::get_max_memory(self.port);
-        let upload_pct = crate::tiering::get_upload_threshold_pct(self.port);
-        let used_mem = self.local_db.borrow().table.used_memory;
-        let shard_threshold = if max_mem > 0 {
-            (max_mem / self.num_shards.max(1) as u64) as usize
+        let offload_pct = crate::tiering::get_offload_threshold_pct(self.port);
+        let target = target_shard(&key, self.num_shards);
+
+        let is_constrained = if max_mem > 0 {
+            let used_mem = self.local_db.borrow().table.used_memory;
+            let shard_threshold = (max_mem / self.num_shards.max(1) as u64) as usize;
+            used_mem >= (shard_threshold * offload_pct as usize) / 100
         } else {
-            usize::MAX
+            false
         };
 
-        let target = target_shard(&key, self.num_shards);
-        if target == self.shard_id && max_mem > 0 && used_mem >= (shard_threshold * upload_pct as usize) / 100 {
-            if let Some(val) = self.stream_cold_read_local(&key).await {
-                let stats = crate::tiering::get_tier_stats(self.port);
-                stats.streaming_reads.fetch_add(1, Ordering::Relaxed);
-                stats.ram_misses.fetch_add(1, Ordering::Relaxed);
-                return Some(val);
+        if is_constrained {
+            if target == self.shard_id {
+                if let Some(val) = self.stream_cold_read_local(&key).await {
+                    let stats = crate::tiering::get_tier_stats(self.port);
+                    stats.streaming_reads.fetch_add(1, Ordering::Relaxed);
+                    stats.ram_misses.fetch_add(1, Ordering::Relaxed);
+                    return Some(val);
+                }
+            } else {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::StreamColdRead {
+                    key: key.clone(),
+                    responder: tx,
+                };
+                if self.senders[target].send(msg).is_ok() {
+                    if let Ok(Some(val)) = rx.recv_async().await {
+                        let stats = crate::tiering::get_tier_stats(self.port);
+                        stats.streaming_reads.fetch_add(1, Ordering::Relaxed);
+                        stats.ram_misses.fetch_add(1, Ordering::Relaxed);
+                        return Some(val);
+                    }
+                }
             }
         }
 
@@ -533,7 +593,21 @@ impl Router {
                     aof.borrow_mut().append(&bytes);
                 }
             }
-            self.check_auto_tier().await;
+            let max_mem = crate::tiering::get_max_memory(self.port);
+            if max_mem > 0 {
+                let used = self.local_db.borrow().table.used_memory;
+                let shard_max_mem = (max_mem / self.num_shards.max(1) as u64) as usize;
+                if used > shard_max_mem && !self.is_auto_tiering.get() {
+                    let decommitted = self.decommit_local(None);
+                    let used_after = self.local_db.borrow().table.used_memory;
+                    if (decommitted == 0 || used_after > shard_max_mem) && !self.is_auto_tiering.get() {
+                        let r = self.clone();
+                        monoio::spawn(async move {
+                            r.check_auto_tier().await;
+                        });
+                    }
+                }
+            }
         } else {
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::Set {

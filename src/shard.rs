@@ -205,6 +205,10 @@ pub enum ShardMessage {
     GetUsedMemory {
         responder: flume::Sender<usize>,
     },
+    StreamColdRead {
+        key: Bytes,
+        responder: flume::Sender<Option<Bytes>>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -100,23 +100,28 @@ A direct comparative evaluation between **Rudis v0.1.0** and **Dragonfly v1.39.0
 
 | Workload | Payload | Rudis (Ops/sec) | Dragonfly (Ops/sec) | Rudis Speedup | Winner |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **SET** | 1KB | **1,062,330** | 290,892 | **+265.2% (3.65x)** | **Rudis** |
-| **GET** | 1KB | **567,540** | 207,463 | **+173.6% (2.74x)** | **Rudis** |
-| **SET/GET 1:1** | 1KB | 46,528 | **272,537** | -82.9% (0.17x) | Dragonfly |
+| **SET** | 1KB | **1,125,759** | 281,561 | **+299.8% (4.00x)** | **Rudis** |
+| **GET** | 1KB | **630,595** | 202,205 | **+211.9% (3.12x)** | **Rudis** |
+| **SET/GET 1:1** | 1KB | 94,371 | **264,468** | -64.3% (0.36x) | Dragonfly |
 
 ### Latency Percentiles Comparison
 
 | Engine | Workload | Ops/sec | Bandwidth | Avg Latency | p50 | p90 | p95 | p99 | p99.9 |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Rudis** | **SET (1KB)** | **1,062,330** | 1,112.0 MB/s | **0.74 ms** | **0.58 ms** | 1.00 ms | 1.21 ms | **1.73 ms** | 15.23 ms |
-| Dragonfly | **SET (1KB)** | 290,892 | 304.4 MB/s | 2.74 ms | 2.61 ms | 3.28 ms | 3.66 ms | 5.22 ms | 16.51 ms |
-| **Rudis** | **GET (1KB)** | **567,540** | 582.3 MB/s | **1.41 ms** | **1.04 ms** | 2.93 ms | 4.38 ms | 7.97 ms | **16.77 ms** |
-| Dragonfly | **GET (1KB)** | 207,463 | 216.0 MB/s | 3.86 ms | 3.78 ms | 4.35 ms | 4.61 ms | 6.40 ms | 23.42 ms |
-| Rudis | **SET/GET 1:1**| 46,528 | 48.5 MB/s | 17.14 ms | 7.36 ms | 24.19 ms | 95.74 ms | 202.75 ms | 290.82 ms |
-| **Dragonfly**| **SET/GET 1:1**| **272,537** | 284.3 MB/s | 2.93 ms | 2.82 ms | 3.50 ms | 3.84 ms | 5.15 ms | 18.56 ms |
+| **Rudis** | **SET (1KB)** | **1,125,759** | 1,178.4 MB/s | **0.70 ms** | **0.50 ms** | **0.80 ms** | **0.92 ms** | **3.95 ms** | 25.09 ms |
+| Dragonfly | **SET (1KB)** | 281,561 | 294.6 MB/s | 2.83 ms | 2.72 ms | 3.38 ms | 3.70 ms | 4.90 ms | **17.92 ms** |
+| **Rudis** | **GET (1KB)** | **630,595** | 650.6 MB/s | **1.27 ms** | **0.96 ms** | **2.27 ms** | **3.79 ms** | 6.78 ms | **10.82 ms** |
+| Dragonfly | **GET (1KB)** | 202,205 | 210.5 MB/s | 3.96 ms | 3.86 ms | 4.48 ms | 4.74 ms | **6.46 ms** | 22.78 ms |
+| Rudis | **SET/GET 1:1**| 94,371 | 98.4 MB/s | 8.47 ms | 5.34 ms | 13.76 ms | 22.91 ms | 81.41 ms | 125.44 ms |
+| **Dragonfly**| **SET/GET 1:1**| **264,468** | 275.9 MB/s | **3.02 ms** | **2.94 ms** | **3.55 ms** | **3.82 ms** | **4.90 ms** | **20.35 ms** |
 
-### Analysis
-1. **Write & Spill Throughput**: Rudis outperforms Dragonfly by **3.65x** on `SET` operations under memory limits (1.06M ops/s vs 291K ops/s), benefiting from thread-local `io_uring` direct submission with zero cross-thread locking or fiber context switches.
-2. **Read & Fetch Throughput**: Rudis outperforms Dragonfly by **2.74x** on `GET` operations (568K ops/s vs 207K ops/s) with a **2.7x lower average latency** (1.41 ms vs 3.86 ms), driven by `OpManager`'s fast-path read coalescing and direct buffer handoff.
-3. **Interleaved Pipeline Contention**: On 1:1 mixed pipelined workloads, Dragonfly's fiber architecture decouples background flushes asynchronously, while Rudis enforces strict write backpressure barriers when small bins are pending disk flush.
+### Analysis & Mixed Workload Optimizations
+1. **Write & Spill Throughput**: Rudis delivers **4.0x higher write throughput** than Dragonfly under memory limits (1.13M ops/s vs 282K ops/s) with sub-millisecond average latency (0.70 ms vs 2.83 ms), leveraging thread-local `io_uring` batched submissions without cross-thread locking or fiber context switches.
+2. **Read & Fetch Throughput**: Rudis delivers **3.12x higher read throughput** than Dragonfly (631K ops/s vs 202K ops/s) and **3.1x lower average latency** (1.27 ms vs 3.96 ms), powered by `OpManager`'s fast-path read coalescing and direct buffer handoff.
+3. **Pipelined Mixed Workload Improvements**: Through targeted architectural enhancements, Rudis doubled its 1:1 SET/GET mixed throughput from 46,528 ops/sec to **94,371 ops/sec (+103%)**, halved average latency from 17.14 ms to **8.47 ms**, and reduced p99 tail latency from 202.75 ms to **81.41 ms** (60% drop):
+   - **Batched SmallBins Flushing**: Accumulates entries into 4KB active bin pages in memory, eliminating redundant page rewrites and write amplification on every small record.
+   - **Active Bin Fast-Path Read**: Cold reads hitting active in-memory bin buffers are resolved directly from DRAM without issuing NVMe disk I/O.
+   - **Memory Hysteresis & Streaming Cold Reads**: Avoids ping-pong cache thrashing when DRAM is constrained; keys fetched from disk above the offload watermark are streamed directly to socket output buffers via `ShardMessage::StreamColdRead` without allocating DRAM or displacing active working sets.
+   - **Asynchronous Deduplicated Offload**: Write operations spawn background offloading tasks guarded by concurrency controls (`is_auto_tiering`), preventing Monoio task queue saturation.
+
 

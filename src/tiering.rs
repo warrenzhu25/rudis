@@ -399,30 +399,24 @@ impl ShardTierManager {
                 self.small_bins.borrow_mut().active_bin = Some(ActiveBin::new(next_page_idx));
             }
 
-            let (page_idx, item, page_buf, items_len) = {
+            let (ptr, should_flush) = {
                 let mut bins = self.small_bins.borrow_mut();
                 let ab = bins.active_bin.as_mut().unwrap();
                 let page_idx = ab.page_index;
                 let item = ab.append(key.clone(), &record, val_type);
-                let items_len = ab.items.len();
-                let mut page_buf = ab.buffer.clone();
-                if page_buf.len() < PAGE_SIZE {
-                    page_buf.resize(PAGE_SIZE, 0);
-                }
-                (page_idx, item, page_buf, items_len)
+                let should_flush = !ab.can_fit(SMALL_VALUE_LIMIT);
+                let ptr = TieredPointer {
+                    file_id: self.shard_id as u32,
+                    offset: page_idx * PAGE_SIZE as u64 + item.offset_in_page as u64,
+                    length: item.length,
+                    value_type: item.value_type,
+                };
+                (ptr, should_flush)
             };
 
-            let (res, _) = self.file.write_all_at(page_buf, page_idx * PAGE_SIZE as u64).await;
-            res?;
-            self.stats.disk_writes.fetch_add(1, Ordering::Relaxed);
-            self.small_bins.borrow_mut().page_active_counts.insert(page_idx, items_len);
-
-            let ptr = TieredPointer {
-                file_id: self.shard_id as u32,
-                offset: page_idx * PAGE_SIZE as u64 + item.offset_in_page as u64,
-                length: item.length,
-                value_type: item.value_type,
-            };
+            if should_flush {
+                self.flush_active_bin().await?;
+            }
 
             self.stats.total_stashes.fetch_add(1, Ordering::Relaxed);
             Ok(ptr)
@@ -560,6 +554,7 @@ pub fn decode_tiered_record(data: &[u8], expected_val_type: u8) -> io::Result<(B
 pub async fn read_tiered_record(
     file: &Rc<monoio::fs::File>,
     op_manager: &OpManager,
+    small_bins: Option<&RefCell<SmallBinsManager>>,
     ptr: TieredPointer,
     stats: &TieringStats,
 ) -> io::Result<(Bytes, Vec<u8>)> {
@@ -574,8 +569,29 @@ pub async fn read_tiered_record(
     let offset_in_page = (ptr.offset % PAGE_SIZE as u64) as usize;
     let data: Vec<u8> = if offset_in_page + len <= PAGE_SIZE {
         let page_start = (ptr.offset / PAGE_SIZE as u64) * PAGE_SIZE as u64;
-        let page_rc = op_manager.read_page_coalesced(file, page_start, stats).await?;
-        page_rc[offset_in_page..offset_in_page + len].to_vec()
+        let page_idx = ptr.offset / PAGE_SIZE as u64;
+
+        let in_mem = if let Some(sb) = small_bins {
+            let bins = sb.borrow();
+            if let Some(ab) = &bins.active_bin {
+                if ab.page_index == page_idx && ab.buffer.len() >= offset_in_page + len {
+                    Some(ab.buffer[offset_in_page..offset_in_page + len].to_vec())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(d) = in_mem {
+            d
+        } else {
+            let page_rc = op_manager.read_page_coalesced(file, page_start, stats).await?;
+            page_rc[offset_in_page..offset_in_page + len].to_vec()
+        }
     } else {
         let buf = Vec::with_capacity(len);
         let (res, data) = file.read_exact_at(buf, ptr.offset).await;
