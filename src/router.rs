@@ -158,7 +158,138 @@ impl Router {
         }
     }
 
+    pub async fn spill_local(&self, key: &[u8]) -> bool {
+        let (entry_data, val_type) = match self.local_db.borrow_mut().table.get_value_for_spill(key) {
+            Some(p) => p,
+            None => return false,
+        };
+
+        let (file, offset, stats, shard_id) = {
+            let mut db = self.local_db.borrow_mut();
+            if let Some(tm) = &mut db.tier_manager {
+                let off = tm.current_offset;
+                (tm.file.clone(), off, tm.stats.clone(), tm.shard_id)
+            } else {
+                return false;
+            }
+        };
+
+        let record = crate::tiering::encode_tiered_record(key, &entry_data, val_type);
+        let record_len = record.len() as u32;
+
+        let (res, _) = file.write_all_at(record, offset).await;
+        if res.is_err() {
+            return false;
+        }
+
+        let ptr = crate::table::TieredPointer {
+            file_id: shard_id as u32,
+            offset,
+            length: record_len,
+            value_type: val_type,
+        };
+
+        let mut db = self.local_db.borrow_mut();
+        if let Some(tm) = &mut db.tier_manager {
+            tm.current_offset += record_len as u64;
+        }
+        if db.table.set_tiered_pointer(key, ptr) {
+            stats.disk_writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stats.tiered_keys.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stats.tiered_bytes.fetch_add(record_len as u64, std::sync::atomic::Ordering::Relaxed);
+            stats.ram_saved_bytes.fetch_add(entry_data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub async fn load_local(&self, key: &[u8]) -> bool {
+        let ptr = self.local_db.borrow_mut().table.is_tiered(key);
+        let ptr = match ptr {
+            Some(p) => p,
+            None => return false,
+        };
+
+        let (file, stats) = {
+            let db = self.local_db.borrow();
+            if let Some(tm) = &db.tier_manager {
+                (tm.file.clone(), tm.stats.clone())
+            } else {
+                return false;
+            }
+        };
+
+        let (record_key, val_payload) = match crate::tiering::read_tiered_record(&file, ptr).await {
+            Ok(pair) => pair,
+            Err(_) => return false,
+        };
+
+        let (val, _) = match crate::table::RudisTable::deserialize_val_payload(&val_payload) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+
+        let mut db = self.local_db.borrow_mut();
+        if db.table.restore_tiered_value(&record_key, val) {
+            stats.disk_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stats.tiered_keys.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            stats.dead_bytes.fetch_add(ptr.length as u64, std::sync::atomic::Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub async fn spill_key(&self, key: &[u8]) -> bool {
+        let target = target_shard(key, self.num_shards);
+        if target == self.shard_id {
+            self.spill_local(key).await
+        } else {
+            let (tx, rx) = flume::bounded(1);
+            let msg = ShardMessage::TierSpill {
+                key: Bytes::copy_from_slice(key),
+                responder: tx,
+            };
+            if self.senders[target].send(msg).is_ok() {
+                rx.recv_async().await.unwrap_or(false)
+            } else {
+                false
+            }
+        }
+    }
+
+    pub async fn ensure_loaded(&self, key: &[u8]) -> bool {
+        let target = target_shard(key, self.num_shards);
+        if target == self.shard_id {
+            self.load_local(key).await
+        } else {
+            let (tx, rx) = flume::bounded(1);
+            let msg = ShardMessage::TierLoad {
+                key: Bytes::copy_from_slice(key),
+                responder: tx,
+            };
+            if self.senders[target].send(msg).is_ok() {
+                rx.recv_async().await.unwrap_or(false)
+            } else {
+                false
+            }
+        }
+    }
+
+    pub async fn spill_all(&self) -> usize {
+        let mut count = 0;
+        let keys = self.local_db.borrow_mut().table.keys(b"*");
+        for k in keys {
+            if self.spill_local(&k).await {
+                count += 1;
+            }
+        }
+        count
+    }
+
     pub async fn get(&self, key: Bytes) -> Option<Bytes> {
+        self.ensure_loaded(&key).await;
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
             self.local_db.borrow_mut().get(&key)
@@ -177,6 +308,7 @@ impl Router {
         &self,
         key: Bytes,
     ) -> Option<(crate::table::RudisValue, Option<Duration>)> {
+        self.ensure_loaded(&key).await;
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
             self.local_db.borrow_mut().get_entry(&key)

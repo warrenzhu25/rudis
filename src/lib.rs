@@ -11,6 +11,7 @@ pub mod scripting;
 pub mod server;
 pub mod shard;
 pub mod table;
+pub mod tiering;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

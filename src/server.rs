@@ -128,6 +128,19 @@ pub fn run_shard_worker(
             crate::cluster::start_cluster_bus(port);
         }
 
+        // Initialize NVMe Tiered Storage Manager (io_uring)
+        let tier_dir = std::env::var("RUDIS_TIER_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir().join(format!("rudis_tier_{}", port)));
+        match crate::tiering::ShardTierManager::open(shard_id, port, &tier_dir).await {
+            Ok(tm) => {
+                local_db.borrow_mut().tier_manager = Some(tm);
+            }
+            Err(e) => {
+                eprintln!("[Shard {}] Failed to open Tier manager: {}", shard_id, e);
+            }
+        }
+
         let client_registry = Rc::new(RefCell::new(hashbrown::HashMap::<
             u64,
             crate::connection::ClientInfo,
@@ -155,6 +168,7 @@ pub fn run_shard_worker(
 
         // 4. Spawn background worker to handle incoming cross-shard messages from peer cores
         let cross_shard_db = local_db.clone();
+        let cross_shard_router = router.clone();
         let cross_shard_clients = client_registry.clone();
         let cross_shard_slot_states = router.slot_states.clone();
         let cross_shard_slot_owners = router.slot_owners.clone();
@@ -166,8 +180,18 @@ pub fn run_shard_worker(
             while let Ok(msg) = rx.recv_async().await {
                 match msg {
                     ShardMessage::Get { key, responder } => {
-                        let val = cross_shard_db.borrow_mut().get(&key);
-                        let _ = responder.send(val);
+                        let is_tiered = cross_shard_db.borrow_mut().table.is_tiered(&key).is_some();
+                        if is_tiered {
+                            let r = cross_shard_router.clone();
+                            monoio::spawn(async move {
+                                r.ensure_loaded(&key).await;
+                                let val = r.local_db.borrow_mut().get(&key);
+                                let _ = responder.send(val);
+                            });
+                        } else {
+                            let val = cross_shard_db.borrow_mut().get(&key);
+                            let _ = responder.send(val);
+                        }
                     }
                     ShardMessage::Set {
                         key,
@@ -317,8 +341,18 @@ pub fn run_shard_worker(
                         cross_shard_slot_owners.borrow_mut()[slot as usize] = owner;
                     }
                     ShardMessage::DumpKey { key, responder } => {
-                        let entry = cross_shard_db.borrow_mut().get_entry(&key);
-                        let _ = responder.send(entry);
+                        let is_tiered = cross_shard_db.borrow_mut().table.is_tiered(&key).is_some();
+                        if is_tiered {
+                            let r = cross_shard_router.clone();
+                            monoio::spawn(async move {
+                                r.ensure_loaded(&key).await;
+                                let entry = r.local_db.borrow_mut().get_entry(&key);
+                                let _ = responder.send(entry);
+                            });
+                        } else {
+                            let entry = cross_shard_db.borrow_mut().get_entry(&key);
+                            let _ = responder.send(entry);
+                        }
                     }
                     ShardMessage::SyncAof { responder } => {
                         let (file, chunk, offset) = if let Some(aof) = &cross_shard_aof {
@@ -435,6 +469,27 @@ pub fn run_shard_worker(
                         let aof_ref = cross_shard_aof.as_deref();
                         execute_local_command(&cmd, &mut db, &mut dummy_out, aof_ref);
                         let _ = responder.send(());
+                    }
+                    ShardMessage::TierSpill { key, responder } => {
+                        let r = cross_shard_router.clone();
+                        monoio::spawn(async move {
+                            let ok = r.spill_key(&key).await;
+                            let _ = responder.send(ok);
+                        });
+                    }
+                    ShardMessage::TierLoad { key, responder } => {
+                        let r = cross_shard_router.clone();
+                        monoio::spawn(async move {
+                            let ok = r.ensure_loaded(&key).await;
+                            let _ = responder.send(ok);
+                        });
+                    }
+                    ShardMessage::TierSpillAll { responder } => {
+                        let r = cross_shard_router.clone();
+                        monoio::spawn(async move {
+                            let count = r.spill_all().await;
+                            let _ = responder.send(count);
+                        });
                     }
                 }
             }

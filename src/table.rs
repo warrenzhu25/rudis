@@ -867,6 +867,14 @@ impl RudisStream {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TieredPointer {
+    pub file_id: u32,
+    pub offset: u64,
+    pub length: u32,
+    pub value_type: u8,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RudisValue {
     String(Bytes),
@@ -878,6 +886,7 @@ pub enum RudisValue {
     ZSet(RudisZSet),
     HyperLogLog(Box<[u8; 16384]>),
     Stream(RudisStream),
+    Tiered(TieredPointer),
 }
 
 #[derive(Clone, Debug)]
@@ -1575,6 +1584,16 @@ impl RudisTable {
                     RudisValue::ZSet(_) => "zset",
                     RudisValue::HyperLogLog(_) => "string",
                     RudisValue::Stream(_) => "stream",
+                    RudisValue::Tiered(ptr) => match ptr.value_type {
+                        0 => "string",
+                        1 => "list",
+                        2 => "set",
+                        3 => "zset",
+                        4 => "hash",
+                        5 => "string",
+                        6 => "stream",
+                        _ => "string",
+                    },
                 }
             } else {
                 "none"
@@ -1582,6 +1601,73 @@ impl RudisTable {
         } else {
             "none"
         }
+    }
+
+    #[inline]
+    pub fn is_tiered(&mut self, key: &[u8]) -> Option<TieredPointer> {
+        let h = hash_key(key);
+        let idx = self.table.find(key, h)?;
+        if self.check_expired_slot(idx) {
+            return None;
+        }
+        let entry = self.table.get_slot(idx)?;
+        if let RudisValue::Tiered(ptr) = entry.val {
+            Some(ptr)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub fn set_tiered_pointer(&mut self, key: &[u8], ptr: TieredPointer) -> bool {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if let Some(entry) = self.table.get_slot_mut(idx) {
+                entry.val = RudisValue::Tiered(ptr);
+                return true;
+            }
+        }
+        false
+    }
+
+    #[inline]
+    pub fn restore_tiered_value(&mut self, key: &[u8], val: RudisValue) -> bool {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if let Some(entry) = self.table.get_slot_mut(idx) {
+                if matches!(entry.val, RudisValue::Tiered(_)) {
+                    entry.val = val;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[inline]
+    pub fn get_value_for_spill(&mut self, key: &[u8]) -> Option<(Vec<u8>, u8)> {
+        let h = hash_key(key);
+        let idx = self.table.find(key, h)?;
+        if self.check_expired_slot(idx) {
+            return None;
+        }
+        let entry = self.table.get_slot(idx)?;
+        if matches!(entry.val, RudisValue::Tiered(_)) {
+            return None;
+        }
+        let mut payload = Vec::new();
+        Self::serialize_val_payload(&entry.val, &mut payload);
+        let val_type = match &entry.val {
+            RudisValue::String(_) | RudisValue::Int(_) => 0u8,
+            RudisValue::List(_) => 1u8,
+            RudisValue::Set(_) => 2u8,
+            RudisValue::ZSet(_) => 3u8,
+            RudisValue::SmallHash(_) | RudisValue::Hash(_) => 4u8,
+            RudisValue::HyperLogLog(_) => 5u8,
+            RudisValue::Stream(_) => 6u8,
+            RudisValue::Tiered(_) => unreachable!(),
+        };
+        Some((payload, val_type))
     }
 
     pub fn touch(&mut self, keys: &[Bytes]) -> usize {
@@ -5323,6 +5409,7 @@ impl RudisTable {
                     }
                 }
             }
+            RudisValue::Tiered(_) => {}
         }
     }
 

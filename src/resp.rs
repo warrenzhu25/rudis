@@ -30,6 +30,14 @@ pub enum ClusterSubcommand {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
+pub enum TierSubcommand {
+    Spill(Bytes),
+    Load(Bytes),
+    Info,
+    SpillAll,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ClientSubcommand {
     List,
     SetName(String),
@@ -318,6 +326,8 @@ pub enum Command {
     ScriptLoad(Bytes),
     ScriptExists(Vec<Bytes>),
     ScriptFlush,
+    // TIERED STORAGE COMMANDS
+    Tier(TierSubcommand),
     Quit,
     // PUBSUB COMMANDS
     Subscribe(Vec<Bytes>),
@@ -2319,6 +2329,32 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     Ok(Some(Command::ScriptFlush))
                 }
                 _ => Err(format!("ERR Unknown SCRIPT subcommand or wrong number of arguments for '{}'", sub)),
+            }
+        }
+        "TIER" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'tier' command".to_string());
+            }
+            let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
+            match sub.as_str() {
+                "SPILL" => {
+                    if args.len() != 3 {
+                        return Err("wrong number of arguments for 'tier spill' command".to_string());
+                    }
+                    Ok(Some(Command::Tier(TierSubcommand::Spill(args[2].clone()))))
+                }
+                "LOAD" | "PROMOTE" => {
+                    if args.len() != 3 {
+                        return Err("wrong number of arguments for 'tier load' command".to_string());
+                    }
+                    Ok(Some(Command::Tier(TierSubcommand::Load(args[2].clone()))))
+                }
+                "INFO" => Ok(Some(Command::Tier(TierSubcommand::Info))),
+                "SPILLALL" => Ok(Some(Command::Tier(TierSubcommand::SpillAll))),
+                _ => Err(format!(
+                    "ERR unknown subcommand '{}'. Try TIER SPILL, TIER LOAD, TIER INFO, TIER SPILLALL.",
+                    sub
+                )),
             }
         }
         "QUIT" => Ok(Some(Command::Quit)),

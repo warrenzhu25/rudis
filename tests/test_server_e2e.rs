@@ -2779,6 +2779,101 @@ fn test_cluster_bus_gossip_failover_e2e() {
     assert!(info3_reset.contains("cluster_current_epoch:1"), "Current epoch should reset to 1");
 }
 
+#[test]
+fn test_nvme_tiered_storage_e2e() {
+    let port = 16480;
+    start_test_server(port, 2);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Initially check TIER INFO and INFO storage
+    let info = send_and_read(&mut client, b"TIER INFO\r\n");
+    assert!(info.contains("tier_enabled:1"));
+    assert!(info.contains("tiered_keys:0"));
+
+    let storage_info = send_and_read(&mut client, b"INFO storage\r\n");
+    assert!(storage_info.contains("# Storage"));
+    assert!(storage_info.contains("tier_enabled:1"));
+
+    // 2. Insert keys of various sizes
+    let val_256 = "A".repeat(256);
+    let val_512 = "B".repeat(512);
+    assert_eq!(
+        send_and_read(&mut client, format!("SET key:256 {}\r\n", val_256).as_bytes()),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, format!("SET key:512 {}\r\n", val_512).as_bytes()),
+        "+OK\r\n"
+    );
+
+    // 3. Spill key:256 to NVMe disk
+    let spill_resp = send_and_read(&mut client, b"TIER SPILL key:256\r\n");
+    assert_eq!(spill_resp, ":1\r\n");
+
+    // Re-spilling already tiered key returns :0
+    assert_eq!(send_and_read(&mut client, b"TIER SPILL key:256\r\n"), ":0\r\n");
+
+    // 4. Verify stats after spill
+    let info_after_spill = send_and_read(&mut client, b"TIER INFO\r\n");
+    assert!(info_after_spill.contains("tiered_keys:1"));
+    assert!(info_after_spill.contains("disk_writes:1"));
+
+    // 5. EXISTS works on tiered key without disk retrieval
+    assert_eq!(send_and_read(&mut client, b"EXISTS key:256\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"TYPE key:256\r\n"), "+string\r\n");
+
+    // 6. Transparent async GET reads from NVMe via io_uring
+    let get_resp = send_and_read(&mut client, b"GET key:256\r\n");
+    assert_eq!(get_resp, format!("${}\r\n{}\r\n", val_256.len(), val_256));
+
+    let info_after_get = send_and_read(&mut client, b"TIER INFO\r\n");
+    assert!(info_after_get.contains("disk_reads:1"));
+
+    // 7. Explicit TIER LOAD back into RAM
+    let spill_resp2 = send_and_read(&mut client, b"TIER SPILL key:512\r\n");
+    assert_eq!(spill_resp2, ":1\r\n");
+    let load_resp = send_and_read(&mut client, b"TIER LOAD key:512\r\n");
+    assert_eq!(load_resp, ":1\r\n");
+    // Loading already-loaded key returns :0
+    assert_eq!(send_and_read(&mut client, b"TIER LOAD key:512\r\n"), ":0\r\n");
+    // Verify data intact
+    let get_512 = send_and_read(&mut client, b"GET key:512\r\n");
+    assert_eq!(get_512, format!("${}\r\n{}\r\n", val_512.len(), val_512));
+
+    // 8. Test TIER SPILLALL across all shards
+    for i in 0..10 {
+        let val = format!("val_{}", i).repeat(20);
+        assert_eq!(
+            send_and_read(&mut client, format!("SET item:{} {}\r\n", i, val).as_bytes()),
+            "+OK\r\n"
+        );
+    }
+    let spillall_resp = send_and_read(&mut client, b"TIER SPILLALL\r\n");
+    assert!(spillall_resp.starts_with(':'));
+    let count: i64 = spillall_resp.trim_start_matches(':').trim().parse().unwrap();
+    assert!(count >= 10);
+
+    // Read back all keys from disk
+    for i in 0..10 {
+        let expected = format!("val_{}", i).repeat(20);
+        let resp = send_and_read(&mut client, format!("GET item:{}\r\n", i).as_bytes());
+        assert_eq!(resp, format!("${}\r\n{}\r\n", expected.len(), expected));
+    }
+
+    // 9. Mutate and Delete tiered keys
+    assert_eq!(send_and_read(&mut client, b"TIER SPILL item:0\r\n"), ":1\r\n");
+    // Overwrite tiered key
+    assert_eq!(send_and_read(&mut client, b"SET item:0 new_overwritten_value\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"GET item:0\r\n"), "$21\r\nnew_overwritten_value\r\n");
+
+    // Delete tiered key
+    assert_eq!(send_and_read(&mut client, b"TIER SPILL item:1\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"DEL item:1\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"EXISTS item:1\r\n"), ":0\r\n");
+    assert_eq!(send_and_read(&mut client, b"GET item:1\r\n"), "$-1\r\n");
+}
+
 
 
 

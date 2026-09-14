@@ -1262,6 +1262,7 @@ async fn migrate_keys_to_node(
                     );
                 }
             }
+            crate::table::RudisValue::Tiered(_) => {}
         }
     }
 
@@ -1417,6 +1418,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Psync { .. } => "PSYNC",
         Command::Replconf(_) => "REPLCONF",
         Command::Role => "ROLE",
+        Command::Tier(_) => "TIER",
         Command::Quit => "QUIT",
         Command::Subscribe(_) => "SUBSCRIBE",
         Command::Unsubscribe(_) => "UNSUBSCRIBE",
@@ -1675,15 +1677,29 @@ async fn execute_command(
         }
         Command::Info(section) => {
             let hub = crate::replication::get_replication_hub(router.port);
+            let stats = crate::tiering::get_tier_stats(router.port);
+            let storage_str = format!(
+                "# Storage\r\ntier_enabled:1\r\ntiered_keys:{}\r\ntiered_bytes:{}\r\nram_saved_bytes:{}\r\ndisk_reads:{}\r\ndisk_writes:{}\r\ndead_bytes:{}\r\n",
+                stats.tiered_keys.load(std::sync::atomic::Ordering::Relaxed),
+                stats.tiered_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                stats.ram_saved_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                stats.disk_reads.load(std::sync::atomic::Ordering::Relaxed),
+                stats.disk_writes.load(std::sync::atomic::Ordering::Relaxed),
+                stats.dead_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            );
             let info_str = match section.as_deref() {
                 Some(b"replication") | Some(b"REPLICATION") => {
                     hub.format_info_replication()
                 }
+                Some(b"storage") | Some(b"STORAGE") => {
+                    storage_str
+                }
                 _ => {
                     format!(
                         "# Server\r\nrudis_version:0.1.0\r\narch:shared-nothing-io_uring\r\nshard_id:{}\r\nnum_shards:{}\r\n\
-                         # Replication\r\n{}",
-                        router.shard_id, router.num_shards, hub.format_info_replication()
+                         # Replication\r\n{}\
+                         {}",
+                        router.shard_id, router.num_shards, hub.format_info_replication(), storage_str
                     )
                 }
             };
@@ -1758,6 +1774,46 @@ async fn execute_command(
         }
         Command::Psync { .. } => {
             out.extend_from_slice(b"+OK\r\n");
+            false
+        }
+        Command::Tier(sub) => {
+            match sub {
+                crate::resp::TierSubcommand::Spill(key) => {
+                    let ok = router.spill_key(&key).await;
+                    out.extend_from_slice(if ok { b":1\r\n" } else { b":0\r\n" });
+                }
+                crate::resp::TierSubcommand::Load(key) => {
+                    let ok = router.ensure_loaded(&key).await;
+                    out.extend_from_slice(if ok { b":1\r\n" } else { b":0\r\n" });
+                }
+                crate::resp::TierSubcommand::SpillAll => {
+                    let mut total = 0;
+                    for s in 0..router.num_shards {
+                        if s == router.shard_id {
+                            total += router.spill_all().await;
+                        } else {
+                            let (tx, rx) = flume::bounded(1);
+                            if router.senders[s].send(crate::shard::ShardMessage::TierSpillAll { responder: tx }).is_ok() {
+                                total += rx.recv_async().await.unwrap_or(0);
+                            }
+                        }
+                    }
+                    out.extend_from_slice(format!(":{}\r\n", total).as_bytes());
+                }
+                crate::resp::TierSubcommand::Info => {
+                    let stats = crate::tiering::get_tier_stats(router.port);
+                    let info = format!(
+                        "# Tiered Storage (io_uring NVMe)\r\ntier_enabled:1\r\ntiered_keys:{}\r\ntiered_bytes:{}\r\nram_saved_bytes:{}\r\ndisk_reads:{}\r\ndisk_writes:{}\r\ndead_bytes:{}\r\n",
+                        stats.tiered_keys.load(std::sync::atomic::Ordering::Relaxed),
+                        stats.tiered_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                        stats.ram_saved_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                        stats.disk_reads.load(std::sync::atomic::Ordering::Relaxed),
+                        stats.disk_writes.load(std::sync::atomic::Ordering::Relaxed),
+                        stats.dead_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                    out.extend_from_slice(format!("${}\r\n{}\r\n", info.len(), info).as_bytes());
+                }
+            }
             false
         }
         Command::Cluster(sub) => {
@@ -3232,6 +3288,7 @@ async fn execute_command(
                             );
                         }
                     }
+                    crate::table::RudisValue::Tiered(_) => {}
                 }
             }
 
@@ -3519,6 +3576,8 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Linsert { key, .. }
         | Command::Incrbyfloat { key, .. }
         | Command::Setrange { key, .. }
+        | Command::Tier(crate::resp::TierSubcommand::Spill(key))
+        | Command::Tier(crate::resp::TierSubcommand::Load(key))
         | Command::Getrange { key, .. } => Some(target_shard(key, num_shards)),
         Command::Smove { source, destination, .. } => {
             let s1 = target_shard(source, num_shards);
@@ -5865,6 +5924,7 @@ async fn execute_commands_squashed(
                     | Command::Reset
                     | Command::Auth { .. }
                     | Command::Acl(_)
+                    | Command::Tier(_)
                     | Command::Xread { block_ms: Some(_), .. }
                     | Command::Xreadgroup { block_ms: Some(_), .. }
             ) {
@@ -5874,6 +5934,10 @@ async fn execute_commands_squashed(
             if let Some(k) = cmd_primary_key(cmd) {
                 let slot = key_slot(k);
                 if router.slot_states.borrow()[slot as usize] != crate::shard::SlotState::Stable {
+                    can_squash = false;
+                    break;
+                }
+                if router.local_db.borrow_mut().table.is_tiered(k).is_some() {
                     can_squash = false;
                     break;
                 }

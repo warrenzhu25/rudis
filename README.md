@@ -82,6 +82,14 @@ QUIT
 +OK
 ```
 
+### 5. NVMe Cold-Storage Tiering (`io_uring`)
+Rudis features a thread-per-core asynchronous storage tiering engine built natively on `io_uring`:
+- **Spill Cold Keys**: `TIER SPILL <key>` offloads payloads to disk via `io_uring` and replaces the in-memory entry with a compact 24-byte pointer.
+- **Transparent Async Retrieval**: Any access (`GET`, `DUMP`, etc.) to a tiered key transparently reads from disk via `io_uring` without blocking the event loop or other connections.
+- **Bulk Spill**: `TIER SPILLALL` spills cold keys across all shards to disk.
+- **Explicit Promotion**: `TIER LOAD <key>` promotes a tiered key back into RAM.
+- **Storage Metrics**: `TIER INFO` or `INFO storage` reports active statistics on tiered keys, disk bytes, RAM saved, and asynchronous `io_uring` disk reads/writes.
+
 ---
 
 ## Testing

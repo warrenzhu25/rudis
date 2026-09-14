@@ -183,6 +183,17 @@ pub enum ShardMessage {
         cmd: Command,
         responder: flume::Sender<()>,
     },
+    TierSpill {
+        key: Bytes,
+        responder: flume::Sender<bool>,
+    },
+    TierLoad {
+        key: Bytes,
+        responder: flume::Sender<bool>,
+    },
+    TierSpillAll {
+        responder: flume::Sender<usize>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -199,6 +210,7 @@ pub enum SlotState {
 pub struct ShardDb {
     pub table: crate::table::RudisTable,
     pub port: u16,
+    pub tier_manager: Option<crate::tiering::ShardTierManager>,
 }
 
 impl ShardDb {
@@ -206,6 +218,7 @@ impl ShardDb {
         Self {
             table: crate::table::RudisTable::new(),
             port,
+            tier_manager: None,
         }
     }
 
@@ -224,12 +237,28 @@ impl ShardDb {
 
     #[inline]
     pub fn set(&mut self, key: Bytes, value: Bytes, expire_in: Option<Duration>) {
+        if let Some(ptr) = self.table.is_tiered(&key) {
+            if let Some(tm) = &self.tier_manager {
+                tm.stats.tiered_keys.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                tm.stats.dead_bytes.fetch_add(ptr.length as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         self.table.set(key, value, expire_in);
     }
 
     #[inline]
     pub fn del(&mut self, key: &[u8]) -> bool {
-        self.table.del(key)
+        let ptr = self.table.is_tiered(key);
+        let deleted = self.table.del(key);
+        if deleted {
+            if let Some(ptr) = ptr {
+                if let Some(tm) = &self.tier_manager {
+                    tm.stats.tiered_keys.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    tm.stats.dead_bytes.fetch_add(ptr.length as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        deleted
     }
 
     #[inline]
