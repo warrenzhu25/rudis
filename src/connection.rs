@@ -9,10 +9,22 @@ use crate::shard::{ShardDb, ShardMessage};
 
 const READ_BUFFER_SIZE: usize = 65536;
 
+pub type ResponderChannel = (
+    flume::Sender<Vec<(usize, Vec<u8>)>>,
+    flume::Receiver<Vec<(usize, Vec<u8>)>>,
+);
+
 pub async fn handle_connection(mut stream: TcpStream, router: Rc<Router>) {
     let mut buf = BytesMut::with_capacity(131072);
     let mut read_buf = vec![0u8; READ_BUFFER_SIZE];
     let mut out_buf = Vec::with_capacity(65536);
+
+    // Pre-allocated reusable channel responders (1 per shard, 0 allocations per hop in steady-state)
+    let responders: Vec<ResponderChannel> = (0..router.num_shards)
+        .map(|_| flume::bounded(1))
+        .collect();
+    let mut remote_batches: Vec<Vec<(usize, Command)>> =
+        (0..router.num_shards).map(|_| Vec::with_capacity(64)).collect();
 
     loop {
         // Rent buffer to monoio's io_uring driver
@@ -56,7 +68,14 @@ pub async fn handle_connection(mut stream: TcpStream, router: Rc<Router>) {
                             should_quit = true;
                         }
                     } else {
-                        let quit = execute_commands_squashed(commands, &router, &mut out_buf).await;
+                        let quit = execute_commands_squashed(
+                            commands,
+                            &router,
+                            &responders,
+                            &mut remote_batches,
+                            &mut out_buf,
+                        )
+                        .await;
                         if quit {
                             should_quit = true;
                         }
@@ -346,6 +365,8 @@ pub fn execute_local_command(cmd: &Command, db: &mut ShardDb, out: &mut Vec<u8>)
 async fn execute_commands_squashed(
     commands: Vec<Command>,
     router: &Router,
+    responders: &[ResponderChannel],
+    remote_batches: &mut [Vec<(usize, Command)>],
     out: &mut Vec<u8>,
 ) -> bool {
     let mut can_squash = true;
@@ -370,8 +391,11 @@ async fn execute_commands_squashed(
 
     let n = commands.len();
     let mut responses: Vec<Vec<u8>> = vec![Vec::new(); n];
-    let mut remote_batches: Vec<Vec<(usize, Command)>> = vec![Vec::new(); router.num_shards];
     let mut should_close = false;
+
+    for batch in remote_batches.iter_mut() {
+        batch.clear();
+    }
 
     // 1. Process local shard commands immediately; bucket remote commands by shard
     for (idx, cmd) in commands.into_iter().enumerate() {
@@ -391,14 +415,14 @@ async fn execute_commands_squashed(
         }
     }
 
-    // 2. Dispatch batched hops to all remote shards in parallel
+    // 2. Dispatch batched hops to all remote shards in parallel using pre-allocated channels
     let mut pending = Vec::new();
-    for (target_shard, items) in remote_batches.into_iter().enumerate() {
+    for (target_shard, items) in remote_batches.iter_mut().enumerate() {
         if !items.is_empty() {
-            let (tx, rx) = flume::bounded(1);
+            let (tx, rx) = &responders[target_shard];
             let msg = ShardMessage::Batch {
-                items,
-                responder: tx,
+                items: std::mem::take(items),
+                responder: tx.clone(),
             };
             if router.senders[target_shard].send(msg).is_ok() {
                 pending.push(rx);
