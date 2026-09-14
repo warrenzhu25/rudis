@@ -1936,6 +1936,45 @@ async fn execute_command(
                     }
                     out.extend_from_slice(format!(":{}\r\n", migrated_count).as_bytes());
                 }
+                ClusterSubcommand::Failover { force } => {
+                    match router.cluster_failover(force) {
+                        Ok(_) => out.extend_from_slice(b"+OK\r\n"),
+                        Err(e) => {
+                            let resp = format!("-ERR {}\r\n", e);
+                            out.extend_from_slice(resp.as_bytes());
+                        }
+                    }
+                }
+                ClusterSubcommand::Reset { hard } => {
+                    match router.cluster_reset(hard) {
+                        Ok(_) => out.extend_from_slice(b"+OK\r\n"),
+                        Err(e) => {
+                            let resp = format!("-ERR {}\r\n", e);
+                            out.extend_from_slice(resp.as_bytes());
+                        }
+                    }
+                }
+                ClusterSubcommand::Forget(node_id) => {
+                    match router.cluster_forget(&node_id) {
+                        Ok(_) => out.extend_from_slice(b"+OK\r\n"),
+                        Err(e) => {
+                            let resp = format!("-ERR {}\r\n", e);
+                            out.extend_from_slice(resp.as_bytes());
+                        }
+                    }
+                }
+                ClusterSubcommand::Replicate(node_id) => {
+                    match router.cluster_replicate(&node_id) {
+                        Ok(_) => out.extend_from_slice(b"+OK\r\n"),
+                        Err(e) => {
+                            let resp = format!("-ERR {}\r\n", e);
+                            out.extend_from_slice(resp.as_bytes());
+                        }
+                    }
+                }
+                ClusterSubcommand::SaveConfig => {
+                    out.extend_from_slice(b"+OK\r\n");
+                }
             }
             false
         }

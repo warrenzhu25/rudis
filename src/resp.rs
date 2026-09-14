@@ -22,6 +22,11 @@ pub enum ClusterSubcommand {
     MyId,
     MigrateSlot { slot: u16, host: String, port: u16 },
     Rebalance { host: String, port: u16, slots: Option<usize> },
+    Failover { force: bool },
+    Reset { hard: bool },
+    Forget(String),
+    Replicate(String),
+    SaveConfig,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -1099,6 +1104,29 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         slots,
                     })))
                 }
+                "FAILOVER" => {
+                    let force = args.len() > 2 && args[2].eq_ignore_ascii_case(b"force");
+                    Ok(Some(Command::Cluster(ClusterSubcommand::Failover { force })))
+                }
+                "RESET" => {
+                    let hard = args.len() > 2 && args[2].eq_ignore_ascii_case(b"hard");
+                    Ok(Some(Command::Cluster(ClusterSubcommand::Reset { hard })))
+                }
+                "FORGET" => {
+                    if args.len() < 3 {
+                        return Err("wrong number of arguments for 'cluster forget' command".to_string());
+                    }
+                    let node_id = String::from_utf8_lossy(&args[2]).to_string();
+                    Ok(Some(Command::Cluster(ClusterSubcommand::Forget(node_id))))
+                }
+                "REPLICATE" => {
+                    if args.len() < 3 {
+                        return Err("wrong number of arguments for 'cluster replicate' command".to_string());
+                    }
+                    let node_id = String::from_utf8_lossy(&args[2]).to_string();
+                    Ok(Some(Command::Cluster(ClusterSubcommand::Replicate(node_id))))
+                }
+                "SAVECONFIG" => Ok(Some(Command::Cluster(ClusterSubcommand::SaveConfig))),
                 _ => Ok(Some(Command::Unknown(format!("CLUSTER {}", sub)))),
             }
         }

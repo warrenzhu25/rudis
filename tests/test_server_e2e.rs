@@ -2699,6 +2699,87 @@ fn test_lua_scripting_engine_e2e() {
     assert!(evalsha_err.starts_with("-NOSCRIPT"), "Expected -NOSCRIPT error, got {}", evalsha_err);
 }
 
+#[test]
+fn test_cluster_bus_gossip_failover_e2e() {
+    let port1 = 16440;
+    let port2 = 16441;
+    let port3 = 16442;
+
+    let _s1 = start_test_server(port1, 2);
+    let _s2 = start_test_server(port2, 2);
+    let _s3 = start_test_server(port3, 2);
+
+    let mut c1 = TcpStream::connect(format!("127.0.0.1:{}", port1)).unwrap();
+    let mut c2 = TcpStream::connect(format!("127.0.0.1:{}", port2)).unwrap();
+    let mut c3 = TcpStream::connect(format!("127.0.0.1:{}", port3)).unwrap();
+
+    // 1. Verify Cluster Bus listeners on port + 10000 are active
+    let bus_stream1 = TcpStream::connect(format!("127.0.0.1:{}", port1 + 10000));
+    assert!(bus_stream1.is_ok(), "Cluster bus on port {} should be listening", port1 + 10000);
+    drop(bus_stream1);
+
+    // 2. Initial CLUSTER MYID & INFO
+    let myid1_resp = send_and_read(&mut c1, b"CLUSTER MYID\r\n");
+    let myid1 = myid1_resp.trim_start_matches('$').split("\r\n").nth(1).unwrap().to_string();
+    assert_eq!(myid1.len(), 40);
+
+    let myid2_resp = send_and_read(&mut c2, b"CLUSTER MYID\r\n");
+    let myid2 = myid2_resp.trim_start_matches('$').split("\r\n").nth(1).unwrap().to_string();
+    assert_eq!(myid2.len(), 40);
+
+    let myid3_resp = send_and_read(&mut c3, b"CLUSTER MYID\r\n");
+    let myid3 = myid3_resp.trim_start_matches('$').split("\r\n").nth(1).unwrap().to_string();
+    assert_eq!(myid3.len(), 40);
+
+    // 3. CLUSTER MEET: Node 1 meets Node 2, Node 2 meets Node 3
+    assert_eq!(send_and_read(&mut c1, format!("CLUSTER MEET 127.0.0.1 {}\r\n", port2).as_bytes()), "+OK\r\n");
+    assert_eq!(send_and_read(&mut c2, format!("CLUSTER MEET 127.0.0.1 {}\r\n", port3).as_bytes()), "+OK\r\n");
+
+    // Wait for cluster bus gossip heartbeats to propagate transitively
+    thread::sleep(Duration::from_millis(1200));
+
+    // Verify Node 1 cluster nodes shows cport (26440, 26441)
+    let nodes1 = send_and_read(&mut c1, b"CLUSTER NODES\r\n");
+    assert!(nodes1.contains("myself,master"), "Node 1 should be myself,master");
+    assert!(nodes1.contains(&format!("127.0.0.1:{}@{}", port2, port2 + 10000)), "Node 1 should have met Node 2 with cport");
+
+    // Verify transitive gossip: Node 1 should discover Node 3
+    assert!(nodes1.contains(&myid3) || nodes1.contains(&format!("127.0.0.1:{}", port3)),
+        "Node 1 should discover Node 3 transitively through gossip! Nodes:\n{}", nodes1);
+
+    // 4. Test CLUSTER REPLICATE
+    let rep_resp = send_and_read(&mut c2, format!("CLUSTER REPLICATE {}\r\n", myid1).as_bytes());
+    assert_eq!(rep_resp, "+OK\r\n");
+
+    let nodes2_after_rep = send_and_read(&mut c2, b"CLUSTER NODES\r\n");
+    assert!(nodes2_after_rep.contains("myself,slave"), "Node 2 should be myself,slave");
+    assert!(nodes2_after_rep.contains(&myid1), "Node 2 should list Node 1 as its master");
+
+    // 5. Test CLUSTER FAILOVER
+    let failover_resp = send_and_read(&mut c2, b"CLUSTER FAILOVER\r\n");
+    assert_eq!(failover_resp, "+OK\r\n");
+
+    let nodes2_after_failover = send_and_read(&mut c2, b"CLUSTER NODES\r\n");
+    assert!(nodes2_after_failover.contains("myself,master"), "Node 2 should be promoted to myself,master after failover");
+
+    let info2 = send_and_read(&mut c2, b"CLUSTER INFO\r\n");
+    assert!(info2.contains("cluster_state:ok"));
+    assert!(info2.contains("cluster_current_epoch:2") || info2.contains("cluster_my_epoch:2"),
+        "Epoch should increment after failover. Info: {}", info2);
+
+    // 6. Test CLUSTER FORGET
+    assert_eq!(send_and_read(&mut c1, format!("CLUSTER FORGET {}\r\n", myid3).as_bytes()), "+OK\r\n");
+    let nodes1_after_forget = send_and_read(&mut c1, b"CLUSTER NODES\r\n");
+    assert!(!nodes1_after_forget.contains(&myid3), "Node 3 should be forgotten from Node 1");
+
+    // 7. Test CLUSTER RESET HARD
+    assert_eq!(send_and_read(&mut c3, b"CLUSTER RESET HARD\r\n"), "+OK\r\n");
+    let info3_reset = send_and_read(&mut c3, b"CLUSTER INFO\r\n");
+    assert!(info3_reset.contains("cluster_known_nodes:1"), "Reset node should only know itself");
+    assert!(info3_reset.contains("cluster_current_epoch:1"), "Current epoch should reset to 1");
+}
+
+
 
 
 

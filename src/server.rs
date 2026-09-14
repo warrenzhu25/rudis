@@ -123,14 +123,9 @@ pub fn run_shard_worker(
             None
         };
 
-        // 4. Background Cluster Gossip Ping/Pong Daemon (on Shard 0)
+        // 4. Background Cluster Bus & Gossip Engine (on Shard 0)
         if shard_id == 0 {
-            monoio::spawn(async move {
-                loop {
-                    monoio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                    crate::router::cluster_gossip_tick().await;
-                }
-            });
+            crate::cluster::start_cluster_bus(port);
         }
 
         let client_registry = Rc::new(RefCell::new(hashbrown::HashMap::<

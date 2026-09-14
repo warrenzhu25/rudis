@@ -44,24 +44,6 @@ pub fn target_shard(key: &[u8], num_shards: usize) -> usize {
 }
 
 use std::sync::atomic::Ordering;
-use std::sync::RwLock;
-
-#[derive(Clone, Debug)]
-pub struct RemoteClusterNode {
-    pub id: String,
-    pub ip: String,
-    pub port: u16,
-    pub cport: u16,
-    pub flags: String,
-    pub master_id: String,
-    pub ping_sent: u64,
-    pub pong_recv: u64,
-    pub config_epoch: u64,
-    pub link_state: String,
-}
-
-pub static REMOTE_CLUSTER_NODES: std::sync::LazyLock<RwLock<Vec<RemoteClusterNode>>> =
-    std::sync::LazyLock::new(|| RwLock::new(Vec::new()));
 
 /// The router handles dispatching operations.
 /// If the key belongs to the current shard, it directly touches `local_db` without locking.
@@ -968,150 +950,34 @@ impl Router {
     }
 
     pub fn my_id(&self) -> String {
-        format!("{:040x}", self.shard_id + 1)
+        crate::cluster::get_cluster_hub(self.port).my_id()
     }
 
     pub fn cluster_meet(&self, ip: String, port: u16) -> Result<(), String> {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-        let mut nodes = REMOTE_CLUSTER_NODES.write().map_err(|e| e.to_string())?;
-        if nodes.iter().any(|n| n.ip == ip && n.port == port) {
-            return Ok(());
-        }
-        use fxhash::hash64;
-        let node_hash = hash64(format!("{}:{}", ip, port).as_bytes());
-        let node_id = format!("{:040x}", node_hash);
-        let next_epoch = (nodes.len() + self.num_shards + 1) as u64;
-        nodes.push(RemoteClusterNode {
-            id: node_id,
-            ip,
-            port,
-            cport: port + 10000,
-            flags: "master".to_string(),
-            master_id: "-".to_string(),
-            ping_sent: now,
-            pong_recv: now,
-            config_epoch: next_epoch,
-            link_state: "connected".to_string(),
-        });
-        Ok(())
+        crate::cluster::get_cluster_hub(self.port).cluster_meet(&ip, port)
     }
 
     pub fn cluster_nodes(&self) -> String {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-        let mut nodes = String::new();
-        for s in 0..self.num_shards {
-            let start_slot = s * 16384 / self.num_shards;
-            let end_slot = if s == self.num_shards - 1 {
-                16383
-            } else {
-                (s + 1) * 16384 / self.num_shards - 1
-            };
-            let node_id = format!("{:040x}", s + 1);
-            let myself = if s == self.shard_id { "myself," } else { "" };
-            nodes.push_str(&format!(
-                "{} 127.0.0.1:{}@{} {}master - 0 0 {} connected {}-{}\n",
-                node_id,
-                self.port,
-                self.port + 10000,
-                myself,
-                s + 1,
-                start_slot,
-                end_slot
-            ));
-        }
-        if let Ok(mut remote_nodes) = REMOTE_CLUSTER_NODES.write() {
-            for node in remote_nodes.iter_mut() {
-                if now.saturating_sub(node.pong_recv) > 10000 {
-                    node.flags = "fail".to_string();
-                } else if now.saturating_sub(node.pong_recv) > 5000 {
-                    node.flags = "fail?".to_string();
-                } else {
-                    node.flags = "master".to_string();
-                }
-                nodes.push_str(&format!(
-                    "{} {}:{}@{} {} {} {} {} {} {}\n",
-                    node.id,
-                    node.ip,
-                    node.port,
-                    node.cport,
-                    node.flags,
-                    node.master_id,
-                    node.ping_sent,
-                    node.pong_recv,
-                    node.config_epoch,
-                    node.link_state,
-                ));
-            }
-        }
-        nodes
+        crate::cluster::get_cluster_hub(self.port).cluster_nodes()
     }
 
     pub fn cluster_info(&self) -> String {
-        let remote_count = REMOTE_CLUSTER_NODES.read().map(|r| r.len()).unwrap_or(0);
-        let total_nodes = self.num_shards + remote_count;
-        let pfail_count = REMOTE_CLUSTER_NODES.read().map(|r| r.iter().filter(|n| n.flags == "fail?").count()).unwrap_or(0);
-        let fail_count = REMOTE_CLUSTER_NODES.read().map(|r| r.iter().filter(|n| n.flags == "fail").count()).unwrap_or(0);
-        let state = if fail_count > 0 { "fail" } else { "ok" };
-        format!(
-            "cluster_state:{}\r\ncluster_slots_assigned:16384\r\ncluster_slots_ok:16384\r\ncluster_slots_pfail:{}\r\ncluster_slots_fail:{}\r\ncluster_known_nodes:{}\r\ncluster_size:{}\r\ncluster_current_epoch:1\r\ncluster_my_epoch:1\r\ncluster_stats_messages_sent:0\r\ncluster_stats_messages_received:0\r\n",
-            state, pfail_count, fail_count, total_nodes, total_nodes
-        )
-    }
-}
-
-pub async fn cluster_gossip_tick() {
-    let nodes_to_ping: Vec<(String, u16)> = if let Ok(nodes) = REMOTE_CLUSTER_NODES.read() {
-        nodes.iter().map(|n| (n.ip.clone(), n.port)).collect()
-    } else {
-        return;
-    };
-
-    if nodes_to_ping.is_empty() {
-        return;
+        crate::cluster::get_cluster_hub(self.port).cluster_info()
     }
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
+    pub fn cluster_failover(&self, force: bool) -> Result<(), String> {
+        crate::cluster::get_cluster_hub(self.port).cluster_failover(force)
+    }
 
-    for (ip, port) in nodes_to_ping {
-        if let Ok(mut nodes) = REMOTE_CLUSTER_NODES.write() {
-            if let Some(node) = nodes.iter_mut().find(|n| n.ip == ip && n.port == port) {
-                node.ping_sent = now;
-            }
-        }
+    pub fn cluster_reset(&self, hard: bool) -> Result<(), String> {
+        crate::cluster::get_cluster_hub(self.port).cluster_reset(hard)
+    }
 
-        let addr = format!("{}:{}", ip, port);
-        let success = match monoio::net::TcpStream::connect(&addr).await {
-            Ok(mut stream) => {
-                use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
-                let (res, _) = stream.write_all(b"*1\r\n$4\r\nPING\r\n".to_vec()).await;
-                if res.is_ok() {
-                    let buf = vec![0u8; 64];
-                    let (res, read_buf) = stream.read(buf).await;
-                    if let Ok(n) = res {
-                        read_buf[..n].starts_with(b"+PONG")
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            Err(_) => false,
-        };
+    pub fn cluster_forget(&self, node_id: &str) -> Result<(), String> {
+        crate::cluster::get_cluster_hub(self.port).cluster_forget(node_id)
+    }
 
-        if let Ok(mut nodes) = REMOTE_CLUSTER_NODES.write() {
-            if let Some(node) = nodes.iter_mut().find(|n| n.ip == ip && n.port == port) {
-                if success {
-                    node.pong_recv = now;
-                    node.link_state = "connected".to_string();
-                    node.flags = "master".to_string();
-                } else {
-                    node.link_state = "disconnected".to_string();
-                }
-            }
-        }
+    pub fn cluster_replicate(&self, node_id: &str) -> Result<(), String> {
+        crate::cluster::get_cluster_hub(self.port).cluster_replicate(node_id)
     }
 }

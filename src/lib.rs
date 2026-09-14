@@ -1,6 +1,7 @@
 pub mod acl;
 pub mod aof;
 pub mod block;
+pub mod cluster;
 pub mod connection;
 pub mod pubsub;
 pub mod replication;
