@@ -6,7 +6,7 @@ use bytes::BytesMut;
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::TcpStream;
 
-use crate::resp::{parse_command, ClientSubcommand, ClusterSubcommand, Command};
+use crate::resp::{parse_command, ClientSubcommand, ClusterSubcommand, Command, SetSlotSubcommand};
 use crate::router::{key_slot, target_shard, Router};
 use crate::shard::{ShardDb, ShardMessage};
 
@@ -72,6 +72,8 @@ pub async fn handle_connection(
     let mut remote_batches: Vec<Vec<(usize, Command)>> =
         (0..router.num_shards).map(|_| Vec::with_capacity(64)).collect();
 
+    let mut asking = false;
+
     loop {
         // Rent buffer to monoio's io_uring driver
         let (res, returned_buf) = stream.read(read_buf).await;
@@ -115,6 +117,7 @@ pub async fn handle_connection(
                             client_id,
                             &client_registry,
                             &mut out_buf,
+                            &mut asking,
                         )
                         .await;
                         if quit {
@@ -129,6 +132,7 @@ pub async fn handle_connection(
                             client_id,
                             &client_registry,
                             &mut out_buf,
+                            &mut asking,
                         )
                         .await;
                         if quit {
@@ -158,12 +162,37 @@ pub async fn handle_connection(
     }
 }
 
+pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
+    match cmd {
+        Command::Get(key)
+        | Command::Set { key, .. }
+        | Command::IncrBy(key, _)
+        | Command::Expire(key, _)
+        | Command::Persist(key)
+        | Command::Ttl(key, _)
+        | Command::Hset { key, .. }
+        | Command::Hmset { key, .. }
+        | Command::Hget { key, .. }
+        | Command::Hmget { key, .. }
+        | Command::Hdel { key, .. }
+        | Command::Hexists { key, .. }
+        | Command::Hlen(key)
+        | Command::Hgetall(key)
+        | Command::Hkeys(key)
+        | Command::Hvals(key) => Some(key),
+        Command::Del(keys) | Command::Exists(keys) | Command::Mget(keys) => keys.first(),
+        Command::Mset(pairs) => pairs.first().map(|(k, _)| k),
+        _ => None,
+    }
+}
+
 async fn execute_command(
     cmd: Command,
     router: &Router,
     client_id: u64,
     client_registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
     out: &mut Vec<u8>,
+    asking: &mut bool,
 ) -> bool {
     let cmd_name = match &cmd {
         Command::Get(_) => "GET",
@@ -178,6 +207,8 @@ async fn execute_command(
         Command::Ttl(_, _) => "TTL",
         Command::Cluster(_) => "CLUSTER",
         Command::Client(_) => "CLIENT",
+        Command::Asking => "ASKING",
+        Command::Migrate { .. } => "MIGRATE",
         Command::Hset { .. } => "HSET",
         Command::Hmset { .. } => "HMSET",
         Command::Hget { .. } => "HGET",
@@ -197,6 +228,40 @@ async fn execute_command(
     if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
         c.last_active = Instant::now();
         c.last_cmd = cmd_name.to_string();
+    }
+
+    if let Command::Asking = cmd {
+        *asking = true;
+        out.extend_from_slice(b"+OK\r\n");
+        return false;
+    }
+
+    let is_asking = *asking;
+    *asking = false;
+
+    if let Some(key) = cmd_primary_key(&cmd) {
+        let slot = key_slot(key);
+        let state = router.slot_states.borrow()[slot as usize].clone();
+        match state {
+            crate::shard::SlotState::Moved(target) => {
+                out.extend_from_slice(format!("-MOVED {} {}\r\n", slot, target).as_bytes());
+                return false;
+            }
+            crate::shard::SlotState::Importing(source) => {
+                if !is_asking {
+                    out.extend_from_slice(format!("-MOVED {} {}\r\n", slot, source).as_bytes());
+                    return false;
+                }
+            }
+            crate::shard::SlotState::Migrating(target) => {
+                let key_exists = router.exists(key.clone()).await;
+                if !key_exists {
+                    out.extend_from_slice(format!("-ASK {} {}\r\n", slot, target).as_bytes());
+                    return false;
+                }
+            }
+            crate::shard::SlotState::Stable => {}
+        }
     }
 
     match cmd {
@@ -405,6 +470,35 @@ async fn execute_command(
                     out.extend_from_slice(info.as_bytes());
                     out.extend_from_slice(b"\r\n");
                 }
+                ClusterSubcommand::SetSlot(slot, sub_cmd) => {
+                    match sub_cmd {
+                        SetSlotSubcommand::Migrating(node) => {
+                            router.set_slot_state(slot, crate::shard::SlotState::Migrating(node));
+                            out.extend_from_slice(b"+OK\r\n");
+                        }
+                        SetSlotSubcommand::Importing(node) => {
+                            router.set_slot_state(slot, crate::shard::SlotState::Importing(node));
+                            out.extend_from_slice(b"+OK\r\n");
+                        }
+                        SetSlotSubcommand::Stable => {
+                            router.set_slot_state(slot, crate::shard::SlotState::Stable);
+                            out.extend_from_slice(b"+OK\r\n");
+                        }
+                        SetSlotSubcommand::Node(node) => {
+                            let is_myself = node == "myself"
+                                || (0..router.num_shards).any(|s| node == format!("{:040x}", s + 1));
+                            if is_myself {
+                                let shard = (0..router.num_shards)
+                                    .find(|&s| node == format!("{:040x}", s + 1))
+                                    .unwrap_or_else(|| crate::router::slot_to_shard(slot, router.num_shards));
+                                router.set_slot_owner(slot, shard);
+                            } else {
+                                router.set_slot_state(slot, crate::shard::SlotState::Moved(node));
+                            }
+                            out.extend_from_slice(b"+OK\r\n");
+                        }
+                    }
+                }
             }
             false
         }
@@ -459,6 +553,161 @@ async fn execute_command(
                     out.extend_from_slice(&res);
                 }
             }
+            false
+        }
+        Command::Asking => {
+            // Already handled at start of execute_command
+            false
+        }
+        Command::Migrate {
+            host,
+            port,
+            key,
+            keys,
+            destination_db: _,
+            timeout_ms: _,
+            copy,
+            replace: _,
+        } => {
+            let mut migrate_keys = Vec::new();
+            if let Some(k) = key {
+                if !k.is_empty() {
+                    migrate_keys.push(k);
+                }
+            }
+            for k in keys {
+                if !migrate_keys.contains(&k) {
+                    migrate_keys.push(k);
+                }
+            }
+            if migrate_keys.is_empty() {
+                out.extend_from_slice(b"+NOKEY\r\n");
+                return false;
+            }
+
+            let mut dumps = Vec::new();
+            for k in &migrate_keys {
+                if let Some(entry) = router.dump_key(k.clone()).await {
+                    dumps.push((k.clone(), entry));
+                }
+            }
+
+            if dumps.is_empty() {
+                out.extend_from_slice(b"+NOKEY\r\n");
+                return false;
+            }
+
+            let target_addr = format!("{}:{}", host, port);
+            let socket_addr = match std::net::ToSocketAddrs::to_socket_addrs(&target_addr) {
+                Ok(mut iter) => match iter.next() {
+                    Some(a) => a,
+                    None => {
+                        out.extend_from_slice(b"-ERR cannot resolve destination host\r\n");
+                        return false;
+                    }
+                },
+                Err(_) => {
+                    out.extend_from_slice(b"-ERR invalid destination address\r\n");
+                    return false;
+                }
+            };
+
+            let mut stream = match monoio::net::TcpStream::connect(socket_addr).await {
+                Ok(s) => s,
+                Err(err) => {
+                    out.extend_from_slice(
+                        format!("-IOERR error connecting to destination: {}\r\n", err).as_bytes(),
+                    );
+                    return false;
+                }
+            };
+
+            // Send ASKING first to allow import if destination slot is in IMPORTING state
+            let mut tx_buf = Vec::new();
+            tx_buf.extend_from_slice(b"*1\r\n$6\r\nASKING\r\n");
+            for (k, (val, ttl)) in &dumps {
+                match val {
+                    crate::table::RudisValue::String(s) => {
+                        if let Some(dur) = ttl {
+                            let ms = dur.as_millis().max(1);
+                            let ms_str = ms.to_string();
+                            tx_buf.extend_from_slice(
+                                format!("*5\r\n$3\r\nSET\r\n${}\r\n", k.len()).as_bytes(),
+                            );
+                            tx_buf.extend_from_slice(k);
+                            tx_buf.extend_from_slice(format!("\r\n${}\r\n", s.len()).as_bytes());
+                            tx_buf.extend_from_slice(s);
+                            tx_buf.extend_from_slice(
+                                format!("\r\n$2\r\nPX\r\n${}\r\n{}\r\n", ms_str.len(), ms_str)
+                                    .as_bytes(),
+                            );
+                        } else {
+                            tx_buf.extend_from_slice(
+                                format!("*3\r\n$3\r\nSET\r\n${}\r\n", k.len()).as_bytes(),
+                            );
+                            tx_buf.extend_from_slice(k);
+                            tx_buf.extend_from_slice(format!("\r\n${}\r\n", s.len()).as_bytes());
+                            tx_buf.extend_from_slice(s);
+                            tx_buf.extend_from_slice(b"\r\n");
+                        }
+                    }
+                    crate::table::RudisValue::Hash(fields) => {
+                        tx_buf.extend_from_slice(
+                            format!("*{}\r\n$4\r\nHSET\r\n${}\r\n", 2 + fields.len() * 2, k.len())
+                                .as_bytes(),
+                        );
+                        tx_buf.extend_from_slice(k);
+                        tx_buf.extend_from_slice(b"\r\n");
+                        for (f, v) in fields {
+                            tx_buf.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
+                            tx_buf.extend_from_slice(f);
+                            tx_buf.extend_from_slice(b"\r\n");
+                            tx_buf.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                            tx_buf.extend_from_slice(v);
+                            tx_buf.extend_from_slice(b"\r\n");
+                        }
+                        if let Some(dur) = ttl {
+                            let ms = dur.as_millis().max(1);
+                            let ms_str = ms.to_string();
+                            tx_buf.extend_from_slice(
+                                format!(
+                                    "*3\r\n$7\r\nPEXPIRE\r\n${}\r\n",
+                                    k.len()
+                                )
+                                .as_bytes(),
+                            );
+                            tx_buf.extend_from_slice(k);
+                            tx_buf.extend_from_slice(
+                                format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
+                            );
+                        }
+                    }
+                }
+            }
+
+            if let Err(e) = stream.write_all(tx_buf).await.0 {
+                out.extend_from_slice(
+                    format!("-IOERR error sending to destination: {}\r\n", e).as_bytes(),
+                );
+                return false;
+            }
+
+            let resp_buf = vec![0u8; 1024];
+            let (read_res, _) = stream.read(resp_buf).await;
+            if let Err(e) = read_res {
+                out.extend_from_slice(
+                    format!("-IOERR error reading from destination: {}\r\n", e).as_bytes(),
+                );
+                return false;
+            }
+
+            if !copy {
+                for (k, _) in dumps {
+                    let _ = router.del(k).await;
+                }
+            }
+
+            out.extend_from_slice(b"+OK\r\n");
             false
         }
         Command::Quit => {
@@ -758,12 +1007,17 @@ async fn execute_commands_squashed(
     client_id: u64,
     client_registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
     out: &mut Vec<u8>,
+    asking: &mut bool,
 ) -> bool {
     let mut can_squash = true;
     for cmd in &commands {
-        if target_shard_of_cmd(cmd, router.num_shards).is_none()
-            && !matches!(cmd, Command::Ping(_) | Command::CommandDocs | Command::Quit)
-        {
+        if let Some(k) = cmd_primary_key(cmd) {
+            let slot = key_slot(k);
+            if router.slot_states.borrow()[slot as usize] != crate::shard::SlotState::Stable {
+                can_squash = false;
+                break;
+            }
+        } else if !matches!(cmd, Command::Ping(_) | Command::CommandDocs | Command::Quit) {
             can_squash = false;
             break;
         }
@@ -772,12 +1026,14 @@ async fn execute_commands_squashed(
     if !can_squash {
         let mut should_close = false;
         for cmd in commands {
-            if execute_command(cmd, router, client_id, client_registry, out).await {
+            if execute_command(cmd, router, client_id, client_registry, out, asking).await {
                 should_close = true;
             }
         }
         return should_close;
     }
+
+    *asking = false;
 
     let n = commands.len();
     if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
@@ -796,6 +1052,8 @@ async fn execute_commands_squashed(
                 Command::Ttl(_, _) => "TTL",
                 Command::Cluster(_) => "CLUSTER",
                 Command::Client(_) => "CLIENT",
+                Command::Asking => "ASKING",
+                Command::Migrate { .. } => "MIGRATE",
                 Command::Hset { .. } => "HSET",
                 Command::Hmset { .. } => "HMSET",
                 Command::Hget { .. } => "HGET",

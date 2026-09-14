@@ -364,3 +364,154 @@ fn test_multithread_shared_nothing_e2e() {
     }
     assert_eq!(String::from_utf8_lossy(&actual_hash_resp), expected_prefix);
 }
+
+#[test]
+fn test_cluster_slot_migration_and_redirection() {
+    let port = 16381;
+    let num_shards = 2;
+    start_test_server(port, num_shards);
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("Failed to connect to rudis server");
+
+    // 1. SET key and verify it works when slot is stable
+    let resp = send_and_read(&mut stream, b"SET local_key value1\r\n");
+    assert_eq!(resp, "+OK\r\n");
+
+    let local_slot = rudis::router::key_slot(b"local_key");
+
+    // 2. Set slot to MIGRATING 127.0.0.1:7001
+    let resp = send_and_read(
+        &mut stream,
+        format!("CLUSTER SETSLOT {} MIGRATING 127.0.0.1:7001\r\n", local_slot).as_bytes(),
+    );
+    assert_eq!(resp, "+OK\r\n");
+
+    // Existing key on migrating slot should still be returned
+    let resp = send_and_read(&mut stream, b"GET local_key\r\n");
+    assert_eq!(resp, "$6\r\nvalue1\r\n");
+
+    // Non-existing key on migrating slot should return -ASK
+    let tagged_missing = format!("{{local_key}}missing");
+    assert_eq!(rudis::router::key_slot(tagged_missing.as_bytes()), local_slot);
+    let resp = send_and_read(&mut stream, format!("GET {}\r\n", tagged_missing).as_bytes());
+    assert_eq!(resp, format!("-ASK {} 127.0.0.1:7001\r\n", local_slot));
+
+    // 3. Set slot to IMPORTING 127.0.0.1:7000
+    let import_slot = 5000;
+    let resp = send_and_read(
+        &mut stream,
+        format!("CLUSTER SETSLOT {} IMPORTING 127.0.0.1:7000\r\n", import_slot).as_bytes(),
+    );
+    assert_eq!(resp, "+OK\r\n");
+
+    let mut target_key = Vec::new();
+    for i in 0..100000 {
+        let k = format!("k_{}", i);
+        if rudis::router::key_slot(k.as_bytes()) == import_slot {
+            target_key = k.into_bytes();
+            break;
+        }
+    }
+
+    // Querying importing slot without ASKING should return -MOVED
+    let resp = send_and_read(
+        &mut stream,
+        format!("GET {}\r\n", String::from_utf8_lossy(&target_key)).as_bytes(),
+    );
+    assert_eq!(resp, format!("-MOVED {} 127.0.0.1:7000\r\n", import_slot));
+
+    // With ASKING command preceding it:
+    let resp = send_and_read(&mut stream, b"ASKING\r\n");
+    assert_eq!(resp, "+OK\r\n");
+
+    let resp = send_and_read(
+        &mut stream,
+        format!("SET {} imported_val\r\n", String::from_utf8_lossy(&target_key)).as_bytes(),
+    );
+    assert_eq!(resp, "+OK\r\n");
+
+    // After running, ASKING flag was consumed, next command without ASKING should return -MOVED again
+    let resp = send_and_read(
+        &mut stream,
+        format!("GET {}\r\n", String::from_utf8_lossy(&target_key)).as_bytes(),
+    );
+    assert_eq!(resp, format!("-MOVED {} 127.0.0.1:7000\r\n", import_slot));
+
+    // Send ASKING again:
+    let resp = send_and_read(&mut stream, b"ASKING\r\n");
+    assert_eq!(resp, "+OK\r\n");
+    let resp = send_and_read(
+        &mut stream,
+        format!("GET {}\r\n", String::from_utf8_lossy(&target_key)).as_bytes(),
+    );
+    assert_eq!(resp, "$12\r\nimported_val\r\n");
+
+    // 4. Set slot to STABLE
+    let resp = send_and_read(
+        &mut stream,
+        format!("CLUSTER SETSLOT {} STABLE\r\n", import_slot).as_bytes(),
+    );
+    assert_eq!(resp, "+OK\r\n");
+
+    let resp = send_and_read(
+        &mut stream,
+        format!("GET {}\r\n", String::from_utf8_lossy(&target_key)).as_bytes(),
+    );
+    assert_eq!(resp, "$12\r\nimported_val\r\n");
+}
+
+#[test]
+fn test_migrate_command_e2e() {
+    let port1 = 16382;
+    let port2 = 16383;
+    start_test_server(port1, 2);
+    start_test_server(port2, 2);
+
+    let mut stream1 = TcpStream::connect(format!("127.0.0.1:{}", port1)).unwrap();
+    let mut stream2 = TcpStream::connect(format!("127.0.0.1:{}", port2)).unwrap();
+
+    // 1. Setup keys on server 1
+    let resp = send_and_read(&mut stream1, b"SET mig_str hello_world\r\n");
+    assert_eq!(resp, "+OK\r\n");
+
+    let resp = send_and_read(&mut stream1, b"HSET mig_hash f1 v1 f2 v2\r\n");
+    assert_eq!(resp, ":2\r\n");
+
+    // 2. Migrate mig_str from server 1 to server 2 with COPY
+    let resp = send_and_read(
+        &mut stream1,
+        format!("MIGRATE 127.0.0.1 {} mig_str 0 5000 COPY\r\n", port2).as_bytes(),
+    );
+    assert_eq!(resp, "+OK\r\n");
+
+    // COPY preserves key on server 1
+    let resp = send_and_read(&mut stream1, b"GET mig_str\r\n");
+    assert_eq!(resp, "$11\r\nhello_world\r\n");
+
+    // Key now exists on server 2
+    let resp = send_and_read(&mut stream2, b"GET mig_str\r\n");
+    assert_eq!(resp, "$11\r\nhello_world\r\n");
+
+    // 3. Migrate mig_hash without COPY (should delete from server 1)
+    let resp = send_and_read(
+        &mut stream1,
+        format!("MIGRATE 127.0.0.1 {} mig_hash 0 5000\r\n", port2).as_bytes(),
+    );
+    assert_eq!(resp, "+OK\r\n");
+
+    // Key deleted from server 1
+    let resp = send_and_read(&mut stream1, b"EXISTS mig_hash\r\n");
+    assert_eq!(resp, ":0\r\n");
+
+    // Hash exists on server 2
+    let resp = send_and_read(&mut stream2, b"HGET mig_hash f2\r\n");
+    assert_eq!(resp, "$2\r\nv2\r\n");
+
+    // 4. Test MIGRATE on non-existing key returns +NOKEY
+    let resp = send_and_read(
+        &mut stream1,
+        format!("MIGRATE 127.0.0.1 {} non_existing_key 0 5000\r\n", port2).as_bytes(),
+    );
+    assert_eq!(resp, "+NOKEY\r\n");
+}

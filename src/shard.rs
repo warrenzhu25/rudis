@@ -58,6 +58,26 @@ pub enum ShardMessage {
         items: Vec<(usize, Command)>,
         responder: flume::Sender<Vec<(usize, Vec<u8>)>>,
     },
+    SetSlotState {
+        slot: u16,
+        state: SlotState,
+    },
+    SetSlotOwner {
+        slot: u16,
+        owner: usize,
+    },
+    DumpKey {
+        key: Bytes,
+        responder: flume::Sender<Option<(crate::table::RudisValue, Option<Duration>)>>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SlotState {
+    Stable,
+    Migrating(String),
+    Importing(String),
+    Moved(String),
 }
 
 /// A purely thread-local key-value store for one shard powered by RudisTable.
@@ -72,6 +92,11 @@ impl ShardDb {
         Self {
             table: crate::table::RudisTable::new(),
         }
+    }
+
+    #[inline]
+    pub fn get_entry(&mut self, key: &[u8]) -> Option<(crate::table::RudisValue, Option<Duration>)> {
+        self.table.get_entry(key)
     }
 
     #[inline]

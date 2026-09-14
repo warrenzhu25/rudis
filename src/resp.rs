@@ -2,10 +2,19 @@ use std::time::Duration;
 use bytes::{Buf, Bytes, BytesMut};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
+pub enum SetSlotSubcommand {
+    Migrating(String),
+    Importing(String),
+    Stable,
+    Node(String),
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ClusterSubcommand {
     KeySlot(Bytes),
     CountKeysInSlot(u16),
     GetKeysInSlot(u16, usize),
+    SetSlot(u16, SetSlotSubcommand),
     Slots,
     Nodes,
     Info,
@@ -37,6 +46,17 @@ pub enum Command {
     Ttl(Bytes, bool), // true for PTTL (milliseconds), false for TTL (seconds)
     Cluster(ClusterSubcommand),
     Client(ClientSubcommand),
+    Asking,
+    Migrate {
+        host: String,
+        port: u16,
+        key: Option<Bytes>,
+        keys: Vec<Bytes>,
+        destination_db: u32,
+        timeout_ms: u64,
+        copy: bool,
+        replace: bool,
+    },
     Hset {
         key: Bytes,
         fields: Vec<(Bytes, Bytes)>,
@@ -383,11 +403,110 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         .ok_or_else(|| "value is not an integer or out of range".to_string())?;
                     Ok(Some(Command::Cluster(ClusterSubcommand::GetKeysInSlot(slot, count))))
                 }
+                "SETSLOT" => {
+                    if args.len() < 4 {
+                        return Err("wrong number of arguments for 'cluster setslot' command".to_string());
+                    }
+                    let slot: u16 = std::str::from_utf8(&args[2])
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                    let action = String::from_utf8_lossy(&args[3]).to_uppercase();
+                    match action.as_str() {
+                        "MIGRATING" => {
+                            if args.len() < 5 {
+                                return Err("wrong number of arguments for 'cluster setslot migrating' command".to_string());
+                            }
+                            let node = String::from_utf8_lossy(&args[4]).to_string();
+                            Ok(Some(Command::Cluster(ClusterSubcommand::SetSlot(slot, SetSlotSubcommand::Migrating(node)))))
+                        }
+                        "IMPORTING" => {
+                            if args.len() < 5 {
+                                return Err("wrong number of arguments for 'cluster setslot importing' command".to_string());
+                            }
+                            let node = String::from_utf8_lossy(&args[4]).to_string();
+                            Ok(Some(Command::Cluster(ClusterSubcommand::SetSlot(slot, SetSlotSubcommand::Importing(node)))))
+                        }
+                        "STABLE" => {
+                            Ok(Some(Command::Cluster(ClusterSubcommand::SetSlot(slot, SetSlotSubcommand::Stable))))
+                        }
+                        "NODE" => {
+                            if args.len() < 5 {
+                                return Err("wrong number of arguments for 'cluster setslot node' command".to_string());
+                            }
+                            let node = String::from_utf8_lossy(&args[4]).to_string();
+                            Ok(Some(Command::Cluster(ClusterSubcommand::SetSlot(slot, SetSlotSubcommand::Node(node)))))
+                        }
+                        _ => Ok(Some(Command::Unknown(format!("CLUSTER SETSLOT {}", action)))),
+                    }
+                }
                 "SLOTS" => Ok(Some(Command::Cluster(ClusterSubcommand::Slots))),
                 "NODES" => Ok(Some(Command::Cluster(ClusterSubcommand::Nodes))),
                 "INFO" => Ok(Some(Command::Cluster(ClusterSubcommand::Info))),
                 _ => Ok(Some(Command::Unknown(format!("CLUSTER {}", sub)))),
             }
+        }
+        "ASKING" => Ok(Some(Command::Asking)),
+        "MIGRATE" => {
+            if args.len() < 6 {
+                return Err("wrong number of arguments for 'migrate' command".to_string());
+            }
+            let host = String::from_utf8_lossy(&args[1]).to_string();
+            let port: u16 = std::str::from_utf8(&args[2])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            let key = if args[3].is_empty() {
+                None
+            } else {
+                Some(args[3].clone())
+            };
+            let destination_db: u32 = std::str::from_utf8(&args[4])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            let timeout_ms: u64 = std::str::from_utf8(&args[5])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+
+            let mut copy = false;
+            let mut replace = false;
+            let mut keys = Vec::new();
+            let mut i = 6;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "COPY" => {
+                        copy = true;
+                        i += 1;
+                    }
+                    "REPLACE" => {
+                        replace = true;
+                        i += 1;
+                    }
+                    "KEYS" => {
+                        i += 1;
+                        while i < args.len() {
+                            keys.push(args[i].clone());
+                            i += 1;
+                        }
+                    }
+                    _ => {
+                        i += 1;
+                    }
+                }
+            }
+            Ok(Some(Command::Migrate {
+                host,
+                port,
+                key,
+                keys,
+                destination_db,
+                timeout_ms,
+                copy,
+                replace,
+            }))
         }
         "CLIENT" => {
             if args.len() < 2 {

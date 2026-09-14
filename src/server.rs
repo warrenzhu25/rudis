@@ -46,6 +46,7 @@ pub fn run_shard_worker(
         // 2. Pure thread-local Shard DB (no Mutex, no Arc)
         let local_db = Rc::new(RefCell::new(ShardDb::new()));
         let client_registry = Rc::new(RefCell::new(hashbrown::HashMap::<u64, crate::connection::ClientInfo>::new()));
+        let router = Rc::new(Router::new(shard_id, num_shards, port, local_db.clone(), senders));
 
         // Active expiration cycle: run every 100ms
         let active_db = local_db.clone();
@@ -59,6 +60,8 @@ pub fn run_shard_worker(
         // 3. Spawn background worker to handle incoming cross-shard messages from peer cores
         let cross_shard_db = local_db.clone();
         let cross_shard_clients = client_registry.clone();
+        let cross_shard_slot_states = router.slot_states.clone();
+        let cross_shard_slot_owners = router.slot_owners.clone();
         monoio::spawn(async move {
             while let Ok(msg) = rx.recv_async().await {
                 match msg {
@@ -152,12 +155,20 @@ pub fn run_shard_worker(
                         }
                         let _ = responder.send(results);
                     }
+                    ShardMessage::SetSlotState { slot, state } => {
+                        cross_shard_slot_states.borrow_mut()[slot as usize] = state;
+                    }
+                    ShardMessage::SetSlotOwner { slot, owner } => {
+                        cross_shard_slot_states.borrow_mut()[slot as usize] = crate::shard::SlotState::Stable;
+                        cross_shard_slot_owners.borrow_mut()[slot as usize] = owner;
+                    }
+                    ShardMessage::DumpKey { key, responder } => {
+                        let entry = cross_shard_db.borrow_mut().get_entry(&key);
+                        let _ = responder.send(entry);
+                    }
                 }
             }
         });
-
-        // 4. Create router
-        let router = Rc::new(Router::new(shard_id, num_shards, port, local_db, senders));
 
         println!(
             "[Shard {}/{}] Worker started and listening on {} via io_uring",

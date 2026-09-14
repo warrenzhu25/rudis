@@ -307,6 +307,27 @@ impl RudisTable {
         }
     }
 
+    pub fn get_entry(&mut self, key: &[u8]) -> Option<(RudisValue, Option<Duration>)> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return None;
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                let ttl = entry.expire_at.and_then(|exp| {
+                    let now = Instant::now();
+                    if exp > now {
+                        Some(exp.duration_since(now))
+                    } else {
+                        None
+                    }
+                });
+                return Some((entry.val.clone(), ttl));
+            }
+        }
+        None
+    }
+
     pub fn set(&mut self, key: Bytes, value: Bytes, expire_in: Option<Duration>) {
         let slot = crate::router::key_slot(&key);
         self.slot_to_keys.entry(slot).or_default().insert(key.clone());

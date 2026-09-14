@@ -52,6 +52,8 @@ pub struct Router {
     pub port: u16,
     pub local_db: Rc<RefCell<ShardDb>>,
     pub senders: Vec<flume::Sender<ShardMessage>>,
+    pub slot_states: Rc<RefCell<Vec<crate::shard::SlotState>>>,
+    pub slot_owners: Rc<RefCell<Vec<usize>>>,
 }
 
 impl Router {
@@ -62,12 +64,72 @@ impl Router {
         local_db: Rc<RefCell<ShardDb>>,
         senders: Vec<flume::Sender<ShardMessage>>,
     ) -> Self {
+        let mut slot_states = Vec::with_capacity(16384);
+        let mut slot_owners = Vec::with_capacity(16384);
+        for s in 0..16384 {
+            slot_states.push(crate::shard::SlotState::Stable);
+            slot_owners.push(slot_to_shard(s as u16, num_shards));
+        }
         Self {
             shard_id,
             num_shards,
             port,
             local_db,
             senders,
+            slot_states: Rc::new(RefCell::new(slot_states)),
+            slot_owners: Rc::new(RefCell::new(slot_owners)),
+        }
+    }
+
+    pub fn target_shard_for_slot(&self, slot: u16) -> usize {
+        self.slot_owners.borrow()[slot as usize]
+    }
+
+    pub fn target_shard(&self, key: &[u8]) -> usize {
+        let slot = key_slot(key);
+        self.target_shard_for_slot(slot)
+    }
+
+    pub fn check_slot_redirection(&self, slot: u16, key_exists: bool, asking: bool) -> Result<(), String> {
+        let state = self.slot_states.borrow()[slot as usize].clone();
+        match state {
+            crate::shard::SlotState::Migrating(target) => {
+                if !key_exists {
+                    return Err(format!("-ASK {} {}\r\n", slot, target));
+                }
+            }
+            crate::shard::SlotState::Importing(source) => {
+                if !asking {
+                    return Err(format!("-MOVED {} {}\r\n", slot, source));
+                }
+            }
+            crate::shard::SlotState::Moved(target) => {
+                return Err(format!("-MOVED {} {}\r\n", slot, target));
+            }
+            crate::shard::SlotState::Stable => {}
+        }
+        Ok(())
+    }
+
+    pub fn set_slot_state(&self, slot: u16, state: crate::shard::SlotState) {
+        self.slot_states.borrow_mut()[slot as usize] = state.clone();
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let _ = sender.send(ShardMessage::SetSlotState {
+                    slot,
+                    state: state.clone(),
+                });
+            }
+        }
+    }
+
+    pub fn set_slot_owner(&self, slot: u16, owner: usize) {
+        self.slot_states.borrow_mut()[slot as usize] = crate::shard::SlotState::Stable;
+        self.slot_owners.borrow_mut()[slot as usize] = owner;
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let _ = sender.send(ShardMessage::SetSlotOwner { slot, owner });
+            }
         }
     }
 
@@ -78,6 +140,24 @@ impl Router {
         } else {
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::Get {
+                key,
+                responder: tx,
+            };
+            if self.senders[target].send(msg).is_ok() {
+                rx.recv_async().await.ok().flatten()
+            } else {
+                None
+            }
+        }
+    }
+
+    pub async fn dump_key(&self, key: Bytes) -> Option<(crate::table::RudisValue, Option<Duration>)> {
+        let target = target_shard(&key, self.num_shards);
+        if target == self.shard_id {
+            self.local_db.borrow_mut().get_entry(&key)
+        } else {
+            let (tx, rx) = flume::bounded(1);
+            let msg = ShardMessage::DumpKey {
                 key,
                 responder: tx,
             };
