@@ -12,7 +12,7 @@ flume = "0.12.0"
 hashbrown = "0.17.1"
 fxhash = "0.2.1"
 mimalloc = { version = "0.1.52", default-features = false }
-monoio = { version = "0.2.4", features = ["sync"] }
+monoio = { version = "0.2.4", features = ["sync", "zero-copy"] }
 socket2 = { version = "0.6.5", features = ["all"] }
 mlua = { version = "0.12.1", features = ["lua54", "vendored"] }
 sha1 = "0.11.0"
@@ -22,4 +22,8 @@ tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats", "use_std"] }
 rustls = "0.23.45"
 rustls-pki-types = { version = "1.15.1", features = ["std"] }
 rcgen = "0.14.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+io-uring = "0.6"
+
 

@@ -236,6 +236,7 @@ pub struct ShardDb {
     pub tier_manager: Option<std::rc::Rc<crate::tiering::ShardTierManager>>,
     pub vector_indexes: std::collections::HashMap<String, crate::vector::HnswIndex>,
     pub crdt_store: crate::crdt::CrdtStore,
+    pub json_store: crate::json::JsonStore,
 }
 
 impl ShardDb {
@@ -246,6 +247,7 @@ impl ShardDb {
             tier_manager: None,
             vector_indexes: std::collections::HashMap::new(),
             crdt_store: crate::crdt::CrdtStore::new(port),
+            json_store: crate::json::JsonStore::new(),
         }
     }
 

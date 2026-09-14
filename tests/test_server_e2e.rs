@@ -3345,6 +3345,123 @@ fn test_tls_in_memory_cert_and_ktls_e2e() {
     assert!(session.is_ok());
 }
 
+#[test]
+fn test_redis_json_engine_e2e() {
+    let port = 16570;
+    let _server = start_test_server(port, 2);
+    std::thread::sleep(Duration::from_millis(50));
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. JSON.SET root
+    let doc = r#"{"name":"Bob","age":28,"tags":["rust","io_uring"],"online":true}"#;
+    let set_cmd = format!("*4\r\n$8\r\nJSON.SET\r\n$6\r\nuser:1\r\n$1\r\n$\r\n${}\r\n{}\r\n", doc.len(), doc);
+    assert_eq!(send_and_read(&mut stream, set_cmd.as_bytes()), "+OK\r\n");
+
+    // 2. JSON.GET root
+    let resp = send_and_read(&mut stream, b"*3\r\n$8\r\nJSON.GET\r\n$6\r\nuser:1\r\n$1\r\n$\r\n");
+    assert!(resp.contains("Bob"));
+    assert!(resp.contains("io_uring"));
+
+    // 3. JSON.GET path $.name
+    let resp = send_and_read(&mut stream, b"*3\r\n$8\r\nJSON.GET\r\n$6\r\nuser:1\r\n$6\r\n$.name\r\n");
+    assert!(resp.contains("\"Bob\""));
+
+    // 4. JSON.TYPE
+    let resp = send_and_read(&mut stream, b"*3\r\n$9\r\nJSON.TYPE\r\n$6\r\nuser:1\r\n$6\r\n$.tags\r\n");
+    assert_eq!(resp, "+array\r\n");
+
+    // 5. JSON.NUMINCRBY
+    let resp = send_and_read(&mut stream, b"*4\r\n$14\r\nJSON.NUMINCRBY\r\n$6\r\nuser:1\r\n$5\r\n$.age\r\n$1\r\n2\r\n");
+    assert!(resp.contains("30"));
+
+    // 6. JSON.ARRAPPEND
+    let resp = send_and_read(&mut stream, b"*4\r\n$14\r\nJSON.ARRAPPEND\r\n$6\r\nuser:1\r\n$6\r\n$.tags\r\n$11\r\n\"high_perf\"\r\n");
+    assert_eq!(resp, ":3\r\n");
+
+    // 7. JSON.ARRLEN
+    let resp = send_and_read(&mut stream, b"*3\r\n$11\r\nJSON.ARRLEN\r\n$6\r\nuser:1\r\n$6\r\n$.tags\r\n");
+    assert_eq!(resp, ":3\r\n");
+
+    // 8. JSON.ARRPOP
+    let resp = send_and_read(&mut stream, b"*3\r\n$11\r\nJSON.ARRPOP\r\n$6\r\nuser:1\r\n$6\r\n$.tags\r\n");
+    assert!(resp.contains("\"high_perf\""));
+
+    // 9. JSON.TOGGLE
+    let resp = send_and_read(&mut stream, b"*3\r\n$11\r\nJSON.TOGGLE\r\n$6\r\nuser:1\r\n$8\r\n$.online\r\n");
+    assert!(resp.contains("false"));
+
+    // 10. JSON.OBJKEYS
+    let resp = send_and_read(&mut stream, b"*3\r\n$12\r\nJSON.OBJKEYS\r\n$6\r\nuser:1\r\n$1\r\n$\r\n");
+    assert!(resp.contains("name"));
+    assert!(resp.contains("age"));
+
+    // 11. JSON.OBJLEN
+    let resp = send_and_read(&mut stream, b"*3\r\n$11\r\nJSON.OBJLEN\r\n$6\r\nuser:1\r\n$1\r\n$\r\n");
+    assert_eq!(resp, ":4\r\n");
+
+    // 12. JSON.DEL nested
+    let resp = send_and_read(&mut stream, b"*3\r\n$8\r\nJSON.DEL\r\n$6\r\nuser:1\r\n$8\r\n$.online\r\n");
+    assert_eq!(resp, ":1\r\n");
+
+    // 13. JSON.DEL root
+    let resp = send_and_read(&mut stream, b"*2\r\n$8\r\nJSON.DEL\r\n$6\r\nuser:1\r\n");
+    assert_eq!(resp, ":1\r\n");
+
+    // 14. Verify deleted
+    let resp = send_and_read(&mut stream, b"*2\r\n$8\r\nJSON.GET\r\n$6\r\nuser:1\r\n");
+    assert_eq!(resp, "$-1\r\n");
+}
+
+#[test]
+fn test_zero_copy_network_engine_e2e() {
+    use rudis::zerocopy::{PAGE_SIZE, RegisteredBufferPool, ZeroCopyEngine, ZeroCopyStats};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    let stats = Arc::new(ZeroCopyStats::new());
+    let mut pool = RegisteredBufferPool::new(8, PAGE_SIZE, stats.clone())
+        .expect("Failed to create registered buffer pool");
+
+    assert_eq!(pool.available_slots(), 8);
+    assert_eq!(pool.slot_size(), PAGE_SIZE);
+
+    let s = pool.acquire_slot().expect("acquire slot");
+    {
+        let buf = pool.get_slot_mut(s).unwrap();
+        buf[0] = 0x55;
+        buf[1] = 0xAA;
+    }
+    assert_eq!(pool.get_slot(s).unwrap()[0], 0x55);
+    pool.release_slot(s);
+    assert_eq!(pool.available_slots(), 8);
+
+    // Test zero-copy socket loopback transfer
+    let (s1, s2) = std::os::unix::net::UnixStream::pair().expect("socket pair");
+    let fd1 = std::os::unix::io::AsRawFd::as_raw_fd(&s1);
+    let fd2 = std::os::unix::io::AsRawFd::as_raw_fd(&s2);
+
+    let engine = ZeroCopyEngine::new(stats.clone());
+    let _ = ZeroCopyEngine::enable_so_zerocopy(fd1);
+
+    let test_msg = b"+PONG_ZEROCOPY\r\n";
+    let sent = engine.send_zc(fd1, test_msg).expect("zero-copy send");
+    assert_eq!(sent, test_msg.len());
+
+    let mut recv_buf = [0u8; 32];
+    let n = unsafe {
+        libc::recv(
+            fd2,
+            recv_buf.as_mut_ptr() as *mut libc::c_void,
+            recv_buf.len(),
+            0,
+        )
+    };
+    assert_eq!(n as usize, test_msg.len());
+    assert_eq!(&recv_buf[..n as usize], test_msg);
+    assert_eq!(stats.zc_send_calls.load(Ordering::Relaxed), 1);
+}
+
 
 
 

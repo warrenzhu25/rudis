@@ -136,6 +136,33 @@ Rudis features a conflict-free replicated data type (CRDT) engine for leaderless
 - **Automated Tombstone TTL Garbage Collection**: Prunes deletion tombstones (`CRDT.GC [ttl_ms]`) to prevent metadata bloat without sacrificing convergence.
 - **Commands**: `CRDT.SET`, `CRDT.GET`, `CRDT.DEL`, `CRDT.INCRBY`, `CRDT.SADD`, `CRDT.SMEMBERS`, `CRDT.SREM`, `CRDT.DUMP`, `CRDT.MERGE`, `CRDT.GC`.
 
+### 12. Hardware Zero-Copy Network I/O (`io_uring` Fixed Buffers & `SO_ZEROCOPY`)
+Rudis leverages modern Linux kernel capabilities to eliminate intermediate memory copies on network I/O:
+- **Registered Fixed Buffers (`IORING_REGISTER_BUFFERS`)**: Memory pages (4KB-aligned) are pre-registered with the kernel during startup via `RegisteredBufferPool`. The kernel pins page frames directly, avoiding `get_user_pages` and page table walks during high-throughput `io_uring` reads and writes.
+- **Linux `SO_ZEROCOPY` & `send_zc` (`MSG_ZEROCOPY`)**: Bypasses kernel skb socket buffer allocations by allowing network interface cards (NICs) to perform direct DMA reads from user-space memory buffers, generating asynchronous completion notifications on the kernel error queue.
+- **Zero-Copy Engine Stats**: Live atomic telemetry (`zc_send_calls`, `zc_bytes_sent`, `fallback_send_calls`, `registered_buffer_hits`) monitoring zero-copy data paths.
+
+### 13. SIMD Hardware Acceleration for Vector Search (AVX2 + FMA)
+Rudis features AVX2 + FMA SIMD optimizations for high-throughput vector queries:
+- **16-Lane Unrolled Float32 Dot Product & $L_2$ Distance**: Processes 16 single-precision floats per loop cycle utilizing `_mm256_fmadd_ps` fused multiply-add, achieving single-cycle accumulation with horizontal vector sums.
+- **SIMD Asymmetric SQ8 Distance Scoring**: Directly loads 8-bit unsigned integer quantized codes into `__m128i`, unpacks them into 32-bit integer vectors with `_mm256_cvtepu8_epi32`, converts them to `f32` vectors via `_mm256_cvtepi32_ps`, and multiply-accumulates with query float vectors using FMA.
+- **$O(1)$ Cosine Norm Calculation**: Quantized vectors precompute and store their sum of squared quantized values ($\sum d_i^2$) on ingest. Using algebraic expansion ($\text{norm\_b}^2 = D\min^2 + 2\min s \sum d_i + s^2 \sum d_i^2$), exact norms are resolved in $O(1)$ time during Cosine similarity scoring without vector scans.
+- **Runtime CPU Feature Detection**: Seamlessly switches between AVX2 hardware kernels and portable auto-vectorized fallbacks based on runtime CPU capabilities.
+
+### 14. Embedded RedisJSON Engine (RFC 8259 & JSONPath Query / Mutation Engine)
+Rudis provides native JSON document storage and deep manipulation with full RedisJSON specification parity:
+- **Hierarchical JSONPath Processing**: Full recursive selector parsing for root (`$`), property accesses (`.user`, `['name']`), wildcard fields (`.*`), array indices (`[0]`), array wildcards (`[*]`), and slice ranges (`[start:end]`).
+- **In-Place Atomic Mutations**: Modifies sub-trees in memory without re-serializing entire documents. Supports atomic integer/float increments (`JSON.NUMINCRBY`), multiplications (`JSON.NUMMULTBY`), string appends (`JSON.STRAPPEND`), and boolean toggles (`JSON.TOGGLE`).
+- **Comprehensive Command Suite**:
+  - `JSON.SET <key> <path> <json> [NX|XX]`: Store or update JSON documents with conditional existence flags.
+  - `JSON.GET <key> [path ...]`: Retrieve documents or sub-paths formatted as JSON.
+  - `JSON.DEL <key> [path]`: Atomically delete documents or sub-path keys.
+  - `JSON.TYPE <key> [path]`: Report JSON type (`object`, `array`, `string`, `integer`, `number`, `boolean`, `null`).
+  - `JSON.ARRAPPEND <key> <path> <val ...>`, `JSON.ARRLEN`, `JSON.ARRPOP`: Native array operations.
+  - `JSON.OBJKEYS <key> [path]`, `JSON.OBJLEN <key> [path]`: Object key introspection.
+  - `JSON.CLEAR <key> [path]`: Clear array or object containers in place.
+  - `JSON.MGET <key ...> <path>`: Multi-key scatter-gather JSONPath queries.
+
 ---
 
 ## Testing
@@ -155,9 +182,9 @@ Detailed Vector Search benchmark report: [docs/benchmarks/vector_search.md](docs
 
 | Index Mode | Vector Payload RAM | RAM Savings | Ingestion Rate | Search QPS | Latency p50 | Latency p99 | Recall@10 |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Float32 HNSW** | 5.12 MB | Baseline (0%) | **1,972 vec/s** | **4,003 QPS** | **240 µs** | 458 µs | **54.8%** |
-| **SQ8 Quantized** | **1.28 MB** | **-75.0%** | 1,737 vec/s | 3,630 QPS | 270 µs | 462 µs | 53.0% |
-| **SQ8 + Exact Rerank** | 1.28 MB | **-75.0%** | 1,737 vec/s | 3,545 QPS | 276 µs | 505 µs | 53.0% |
+| **Float32 HNSW (AVX2)** | 5.12 MB | Baseline (0%) | **3,556 vec/s** | **5,880 QPS** | **147 µs** | **338 µs** | **54.8%** |
+| **SQ8 Quantized (AVX2)** | **1.28 MB** | **-75.0%** | 2,080 vec/s | 3,752 QPS | 254 µs | 427 µs | 53.0% |
+| **SQ8 + Exact Rerank (AVX2)** | 1.28 MB | **-75.0%** | 2,080 vec/s | 3,901 QPS | 243 µs | 448 µs | 53.0% |
 
 ---
 
@@ -230,13 +257,15 @@ rudis/
 │   │   └── vector_bench.rs # Standalone vector benchmark suite
 │   ├── connection.rs   # TCP connection handler, RESP3 push, and command dispatcher
 │   ├── crdt.rs         # Active-Active multi-region CRDT engine (HLC, LWW, OR-Set, PN-Counter)
+│   ├── json.rs         # RFC 8259 RedisJSON engine with deep JSONPath navigation and mutations
 │   ├── resp.rs         # RESP2/RESP3 & inline frame parser and serializer
 │   ├── router.rs       # CRC16 key partitioner and cross-core message dispatcher
 │   ├── scripting.rs    # Lua scripting and Redis 7 Function engine
 │   ├── shard.rs        # Thread-local in-memory key-value database and message types
 │   ├── tiering.rs      # NVMe tiered storage, io_uring Direct I/O, zero-copy snapshots
 │   ├── tls.rs          # Hardware-accelerated Linux Kernel TLS (kTLS) and rustls integration
-│   └── vector.rs       # HNSW vector search engine, SQ8 quantization, tiered reranking
+│   ├── vector.rs       # HNSW vector search engine, AVX2 SIMD acceleration, SQ8 quantization
+│   └── zerocopy.rs     # SO_ZEROCOPY and io_uring fixed registered buffer pool
 └── tests/
     ├── test_cross_thread.rs # Validates cross-core eventfd waker with Monoio
     └── test_server_e2e.rs   # Multi-shard end-to-end integration tests

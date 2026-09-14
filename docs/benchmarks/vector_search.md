@@ -26,9 +26,9 @@ To address the high DRAM requirements of floating-point embeddings at scale, Rud
 
 | Index Mode | Vector Payload RAM | RAM Savings | Ingestion Rate | Search QPS | Latency p50 | Latency p99 | Recall@10 |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Float32 HNSW** | 5.12 MB | Baseline (0%) | **1,972 vec/s** | **4,003 QPS** | **240 µs** | 458 µs | **54.8%** |
-| **SQ8 Quantized** | **1.28 MB** | **-75.0%** | 1,737 vec/s | 3,630 QPS | 270 µs | 462 µs | 53.0% |
-| **SQ8 + Exact Rerank** | 1.28 MB | **-75.0%** | 1,737 vec/s | 3,545 QPS | 276 µs | 505 µs | 53.0% |
+| **Float32 HNSW (AVX2)** | 5.12 MB | Baseline (0%) | **3,556 vec/s** | **5,880 QPS** | **147 µs** | **338 µs** | **54.8%** |
+| **SQ8 Quantized (AVX2)** | **1.28 MB** | **-75.0%** | 2,080 vec/s | 3,752 QPS | 254 µs | 427 µs | 53.0% |
+| **SQ8 + Exact Rerank (AVX2)**| 1.28 MB | **-75.0%** | 2,080 vec/s | 3,901 QPS | 243 µs | 448 µs | 53.0% |
 
 ---
 

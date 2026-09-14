@@ -942,7 +942,22 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Setrange { key, .. }
         | Command::Getrange { key, .. }
         | Command::Vadd { key, .. }
-        | Command::Vdel { key, .. } => Some(key),
+        | Command::Vdel { key, .. }
+        | Command::JsonSet { key, .. }
+        | Command::JsonGet { key, .. }
+        | Command::JsonDel { key, .. }
+        | Command::JsonType { key, .. }
+        | Command::JsonNumIncrBy { key, .. }
+        | Command::JsonNumMultBy { key, .. }
+        | Command::JsonStrAppend { key, .. }
+        | Command::JsonStrLen { key, .. }
+        | Command::JsonArrAppend { key, .. }
+        | Command::JsonArrLen { key, .. }
+        | Command::JsonArrPop { key, .. }
+        | Command::JsonObjKeys { key, .. }
+        | Command::JsonObjLen { key, .. }
+        | Command::JsonToggle { key, .. }
+        | Command::JsonClear { key, .. } => Some(key),
 
         Command::Smove { source, .. }
         | Command::Lmove { source, .. }
@@ -1060,7 +1075,22 @@ pub fn cmd_keys<'a>(cmd: &'a Command) -> Vec<&'a [u8]> {
         | Command::Setrange { key, .. }
         | Command::Getrange { key, .. }
         | Command::Vadd { key, .. }
-        | Command::Vdel { key, .. } => vec![key.as_ref()],
+        | Command::Vdel { key, .. }
+        | Command::JsonSet { key, .. }
+        | Command::JsonGet { key, .. }
+        | Command::JsonDel { key, .. }
+        | Command::JsonType { key, .. }
+        | Command::JsonNumIncrBy { key, .. }
+        | Command::JsonNumMultBy { key, .. }
+        | Command::JsonStrAppend { key, .. }
+        | Command::JsonStrLen { key, .. }
+        | Command::JsonArrAppend { key, .. }
+        | Command::JsonArrLen { key, .. }
+        | Command::JsonArrPop { key, .. }
+        | Command::JsonObjKeys { key, .. }
+        | Command::JsonObjLen { key, .. }
+        | Command::JsonToggle { key, .. }
+        | Command::JsonClear { key, .. } => vec![key.as_ref()],
 
 
         Command::Smove { source, destination, .. }
@@ -1599,6 +1629,22 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         | Command::FunctionList
         | Command::FunctionDelete(_) => "FUNCTION",
         Command::Fcall { .. } => "FCALL",
+        Command::JsonSet { .. }
+        | Command::JsonGet { .. }
+        | Command::JsonDel { .. }
+        | Command::JsonType { .. }
+        | Command::JsonNumIncrBy { .. }
+        | Command::JsonNumMultBy { .. }
+        | Command::JsonStrAppend { .. }
+        | Command::JsonStrLen { .. }
+        | Command::JsonArrAppend { .. }
+        | Command::JsonArrLen { .. }
+        | Command::JsonArrPop { .. }
+        | Command::JsonObjKeys { .. }
+        | Command::JsonObjLen { .. }
+        | Command::JsonToggle { .. }
+        | Command::JsonClear { .. }
+        | Command::JsonMget { .. } => "JSON",
         Command::Unknown(_) => "UNKNOWN",
     }
 }
@@ -2467,7 +2513,22 @@ async fn execute_command(
         | Command::Zscan { .. }
         | Command::Incrbyfloat { .. }
         | Command::Setrange { .. }
-        | Command::Getrange { .. } => {
+        | Command::Getrange { .. }
+        | Command::JsonSet { .. }
+        | Command::JsonGet { .. }
+        | Command::JsonDel { .. }
+        | Command::JsonType { .. }
+        | Command::JsonNumIncrBy { .. }
+        | Command::JsonNumMultBy { .. }
+        | Command::JsonStrAppend { .. }
+        | Command::JsonStrLen { .. }
+        | Command::JsonArrAppend { .. }
+        | Command::JsonArrLen { .. }
+        | Command::JsonArrPop { .. }
+        | Command::JsonObjKeys { .. }
+        | Command::JsonObjLen { .. }
+        | Command::JsonToggle { .. }
+        | Command::JsonClear { .. } => {
             if let Some(target) = target_shard_of_cmd(&cmd, router.num_shards) {
                 if target == router.shard_id {
                     execute_local_command(
@@ -2483,6 +2544,26 @@ async fn execute_command(
             }
             false
         }
+        Command::JsonMget { keys, path } => {
+            out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
+            for k in keys {
+                let single_cmd = Command::JsonGet { key: k.clone(), paths: vec![path.clone()] };
+                if let Some(target) = target_shard_of_cmd(&single_cmd, router.num_shards) {
+                    if target == router.shard_id {
+                        let mut tmp = Vec::new();
+                        execute_local_command(&single_cmd, &mut router.local_db.borrow_mut(), &mut tmp, None);
+                        out.extend_from_slice(&tmp);
+                    } else {
+                        let res = router.execute_remote(target, single_cmd).await;
+                        out.extend_from_slice(&res);
+                    }
+                } else {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+            }
+            false
+        }
+
         Command::Xread {
             ref keys,
             block_ms,
@@ -4099,7 +4180,22 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Linsert { key, .. }
         | Command::Incrbyfloat { key, .. }
         | Command::Setrange { key, .. }
-        | Command::Getrange { key, .. } => Some(target_shard(key, num_shards)),
+        | Command::Getrange { key, .. }
+        | Command::JsonSet { key, .. }
+        | Command::JsonGet { key, .. }
+        | Command::JsonDel { key, .. }
+        | Command::JsonType { key, .. }
+        | Command::JsonNumIncrBy { key, .. }
+        | Command::JsonNumMultBy { key, .. }
+        | Command::JsonStrAppend { key, .. }
+        | Command::JsonStrLen { key, .. }
+        | Command::JsonArrAppend { key, .. }
+        | Command::JsonArrLen { key, .. }
+        | Command::JsonArrPop { key, .. }
+        | Command::JsonObjKeys { key, .. }
+        | Command::JsonObjLen { key, .. }
+        | Command::JsonToggle { key, .. }
+        | Command::JsonClear { key, .. } => Some(target_shard(key, num_shards)),
         Command::Smove { source, destination, .. } => {
             let s1 = target_shard(source, num_shards);
             let s2 = target_shard(destination, num_shards);
@@ -6409,6 +6505,175 @@ pub fn execute_local_command(
         }
         Command::Echo(msg) => {
             write_resp_bulk(out, msg);
+            false
+        }
+        // REDISJSON COMMANDS
+        Command::JsonSet { key, path, json_val, nx, xx } => {
+            match db.json_store.json_set(key, path, json_val, *nx, *xx) {
+                Ok(true) => {
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                Ok(false) => {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::JsonGet { key, paths } => {
+            let path_refs: Vec<&str> = paths.iter().map(|p| p.as_str()).collect();
+            match db.json_store.json_get(key, &path_refs) {
+                Some(res) => {
+                    write_resp_bulk(out, res.as_bytes());
+                }
+                None => {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+            }
+            false
+        }
+        Command::JsonDel { key, path } => {
+            let count = db.json_store.json_del(key, path.as_deref());
+            write_resp_integer(out, count as i64);
+            false
+        }
+        Command::JsonType { key, path } => {
+            match db.json_store.json_type(key, path.as_deref()) {
+                Some(t) => {
+                    out.extend_from_slice(format!("+{}\r\n", t).as_bytes());
+                }
+                None => {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+            }
+            false
+        }
+        Command::JsonNumIncrBy { key, path, delta } => {
+            match db.json_store.json_numincrby(key, path, *delta) {
+                Ok(new_val) => {
+                    write_resp_bulk(out, new_val.as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::JsonNumMultBy { key, path, factor } => {
+            match db.json_store.json_numincrby(key, path, 0.0) {
+                Ok(cur_str) => {
+                    if let Ok(cur) = cur_str.parse::<f64>() {
+                        let new_num = cur * factor;
+                        let delta = new_num - cur;
+                        let _ = db.json_store.json_numincrby(key, path, delta);
+                        write_resp_bulk(out, new_num.to_string().as_bytes());
+                    } else {
+                        out.extend_from_slice(b"-ERR value at path is not a number\r\n");
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::JsonStrAppend { key, path, value } => {
+            match db.json_store.json_strappend(key, path.as_deref(), value) {
+                Ok(new_len) => {
+                    write_resp_integer(out, new_len as i64);
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::JsonStrLen { key, path } => {
+            match db.json_store.json_strlen(key, path.as_deref()) {
+                Some(len) => {
+                    write_resp_integer(out, len as i64);
+                }
+                None => {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+            }
+            false
+        }
+        Command::JsonArrAppend { key, path, values } => {
+            let val_refs: Vec<&str> = values.iter().map(|v| v.as_str()).collect();
+            match db.json_store.json_arrappend(key, path, &val_refs) {
+                Ok(new_len) => {
+                    write_resp_integer(out, new_len as i64);
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::JsonArrLen { key, path } => {
+            match db.json_store.json_arrlen(key, path.as_deref()) {
+                Some(len) => {
+                    write_resp_integer(out, len as i64);
+                }
+                None => {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+            }
+            false
+        }
+        Command::JsonArrPop { key, path, index } => {
+            match db.json_store.json_arrpop(key, path.as_deref(), *index) {
+                Some(popped) => {
+                    write_resp_bulk(out, popped.as_bytes());
+                }
+                None => {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+            }
+            false
+        }
+        Command::JsonObjKeys { key, path } => {
+            match db.json_store.json_objkeys(key, path.as_deref()) {
+                Some(keys) => {
+                    out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
+                    for k in keys {
+                        write_resp_bulk(out, k.as_bytes());
+                    }
+                }
+                None => {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+            }
+            false
+        }
+        Command::JsonObjLen { key, path } => {
+            match db.json_store.json_objlen(key, path.as_deref()) {
+                Some(len) => {
+                    write_resp_integer(out, len as i64);
+                }
+                None => {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+            }
+            false
+        }
+        Command::JsonToggle { key, path } => {
+            match db.json_store.json_toggle(key, path) {
+                Ok(b) => {
+                    write_resp_bulk(out, b.as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::JsonClear { key, path } => {
+            let cleared = db.json_store.json_clear(key, path.as_deref());
+            write_resp_integer(out, cleared as i64);
             false
         }
         Command::Quit => {

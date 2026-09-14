@@ -694,6 +694,79 @@ pub enum Command {
     },
     FunctionList,
     FunctionDelete(String),
+    // REDISJSON COMMANDS
+    JsonSet {
+        key: Bytes,
+        path: String,
+        json_val: String,
+        nx: bool,
+        xx: bool,
+    },
+    JsonGet {
+        key: Bytes,
+        paths: Vec<String>,
+    },
+    JsonDel {
+        key: Bytes,
+        path: Option<String>,
+    },
+    JsonType {
+        key: Bytes,
+        path: Option<String>,
+    },
+    JsonNumIncrBy {
+        key: Bytes,
+        path: String,
+        delta: f64,
+    },
+    JsonNumMultBy {
+        key: Bytes,
+        path: String,
+        factor: f64,
+    },
+    JsonStrAppend {
+        key: Bytes,
+        path: Option<String>,
+        value: String,
+    },
+    JsonStrLen {
+        key: Bytes,
+        path: Option<String>,
+    },
+    JsonArrAppend {
+        key: Bytes,
+        path: String,
+        values: Vec<String>,
+    },
+    JsonArrLen {
+        key: Bytes,
+        path: Option<String>,
+    },
+    JsonArrPop {
+        key: Bytes,
+        path: Option<String>,
+        index: Option<isize>,
+    },
+    JsonObjKeys {
+        key: Bytes,
+        path: Option<String>,
+    },
+    JsonObjLen {
+        key: Bytes,
+        path: Option<String>,
+    },
+    JsonToggle {
+        key: Bytes,
+        path: String,
+    },
+    JsonClear {
+        key: Bytes,
+        path: Option<String>,
+    },
+    JsonMget {
+        keys: Vec<Bytes>,
+        path: String,
+    },
     Unknown(String),
 }
 
@@ -4072,6 +4145,193 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 keys,
                 args: func_args,
             }))
+        }
+        "JSON.SET" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'json.set' command".to_string());
+            }
+            let key = args[1].clone();
+            let path = String::from_utf8_lossy(&args[2]).to_string();
+            let json_val = String::from_utf8_lossy(&args[3]).to_string();
+            let mut nx = false;
+            let mut xx = false;
+            for arg in &args[4..] {
+                let opt = String::from_utf8_lossy(arg).to_uppercase();
+                if opt == "NX" {
+                    nx = true;
+                } else if opt == "XX" {
+                    xx = true;
+                }
+            }
+            Ok(Some(Command::JsonSet { key, path, json_val, nx, xx }))
+        }
+        "JSON.GET" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'json.get' command".to_string());
+            }
+            let key = args[1].clone();
+            let paths = if args.len() > 2 {
+                args[2..].iter().map(|a| String::from_utf8_lossy(a).to_string()).collect()
+            } else {
+                vec!["$".to_string()]
+            };
+            Ok(Some(Command::JsonGet { key, paths }))
+        }
+        "JSON.DEL" | "JSON.FORGET" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'json.del' command".to_string());
+            }
+            let key = args[1].clone();
+            let path = if args.len() > 2 {
+                Some(String::from_utf8_lossy(&args[2]).to_string())
+            } else {
+                None
+            };
+            Ok(Some(Command::JsonDel { key, path }))
+        }
+        "JSON.TYPE" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'json.type' command".to_string());
+            }
+            let key = args[1].clone();
+            let path = if args.len() > 2 {
+                Some(String::from_utf8_lossy(&args[2]).to_string())
+            } else {
+                None
+            };
+            Ok(Some(Command::JsonType { key, path }))
+        }
+        "JSON.NUMINCRBY" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'json.numincrby' command".to_string());
+            }
+            let key = args[1].clone();
+            let path = String::from_utf8_lossy(&args[2]).to_string();
+            let delta = String::from_utf8_lossy(&args[3]).parse::<f64>().map_err(|_| "not a number")?;
+            Ok(Some(Command::JsonNumIncrBy { key, path, delta }))
+        }
+        "JSON.NUMMULTBY" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'json.nummultby' command".to_string());
+            }
+            let key = args[1].clone();
+            let path = String::from_utf8_lossy(&args[2]).to_string();
+            let factor = String::from_utf8_lossy(&args[3]).parse::<f64>().map_err(|_| "not a number")?;
+            Ok(Some(Command::JsonNumMultBy { key, path, factor }))
+        }
+        "JSON.STRAPPEND" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'json.strappend' command".to_string());
+            }
+            let key = args[1].clone();
+            let (path, value) = if args.len() == 3 {
+                (None, String::from_utf8_lossy(&args[2]).to_string())
+            } else {
+                (Some(String::from_utf8_lossy(&args[2]).to_string()), String::from_utf8_lossy(&args[3]).to_string())
+            };
+            Ok(Some(Command::JsonStrAppend { key, path, value }))
+        }
+        "JSON.STRLEN" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'json.strlen' command".to_string());
+            }
+            let key = args[1].clone();
+            let path = if args.len() > 2 {
+                Some(String::from_utf8_lossy(&args[2]).to_string())
+            } else {
+                None
+            };
+            Ok(Some(Command::JsonStrLen { key, path }))
+        }
+        "JSON.ARRAPPEND" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'json.arrappend' command".to_string());
+            }
+            let key = args[1].clone();
+            let path = String::from_utf8_lossy(&args[2]).to_string();
+            let values = args[3..].iter().map(|a| String::from_utf8_lossy(a).to_string()).collect();
+            Ok(Some(Command::JsonArrAppend { key, path, values }))
+        }
+        "JSON.ARRLEN" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'json.arrlen' command".to_string());
+            }
+            let key = args[1].clone();
+            let path = if args.len() > 2 {
+                Some(String::from_utf8_lossy(&args[2]).to_string())
+            } else {
+                None
+            };
+            Ok(Some(Command::JsonArrLen { key, path }))
+        }
+        "JSON.ARRPOP" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'json.arrpop' command".to_string());
+            }
+            let key = args[1].clone();
+            let path = if args.len() > 2 {
+                Some(String::from_utf8_lossy(&args[2]).to_string())
+            } else {
+                None
+            };
+            let index = if args.len() > 3 {
+                String::from_utf8_lossy(&args[3]).parse::<isize>().ok()
+            } else {
+                None
+            };
+            Ok(Some(Command::JsonArrPop { key, path, index }))
+        }
+        "JSON.OBJKEYS" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'json.objkeys' command".to_string());
+            }
+            let key = args[1].clone();
+            let path = if args.len() > 2 {
+                Some(String::from_utf8_lossy(&args[2]).to_string())
+            } else {
+                None
+            };
+            Ok(Some(Command::JsonObjKeys { key, path }))
+        }
+        "JSON.OBJLEN" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'json.objlen' command".to_string());
+            }
+            let key = args[1].clone();
+            let path = if args.len() > 2 {
+                Some(String::from_utf8_lossy(&args[2]).to_string())
+            } else {
+                None
+            };
+            Ok(Some(Command::JsonObjLen { key, path }))
+        }
+        "JSON.TOGGLE" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'json.toggle' command".to_string());
+            }
+            let key = args[1].clone();
+            let path = String::from_utf8_lossy(&args[2]).to_string();
+            Ok(Some(Command::JsonToggle { key, path }))
+        }
+        "JSON.CLEAR" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'json.clear' command".to_string());
+            }
+            let key = args[1].clone();
+            let path = if args.len() > 2 {
+                Some(String::from_utf8_lossy(&args[2]).to_string())
+            } else {
+                None
+            };
+            Ok(Some(Command::JsonClear { key, path }))
+        }
+        "JSON.MGET" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'json.mget' command".to_string());
+            }
+            let path = String::from_utf8_lossy(args.last().unwrap()).to_string();
+            let keys = args[1..args.len() - 1].to_vec();
+            Ok(Some(Command::JsonMget { keys, path }))
         }
         _ => Ok(Some(Command::Unknown(cmd_name))),
 

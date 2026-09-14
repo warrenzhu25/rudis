@@ -17,6 +17,8 @@ pub mod table;
 pub mod tiering;
 pub mod tls;
 pub mod vector;
+pub mod zerocopy;
+pub mod json;
 
 
 #[global_allocator]
