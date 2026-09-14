@@ -71,6 +71,14 @@ pub fn run_shard_worker(
                         let exists = cross_shard_db.borrow().exists(&key);
                         let _ = responder.send(exists);
                     }
+                    ShardMessage::IncrBy {
+                        key,
+                        delta,
+                        responder,
+                    } => {
+                        let res = cross_shard_db.borrow_mut().incr_by(key, delta);
+                        let _ = responder.send(res);
+                    }
                 }
             }
         });

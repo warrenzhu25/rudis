@@ -6,6 +6,7 @@ pub enum Command {
     Set(Bytes, Bytes),
     Del(Vec<Bytes>),
     Exists(Vec<Bytes>),
+    IncrBy(Bytes, i64),
     Ping(Option<Bytes>),
     CommandDocs,
     Info,
@@ -157,6 +158,38 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'exists' command".to_string());
             }
             Ok(Some(Command::Exists(args[1..].to_vec())))
+        }
+        "INCR" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'incr' command".to_string());
+            }
+            Ok(Some(Command::IncrBy(args[1].clone(), 1)))
+        }
+        "DECR" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'decr' command".to_string());
+            }
+            Ok(Some(Command::IncrBy(args[1].clone(), -1)))
+        }
+        "INCRBY" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'incrby' command".to_string());
+            }
+            let delta = std::str::from_utf8(&args[2])
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            Ok(Some(Command::IncrBy(args[1].clone(), delta)))
+        }
+        "DECRBY" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'decrby' command".to_string());
+            }
+            let delta = std::str::from_utf8(&args[2])
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            Ok(Some(Command::IncrBy(args[1].clone(), -delta)))
         }
         "PING" => {
             let msg = if args.len() > 1 {

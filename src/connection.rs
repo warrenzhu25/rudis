@@ -122,6 +122,17 @@ async fn execute_command(cmd: Command, router: &Router, out: &mut Vec<u8>) -> bo
             out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
             false
         }
+        Command::IncrBy(key, delta) => {
+            match router.incr_by(key, delta).await {
+                Ok(val) => {
+                    out.extend_from_slice(format!(":{}\r\n", val).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
         Command::Ping(msg) => {
             match msg {
                 Some(m) => {

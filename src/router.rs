@@ -112,4 +112,25 @@ impl Router {
             }
         }
     }
+
+    pub async fn incr_by(&self, key: Bytes, delta: i64) -> Result<i64, String> {
+        let target = target_shard(&key, self.num_shards);
+        if target == self.shard_id {
+            self.local_db.borrow_mut().incr_by(key, delta)
+        } else {
+            let (tx, rx) = flume::bounded(1);
+            let msg = ShardMessage::IncrBy {
+                key,
+                delta,
+                responder: tx,
+            };
+            if self.senders[target].send(msg).is_ok() {
+                rx.recv_async()
+                    .await
+                    .unwrap_or_else(|_| Err("shard disconnected".to_string()))
+            } else {
+                Err("failed to route to shard".to_string())
+            }
+        }
+    }
 }

@@ -113,4 +113,23 @@ fn test_multithread_shared_nothing_e2e() {
 
     let resp = send_and_read(&mut stream, b"GET respkey\r\n");
     assert_eq!(resp, "$-1\r\n");
+
+    // 8. Test INCR, DECR, INCRBY, DECRBY
+    let resp = send_and_read(&mut stream, b"INCR counter\r\n");
+    assert_eq!(resp, ":1\r\n");
+
+    let resp = send_and_read(&mut stream, b"INCR counter\r\n");
+    assert_eq!(resp, ":2\r\n");
+
+    let resp = send_and_read(&mut stream, b"INCRBY counter 10\r\n");
+    assert_eq!(resp, ":12\r\n");
+
+    let resp = send_and_read(&mut stream, b"DECR counter\r\n");
+    assert_eq!(resp, ":11\r\n");
+
+    let resp = send_and_read(&mut stream, b"DECRBY counter 5\r\n");
+    assert_eq!(resp, ":6\r\n");
+
+    let resp = send_and_read(&mut stream, b"GET counter\r\n");
+    assert_eq!(resp, "$1\r\n6\r\n");
 }
