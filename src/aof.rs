@@ -643,6 +643,131 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             Some(buf)
         }
+        Command::Hincrby { key, field, increment } => {
+            let s = increment.to_string();
+            buf.extend_from_slice(format!("*4\r\n$7\r\nHINCRBY\r\n${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n", field.len()).as_bytes());
+            buf.extend_from_slice(field);
+            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", s.len(), s).as_bytes());
+            Some(buf)
+        }
+        Command::Hincrbyfloat { key, field, increment } => {
+            let s = increment.to_string();
+            buf.extend_from_slice(format!("*4\r\n$12\r\nHINCRBYFLOAT\r\n${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n", field.len()).as_bytes());
+            buf.extend_from_slice(field);
+            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", s.len(), s).as_bytes());
+            Some(buf)
+        }
+        Command::Smove { source, destination, member } => {
+            buf.extend_from_slice(format!("*4\r\n$5\r\nSMOVE\r\n${}\r\n", source.len()).as_bytes());
+            buf.extend_from_slice(source);
+            buf.extend_from_slice(format!("\r\n${}\r\n", destination.len()).as_bytes());
+            buf.extend_from_slice(destination);
+            buf.extend_from_slice(format!("\r\n${}\r\n", member.len()).as_bytes());
+            buf.extend_from_slice(member);
+            buf.extend_from_slice(b"\r\n");
+            Some(buf)
+        }
+        Command::Zremrangebyrank { key, start, stop } => {
+            let st = start.to_string();
+            let sp = stop.to_string();
+            buf.extend_from_slice(format!("*4\r\n$16\r\nZREMRANGEBYRANK\r\n${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n${}\r\n{}\r\n", st.len(), st, sp.len(), sp).as_bytes());
+            Some(buf)
+        }
+        Command::Zremrangebyscore { key, min_score, min_inc, max_score, max_inc } => {
+            let min_s = if *min_inc { min_score.to_string() } else { format!("({}", min_score) };
+            let max_s = if *max_inc { max_score.to_string() } else { format!("({}", max_score) };
+            buf.extend_from_slice(format!("*4\r\n$17\r\nZREMRANGEBYSCORE\r\n${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n${}\r\n{}\r\n", min_s.len(), min_s, max_s.len(), max_s).as_bytes());
+            Some(buf)
+        }
+        Command::Zremrangebylex { key, min, max } => {
+            let min_s = match min {
+                crate::table::LexBound::UnboundedMin => "-".to_string(),
+                crate::table::LexBound::UnboundedMax => "+".to_string(),
+                crate::table::LexBound::Inclusive(b) => format!("[{}", String::from_utf8_lossy(b)),
+                crate::table::LexBound::Exclusive(b) => format!("({}", String::from_utf8_lossy(b)),
+            };
+            let max_s = match max {
+                crate::table::LexBound::UnboundedMin => "-".to_string(),
+                crate::table::LexBound::UnboundedMax => "+".to_string(),
+                crate::table::LexBound::Inclusive(b) => format!("[{}", String::from_utf8_lossy(b)),
+                crate::table::LexBound::Exclusive(b) => format!("({}", String::from_utf8_lossy(b)),
+            };
+            buf.extend_from_slice(format!("*4\r\n$15\r\nZREMRANGEBYLEX\r\n${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n${}\r\n{}\r\n", min_s.len(), min_s, max_s.len(), max_s).as_bytes());
+            Some(buf)
+        }
+        Command::Ltrim { key, start, stop } => {
+            let st = start.to_string();
+            let sp = stop.to_string();
+            buf.extend_from_slice(format!("*4\r\n$5\r\nLTRIM\r\n${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n${}\r\n{}\r\n", st.len(), st, sp.len(), sp).as_bytes());
+            Some(buf)
+        }
+        Command::Lset { key, index, element } => {
+            let idx_s = index.to_string();
+            buf.extend_from_slice(format!("*4\r\n$4\r\nLSET\r\n${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n${}\r\n", idx_s.len(), idx_s, element.len()).as_bytes());
+            buf.extend_from_slice(element);
+            buf.extend_from_slice(b"\r\n");
+            Some(buf)
+        }
+        Command::Lrem { key, count, element } => {
+            let cnt_s = count.to_string();
+            buf.extend_from_slice(format!("*4\r\n$4\r\nLREM\r\n${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n${}\r\n", cnt_s.len(), cnt_s, element.len()).as_bytes());
+            buf.extend_from_slice(element);
+            buf.extend_from_slice(b"\r\n");
+            Some(buf)
+        }
+        Command::Linsert { key, before, pivot, element } => {
+            let dir = if *before { "BEFORE" } else { "AFTER" };
+            buf.extend_from_slice(format!("*5\r\n$7\r\nLINSERT\r\n${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n${}\r\n", dir.len(), dir, pivot.len()).as_bytes());
+            buf.extend_from_slice(pivot);
+            buf.extend_from_slice(format!("\r\n${}\r\n", element.len()).as_bytes());
+            buf.extend_from_slice(element);
+            buf.extend_from_slice(b"\r\n");
+            Some(buf)
+        }
+        Command::Lmove { source, destination, where_from, where_to } => {
+            let from_s = match where_from { crate::table::ListDirection::Left => "LEFT", crate::table::ListDirection::Right => "RIGHT" };
+            let to_s = match where_to { crate::table::ListDirection::Left => "LEFT", crate::table::ListDirection::Right => "RIGHT" };
+            buf.extend_from_slice(format!("*5\r\n$5\r\nLMOVE\r\n${}\r\n", source.len()).as_bytes());
+            buf.extend_from_slice(source);
+            buf.extend_from_slice(format!("\r\n${}\r\n", destination.len()).as_bytes());
+            buf.extend_from_slice(destination);
+            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n${}\r\n{}\r\n", from_s.len(), from_s, to_s.len(), to_s).as_bytes());
+            Some(buf)
+        }
+        Command::Incrbyfloat { key, increment } => {
+            let s = increment.to_string();
+            buf.extend_from_slice(format!("*3\r\n$11\r\nINCRBYFLOAT\r\n${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", s.len(), s).as_bytes());
+            Some(buf)
+        }
+        Command::Setrange { key, offset, value } => {
+            let off_s = offset.to_string();
+            buf.extend_from_slice(format!("*4\r\n$8\r\nSETRANGE\r\n${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n${}\r\n", off_s.len(), off_s, value.len()).as_bytes());
+            buf.extend_from_slice(value);
+            buf.extend_from_slice(b"\r\n");
+            Some(buf)
+        }
         _ => None,
     }
 }
