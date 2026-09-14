@@ -1547,12 +1547,14 @@ async fn execute_command(
             value,
             expire_in,
         } => {
-            if let Some(bytes) = crate::aof::command_to_resp(&Command::Set {
-                key: key.clone(),
-                value: value.clone(),
-                expire_in,
-            }) {
-                crate::replication::propagate_bytes(router.port, &bytes);
+            if crate::replication::has_connected_replicas(router.port) {
+                if let Some(bytes) = crate::aof::command_to_resp(&Command::Set {
+                    key: key.clone(),
+                    value: value.clone(),
+                    expire_in,
+                }) {
+                    crate::replication::propagate_bytes(router.port, &bytes);
+                }
             }
             router.set(key, value, expire_in).await;
             out.extend_from_slice(b"+OK\r\n");
@@ -1575,8 +1577,10 @@ async fn execute_command(
             false
         }
         Command::Mset(pairs) => {
-            if let Some(bytes) = crate::aof::command_to_resp(&Command::Mset(pairs.clone())) {
-                crate::replication::propagate_bytes(router.port, &bytes);
+            if crate::replication::has_connected_replicas(router.port) {
+                if let Some(bytes) = crate::aof::command_to_resp(&Command::Mset(pairs.clone())) {
+                    crate::replication::propagate_bytes(router.port, &bytes);
+                }
             }
             for (key, val) in pairs {
                 router.set(key, val, None).await;
@@ -1591,7 +1595,7 @@ async fn execute_command(
                     count += 1;
                 }
             }
-            if count > 0 {
+            if count > 0 && crate::replication::has_connected_replicas(router.port) {
                 if let Some(bytes) = crate::aof::command_to_resp(&Command::Del(keys)) {
                     crate::replication::propagate_bytes(router.port, &bytes);
                 }
@@ -3594,11 +3598,17 @@ pub fn execute_local_command(
 ) -> bool {
     macro_rules! record_change {
         ($cmd_expr:expr) => {
-            if let Some(bytes) = crate::aof::command_to_resp($cmd_expr) {
-                if let Some(aof_w) = aof {
-                    aof_w.borrow_mut().append(&bytes);
+            let need_aof = aof.is_some();
+            let need_rep = crate::replication::has_connected_replicas(db.port);
+            if need_aof || need_rep {
+                if let Some(bytes) = crate::aof::command_to_resp($cmd_expr) {
+                    if let Some(aof_w) = aof {
+                        aof_w.borrow_mut().append(&bytes);
+                    }
+                    if need_rep {
+                        crate::replication::propagate_bytes(db.port, &bytes);
+                    }
                 }
-                crate::replication::propagate_bytes(db.port, &bytes);
             }
         };
     }

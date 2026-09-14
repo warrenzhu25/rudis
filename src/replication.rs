@@ -56,6 +56,7 @@ pub struct ReplicationHub {
     pub role: RwLock<ReplicationRole>,
     pub master_replid: String,
     pub master_repl_offset: AtomicU64,
+    pub has_replicas: std::sync::atomic::AtomicBool,
     pub backlog: RwLock<ReplicationBacklog>,
     pub replicas: RwLock<HashMap<u64, Arc<ConnectedReplica>>>,
     pub cancel_sync: RwLock<Option<flume::Sender<()>>>,
@@ -81,6 +82,7 @@ impl ReplicationHub {
             }),
             master_replid: replid,
             master_repl_offset: AtomicU64::new(0),
+            has_replicas: std::sync::atomic::AtomicBool::new(false),
             backlog: RwLock::new(ReplicationBacklog::new(1024 * 1024)),
             replicas: RwLock::new(HashMap::new()),
             cancel_sync: RwLock::new(None),
@@ -130,11 +132,16 @@ impl ReplicationHub {
             last_ack_time: AtomicU64::new(0),
         });
         self.replicas.write().unwrap().insert(id, rep.clone());
+        self.has_replicas.store(true, Ordering::Release);
         rep
     }
 
     pub fn unregister_replica(&self, id: u64) {
-        self.replicas.write().unwrap().remove(&id);
+        let mut reps = self.replicas.write().unwrap();
+        reps.remove(&id);
+        if reps.is_empty() {
+            self.has_replicas.store(false, Ordering::Release);
+        }
     }
 
     pub fn update_replica_ack(&self, id: u64, offset: u64) {
@@ -155,8 +162,7 @@ impl ReplicationHub {
     }
 
     pub fn propagate(&self, bytes: &[u8]) {
-    
-        if !self.is_master() {
+        if !self.has_replicas.load(Ordering::Relaxed) || !self.is_master() {
             return;
         }
         let new_offset = self.master_repl_offset.fetch_add(bytes.len() as u64, Ordering::SeqCst)
@@ -303,6 +309,16 @@ pub fn get_replication_hub(port: u16) -> Arc<ReplicationHub> {
     hubs.entry(port)
         .or_insert_with(|| Arc::new(ReplicationHub::new(port)))
         .clone()
+}
+
+#[inline]
+pub fn has_connected_replicas(port: u16) -> bool {
+    let hubs = REPLICATION_HUBS.read().unwrap();
+    if let Some(hub) = hubs.get(&port) {
+        hub.has_replicas.load(Ordering::Relaxed)
+    } else {
+        false
+    }
 }
 
 pub fn propagate_bytes(port: u16, bytes: &[u8]) {
