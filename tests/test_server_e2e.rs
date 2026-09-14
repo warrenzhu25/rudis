@@ -286,4 +286,81 @@ fn test_multithread_shared_nothing_e2e() {
     let list_resp3 = send_and_read(&mut stream, b"CLIENT LIST\r\n");
     assert!(list_resp3.contains(&format!("id={}", client_id)));
     assert!(!list_resp3.contains(&format!("id={}", client_id2)), "Disconnected client should be removed");
+
+    // 14. Test Redis Hash data structure (HSET, HGET, HMGET, HDEL, HEXISTS, HLEN, HGETALL, HKEYS, HVALS)
+    let resp = send_and_read(&mut stream, b"HSET user:100 name alice age 30 city nyc\r\n");
+    assert_eq!(resp, ":3\r\n", "Should return 3 fields added");
+
+    // Adding existing field updates and returns 0 new fields
+    let resp = send_and_read(&mut stream, b"HSET user:100 age 31\r\n");
+    assert_eq!(resp, ":0\r\n", "Updating existing field returns 0 added");
+
+    let resp = send_and_read(&mut stream, b"HGET user:100 name\r\n");
+    assert_eq!(resp, "$5\r\nalice\r\n");
+
+    let resp = send_and_read(&mut stream, b"HGET user:100 age\r\n");
+    assert_eq!(resp, "$2\r\n31\r\n");
+
+    let resp = send_and_read(&mut stream, b"HGET user:100 nonexistent\r\n");
+    assert_eq!(resp, "$-1\r\n");
+
+    let resp = send_and_read(&mut stream, b"HMGET user:100 name age nonexistent\r\n");
+    assert_eq!(resp, "*3\r\n$5\r\nalice\r\n$2\r\n31\r\n$-1\r\n");
+
+    let resp = send_and_read(&mut stream, b"HEXISTS user:100 city\r\n");
+    assert_eq!(resp, ":1\r\n");
+
+    let resp = send_and_read(&mut stream, b"HEXISTS user:100 nonexistent\r\n");
+    assert_eq!(resp, ":0\r\n");
+
+    let resp = send_and_read(&mut stream, b"HLEN user:100\r\n");
+    assert_eq!(resp, ":3\r\n");
+
+    let resp = send_and_read(&mut stream, b"HGETALL user:100\r\n");
+    assert!(resp.starts_with("*6\r\n"));
+    assert!(resp.contains("$4\r\ncity\r\n$3\r\nnyc\r\n") || resp.contains("$3\r\nnyc\r\n"));
+
+    let resp = send_and_read(&mut stream, b"HKEYS user:100\r\n");
+    assert!(resp.starts_with("*3\r\n"));
+    assert!(resp.contains("name") && resp.contains("age") && resp.contains("city"));
+
+    let resp = send_and_read(&mut stream, b"HVALS user:100\r\n");
+    assert!(resp.starts_with("*3\r\n"));
+    assert!(resp.contains("alice") && resp.contains("31") && resp.contains("nyc"));
+
+    let resp = send_and_read(&mut stream, b"HDEL user:100 age nonexistent\r\n");
+    assert_eq!(resp, ":1\r\n", "Should delete 1 existing field");
+
+    let resp = send_and_read(&mut stream, b"HLEN user:100\r\n");
+    assert_eq!(resp, ":2\r\n");
+
+    // Test WRONGTYPE: performing INCR on a Hash key
+    let resp = send_and_read(&mut stream, b"INCR user:100\r\n");
+    assert!(resp.starts_with("-ERR WRONGTYPE"));
+
+    // Test cross-shard Hash operations via pipelined squashing
+    let mut hash_pipe = Vec::new();
+    let mut expected_prefix = String::new();
+    for i in 0..20 {
+        hash_pipe.extend_from_slice(format!("HSET hash_pipe_{} f1 v1 f2 v2\r\n", i).as_bytes());
+        expected_prefix.push_str(":2\r\n");
+    }
+    for i in 0..20 {
+        hash_pipe.extend_from_slice(format!("HGET hash_pipe_{} f1\r\n", i).as_bytes());
+        expected_prefix.push_str("$2\r\nv1\r\n");
+    }
+    stream.write_all(&hash_pipe).unwrap();
+    let mut actual_hash_resp = Vec::new();
+    let mut total_read = 0;
+    let expected_len = expected_prefix.len();
+    while total_read < expected_len {
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        if n == 0 {
+            break;
+        }
+        actual_hash_resp.extend_from_slice(&buf[..n]);
+        total_read += n;
+    }
+    assert_eq!(String::from_utf8_lossy(&actual_hash_resp), expected_prefix);
 }

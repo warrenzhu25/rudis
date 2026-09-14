@@ -178,6 +178,16 @@ async fn execute_command(
         Command::Ttl(_, _) => "TTL",
         Command::Cluster(_) => "CLUSTER",
         Command::Client(_) => "CLIENT",
+        Command::Hset { .. } => "HSET",
+        Command::Hmset { .. } => "HMSET",
+        Command::Hget { .. } => "HGET",
+        Command::Hmget { .. } => "HMGET",
+        Command::Hdel { .. } => "HDEL",
+        Command::Hexists { .. } => "HEXISTS",
+        Command::Hlen(_) => "HLEN",
+        Command::Hgetall(_) => "HGETALL",
+        Command::Hkeys(_) => "HKEYS",
+        Command::Hvals(_) => "HVALS",
         Command::Ping(_) => "PING",
         Command::CommandDocs => "COMMAND",
         Command::Info => "INFO",
@@ -431,6 +441,26 @@ async fn execute_command(
             }
             false
         }
+        Command::Hset { .. }
+        | Command::Hmset { .. }
+        | Command::Hget { .. }
+        | Command::Hmget { .. }
+        | Command::Hdel { .. }
+        | Command::Hexists { .. }
+        | Command::Hlen(_)
+        | Command::Hgetall(_)
+        | Command::Hkeys(_)
+        | Command::Hvals(_) => {
+            if let Some(target) = target_shard_of_cmd(&cmd, router.num_shards) {
+                if target == router.shard_id {
+                    execute_local_command(&cmd, &mut router.local_db.borrow_mut(), out);
+                } else {
+                    let res = router.execute_remote(target, cmd).await;
+                    out.extend_from_slice(&res);
+                }
+            }
+            false
+        }
         Command::Quit => {
             out.extend_from_slice(b"+OK\r\n");
             true
@@ -450,7 +480,17 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::IncrBy(key, _)
         | Command::Expire(key, _)
         | Command::Persist(key)
-        | Command::Ttl(key, _) => Some(target_shard(key, num_shards)),
+        | Command::Ttl(key, _)
+        | Command::Hset { key, .. }
+        | Command::Hmset { key, .. }
+        | Command::Hget { key, .. }
+        | Command::Hmget { key, .. }
+        | Command::Hdel { key, .. }
+        | Command::Hexists { key, .. }
+        | Command::Hlen(key)
+        | Command::Hgetall(key)
+        | Command::Hkeys(key)
+        | Command::Hvals(key) => Some(target_shard(key, num_shards)),
         Command::Del(keys) | Command::Exists(keys) if keys.len() == 1 => {
             Some(target_shard(&keys[0], num_shards))
         }
@@ -536,6 +576,155 @@ pub fn execute_local_command(cmd: &Command, db: &mut ShardDb, out: &mut Vec<u8>)
             out.extend_from_slice(format!(":{}\r\n", res).as_bytes());
             false
         }
+        Command::Hset { key, fields } => {
+            match db.hset(key.clone(), fields.clone()) {
+                Ok(count) => {
+                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Hmset { key, fields } => {
+            match db.hset(key.clone(), fields.clone()) {
+                Ok(_) => {
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Hget { key, field } => {
+            match db.hget(key, field) {
+                Ok(Some(v)) => {
+                    out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                    out.extend_from_slice(&v);
+                    out.extend_from_slice(b"\r\n");
+                }
+                Ok(None) => {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Hmget { key, fields } => {
+            match db.hmget(key, fields) {
+                Ok(vals) => {
+                    out.extend_from_slice(format!("*{}\r\n", vals.len()).as_bytes());
+                    for v in vals {
+                        match v {
+                            Some(val) => {
+                                out.extend_from_slice(format!("${}\r\n", val.len()).as_bytes());
+                                out.extend_from_slice(&val);
+                                out.extend_from_slice(b"\r\n");
+                            }
+                            None => {
+                                out.extend_from_slice(b"$-1\r\n");
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Hdel { key, fields } => {
+            match db.hdel(key, fields) {
+                Ok(count) => {
+                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Hexists { key, field } => {
+            match db.hexists(key, field) {
+                Ok(exists) => {
+                    if exists {
+                        out.extend_from_slice(b":1\r\n");
+                    } else {
+                        out.extend_from_slice(b":0\r\n");
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Hlen(key) => {
+            match db.hlen(key) {
+                Ok(len) => {
+                    out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Hgetall(key) => {
+            match db.hgetall(key) {
+                Ok(pairs) => {
+                    out.extend_from_slice(format!("*{}\r\n", pairs.len() * 2).as_bytes());
+                    for (k, v) in pairs {
+                        out.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                        out.extend_from_slice(&k);
+                        out.extend_from_slice(b"\r\n");
+                        out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                        out.extend_from_slice(&v);
+                        out.extend_from_slice(b"\r\n");
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Hkeys(key) => {
+            match db.hkeys(key) {
+                Ok(keys) => {
+                    out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
+                    for k in keys {
+                        out.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                        out.extend_from_slice(&k);
+                        out.extend_from_slice(b"\r\n");
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Hvals(key) => {
+            match db.hvals(key) {
+                Ok(vals) => {
+                    out.extend_from_slice(format!("*{}\r\n", vals.len()).as_bytes());
+                    for v in vals {
+                        out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                        out.extend_from_slice(&v);
+                        out.extend_from_slice(b"\r\n");
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
         Command::Ping(msg) => {
             match msg {
                 Some(m) => {
@@ -607,6 +796,16 @@ async fn execute_commands_squashed(
                 Command::Ttl(_, _) => "TTL",
                 Command::Cluster(_) => "CLUSTER",
                 Command::Client(_) => "CLIENT",
+                Command::Hset { .. } => "HSET",
+                Command::Hmset { .. } => "HMSET",
+                Command::Hget { .. } => "HGET",
+                Command::Hmget { .. } => "HMGET",
+                Command::Hdel { .. } => "HDEL",
+                Command::Hexists { .. } => "HEXISTS",
+                Command::Hlen(_) => "HLEN",
+                Command::Hgetall(_) => "HGETALL",
+                Command::Hkeys(_) => "HKEYS",
+                Command::Hvals(_) => "HVALS",
                 Command::Ping(_) => "PING",
                 Command::CommandDocs => "COMMAND",
                 Command::Info => "INFO",

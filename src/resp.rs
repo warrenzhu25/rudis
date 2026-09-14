@@ -37,6 +37,34 @@ pub enum Command {
     Ttl(Bytes, bool), // true for PTTL (milliseconds), false for TTL (seconds)
     Cluster(ClusterSubcommand),
     Client(ClientSubcommand),
+    Hset {
+        key: Bytes,
+        fields: Vec<(Bytes, Bytes)>,
+    },
+    Hmset {
+        key: Bytes,
+        fields: Vec<(Bytes, Bytes)>,
+    },
+    Hget {
+        key: Bytes,
+        field: Bytes,
+    },
+    Hmget {
+        key: Bytes,
+        fields: Vec<Bytes>,
+    },
+    Hdel {
+        key: Bytes,
+        fields: Vec<Bytes>,
+    },
+    Hexists {
+        key: Bytes,
+        field: Bytes,
+    },
+    Hlen(Bytes),
+    Hgetall(Bytes),
+    Hkeys(Bytes),
+    Hvals(Bytes),
     Ping(Option<Bytes>),
     CommandDocs,
     Info,
@@ -380,6 +408,92 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 _ => Ok(Some(Command::Unknown(format!("CLIENT {}", sub)))),
             }
         }
+        "HSET" => {
+            if args.len() < 4 || (args.len() - 2) % 2 != 0 {
+                return Err("wrong number of arguments for 'hset' command".to_string());
+            }
+            let key = args[1].clone();
+            let mut fields = Vec::with_capacity((args.len() - 2) / 2);
+            let mut i = 2;
+            while i < args.len() {
+                fields.push((args[i].clone(), args[i + 1].clone()));
+                i += 2;
+            }
+            Ok(Some(Command::Hset { key, fields }))
+        }
+        "HMSET" => {
+            if args.len() < 4 || (args.len() - 2) % 2 != 0 {
+                return Err("wrong number of arguments for 'hmset' command".to_string());
+            }
+            let key = args[1].clone();
+            let mut fields = Vec::with_capacity((args.len() - 2) / 2);
+            let mut i = 2;
+            while i < args.len() {
+                fields.push((args[i].clone(), args[i + 1].clone()));
+                i += 2;
+            }
+            Ok(Some(Command::Hmset { key, fields }))
+        }
+        "HGET" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'hget' command".to_string());
+            }
+            Ok(Some(Command::Hget {
+                key: args[1].clone(),
+                field: args[2].clone(),
+            }))
+        }
+        "HMGET" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'hmget' command".to_string());
+            }
+            Ok(Some(Command::Hmget {
+                key: args[1].clone(),
+                fields: args[2..].to_vec(),
+            }))
+        }
+        "HDEL" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'hdel' command".to_string());
+            }
+            Ok(Some(Command::Hdel {
+                key: args[1].clone(),
+                fields: args[2..].to_vec(),
+            }))
+        }
+        "HEXISTS" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'hexists' command".to_string());
+            }
+            Ok(Some(Command::Hexists {
+                key: args[1].clone(),
+                field: args[2].clone(),
+            }))
+        }
+        "HLEN" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'hlen' command".to_string());
+            }
+            Ok(Some(Command::Hlen(args[1].clone())))
+        }
+        "HGETALL" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'hgetall' command".to_string());
+            }
+            Ok(Some(Command::Hgetall(args[1].clone())))
+        }
+        "HKEYS" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'hkeys' command".to_string());
+            }
+            Ok(Some(Command::Hkeys(args[1].clone())))
+        }
+        "HVALS" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'hvals' command".to_string());
+            }
+            Ok(Some(Command::Hvals(args[1].clone())))
+        }
         "COMMAND" => Ok(Some(Command::CommandDocs)),
         "INFO" => Ok(Some(Command::Info)),
         "QUIT" => Ok(Some(Command::Quit)),
@@ -476,5 +590,69 @@ mod tests {
         let mut buf = BytesMut::from("TTL foo\r\n");
         let cmd = parse_command(&mut buf).unwrap().unwrap();
         assert_eq!(cmd, Command::Ttl(Bytes::from_static(b"foo"), false));
+    }
+
+    #[test]
+    fn test_resp_hash_commands() {
+        let mut buf = BytesMut::from("HSET myhash f1 v1 f2 v2\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::Hset {
+                key: Bytes::from_static(b"myhash"),
+                fields: vec![
+                    (Bytes::from_static(b"f1"), Bytes::from_static(b"v1")),
+                    (Bytes::from_static(b"f2"), Bytes::from_static(b"v2")),
+                ],
+            }
+        );
+
+        let mut buf = BytesMut::from("HGET myhash f1\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::Hget {
+                key: Bytes::from_static(b"myhash"),
+                field: Bytes::from_static(b"f1"),
+            }
+        );
+
+        let mut buf = BytesMut::from("HMGET myhash f1 f2\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::Hmget {
+                key: Bytes::from_static(b"myhash"),
+                fields: vec![Bytes::from_static(b"f1"), Bytes::from_static(b"f2")],
+            }
+        );
+
+        let mut buf = BytesMut::from("HDEL myhash f1\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::Hdel {
+                key: Bytes::from_static(b"myhash"),
+                fields: vec![Bytes::from_static(b"f1")],
+            }
+        );
+
+        let mut buf = BytesMut::from("HEXISTS myhash f1\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::Hexists {
+                key: Bytes::from_static(b"myhash"),
+                field: Bytes::from_static(b"f1"),
+            }
+        );
+
+        let mut buf = BytesMut::from("HLEN myhash\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(cmd, Command::Hlen(Bytes::from_static(b"myhash")));
+
+        let mut buf = BytesMut::from("HGETALL myhash\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(cmd, Command::Hgetall(Bytes::from_static(b"myhash")));
     }
 }

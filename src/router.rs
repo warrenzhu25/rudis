@@ -3,6 +3,7 @@ use std::rc::Rc;
 use std::time::Duration;
 use bytes::Bytes;
 
+use crate::resp::Command;
 use crate::shard::{ShardDb, ShardMessage};
 
 /// Extracts the hash tag from a key if present (e.g. "{user:1}:profile" -> "user:1").
@@ -285,5 +286,21 @@ impl Router {
             }
         }
         out
+    }
+
+    pub async fn execute_remote(&self, target: usize, cmd: Command) -> Vec<u8> {
+        let (tx, rx) = flume::bounded(1);
+        let msg = ShardMessage::Batch {
+            items: vec![(0, cmd)],
+            responder: tx,
+        };
+        if self.senders[target].send(msg).is_ok() {
+            if let Ok(mut res) = rx.recv_async().await {
+                if let Some((_, out)) = res.pop() {
+                    return out;
+                }
+            }
+        }
+        b"-ERR internal shard routing error\r\n".to_vec()
     }
 }

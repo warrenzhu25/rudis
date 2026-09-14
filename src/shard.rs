@@ -66,6 +66,7 @@ pub enum ShardMessage {
 /// it requires NO Mutex and NO cross-thread synchronization.
 pub struct ShardDb {
     entries: HashMap<Bytes, Bytes>,
+    hashes: HashMap<Bytes, HashMap<Bytes, Bytes>>,
     expirations: HashMap<Bytes, Instant>,
     slot_to_keys: HashMap<u16, HashSet<Bytes>>,
 }
@@ -74,6 +75,7 @@ impl ShardDb {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            hashes: HashMap::new(),
             expirations: HashMap::new(),
             slot_to_keys: HashMap::new(),
         }
@@ -90,6 +92,7 @@ impl ShardDb {
                     set.remove(key);
                 }
                 self.entries.remove(key);
+                self.hashes.remove(key);
                 self.expirations.remove(key);
                 return true;
             }
@@ -109,6 +112,7 @@ impl ShardDb {
     pub fn set(&mut self, key: Bytes, value: Bytes, expire_in: Option<Duration>) {
         let slot = crate::router::key_slot(&key);
         self.slot_to_keys.entry(slot).or_default().insert(key.clone());
+        self.hashes.remove(&key);
         if let Some(d) = expire_in {
             self.expirations.insert(key.clone(), Instant::now() + d);
         } else {
@@ -124,7 +128,9 @@ impl ShardDb {
             set.remove(key);
         }
         self.expirations.remove(key);
-        self.entries.remove(key).is_some()
+        let removed_str = self.entries.remove(key).is_some();
+        let removed_hash = self.hashes.remove(key).is_some();
+        removed_str || removed_hash
     }
 
     #[inline]
@@ -132,11 +138,14 @@ impl ShardDb {
         if self.check_expired(key) {
             return false;
         }
-        self.entries.contains_key(key)
+        self.entries.contains_key(key) || self.hashes.contains_key(key)
     }
 
     pub fn incr_by(&mut self, key: Bytes, delta: i64) -> Result<i64, String> {
         let _ = self.check_expired(&key);
+        if self.hashes.contains_key(&key) {
+            return Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string());
+        }
         let current = match self.entries.get(&key) {
             Some(bytes) => {
                 let s = std::str::from_utf8(bytes)
@@ -155,11 +164,20 @@ impl ShardDb {
     }
 
     pub fn expire(&mut self, key: &[u8], duration: Duration) -> bool {
-        if self.check_expired(key) || !self.entries.contains_key(key) {
+        if self.check_expired(key) {
             return false;
         }
-        if let Some((k, _)) = self.entries.get_key_value(key) {
-            self.expirations.insert(k.clone(), Instant::now() + duration);
+        let exists = self.entries.contains_key(key) || self.hashes.contains_key(key);
+        if !exists {
+            return false;
+        }
+        let k = self
+            .entries
+            .get_key_value(key)
+            .map(|(k, _)| k.clone())
+            .or_else(|| self.hashes.get_key_value(key).map(|(k, _)| k.clone()));
+        if let Some(k) = k {
+            self.expirations.insert(k, Instant::now() + duration);
             true
         } else {
             false
@@ -167,14 +185,22 @@ impl ShardDb {
     }
 
     pub fn persist(&mut self, key: &[u8]) -> bool {
-        if self.check_expired(key) || !self.entries.contains_key(key) {
+        if self.check_expired(key) {
+            return false;
+        }
+        let exists = self.entries.contains_key(key) || self.hashes.contains_key(key);
+        if !exists {
             return false;
         }
         self.expirations.remove(key).is_some()
     }
 
     pub fn ttl(&mut self, key: &[u8], in_millis: bool) -> i64 {
-        if self.check_expired(key) || !self.entries.contains_key(key) {
+        if self.check_expired(key) {
+            return -2;
+        }
+        let exists = self.entries.contains_key(key) || self.hashes.contains_key(key);
+        if !exists {
             return -2; // Key does not exist
         }
         match self.expirations.get(key) {
@@ -186,6 +212,7 @@ impl ShardDb {
                         set.remove(key);
                     }
                     self.entries.remove(key);
+                    self.hashes.remove(key);
                     self.expirations.remove(key);
                     -2
                 } else {
@@ -198,6 +225,138 @@ impl ShardDb {
                 }
             }
             None => -1, // Key exists with no expiration
+        }
+    }
+
+    pub fn hset(&mut self, key: Bytes, fields: Vec<(Bytes, Bytes)>) -> Result<usize, &'static str> {
+        let _ = self.check_expired(&key);
+        if self.entries.contains_key(&key) {
+            return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
+        }
+        let slot = crate::router::key_slot(&key);
+        self.slot_to_keys.entry(slot).or_default().insert(key.clone());
+
+        let map = self.hashes.entry(key).or_default();
+        let mut added = 0;
+        for (f, v) in fields {
+            if map.insert(f, v).is_none() {
+                added += 1;
+            }
+        }
+        Ok(added)
+    }
+
+    pub fn hget(&mut self, key: &[u8], field: &[u8]) -> Result<Option<Bytes>, &'static str> {
+        if self.check_expired(key) {
+            return Ok(None);
+        }
+        if self.entries.contains_key(key) {
+            return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
+        }
+        Ok(self.hashes.get(key).and_then(|m| m.get(field).cloned()))
+    }
+
+    pub fn hmget(&mut self, key: &[u8], fields: &[Bytes]) -> Result<Vec<Option<Bytes>>, &'static str> {
+        if self.check_expired(key) {
+            return Ok(vec![None; fields.len()]);
+        }
+        if self.entries.contains_key(key) {
+            return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
+        }
+        if let Some(map) = self.hashes.get(key) {
+            Ok(fields.iter().map(|f| map.get(f).cloned()).collect())
+        } else {
+            Ok(vec![None; fields.len()])
+        }
+    }
+
+    pub fn hdel(&mut self, key: &[u8], fields: &[Bytes]) -> Result<usize, &'static str> {
+        if self.check_expired(key) {
+            return Ok(0);
+        }
+        if self.entries.contains_key(key) {
+            return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
+        }
+        if let Some(map) = self.hashes.get_mut(key) {
+            let mut count = 0;
+            for f in fields {
+                if map.remove(f).is_some() {
+                    count += 1;
+                }
+            }
+            if map.is_empty() {
+                self.hashes.remove(key);
+                self.expirations.remove(key);
+                let slot = crate::router::key_slot(key);
+                if let Some(set) = self.slot_to_keys.get_mut(&slot) {
+                    set.remove(key);
+                }
+            }
+            Ok(count)
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn hexists(&mut self, key: &[u8], field: &[u8]) -> Result<bool, &'static str> {
+        if self.check_expired(key) {
+            return Ok(false);
+        }
+        if self.entries.contains_key(key) {
+            return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
+        }
+        Ok(self.hashes.get(key).map_or(false, |m| m.contains_key(field)))
+    }
+
+    pub fn hlen(&mut self, key: &[u8]) -> Result<usize, &'static str> {
+        if self.check_expired(key) {
+            return Ok(0);
+        }
+        if self.entries.contains_key(key) {
+            return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
+        }
+        Ok(self.hashes.get(key).map_or(0, |m| m.len()))
+    }
+
+    pub fn hgetall(&mut self, key: &[u8]) -> Result<Vec<(Bytes, Bytes)>, &'static str> {
+        if self.check_expired(key) {
+            return Ok(Vec::new());
+        }
+        if self.entries.contains_key(key) {
+            return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
+        }
+        if let Some(map) = self.hashes.get(key) {
+            Ok(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub fn hkeys(&mut self, key: &[u8]) -> Result<Vec<Bytes>, &'static str> {
+        if self.check_expired(key) {
+            return Ok(Vec::new());
+        }
+        if self.entries.contains_key(key) {
+            return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
+        }
+        if let Some(map) = self.hashes.get(key) {
+            Ok(map.keys().cloned().collect())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub fn hvals(&mut self, key: &[u8]) -> Result<Vec<Bytes>, &'static str> {
+        if self.check_expired(key) {
+            return Ok(Vec::new());
+        }
+        if self.entries.contains_key(key) {
+            return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
+        }
+        if let Some(map) = self.hashes.get(key) {
+            Ok(map.values().cloned().collect())
+        } else {
+            Ok(Vec::new())
         }
     }
 
@@ -256,6 +415,7 @@ impl ShardDb {
                 set.remove(&k);
             }
             self.entries.remove(&k);
+            self.hashes.remove(&k);
             self.expirations.remove(&k);
         }
         count
@@ -263,6 +423,7 @@ impl ShardDb {
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.len() + self.hashes.len()
     }
 }
+
