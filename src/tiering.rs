@@ -21,6 +21,57 @@ pub struct TieringStats {
     pub disk_reads: AtomicU64,
     pub disk_writes: AtomicU64,
     pub dead_bytes: AtomicU64,
+    pub cooled_keys: AtomicU64,
+    pub decommit_count: AtomicU64,
+    pub max_memory: AtomicU64,
+}
+
+#[inline]
+pub fn set_max_memory(port: u16, bytes: u64) {
+    get_tier_stats(port).max_memory.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub fn get_max_memory(port: u16) -> u64 {
+    get_tier_stats(port).max_memory.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn format_bytes_human(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{}B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.2}K", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.2}M", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2}G", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+pub fn parse_memory_bytes(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let lower = s.to_lowercase();
+    let (num_part, multiplier) = if lower.ends_with("gb") {
+        (&lower[..lower.len() - 2], 1024 * 1024 * 1024)
+    } else if lower.ends_with('g') {
+        (&lower[..lower.len() - 1], 1024 * 1024 * 1024)
+    } else if lower.ends_with("mb") {
+        (&lower[..lower.len() - 2], 1024 * 1024)
+    } else if lower.ends_with('m') {
+        (&lower[..lower.len() - 1], 1024 * 1024)
+    } else if lower.ends_with("kb") {
+        (&lower[..lower.len() - 2], 1024)
+    } else if lower.ends_with('k') {
+        (&lower[..lower.len() - 1], 1024)
+    } else if lower.ends_with('b') {
+        (&lower[..lower.len() - 1], 1)
+    } else {
+        (lower.as_str(), 1)
+    };
+    num_part.trim().parse::<u64>().ok().map(|n| n * multiplier)
 }
 
 static TIER_STATS: RwLock<Option<HashMap<u16, Arc<TieringStats>>>> = RwLock::new(None);
@@ -181,5 +232,27 @@ mod tests {
 
         assert_eq!(&record[21..21 + key_len], key);
         assert_eq!(&record[21 + key_len..21 + key_len + val_len], val);
+    }
+
+    #[test]
+    fn test_max_memory_parsing_and_formatting() {
+        assert_eq!(parse_memory_bytes("1024"), Some(1024));
+        assert_eq!(parse_memory_bytes("64k"), Some(64 * 1024));
+        assert_eq!(parse_memory_bytes("128KB"), Some(128 * 1024));
+        assert_eq!(parse_memory_bytes("16m"), Some(16 * 1024 * 1024));
+        assert_eq!(parse_memory_bytes("2MB"), Some(2 * 1024 * 1024));
+        assert_eq!(parse_memory_bytes("1g"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_memory_bytes("4GB"), Some(4 * 1024 * 1024 * 1024));
+        assert_eq!(parse_memory_bytes("invalid"), None);
+
+        assert_eq!(format_bytes_human(500), "500B");
+        assert_eq!(format_bytes_human(2048), "2.00K");
+        assert_eq!(format_bytes_human(10 * 1024 * 1024), "10.00M");
+        assert_eq!(format_bytes_human(2 * 1024 * 1024 * 1024), "2.00G");
+
+        set_max_memory(0, 50 * 1024 * 1024);
+        assert_eq!(get_max_memory(0), 50 * 1024 * 1024);
+        set_max_memory(0, 0);
+        assert_eq!(get_max_memory(0), 0);
     }
 }

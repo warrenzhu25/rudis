@@ -213,6 +213,10 @@ pub fn run_shard_worker(
                                 aof.borrow_mut().append(&bytes);
                             }
                         }
+                        let r = cross_shard_router.clone();
+                        monoio::spawn(async move {
+                            r.check_auto_tier().await;
+                        });
                         let _ = responder.send(());
                     }
                     ShardMessage::Del { key, responder } => {
@@ -473,14 +477,14 @@ pub fn run_shard_worker(
                     ShardMessage::TierSpill { key, responder } => {
                         let r = cross_shard_router.clone();
                         monoio::spawn(async move {
-                            let ok = r.spill_key(&key).await;
+                            let ok = r.spill_local(&key).await;
                             let _ = responder.send(ok);
                         });
                     }
                     ShardMessage::TierLoad { key, responder } => {
                         let r = cross_shard_router.clone();
                         monoio::spawn(async move {
-                            let ok = r.ensure_loaded(&key).await;
+                            let ok = r.load_local(&key).await;
                             let _ = responder.send(ok);
                         });
                     }
@@ -490,6 +494,21 @@ pub fn run_shard_worker(
                             let count = r.spill_all().await;
                             let _ = responder.send(count);
                         });
+                    }
+                    ShardMessage::TierCool { key, responder } => {
+                        let r = cross_shard_router.clone();
+                        monoio::spawn(async move {
+                            let ok = r.cool_local(&key).await;
+                            let _ = responder.send(ok);
+                        });
+                    }
+                    ShardMessage::TierDecommit { key, responder } => {
+                        let count = cross_shard_router.decommit_local(key.as_deref());
+                        let _ = responder.send(count);
+                    }
+                    ShardMessage::GetUsedMemory { responder } => {
+                        let used = cross_shard_db.borrow().table.used_memory;
+                        let _ = responder.send(used);
                     }
                 }
             }

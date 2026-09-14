@@ -159,6 +159,10 @@ impl Router {
     }
 
     pub async fn spill_local(&self, key: &[u8]) -> bool {
+        if self.local_db.borrow_mut().table.is_cooled(key).is_some() {
+            return self.decommit_local(Some(key)) > 0;
+        }
+
         let (entry_data, val_type) = match self.local_db.borrow_mut().table.get_value_for_spill(key) {
             Some(p) => p,
             None => return false,
@@ -234,10 +238,191 @@ impl Router {
         if db.table.restore_tiered_value(&record_key, val) {
             stats.disk_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             stats.tiered_keys.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            stats.dead_bytes.fetch_add(ptr.length as u64, std::sync::atomic::Ordering::Relaxed);
+            stats.cooled_keys.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stats.ram_saved_bytes.fetch_sub(val_payload.len() as u64, std::sync::atomic::Ordering::Relaxed);
             true
         } else {
             false
+        }
+    }
+
+    pub async fn cool_local(&self, key: &[u8]) -> bool {
+        if self.local_db.borrow_mut().table.is_tiered(key).is_some()
+            || self.local_db.borrow_mut().table.is_cooled(key).is_some()
+        {
+            return false;
+        }
+
+        let (entry_data, val_type) = match self.local_db.borrow_mut().table.get_value_for_spill(key) {
+            Some(p) => p,
+            None => return false,
+        };
+
+        let (file, offset, stats, shard_id) = {
+            let mut db = self.local_db.borrow_mut();
+            if let Some(tm) = &mut db.tier_manager {
+                let off = tm.current_offset;
+                (tm.file.clone(), off, tm.stats.clone(), tm.shard_id)
+            } else {
+                return false;
+            }
+        };
+
+        let record = crate::tiering::encode_tiered_record(key, &entry_data, val_type);
+        let record_len = record.len() as u32;
+
+        let (res, _) = file.write_all_at(record, offset).await;
+        if res.is_err() {
+            return false;
+        }
+
+        let ptr = crate::table::TieredPointer {
+            file_id: shard_id as u32,
+            offset,
+            length: record_len,
+            value_type: val_type,
+        };
+
+        let mut db = self.local_db.borrow_mut();
+        if let Some(tm) = &mut db.tier_manager {
+            tm.current_offset += record_len as u64;
+        }
+        if db.table.set_cooled_pointer(key, ptr) {
+            stats.disk_writes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stats.cooled_keys.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stats.tiered_bytes.fetch_add(record_len as u64, std::sync::atomic::Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn decommit_local(&self, key: Option<&[u8]>) -> usize {
+        let mut db = self.local_db.borrow_mut();
+        let stats = match &db.tier_manager {
+            Some(tm) => tm.stats.clone(),
+            None => return 0,
+        };
+
+        if let Some(k) = key {
+            if let Some((_, freed)) = db.table.decommit_cooled_key(k) {
+                stats.cooled_keys.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                stats.tiered_keys.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                stats.ram_saved_bytes.fetch_add(freed as u64, std::sync::atomic::Ordering::Relaxed);
+                stats.decommit_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                1
+            } else {
+                0
+            }
+        } else {
+            let (count, freed) = db.table.decommit_all_cooled();
+            if count > 0 {
+                stats.cooled_keys.fetch_sub(count as u64, std::sync::atomic::Ordering::Relaxed);
+                stats.tiered_keys.fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+                stats.ram_saved_bytes.fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
+                stats.decommit_count.fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            count
+        }
+    }
+
+    pub async fn cool_key(&self, key: &[u8]) -> bool {
+        let target = target_shard(key, self.num_shards);
+        if target == self.shard_id {
+            self.cool_local(key).await
+        } else {
+            let (tx, rx) = flume::bounded(1);
+            let msg = ShardMessage::TierCool {
+                key: Bytes::copy_from_slice(key),
+                responder: tx,
+            };
+            if self.senders[target].send(msg).is_ok() {
+                rx.recv_async().await.unwrap_or(false)
+            } else {
+                false
+            }
+        }
+    }
+
+    pub async fn decommit(&self, key: Option<&[u8]>) -> usize {
+        if let Some(k) = key {
+            let target = target_shard(k, self.num_shards);
+            if target == self.shard_id {
+                self.decommit_local(Some(k))
+            } else {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::TierDecommit {
+                    key: Some(Bytes::copy_from_slice(k)),
+                    responder: tx,
+                };
+                if self.senders[target].send(msg).is_ok() {
+                    rx.recv_async().await.unwrap_or(0)
+                } else {
+                    0
+                }
+            }
+        } else {
+            let mut total = 0;
+            for s in 0..self.num_shards {
+                if s == self.shard_id {
+                    total += self.decommit_local(None);
+                } else {
+                    let (tx, rx) = flume::bounded(1);
+                    let msg = ShardMessage::TierDecommit {
+                        key: None,
+                        responder: tx,
+                    };
+                    if self.senders[s].send(msg).is_ok() {
+                        total += rx.recv_async().await.unwrap_or(0);
+                    }
+                }
+            }
+            total
+        }
+    }
+
+    pub async fn get_total_used_memory(&self) -> usize {
+        let mut total = self.local_db.borrow().table.used_memory;
+        for s in 0..self.num_shards {
+            if s != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::GetUsedMemory { responder: tx };
+                if self.senders[s].send(msg).is_ok() {
+                    total += rx.recv_async().await.unwrap_or(0);
+                }
+            }
+        }
+        total
+    }
+
+    pub async fn check_auto_tier(&self) {
+        let max_mem = crate::tiering::get_max_memory(self.port);
+        if max_mem == 0 {
+            return;
+        }
+        let shard_max_mem = (max_mem / self.num_shards.max(1) as u64).max(1) as usize;
+
+        let used = self.local_db.borrow().table.used_memory;
+        if used <= shard_max_mem {
+            return;
+        }
+
+        // Phase 1: Instant Zero-I/O Decommit of all Cooled keys
+        let decommitted = self.decommit_local(None);
+        if decommitted > 0 {
+            let used_after = self.local_db.borrow().table.used_memory;
+            if used_after <= shard_max_mem {
+                return;
+            }
+        }
+
+        // Phase 2: Spill Hot keys to NVMe disk until under shard_max_mem
+        let hot_keys = self.local_db.borrow_mut().table.get_hot_keys_for_spill(64);
+        for k in hot_keys {
+            let _ = self.spill_local(&k).await;
+            if self.local_db.borrow().table.used_memory <= shard_max_mem {
+                break;
+            }
         }
     }
 
@@ -338,6 +523,7 @@ impl Router {
                     aof.borrow_mut().append(&bytes);
                 }
             }
+            self.check_auto_tier().await;
         } else {
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::Set {

@@ -194,6 +194,17 @@ pub enum ShardMessage {
     TierSpillAll {
         responder: flume::Sender<usize>,
     },
+    TierCool {
+        key: Bytes,
+        responder: flume::Sender<bool>,
+    },
+    TierDecommit {
+        key: Option<Bytes>,
+        responder: flume::Sender<usize>,
+    },
+    GetUsedMemory {
+        responder: flume::Sender<usize>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -242,6 +253,11 @@ impl ShardDb {
                 tm.stats.tiered_keys.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 tm.stats.dead_bytes.fetch_add(ptr.length as u64, std::sync::atomic::Ordering::Relaxed);
             }
+        } else if let Some(ptr) = self.table.is_cooled(&key) {
+            if let Some(tm) = &self.tier_manager {
+                tm.stats.cooled_keys.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                tm.stats.dead_bytes.fetch_add(ptr.length as u64, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         self.table.set(key, value, expire_in);
     }
@@ -249,11 +265,17 @@ impl ShardDb {
     #[inline]
     pub fn del(&mut self, key: &[u8]) -> bool {
         let ptr = self.table.is_tiered(key);
+        let cooled_ptr = if ptr.is_none() { self.table.is_cooled(key) } else { None };
         let deleted = self.table.del(key);
         if deleted {
             if let Some(ptr) = ptr {
                 if let Some(tm) = &self.tier_manager {
                     tm.stats.tiered_keys.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    tm.stats.dead_bytes.fetch_add(ptr.length as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+            } else if let Some(ptr) = cooled_ptr {
+                if let Some(tm) = &self.tier_manager {
+                    tm.stats.cooled_keys.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     tm.stats.dead_bytes.fetch_add(ptr.length as u64, std::sync::atomic::Ordering::Relaxed);
                 }
             }

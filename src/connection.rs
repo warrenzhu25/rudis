@@ -1262,7 +1262,7 @@ async fn migrate_keys_to_node(
                     );
                 }
             }
-            crate::table::RudisValue::Tiered(_) => {}
+            crate::table::RudisValue::Tiered(_) | crate::table::RudisValue::Cooled { .. } => {}
         }
     }
 
@@ -1419,6 +1419,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Replconf(_) => "REPLCONF",
         Command::Role => "ROLE",
         Command::Tier(_) => "TIER",
+        Command::ConfigGet(_) | Command::ConfigSet(_, _) => "CONFIG",
         Command::Quit => "QUIT",
         Command::Subscribe(_) => "SUBSCRIBE",
         Command::Unsubscribe(_) => "UNSUBSCRIBE",
@@ -1678,14 +1679,31 @@ async fn execute_command(
         Command::Info(section) => {
             let hub = crate::replication::get_replication_hub(router.port);
             let stats = crate::tiering::get_tier_stats(router.port);
+            let max_mem = crate::tiering::get_max_memory(router.port);
+            let used_mem = router.get_total_used_memory().await;
+            let memory_str = format!(
+                "# Memory\r\nused_memory:{}\r\nused_memory_human:{}\r\nmaxmemory:{}\r\nmaxmemory_human:{}\r\ncooled_keys:{}\r\ntiered_keys:{}\r\n",
+                used_mem,
+                crate::tiering::format_bytes_human(used_mem as u64),
+                max_mem,
+                crate::tiering::format_bytes_human(max_mem),
+                stats.cooled_keys.load(std::sync::atomic::Ordering::Relaxed),
+                stats.tiered_keys.load(std::sync::atomic::Ordering::Relaxed),
+            );
             let storage_str = format!(
-                "# Storage\r\ntier_enabled:1\r\ntiered_keys:{}\r\ntiered_bytes:{}\r\nram_saved_bytes:{}\r\ndisk_reads:{}\r\ndisk_writes:{}\r\ndead_bytes:{}\r\n",
+                "# Storage\r\ntier_enabled:1\r\nmaxmemory:{}\r\nmaxmemory_human:{}\r\nused_memory:{}\r\nused_memory_human:{}\r\ncooled_keys:{}\r\ntiered_keys:{}\r\ntiered_bytes:{}\r\nram_saved_bytes:{}\r\ndisk_reads:{}\r\ndisk_writes:{}\r\ndead_bytes:{}\r\ndecommit_count:{}\r\n",
+                max_mem,
+                crate::tiering::format_bytes_human(max_mem),
+                used_mem,
+                crate::tiering::format_bytes_human(used_mem as u64),
+                stats.cooled_keys.load(std::sync::atomic::Ordering::Relaxed),
                 stats.tiered_keys.load(std::sync::atomic::Ordering::Relaxed),
                 stats.tiered_bytes.load(std::sync::atomic::Ordering::Relaxed),
                 stats.ram_saved_bytes.load(std::sync::atomic::Ordering::Relaxed),
                 stats.disk_reads.load(std::sync::atomic::Ordering::Relaxed),
                 stats.disk_writes.load(std::sync::atomic::Ordering::Relaxed),
                 stats.dead_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                stats.decommit_count.load(std::sync::atomic::Ordering::Relaxed),
             );
             let info_str = match section.as_deref() {
                 Some(b"replication") | Some(b"REPLICATION") => {
@@ -1694,12 +1712,16 @@ async fn execute_command(
                 Some(b"storage") | Some(b"STORAGE") => {
                     storage_str
                 }
+                Some(b"memory") | Some(b"MEMORY") => {
+                    memory_str
+                }
                 _ => {
                     format!(
                         "# Server\r\nrudis_version:0.1.0\r\narch:shared-nothing-io_uring\r\nshard_id:{}\r\nnum_shards:{}\r\n\
                          # Replication\r\n{}\
+                         {}\
                          {}",
-                        router.shard_id, router.num_shards, hub.format_info_replication(), storage_str
+                        router.shard_id, router.num_shards, hub.format_info_replication(), memory_str, storage_str
                     )
                 }
             };
@@ -1782,6 +1804,14 @@ async fn execute_command(
                     let ok = router.spill_key(&key).await;
                     out.extend_from_slice(if ok { b":1\r\n" } else { b":0\r\n" });
                 }
+                crate::resp::TierSubcommand::Cool(key) => {
+                    let ok = router.cool_key(&key).await;
+                    out.extend_from_slice(if ok { b":1\r\n" } else { b":0\r\n" });
+                }
+                crate::resp::TierSubcommand::Decommit(key) => {
+                    let count = router.decommit(key.as_deref()).await;
+                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                }
                 crate::resp::TierSubcommand::Load(key) => {
                     let ok = router.ensure_loaded(&key).await;
                     out.extend_from_slice(if ok { b":1\r\n" } else { b":0\r\n" });
@@ -1802,17 +1832,55 @@ async fn execute_command(
                 }
                 crate::resp::TierSubcommand::Info => {
                     let stats = crate::tiering::get_tier_stats(router.port);
+                    let max_mem = crate::tiering::get_max_memory(router.port);
+                    let used_mem = router.get_total_used_memory().await;
                     let info = format!(
-                        "# Tiered Storage (io_uring NVMe)\r\ntier_enabled:1\r\ntiered_keys:{}\r\ntiered_bytes:{}\r\nram_saved_bytes:{}\r\ndisk_reads:{}\r\ndisk_writes:{}\r\ndead_bytes:{}\r\n",
+                        "# Tiered Storage (io_uring NVMe)\r\ntier_enabled:1\r\nmaxmemory:{}\r\nmaxmemory_human:{}\r\nused_memory:{}\r\nused_memory_human:{}\r\ncooled_keys:{}\r\ntiered_keys:{}\r\ntiered_bytes:{}\r\nram_saved_bytes:{}\r\ndisk_reads:{}\r\ndisk_writes:{}\r\ndead_bytes:{}\r\ndecommit_count:{}\r\n",
+                        max_mem,
+                        crate::tiering::format_bytes_human(max_mem),
+                        used_mem,
+                        crate::tiering::format_bytes_human(used_mem as u64),
+                        stats.cooled_keys.load(std::sync::atomic::Ordering::Relaxed),
                         stats.tiered_keys.load(std::sync::atomic::Ordering::Relaxed),
                         stats.tiered_bytes.load(std::sync::atomic::Ordering::Relaxed),
                         stats.ram_saved_bytes.load(std::sync::atomic::Ordering::Relaxed),
                         stats.disk_reads.load(std::sync::atomic::Ordering::Relaxed),
                         stats.disk_writes.load(std::sync::atomic::Ordering::Relaxed),
                         stats.dead_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                        stats.decommit_count.load(std::sync::atomic::Ordering::Relaxed),
                     );
                     out.extend_from_slice(format!("${}\r\n{}\r\n", info.len(), info).as_bytes());
                 }
+            }
+            false
+        }
+        Command::ConfigGet(param) => {
+            let p_str = String::from_utf8_lossy(&param).to_lowercase();
+            if p_str == "maxmemory" || p_str == "*" {
+                let max_mem = crate::tiering::get_max_memory(router.port).to_string();
+                let resp = format!(
+                    "*2\r\n$9\r\nmaxmemory\r\n${}\r\n{}\r\n",
+                    max_mem.len(),
+                    max_mem
+                );
+                out.extend_from_slice(resp.as_bytes());
+            } else {
+                out.extend_from_slice(b"*0\r\n");
+            }
+            false
+        }
+        Command::ConfigSet(param, val) => {
+            let p_str = String::from_utf8_lossy(&param).to_lowercase();
+            if p_str == "maxmemory" {
+                let val_str = String::from_utf8_lossy(&val);
+                if let Some(bytes) = crate::tiering::parse_memory_bytes(&val_str) {
+                    crate::tiering::set_max_memory(router.port, bytes);
+                    out.extend_from_slice(b"+OK\r\n");
+                } else {
+                    out.extend_from_slice(b"-ERR Invalid argument for CONFIG SET maxmemory\r\n");
+                }
+            } else {
+                out.extend_from_slice(b"+OK\r\n");
             }
             false
         }
@@ -3288,7 +3356,7 @@ async fn execute_command(
                             );
                         }
                     }
-                    crate::table::RudisValue::Tiered(_) => {}
+                    crate::table::RudisValue::Tiered(_) | crate::table::RudisValue::Cooled { .. } => {}
                 }
             }
 
@@ -3576,8 +3644,6 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Linsert { key, .. }
         | Command::Incrbyfloat { key, .. }
         | Command::Setrange { key, .. }
-        | Command::Tier(crate::resp::TierSubcommand::Spill(key))
-        | Command::Tier(crate::resp::TierSubcommand::Load(key))
         | Command::Getrange { key, .. } => Some(target_shard(key, num_shards)),
         Command::Smove { source, destination, .. } => {
             let s1 = target_shard(source, num_shards);
@@ -5925,6 +5991,8 @@ async fn execute_commands_squashed(
                     | Command::Auth { .. }
                     | Command::Acl(_)
                     | Command::Tier(_)
+                    | Command::ConfigGet(_)
+                    | Command::ConfigSet(_, _)
                     | Command::Xread { block_ms: Some(_), .. }
                     | Command::Xreadgroup { block_ms: Some(_), .. }
             ) {

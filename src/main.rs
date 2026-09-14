@@ -26,10 +26,20 @@ struct Args {
     /// Directory to store AOF files
     #[arg(long, default_value = ".")]
     aof_dir: std::path::PathBuf,
+
+    /// Max memory limit for tiered storage auto-tiering (e.g. 512mb, 1gb)
+    #[arg(long)]
+    maxmemory: Option<String>,
 }
 
 fn main() {
     let args = Args::parse();
+
+    if let Some(ref m) = args.maxmemory {
+        if let Some(bytes) = rudis::tiering::parse_memory_bytes(m) {
+            rudis::tiering::set_max_memory(args.port, bytes);
+        }
+    }
 
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
     let num_cores = if !core_ids.is_empty() {

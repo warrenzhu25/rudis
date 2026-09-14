@@ -2874,6 +2874,129 @@ fn test_nvme_tiered_storage_e2e() {
     assert_eq!(send_and_read(&mut client, b"GET item:1\r\n"), "$-1\r\n");
 }
 
+#[test]
+fn test_auto_tiering_memory_pressure_e2e() {
+    let port = 16490;
+    start_test_server(port, 2);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Test CONFIG SET and CONFIG GET maxmemory
+    let get_maxmem = send_and_read(&mut client, b"CONFIG GET maxmemory\r\n");
+    assert!(get_maxmem.contains("maxmemory"));
+
+    let set_maxmem = send_and_read(&mut client, b"CONFIG SET maxmemory 500000\r\n");
+    assert_eq!(set_maxmem, "+OK\r\n");
+
+    let get_maxmem2 = send_and_read(&mut client, b"CONFIG GET maxmemory\r\n");
+    assert_eq!(get_maxmem2, "*2\r\n$9\r\nmaxmemory\r\n$6\r\n500000\r\n");
+
+    let set_human = send_and_read(&mut client, b"CONFIG SET maxmemory 100mb\r\n");
+    assert_eq!(set_human, "+OK\r\n");
+    let get_human = send_and_read(&mut client, b"CONFIG GET maxmemory\r\n");
+    assert_eq!(get_human, "*2\r\n$9\r\nmaxmemory\r\n$9\r\n104857600\r\n");
+
+    // 2. Test INFO memory
+    let mem_info = send_and_read(&mut client, b"INFO memory\r\n");
+    assert!(mem_info.contains("# Memory"));
+    assert!(mem_info.contains("used_memory:"));
+    assert!(mem_info.contains("maxmemory:104857600"));
+
+    // 3. Test Three-State Value Lifecycle: Hot -> Cooled -> Cold -> Cooled
+    let val_payload = "X".repeat(300);
+    assert_eq!(
+        send_and_read(&mut client, format!("SET cool_key {}\r\n", val_payload).as_bytes()),
+        "+OK\r\n"
+    );
+
+    // Stash to NVMe but retain in DRAM (Hot -> Cooled)
+    let cool_resp = send_and_read(&mut client, b"TIER COOL cool_key\r\n");
+    assert_eq!(cool_resp, ":1\r\n");
+
+    let tier_info = send_and_read(&mut client, b"TIER INFO\r\n");
+    assert!(tier_info.contains("cooled_keys:1"));
+    assert!(tier_info.contains("disk_writes:1"));
+
+    // Reading Cooled key is an instant DRAM hit with ZERO disk reads!
+    let get_cooled = send_and_read(&mut client, b"GET cool_key\r\n");
+    assert_eq!(get_cooled, format!("${}\r\n{}\r\n", val_payload.len(), val_payload));
+    let tier_info2 = send_and_read(&mut client, b"TIER INFO\r\n");
+    assert!(tier_info2.contains("disk_reads:0"));
+
+    // Instant Zero-I/O Decommit: Cooled -> Cold (drops RAM buffer without disk I/O)
+    let decommit_resp = send_and_read(&mut client, b"TIER DECOMMIT cool_key\r\n");
+    assert_eq!(decommit_resp, ":1\r\n");
+
+    let tier_info3 = send_and_read(&mut client, b"TIER INFO\r\n");
+    assert!(tier_info3.contains("cooled_keys:0"));
+    assert!(tier_info3.contains("tiered_keys:1"));
+    assert!(tier_info3.contains("decommit_count:1"));
+    assert!(tier_info3.contains("disk_writes:1")); // No new disk writes!
+
+    // Reading Cold key fetches from disk via io_uring and promotes to Cooled!
+    let get_cold = send_and_read(&mut client, b"GET cool_key\r\n");
+    assert_eq!(get_cold, format!("${}\r\n{}\r\n", val_payload.len(), val_payload));
+    let tier_info4 = send_and_read(&mut client, b"TIER INFO\r\n");
+    assert!(tier_info4.contains("disk_reads:1"));
+    assert!(tier_info4.contains("cooled_keys:1"));
+    assert!(tier_info4.contains("tiered_keys:0"));
+
+    // Subsequent read is again a fast zero-I/O DRAM hit!
+    let get_again = send_and_read(&mut client, b"GET cool_key\r\n");
+    assert_eq!(get_again, format!("${}\r\n{}\r\n", val_payload.len(), val_payload));
+    let tier_info5 = send_and_read(&mut client, b"TIER INFO\r\n");
+    assert!(tier_info5.contains("disk_reads:1")); // disk_reads did NOT increment!
+
+    // Decommit all cooled keys via TIER DECOMMIT
+    let decommit_all = send_and_read(&mut client, b"TIER DECOMMIT\r\n");
+    assert_eq!(decommit_all, ":1\r\n");
+    let tier_info6 = send_and_read(&mut client, b"TIER INFO\r\n");
+    assert!(tier_info6.contains("cooled_keys:0"));
+    assert!(tier_info6.contains("tiered_keys:1"));
+
+    // 4. Auto-Tiering under Memory Pressure
+    // Retrieve current used memory
+    let mem_info2 = send_and_read(&mut client, b"INFO memory\r\n");
+    let used_mem_line = mem_info2
+        .lines()
+        .find(|l| l.starts_with("used_memory:"))
+        .unwrap();
+    let cur_used: u64 = used_mem_line.strip_prefix("used_memory:").unwrap().trim().parse().unwrap();
+
+    // Set maxmemory just slightly above current used memory (+500 bytes)
+    let limit = cur_used + 500;
+    assert_eq!(
+        send_and_read(&mut client, format!("CONFIG SET maxmemory {}\r\n", limit).as_bytes()),
+        "+OK\r\n"
+    );
+
+    // Insert multiple keys that will exceed the threshold
+    for i in 0..10 {
+        let val = "Z".repeat(200);
+        let resp = send_and_read(&mut client, format!("SET autotier:{} {}\r\n", i, val).as_bytes());
+        assert_eq!(resp, "+OK\r\n");
+    }
+
+    // Auto-tiering should have triggered spilling hot keys to NVMe
+    let tier_info_auto = send_and_read(&mut client, b"TIER INFO\r\n");
+    assert!(tier_info_auto.contains("tier_enabled:1"));
+    // Disk writes must have increased due to auto-tiering
+    assert!(!tier_info_auto.contains("disk_writes:1\r\n"));
+
+    // Verify all keys remain accessible and return correct data
+    for i in 0..10 {
+        let expected = "Z".repeat(200);
+        let resp = send_and_read(&mut client, format!("GET autotier:{}\r\n", i).as_bytes());
+        assert_eq!(resp, format!("${}\r\n{}\r\n", expected.len(), expected));
+    }
+
+    // Reset maxmemory to 0 so subsequent tests are not affected by low memory limits
+    assert_eq!(
+        send_and_read(&mut client, b"CONFIG SET maxmemory 0\r\n"),
+        "+OK\r\n"
+    );
+}
+
 
 
 

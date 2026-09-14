@@ -887,6 +887,28 @@ pub enum RudisValue {
     HyperLogLog(Box<[u8; 16384]>),
     Stream(RudisStream),
     Tiered(TieredPointer),
+    Cooled {
+        ptr: TieredPointer,
+        val: Box<RudisValue>,
+    },
+}
+
+impl RudisValue {
+    pub fn approx_bytes(&self) -> usize {
+        match self {
+            RudisValue::String(b) => b.len(),
+            RudisValue::Int(_) => 8,
+            RudisValue::SmallHash(pairs) => pairs.iter().map(|(k, v)| k.len() + v.len() + 16).sum(),
+            RudisValue::Hash(h) => h.iter().map(|(k, v)| k.len() + v.len() + 32).sum(),
+            RudisValue::List(l) => l.iter().map(|b| b.len() + 16).sum(),
+            RudisValue::Set(s) => s.len() * 32,
+            RudisValue::ZSet(z) => z.len() * 48,
+            RudisValue::HyperLogLog(_) => 16384,
+            RudisValue::Stream(s) => s.len() * 64,
+            RudisValue::Tiered(_) => 24,
+            RudisValue::Cooled { val, .. } => 24 + val.approx_bytes(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1147,14 +1169,30 @@ impl RudisFlatTable {
 pub struct RudisTable {
     table: RudisFlatTable,
     sample_cursor: usize,
+    pub used_memory: usize,
 }
 
 impl RudisTable {
     pub fn new() -> Self {
+        let base_mem = 64 * std::mem::size_of::<Option<RudisEntry>>() + 64 + GROUP_SIZE + 16384 * 4;
         Self {
             table: RudisFlatTable::new(64),
             sample_cursor: 0,
+            used_memory: base_mem,
         }
+    }
+
+    pub fn recalculate_used_memory(&mut self) -> usize {
+        let mut total = self.table.capacity * std::mem::size_of::<Option<RudisEntry>>()
+            + self.table.ctrl.len()
+            + 16384 * 4;
+        for slot in &self.table.slots {
+            if let Some(entry) = slot {
+                total += entry.key.len() + entry.val.approx_bytes() + 64;
+            }
+        }
+        self.used_memory = total;
+        total
     }
 
     #[inline]
@@ -1170,7 +1208,10 @@ impl RudisTable {
         };
 
         if is_exp {
-            self.table.remove(slot_idx);
+            if let Some(removed) = self.table.remove(slot_idx) {
+                let freed = removed.key.len() + removed.val.approx_bytes() + 64;
+                self.used_memory = self.used_memory.saturating_sub(freed);
+            }
             true
         } else {
             false
@@ -1184,7 +1225,11 @@ impl RudisTable {
                 return Ok(None);
             }
             if let Some(entry) = self.table.get_slot(idx) {
-                match &entry.val {
+                let val_ref = match &entry.val {
+                    RudisValue::Cooled { val, .. } => val.as_ref(),
+                    other => other,
+                };
+                match val_ref {
                     RudisValue::String(b) => Ok(Some(b.clone())),
                     RudisValue::Int(n) => Ok(Some(Self::format_i64(*n))),
                     RudisValue::HyperLogLog(regs) => Ok(Some(Bytes::copy_from_slice(&regs[..]))),
@@ -1213,7 +1258,11 @@ impl RudisTable {
                         None
                     }
                 });
-                return Some((entry.val.clone(), ttl));
+                let val = match &entry.val {
+                    RudisValue::Cooled { val, .. } => (**val).clone(),
+                    other => other.clone(),
+                };
+                return Some((val, ttl));
             }
         }
         None
@@ -1302,21 +1351,26 @@ impl RudisTable {
         } else {
             RudisValue::String(value)
         };
+        let val_bytes = val.approx_bytes();
         let (existing, _) = self.table.find_or_prepare_insert(&key, h);
         if let Some(idx) = existing {
             if let Some(entry) = self.table.get_slot_mut(idx) {
+                let old_bytes = entry.val.approx_bytes();
                 entry.val = val;
                 entry.expire_at = expire_at;
+                self.used_memory = self.used_memory.saturating_sub(old_bytes) + val_bytes;
                 return;
             }
         }
 
+        let entry_mem = key.len() + val_bytes + 64;
         let entry = RudisEntry {
             key,
             val,
             expire_at,
         };
         self.table.insert(entry);
+        self.used_memory += entry_mem;
     }
 
     pub fn del(&mut self, key: &[u8]) -> bool {
@@ -1326,7 +1380,9 @@ impl RudisTable {
             if was_exp {
                 return false;
             }
-            if self.table.remove(idx).is_some() {
+            if let Some(entry) = self.table.remove(idx) {
+                let freed = entry.key.len() + entry.val.approx_bytes() + 64;
+                self.used_memory = self.used_memory.saturating_sub(freed);
                 return true;
             }
         }
@@ -1563,6 +1619,10 @@ impl RudisTable {
 
     pub fn flushdb(&mut self) {
         self.table.clear();
+        let base_mem = self.table.capacity * std::mem::size_of::<Option<RudisEntry>>()
+            + self.table.ctrl.len()
+            + 16384 * 4;
+        self.used_memory = base_mem;
     }
 
     pub fn dbsize(&mut self) -> usize {
@@ -1576,7 +1636,11 @@ impl RudisTable {
                 return "none";
             }
             if let Some(entry) = self.table.get_slot(idx) {
-                match &entry.val {
+                let val_ref = match &entry.val {
+                    RudisValue::Cooled { val, .. } => val.as_ref(),
+                    other => other,
+                };
+                match val_ref {
                     RudisValue::String(_) | RudisValue::Int(_) => "string",
                     RudisValue::Hash(_) | RudisValue::SmallHash(_) => "hash",
                     RudisValue::List(_) => "list",
@@ -1594,6 +1658,7 @@ impl RudisTable {
                         6 => "stream",
                         _ => "string",
                     },
+                    RudisValue::Cooled { .. } => unreachable!(),
                 }
             } else {
                 "none"
@@ -1619,12 +1684,49 @@ impl RudisTable {
     }
 
     #[inline]
+    pub fn is_cooled(&mut self, key: &[u8]) -> Option<TieredPointer> {
+        let h = hash_key(key);
+        let idx = self.table.find(key, h)?;
+        if self.check_expired_slot(idx) {
+            return None;
+        }
+        let entry = self.table.get_slot(idx)?;
+        if let RudisValue::Cooled { ptr, .. } = entry.val {
+            Some(ptr)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
     pub fn set_tiered_pointer(&mut self, key: &[u8], ptr: TieredPointer) -> bool {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if let Some(entry) = self.table.get_slot_mut(idx) {
+                let old_bytes = entry.val.approx_bytes();
                 entry.val = RudisValue::Tiered(ptr);
+                let new_bytes = entry.val.approx_bytes();
+                self.used_memory = self.used_memory.saturating_sub(old_bytes) + new_bytes;
                 return true;
+            }
+        }
+        false
+    }
+
+    #[inline]
+    pub fn set_cooled_pointer(&mut self, key: &[u8], ptr: TieredPointer) -> bool {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if let Some(entry) = self.table.get_slot_mut(idx) {
+                if !matches!(entry.val, RudisValue::Tiered(_) | RudisValue::Cooled { .. }) {
+                    let old_val = std::mem::replace(&mut entry.val, RudisValue::Tiered(ptr));
+                    entry.val = RudisValue::Cooled {
+                        ptr,
+                        val: Box::new(old_val),
+                    };
+                    self.used_memory += 24;
+                    return true;
+                }
             }
         }
         false
@@ -1635,13 +1737,67 @@ impl RudisTable {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if let Some(entry) = self.table.get_slot_mut(idx) {
-                if matches!(entry.val, RudisValue::Tiered(_)) {
-                    entry.val = val;
+                if let RudisValue::Tiered(ptr) = entry.val {
+                    let val_bytes = val.approx_bytes();
+                    entry.val = RudisValue::Cooled {
+                        ptr,
+                        val: Box::new(val),
+                    };
+                    self.used_memory += val_bytes;
                     return true;
                 }
             }
         }
         false
+    }
+
+    #[inline]
+    pub fn decommit_cooled_key(&mut self, key: &[u8]) -> Option<(TieredPointer, usize)> {
+        let h = hash_key(key);
+        let idx = self.table.find(key, h)?;
+        let entry = self.table.get_slot_mut(idx)?;
+        if let RudisValue::Cooled { ptr, val } = &entry.val {
+            let p = *ptr;
+            let freed = val.approx_bytes();
+            entry.val = RudisValue::Tiered(p);
+            self.used_memory = self.used_memory.saturating_sub(freed);
+            Some((p, freed))
+        } else {
+            None
+        }
+    }
+
+    pub fn decommit_all_cooled(&mut self) -> (usize, u64) {
+        let mut count = 0;
+        let mut total_freed = 0u64;
+        for opt in self.table.slots.iter_mut() {
+            if let Some(entry) = opt {
+                if let RudisValue::Cooled { ptr, val } = &entry.val {
+                    let p = *ptr;
+                    let freed = val.approx_bytes() as u64;
+                    entry.val = RudisValue::Tiered(p);
+                    self.used_memory = self.used_memory.saturating_sub(freed as usize);
+                    total_freed += freed;
+                    count += 1;
+                }
+            }
+        }
+        (count, total_freed)
+    }
+
+    pub fn get_hot_keys_for_spill(&mut self, limit: usize) -> Vec<Bytes> {
+        let mut hot = Vec::with_capacity(limit);
+        for opt in &self.table.slots {
+            if let Some(entry) = opt {
+                if !matches!(entry.val, RudisValue::Tiered(_) | RudisValue::Cooled { .. }) {
+                    hot.push(entry.key.clone());
+                    if hot.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        hot
     }
 
     #[inline]
@@ -1652,12 +1808,13 @@ impl RudisTable {
             return None;
         }
         let entry = self.table.get_slot(idx)?;
-        if matches!(entry.val, RudisValue::Tiered(_)) {
-            return None;
-        }
+        let val_ref = match &entry.val {
+            RudisValue::Tiered(_) | RudisValue::Cooled { .. } => return None,
+            other => other,
+        };
         let mut payload = Vec::new();
-        Self::serialize_val_payload(&entry.val, &mut payload);
-        let val_type = match &entry.val {
+        Self::serialize_val_payload(val_ref, &mut payload);
+        let val_type = match val_ref {
             RudisValue::String(_) | RudisValue::Int(_) => 0u8,
             RudisValue::List(_) => 1u8,
             RudisValue::Set(_) => 2u8,
@@ -1665,7 +1822,7 @@ impl RudisTable {
             RudisValue::SmallHash(_) | RudisValue::Hash(_) => 4u8,
             RudisValue::HyperLogLog(_) => 5u8,
             RudisValue::Stream(_) => 6u8,
-            RudisValue::Tiered(_) => unreachable!(),
+            _ => unreachable!(),
         };
         Some((payload, val_type))
     }
@@ -5410,6 +5567,7 @@ impl RudisTable {
                 }
             }
             RudisValue::Tiered(_) => {}
+            RudisValue::Cooled { val, .. } => Self::serialize_val_payload(val, payload),
         }
     }
 
@@ -6945,5 +7103,54 @@ mod tests {
             .xrange(b"restored_stream", "-", "+", None)
             .unwrap();
         assert_eq!(restored_range.len(), 5);
+    }
+
+    #[test]
+    fn test_three_state_lifecycle_and_instant_decommit() {
+        let mut table = RudisTable::new();
+        let initial_mem = table.used_memory;
+
+        // 1. Hot key
+        table.set(Bytes::from_static(b"k1"), Bytes::from_static(b"hello_tiered_storage_world"), None);
+        assert!(table.used_memory > initial_mem);
+        let hot_mem = table.used_memory;
+        assert_eq!(table.get(b"k1").unwrap(), Some(Bytes::from_static(b"hello_tiered_storage_world")));
+
+        // 2. Transition Hot -> Cooled
+        let ptr = TieredPointer {
+            file_id: 0,
+            offset: 4096,
+            length: 128,
+            value_type: 0,
+        };
+        assert!(table.set_cooled_pointer(b"k1", ptr));
+        assert!(table.is_cooled(b"k1").is_some());
+        assert!(table.is_tiered(b"k1").is_none());
+
+        // Fast DRAM hit on Cooled key
+        assert_eq!(table.get(b"k1").unwrap(), Some(Bytes::from_static(b"hello_tiered_storage_world")));
+        let (entry_val, _) = table.get_entry(b"k1").unwrap();
+        assert_eq!(entry_val, RudisValue::String(Bytes::from_static(b"hello_tiered_storage_world")));
+
+        // 3. Instant Zero-I/O Decommit: Cooled -> Cold (Tiered)
+        let (p, freed) = table.decommit_cooled_key(b"k1").unwrap();
+        assert_eq!(p.offset, 4096);
+        assert!(freed > 0);
+        assert!(table.used_memory < hot_mem);
+        assert!(table.is_cooled(b"k1").is_none());
+        assert!(table.is_tiered(b"k1").is_some());
+
+        // 4. Restore Cold -> Cooled (Read hit)
+        let restored_val = RudisValue::String(Bytes::from_static(b"hello_tiered_storage_world"));
+        assert!(table.restore_tiered_value(b"k1", restored_val));
+        assert!(table.is_cooled(b"k1").is_some());
+        assert_eq!(table.get(b"k1").unwrap(), Some(Bytes::from_static(b"hello_tiered_storage_world")));
+
+        // 5. Decommit all cooled
+        let (count, total_freed) = table.decommit_all_cooled();
+        assert_eq!(count, 1);
+        assert!(total_freed > 0);
+        assert!(table.is_tiered(b"k1").is_some());
+        assert!(table.is_cooled(b"k1").is_none());
     }
 }

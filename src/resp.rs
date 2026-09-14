@@ -35,6 +35,8 @@ pub enum TierSubcommand {
     Load(Bytes),
     Info,
     SpillAll,
+    Cool(Bytes),
+    Decommit(Option<Bytes>),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -328,6 +330,9 @@ pub enum Command {
     ScriptFlush,
     // TIERED STORAGE COMMANDS
     Tier(TierSubcommand),
+    // CONFIG COMMANDS
+    ConfigGet(Bytes),
+    ConfigSet(Bytes, Bytes),
     Quit,
     // PUBSUB COMMANDS
     Subscribe(Vec<Bytes>),
@@ -2349,12 +2354,48 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     }
                     Ok(Some(Command::Tier(TierSubcommand::Load(args[2].clone()))))
                 }
+                "COOL" => {
+                    if args.len() != 3 {
+                        return Err("wrong number of arguments for 'tier cool' command".to_string());
+                    }
+                    Ok(Some(Command::Tier(TierSubcommand::Cool(args[2].clone()))))
+                }
+                "DECOMMIT" => {
+                    if args.len() == 2 {
+                        Ok(Some(Command::Tier(TierSubcommand::Decommit(None))))
+                    } else if args.len() == 3 {
+                        Ok(Some(Command::Tier(TierSubcommand::Decommit(Some(args[2].clone())))))
+                    } else {
+                        Err("wrong number of arguments for 'tier decommit' command".to_string())
+                    }
+                }
                 "INFO" => Ok(Some(Command::Tier(TierSubcommand::Info))),
                 "SPILLALL" => Ok(Some(Command::Tier(TierSubcommand::SpillAll))),
                 _ => Err(format!(
-                    "ERR unknown subcommand '{}'. Try TIER SPILL, TIER LOAD, TIER INFO, TIER SPILLALL.",
+                    "ERR unknown subcommand '{}'. Try TIER SPILL, TIER COOL, TIER DECOMMIT, TIER LOAD, TIER INFO, TIER SPILLALL.",
                     sub
                 )),
+            }
+        }
+        "CONFIG" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'config' command".to_string());
+            }
+            let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
+            match sub.as_str() {
+                "GET" => {
+                    if args.len() != 3 {
+                        return Err("wrong number of arguments for 'config get' command".to_string());
+                    }
+                    Ok(Some(Command::ConfigGet(args[2].clone())))
+                }
+                "SET" => {
+                    if args.len() != 4 {
+                        return Err("wrong number of arguments for 'config set' command".to_string());
+                    }
+                    Ok(Some(Command::ConfigSet(args[2].clone(), args[3].clone())))
+                }
+                _ => Err(format!("ERR unknown subcommand '{}' for CONFIG", sub)),
             }
         }
         "QUIT" => Ok(Some(Command::Quit)),
