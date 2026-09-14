@@ -621,7 +621,9 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Getbit { key, .. }
         | Command::Bitcount { key, .. }
         | Command::Bitpos { key, .. }
-        | Command::Pfadd { key, .. } => Some(key),
+        | Command::Pfadd { key, .. }
+        | Command::Dump(key)
+        | Command::Restore { key, .. } => Some(key),
         Command::Touch(keys) | Command::Del(keys) | Command::Exists(keys) | Command::Mget(keys) => {
             keys.first()
         }
@@ -650,7 +652,8 @@ pub fn cmd_keys<'a>(cmd: &'a Command) -> Vec<&'a [u8]> {
         | Command::Type(k)
         | Command::Getdel(k)
         | Command::Strlen(k)
-        | Command::Expiretime(k, _) => vec![k.as_ref()],
+        | Command::Expiretime(k, _)
+        | Command::Dump(k) => vec![k.as_ref()],
 
         Command::Set { key, .. }
         | Command::Hget { key, .. }
@@ -684,7 +687,8 @@ pub fn cmd_keys<'a>(cmd: &'a Command) -> Vec<&'a [u8]> {
         | Command::Getbit { key, .. }
         | Command::Bitcount { key, .. }
         | Command::Bitpos { key, .. }
-        | Command::Pfadd { key, .. } => vec![key.as_ref()],
+        | Command::Pfadd { key, .. }
+        | Command::Restore { key, .. } => vec![key.as_ref()],
 
         Command::Mget(keys) | Command::Del(keys) | Command::Exists(keys) | Command::Touch(keys) => {
             keys.iter().map(|k| k.as_ref()).collect()
@@ -811,6 +815,8 @@ async fn execute_command(
         Command::Pfadd { .. } => "PFADD",
         Command::Pfcount { .. } => "PFCOUNT",
         Command::Pfmerge { .. } => "PFMERGE",
+        Command::Dump(_) => "DUMP",
+        Command::Restore { .. } => "RESTORE",
         Command::Unknown(_) => "UNKNOWN",
     };
     if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
@@ -1170,7 +1176,9 @@ async fn execute_command(
         | Command::Getbit { .. }
         | Command::Bitcount { .. }
         | Command::Bitpos { .. }
-        | Command::Pfadd { .. } => {
+        | Command::Pfadd { .. }
+        | Command::Dump(_)
+        | Command::Restore { .. } => {
             if let Some(target) = target_shard_of_cmd(&cmd, router.num_shards) {
                 if target == router.shard_id {
                     execute_local_command(
@@ -1763,7 +1771,9 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Getbit { key, .. }
         | Command::Bitcount { key, .. }
         | Command::Bitpos { key, .. }
-        | Command::Pfadd { key, .. } => Some(target_shard(key, num_shards)),
+        | Command::Pfadd { key, .. }
+        | Command::Dump(key)
+        | Command::Restore { key, .. } => Some(target_shard(key, num_shards)),
         Command::Pfcount { keys } if keys.len() == 1 => Some(target_shard(&keys[0], num_shards)),
         Command::Rename { key, newkey, .. } => {
             let s1 = target_shard(key, num_shards);
@@ -2942,6 +2952,45 @@ pub fn execute_local_command(
             }
             false
         }
+        Command::Dump(key) => {
+            match db.dump(key) {
+                Some(bytes) => {
+                    out.extend_from_slice(format!("${}\r\n", bytes.len()).as_bytes());
+                    out.extend_from_slice(&bytes);
+                    out.extend_from_slice(b"\r\n");
+                }
+                None => {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+            }
+            false
+        }
+        Command::Restore {
+            key,
+            ttl_ms,
+            serialized,
+            replace,
+            absttl,
+        } => {
+            match db.restore(key.clone(), *ttl_ms, serialized, *replace, *absttl) {
+                Ok(()) => {
+                    if let Some(aof) = aof {
+                        if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                    }
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                Err(err) => {
+                    if err.starts_with("BUSYKEY") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                    }
+                }
+            }
+            false
+        }
         Command::Quit => {
             out.extend_from_slice(b"+OK\r\n");
             true
@@ -3082,6 +3131,8 @@ async fn execute_commands_squashed(
                 Command::Pfadd { .. } => "PFADD",
                 Command::Pfcount { .. } => "PFCOUNT",
                 Command::Pfmerge { .. } => "PFMERGE",
+                Command::Dump(_) => "DUMP",
+                Command::Restore { .. } => "RESTORE",
                 Command::Unknown(_) => "UNKNOWN",
             };
             c.last_cmd = cmd_name.to_string();

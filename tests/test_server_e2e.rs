@@ -1744,3 +1744,72 @@ fn test_bitmaps_and_hyperloglog_e2e() {
     // TYPE of HLL returns string
     assert_eq!(send_and_read(&mut client, b"TYPE {h}dest\r\n"), "+string\r\n");
 }
+
+#[test]
+fn test_dump_and_restore_e2e() {
+    let port = 16392;
+    let _server = start_test_server(port, 4);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. DUMP non-existing key
+    assert_eq!(send_and_read(&mut client, b"DUMP non_exist\r\n"), "$-1\r\n");
+
+    // 2. SET and DUMP string
+    assert_eq!(send_and_read(&mut client, b"SET mykey hello_world\r\n"), "+OK\r\n");
+    let dump_resp = send_and_read_bytes(&mut client, b"DUMP mykey\r\n");
+    assert!(dump_resp.starts_with(b"$"));
+
+    // Extract payload from RESP bulk string "$<len>\r\n<payload>\r\n"
+    let crlf_pos = dump_resp.windows(2).position(|w| w == b"\r\n").unwrap();
+    let payload = &dump_resp[crlf_pos + 2..dump_resp.len() - 2];
+
+    // 3. RESTORE to a new key
+    let mut restore_cmd = Vec::new();
+    restore_cmd.extend_from_slice(format!("*4\r\n$7\r\nRESTORE\r\n$7\r\ncopykey\r\n$1\r\n0\r\n${}\r\n", payload.len()).as_bytes());
+    restore_cmd.extend_from_slice(payload);
+    restore_cmd.extend_from_slice(b"\r\n");
+
+    assert_eq!(send_and_read(&mut client, &restore_cmd), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"GET copykey\r\n"), "$11\r\nhello_world\r\n");
+
+    // 4. RESTORE without REPLACE on existing key -> BUSYKEY error
+    assert_eq!(
+        send_and_read(&mut client, &restore_cmd),
+        "-BUSYKEY Target key name already exists.\r\n"
+    );
+
+    // 5. RESTORE with REPLACE
+    let mut restore_replace_cmd = Vec::new();
+    restore_replace_cmd.extend_from_slice(format!("*5\r\n$7\r\nRESTORE\r\n$7\r\ncopykey\r\n$1\r\n0\r\n${}\r\n", payload.len()).as_bytes());
+    restore_replace_cmd.extend_from_slice(payload);
+    restore_replace_cmd.extend_from_slice(b"\r\n$7\r\nREPLACE\r\n");
+
+    assert_eq!(send_and_read(&mut client, &restore_replace_cmd), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"GET copykey\r\n"), "$11\r\nhello_world\r\n");
+
+    // 6. Corrupt checksum
+    let mut corrupt_cmd = Vec::new();
+    let mut corrupt_payload = payload.to_vec();
+    let last = corrupt_payload.len() - 1;
+    corrupt_payload[last] ^= 0xFF;
+    corrupt_cmd.extend_from_slice(format!("*4\r\n$7\r\nRESTORE\r\n$9\r\ncorrupt_k\r\n$1\r\n0\r\n${}\r\n", corrupt_payload.len()).as_bytes());
+    corrupt_cmd.extend_from_slice(&corrupt_payload);
+    corrupt_cmd.extend_from_slice(b"\r\n");
+
+    assert_eq!(
+        send_and_read(&mut client, &corrupt_cmd),
+        "-ERR DUMP payload version or checksum are wrong\r\n"
+    );
+
+    // 7. RESTORE with TTL (150ms)
+    let mut restore_ttl_cmd = Vec::new();
+    restore_ttl_cmd.extend_from_slice(format!("*4\r\n$7\r\nRESTORE\r\n$6\r\nttlkey\r\n$3\r\n150\r\n${}\r\n", payload.len()).as_bytes());
+    restore_ttl_cmd.extend_from_slice(payload);
+    restore_ttl_cmd.extend_from_slice(b"\r\n");
+
+    assert_eq!(send_and_read(&mut client, &restore_ttl_cmd), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"EXISTS ttlkey\r\n"), ":1\r\n");
+    thread::sleep(Duration::from_millis(200));
+    assert_eq!(send_and_read(&mut client, b"EXISTS ttlkey\r\n"), ":0\r\n");
+}

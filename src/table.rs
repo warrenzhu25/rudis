@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use fxhash::hash64;
 use hashbrown::HashMap;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const GROUP_SIZE: usize = 16;
 pub const EMPTY: u8 = 0xFF;
@@ -81,6 +81,14 @@ impl RudisZSet {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.dict.is_empty()
+    }
+
+    #[inline]
+    pub fn insert(&mut self, score: f64, member: Bytes) {
+        if let Some(old_score) = self.dict.insert(member.clone(), score) {
+            self.tree.remove(&(OrderedScore(old_score), member.clone()));
+        }
+        self.tree.insert((OrderedScore(score), member));
     }
 }
 
@@ -2640,6 +2648,293 @@ impl RudisTable {
         self.table.insert(entry);
         Ok(())
     }
+
+    // RDB SERIALIZATION & DUMP / RESTORE
+    pub fn dump(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+        let h = hash_key(key);
+        let idx = self.table.find(key, h)?;
+        if self.check_expired_slot(idx) {
+            return None;
+        }
+        let entry = self.table.get_slot(idx)?;
+        let mut payload = Vec::new();
+        match &entry.val {
+            RudisValue::String(b) => {
+                payload.push(0u8);
+                payload.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                payload.extend_from_slice(b);
+            }
+            RudisValue::List(l) => {
+                payload.push(1u8);
+                payload.extend_from_slice(&(l.len() as u32).to_le_bytes());
+                for item in l {
+                    payload.extend_from_slice(&(item.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(item);
+                }
+            }
+            RudisValue::Set(s) => {
+                payload.push(2u8);
+                payload.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                for item in s {
+                    payload.extend_from_slice(&(item.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(item);
+                }
+            }
+            RudisValue::ZSet(z) => {
+                payload.push(3u8);
+                payload.extend_from_slice(&(z.len() as u32).to_le_bytes());
+                for (m, score) in &z.dict {
+                    payload.extend_from_slice(&(m.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(m);
+                    payload.extend_from_slice(&score.to_bits().to_le_bytes());
+                }
+            }
+            RudisValue::Hash(h) => {
+                payload.push(4u8);
+                payload.extend_from_slice(&(h.len() as u32).to_le_bytes());
+                for (f, v) in h {
+                    payload.extend_from_slice(&(f.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(f);
+                    payload.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(v);
+                }
+            }
+            RudisValue::HyperLogLog(regs) => {
+                payload.push(5u8);
+                payload.extend_from_slice(regs.as_ref());
+            }
+        }
+
+        // 2-byte RDB version: 10
+        payload.extend_from_slice(&10u16.to_le_bytes());
+        // 8-byte CRC64
+        let crc = crc64(&payload);
+        payload.extend_from_slice(&crc.to_le_bytes());
+        Some(payload)
+    }
+
+    pub fn restore(
+        &mut self,
+        key: Bytes,
+        ttl_ms: u64,
+        serialized: &[u8],
+        replace: bool,
+        absttl: bool,
+    ) -> Result<(), &'static str> {
+        if serialized.len() < 10 {
+            return Err("DUMP payload version or checksum are wrong");
+        }
+        let data_len = serialized.len() - 8;
+        let expected_crc = u64::from_le_bytes(
+            serialized[data_len..]
+                .try_into()
+                .map_err(|_| "DUMP payload version or checksum are wrong")?,
+        );
+        let actual_crc = crc64(&serialized[..data_len]);
+        if expected_crc != actual_crc {
+            return Err("DUMP payload version or checksum are wrong");
+        }
+
+        let rdb_ver = u16::from_le_bytes(
+            serialized[data_len - 2..data_len]
+                .try_into()
+                .map_err(|_| "DUMP payload version or checksum are wrong")?,
+        );
+        if rdb_ver > 15 {
+            return Err("DUMP payload version or checksum are wrong");
+        }
+
+        if self.exists(&key) {
+            if !replace {
+                return Err("BUSYKEY Target key name already exists.");
+            }
+            self.del(&key);
+        }
+
+        let payload_len = data_len - 2;
+        let mut cursor = 0;
+        if cursor >= payload_len {
+            return Err("DUMP payload version or checksum are wrong");
+        }
+        let type_byte = serialized[cursor];
+        cursor += 1;
+
+        let decoded_value = match type_byte {
+            0 => {
+                // String
+                if cursor + 4 > payload_len {
+                    return Err("DUMP payload version or checksum are wrong");
+                }
+                let len = u32::from_le_bytes(serialized[cursor..cursor + 4].try_into().unwrap()) as usize;
+                cursor += 4;
+                if cursor + len > payload_len {
+                    return Err("DUMP payload version or checksum are wrong");
+                }
+                let val = Bytes::copy_from_slice(&serialized[cursor..cursor + len]);
+                RudisValue::String(val)
+            }
+            1 => {
+                // List
+                if cursor + 4 > payload_len {
+                    return Err("DUMP payload version or checksum are wrong");
+                }
+                let count = u32::from_le_bytes(serialized[cursor..cursor + 4].try_into().unwrap()) as usize;
+                cursor += 4;
+                let mut list = std::collections::VecDeque::with_capacity(count);
+                for _ in 0..count {
+                    if cursor + 4 > payload_len {
+                        return Err("DUMP payload version or checksum are wrong");
+                    }
+                    let len = u32::from_le_bytes(serialized[cursor..cursor + 4].try_into().unwrap()) as usize;
+                    cursor += 4;
+                    if cursor + len > payload_len {
+                        return Err("DUMP payload version or checksum are wrong");
+                    }
+                    list.push_back(Bytes::copy_from_slice(&serialized[cursor..cursor + len]));
+                    cursor += len;
+                }
+                RudisValue::List(list)
+            }
+            2 => {
+                // Set
+                if cursor + 4 > payload_len {
+                    return Err("DUMP payload version or checksum are wrong");
+                }
+                let count = u32::from_le_bytes(serialized[cursor..cursor + 4].try_into().unwrap()) as usize;
+                cursor += 4;
+                let mut set = hashbrown::HashSet::with_capacity(count);
+                for _ in 0..count {
+                    if cursor + 4 > payload_len {
+                        return Err("DUMP payload version or checksum are wrong");
+                    }
+                    let len = u32::from_le_bytes(serialized[cursor..cursor + 4].try_into().unwrap()) as usize;
+                    cursor += 4;
+                    if cursor + len > payload_len {
+                        return Err("DUMP payload version or checksum are wrong");
+                    }
+                    set.insert(Bytes::copy_from_slice(&serialized[cursor..cursor + len]));
+                    cursor += len;
+                }
+                RudisValue::Set(set)
+            }
+            3 => {
+                // ZSet
+                if cursor + 4 > payload_len {
+                    return Err("DUMP payload version or checksum are wrong");
+                }
+                let count = u32::from_le_bytes(serialized[cursor..cursor + 4].try_into().unwrap()) as usize;
+                cursor += 4;
+                let mut zset = RudisZSet::new();
+                for _ in 0..count {
+                    if cursor + 4 > payload_len {
+                        return Err("DUMP payload version or checksum are wrong");
+                    }
+                    let len = u32::from_le_bytes(serialized[cursor..cursor + 4].try_into().unwrap()) as usize;
+                    cursor += 4;
+                    if cursor + len > payload_len {
+                        return Err("DUMP payload version or checksum are wrong");
+                    }
+                    let member = Bytes::copy_from_slice(&serialized[cursor..cursor + len]);
+                    cursor += len;
+                    if cursor + 8 > payload_len {
+                        return Err("DUMP payload version or checksum are wrong");
+                    }
+                    let score_bits = u64::from_le_bytes(serialized[cursor..cursor + 8].try_into().unwrap());
+                    cursor += 8;
+                    let score = f64::from_bits(score_bits);
+                    zset.insert(score, member);
+                }
+                RudisValue::ZSet(zset)
+            }
+            4 => {
+                // Hash
+                if cursor + 4 > payload_len {
+                    return Err("DUMP payload version or checksum are wrong");
+                }
+                let count = u32::from_le_bytes(serialized[cursor..cursor + 4].try_into().unwrap()) as usize;
+                cursor += 4;
+                let mut hash = hashbrown::HashMap::with_capacity(count);
+                for _ in 0..count {
+                    if cursor + 4 > payload_len {
+                        return Err("DUMP payload version or checksum are wrong");
+                    }
+                    let f_len = u32::from_le_bytes(serialized[cursor..cursor + 4].try_into().unwrap()) as usize;
+                    cursor += 4;
+                    if cursor + f_len > payload_len {
+                        return Err("DUMP payload version or checksum are wrong");
+                    }
+                    let f = Bytes::copy_from_slice(&serialized[cursor..cursor + f_len]);
+                    cursor += f_len;
+
+                    if cursor + 4 > payload_len {
+                        return Err("DUMP payload version or checksum are wrong");
+                    }
+                    let v_len = u32::from_le_bytes(serialized[cursor..cursor + 4].try_into().unwrap()) as usize;
+                    cursor += 4;
+                    if cursor + v_len > payload_len {
+                        return Err("DUMP payload version or checksum are wrong");
+                    }
+                    let v = Bytes::copy_from_slice(&serialized[cursor..cursor + v_len]);
+                    cursor += v_len;
+
+                    hash.insert(f, v);
+                }
+                RudisValue::Hash(hash)
+            }
+            5 => {
+                // HyperLogLog
+                if cursor + 16384 > payload_len {
+                    return Err("DUMP payload version or checksum are wrong");
+                }
+                let mut regs = Box::new([0u8; 16384]);
+                regs.copy_from_slice(&serialized[cursor..cursor + 16384]);
+                RudisValue::HyperLogLog(regs)
+            }
+            _ => return Err("DUMP payload version or checksum are wrong"),
+        };
+
+        let expire_at = if ttl_ms == 0 {
+            None
+        } else if absttl {
+            let now_unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            if ttl_ms <= now_unix {
+                return Ok(());
+            } else {
+                let remaining_ms = ttl_ms - now_unix;
+                Some(Instant::now() + Duration::from_millis(remaining_ms))
+            }
+        } else {
+            Some(Instant::now() + Duration::from_millis(ttl_ms))
+        };
+
+        let slot = crate::router::key_slot(&key);
+        self.slot_to_keys.entry(slot).or_default().insert(key.clone());
+        let entry = RudisEntry {
+            key,
+            val: decoded_value,
+            expire_at,
+        };
+        self.table.insert(entry);
+        Ok(())
+    }
+}
+
+pub fn crc64(data: &[u8]) -> u64 {
+    let mut crc: u64 = 0;
+    for &b in data {
+        crc ^= (b as u64) << 56;
+        for _ in 0..8 {
+            if (crc & 0x8000_0000_0000_0000) != 0 {
+                crc = (crc << 1) ^ 0x42F0_E1EB_A9EA_3693;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    crc
 }
 
 #[cfg(test)]
@@ -2971,5 +3266,126 @@ mod tests {
             .unwrap();
         let c_merged = table.pfcount(&[Bytes::from_static(b"hll_merged")]).unwrap();
         assert_eq!(c_merged, 6);
+    }
+
+    #[test]
+    fn test_rudis_table_dump_and_restore() {
+        let mut table = RudisTable::new();
+
+        // 1. Non-existent key
+        assert_eq!(table.dump(b"non_exist"), None);
+
+        // 2. String dump and restore
+        table.set(
+            Bytes::from_static(b"str_key"),
+            Bytes::from_static(b"hello world"),
+            None,
+        );
+        let dumped = table.dump(b"str_key").expect("dump must succeed");
+        assert!(dumped.len() >= 10);
+
+        // Restore to target key
+        table
+            .restore(
+                Bytes::from_static(b"restored_str"),
+                0,
+                &dumped,
+                false,
+                false,
+            )
+            .expect("restore must succeed");
+        assert_eq!(
+            table.get(b"restored_str").unwrap(),
+            Some(Bytes::from_static(b"hello world"))
+        );
+
+        // BUSYKEY error
+        let err = table.restore(
+            Bytes::from_static(b"restored_str"),
+            0,
+            &dumped,
+            false,
+            false,
+        );
+        assert_eq!(err, Err("BUSYKEY Target key name already exists."));
+
+        // Replace success
+        table
+            .restore(
+                Bytes::from_static(b"restored_str"),
+                0,
+                &dumped,
+                true,
+                false,
+            )
+            .expect("replace must succeed");
+
+        // Checksum verification failure
+        let mut corrupt = dumped.clone();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xFF;
+        assert_eq!(
+            table.restore(
+                Bytes::from_static(b"corrupt"),
+                0,
+                &corrupt,
+                false,
+                false,
+            ),
+            Err("DUMP payload version or checksum are wrong")
+        );
+
+        // 3. Hash dump and restore
+        table
+            .hset(
+                Bytes::from_static(b"myhash"),
+                vec![
+                    (Bytes::from_static(b"f1"), Bytes::from_static(b"v1")),
+                    (Bytes::from_static(b"f2"), Bytes::from_static(b"v2")),
+                ],
+            )
+            .unwrap();
+        let hash_dump = table.dump(b"myhash").unwrap();
+        table
+            .restore(
+                Bytes::from_static(b"restored_hash"),
+                0,
+                &hash_dump,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            table.hget(b"restored_hash", b"f1").unwrap(),
+            Some(Bytes::from_static(b"v1"))
+        );
+        assert_eq!(
+            table.hget(b"restored_hash", b"f2").unwrap(),
+            Some(Bytes::from_static(b"v2"))
+        );
+
+        // 4. ZSet dump and restore
+        table
+            .zadd(
+                Bytes::from_static(b"myz"),
+                vec![
+                    (10.5, Bytes::from_static(b"m1")),
+                    (20.0, Bytes::from_static(b"m2")),
+                ],
+                ZAddFlags::default(),
+            )
+            .unwrap();
+        let zset_dump = table.dump(b"myz").unwrap();
+        table
+            .restore(
+                Bytes::from_static(b"restored_z"),
+                0,
+                &zset_dump,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(table.zscore(b"restored_z", b"m1").unwrap(), Some(10.5));
+        assert_eq!(table.zscore(b"restored_z", b"m2").unwrap(), Some(20.0));
     }
 }

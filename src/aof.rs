@@ -459,6 +459,44 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             Some(buf)
         }
+        Command::Restore {
+            key,
+            ttl_ms,
+            serialized,
+            replace,
+            absttl,
+        } => {
+            let mut num_args = 4;
+            if *replace {
+                num_args += 1;
+            }
+            if *absttl {
+                num_args += 1;
+            }
+            let ttl_str = ttl_ms.to_string();
+            buf.extend_from_slice(
+                format!("*{}\r\n$7\r\nRESTORE\r\n${}\r\n", num_args, key.len()).as_bytes(),
+            );
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(
+                format!(
+                    "\r\n${}\r\n{}\r\n${}\r\n",
+                    ttl_str.len(),
+                    ttl_str,
+                    serialized.len()
+                )
+                .as_bytes(),
+            );
+            buf.extend_from_slice(serialized);
+            buf.extend_from_slice(b"\r\n");
+            if *replace {
+                buf.extend_from_slice(b"$7\r\nREPLACE\r\n");
+            }
+            if *absttl {
+                buf.extend_from_slice(b"$6\r\nABSTTL\r\n");
+            }
+            Some(buf)
+        }
         _ => None,
     }
 }

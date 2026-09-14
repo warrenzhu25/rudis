@@ -533,4 +533,21 @@ impl ShardDb {
     pub fn pfmerge(&mut self, destkey: Bytes, srckeys: &[Bytes]) -> Result<(), &'static str> {
         self.table.pfmerge(destkey, srckeys)
     }
+
+    #[inline]
+    pub fn dump(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+        self.table.dump(key)
+    }
+
+    #[inline]
+    pub fn restore(
+        &mut self,
+        key: Bytes,
+        ttl_ms: u64,
+        serialized: &[u8],
+        replace: bool,
+        absttl: bool,
+    ) -> Result<(), &'static str> {
+        self.table.restore(key, ttl_ms, serialized, replace, absttl)
+    }
 }

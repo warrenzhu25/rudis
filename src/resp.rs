@@ -274,6 +274,15 @@ pub enum Command {
         destkey: Bytes,
         srckeys: Vec<Bytes>,
     },
+    // RDB SERIALIZATION
+    Dump(Bytes),
+    Restore {
+        key: Bytes,
+        ttl_ms: u64,
+        serialized: Bytes,
+        replace: bool,
+        absttl: bool,
+    },
     Unknown(String),
 }
 
@@ -1831,6 +1840,53 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let srckeys = args[2..].to_vec();
             Ok(Some(Command::Pfmerge { destkey, srckeys }))
         }
+        "DUMP" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'dump' command".to_string());
+            }
+            Ok(Some(Command::Dump(args[1].clone())))
+        }
+        "RESTORE" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'restore' command".to_string());
+            }
+            let key = args[1].clone();
+            let ttl_ms: u64 = std::str::from_utf8(&args[2])
+                .map_err(|_| "value is not an integer or out of range")?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range")?;
+            let serialized = args[3].clone();
+            let mut replace = false;
+            let mut absttl = false;
+            let mut i = 4;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "REPLACE" => {
+                        replace = true;
+                        i += 1;
+                    }
+                    "ABSTTL" => {
+                        absttl = true;
+                        i += 1;
+                    }
+                    "IDLETIME" | "FREQ" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        i += 2;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            Ok(Some(Command::Restore {
+                key,
+                ttl_ms,
+                serialized,
+                replace,
+                absttl,
+            }))
+        }
         _ => Ok(Some(Command::Unknown(cmd_name))),
     }
 }
@@ -2150,6 +2206,42 @@ mod tests {
             Command::Pfmerge {
                 destkey: Bytes::from_static(b"dest"),
                 srckeys: vec![Bytes::from_static(b"hll1"), Bytes::from_static(b"hll2")],
+            }
+        );
+    }
+
+    #[test]
+    fn test_resp_dump_and_restore() {
+        // DUMP
+        let mut buf = BytesMut::from("DUMP mykey\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Dump(Bytes::from_static(b"mykey"))
+        );
+
+        // RESTORE
+        let mut buf = BytesMut::from("*4\r\n$7\r\nRESTORE\r\n$5\r\nmykey\r\n$1\r\n0\r\n$4\r\ndata\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Restore {
+                key: Bytes::from_static(b"mykey"),
+                ttl_ms: 0,
+                serialized: Bytes::from_static(b"data"),
+                replace: false,
+                absttl: false,
+            }
+        );
+
+        // RESTORE with REPLACE and ABSTTL
+        let mut buf = BytesMut::from("*6\r\n$7\r\nRESTORE\r\n$5\r\nmykey\r\n$4\r\n1000\r\n$4\r\ndata\r\n$7\r\nREPLACE\r\n$6\r\nABSTTL\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Restore {
+                key: Bytes::from_static(b"mykey"),
+                ttl_ms: 1000,
+                serialized: Bytes::from_static(b"data"),
+                replace: true,
+                absttl: true,
             }
         );
     }
