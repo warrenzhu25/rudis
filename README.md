@@ -93,11 +93,31 @@ cargo test
 
 ---
 
+## Benchmarks
+
+### Baseline Scaling (1 to 32 Threads, 100% SET, 1KB Payload, Pipeline 100)
+
+Detailed baseline benchmark document: [docs/benchmarks/baseline.md](docs/benchmarks/baseline.md)
+
+| Server Threads | Throughput (Ops/sec) | Bandwidth (MB/s) | Avg Latency (ms) | p50 (ms) | p99 (ms) |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+| **1** | 60,487.24 | 63.26 | 52.87 | 53.50 | 80.90 |
+| **2** | 88,727.36 | 92.83 | 36.05 | 37.12 | 66.56 |
+| **4** | 159,224.13 | 166.63 | 20.09 | 20.86 | 41.47 |
+| **8** | 295,665.11 | 309.47 | 10.82 | 9.86 | 26.75 |
+| **16** | 297,048.94 | 310.92 | 10.77 | 10.18 | 30.72 |
+| **32** | 273,831.18 | 286.61 | 11.69 | 10.56 | 34.82 |
+
+---
+
 ## Project Structure
 
 ```
 rudis/
 ├── Cargo.toml
+├── docs/
+│   └── benchmarks/
+│       └── baseline.md # Detailed 1-32 thread baseline results
 ├── src/
 │   ├── main.rs         # CLI argument parsing, thread spawning, mesh setup
 │   ├── lib.rs          # Library root exporting modules
@@ -110,3 +130,4 @@ rudis/
     ├── test_cross_thread.rs # Validates cross-core eventfd waker with Monoio
     └── test_server_e2e.rs   # Multi-shard end-to-end integration tests
 ```
+
