@@ -27,6 +27,45 @@ pub struct ClientInfo {
     pub last_cmd: String,
 }
 
+#[inline(always)]
+pub fn write_resp_integer(out: &mut Vec<u8>, val: i64) {
+    match val {
+        0 => out.extend_from_slice(b":0\r\n"),
+        1 => out.extend_from_slice(b":1\r\n"),
+        2 => out.extend_from_slice(b":2\r\n"),
+        3 => out.extend_from_slice(b":3\r\n"),
+        4 => out.extend_from_slice(b":4\r\n"),
+        5 => out.extend_from_slice(b":5\r\n"),
+        -1 => out.extend_from_slice(b":-1\r\n"),
+        _ => {
+            let mut buf = [0u8; 24];
+            let mut i = buf.len();
+            let neg = val < 0;
+            let mut uval = if neg {
+                if val == i64::MIN {
+                    out.extend_from_slice(b":-9223372036854775808\r\n");
+                    return;
+                }
+                (-val) as u64
+            } else {
+                val as u64
+            };
+            while uval > 0 {
+                i -= 1;
+                buf[i] = b'0' + (uval % 10) as u8;
+                uval /= 10;
+            }
+            if neg {
+                i -= 1;
+                buf[i] = b'-';
+            }
+            out.push(b':');
+            out.extend_from_slice(&buf[i..]);
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+}
+
 pub async fn handle_connection(
     mut stream: TcpStream,
     client_addr: SocketAddr,
@@ -933,7 +972,7 @@ async fn execute_command(
                     count += 1;
                 }
             }
-            out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+            write_resp_integer(out, count as i64);
             false
         }
         Command::Exists(keys) => {
@@ -943,13 +982,13 @@ async fn execute_command(
                     count += 1;
                 }
             }
-            out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+            write_resp_integer(out, count as i64);
             false
         }
         Command::IncrBy(key, delta) => {
             match router.incr_by(key, delta).await {
                 Ok(val) => {
-                    out.extend_from_slice(format!(":{}\r\n", val).as_bytes());
+                    write_resp_integer(out, val);
                 }
                 Err(err) => {
                     out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
@@ -1987,7 +2026,7 @@ pub fn execute_local_command(
                     }
                 }
             }
-            out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+            write_resp_integer(out, count as i64);
             false
         }
         Command::Exists(keys) => {
@@ -1997,7 +2036,7 @@ pub fn execute_local_command(
                     count += 1;
                 }
             }
-            out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+            write_resp_integer(out, count as i64);
             false
         }
         Command::IncrBy(key, delta) => {
@@ -2008,7 +2047,7 @@ pub fn execute_local_command(
                             aof.borrow_mut().append(&bytes);
                         }
                     }
-                    out.extend_from_slice(format!(":{}\r\n", val).as_bytes());
+                    write_resp_integer(out, val);
                 }
                 Err(err) => {
                     out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
@@ -2046,7 +2085,7 @@ pub fn execute_local_command(
         }
         Command::Ttl(key, in_millis) => {
             let res = db.ttl(key, *in_millis);
-            out.extend_from_slice(format!(":{}\r\n", res).as_bytes());
+            write_resp_integer(out, res);
             false
         }
         Command::Hset { key, fields } => {
@@ -2057,7 +2096,7 @@ pub fn execute_local_command(
                             aof.borrow_mut().append(&bytes);
                         }
                     }
-                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                    write_resp_integer(out, count as i64);
                 }
                 Err(err) => {
                     out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
@@ -2156,7 +2195,7 @@ pub fn execute_local_command(
         Command::Hlen(key) => {
             match db.hlen(key) {
                 Ok(len) => {
-                    out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
+                    write_resp_integer(out, len as i64);
                 }
                 Err(err) => {
                     out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
@@ -2224,7 +2263,7 @@ pub fn execute_local_command(
                             aof.borrow_mut().append(&bytes);
                         }
                     }
-                    out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
+                    write_resp_integer(out, len as i64);
                 }
                 Err(err) => {
                     out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
@@ -2240,7 +2279,7 @@ pub fn execute_local_command(
                             aof.borrow_mut().append(&bytes);
                         }
                     }
-                    out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
+                    write_resp_integer(out, len as i64);
                 }
                 Err(err) => {
                     out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
@@ -2499,7 +2538,7 @@ pub fn execute_local_command(
                             out.extend_from_slice(b"$-1\r\n");
                         }
                     } else {
-                        out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                        write_resp_integer(out, count as i64);
                     }
                 }
                 Err(err) => {

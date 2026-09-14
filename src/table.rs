@@ -546,14 +546,99 @@ impl RudisTable {
         None
     }
 
+    #[inline(always)]
+    pub fn format_i64(n: i64) -> Bytes {
+        match n {
+            0 => Bytes::from_static(b"0"),
+            1 => Bytes::from_static(b"1"),
+            2 => Bytes::from_static(b"2"),
+            3 => Bytes::from_static(b"3"),
+            4 => Bytes::from_static(b"4"),
+            5 => Bytes::from_static(b"5"),
+            6 => Bytes::from_static(b"6"),
+            7 => Bytes::from_static(b"7"),
+            8 => Bytes::from_static(b"8"),
+            9 => Bytes::from_static(b"9"),
+            10 => Bytes::from_static(b"10"),
+            -1 => Bytes::from_static(b"-1"),
+            _ => {
+                let mut buf = [0u8; 24];
+                let mut i = buf.len();
+                let val = n;
+                let neg = val < 0;
+                let mut uval = if neg {
+                    if val == i64::MIN {
+                        return Bytes::from_static(b"-9223372036854775808");
+                    }
+                    (-val) as u64
+                } else {
+                    val as u64
+                };
+                while uval > 0 {
+                    i -= 1;
+                    buf[i] = b'0' + (uval % 10) as u8;
+                    uval /= 10;
+                }
+                if neg {
+                    i -= 1;
+                    buf[i] = b'-';
+                }
+                Bytes::copy_from_slice(&buf[i..])
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub fn parse_i64_bytes(bytes: &[u8]) -> Option<i64> {
+        if bytes.is_empty() {
+            return None;
+        }
+        let (neg, s) = match bytes[0] {
+            b'-' => (true, &bytes[1..]),
+            b'+' => (false, &bytes[1..]),
+            _ => (false, bytes),
+        };
+        if s.is_empty() {
+            return None;
+        }
+        let mut val: u64 = 0;
+        for &b in s {
+            if !b.is_ascii_digit() {
+                return None;
+            }
+            val = val.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+        }
+        if neg {
+            if val > (i64::MIN.unsigned_abs()) {
+                return None;
+            }
+            Some(-(val as i64))
+        } else {
+            if val > (i64::MAX as u64) {
+                return None;
+            }
+            Some(val as i64)
+        }
+    }
+
     pub fn set(&mut self, key: Bytes, value: Bytes, expire_in: Option<Duration>) {
+        let h = hash_key(&key);
+        let expire_at = expire_in.map(|d| Instant::now() + d);
+        let (existing, _) = self.table.find_or_prepare_insert(&key, h);
+        if let Some(idx) = existing {
+            if let Some(entry) = self.table.get_slot_mut(idx) {
+                entry.val = RudisValue::String(value);
+                entry.expire_at = expire_at;
+                return;
+            }
+        }
+
         let slot = crate::router::key_slot(&key);
         self.slot_to_keys
             .entry(slot)
             .or_default()
             .insert(key.clone());
 
-        let expire_at = expire_in.map(|d| Instant::now() + d);
         let entry = RudisEntry {
             key,
             val: RudisValue::String(value),
@@ -595,40 +680,29 @@ impl RudisTable {
 
     pub fn incr_by(&mut self, key: Bytes, delta: i64) -> Result<i64, String> {
         let h = hash_key(&key);
-        if let Some(idx) = self.table.find(&key, h) {
+        let (existing, _) = self.table.find_or_prepare_insert(&key, h);
+        if let Some(idx) = existing {
             let was_exp = self.check_expired_slot(idx);
             if !was_exp {
-                let (current, old_expire) = match self.table.get_slot(idx) {
-                    Some(entry) => {
-                        match &entry.val {
-                            RudisValue::String(b) => {
-                                let s = std::str::from_utf8(b).map_err(|_| {
-                                    "value is not an integer or out of range".to_string()
-                                })?;
-                                let val = s.parse::<i64>().map_err(|_| {
-                                    "value is not an integer or out of range".to_string()
-                                })?;
-                                (val, entry.expire_at)
-                            }
-                            _ => {
-                                return Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string());
-                            }
+                if let Some(entry) = self.table.get_slot_mut(idx) {
+                    let current = match &entry.val {
+                        RudisValue::String(b) => {
+                            Self::parse_i64_bytes(b).ok_or_else(|| {
+                                "value is not an integer or out of range".to_string()
+                            })?
                         }
-                    }
-                    None => (0, None),
-                };
+                        _ => {
+                            return Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string());
+                        }
+                    };
 
-                let new_val = current
-                    .checked_add(delta)
-                    .ok_or_else(|| "increment or decrement would overflow".to_string())?;
+                    let new_val = current
+                        .checked_add(delta)
+                        .ok_or_else(|| "increment or decrement would overflow".to_string())?;
 
-                let entry = RudisEntry {
-                    key: key.clone(),
-                    val: RudisValue::String(Bytes::from(new_val.to_string())),
-                    expire_at: old_expire,
-                };
-                self.table.insert(entry);
-                return Ok(new_val);
+                    entry.val = RudisValue::String(Self::format_i64(new_val));
+                    return Ok(new_val);
+                }
             }
         }
 
@@ -640,7 +714,7 @@ impl RudisTable {
             .insert(key.clone());
         let entry = RudisEntry {
             key,
-            val: RudisValue::String(Bytes::from(new_val.to_string())),
+            val: RudisValue::String(Self::format_i64(new_val)),
             expire_at: None,
         };
         self.table.insert(entry);
@@ -1037,27 +1111,25 @@ impl RudisTable {
 
     pub fn hset(&mut self, key: Bytes, fields: Vec<(Bytes, Bytes)>) -> Result<usize, &'static str> {
         let h = hash_key(&key);
-        if let Some(idx) = self.table.find(&key, h) {
-            let _ = self.check_expired_slot(idx);
-        }
-
         let (existing, _) = self.table.find_or_prepare_insert(&key, h);
         if let Some(idx) = existing {
-            if let Some(entry) = self.table.get_slot_mut(idx) {
-                match &mut entry.val {
-                    RudisValue::Hash(map) => {
-                        let mut added = 0;
-                        for (f, v) in fields {
-                            if map.insert(f, v).is_none() {
-                                added += 1;
+            if !self.check_expired_slot(idx) {
+                if let Some(entry) = self.table.get_slot_mut(idx) {
+                    match &mut entry.val {
+                        RudisValue::Hash(map) => {
+                            let mut added = 0;
+                            for (f, v) in fields {
+                                if map.insert(f, v).is_none() {
+                                    added += 1;
+                                }
                             }
+                            return Ok(added);
                         }
-                        return Ok(added);
-                    }
-                    _ => {
-                        return Err(
-                            "WRONGTYPE Operation against a key holding the wrong kind of value",
-                        );
+                        _ => {
+                            return Err(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            );
+                        }
                     }
                 }
             }
