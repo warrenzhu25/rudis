@@ -6,11 +6,13 @@ use monoio::net::TcpStream;
 use crate::resp::{parse_command, Command};
 use crate::router::Router;
 
-const READ_BUFFER_SIZE: usize = 4096;
+const READ_BUFFER_SIZE: usize = 65536;
+const MAX_BATCH_WRITE: usize = 65536;
 
 pub async fn handle_connection(mut stream: TcpStream, router: Rc<Router>) {
-    let mut buf = BytesMut::with_capacity(8192);
+    let mut buf = BytesMut::with_capacity(131072);
     let mut read_buf = vec![0u8; READ_BUFFER_SIZE];
+    let mut out_buf = Vec::with_capacity(65536);
 
     loop {
         // Rent buffer to monoio's io_uring driver
@@ -30,13 +32,19 @@ pub async fn handle_connection(mut stream: TcpStream, router: Rc<Router>) {
                 while !buf.is_empty() {
                     match parse_command(&mut buf) {
                         Ok(Some(cmd)) => {
-                            let (response, quit) = execute_command(cmd, &router).await;
-                            if let Err(_e) = stream.write_all(response).await.0 {
-                                return;
-                            }
+                            let quit = execute_command(cmd, &router, &mut out_buf).await;
                             if quit {
                                 should_quit = true;
                                 break;
+                            }
+
+                            // Flush early if write batch buffer exceeds threshold
+                            if out_buf.len() >= MAX_BATCH_WRITE {
+                                let write_chunk =
+                                    std::mem::replace(&mut out_buf, Vec::with_capacity(65536));
+                                if let Err(_e) = stream.write_all(write_chunk).await.0 {
+                                    return;
+                                }
                             }
                         }
                         Ok(None) => {
@@ -45,9 +53,19 @@ pub async fn handle_connection(mut stream: TcpStream, router: Rc<Router>) {
                         }
                         Err(err) => {
                             let err_resp = format!("-ERR {}\r\n", err).into_bytes();
-                            let _ = stream.write_all(err_resp).await;
-                            return;
+                            out_buf.extend_from_slice(&err_resp);
+                            should_quit = true;
+                            break;
                         }
+                    }
+                }
+
+                // Batch flush all accumulated responses in one io_uring write
+                if !out_buf.is_empty() {
+                    let write_chunk =
+                        std::mem::replace(&mut out_buf, Vec::with_capacity(65536));
+                    if let Err(_e) = stream.write_all(write_chunk).await.0 {
+                        return;
                     }
                 }
 
@@ -63,51 +81,62 @@ pub async fn handle_connection(mut stream: TcpStream, router: Rc<Router>) {
     }
 }
 
-async fn execute_command(cmd: Command, router: &Router) -> (Vec<u8>, bool) {
+async fn execute_command(cmd: Command, router: &Router, out: &mut Vec<u8>) -> bool {
     match cmd {
         Command::Get(key) => {
             let val = router.get(key).await;
             match val {
                 Some(v) => {
-                    let mut resp = Vec::with_capacity(32 + v.len());
-                    resp.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                    resp.extend_from_slice(&v);
-                    resp.extend_from_slice(b"\r\n");
-                    (resp, false)
+                    out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                    out.extend_from_slice(&v);
+                    out.extend_from_slice(b"\r\n");
                 }
-                None => (b"$-1\r\n".to_vec(), false),
+                None => {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
             }
+            false
         }
         Command::Set(key, value) => {
             router.set(key, value).await;
-            (b"+OK\r\n".to_vec(), false)
+            out.extend_from_slice(b"+OK\r\n");
+            false
         }
-        Command::Ping(msg) => match msg {
-            Some(m) => {
-                let mut resp = Vec::with_capacity(32 + m.len());
-                resp.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
-                resp.extend_from_slice(&m);
-                resp.extend_from_slice(b"\r\n");
-                (resp, false)
+        Command::Ping(msg) => {
+            match msg {
+                Some(m) => {
+                    out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                    out.extend_from_slice(&m);
+                    out.extend_from_slice(b"\r\n");
+                }
+                None => {
+                    out.extend_from_slice(b"+PONG\r\n");
+                }
             }
-            None => (b"+PONG\r\n".to_vec(), false),
-        },
-        Command::CommandDocs => (b"*0\r\n".to_vec(), false),
+            false
+        }
+        Command::CommandDocs => {
+            out.extend_from_slice(b"*0\r\n");
+            false
+        }
         Command::Info => {
             let info_str = format!(
                 "# Server\r\nrudis_version:0.1.0\r\narch:shared-nothing-io_uring\r\nshard_id:{}\r\nnum_shards:{}\r\n",
                 router.shard_id, router.num_shards
             );
-            let mut resp = Vec::with_capacity(32 + info_str.len());
-            resp.extend_from_slice(format!("${}\r\n", info_str.len()).as_bytes());
-            resp.extend_from_slice(info_str.as_bytes());
-            resp.extend_from_slice(b"\r\n");
-            (resp, false)
+            out.extend_from_slice(format!("${}\r\n", info_str.len()).as_bytes());
+            out.extend_from_slice(info_str.as_bytes());
+            out.extend_from_slice(b"\r\n");
+            false
         }
-        Command::Quit => (b"+OK\r\n".to_vec(), true),
+        Command::Quit => {
+            out.extend_from_slice(b"+OK\r\n");
+            true
+        }
         Command::Unknown(cmd_name) => {
-            let resp = format!("-ERR unknown command '{}'\r\n", cmd_name).into_bytes();
-            (resp, false)
+            let resp = format!("-ERR unknown command '{}'\r\n", cmd_name);
+            out.extend_from_slice(resp.as_bytes());
+            false
         }
     }
 }
