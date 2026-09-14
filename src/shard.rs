@@ -89,6 +89,24 @@ pub enum ShardMessage {
     PubsubNumpat {
         responder: flume::Sender<usize>,
     },
+    Keys {
+        pattern: Bytes,
+        responder: flume::Sender<Vec<Bytes>>,
+    },
+    Scan {
+        slot: usize,
+        pattern: Option<Bytes>,
+        count: usize,
+        responder: flume::Sender<(usize, Vec<Bytes>)>,
+    },
+    RandomKey {
+        responder: flume::Sender<Option<Bytes>>,
+    },
+    ExpireTime {
+        key: Bytes,
+        in_millis: bool,
+        responder: flume::Sender<i64>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -426,5 +444,30 @@ impl ShardDb {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.table.is_empty()
+    }
+
+    #[inline]
+    pub fn keys(&mut self, pattern: &[u8]) -> Vec<Bytes> {
+        self.table.keys(pattern)
+    }
+
+    #[inline]
+    pub fn scan(
+        &mut self,
+        cursor: usize,
+        pattern: Option<&[u8]>,
+        count: usize,
+    ) -> (usize, Vec<Bytes>) {
+        self.table.scan(cursor, pattern, count)
+    }
+
+    #[inline]
+    pub fn random_key(&mut self) -> Option<Bytes> {
+        self.table.random_key()
+    }
+
+    #[inline]
+    pub fn expiretime(&mut self, key: &[u8], in_millis: bool) -> i64 {
+        self.table.expiretime(key, in_millis)
     }
 }

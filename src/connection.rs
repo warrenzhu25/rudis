@@ -76,6 +76,9 @@ pub async fn handle_connection(
         .collect();
 
     let mut asking = false;
+    let mut in_multi = false;
+    let mut tx_queue: Vec<Command> = Vec::new();
+    let mut tx_has_error = false;
 
     loop {
         // Rent buffer to monoio's io_uring driver
@@ -105,8 +108,12 @@ pub async fn handle_connection(
                         Err(err) => {
                             let err_resp = format!("-ERR {}\r\n", err).into_bytes();
                             out_buf.extend_from_slice(&err_resp);
-                            should_quit = true;
-                            break;
+                            if in_multi {
+                                tx_has_error = true;
+                            } else {
+                                should_quit = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -145,9 +152,105 @@ pub async fn handle_connection(
                     return;
                 }
 
-                // 3. Execute parsed commands with pipeline squashing when pipelined
+                // 3. Execute parsed commands with transaction support and pipeline squashing
                 if !commands.is_empty() {
-                    if commands.len() == 1 {
+                    let has_tx = in_multi
+                        || commands.iter().any(|c| {
+                            matches!(c, Command::Multi | Command::Exec | Command::Discard)
+                        });
+
+                    if has_tx {
+                        for cmd in commands {
+                            if in_multi {
+                                match cmd {
+                                    Command::Multi => {
+                                        out_buf.extend_from_slice(
+                                            b"-ERR MULTI calls can not be nested\r\n",
+                                        );
+                                    }
+                                    Command::Discard => {
+                                        in_multi = false;
+                                        tx_queue.clear();
+                                        tx_has_error = false;
+                                        out_buf.extend_from_slice(b"+OK\r\n");
+                                    }
+                                    Command::Exec => {
+                                        in_multi = false;
+                                        if tx_has_error {
+                                            tx_queue.clear();
+                                            tx_has_error = false;
+                                            out_buf.extend_from_slice(
+                                                b"-EXECABORT Transaction discarded because of previous errors.\r\n",
+                                            );
+                                        } else {
+                                            let count = tx_queue.len();
+                                            out_buf.extend_from_slice(
+                                                format!("*{}\r\n", count).as_bytes(),
+                                            );
+                                            let queued = std::mem::take(&mut tx_queue);
+                                            for q_cmd in queued {
+                                                let quit = execute_command(
+                                                    q_cmd,
+                                                    &router,
+                                                    client_id,
+                                                    &client_registry,
+                                                    &mut out_buf,
+                                                    &mut asking,
+                                                )
+                                                .await;
+                                                if quit {
+                                                    should_quit = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Command::Quit => {
+                                        out_buf.extend_from_slice(b"+OK\r\n");
+                                        should_quit = true;
+                                        break;
+                                    }
+                                    _ => {
+                                        tx_queue.push(cmd);
+                                        out_buf.extend_from_slice(b"+QUEUED\r\n");
+                                    }
+                                }
+                            } else {
+                                match cmd {
+                                    Command::Multi => {
+                                        in_multi = true;
+                                        tx_queue.clear();
+                                        tx_has_error = false;
+                                        out_buf.extend_from_slice(b"+OK\r\n");
+                                    }
+                                    Command::Discard => {
+                                        out_buf.extend_from_slice(
+                                            b"-ERR DISCARD without MULTI\r\n",
+                                        );
+                                    }
+                                    Command::Exec => {
+                                        out_buf
+                                            .extend_from_slice(b"-ERR EXEC without MULTI\r\n");
+                                    }
+                                    _ => {
+                                        let quit = execute_command(
+                                            cmd,
+                                            &router,
+                                            client_id,
+                                            &client_registry,
+                                            &mut out_buf,
+                                            &mut asking,
+                                        )
+                                        .await;
+                                        if quit {
+                                            should_quit = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else if commands.len() == 1 {
                         let quit = execute_command(
                             commands.pop().unwrap(),
                             &router,
@@ -486,6 +589,7 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Getdel(key)
         | Command::Append { key, .. }
         | Command::Strlen(key)
+        | Command::Expiretime(key, _)
         | Command::Rename { key, .. } => Some(key),
         Command::Touch(keys) | Command::Del(keys) | Command::Exists(keys) | Command::Mget(keys) => {
             keys.first()
@@ -579,6 +683,14 @@ async fn execute_command(
         Command::PubsubChannels(_) => "PUBSUB CHANNELS",
         Command::PubsubNumsub(_) => "PUBSUB NUMSUB",
         Command::PubsubNumpat => "PUBSUB NUMPAT",
+        Command::Keys(_) => "KEYS",
+        Command::Scan { .. } => "SCAN",
+        Command::Randomkey => "RANDOMKEY",
+        Command::Expiretime(_, false) => "EXPIRETIME",
+        Command::Expiretime(_, true) => "PEXPIRETIME",
+        Command::Multi => "MULTI",
+        Command::Exec => "EXEC",
+        Command::Discard => "DISCARD",
         Command::Unknown(_) => "UNKNOWN",
     };
     if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
@@ -1298,6 +1410,68 @@ async fn execute_command(
             out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
             false
         }
+        Command::Keys(pattern) => {
+            let keys = router.keys(&pattern).await;
+            out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
+            for k in keys {
+                out.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                out.extend_from_slice(&k);
+                out.extend_from_slice(b"\r\n");
+            }
+            false
+        }
+        Command::Scan {
+            cursor,
+            pattern,
+            count,
+        } => {
+            let cnt = count.unwrap_or(10);
+            let (next_cursor, keys) = router.scan(cursor, pattern.as_deref(), cnt).await;
+            let cursor_str = next_cursor.to_string();
+            out.extend_from_slice(b"*2\r\n$");
+            out.extend_from_slice(cursor_str.len().to_string().as_bytes());
+            out.extend_from_slice(b"\r\n");
+            out.extend_from_slice(cursor_str.as_bytes());
+            out.extend_from_slice(b"\r\n*");
+            out.extend_from_slice(keys.len().to_string().as_bytes());
+            out.extend_from_slice(b"\r\n");
+            for k in keys {
+                out.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                out.extend_from_slice(&k);
+                out.extend_from_slice(b"\r\n");
+            }
+            false
+        }
+        Command::Randomkey => {
+            match router.random_key().await {
+                Some(k) => {
+                    out.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                    out.extend_from_slice(&k);
+                    out.extend_from_slice(b"\r\n");
+                }
+                None => {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+            }
+            false
+        }
+        Command::Expiretime(key, in_millis) => {
+            let ts = router.expiretime(key, in_millis).await;
+            out.extend_from_slice(format!(":{}\r\n", ts).as_bytes());
+            false
+        }
+        Command::Multi => {
+            out.extend_from_slice(b"+OK\r\n");
+            false
+        }
+        Command::Exec => {
+            out.extend_from_slice(b"-ERR EXEC without MULTI\r\n");
+            false
+        }
+        Command::Discard => {
+            out.extend_from_slice(b"-ERR DISCARD without MULTI\r\n");
+            false
+        }
         Command::Quit => {
             out.extend_from_slice(b"+OK\r\n");
             true
@@ -1357,7 +1531,8 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Getset { key, .. }
         | Command::Getdel(key)
         | Command::Append { key, .. }
-        | Command::Strlen(key) => Some(target_shard(key, num_shards)),
+        | Command::Strlen(key)
+        | Command::Expiretime(key, _) => Some(target_shard(key, num_shards)),
         Command::Rename { key, newkey, .. } => {
             let s1 = target_shard(key, num_shards);
             let s2 = target_shard(newkey, num_shards);
@@ -2338,6 +2513,68 @@ pub fn execute_local_command(
             out.extend_from_slice(b"*0\r\n");
             false
         }
+        Command::Keys(pattern) => {
+            let keys = db.keys(pattern);
+            out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
+            for k in keys {
+                out.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                out.extend_from_slice(&k);
+                out.extend_from_slice(b"\r\n");
+            }
+            false
+        }
+        Command::Scan {
+            cursor,
+            pattern,
+            count,
+        } => {
+            let cnt = count.unwrap_or(10);
+            let (next_cursor, keys) = db.scan(*cursor as usize, pattern.as_deref(), cnt);
+            let cursor_str = next_cursor.to_string();
+            out.extend_from_slice(b"*2\r\n$");
+            out.extend_from_slice(cursor_str.len().to_string().as_bytes());
+            out.extend_from_slice(b"\r\n");
+            out.extend_from_slice(cursor_str.as_bytes());
+            out.extend_from_slice(b"\r\n*");
+            out.extend_from_slice(keys.len().to_string().as_bytes());
+            out.extend_from_slice(b"\r\n");
+            for k in keys {
+                out.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                out.extend_from_slice(&k);
+                out.extend_from_slice(b"\r\n");
+            }
+            false
+        }
+        Command::Randomkey => {
+            match db.random_key() {
+                Some(k) => {
+                    out.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                    out.extend_from_slice(&k);
+                    out.extend_from_slice(b"\r\n");
+                }
+                None => {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+            }
+            false
+        }
+        Command::Expiretime(key, in_millis) => {
+            let ts = db.expiretime(key, *in_millis);
+            out.extend_from_slice(format!(":{}\r\n", ts).as_bytes());
+            false
+        }
+        Command::Multi => {
+            out.extend_from_slice(b"+OK\r\n");
+            false
+        }
+        Command::Exec => {
+            out.extend_from_slice(b"-ERR EXEC without MULTI\r\n");
+            false
+        }
+        Command::Discard => {
+            out.extend_from_slice(b"-ERR DISCARD without MULTI\r\n");
+            false
+        }
         Command::Quit => {
             out.extend_from_slice(b"+OK\r\n");
             true
@@ -2462,6 +2699,14 @@ async fn execute_commands_squashed(
                 Command::PubsubChannels(_) => "PUBSUB CHANNELS",
                 Command::PubsubNumsub(_) => "PUBSUB NUMSUB",
                 Command::PubsubNumpat => "PUBSUB NUMPAT",
+                Command::Keys(_) => "KEYS",
+                Command::Scan { .. } => "SCAN",
+                Command::Randomkey => "RANDOMKEY",
+                Command::Expiretime(_, false) => "EXPIRETIME",
+                Command::Expiretime(_, true) => "PEXPIRETIME",
+                Command::Multi => "MULTI",
+                Command::Exec => "EXEC",
+                Command::Discard => "DISCARD",
                 Command::Unknown(_) => "UNKNOWN",
             };
             c.last_cmd = cmd_name.to_string();

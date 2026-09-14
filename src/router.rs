@@ -592,4 +592,105 @@ impl Router {
         }
         total
     }
+
+    pub async fn keys(&self, pattern: &[u8]) -> Vec<Bytes> {
+        let mut all_keys = self.local_db.borrow_mut().keys(pattern);
+        let mut pending = Vec::new();
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::Keys {
+                    pattern: Bytes::copy_from_slice(pattern),
+                    responder: tx,
+                };
+                if sender.send(msg).is_ok() {
+                    pending.push(rx);
+                }
+            }
+        }
+        for rx in pending {
+            if let Ok(shard_keys) = rx.recv_async().await {
+                all_keys.extend(shard_keys);
+            }
+        }
+        all_keys
+    }
+
+    pub async fn scan(
+        &self,
+        cursor: u64,
+        pattern: Option<&[u8]>,
+        count: usize,
+    ) -> (u64, Vec<Bytes>) {
+        let shard_id = (cursor >> 32) as usize;
+        let slot_idx = (cursor & 0xFFFF_FFFF) as usize;
+        if shard_id >= self.num_shards {
+            return (0, Vec::new());
+        }
+
+        let (next_slot, keys) = if shard_id == self.shard_id {
+            self.local_db.borrow_mut().scan(slot_idx, pattern, count)
+        } else {
+            let (tx, rx) = flume::bounded(1);
+            let msg = ShardMessage::Scan {
+                slot: slot_idx,
+                pattern: pattern.map(Bytes::copy_from_slice),
+                count,
+                responder: tx,
+            };
+            if self.senders[shard_id].send(msg).is_ok() {
+                rx.recv_async().await.unwrap_or((0, Vec::new()))
+            } else {
+                (0, Vec::new())
+            }
+        };
+
+        let next_cursor = if next_slot == 0 {
+            if shard_id + 1 < self.num_shards {
+                ((shard_id + 1) as u64) << 32
+            } else {
+                0
+            }
+        } else {
+            ((shard_id as u64) << 32) | (next_slot as u64)
+        };
+
+        (next_cursor, keys)
+    }
+
+    pub async fn random_key(&self) -> Option<Bytes> {
+        if let Some(k) = self.local_db.borrow_mut().random_key() {
+            return Some(k);
+        }
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                if sender.send(ShardMessage::RandomKey { responder: tx }).is_ok() {
+                    if let Ok(Some(k)) = rx.recv_async().await {
+                        return Some(k);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub async fn expiretime(&self, key: Bytes, in_millis: bool) -> i64 {
+        let target = self.target_shard(&key);
+        if target == self.shard_id {
+            self.local_db.borrow_mut().expiretime(&key, in_millis)
+        } else {
+            let (tx, rx) = flume::bounded(1);
+            let msg = ShardMessage::ExpireTime {
+                key,
+                in_millis,
+                responder: tx,
+            };
+            if self.senders[target].send(msg).is_ok() {
+                rx.recv_async().await.unwrap_or(-2)
+            } else {
+                -2
+            }
+        }
+    }
 }

@@ -578,6 +578,110 @@ impl RudisTable {
         }
     }
 
+    pub fn expiretime(&mut self, key: &[u8], in_millis: bool) -> i64 {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return -2;
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                match entry.expire_at {
+                    Some(expire_at) => {
+                        let now = Instant::now();
+                        if now >= expire_at {
+                            self.check_expired_slot(idx);
+                            -2
+                        } else {
+                            let diff = expire_at.duration_since(now);
+                            let now_epoch = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or(Duration::ZERO);
+                            let target_epoch = now_epoch + diff;
+                            if in_millis {
+                                target_epoch.as_millis() as i64
+                            } else {
+                                target_epoch.as_secs() as i64
+                            }
+                        }
+                    }
+                    None => -1,
+                }
+            } else {
+                -2
+            }
+        } else {
+            -2
+        }
+    }
+
+    pub fn keys(&mut self, pattern: &[u8]) -> Vec<Bytes> {
+        let mut res = Vec::new();
+        let cap = self.table.capacity();
+        for i in 0..cap {
+            if self.check_expired_slot(i) {
+                continue;
+            }
+            if let Some(entry) = self.table.get_slot(i) {
+                if crate::pubsub::glob_match(pattern, &entry.key) {
+                    res.push(entry.key.clone());
+                }
+            }
+        }
+        res
+    }
+
+    pub fn scan(
+        &mut self,
+        cursor: usize,
+        pattern: Option<&[u8]>,
+        count: usize,
+    ) -> (usize, Vec<Bytes>) {
+        let cap = self.table.capacity();
+        if cursor >= cap || cap == 0 {
+            return (0, Vec::new());
+        }
+        let mut res = Vec::new();
+        let mut idx = cursor;
+        while idx < cap {
+            if !self.check_expired_slot(idx) {
+                if let Some(entry) = self.table.get_slot(idx) {
+                    let matches = match pattern {
+                        Some(pat) => crate::pubsub::glob_match(pat, &entry.key),
+                        None => true,
+                    };
+                    if matches {
+                        res.push(entry.key.clone());
+                    }
+                }
+            }
+            idx += 1;
+            if res.len() >= count {
+                break;
+            }
+        }
+        let next_cursor = if idx >= cap { 0 } else { idx };
+        (next_cursor, res)
+    }
+
+    pub fn random_key(&mut self) -> Option<Bytes> {
+        let cap = self.table.capacity();
+        if self.table.len() == 0 || cap == 0 {
+            return None;
+        }
+        self.sample_cursor = (self.sample_cursor + 17) & (cap - 1);
+        let start = self.sample_cursor;
+        for i in 0..cap {
+            let idx = (start + i) & (cap - 1);
+            if self.check_expired_slot(idx) {
+                continue;
+            }
+            if let Some(entry) = self.table.get_slot(idx) {
+                return Some(entry.key.clone());
+            }
+        }
+        None
+    }
+
     pub fn flushdb(&mut self) {
         self.table.clear();
         self.slot_to_keys.clear();
@@ -2230,5 +2334,38 @@ mod tests {
             None,
         );
         assert!(table.zcard(b"str_key").is_err());
+    }
+
+    #[test]
+    fn test_rudis_table_keyspace_inspection() {
+        let mut table = RudisTable::new();
+        assert_eq!(table.random_key(), None);
+        assert_eq!(table.keys(b"*").len(), 0);
+
+        table.set(Bytes::from_static(b"alpha:1"), Bytes::from_static(b"a"), None);
+        table.set(Bytes::from_static(b"alpha:2"), Bytes::from_static(b"b"), None);
+        table.set(Bytes::from_static(b"beta:1"), Bytes::from_static(b"c"), None);
+
+        // KEYS
+        let matched = table.keys(b"alpha:*");
+        assert_eq!(matched.len(), 2);
+        assert!(matched.contains(&Bytes::from_static(b"alpha:1")));
+        assert!(matched.contains(&Bytes::from_static(b"alpha:2")));
+
+        // RANDOMKEY
+        let rk = table.random_key();
+        assert!(rk.is_some());
+
+        // SCAN
+        let (next_cursor, scanned) = table.scan(0, Some(b"alpha:*"), 10);
+        assert_eq!(next_cursor, 0); // Scanned whole small table
+        assert_eq!(scanned.len(), 2);
+
+        // EXPIRETIME
+        assert_eq!(table.expiretime(b"non_exist", false), -2);
+        assert_eq!(table.expiretime(b"alpha:1", false), -1);
+        table.expire(b"alpha:1", Duration::from_secs(50));
+        let exp = table.expiretime(b"alpha:1", false);
+        assert!(exp > 0);
     }
 }

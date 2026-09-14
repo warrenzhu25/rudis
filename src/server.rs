@@ -323,6 +323,33 @@ pub fn run_shard_worker(
                         let cnt = cross_shard_pubsub.borrow().numpat();
                         let _ = responder.send(cnt);
                     }
+                    ShardMessage::Keys { pattern, responder } => {
+                        let keys = cross_shard_db.borrow_mut().keys(&pattern);
+                        let _ = responder.send(keys);
+                    }
+                    ShardMessage::Scan {
+                        slot,
+                        pattern,
+                        count,
+                        responder,
+                    } => {
+                        let res = cross_shard_db
+                            .borrow_mut()
+                            .scan(slot, pattern.as_deref(), count);
+                        let _ = responder.send(res);
+                    }
+                    ShardMessage::RandomKey { responder } => {
+                        let key = cross_shard_db.borrow_mut().random_key();
+                        let _ = responder.send(key);
+                    }
+                    ShardMessage::ExpireTime {
+                        key,
+                        in_millis,
+                        responder,
+                    } => {
+                        let res = cross_shard_db.borrow_mut().expiretime(&key, in_millis);
+                        let _ = responder.send(res);
+                    }
                 }
             }
         });

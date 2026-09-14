@@ -1304,3 +1304,256 @@ fn test_pubsub_cross_shard_e2e() {
     let resp = send_and_read(&mut pub_client, b"PUBLISH news.sports final\r\n");
     assert_eq!(resp, ":1\r\n");
 }
+
+#[test]
+fn test_keyspace_inspection_e2e() {
+    let port = 16388;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut stream =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect client");
+
+    // 1. FLUSHDB and verify empty database
+    let resp = send_and_read(&mut stream, b"FLUSHDB\r\n");
+    assert_eq!(resp, "+OK\r\n");
+
+    let resp = send_and_read(&mut stream, b"RANDOMKEY\r\n");
+    assert_eq!(resp, "$-1\r\n");
+
+    let resp = send_and_read(&mut stream, b"KEYS *\r\n");
+    assert_eq!(resp, "*0\r\n");
+
+    // 2. Populate keys across multiple shards
+    assert_eq!(send_and_read(&mut stream, b"SET user:1 alice\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut stream, b"SET user:2 bob\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"SET product:100 apple\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"SET product:200 banana\r\n"),
+        "+OK\r\n"
+    );
+
+    // 3. Test KEYS pattern
+    let resp = send_and_read(&mut stream, b"KEYS user:*\r\n");
+    assert!(resp.starts_with("*2\r\n"));
+    assert!(resp.contains("user:1") && resp.contains("user:2"));
+    assert!(!resp.contains("product:"));
+
+    let resp = send_and_read(&mut stream, b"KEYS *\r\n");
+    assert!(resp.starts_with("*4\r\n"));
+    assert!(
+        resp.contains("user:1")
+            && resp.contains("user:2")
+            && resp.contains("product:100")
+            && resp.contains("product:200")
+    );
+
+    let resp = send_and_read(&mut stream, b"KEYS *1*\r\n");
+    assert!(resp.starts_with("*2\r\n"));
+    assert!(resp.contains("user:1") && resp.contains("product:100"));
+
+    // 4. Test RANDOMKEY
+    let resp = send_and_read(&mut stream, b"RANDOMKEY\r\n");
+    assert!(
+        resp.contains("user:1")
+            || resp.contains("user:2")
+            || resp.contains("product:100")
+            || resp.contains("product:200")
+    );
+
+    // 5. Test SCAN full iteration
+    let mut scanned_keys = Vec::new();
+    let mut cursor = "0".to_string();
+    loop {
+        let cmd = format!("SCAN {} COUNT 10\r\n", cursor);
+        let resp = send_and_read(&mut stream, cmd.as_bytes());
+        // Parse cursor from "*2\r\n$<len>\r\n<cursor>\r\n*<klen>\r\n..."
+        let lines: Vec<&str> = resp.split("\r\n").collect();
+        assert!(lines[0] == "*2");
+        cursor = lines[2].to_string();
+        for line in &lines[4..] {
+            if !line.is_empty() && !line.starts_with('$') && !line.starts_with('*') {
+                scanned_keys.push(line.to_string());
+            }
+        }
+        if cursor == "0" {
+            break;
+        }
+    }
+    assert_eq!(scanned_keys.len(), 4);
+    assert!(scanned_keys.contains(&"user:1".to_string()));
+    assert!(scanned_keys.contains(&"user:2".to_string()));
+    assert!(scanned_keys.contains(&"product:100".to_string()));
+    assert!(scanned_keys.contains(&"product:200".to_string()));
+
+    // 6. Test SCAN with MATCH pattern
+    let mut matched_keys = Vec::new();
+    let mut cursor = "0".to_string();
+    loop {
+        let cmd = format!("SCAN {} MATCH user:* COUNT 10\r\n", cursor);
+        let resp = send_and_read(&mut stream, cmd.as_bytes());
+        let lines: Vec<&str> = resp.split("\r\n").collect();
+        assert!(lines[0] == "*2");
+        cursor = lines[2].to_string();
+        for line in &lines[4..] {
+            if !line.is_empty() && !line.starts_with('$') && !line.starts_with('*') {
+                matched_keys.push(line.to_string());
+            }
+        }
+        if cursor == "0" {
+            break;
+        }
+    }
+    assert_eq!(matched_keys.len(), 2);
+    assert!(matched_keys.contains(&"user:1".to_string()));
+    assert!(matched_keys.contains(&"user:2".to_string()));
+
+    // 7. Test EXPIRETIME and PEXPIRETIME
+    assert_eq!(
+        send_and_read(&mut stream, b"EXPIRETIME non_existing\r\n"),
+        ":-2\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"PEXPIRETIME non_existing\r\n"),
+        ":-2\r\n"
+    );
+
+    assert_eq!(
+        send_and_read(&mut stream, b"EXPIRETIME user:1\r\n"),
+        ":-1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"PEXPIRETIME user:1\r\n"),
+        ":-1\r\n"
+    );
+
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    assert_eq!(
+        send_and_read(&mut stream, b"EXPIRE user:1 100\r\n"),
+        ":1\r\n"
+    );
+
+    let resp = send_and_read(&mut stream, b"EXPIRETIME user:1\r\n");
+    let exp_ts: i64 = resp.trim_start_matches(':').trim().parse().unwrap();
+    assert!((exp_ts - (now_unix + 100)).abs() <= 2);
+
+    let resp = send_and_read(&mut stream, b"PEXPIRETIME user:1\r\n");
+    let exp_ts_ms: i64 = resp.trim_start_matches(':').trim().parse().unwrap();
+    let now_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    assert!((exp_ts_ms - (now_unix_ms + 100_000)).abs() <= 2000);
+}
+
+#[test]
+fn test_transactions_multi_exec_e2e() {
+    let port = 16389;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut stream =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect client");
+
+    // 1. DISCARD/EXEC without MULTI errors
+    assert_eq!(
+        send_and_read(&mut stream, b"DISCARD\r\n"),
+        "-ERR DISCARD without MULTI\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"EXEC\r\n"),
+        "-ERR EXEC without MULTI\r\n"
+    );
+
+    // 2. DISCARD transaction
+    assert_eq!(send_and_read(&mut stream, b"MULTI\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"MULTI\r\n"),
+        "-ERR MULTI calls can not be nested\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"SET tx:discard_key v1\r\n"),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(send_and_read(&mut stream, b"DISCARD\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"GET tx:discard_key\r\n"),
+        "$-1\r\n"
+    );
+
+    // 3. Successful MULTI / EXEC transaction
+    assert_eq!(send_and_read(&mut stream, b"MULTI\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"SET tx:key1 myval\r\n"),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"INCRBY tx:counter 10\r\n"),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"LPUSH tx:list a b\r\n"),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"GET tx:key1\r\n"),
+        "+QUEUED\r\n"
+    );
+
+    let exec_resp = send_and_read(&mut stream, b"EXEC\r\n");
+    assert_eq!(
+        exec_resp,
+        "*4\r\n+OK\r\n:10\r\n:2\r\n$5\r\nmyval\r\n"
+    );
+
+    assert_eq!(
+        send_and_read(&mut stream, b"GET tx:counter\r\n"),
+        "$2\r\n10\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"LLEN tx:list\r\n"),
+        ":2\r\n"
+    );
+
+    // 4. Runtime error inside transaction (non-aborting, error returned as element in array)
+    assert_eq!(send_and_read(&mut stream, b"MULTI\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"SET tx:str hello\r\n"),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"LPUSH tx:str world\r\n"),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"GET tx:str\r\n"),
+        "+QUEUED\r\n"
+    );
+
+    let exec_resp = send_and_read(&mut stream, b"EXEC\r\n");
+    assert!(exec_resp.starts_with("*3\r\n+OK\r\n-ERR"));
+    assert!(exec_resp.ends_with("$5\r\nhello\r\n"));
+
+    // 5. Syntax error causing EXECABORT
+    assert_eq!(send_and_read(&mut stream, b"MULTI\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"SET tx:abort_key 1\r\n"),
+        "+QUEUED\r\n"
+    );
+    let err_resp = send_and_read(&mut stream, b"SET\r\n");
+    assert!(err_resp.starts_with("-ERR"));
+    assert_eq!(
+        send_and_read(&mut stream, b"EXEC\r\n"),
+        "-EXECABORT Transaction discarded because of previous errors.\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"GET tx:abort_key\r\n"),
+        "$-1\r\n"
+    );
+}

@@ -223,6 +223,19 @@ pub enum Command {
     PubsubChannels(Option<Bytes>),
     PubsubNumsub(Vec<Bytes>),
     PubsubNumpat,
+    // KEYSPACE INSPECTION
+    Keys(Bytes),
+    Scan {
+        cursor: u64,
+        pattern: Option<Bytes>,
+        count: Option<usize>,
+    },
+    Randomkey,
+    Expiretime(Bytes, bool),
+    // TRANSACTIONS
+    Multi,
+    Exec,
+    Discard,
     Unknown(String),
 }
 
@@ -1552,6 +1565,95 @@ fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 _ => Ok(Some(Command::Unknown(format!("PUBSUB {}", sub)))),
             }
         }
+        "KEYS" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'keys' command".to_string());
+            }
+            Ok(Some(Command::Keys(args[1].clone())))
+        }
+        "SCAN" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'scan' command".to_string());
+            }
+            let cursor: u64 = std::str::from_utf8(&args[1])
+                .map_err(|_| "value is not an integer or out of range")?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range")?;
+            let mut pattern = None;
+            let mut count = None;
+            let mut i = 2;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "MATCH" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        pattern = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "COUNT" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let cnt: usize = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        count = Some(cnt);
+                        i += 2;
+                    }
+                    "TYPE" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        i += 2;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            Ok(Some(Command::Scan {
+                cursor,
+                pattern,
+                count,
+            }))
+        }
+        "RANDOMKEY" => {
+            if args.len() != 1 {
+                return Err("wrong number of arguments for 'randomkey' command".to_string());
+            }
+            Ok(Some(Command::Randomkey))
+        }
+        "EXPIRETIME" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'expiretime' command".to_string());
+            }
+            Ok(Some(Command::Expiretime(args[1].clone(), false)))
+        }
+        "PEXPIRETIME" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'pexpiretime' command".to_string());
+            }
+            Ok(Some(Command::Expiretime(args[1].clone(), true)))
+        }
+        "MULTI" => {
+            if args.len() != 1 {
+                return Err("wrong number of arguments for 'multi' command".to_string());
+            }
+            Ok(Some(Command::Multi))
+        }
+        "EXEC" => {
+            if args.len() != 1 {
+                return Err("wrong number of arguments for 'exec' command".to_string());
+            }
+            Ok(Some(Command::Exec))
+        }
+        "DISCARD" => {
+            if args.len() != 1 {
+                return Err("wrong number of arguments for 'discard' command".to_string());
+            }
+            Ok(Some(Command::Discard))
+        }
         _ => Ok(Some(Command::Unknown(cmd_name))),
     }
 }
@@ -1738,5 +1840,53 @@ mod tests {
         let mut buf = BytesMut::from("HGETALL myhash\r\n");
         let cmd = parse_command(&mut buf).unwrap().unwrap();
         assert_eq!(cmd, Command::Hgetall(Bytes::from_static(b"myhash")));
+    }
+
+    #[test]
+    fn test_resp_keyspace_and_transactions() {
+        // KEYS
+        let mut buf = BytesMut::from("KEYS user:*\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Keys(Bytes::from_static(b"user:*"))
+        );
+
+        // SCAN
+        let mut buf = BytesMut::from("SCAN 123 MATCH pat:* COUNT 50\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Scan {
+                cursor: 123,
+                pattern: Some(Bytes::from_static(b"pat:*")),
+                count: Some(50),
+            }
+        );
+
+        // RANDOMKEY
+        let mut buf = BytesMut::from("RANDOMKEY\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Randomkey
+        );
+
+        // EXPIRETIME & PEXPIRETIME
+        let mut buf = BytesMut::from("EXPIRETIME k1\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Expiretime(Bytes::from_static(b"k1"), false)
+        );
+        let mut buf = BytesMut::from("PEXPIRETIME k1\r\n");
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Expiretime(Bytes::from_static(b"k1"), true)
+        );
+
+        // MULTI, EXEC, DISCARD
+        let mut buf = BytesMut::from("MULTI\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Multi);
+        let mut buf = BytesMut::from("EXEC\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Exec);
+        let mut buf = BytesMut::from("DISCARD\r\n");
+        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Discard);
     }
 }
