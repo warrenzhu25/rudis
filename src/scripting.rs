@@ -370,3 +370,192 @@ fn lua_val_to_resp(val: &Value, out: &mut Vec<u8>) -> Result<(), String> {
         }
     }
 }
+
+/// A registered Redis 7 Function Library
+#[derive(Clone, Debug)]
+pub struct FunctionLib {
+    pub name: String,
+    pub engine: String,
+    pub raw_code: String,
+    pub functions: Vec<String>,
+}
+
+static FUNCTION_LIBS: LazyLock<RwLock<HashMap<String, FunctionLib>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Load a Redis 7 Function Library
+pub fn load_function(code: &str, replace: bool) -> Result<String, String> {
+    // Parse library name from shebang or comment, e.g. "#!lua name=mylib"
+    let mut lib_name = "default_lib".to_string();
+    for line in code.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("#!lua") || trimmed.starts_with("--") {
+            if let Some(pos) = trimmed.find("name=") {
+                let rest = &trimmed[pos + 5..];
+                let name = rest.split_whitespace().next().unwrap_or("").trim_matches('"');
+                if !name.is_empty() {
+                    lib_name = name.to_string();
+                    break;
+                }
+            }
+        }
+    }
+
+    {
+        let cache = FUNCTION_LIBS.read().unwrap();
+        if cache.contains_key(&lib_name) && !replace {
+            return Err(format!("ERR Library '{}' already exists", lib_name));
+        }
+    }
+
+    // Execute with mock redis.register_function to collect function names
+    let lua = Lua::new();
+    let func_names = Rc::new(RefCell::new(Vec::new()));
+    let func_names_clone = func_names.clone();
+
+    let redis_tbl = lua.create_table().map_err(|e| e.to_string())?;
+    let reg_fn = lua.create_function(move |_, (name, _): (String, Value)| {
+        func_names_clone.borrow_mut().push(name);
+        Ok(())
+    }).map_err(|e| e.to_string())?;
+    redis_tbl.set("register_function", reg_fn).map_err(|e| e.to_string())?;
+    lua.globals().set("redis", redis_tbl).map_err(|e| e.to_string())?;
+
+    let lua_code: String = code
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("#!") {
+                format!("--{}", line)
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    lua.load(&lua_code).exec().map_err(|e| format!("ERR Error registering function: {}", e))?;
+
+    let registered = func_names.borrow().clone();
+    let lib = FunctionLib {
+        name: lib_name.clone(),
+        engine: "LUA".to_string(),
+        raw_code: lua_code,
+        functions: registered,
+    };
+
+    FUNCTION_LIBS.write().unwrap().insert(lib_name.clone(), lib);
+    Ok(lib_name)
+}
+
+/// Execute a registered Redis 7 Function via FCALL
+pub fn call_function(
+    func_name: &str,
+    keys: &[Bytes],
+    args: &[Bytes],
+    db: &Rc<RefCell<crate::shard::ShardDb>>,
+    aof: Option<&RefCell<crate::aof::AofWriter>>,
+) -> Result<Vec<u8>, String> {
+    // Find which library contains this function
+    let lib = {
+        let cache = FUNCTION_LIBS.read().unwrap();
+        cache.values()
+            .find(|l| l.functions.iter().any(|f| f == func_name))
+            .cloned()
+            .ok_or_else(|| format!("ERR Function '{}' not found", func_name))?
+    };
+
+    let lua = Lua::new();
+
+    // Set KEYS table
+    let keys_tbl = lua.create_table().map_err(|e| e.to_string())?;
+    for (i, k) in keys.iter().enumerate() {
+        let s = lua.create_string(k.as_ref()).map_err(|e| e.to_string())?;
+        keys_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
+    }
+
+    // Set ARGV table
+    let argv_tbl = lua.create_table().map_err(|e| e.to_string())?;
+    for (i, a) in args.iter().enumerate() {
+        let s = lua.create_string(a.as_ref()).map_err(|e| e.to_string())?;
+        argv_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
+    }
+
+    // Capture target function
+    let target_fn = Rc::new(RefCell::new(None));
+    let target_fn_clone = target_fn.clone();
+    let target_name = func_name.to_string();
+
+    let redis_tbl = lua.create_table().map_err(|e| e.to_string())?;
+
+    // Bind redis.call
+    let db_call = db.clone();
+    let aof_call = aof.map(|a| a as *const _);
+    let call_fn = lua
+        .create_function(move |lua, margs: MultiValue| {
+            let mut cmd_args = Vec::with_capacity(margs.len());
+            for v in margs {
+                match v {
+                    Value::String(s) => cmd_args.push(Bytes::copy_from_slice(&s.as_bytes())),
+                    Value::Integer(i) => cmd_args.push(Bytes::from(i.to_string())),
+                    Value::Number(n) => cmd_args.push(Bytes::from(n.to_string())),
+                    Value::Boolean(b) => cmd_args.push(Bytes::from(if b { "1" } else { "0" })),
+                    Value::Nil => cmd_args.push(Bytes::new()),
+                    _ => {}
+                }
+            }
+            let cmd = match crate::resp::build_command(cmd_args) {
+                Ok(Some(c)) => c,
+                Ok(None) => return Err(mlua::Error::RuntimeError("ERR empty command".to_string())),
+                Err(e) => return Err(mlua::Error::RuntimeError(format!("ERR {}", e))),
+            };
+
+            let mut out = Vec::new();
+            let aof_ref = unsafe { aof_call.map(|ptr| &*ptr) };
+            crate::connection::execute_local_command(
+                &cmd,
+                &mut db_call.borrow_mut(),
+                &mut out,
+                aof_ref,
+            );
+
+            resp_bytes_to_lua(lua, &out)
+        })
+        .map_err(|e| e.to_string())?;
+    redis_tbl.set("call", call_fn).map_err(|e| e.to_string())?;
+
+    let reg_fn = lua.create_function(move |lua, (name, f): (String, mlua::Function)| {
+        if name == target_name {
+            let key = lua.create_registry_value(f)?;
+            *target_fn_clone.borrow_mut() = Some(key);
+        }
+        Ok(())
+    }).map_err(|e| e.to_string())?;
+    redis_tbl.set("register_function", reg_fn).map_err(|e| e.to_string())?;
+
+    lua.globals().set("redis", redis_tbl).map_err(|e| e.to_string())?;
+
+    // Run library script to define functions
+    lua.load(&lib.raw_code).exec().map_err(|e| format!("ERR Failed to compile library: {}", e))?;
+
+    let fn_key = target_fn.borrow_mut().take()
+        .ok_or_else(|| format!("ERR Function '{}' registered but failed to capture", func_name))?;
+    let f: mlua::Function = lua.registry_value(&fn_key).map_err(|e| e.to_string())?;
+
+    let res: Value = f.call((keys_tbl, argv_tbl)).map_err(|e| format!("ERR Error running function '{}': {}", func_name, e))?;
+
+    let mut out = Vec::new();
+    lua_val_to_resp(&res, &mut out)?;
+    Ok(out)
+}
+
+/// Returns list of registered libraries and functions
+pub fn list_functions() -> Vec<FunctionLib> {
+    let cache = FUNCTION_LIBS.read().unwrap();
+    cache.values().cloned().collect()
+}
+
+/// Delete a registered function library
+pub fn delete_function(lib_name: &str) -> bool {
+    FUNCTION_LIBS.write().unwrap().remove(lib_name).is_some()
+}
+

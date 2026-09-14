@@ -25,7 +25,92 @@ pub struct ClientInfo {
     pub connected_at: Instant,
     pub last_active: Instant,
     pub last_cmd: String,
+    pub is_resp3: bool,
+    pub track_tx: Option<flume::Sender<Vec<u8>>>,
 }
+
+
+#[derive(Clone, Debug)]
+pub struct ClientTracker {
+    pub port: u16,
+    pub client_id: u64,
+    pub bcast: bool,
+    pub prefixes: Vec<Bytes>,
+    pub tracked_keys: hashbrown::HashSet<Vec<u8>>,
+    pub sender: flume::Sender<Vec<u8>>,
+    pub is_resp3: bool,
+}
+
+static TRACKING_CLIENTS: std::sync::LazyLock<std::sync::RwLock<hashbrown::HashMap<(u16, u64), ClientTracker>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(hashbrown::HashMap::new()));
+
+pub fn register_client_tracking(
+    port: u16,
+    client_id: u64,
+    bcast: bool,
+    prefixes: Vec<Bytes>,
+    sender: flume::Sender<Vec<u8>>,
+    is_resp3: bool,
+) {
+    let mut map = TRACKING_CLIENTS.write().unwrap();
+    map.insert((port, client_id), ClientTracker {
+        port,
+        client_id,
+        bcast,
+        prefixes,
+        tracked_keys: hashbrown::HashSet::new(),
+        sender,
+        is_resp3,
+    });
+}
+
+pub fn unregister_client_tracking(port: u16, client_id: u64) {
+    let mut map = TRACKING_CLIENTS.write().unwrap();
+    map.remove(&(port, client_id));
+}
+
+pub fn record_client_read(port: u16, client_id: u64, key: &[u8]) {
+    let mut map = TRACKING_CLIENTS.write().unwrap();
+    if let Some(tracker) = map.get_mut(&(port, client_id)) {
+        if !tracker.bcast {
+            tracker.tracked_keys.insert(key.to_vec());
+        }
+    }
+}
+
+pub fn notify_key_invalidation(port: u16, key: &[u8], sender_client_id: u64) {
+    let mut map = TRACKING_CLIENTS.write().unwrap();
+    for tracker in map.values_mut() {
+        if tracker.port != port {
+            continue;
+        }
+        if tracker.client_id == sender_client_id && !tracker.bcast {
+            continue;
+        }
+        if tracker.bcast {
+            if !tracker.prefixes.is_empty() {
+                let matched = tracker.prefixes.iter().any(|pfx| key.starts_with(pfx));
+                if !matched {
+                    continue;
+                }
+            }
+        } else {
+            if !tracker.tracked_keys.remove(key) {
+                continue;
+            }
+        }
+        let mut msg = Vec::new();
+        if tracker.is_resp3 {
+            msg.extend_from_slice(b">2\r\n$10\r\ninvalidate\r\n*1\r\n");
+            write_resp_bulk(&mut msg, key);
+        } else {
+            msg.extend_from_slice(b"*2\r\n$10\r\ninvalidate\r\n*1\r\n");
+            write_resp_bulk(&mut msg, key);
+        }
+        let _ = tracker.sender.send(msg);
+    }
+}
+
 
 #[inline(always)]
 pub fn write_resp_integer(out: &mut Vec<u8>, val: i64) {
@@ -96,6 +181,7 @@ pub async fn handle_connection(
     router: Rc<Router>,
 ) {
     let now = Instant::now();
+    let (track_tx, track_rx) = flume::unbounded::<Vec<u8>>();
     client_registry.borrow_mut().insert(
         client_id,
         ClientInfo {
@@ -105,10 +191,13 @@ pub async fn handle_connection(
             connected_at: now,
             last_active: now,
             last_cmd: "NONE".to_string(),
+            is_resp3: false,
+            track_tx: Some(track_tx),
         },
     );
 
     struct ClientCleanup {
+        port: u16,
         client_id: u64,
         registry: Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
         pubsub: Rc<RefCell<crate::pubsub::PubSubHub>>,
@@ -117,13 +206,16 @@ pub async fn handle_connection(
         fn drop(&mut self) {
             self.registry.borrow_mut().remove(&self.client_id);
             self.pubsub.borrow_mut().remove_client(self.client_id);
+            unregister_client_tracking(self.port, self.client_id);
         }
     }
     let _cleanup = ClientCleanup {
+        port: router.port,
         client_id,
         registry: client_registry.clone(),
         pubsub: router.pubsub.clone(),
     };
+
 
     let mut buf = BytesMut::with_capacity(131072);
     let mut read_buf = vec![0u8; READ_BUFFER_SIZE];
@@ -424,7 +516,11 @@ pub async fn handle_connection(
                 }
 
                 // 4. Batch flush all accumulated responses in one io_uring write
+                while let Ok(inval) = track_rx.try_recv() {
+                    out_buf.extend_from_slice(&inval);
+                }
                 if !out_buf.is_empty() {
+
                     let (write_res, returned_buf) = stream.write_all(out_buf).await;
                     out_buf = returned_buf;
                     out_buf.clear();
@@ -844,7 +940,10 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Linsert { key, .. }
         | Command::Incrbyfloat { key, .. }
         | Command::Setrange { key, .. }
-        | Command::Getrange { key, .. } => Some(key),
+        | Command::Getrange { key, .. }
+        | Command::Vadd { key, .. }
+        | Command::Vdel { key, .. } => Some(key),
+
         Command::Smove { source, .. }
         | Command::Lmove { source, .. }
         | Command::Blmove { source, .. } => Some(source),
@@ -959,7 +1058,10 @@ pub fn cmd_keys<'a>(cmd: &'a Command) -> Vec<&'a [u8]> {
         | Command::Linsert { key, .. }
         | Command::Incrbyfloat { key, .. }
         | Command::Setrange { key, .. }
-        | Command::Getrange { key, .. } => vec![key.as_ref()],
+        | Command::Getrange { key, .. }
+        | Command::Vadd { key, .. }
+        | Command::Vdel { key, .. } => vec![key.as_ref()],
+
 
         Command::Smove { source, destination, .. }
         | Command::Lmove { source, destination, .. }
@@ -1478,9 +1580,19 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Eval { .. } => "EVAL",
         Command::Evalsha { .. } => "EVALSHA",
         Command::ScriptLoad(_) | Command::ScriptExists(_) | Command::ScriptFlush => "SCRIPT",
+        Command::Vadd { .. } => "VADD",
+        Command::Vquery { .. } => "VQUERY",
+        Command::Vsim { .. } => "VSIM",
+        Command::Vdel { .. } => "VDEL",
+        Command::Vinfo(_) => "VINFO",
+        Command::FunctionLoad { .. }
+        | Command::FunctionList
+        | Command::FunctionDelete(_) => "FUNCTION",
+        Command::Fcall { .. } => "FCALL",
         Command::Unknown(_) => "UNKNOWN",
     }
 }
+
 
 async fn execute_command(
     cmd: Command,
@@ -1546,6 +1658,7 @@ async fn execute_command(
 
     match cmd {
         Command::Get(key) => {
+            record_client_read(router.port, client_id, key.as_ref());
             let val = router.get(key).await;
             match val {
                 Some(v) => {
@@ -1573,11 +1686,15 @@ async fn execute_command(
                     crate::replication::propagate_bytes(router.port, &bytes);
                 }
             }
+            notify_key_invalidation(router.port, key.as_ref(), client_id);
             router.set(key, value, expire_in).await;
             out.extend_from_slice(b"+OK\r\n");
             false
         }
         Command::Mget(keys) => {
+            for key in &keys {
+                record_client_read(router.port, client_id, key.as_ref());
+            }
             out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
             for key in keys {
                 match router.get(key).await {
@@ -1600,6 +1717,7 @@ async fn execute_command(
                 }
             }
             for (key, val) in pairs {
+                notify_key_invalidation(router.port, key.as_ref(), client_id);
                 router.set(key, val, None).await;
             }
             out.extend_from_slice(b"+OK\r\n");
@@ -1608,10 +1726,12 @@ async fn execute_command(
         Command::Del(keys) => {
             let mut count = 0usize;
             for key in keys.clone() {
+                notify_key_invalidation(router.port, key.as_ref(), client_id);
                 if router.del(key).await {
                     count += 1;
                 }
             }
+
             if count > 0 && crate::replication::has_connected_replicas(router.port) {
                 if let Some(bytes) = crate::aof::command_to_resp(&Command::Del(keys)) {
                     crate::replication::propagate_bytes(router.port, &bytes);
@@ -1695,12 +1815,9 @@ async fn execute_command(
             let stats = crate::tiering::get_tier_stats(router.port);
             let max_mem = crate::tiering::get_max_memory(router.port);
             let used_mem = router.get_total_used_memory().await;
-            let memory_str = format!(
-                "# Memory\r\nused_memory:{}\r\nused_memory_human:{}\r\nmaxmemory:{}\r\nmaxmemory_human:{}\r\ncooled_keys:{}\r\ntiered_keys:{}\r\n",
+            let memory_str = crate::allocator::format_memory_info(
                 used_mem,
-                crate::tiering::format_bytes_human(used_mem as u64),
                 max_mem,
-                crate::tiering::format_bytes_human(max_mem),
                 stats.cooled_keys.load(std::sync::atomic::Ordering::Relaxed),
                 stats.tiered_keys.load(std::sync::atomic::Ordering::Relaxed),
             );
@@ -1858,6 +1975,23 @@ async fn execute_command(
                     let reclaimed = router.gc_all().await;
                     out.extend_from_slice(format!(":{}\r\n", reclaimed).as_bytes());
                 }
+                crate::resp::TierSubcommand::Snapshot(dir) => {
+                    let start = std::time::Instant::now();
+                    match router.tier_snapshot_all(dir).await {
+                        Ok((is_reflink, total_bytes, shards)) => {
+                            let ms = start.elapsed().as_millis();
+                            let msg = format!(
+                                "+OK snapshot created in {}ms, shards:{}, bytes:{}, reflink:{}\r\n",
+                                ms, shards, total_bytes, is_reflink
+                            );
+                            out.extend_from_slice(msg.as_bytes());
+                        }
+                        Err(e) => {
+                            out.extend_from_slice(format!("-ERR snapshot failed: {}\r\n", e).as_bytes());
+                        }
+                    }
+                }
+
                 crate::resp::TierSubcommand::Info => {
                     let stats = crate::tiering::get_tier_stats(router.port);
                     let max_mem = crate::tiering::get_max_memory(router.port);
@@ -2223,8 +2357,25 @@ async fn execute_command(
                 ClientSubcommand::Id => {
                     out.extend_from_slice(format!(":{}\r\n", client_id).as_bytes());
                 }
+                ClientSubcommand::Tracking { enabled, bcast, prefixes } => {
+                    if enabled {
+                        let reg = client_registry.borrow();
+                        if let Some(c) = reg.get(&client_id) {
+                            if let Some(tx) = &c.track_tx {
+                                register_client_tracking(router.port, client_id, bcast, prefixes, tx.clone(), c.is_resp3);
+                            }
+                        }
+                    } else {
+                        unregister_client_tracking(router.port, client_id);
+                    }
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                ClientSubcommand::Caching(_) => {
+                    out.extend_from_slice(b"+OK\r\n");
+                }
             }
             false
+
         }
         Command::Hset { .. }
         | Command::Hmset { .. }
@@ -2809,7 +2960,17 @@ async fn execute_command(
             }
 
             let proto_ver = proto.unwrap_or(2);
-            out.extend_from_slice(b"*14\r\n");
+            if proto_ver == 3 {
+                if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                    c.is_resp3 = true;
+                }
+                out.extend_from_slice(b"%7\r\n");
+            } else {
+                if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                    c.is_resp3 = false;
+                }
+                out.extend_from_slice(b"*14\r\n");
+            }
             out.extend_from_slice(b"$6\r\nserver\r\n$6\r\nvalkey\r\n");
             out.extend_from_slice(b"$7\r\nversion\r\n$5\r\n7.2.0\r\n");
             out.extend_from_slice(format!("$5\r\nproto\r\n:{}\r\n", proto_ver).as_bytes());
@@ -2822,8 +2983,11 @@ async fn execute_command(
         Command::Reset => {
             if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                 c.name = None;
+                c.is_resp3 = false;
             }
+            unregister_client_tracking(router.port, client_id);
             *asking = false;
+
             let acl = crate::acl::get_acl_for_port(router.port);
             let default_requires_auth = acl
                 .read()
@@ -3627,7 +3791,121 @@ async fn execute_command(
             out.extend_from_slice(b"+OK\r\n");
             false
         }
+        Command::Vadd { index, key, vector, metric } => {
+            match router.local_db.borrow_mut().vadd(&index, key.clone(), vector, metric) {
+                Ok(()) => {
+                    notify_key_invalidation(router.port, key.as_ref(), client_id);
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Vquery { index, k, query } => {
+            let results = router.local_db.borrow().vquery(&index, &query, k);
+            out.extend_from_slice(format!("*{}\r\n", results.len() * 2).as_bytes());
+            for (key, dist) in results {
+                write_resp_bulk(out, &key);
+                let s = format!("{:.6}", dist);
+                write_resp_bulk(out, s.as_bytes());
+            }
+            false
+        }
+        Command::Vsim { index, k1, k2, metric } => {
+            match router.local_db.borrow().vsim(&index, &k1, &k2, metric) {
+                Ok(dist) => {
+                    let s = format!("{:.6}", dist);
+                    write_resp_bulk(out, s.as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Vdel { index, key } => {
+            let removed = router.local_db.borrow_mut().vdel(&index, &key);
+            if removed {
+                notify_key_invalidation(router.port, key.as_ref(), client_id);
+                write_resp_integer(out, 1);
+            } else {
+                write_resp_integer(out, 0);
+            }
+            false
+        }
+        Command::Vinfo(index) => {
+            if let Some((count, dim, metric, max_layer)) = router.local_db.borrow().vinfo(&index) {
+                out.extend_from_slice(b"*8\r\n");
+                write_resp_bulk(out, b"num_elements");
+                write_resp_integer(out, count as i64);
+                write_resp_bulk(out, b"dimension");
+                write_resp_integer(out, dim as i64);
+                write_resp_bulk(out, b"metric");
+                write_resp_bulk(out, metric.as_bytes());
+                write_resp_bulk(out, b"max_layer");
+                write_resp_integer(out, max_layer as i64);
+            } else {
+                out.extend_from_slice(b"$-1\r\n");
+            }
+            false
+        }
+        Command::FunctionLoad { replace, code } => {
+            let code_str = String::from_utf8_lossy(&code);
+            match crate::scripting::load_function(&code_str, replace) {
+                Ok(lib_name) => {
+                    write_resp_bulk(out, lib_name.as_bytes());
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Fcall { function, keys, args } => {
+            match crate::scripting::call_function(&function, &keys, &args, &router.local_db, None) {
+                Ok(res) => {
+                    for k in &keys {
+                        notify_key_invalidation(router.port, k.as_ref(), client_id);
+                    }
+                    out.extend_from_slice(&res);
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::FunctionList => {
+            let libs = crate::scripting::list_functions();
+            out.extend_from_slice(format!("*{}\r\n", libs.len()).as_bytes());
+            for lib in libs {
+                out.extend_from_slice(b"*8\r\n");
+                write_resp_bulk(out, b"library_name");
+                write_resp_bulk(out, lib.name.as_bytes());
+                write_resp_bulk(out, b"engine");
+                write_resp_bulk(out, lib.engine.as_bytes());
+                write_resp_bulk(out, b"functions");
+                out.extend_from_slice(format!("*{}\r\n", lib.functions.len()).as_bytes());
+                for f in &lib.functions {
+                    write_resp_bulk(out, f.as_bytes());
+                }
+                write_resp_bulk(out, b"raw_code");
+                write_resp_bulk(out, lib.raw_code.as_bytes());
+            }
+            false
+        }
+        Command::FunctionDelete(lib) => {
+            if crate::scripting::delete_function(&lib) {
+                out.extend_from_slice(b"+OK\r\n");
+            } else {
+                out.extend_from_slice(format!("-ERR Library not found: {}\r\n", lib).as_bytes());
+            }
+            false
+        }
         Command::Quit => {
+
             out.extend_from_slice(b"+OK\r\n");
             true
         }
@@ -6041,6 +6319,8 @@ pub fn execute_local_command(
             false
         }
         Command::Quit => {
+
+
             out.extend_from_slice(b"+OK\r\n");
             true
         }

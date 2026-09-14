@@ -427,6 +427,78 @@ impl ShardTierManager {
         count * PAGE_SIZE
     }
 
+    /// Performs zero-copy file cloning via Linux FICLONE ioctl (reflink) if supported by the filesystem,
+    /// falling back to copy_file_range or standard copy.
+    pub fn snapshot_file(src_path: &Path, dst_path: &Path) -> io::Result<bool> {
+        use std::fs::OpenOptions;
+        use std::os::unix::io::AsRawFd;
+
+        let src_file = OpenOptions::new().read(true).open(src_path)?;
+        let dst_file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dst_path)?;
+
+        const FICLONE: libc::c_ulong = 0x40049409;
+        let ret = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
+        if ret == 0 {
+            Ok(true) // Instantaneous CoW reflink succeeded!
+        } else {
+            let src_fd = src_file.as_raw_fd();
+            let dst_fd = dst_file.as_raw_fd();
+            let len = src_file.metadata()?.len();
+            let mut copied = 0u64;
+            while copied < len {
+                let chunk = (len - copied).min(1024 * 1024 * 16) as libc::size_t;
+                let ret = unsafe {
+                    libc::copy_file_range(
+                        src_fd,
+                        std::ptr::null_mut(),
+                        dst_fd,
+                        std::ptr::null_mut(),
+                        chunk,
+                        0,
+                    )
+                };
+                if ret > 0 {
+                    copied += ret as u64;
+                } else {
+                    std::fs::copy(src_path, dst_path)?;
+                    return Ok(false);
+                }
+            }
+            Ok(false)
+        }
+    }
+
+    /// Creates an atomic snapshot of this shard's NVMe tiered storage database and manifest.
+    pub async fn snapshot(&self, backup_dir: &Path) -> io::Result<(bool, u64)> {
+        // 1. Flush any in-flight SmallBin
+        self.flush_active_bin().await?;
+        // 2. Sync underlying file
+        let _ = self.file.sync_all().await;
+        // 3. Ensure backup dir exists
+        std::fs::create_dir_all(backup_dir)?;
+        let backup_file = backup_dir.join(format!("tier_shard_{}.db", self.shard_id));
+        let is_reflink = Self::snapshot_file(&self.path, &backup_file)?;
+        let file_size = std::fs::metadata(&backup_file).map(|m| m.len()).unwrap_or(0);
+
+        // 4. Write manifest
+        let manifest_path = backup_dir.join(format!("tier_shard_{}.manifest", self.shard_id));
+        let manifest = format!(
+            "version:1\nshard_id:{}\nfile_size:{}\nis_reflink:{}\ncurrent_offset:{}\n",
+            self.shard_id,
+            file_size,
+            is_reflink,
+            self.current_offset.get(),
+        );
+        std::fs::write(&manifest_path, manifest)?;
+
+        Ok((is_reflink, file_size))
+    }
+
+
     /// Stash a single record onto disk.
     /// Values < 2048 bytes are packed into 4096-byte SmallBins with direct I/O alignment.
     /// Values >= 2048 bytes flush the active bin and write in aligned 4096-byte blocks.

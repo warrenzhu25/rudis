@@ -38,7 +38,9 @@ pub enum TierSubcommand {
     Cool(Bytes),
     Decommit(Option<Bytes>),
     Gc,
+    Snapshot(std::path::PathBuf),
 }
+
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ClientSubcommand {
@@ -46,7 +48,14 @@ pub enum ClientSubcommand {
     SetName(String),
     GetName,
     Id,
+    Tracking {
+        enabled: bool,
+        bcast: bool,
+        prefixes: Vec<Bytes>,
+    },
+    Caching(bool),
 }
+
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum AclSubcommand {
@@ -624,8 +633,44 @@ pub enum Command {
         start: i64,
         end: i64,
     },
+    // VECTOR COMMANDS
+    Vadd {
+        index: String,
+        key: Bytes,
+        vector: Vec<f32>,
+        metric: Option<crate::vector::VectorMetric>,
+    },
+    Vquery {
+        index: String,
+        k: usize,
+        query: Vec<f32>,
+    },
+    Vsim {
+        index: String,
+        k1: Bytes,
+        k2: Bytes,
+        metric: Option<crate::vector::VectorMetric>,
+    },
+    Vdel {
+        index: String,
+        key: Bytes,
+    },
+    Vinfo(String),
+    // REDIS 7 FUNCTIONS
+    FunctionLoad {
+        replace: bool,
+        code: Bytes,
+    },
+    Fcall {
+        function: String,
+        keys: Vec<Bytes>,
+        args: Vec<Bytes>,
+    },
+    FunctionList,
+    FunctionDelete(String),
     Unknown(String),
 }
+
 
 /// Parse a single Redis command from the buffer.
 /// Supports both RESP arrays (e.g., `*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n`)
@@ -1226,9 +1271,55 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
                 "GETNAME" => Ok(Some(Command::Client(ClientSubcommand::GetName))),
                 "ID" => Ok(Some(Command::Client(ClientSubcommand::Id))),
+                "TRACKING" => {
+                    if args.len() < 3 {
+                        return Err("wrong number of arguments for 'client tracking' command".to_string());
+                    }
+                    let state = String::from_utf8_lossy(&args[2]).to_uppercase();
+                    let enabled = match state.as_str() {
+                        "ON" => true,
+                        "OFF" => false,
+                        _ => return Err("syntax error: expected 'on' or 'off'".to_string()),
+                    };
+                    let mut bcast = false;
+                    let mut prefixes = Vec::new();
+                    let mut i = 3;
+                    while i < args.len() {
+                        let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                        match opt.as_str() {
+                            "BCAST" => {
+                                bcast = true;
+                                i += 1;
+                            }
+                            "PREFIX" => {
+                                if i + 1 < args.len() {
+                                    prefixes.push(args[i + 1].clone());
+                                    i += 2;
+                                } else {
+                                    i += 1;
+                                }
+                            }
+                            _ => { i += 1; }
+                        }
+                    }
+                    Ok(Some(Command::Client(ClientSubcommand::Tracking {
+                        enabled,
+                        bcast,
+                        prefixes,
+                    })))
+                }
+                "CACHING" => {
+                    if args.len() < 3 {
+                        return Err("wrong number of arguments for 'client caching' command".to_string());
+                    }
+                    let state = String::from_utf8_lossy(&args[2]).to_uppercase();
+                    let flag = state == "YES";
+                    Ok(Some(Command::Client(ClientSubcommand::Caching(flag))))
+                }
                 _ => Ok(Some(Command::Unknown(format!("CLIENT {}", sub)))),
             }
         }
+
         "HSET" => {
             if args.len() < 4 || (args.len() - 2) % 2 != 0 {
                 return Err("wrong number of arguments for 'hset' command".to_string());
@@ -2373,10 +2464,18 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "INFO" => Ok(Some(Command::Tier(TierSubcommand::Info))),
                 "SPILLALL" => Ok(Some(Command::Tier(TierSubcommand::SpillAll))),
                 "GC" => Ok(Some(Command::Tier(TierSubcommand::Gc))),
+                "SNAPSHOT" | "BACKUP" => {
+                    if args.len() < 3 {
+                        return Err("wrong number of arguments for 'tier snapshot' command".to_string());
+                    }
+                    let dir = String::from_utf8_lossy(&args[2]).to_string();
+                    Ok(Some(Command::Tier(TierSubcommand::Snapshot(std::path::PathBuf::from(dir)))))
+                }
                 _ => Err(format!(
-                    "ERR unknown subcommand '{}'. Try TIER SPILL, TIER COOL, TIER DECOMMIT, TIER LOAD, TIER INFO, TIER SPILLALL, TIER GC.",
+                    "ERR unknown subcommand '{}'. Try TIER SPILL, TIER COOL, TIER DECOMMIT, TIER LOAD, TIER INFO, TIER SPILLALL, TIER GC, TIER SNAPSHOT.",
                     sub
                 )),
+
             }
         }
         "CONFIG" => {
@@ -3750,7 +3849,124 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 end,
             }))
         }
+        "VADD" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'vadd' command".to_string());
+            }
+            let index = String::from_utf8_lossy(&args[1]).to_string();
+            let key = args[2].clone();
+            let mut vector = Vec::with_capacity(args.len() - 3);
+            for a in &args[3..] {
+                let s = std::str::from_utf8(a).map_err(|_| "not a valid float")?;
+                let val: f32 = s.parse().map_err(|_| "not a valid float")?;
+                vector.push(val);
+            }
+            Ok(Some(Command::Vadd {
+                index,
+                key,
+                vector,
+                metric: None,
+            }))
+        }
+        "VQUERY" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'vquery' command".to_string());
+            }
+            let index = String::from_utf8_lossy(&args[1]).to_string();
+            let k: usize = std::str::from_utf8(&args[2])
+                .map_err(|_| "value is not an integer or out of range")?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range")?;
+            let mut query = Vec::with_capacity(args.len() - 3);
+            for a in &args[3..] {
+                let s = std::str::from_utf8(a).map_err(|_| "not a valid float")?;
+                let val: f32 = s.parse().map_err(|_| "not a valid float")?;
+                query.push(val);
+            }
+            Ok(Some(Command::Vquery { index, k, query }))
+        }
+        "VSIM" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'vsim' command".to_string());
+            }
+            let index = String::from_utf8_lossy(&args[1]).to_string();
+            let k1 = args[2].clone();
+            let k2 = args[3].clone();
+            let metric = if args.len() > 4 {
+                let s = String::from_utf8_lossy(&args[4]);
+                crate::vector::VectorMetric::from_str(&s)
+            } else {
+                None
+            };
+            Ok(Some(Command::Vsim { index, k1, k2, metric }))
+        }
+        "VDEL" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'vdel' command".to_string());
+            }
+            let index = String::from_utf8_lossy(&args[1]).to_string();
+            let key = args[2].clone();
+            Ok(Some(Command::Vdel { index, key }))
+        }
+        "VINFO" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'vinfo' command".to_string());
+            }
+            let index = String::from_utf8_lossy(&args[1]).to_string();
+            Ok(Some(Command::Vinfo(index)))
+        }
+        "FUNCTION" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'function' command".to_string());
+            }
+            let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
+            match sub.as_str() {
+                "LOAD" => {
+                    if args.len() < 3 {
+                        return Err("wrong number of arguments for 'function load' command".to_string());
+                    }
+                    let mut replace = false;
+                    let mut code_idx = 2;
+                    if args.len() >= 4 && String::from_utf8_lossy(&args[2]).to_uppercase() == "REPLACE" {
+                        replace = true;
+                        code_idx = 3;
+                    }
+                    let code = args[code_idx].clone();
+                    Ok(Some(Command::FunctionLoad { replace, code }))
+                }
+                "LIST" => Ok(Some(Command::FunctionList)),
+                "DELETE" => {
+                    if args.len() != 3 {
+                        return Err("wrong number of arguments for 'function delete' command".to_string());
+                    }
+                    let lib = String::from_utf8_lossy(&args[2]).to_string();
+                    Ok(Some(Command::FunctionDelete(lib)))
+                }
+                _ => Ok(Some(Command::Unknown(format!("FUNCTION {}", sub)))),
+            }
+        }
+        "FCALL" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'fcall' command".to_string());
+            }
+            let function = String::from_utf8_lossy(&args[1]).to_string();
+            let numkeys: usize = std::str::from_utf8(&args[2])
+                .map_err(|_| "value is not an integer or out of range")?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range")?;
+            if args.len() < 3 + numkeys {
+                return Err("Number of keys can't be greater than number of args".to_string());
+            }
+            let keys = args[3..3 + numkeys].to_vec();
+            let func_args = args[3 + numkeys..].to_vec();
+            Ok(Some(Command::Fcall {
+                function,
+                keys,
+                args: func_args,
+            }))
+        }
         _ => Ok(Some(Command::Unknown(cmd_name))),
+
     }
 }
 

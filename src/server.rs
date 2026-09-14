@@ -619,7 +619,15 @@ pub fn run_shard_worker(
                         let reclaimed = cross_shard_router.gc_local();
                         let _ = responder.send(reclaimed);
                     }
+                    ShardMessage::TierSnapshot { backup_dir, responder } => {
+                        let r = cross_shard_router.clone();
+                        monoio::spawn(async move {
+                            let res = r.snapshot_local(&backup_dir).await;
+                            let _ = responder.send(res);
+                        });
+                    }
                 }
+
             }
         });
 

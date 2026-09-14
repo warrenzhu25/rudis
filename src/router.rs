@@ -530,6 +530,41 @@ impl Router {
         total
     }
 
+    pub async fn snapshot_local(&self, backup_dir: &std::path::Path) -> Result<(bool, u64), String> {
+        let tm = self.local_db.borrow().tier_manager.clone();
+        if let Some(tm) = tm {
+            tm.snapshot(backup_dir).await.map_err(|e| e.to_string())
+        } else {
+            Err("Tiered storage not enabled".to_string())
+        }
+    }
+
+    pub async fn tier_snapshot_all(&self, backup_dir: std::path::PathBuf) -> Result<(bool, u64, usize), String> {
+        let (local_reflink, local_bytes) = self.snapshot_local(&backup_dir).await?;
+        let mut total_bytes = local_bytes;
+        let mut all_reflink = local_reflink;
+        let mut shard_count = 1;
+
+        for s in 0..self.num_shards {
+            if s != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                if self.senders[s].send(ShardMessage::TierSnapshot {
+                    backup_dir: backup_dir.clone(),
+                    responder: tx,
+                }).is_ok() {
+                    let res = rx.recv_async().await.map_err(|e| e.to_string())??;
+                    total_bytes += res.1;
+                    if !res.0 {
+                        all_reflink = false;
+                    }
+                    shard_count += 1;
+                }
+            }
+        }
+        Ok((all_reflink, total_bytes, shard_count))
+    }
+
+
     pub async fn get(&self, key: Bytes) -> Option<Bytes> {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {

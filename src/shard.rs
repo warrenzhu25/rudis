@@ -212,7 +212,12 @@ pub enum ShardMessage {
     TierGc {
         responder: flume::Sender<usize>,
     },
+    TierSnapshot {
+        backup_dir: std::path::PathBuf,
+        responder: flume::Sender<Result<(bool, u64), String>>,
+    },
 }
+
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SlotState {
@@ -229,6 +234,7 @@ pub struct ShardDb {
     pub table: crate::table::RudisTable,
     pub port: u16,
     pub tier_manager: Option<std::rc::Rc<crate::tiering::ShardTierManager>>,
+    pub vector_indexes: std::collections::HashMap<String, crate::vector::HnswIndex>,
 }
 
 impl ShardDb {
@@ -237,8 +243,10 @@ impl ShardDb {
             table: crate::table::RudisTable::new(),
             port,
             tier_manager: None,
+            vector_indexes: std::collections::HashMap::new(),
         }
     }
+
 
     #[inline]
     pub fn get_entry(
@@ -1113,4 +1121,63 @@ impl ShardDb {
     ) -> Result<Vec<(crate::table::StreamId, Bytes, u64, usize)>, &'static str> {
         self.table.xpending_range(key, group, start, end, count, consumer)
     }
+
+    // Vector operations
+    pub fn vadd(
+        &mut self,
+        index_name: &str,
+        key: Bytes,
+        vector: Vec<f32>,
+        metric: Option<crate::vector::VectorMetric>,
+    ) -> Result<(), &'static str> {
+        let dim = vector.len();
+        let idx = self.vector_indexes.entry(index_name.to_string()).or_insert_with(|| {
+            crate::vector::HnswIndex::new(
+                index_name.to_string(),
+                dim,
+                metric.unwrap_or(crate::vector::VectorMetric::Cosine),
+            )
+        });
+        idx.add(key, vector)
+    }
+
+    pub fn vquery(&self, index_name: &str, query: &[f32], k: usize) -> Vec<(Bytes, f32)> {
+        if let Some(idx) = self.vector_indexes.get(index_name) {
+            idx.search(query, k)
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn vsim(
+        &self,
+        index_name: &str,
+        k1: &Bytes,
+        k2: &Bytes,
+        metric_override: Option<crate::vector::VectorMetric>,
+    ) -> Result<f32, &'static str> {
+        if let Some(idx) = self.vector_indexes.get(index_name) {
+            let v1 = idx.get_vector(k1).ok_or("vector 1 not found")?;
+            let v2 = idx.get_vector(k2).ok_or("vector 2 not found")?;
+            let metric = metric_override.unwrap_or(idx.metric);
+            Ok(crate::vector::compute_distance(v1, v2, metric))
+        } else {
+            Err("index not found")
+        }
+    }
+
+    pub fn vdel(&mut self, index_name: &str, key: &Bytes) -> bool {
+        if let Some(idx) = self.vector_indexes.get_mut(index_name) {
+            idx.remove(key)
+        } else {
+            false
+        }
+    }
+
+    pub fn vinfo(&self, index_name: &str) -> Option<(usize, usize, &'static str, usize)> {
+        self.vector_indexes.get(index_name).map(|idx| {
+            (idx.len(), idx.dim, idx.metric.as_str(), idx.max_layer)
+        })
+    }
 }
+

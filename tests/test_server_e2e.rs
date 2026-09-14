@@ -3109,6 +3109,139 @@ fn test_tiered_storage_gc_and_hole_punching_e2e() {
     let _ = std::fs::remove_dir_all(format!("/tmp/rudis_tier_{}", port));
 }
 
+#[test]
+fn test_option1_zero_copy_snapshots_e2e() {
+    let port = 16510;
+    start_test_server(port, 2);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Write keys and spill one to tier
+    assert_eq!(send_and_read(&mut client, b"SET snap_key1 hello\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"SET snap_key2 world\r\n"), "+OK\r\n");
+    let spill_resp = send_and_read(&mut client, b"TIER SPILL snap_key1\r\n");
+    assert_eq!(spill_resp, ":1\r\n");
+
+    // 2. Perform zero-copy snapshot
+    let snap_dir = format!("/tmp/rudis_snapshot_test_{}", port);
+    let _ = std::fs::remove_dir_all(&snap_dir);
+
+    let snap_cmd = format!("TIER SNAPSHOT {}\r\n", snap_dir);
+    let snap_resp = send_and_read(&mut client, snap_cmd.as_bytes());
+    assert!(snap_resp.starts_with("+OK"));
+
+    // Verify snapshot directory exists and has files
+    assert!(std::path::Path::new(&snap_dir).exists());
+    let entries = std::fs::read_dir(&snap_dir).unwrap().count();
+    assert!(entries > 0);
+
+    let _ = std::fs::remove_dir_all(&snap_dir);
+    let _ = std::fs::remove_dir_all(format!("/tmp/rudis_tier_{}", port));
+}
+
+#[test]
+fn test_option2_vector_search_hnsw_e2e() {
+    let port = 16520;
+    start_test_server(port, 2);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Add vectors to HNSW index
+    assert_eq!(send_and_read(&mut client, b"VADD v_idx doc1 1.0 0.0 0.0\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"VADD v_idx doc2 0.0 1.0 0.0\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"VADD v_idx doc3 0.9 0.1 0.0\r\n"), "+OK\r\n");
+
+    // 2. Query index info
+    let info = send_and_read(&mut client, b"VINFO v_idx\r\n");
+    assert!(info.contains("num_elements"));
+    assert!(info.contains(":3\r\n"));
+    assert!(info.contains("dimension"));
+    assert!(info.contains(":3\r\n"));
+
+    // 3. Compute vector similarity (Cosine metric by default)
+    // doc1 [1,0,0] vs doc3 [0.9, 0.1, 0] is very close (distance close to 0)
+    let sim_1_3 = send_and_read(&mut client, b"VSIM v_idx doc1 doc3\r\n");
+    assert!(sim_1_3.starts_with("$"));
+
+    // doc1 [1,0,0] vs doc2 [0,1,0] is orthogonal (distance 1.0)
+    let sim_1_2 = send_and_read(&mut client, b"VSIM v_idx doc1 doc2\r\n");
+    assert!(sim_1_2.contains("1.000000"));
+
+    // 4. Query top-2 nearest neighbors for [1.0, 0.0, 0.0]
+    let query_resp = send_and_read(&mut client, b"VQUERY v_idx 2 1.0 0.0 0.0\r\n");
+    assert!(query_resp.contains("doc1"));
+    assert!(query_resp.contains("doc3"));
+
+    // 5. Delete element
+    assert_eq!(send_and_read(&mut client, b"VDEL v_idx doc1\r\n"), ":1\r\n");
+    let info_after = send_and_read(&mut client, b"VINFO v_idx\r\n");
+    assert!(info_after.contains(":2\r\n"));
+}
+
+#[test]
+fn test_option3_modern_redis7_features_e2e() {
+    let port = 16530;
+    start_test_server(port, 2);
+    let mut client1 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client1.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+
+    // 1. RESP3 Negotiation via HELLO 3
+    let hello_resp = send_and_read(&mut client1, b"HELLO 3\r\n");
+    assert!(hello_resp.starts_with("%"));
+    assert!(hello_resp.contains("server"));
+    assert!(hello_resp.contains("valkey"));
+    assert!(hello_resp.contains("proto"));
+
+    // 2. Client tracking & invalidation
+    assert_eq!(send_and_read(&mut client1, b"CLIENT TRACKING on\r\n"), "+OK\r\n");
+
+    // Client 1 reads a key to track it
+    assert_eq!(send_and_read(&mut client1, b"GET track_k1\r\n"), "$-1\r\n");
+
+    // Client 2 modifies track_k1
+    let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    assert_eq!(send_and_read(&mut client2, b"SET track_k1 updated_val\r\n"), "+OK\r\n");
+
+    // Client 1 should receive the invalidation message on next interaction or read
+    let next_resp = send_and_read(&mut client1, b"PING\r\n");
+    assert!(next_resp.contains("invalidate"));
+    assert!(next_resp.contains("track_k1"));
+
+    // 3. Redis 7 Functions: FUNCTION LOAD and FCALL
+    let func_code = "#!lua name=mathlib\nredis.register_function('add_nums', function(keys, args) return tonumber(args[1]) + tonumber(args[2]) end)\n";
+    let load_cmd = format!("*3\r\n$8\r\nFUNCTION\r\n$4\r\nLOAD\r\n${}\r\n{}\r\n", func_code.len(), func_code);
+    let load_resp = send_and_read(&mut client2, load_cmd.as_bytes());
+    assert_eq!(load_resp, "$7\r\nmathlib\r\n");
+
+    // Call function via FCALL
+    let fcall_cmd = "*5\r\n$5\r\nFCALL\r\n$8\r\nadd_nums\r\n$1\r\n0\r\n$2\r\n15\r\n$2\r\n27\r\n";
+    let fcall_resp = send_and_read(&mut client2, fcall_cmd.as_bytes());
+    assert_eq!(fcall_resp, ":42\r\n");
+
+    // FUNCTION LIST
+    let list_resp = send_and_read(&mut client2, b"FUNCTION LIST\r\n");
+    assert!(list_resp.contains("mathlib"));
+    assert!(list_resp.contains("add_nums"));
+
+    // FUNCTION DELETE
+    assert_eq!(send_and_read(&mut client2, b"FUNCTION DELETE mathlib\r\n"), "+OK\r\n");
+}
+
+#[test]
+fn test_option4_jemalloc_memory_profiling_e2e() {
+    let port = 16540;
+    start_test_server(port, 2);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    let info_resp = send_and_read(&mut client, b"INFO memory\r\n");
+    assert!(info_resp.contains("# Memory"));
+    assert!(info_resp.contains("used_memory:"));
+    assert!(info_resp.contains("used_memory_rss:"));
+    assert!(info_resp.contains("allocator_allocated:"));
+    assert!(info_resp.contains("allocator_active:"));
+    assert!(info_resp.contains("allocator_resident:"));
+    assert!(info_resp.contains("mem_fragmentation_ratio:"));
+}
+
+
 
 
 

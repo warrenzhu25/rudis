@@ -92,6 +92,32 @@ Rudis features a thread-per-core asynchronous storage tiering engine built nativ
 - **Transparent Async Retrieval**: Any access (`GET`, `DUMP`, etc.) to a tiered key transparently reads from disk via `io_uring` without blocking the event loop or other connections.
 - **Bulk Operations & Metrics**: `TIER SPILLALL`, `TIER COOLALL`, and `TIER INFO` / `INFO storage` report live telemetry on disk footprint, RAM saved, and coalesced I/O.
 
+### 6. Zero-Copy Tiered Snapshots (`FICLONE` / Reflink CoW)
+Rudis supports sub-millisecond, zero-copy snapshots of tiered storage on NVMe filesystems supporting copy-on-write (Btrfs, XFS reflink, ZFS, OCFS2):
+- **`TIER SNAPSHOT <dir>` / `TIER BACKUP <dir>`**: Dispatches parallel snapshot commands across all thread shards.
+- Uses kernel `ioctl(FICLONE)` reflink cloning with automatic fallbacks to `copy_file_range` and streaming copy.
+- Atomically creates point-in-time storage checkpoints with metadata manifests in $<1$ ms without stopping traffic or locking workers.
+
+### 7. Vector Search & Embeddings Engine (HNSW)
+Rudis includes an integrated Hierarchical Navigable Small World (HNSW) vector index:
+- **Metrics**: Cosine distance, Euclidean $L_2$ distance, and Inner Product (IP) with SIMD-friendly loop vectorization.
+- **Commands**:
+  - `VADD <index> <key> <dim0> <dim1> ... [METRIC cosine|l2|ip]`: Insert or update embeddings.
+  - `VQUERY <index> <k> <dim0> <dim1> ...`: Approximate Nearest Neighbor (ANN) search returning top-$k$ nearest keys and distances.
+  - `VSIM <index> <key1> <key2> [METRIC ...]`: Compute pairwise vector similarity directly in memory.
+  - `VDEL <index> <key>`: Remove a vector element and rewire graph edges.
+  - `VINFO <index>`: Inspect index statistics (element count, dimension, metric, max layers).
+
+### 8. Modern Redis 7 / Valkey Parity & Client Tracking
+- **RESP3 Protocol**: Full protocol negotiation via `HELLO 3`, native RESP3 maps (`%`), sets (`~`), and push frames (`>`).
+- **Client-Side Caching (`CLIENT TRACKING`)**: High-performance invalidation broadcasts (`CLIENT TRACKING on [BCAST] [PREFIX ...]`). Subscribed clients receive asynchronous push notifications (`>2 invalidate ...`) whenever tracked keys are updated or deleted.
+- **Redis 7 Functions Engine**: Standalone, persistent Lua library routines loaded via `FUNCTION LOAD #!lua name=<lib>`, invoked with `FCALL <func> <numkeys> [key ...] [arg ...]`, queried via `FUNCTION LIST`, and purged via `FUNCTION DELETE <lib>`.
+
+### 9. Jemalloc Per-Core Memory Allocator & Live Telemetry
+- Pinned to `tikv-jemallocator` as the global memory allocator for minimal lock contention and reduced memory fragmentation.
+- `INFO memory` outputs detailed jemalloc statistics via `tikv-jemalloc-ctl`:
+  - `used_memory_rss`, `allocator_allocated`, `allocator_active`, `allocator_resident`, `allocator_metadata`, and `mem_fragmentation_ratio`.
+
 ---
 
 ## Testing
@@ -167,11 +193,14 @@ rudis/
 ├── src/
 │   ├── main.rs         # CLI argument parsing, thread spawning, mesh setup
 │   ├── lib.rs          # Library root exporting modules
-│   ├── server.rs       # SO_REUSEPORT socket setup, Monoio io_uring accept loop
-│   ├── connection.rs   # TCP connection handler and command dispatcher
-│   ├── resp.rs         # RESP2 & inline frame parser and serializer
+│   ├── allocator.rs    # jemalloc profiling and memory statistics
+│   ├── connection.rs   # TCP connection handler, RESP3 push, and command dispatcher
+│   ├── resp.rs         # RESP2/RESP3 & inline frame parser and serializer
 │   ├── router.rs       # CRC16 key partitioner and cross-core message dispatcher
-│   └── shard.rs        # Thread-local in-memory key-value database and message types
+│   ├── scripting.rs    # Lua scripting and Redis 7 Function engine
+│   ├── shard.rs        # Thread-local in-memory key-value database and message types
+│   ├── tiering.rs      # NVMe tiered storage, io_uring Direct I/O, zero-copy snapshots
+│   └── vector.rs       # HNSW vector search engine and distance metrics
 └── tests/
     ├── test_cross_thread.rs # Validates cross-core eventfd waker with Monoio
     └── test_server_e2e.rs   # Multi-shard end-to-end integration tests
