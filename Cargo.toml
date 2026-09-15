@@ -27,4 +27,9 @@ serde_json = "1.0"
 io-uring = "0.6"
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
 
+[profile.release]
+debug = 1
+opt-level = 3
+lto = "thin"
+
 

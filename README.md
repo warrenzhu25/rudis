@@ -552,6 +552,23 @@ cargo test
 
 ## Benchmarks
 
+### Multi-Core In-Memory Scaling & CPU Profiling (1 to 32 Cores, 1KB Payloads)
+
+Detailed Benchmark & Profiling report: [docs/benchmarks/scaling_and_profiling_report.md](docs/benchmarks/scaling_and_profiling_report.md)
+
+Benchmarked on **AMD EPYC 7B13 (64 vCPUs, 117 GiB RAM)** with server pinned to cores `0..(N-1)` and `memtier_benchmark` on cores `32-63` (Pipeline 100, 1M Keys):
+
+| Cores | 100% SET (1KB) | SET Bandwidth | 100% GET (1KB) | 50/50 SET/GET | p50 Latency | p99 Latency |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **1** | 867,251 ops/s | 886.29 MB/s | 1,707,230 ops/s | 448,088 ops/s | 1.48 ms | 4.25 ms |
+| **2** | 1,181,227 ops/s | 1,207.27 MB/s | 2,410,932 ops/s | 578,853 ops/s | 1.04 ms | 4.32 ms |
+| **4** | 1,689,026 ops/s | 1,726.42 MB/s | 3,546,696 ops/s | 757,423 ops/s | 0.71 ms | 2.81 ms |
+| **8** | 2,190,518 ops/s | 2,239.09 MB/s | **4,251,151 ops/s** | 1,057,310 ops/s | **0.59 ms** | **2.24 ms** |
+| **16** | **2,795,856 ops/s** | **2,857.88 MB/s** | 3,260,984 ops/s | **1,401,317 ops/s** | 0.86 ms | 2.67 ms |
+| **32** | 2,534,120 ops/s | 2,590.36 MB/s | 3,278,615 ops/s | 1,341,148 ops/s | 0.83 ms | 2.64 ms |
+
+---
+
 ### Vector Search & SQ8 Quantization (10,000 Vectors, 128 Dimensions, Cosine)
 
 Detailed Vector Search benchmark report: [docs/benchmarks/vector_search.md](docs/benchmarks/vector_search.md)
