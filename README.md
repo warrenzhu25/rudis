@@ -191,6 +191,23 @@ Rudis extends its HNSW vector engine with Product Quantization (PQ) and Asymmetr
 - **Two-Stage Retrieval & Exact Rerank**: Supports candidate pool expansion followed by exact Float32 reranking for maximum precision.
 - **Commands**: `VADD <index> <key> <coords...> PQ [TIERED]`, `VQUERY <index> <k> <coords...> [RERANK]`.
 
+### 18. Redis Cluster Bus Protocol & Consensus-Based Automated Failover
+Rudis includes full Redis Cluster bus protocol implementation, dynamic multi-node introspection, and consensus-driven failover:
+- **Dedicated Cluster Bus Port (`port + 10000`)**: Independent gossip networking thread handling bidirectional peer heartbeats, transitive topology dissemination, and consensus voting without latency impact on client data planes.
+- **Modern Topology Introspection**:
+  - `CLUSTER SLOTS`: Dynamic multi-node slot mappings across all cluster shards with automatic single-node fallback for legacy clients.
+  - `CLUSTER SHARDS`: Redis 7 / Valkey specification reporting nested `slots` arrays and `nodes` attribute maps (`id`, `port`, `ip`, `endpoint`, `role`, `replication-offset`, `health`).
+  - `CLUSTER LINKS`: Active peer bus link telemetry monitoring connection direction (`to`/`from`), remote node ID, creation timestamp, event flags (`r`/`w`), and memory buffer allocations.
+- **Slot Mutation Commands**:
+  - `CLUSTER ADDSLOTS`, `CLUSTER DELSLOTS`, `CLUSTER ADDSLOTSRANGE`, `CLUSTER DELSLOTSRANGE`: Dynamic runtime slot repartitioning with range compaction and bounds validation.
+- **Dynamic Request Routing (`-MOVED` Redirection)**:
+  - Automatically redirects client commands with `-MOVED <slot> <target_ip>:<target_port>` when queried for keys belonging to peer masters, complementing live migration redirection (`-ASK` and `ASKING`).
+- **Raft-Like Consensus Automated Failover**:
+  - Replicas continuously track master heartbeats and detect failures via gossip timeout flags (`fail?` / `fail`).
+  - Initiates candidate elections by incrementing `current_epoch` and broadcasting `FAILOVER_AUTH_REQUEST <replica_id> <epoch> <master_id>`.
+  - Active cluster masters vote at most once per epoch with `FAILOVER_AUTH_ACK`.
+  - Upon achieving majority quorum, the candidate promotes to master, inherits slot ranges, broadcasts `FAILOVER_ANNOUNCE`, and seamlessly transitions replication roles.
+
 ---
 
 ## Testing
@@ -283,6 +300,7 @@ rudis/
 │   ├── allocator.rs    # jemalloc profiling and memory statistics
 │   ├── bin/
 │   │   └── vector_bench.rs # Standalone vector benchmark suite
+│   ├── cluster.rs      # Redis Cluster bus protocol (port + 10000), gossip, consensus voting
 │   ├── connection.rs   # TCP connection handler, RESP3 push, and command dispatcher
 │   ├── crdt.rs         # Active-Active multi-region CRDT engine (HLC, LWW, OR-Set, PN-Counter)
 │   ├── geo.rs          # 52-bit geohash encoding, Haversine distance, and geospatial queries

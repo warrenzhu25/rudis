@@ -1434,4 +1434,46 @@ impl Router {
     pub fn cluster_replicate(&self, node_id: &str) -> Result<(), String> {
         crate::cluster::get_cluster_hub(self.port).cluster_replicate(node_id)
     }
+
+    pub fn cluster_slots(&self, out: &mut Vec<u8>) {
+        crate::cluster::get_cluster_hub(self.port).cluster_slots(out, self.num_shards);
+    }
+
+    pub fn cluster_shards(&self, out: &mut Vec<u8>) {
+        crate::cluster::get_cluster_hub(self.port).cluster_shards(out);
+    }
+
+    pub fn cluster_links(&self, out: &mut Vec<u8>) {
+        crate::cluster::get_cluster_hub(self.port).cluster_links(out);
+    }
+
+    pub fn cluster_addslots(&self, slots: &[u16]) -> Result<(), String> {
+        let res = crate::cluster::get_cluster_hub(self.port).cluster_addslots(slots);
+        if res.is_ok() {
+            for &s in slots {
+                self.set_slot_state(s, crate::shard::SlotState::Stable);
+            }
+        }
+        res
+    }
+
+    pub fn cluster_delslots(&self, slots: &[u16]) -> Result<(), String> {
+        crate::cluster::get_cluster_hub(self.port).cluster_delslots(slots)
+    }
+
+    pub fn cluster_addslotsrange(&self, ranges: &[(u16, u16)]) -> Result<(), String> {
+        let res = crate::cluster::get_cluster_hub(self.port).cluster_addslotsrange(ranges);
+        if res.is_ok() {
+            for &(start, end) in ranges {
+                for s in start..=end {
+                    self.set_slot_state(s, crate::shard::SlotState::Stable);
+                }
+            }
+        }
+        res
+    }
+
+    pub fn cluster_delslotsrange(&self, ranges: &[(u16, u16)]) -> Result<(), String> {
+        crate::cluster::get_cluster_hub(self.port).cluster_delslotsrange(ranges)
+    }
 }

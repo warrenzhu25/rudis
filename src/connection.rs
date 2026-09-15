@@ -1788,7 +1788,22 @@ async fn execute_command(
                     return false;
                 }
             }
-            crate::shard::SlotState::Stable => {}
+            crate::shard::SlotState::Stable => {
+                let hub = crate::cluster::get_cluster_hub(router.port);
+                let my_slots = hub.my_slots.read().unwrap();
+                let owns_slot = my_slots.iter().any(|&(s, e)| slot >= s && slot <= e);
+                if !owns_slot {
+                    let nodes = hub.nodes.read().unwrap();
+                    if !nodes.is_empty() {
+                        if let Some(peer) = nodes.values().find(|n| {
+                            n.flags.contains("master") && !n.flags.contains("fail") && n.slots.iter().any(|&(s, e)| slot >= s && slot <= e)
+                        }) {
+                            out.extend_from_slice(format!("-MOVED {} {}:{}\r\n", slot, peer.ip, peer.port).as_bytes());
+                            return false;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -2265,27 +2280,42 @@ async fn execute_command(
                     }
                 }
                 ClusterSubcommand::Slots => {
-                    out.extend_from_slice(format!("*{}\r\n", router.num_shards).as_bytes());
-                    for s in 0..router.num_shards {
-                        let start_slot = s * 16384 / router.num_shards;
-                        let end_slot = if s == router.num_shards - 1 {
-                            16383
-                        } else {
-                            (s + 1) * 16384 / router.num_shards - 1
-                        };
-                        let node_id = format!("{:040x}", s + 1);
-                        out.extend_from_slice(b"*3\r\n");
-                        out.extend_from_slice(format!(":{}\r\n", start_slot).as_bytes());
-                        out.extend_from_slice(format!(":{}\r\n", end_slot).as_bytes());
-                        out.extend_from_slice(
-                            format!(
-                                "*3\r\n$9\r\n127.0.0.1\r\n:{}\r\n${}\r\n{}\r\n",
-                                router.port,
-                                node_id.len(),
-                                node_id
-                            )
-                            .as_bytes(),
-                        );
+                    let mut slots_bytes = Vec::new();
+                    router.cluster_slots(&mut slots_bytes);
+                    out.extend_from_slice(&slots_bytes);
+                }
+                ClusterSubcommand::Shards => {
+                    let mut shards_bytes = Vec::new();
+                    router.cluster_shards(&mut shards_bytes);
+                    out.extend_from_slice(&shards_bytes);
+                }
+                ClusterSubcommand::Links => {
+                    let mut links_bytes = Vec::new();
+                    router.cluster_links(&mut links_bytes);
+                    out.extend_from_slice(&links_bytes);
+                }
+                ClusterSubcommand::AddSlots(slots) => {
+                    match router.cluster_addslots(&slots) {
+                        Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                        Err(e) => out.extend_from_slice(format!("-{}\r\n", e).as_bytes()),
+                    }
+                }
+                ClusterSubcommand::DelSlots(slots) => {
+                    match router.cluster_delslots(&slots) {
+                        Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                        Err(e) => out.extend_from_slice(format!("-{}\r\n", e).as_bytes()),
+                    }
+                }
+                ClusterSubcommand::AddSlotsRange(ranges) => {
+                    match router.cluster_addslotsrange(&ranges) {
+                        Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                        Err(e) => out.extend_from_slice(format!("-{}\r\n", e).as_bytes()),
+                    }
+                }
+                ClusterSubcommand::DelSlotsRange(ranges) => {
+                    match router.cluster_delslotsrange(&ranges) {
+                        Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                        Err(e) => out.extend_from_slice(format!("-{}\r\n", e).as_bytes()),
                     }
                 }
                 ClusterSubcommand::Nodes => {

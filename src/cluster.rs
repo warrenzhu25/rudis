@@ -26,6 +26,8 @@ pub struct ClusterHub {
     pub my_id: RwLock<String>,
     pub current_epoch: AtomicU64,
     pub config_epoch: AtomicU64,
+    pub last_vote_epoch: AtomicU64,
+    pub election_in_progress: AtomicBool,
     pub role: RwLock<String>, // "master" or "slave"
     pub master_id: RwLock<String>, // "-" or ID
     pub nodes: RwLock<HashMap<String, ClusterNodeInfo>>,
@@ -69,6 +71,8 @@ impl ClusterHub {
             my_id: RwLock::new(my_id),
             current_epoch: AtomicU64::new(1),
             config_epoch: AtomicU64::new(1),
+            last_vote_epoch: AtomicU64::new(0),
+            election_in_progress: AtomicBool::new(false),
             role: RwLock::new("master".to_string()),
             master_id: RwLock::new("-".to_string()),
             nodes: RwLock::new(HashMap::new()),
@@ -356,6 +360,389 @@ impl ClusterHub {
         Ok(())
     }
 
+    pub fn cluster_slots(&self, out: &mut Vec<u8>, num_shards: usize) {
+        let nodes = self.nodes.read().unwrap();
+        if nodes.is_empty() {
+            // Standalone node fallback: report slots divided across local num_shards
+            out.extend_from_slice(format!("*{}\r\n", num_shards).as_bytes());
+            for s in 0..num_shards {
+                let start_slot = s * 16384 / num_shards;
+                let end_slot = if s == num_shards - 1 {
+                    16383
+                } else {
+                    (s + 1) * 16384 / num_shards - 1
+                };
+                let node_id = format!("{:040x}", s + 1);
+                out.extend_from_slice(b"*3\r\n");
+                out.extend_from_slice(format!(":{}\r\n:{}\r\n", start_slot, end_slot).as_bytes());
+                out.extend_from_slice(
+                    format!(
+                        "*3\r\n$9\r\n127.0.0.1\r\n:{}\r\n${}\r\n{}\r\n",
+                        self.port,
+                        node_id.len(),
+                        node_id
+                    )
+                    .as_bytes(),
+                );
+            }
+            return;
+        }
+
+        // Multi-node cluster: collect slot ranges for all master nodes
+        let my_id = self.my_id();
+        let my_role = self.role.read().unwrap().clone();
+        let my_slots = self.my_slots.read().unwrap().clone();
+
+        struct MasterSlotEntry {
+            start: u16,
+            end: u16,
+            master_ip: String,
+            master_port: u16,
+            master_id: String,
+            replicas: Vec<(String, u16, String)>,
+        }
+
+        let mut entries = Vec::new();
+
+        // 1. Myself if master
+        if my_role == "master" {
+            let my_replicas: Vec<(String, u16, String)> = nodes
+                .values()
+                .filter(|n| n.master_id == my_id)
+                .map(|n| (n.ip.clone(), n.port, n.id.clone()))
+                .collect();
+            for &(s, e) in &my_slots {
+                entries.push(MasterSlotEntry {
+                    start: s,
+                    end: e,
+                    master_ip: "127.0.0.1".to_string(),
+                    master_port: self.port,
+                    master_id: my_id.clone(),
+                    replicas: my_replicas.clone(),
+                });
+            }
+        }
+
+        // 2. Peer masters
+        for peer in nodes.values() {
+            if peer.flags.contains("master") {
+                let peer_replicas: Vec<(String, u16, String)> = nodes
+                    .values()
+                    .filter(|n| n.master_id == peer.id)
+                    .map(|n| (n.ip.clone(), n.port, n.id.clone()))
+                    .collect();
+                for &(s, e) in &peer.slots {
+                    entries.push(MasterSlotEntry {
+                        start: s,
+                        end: e,
+                        master_ip: peer.ip.clone(),
+                        master_port: peer.port,
+                        master_id: peer.id.clone(),
+                        replicas: peer_replicas.clone(),
+                    });
+                }
+            }
+        }
+
+        entries.sort_by_key(|e| e.start);
+
+        out.extend_from_slice(format!("*{}\r\n", entries.len()).as_bytes());
+        for entry in entries {
+            let total_nodes = 1 + entry.replicas.len();
+            out.extend_from_slice(format!("*{}\r\n", 2 + total_nodes).as_bytes());
+            out.extend_from_slice(format!(":{}\r\n:{}\r\n", entry.start, entry.end).as_bytes());
+            // Master node tuple: [ip, port, id]
+            out.extend_from_slice(
+                format!(
+                    "*3\r\n${}\r\n{}\r\n:{}\r\n${}\r\n{}\r\n",
+                    entry.master_ip.len(),
+                    entry.master_ip,
+                    entry.master_port,
+                    entry.master_id.len(),
+                    entry.master_id
+                )
+                .as_bytes(),
+            );
+            // Replicas tuples
+            for (rip, rport, rid) in entry.replicas {
+                out.extend_from_slice(
+                    format!(
+                        "*3\r\n${}\r\n{}\r\n:{}\r\n${}\r\n{}\r\n",
+                        rip.len(),
+                        rip,
+                        rport,
+                        rid.len(),
+                        rid
+                    )
+                    .as_bytes(),
+                );
+            }
+        }
+    }
+
+    pub fn cluster_shards(&self, out: &mut Vec<u8>) {
+        let nodes = self.nodes.read().unwrap();
+        let my_id = self.my_id();
+        let my_role = self.role.read().unwrap().clone();
+        let my_slots = self.my_slots.read().unwrap().clone();
+
+        struct ShardItem {
+            slots: Vec<(u16, u16)>,
+            nodes: Vec<(String, u16, String, String, String)>, // id, port, ip, role, health
+        }
+
+        let mut shards = Vec::new();
+
+        // 1. Shard for myself if master
+        if my_role == "master" {
+            let mut shard_nodes = Vec::new();
+            shard_nodes.push((my_id.clone(), self.port, "127.0.0.1".to_string(), "master".to_string(), "online".to_string()));
+            for n in nodes.values() {
+                if n.master_id == my_id {
+                    let health = if n.flags.contains("fail") { "fail" } else { "online" };
+                    shard_nodes.push((n.id.clone(), n.port, n.ip.clone(), "replica".to_string(), health.to_string()));
+                }
+            }
+            shards.push(ShardItem {
+                slots: my_slots.clone(),
+                nodes: shard_nodes,
+            });
+        }
+
+        // 2. Shards for peer masters
+        for peer in nodes.values() {
+            if peer.flags.contains("master") {
+                let mut shard_nodes = Vec::new();
+                let master_health = if peer.flags.contains("fail") { "fail" } else { "online" };
+                shard_nodes.push((peer.id.clone(), peer.port, peer.ip.clone(), "master".to_string(), master_health.to_string()));
+                for n in nodes.values() {
+                    if n.master_id == peer.id {
+                        let health = if n.flags.contains("fail") { "fail" } else { "online" };
+                        shard_nodes.push((n.id.clone(), n.port, n.ip.clone(), "replica".to_string(), health.to_string()));
+                    }
+                }
+                // If myself is replica of this peer
+                if *self.master_id.read().unwrap() == peer.id {
+                    shard_nodes.push((my_id.clone(), self.port, "127.0.0.1".to_string(), "replica".to_string(), "online".to_string()));
+                }
+                shards.push(ShardItem {
+                    slots: peer.slots.clone(),
+                    nodes: shard_nodes,
+                });
+            }
+        }
+
+        if shards.is_empty() {
+            // Fallback for single node
+            let mut shard_nodes = Vec::new();
+            shard_nodes.push((my_id, self.port, "127.0.0.1".to_string(), my_role, "online".to_string()));
+            shards.push(ShardItem {
+                slots: my_slots,
+                nodes: shard_nodes,
+            });
+        }
+
+        out.extend_from_slice(format!("*{}\r\n", shards.len()).as_bytes());
+        for shard in shards {
+            out.extend_from_slice(b"*4\r\n");
+            // Field 1: slots
+            out.extend_from_slice(b"$5\r\nslots\r\n");
+            out.extend_from_slice(format!("*{}\r\n", shard.slots.len() * 2).as_bytes());
+            for (s, e) in shard.slots {
+                out.extend_from_slice(format!(":{}\r\n:{}\r\n", s, e).as_bytes());
+            }
+            // Field 2: nodes
+            out.extend_from_slice(b"$5\r\nnodes\r\n");
+            out.extend_from_slice(format!("*{}\r\n", shard.nodes.len()).as_bytes());
+            for (id, port, ip, role, health) in shard.nodes {
+                out.extend_from_slice(b"*14\r\n");
+                out.extend_from_slice(b"$2\r\nid\r\n");
+                out.extend_from_slice(format!("${}\r\n{}\r\n", id.len(), id).as_bytes());
+                out.extend_from_slice(b"$4\r\nport\r\n");
+                out.extend_from_slice(format!(":{}\r\n", port).as_bytes());
+                out.extend_from_slice(b"$2\r\nip\r\n");
+                out.extend_from_slice(format!("${}\r\n{}\r\n", ip.len(), ip).as_bytes());
+                out.extend_from_slice(b"$8\r\nendpoint\r\n");
+                out.extend_from_slice(format!("${}\r\n{}\r\n", ip.len(), ip).as_bytes());
+                out.extend_from_slice(b"$4\r\nrole\r\n");
+                out.extend_from_slice(format!("${}\r\n{}\r\n", role.len(), role).as_bytes());
+                out.extend_from_slice(b"$18\r\nreplication-offset\r\n:0\r\n");
+                out.extend_from_slice(b"$6\r\nhealth\r\n");
+                out.extend_from_slice(format!("${}\r\n{}\r\n", health.len(), health).as_bytes());
+            }
+        }
+    }
+
+    pub fn cluster_links(&self, out: &mut Vec<u8>) {
+        let nodes = self.nodes.read().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        out.extend_from_slice(format!("*{}\r\n", nodes.len()).as_bytes());
+        for node in nodes.values() {
+            out.extend_from_slice(b"*12\r\n");
+            out.extend_from_slice(b"$9\r\ndirection\r\n$2\r\nto\r\n");
+            out.extend_from_slice(b"$4\r\nnode\r\n");
+            out.extend_from_slice(format!("${}\r\n{}\r\n", node.id.len(), node.id).as_bytes());
+            out.extend_from_slice(b"$11\r\ncreate-time\r\n");
+            out.extend_from_slice(format!(":{}\r\n", now).as_bytes());
+            out.extend_from_slice(b"$6\r\nevents\r\n$1\r\nr\r\n");
+            out.extend_from_slice(b"$21\r\nsend-buffer-allocated\r\n:0\r\n");
+            out.extend_from_slice(b"$16\r\nsend-buffer-used\r\n:0\r\n");
+        }
+    }
+
+    pub fn cluster_addslots(&self, slots: &[u16]) -> Result<(), String> {
+        for &s in slots {
+            if s >= 16384 {
+                return Err(format!("ERR Slot {} out of range", s));
+            }
+        }
+        let mut my_slots = self.my_slots.write().unwrap();
+        for &s in slots {
+            my_slots.push((s, s));
+        }
+        compact_slots(&mut my_slots);
+        Ok(())
+    }
+
+    pub fn cluster_delslots(&self, slots: &[u16]) -> Result<(), String> {
+        let mut my_slots = self.my_slots.write().unwrap();
+        remove_slots(&mut my_slots, slots);
+        Ok(())
+    }
+
+    pub fn cluster_addslotsrange(&self, ranges: &[(u16, u16)]) -> Result<(), String> {
+        for &(start, end) in ranges {
+            if start > end || end >= 16384 {
+                return Err(format!("ERR Invalid slot range {}-{}", start, end));
+            }
+        }
+        let mut my_slots = self.my_slots.write().unwrap();
+        for &(start, end) in ranges {
+            my_slots.push((start, end));
+        }
+        compact_slots(&mut my_slots);
+        Ok(())
+    }
+
+    pub fn cluster_delslotsrange(&self, ranges: &[(u16, u16)]) -> Result<(), String> {
+        let mut my_slots = self.my_slots.write().unwrap();
+        let mut to_remove = Vec::new();
+        for &(start, end) in ranges {
+            for s in start..=end {
+                to_remove.push(s);
+            }
+        }
+        remove_slots(&mut my_slots, &to_remove);
+        Ok(())
+    }
+
+    pub fn broadcast_to_peers(&self, msg: &str) {
+        let peers: Vec<(String, u16)> = {
+            let nodes = self.nodes.read().unwrap();
+            nodes.values().map(|n| (n.ip.clone(), n.cport)).collect()
+        };
+        for (ip, cport) in peers {
+            let addr = format!("{}:{}", ip, cport);
+            if let Ok(mut stream) = TcpStream::connect_timeout(
+                &addr.parse().unwrap(),
+                Duration::from_millis(200),
+            ) {
+                let _ = stream.write_all(msg.as_bytes());
+            }
+        }
+    }
+
+    pub fn start_election(&self) {
+        let master_id = self.master_id.read().unwrap().clone();
+        if master_id == "-" || master_id.is_empty() {
+            self.election_in_progress.store(false, Ordering::SeqCst);
+            return;
+        }
+
+        let req_epoch = self.current_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+
+        let masters: Vec<(String, u16)> = {
+            let nodes = self.nodes.read().unwrap();
+            nodes
+                .values()
+                .filter(|n| n.flags.contains("master") && !n.flags.contains("fail"))
+                .map(|n| (n.ip.clone(), n.cport))
+                .collect()
+        };
+
+        let mut votes = 1; // self vote
+        let total_masters = masters.len() + 1; // plus the failed master
+
+        for (ip, cport) in &masters {
+            let addr = format!("{}:{}", ip, cport);
+            if let Ok(parsed) = addr.parse::<SocketAddr>() {
+                if let Ok(mut stream) = TcpStream::connect_timeout(&parsed, Duration::from_millis(200)) {
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+                    let req = format!(
+                        "FAILOVER_AUTH_REQUEST {} {} {}\r\n",
+                        self.my_id(),
+                        req_epoch,
+                        master_id
+                    );
+                    if stream.write_all(req.as_bytes()).is_ok() {
+                        let mut buf = [0u8; 128];
+                        if let Ok(n) = stream.read(&mut buf) {
+                            let resp = String::from_utf8_lossy(&buf[..n]);
+                            if resp.starts_with("+FAILOVER_AUTH_ACK") {
+                                votes += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let majority = (total_masters / 2) + 1;
+        if votes >= majority {
+            // Won the election!
+            let my_id = self.my_id();
+            *self.role.write().unwrap() = "master".to_string();
+            *self.master_id.write().unwrap() = "-".to_string();
+            self.config_epoch.store(req_epoch, Ordering::SeqCst);
+
+            // Inherit old master's slots
+            let mut inherited = Vec::new();
+            {
+                let mut nodes = self.nodes.write().unwrap();
+                if let Some(m) = nodes.get_mut(&master_id) {
+                    inherited = std::mem::take(&mut m.slots);
+                    m.flags = "fail".to_string();
+                }
+            }
+            if !inherited.is_empty() {
+                *self.my_slots.write().unwrap() = inherited.clone();
+            }
+
+            crate::replication::get_replication_hub(self.port).make_master();
+
+            // Announce failover to all peers
+            let mut slots_repr = String::new();
+            for (s, e) in &inherited {
+                slots_repr.push_str(&format!("{}-{},", s, e));
+            }
+            if slots_repr.ends_with(',') {
+                slots_repr.pop();
+            }
+            let announce = format!(
+                "FAILOVER_ANNOUNCE {} {} {}\r\n",
+                my_id, req_epoch, slots_repr
+            );
+            self.broadcast_to_peers(&announce);
+        }
+
+        self.election_in_progress.store(false, Ordering::SeqCst);
+    }
+
     pub fn cluster_reset(&self, hard: bool) -> Result<(), String> {
         self.nodes.write().unwrap().clear();
         self.pfail_reports.write().unwrap().clear();
@@ -370,6 +757,43 @@ impl ClusterHub {
         }
         Ok(())
     }
+}
+
+pub fn compact_slots(slots: &mut Vec<(u16, u16)>) {
+    if slots.is_empty() {
+        return;
+    }
+    slots.sort_by_key(|&(s, _)| s);
+    let mut merged = Vec::new();
+    let mut curr = slots[0];
+    for &(s, e) in &slots[1..] {
+        if s <= curr.1.saturating_add(1) {
+            curr.1 = curr.1.max(e);
+        } else {
+            merged.push(curr);
+            curr = (s, e);
+        }
+    }
+    merged.push(curr);
+    *slots = merged;
+}
+
+pub fn remove_slots(slots: &mut Vec<(u16, u16)>, to_remove: &[u16]) {
+    let remove_set: std::collections::HashSet<u16> = to_remove.iter().copied().collect();
+    let mut new_individual = Vec::new();
+    for &(s, e) in slots.iter() {
+        for slot in s..=e {
+            if !remove_set.contains(&slot) {
+                new_individual.push(slot);
+            }
+        }
+    }
+    let mut new_ranges = Vec::new();
+    for slot in new_individual {
+        new_ranges.push((slot, slot));
+    }
+    compact_slots(&mut new_ranges);
+    *slots = new_ranges;
 }
 
 pub fn start_cluster_bus(port: u16) {
@@ -417,9 +841,12 @@ pub fn start_cluster_bus(port: u16) {
                 // 1. Accept new cluster bus connections
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
-                        let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
-                        handle_cluster_bus_conn(stream, &hub_clone);
+                        let hub_for_conn = hub_clone.clone();
+                        std::thread::spawn(move || {
+                            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                            let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+                            handle_cluster_bus_conn(stream, &hub_for_conn);
+                        });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(Duration::from_millis(20));
@@ -441,13 +868,12 @@ pub fn start_cluster_bus(port: u16) {
 
 fn handle_cluster_bus_conn(mut stream: TcpStream, hub: &Arc<ClusterHub>) {
     let mut buf = [0u8; 1024];
-    let n = match stream.read(&mut buf) {
-        Ok(n) if n > 0 => n,
-        _ => return,
-    };
-
-    let msg = String::from_utf8_lossy(&buf[..n]);
-    for line in msg.lines() {
+    while let Ok(n) = stream.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        let msg = String::from_utf8_lossy(&buf[..n]);
+        for line in msg.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -538,6 +964,19 @@ fn handle_cluster_bus_conn(mut stream: TcpStream, hub: &Arc<ClusterHub>) {
                             node.link_state = "connected".to_string();
                             if parts.len() >= 4 {
                                 node.flags = parts[3].to_string();
+                            }
+                            if parts.len() >= 5 {
+                                let mut peer_slots = Vec::new();
+                                for r in parts[4].split(',') {
+                                    if let Some((s, e)) = r.split_once('-') {
+                                        if let (Ok(s), Ok(e)) = (s.parse::<u16>(), e.parse::<u16>()) {
+                                            peer_slots.push((s, e));
+                                        }
+                                    }
+                                }
+                                if !peer_slots.is_empty() {
+                                    node.slots = peer_slots;
+                                }
                             }
                         }
                     }
@@ -640,10 +1079,72 @@ fn handle_cluster_bus_conn(mut stream: TcpStream, hub: &Arc<ClusterHub>) {
                     let _ = stream.write_all(b"+OK\r\n");
                 }
             }
+            "FAILOVER_AUTH_REQUEST" => {
+                // FAILOVER_AUTH_REQUEST <replica_id> <epoch> <master_id>
+                if parts.len() >= 4 {
+                    let req_epoch: u64 = parts[2].parse().unwrap_or(0);
+                    let claimed_master = parts[3];
+                    let is_master = *hub.role.read().unwrap() == "master";
+                    let last_vote = hub.last_vote_epoch.load(Ordering::Relaxed);
+                    let master_is_down = {
+                        let nodes = hub.nodes.read().unwrap();
+                        nodes.get(claimed_master).map(|n| n.flags.contains("fail")).unwrap_or(false)
+                    };
+
+                    if is_master && req_epoch > last_vote && master_is_down {
+                        hub.last_vote_epoch.store(req_epoch, Ordering::SeqCst);
+                        let ack = format!("+FAILOVER_AUTH_ACK {} {}\r\n", hub.my_id(), req_epoch);
+                        let _ = stream.write_all(ack.as_bytes());
+                    } else {
+                        let _ = stream.write_all(b"-ERR vote rejected\r\n");
+                    }
+                }
+            }
+            "FAILOVER_ANNOUNCE" => {
+                // FAILOVER_ANNOUNCE <new_master_id> <epoch> <slots>
+                if parts.len() >= 3 {
+                    let new_master_id = parts[1].to_string();
+                    let epoch: u64 = parts[2].parse().unwrap_or(1);
+                    let mut peer_slots = Vec::new();
+                    if parts.len() >= 4 {
+                        for r in parts[3].split(',') {
+                            if let Some((s, e)) = r.split_once('-') {
+                                if let (Ok(s), Ok(e)) = (s.parse::<u16>(), e.parse::<u16>()) {
+                                    peer_slots.push((s, e));
+                                }
+                            }
+                        }
+                    }
+                    let mut nodes = hub.nodes.write().unwrap();
+                    if let Some(node) = nodes.get_mut(&new_master_id) {
+                        node.flags = "master".to_string();
+                        node.master_id = "-".to_string();
+                        node.config_epoch = epoch;
+                        if !peer_slots.is_empty() {
+                            node.slots = peer_slots.clone();
+                        }
+                    }
+                    if !peer_slots.is_empty() {
+                        let mut to_remove = Vec::new();
+                        for &(s, e) in &peer_slots {
+                            for slot in s..=e {
+                                to_remove.push(slot);
+                            }
+                        }
+                        for (other_id, other_node) in nodes.iter_mut() {
+                            if other_id != &new_master_id {
+                                remove_slots(&mut other_node.slots, &to_remove);
+                            }
+                        }
+                    }
+                    let _ = stream.write_all(b"+OK\r\n");
+                }
+            }
             _ => {
                 let _ = stream.write_all(b"-ERR unknown clusterbus command\r\n");
             }
         }
+    }
     }
 }
 
@@ -701,7 +1202,7 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
             }
         }
 
-        let success = if let Ok(mut stream) =
+        if let Ok(mut stream) =
             TcpStream::connect_timeout(&parsed_addr, Duration::from_millis(200))
         {
             let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
@@ -710,39 +1211,90 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
                 "PING {} {} {} {} GOSSIP {}\r\n",
                 hub.my_id(), my_epoch, role, slots_repr, gossip_payload
             );
-            if stream.write_all(ping_msg.as_bytes()).is_ok() {
+            let (success, peer_slots, peer_epoch) = if stream.write_all(ping_msg.as_bytes()).is_ok() {
                 let mut buf = [0u8; 512];
                 if let Ok(n) = stream.read(&mut buf) {
                     let resp = String::from_utf8_lossy(&buf[..n]);
-                    resp.starts_with("+PONG")
+                    if resp.starts_with("+PONG") {
+                        let parts: Vec<&str> = resp.trim().split_whitespace().collect();
+                        let ep = parts.get(2).and_then(|val| val.parse::<u64>().ok());
+                        let mut slots = Vec::new();
+                        if parts.len() >= 5 {
+                            for r in parts[4].split(',') {
+                                if let Some((s, e)) = r.split_once('-') {
+                                    if let (Ok(s), Ok(e)) = (s.parse::<u16>(), e.parse::<u16>()) {
+                                        slots.push((s, e));
+                                    }
+                                }
+                            }
+                        }
+                        (true, Some(slots), ep)
+                    } else {
+                        (false, None, None)
+                    }
                 } else {
-                    false
+                    (false, None, None)
                 }
             } else {
-                false
-            }
-        } else {
-            false
-        };
+                (false, None, None)
+            };
 
-        if let Ok(mut nodes) = hub.nodes.write() {
+            if let Ok(mut nodes) = hub.nodes.write() {
+                if let Some(node) = nodes.get_mut(&id) {
+                    if success {
+                        node.pong_recv = now;
+                        node.link_state = "connected".to_string();
+                        if let Some(slots) = peer_slots {
+                            if !slots.is_empty() {
+                                node.slots = slots;
+                            }
+                        }
+                        if let Some(ep) = peer_epoch {
+                            node.config_epoch = ep;
+                        }
+                        if node.flags == "fail?" || node.flags == "fail" {
+                            node.flags = "master".to_string();
+                        }
+                    } else {
+                        let elapsed = now.saturating_sub(node.pong_recv);
+                        if elapsed > 10000 {
+                            node.flags = "fail".to_string();
+                            node.link_state = "disconnected".to_string();
+                        } else if elapsed > 5000 {
+                            node.flags = "fail?".to_string();
+                        }
+                    }
+                }
+            }
+        } else if let Ok(mut nodes) = hub.nodes.write() {
             if let Some(node) = nodes.get_mut(&id) {
-                if success {
-                    node.pong_recv = now;
-                    node.link_state = "connected".to_string();
-                    if node.flags == "fail?" || node.flags == "fail" {
-                        node.flags = "master".to_string();
-                    }
-                } else {
-                    let elapsed = now.saturating_sub(node.pong_recv);
-                    if elapsed > 10000 {
-                        node.flags = "fail".to_string();
-                        node.link_state = "disconnected".to_string();
-                    } else if elapsed > 5000 {
-                        node.flags = "fail?".to_string();
-                    }
+                let elapsed = now.saturating_sub(node.pong_recv);
+                if elapsed > 10000 {
+                    node.flags = "fail".to_string();
+                    node.link_state = "disconnected".to_string();
+                } else if elapsed > 5000 {
+                    node.flags = "fail?".to_string();
                 }
             }
         }
+    }
+
+    // Automated failover trigger for replicas
+    let should_elect = {
+        let is_slave = *hub.role.read().unwrap() == "slave";
+        let master_id = hub.master_id.read().unwrap().clone();
+        if is_slave && master_id != "-" && !master_id.is_empty() {
+            let nodes = hub.nodes.read().unwrap();
+            nodes.get(&master_id).map(|n| n.flags.contains("fail")).unwrap_or(false)
+        } else {
+            false
+        }
+    };
+
+    if should_elect && !hub.election_in_progress.swap(true, Ordering::SeqCst) {
+        let hub_election = hub.clone();
+        std::thread::spawn(move || {
+            hub_election.start_election();
+        });
     }
 }

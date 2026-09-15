@@ -3612,6 +3612,149 @@ fn test_product_quantization_adc_e2e() {
     assert!(pos_doc1 < pos_doc3);
 }
 
+#[test]
+fn test_cluster_bus_shards_and_automated_failover_e2e() {
+    let port1 = 16610;
+    let port2 = 16611;
+    let port3 = 16612;
+
+    start_test_server(port1, 2);
+    start_test_server(port2, 2);
+    start_test_server(port3, 2);
+
+    let mut c1 = TcpStream::connect(format!("127.0.0.1:{}", port1)).unwrap();
+    let mut c2 = TcpStream::connect(format!("127.0.0.1:{}", port2)).unwrap();
+    let mut c3 = TcpStream::connect(format!("127.0.0.1:{}", port3)).unwrap();
+
+    // 1. Cluster Slot Mutations: ADDSLOTS, DELSLOTS, ADDSLOTSRANGE, DELSLOTSRANGE
+    // Node 1 clears all slots then adds 0..=8191
+    assert_eq!(send_and_read(&mut c1, b"CLUSTER DELSLOTSRANGE 0 16383\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut c1, b"CLUSTER ADDSLOTSRANGE 0 8191\r\n"), "+OK\r\n");
+
+    // Test DELSLOTS and ADDSLOTS on Node 1
+    assert_eq!(send_and_read(&mut c1, b"CLUSTER DELSLOTS 100\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut c1, b"CLUSTER ADDSLOTS 100\r\n"), "+OK\r\n");
+
+    // Node 2 clears all slots then adds 8192..=16383
+    assert_eq!(send_and_read(&mut c2, b"CLUSTER DELSLOTSRANGE 0 16383\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut c2, b"CLUSTER ADDSLOTSRANGE 8192 16383\r\n"), "+OK\r\n");
+
+    // Node 3 clears slots (will act as replica)
+    assert_eq!(send_and_read(&mut c3, b"CLUSTER DELSLOTSRANGE 0 16383\r\n"), "+OK\r\n");
+
+    // 2. Fetch Node IDs
+    let myid1_resp = send_and_read(&mut c1, b"CLUSTER MYID\r\n");
+    let _myid1 = myid1_resp.trim_start_matches('$').split("\r\n").nth(1).unwrap().to_string();
+
+    let myid2_resp = send_and_read(&mut c2, b"CLUSTER MYID\r\n");
+    let myid2 = myid2_resp.trim_start_matches('$').split("\r\n").nth(1).unwrap().to_string();
+
+    let myid3_resp = send_and_read(&mut c3, b"CLUSTER MYID\r\n");
+    let myid3 = myid3_resp.trim_start_matches('$').split("\r\n").nth(1).unwrap().to_string();
+
+    // 3. CLUSTER MEET: Node 1 meets Node 2, Node 2 meets Node 3
+    assert_eq!(send_and_read(&mut c1, format!("CLUSTER MEET 127.0.0.1 {}\r\n", port2).as_bytes()), "+OK\r\n");
+    assert_eq!(send_and_read(&mut c2, format!("CLUSTER MEET 127.0.0.1 {}\r\n", port3).as_bytes()), "+OK\r\n");
+
+    // Wait for gossip tick & slot exchange over cluster bus
+    thread::sleep(Duration::from_millis(1500));
+
+    // 4. Test CLUSTER SLOTS introspection
+    let slots_resp1 = send_and_read(&mut c1, b"CLUSTER SLOTS\r\n");
+    assert!(slots_resp1.contains(":0\r\n:8191\r\n"), "Node 1 should report range 0-8191. Resp: {}", slots_resp1);
+    assert!(slots_resp1.contains(":8192\r\n:16383\r\n"), "Node 1 should report peer range 8192-16383. Resp: {}", slots_resp1);
+
+    // 5. Test CLUSTER SHARDS (Redis 7 specification)
+    let shards_resp = send_and_read(&mut c1, b"CLUSTER SHARDS\r\n");
+    assert!(shards_resp.contains("slots"), "Shards output should contain 'slots'. Resp: {}", shards_resp);
+    assert!(shards_resp.contains("nodes"), "Shards output should contain 'nodes'. Resp: {}", shards_resp);
+    assert!(shards_resp.contains("endpoint"), "Shards output should contain 'endpoint'. Resp: {}", shards_resp);
+    assert!(shards_resp.contains("health"), "Shards output should contain 'health'. Resp: {}", shards_resp);
+    assert!(shards_resp.contains("online"), "Shards output should contain 'online'. Resp: {}", shards_resp);
+
+    // 6. Test CLUSTER LINKS telemetry
+    let links_resp = send_and_read(&mut c1, b"CLUSTER LINKS\r\n");
+    assert!(links_resp.contains("direction"), "Links output should contain 'direction'. Resp: {}", links_resp);
+    assert!(links_resp.contains("to") || links_resp.contains("from"), "Links output should contain 'to' or 'from'. Resp: {}", links_resp);
+    assert!(links_resp.contains("events"), "Links output should contain 'events'. Resp: {}", links_resp);
+
+    // 7. Test Dynamic -MOVED Redirection:
+    let slot_foo = rudis::router::key_slot(b"foo");
+    assert!(slot_foo >= 8192, "foo slot should be >= 8192");
+
+    // When sent to Node 1, it should return -MOVED <slot_foo> 127.0.0.1:16611
+    let moved_resp = send_and_read(&mut c1, b"SET foo bar\r\n");
+    assert_eq!(
+        moved_resp,
+        format!("-MOVED {} 127.0.0.1:{}\r\n", slot_foo, port2)
+    );
+
+    // When sent to Node 2 (the owner), it should succeed with +OK
+    let ok_resp = send_and_read(&mut c2, b"SET foo bar\r\n");
+    assert_eq!(ok_resp, "+OK\r\n");
+
+    // Find a key belonging to slot < 8192 owned by Node 1
+    let mut low_key = String::new();
+    let mut low_slot = 0;
+    for i in 0..1000 {
+        let k = format!("k_{}", i);
+        let s = rudis::router::key_slot(k.as_bytes());
+        if s < 8192 {
+            low_key = k;
+            low_slot = s;
+            break;
+        }
+    }
+    // Sending low_key to Node 2 should redirect to Node 1
+    let moved_low = send_and_read(&mut c2, format!("SET {} myval\r\n", low_key).as_bytes());
+    assert_eq!(
+        moved_low,
+        format!("-MOVED {} 127.0.0.1:{}\r\n", low_slot, port1)
+    );
+
+    // 8. Test Consensus-based Failover:
+    // Node 3 replicates Node 2
+    assert_eq!(
+        send_and_read(&mut c3, format!("CLUSTER REPLICATE {}\r\n", myid2).as_bytes()),
+        "+OK\r\n"
+    );
+
+    // Verify FAILOVER_AUTH_REQUEST vote handling directly on cluster bus
+    let mut bus_client = TcpStream::connect(format!("127.0.0.1:{}", port1 + 10000)).unwrap();
+    // First, request vote without master being failed -> should reject
+    bus_client.write_all(format!("FAILOVER_AUTH_REQUEST {} 10 {}\r\n", myid3, myid2).as_bytes()).unwrap();
+    let mut vbuf = [0u8; 128];
+    let n = bus_client.read(&mut vbuf).unwrap();
+    let vote_resp = String::from_utf8_lossy(&vbuf[..n]);
+    assert!(vote_resp.contains("ERR vote rejected"), "Should reject vote if master is not failed");
+
+    // Now mark Node 2 as fail on Node 1 via CLUSTER bus FAIL message
+    bus_client.write_all(format!("FAIL {}\r\n", myid2).as_bytes()).unwrap();
+    let n = bus_client.read(&mut vbuf).unwrap();
+    assert_eq!(&vbuf[..n], b"+OK\r\n");
+
+    // Now request vote again with epoch 11 -> should grant ACK!
+    bus_client.write_all(format!("FAILOVER_AUTH_REQUEST {} 11 {}\r\n", myid3, myid2).as_bytes()).unwrap();
+    let n = bus_client.read(&mut vbuf).unwrap();
+    let vote_ack = String::from_utf8_lossy(&vbuf[..n]);
+    assert!(vote_ack.starts_with("+FAILOVER_AUTH_ACK"), "Master Node 1 should grant vote ACK to Node 3. Resp: {}", vote_ack);
+
+    // Duplicate vote in same epoch should be rejected
+    bus_client.write_all(format!("FAILOVER_AUTH_REQUEST {} 11 {}\r\n", myid3, myid2).as_bytes()).unwrap();
+    let n = bus_client.read(&mut vbuf).unwrap();
+    let dup_vote = String::from_utf8_lossy(&vbuf[..n]);
+    assert!(dup_vote.contains("ERR vote rejected"), "Duplicate vote in same epoch should be rejected");
+
+    // Trigger failover on Node 3
+    assert_eq!(send_and_read(&mut c3, b"CLUSTER FAILOVER\r\n"), "+OK\r\n");
+    thread::sleep(Duration::from_millis(500));
+
+    // Verify Node 3 is now master with config epoch updated
+    let nodes3 = send_and_read(&mut c3, b"CLUSTER NODES\r\n");
+    assert!(nodes3.contains("myself,master"), "Node 3 should be promoted to myself,master. Nodes:\n{}", nodes3);
+}
+
+
 
 
 

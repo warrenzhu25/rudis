@@ -16,6 +16,12 @@ pub enum ClusterSubcommand {
     GetKeysInSlot(u16, usize),
     SetSlot(u16, SetSlotSubcommand),
     Slots,
+    Shards,
+    Links,
+    AddSlots(Vec<u16>),
+    DelSlots(Vec<u16>),
+    AddSlotsRange(Vec<(u16, u16)>),
+    DelSlotsRange(Vec<(u16, u16)>),
     Nodes,
     Info,
     Meet { ip: String, port: u16 },
@@ -1340,6 +1346,72 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     }
                 }
                 "SLOTS" => Ok(Some(Command::Cluster(ClusterSubcommand::Slots))),
+                "SHARDS" => Ok(Some(Command::Cluster(ClusterSubcommand::Shards))),
+                "LINKS" => Ok(Some(Command::Cluster(ClusterSubcommand::Links))),
+                "ADDSLOTS" => {
+                    if args.len() < 3 {
+                        return Err("wrong number of arguments for 'cluster addslots' command".to_string());
+                    }
+                    let mut slots = Vec::with_capacity(args.len() - 2);
+                    for a in &args[2..] {
+                        let s: u16 = std::str::from_utf8(a)
+                            .ok()
+                            .and_then(|val| val.parse().ok())
+                            .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                        slots.push(s);
+                    }
+                    Ok(Some(Command::Cluster(ClusterSubcommand::AddSlots(slots))))
+                }
+                "DELSLOTS" => {
+                    if args.len() < 3 {
+                        return Err("wrong number of arguments for 'cluster delslots' command".to_string());
+                    }
+                    let mut slots = Vec::with_capacity(args.len() - 2);
+                    for a in &args[2..] {
+                        let s: u16 = std::str::from_utf8(a)
+                            .ok()
+                            .and_then(|val| val.parse().ok())
+                            .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                        slots.push(s);
+                    }
+                    Ok(Some(Command::Cluster(ClusterSubcommand::DelSlots(slots))))
+                }
+                "ADDSLOTSRANGE" => {
+                    if args.len() < 4 || (args.len() - 2) % 2 != 0 {
+                        return Err("wrong number of arguments for 'cluster addslotsrange' command".to_string());
+                    }
+                    let mut ranges = Vec::new();
+                    for chunk in args[2..].chunks(2) {
+                        let start: u16 = std::str::from_utf8(&chunk[0])
+                            .ok()
+                            .and_then(|val| val.parse().ok())
+                            .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                        let end: u16 = std::str::from_utf8(&chunk[1])
+                            .ok()
+                            .and_then(|val| val.parse().ok())
+                            .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                        ranges.push((start, end));
+                    }
+                    Ok(Some(Command::Cluster(ClusterSubcommand::AddSlotsRange(ranges))))
+                }
+                "DELSLOTSRANGE" => {
+                    if args.len() < 4 || (args.len() - 2) % 2 != 0 {
+                        return Err("wrong number of arguments for 'cluster delslotsrange' command".to_string());
+                    }
+                    let mut ranges = Vec::new();
+                    for chunk in args[2..].chunks(2) {
+                        let start: u16 = std::str::from_utf8(&chunk[0])
+                            .ok()
+                            .and_then(|val| val.parse().ok())
+                            .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                        let end: u16 = std::str::from_utf8(&chunk[1])
+                            .ok()
+                            .and_then(|val| val.parse().ok())
+                            .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                        ranges.push((start, end));
+                    }
+                    Ok(Some(Command::Cluster(ClusterSubcommand::DelSlotsRange(ranges))))
+                }
                 "NODES" => Ok(Some(Command::Cluster(ClusterSubcommand::Nodes))),
                 "INFO" => Ok(Some(Command::Cluster(ClusterSubcommand::Info))),
                 "MYID" => Ok(Some(Command::Cluster(ClusterSubcommand::MyId))),
