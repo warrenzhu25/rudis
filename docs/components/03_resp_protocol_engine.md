@@ -1,5 +1,13 @@
 # Component 03: RESP Protocol Engine & Serialization (`src/resp.rs`)
 
+> ⚠️ **Unverified against the real source.** This document's §5 "Serialization Primitives"
+> (`write_resp_bulk`, `write_resp_integer`, etc.) and its `read_integer` helper (§4.1) do not
+> exist in `src/resp.rs` (spot-checked) — replies are hand-formatted inline in `connection.rs`
+> instead. Treat this file's specifics as unverified. See
+> [`docs/designs/components.md`](../designs/components.md#part-5-resp-parsing-engine)
+> (Part 5) for a version checked against the actual code (note: it predates newer command
+> additions, so re-verify the `Command` enum's current variant list before relying on it).
+
 ## 1. Architectural Purpose & Scope
 
 `src/resp.rs` is Rudis's wire protocol parser and serializer. It decodes raw TCP byte streams into strongly-typed `Command` enum variants and serializes execution results into Redis Serialization Protocol (**RESP2** and **RESP3**) wire formats.

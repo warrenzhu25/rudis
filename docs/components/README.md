@@ -4,6 +4,24 @@ This directory contains deep-dive architectural specifications, internal data st
 
 These documents are designed for contributors and system engineers who need to understand how Rudis works under the hood without needing to inspect every source file.
 
+> ⚠️ **Unverified — at least 01-05 do not match the current source.** Spot-checking against
+> `src/` found concrete mismatches: `04_sharding_and_router_mesh.md` describes a
+> `RouterMesh`/`RouterHandle` type built on `oneshot` channels and `xxh3` hashing, but the real
+> `src/router.rs` is a `Router` struct using `flume` channels and CRC16 (`key_slot`/
+> `target_shard`); `05_storage_engine_and_encodings.md` describes `RudisTable` as a plain
+> `hashbrown::HashMap<Bytes, RudisEntry, FxBuildHasher>` with Listpack/Intset/Skiplist
+> promotion, but the real `src/table.rs` still uses the custom SIMD `RudisFlatTable`/
+> `RudisTable` engine with no Listpack encoding at all; `01_reactor_and_server.md` claims
+> signal-safe shutdown (`SIGINT`/`SIGTERM` trapping) that doesn't exist anywhere in
+> `src/server.rs`. 06-15 have not been individually re-checked and should not be assumed
+> accurate either. Treat every claim in this directory as needing verification against the
+> actual file it cites before relying on it.
+>
+> For **01 (reactor/server)**, **02 (connection)**, **03 (RESP)**, **04 (router)**, and
+> **05 (storage engine)**, [`docs/designs/components.md`](../designs/components.md) covers the
+> same five subsystems and was written directly against the real code — prefer it until these
+> five files are corrected.
+
 ---
 
 ## Component Index

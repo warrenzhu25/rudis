@@ -1,5 +1,17 @@
 # Component 05: Storage Engine & Compact Encodings (`src/table.rs`)
 
+> ⚠️ **Unverified against the real source.** This document describes `RudisTable` as a plain
+> `hashbrown::HashMap<Bytes, RudisEntry, FxBuildHasher>` with Listpack/Intset/raw-pointer-skiplist
+> promotion logic. The real `src/table.rs` (spot-checked) still uses the custom SIMD
+> `RudisFlatTable`/`RudisTable` engine (control-byte probing, no Listpack encoding at all) —
+> confirmed unchanged from the original design. The real `RudisValue` enum's actual variants
+> (`String`, `Int`, `SmallHash`, `Hash`, `List`, `Set`, `ZSet`, `HyperLogLog`, `Stream`,
+> `Tiered`, `Cooled`) also don't match what's shown here. Treat this file's specifics as
+> unverified. See [`docs/designs/components.md`](../designs/components.md#part-1-storage-engine-rudistable)
+> (Part 1) for the SIMD engine checked against the actual code (note: it predates the List/
+> Set/ZSet/Stream/tiering variants now in `RudisValue`, so treat those specifically as
+> undocumented rather than assuming Part 1 is exhaustive).
+
 ## 1. Architectural Purpose & Scope
 
 `src/table.rs` is Rudis's core in-memory associative storage engine. It provides the dictionary implementation (`RudisTable`), manages the lifecycle of `RudisValue` data structures, enforces compact memory encodings (Listpack, Intset, Skiplist), and coordinates active/passive key expiration.

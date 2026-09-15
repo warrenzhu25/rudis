@@ -1,5 +1,11 @@
 # Component 01: Reactor Runtime & Server Lifecycle (`src/main.rs`, `src/server.rs`)
 
+> ⚠️ **Unverified against the real source.** This document's §2.4 "Signal-Safe Shutdown"
+> (trapping `SIGINT`/`SIGTERM`, draining requests) does not exist anywhere in `src/server.rs`
+> — there is no signal handling in the codebase. Treat the rest of this file's claims as
+> unverified too. See [`docs/designs/components.md`](../designs/components.md#part-2-server-runtime-and-entrypoint)
+> (Part 2) for a version checked against the actual code.
+
 ## 1. Architectural Purpose & Scope
 
 The **Reactor Runtime & Server Lifecycle** subsystem is responsible for bootstrapping the Rudis server process, pinning worker threads to physical CPU cores, setting up Linux `io_uring` instances via the `monoio` asynchronous runtime, and orchestrating thread-local event loops.

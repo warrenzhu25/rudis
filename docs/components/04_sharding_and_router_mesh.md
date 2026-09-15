@@ -1,5 +1,13 @@
 # Component 04: Sharding Architecture & Cross-Core Mesh (`src/router.rs`, `src/shard.rs`)
 
+> ⚠️ **Unverified against the real source.** This document describes a `RouterMesh`/
+> `RouterHandle` type built on `oneshot` channels and `xxh3` key hashing. Neither exists in
+> `src/router.rs` (spot-checked) — the real code is a `Router` struct using `flume` channels
+> and CRC16 (`key_slot`/`target_shard`/`slot_to_shard`), unchanged from the original design.
+> Treat this file's specifics as unverified. See
+> [`docs/designs/components.md`](../designs/components.md#part-4-router-and-cross-shard-mesh)
+> (Part 4) for a version checked against the actual code.
+
 ## 1. Architectural Purpose & Scope
 
 The **Sharding Architecture & Cross-Core Mesh** implements Rudis's data partitioning and inter-thread messaging system. It defines how keys are mapped to shards, how cross-shard requests are forwarded and awaited without blocking reactor threads, and how multi-key operations (like `MGET`, `MSET`, and `FLUSHDB`) are coordinated across cores.

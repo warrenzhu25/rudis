@@ -16,6 +16,17 @@ See `agent.md`'s "Core Architectural Invariants" for the non-negotiable rules th
 modules exist to satisfy, and `docs/benchmarks/` for the performance numbers referenced
 throughout.
 
+> **Relationship to `docs/components/`**: that directory covers 15 subsystems, including
+> 10 (blocking ops, tiering, vector search, RediSearch, kernel bypass, cluster gossip, CRDT
+> replication, Lua scripting, persistence, security/TLS) this doc doesn't touch at all. Its
+> files 01-05 cover the same five subsystems as the five parts below, but as of this writing
+> **do not match the current source** (verified by spot-checking each against `src/` — see
+> the warning banners on those files) — this doc is the one checked against real code for
+> those five areas. This doc also predates several major additions to `RudisValue`
+> (`List`, `Set`, `ZSet`, `Stream`, `Tiered`/`Cooled` for NVMe tiering) — Part 1 documents the
+> SIMD table engine underneath all of them accurately, but doesn't cover those newer value
+> types' own internals.
+
 **Contents**
 - Part 1: Storage Engine (`RudisTable`) — `src/table.rs`, `src/shard.rs`
 - Part 2: Server Runtime and Entrypoint — `src/server.rs`, `src/main.rs`

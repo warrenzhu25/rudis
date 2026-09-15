@@ -1,5 +1,13 @@
 # Component 02: Connection Lifecycle & Command Execution (`src/connection.rs`)
 
+> ⚠️ **Unverified against the real source.** This document describes a `ClientContext`
+> struct with `ClientTxState`/`ClientProtocol` fields; no such types exist in `src/connection.rs`
+> as of this writing (spot-checked). Treat this file's specifics as unverified. See
+> [`docs/designs/components.md`](../designs/components.md#part-3-connection-handling-and-pipeline-squashing)
+> (Part 3) for a version checked against the actual code (note: it predates the Lists/Sets/
+> ZSets/Streams additions, so re-verify against current `src/connection.rs` before relying on
+> command-specific details).
+
 ## 1. Architectural Purpose & Scope
 
 `src/connection.rs` is the central coordination layer for client sessions. It manages the TCP connection lifecycle, handles protocol negotiation (RESP2, RESP3, and Memcached text), maintains client session state (authentication, current database, transactions, pub/sub subscriptions), and dispatches parsed commands to local or remote storage engines.
