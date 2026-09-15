@@ -550,13 +550,42 @@ cargo test
 
 ---
 
-## Benchmarks
+## Benchmarks & Performance Whitepapers
 
-### Multi-Core In-Memory Scaling & CPU Profiling (1 to 32 Cores, 1KB Payloads)
+> **Master Documentation**:
+> - [**Comprehensive Performance Guide & Benchmark Whitepaper**](docs/benchmarks/comprehensive_performance_guide.md): Master report covering payload sensitivity (64B-64KB), pipeline depth sensitivity (1-200), tail latency distributions ($p50$ to $p99.9$), and specialized engines.
+> - [**Benchmark Index & Directory**](docs/benchmarks/README.md): Central catalog linking all benchmark evaluations, comparative analyses against Dragonfly, and reproduction scripts.
+
+### 1. High-Concurrency Multi-Engine Throughput (16 Cores, Pipeline 50–100)
+
+Benchmarked on **AMD EPYC 7B13 (64 vCPUs, 117 GiB RAM)** with server pinned to cores `0-15` and `memtier_benchmark` on cores `32-63` (32 client threads):
+
+| Engine / Workload | Command | Throughput (Ops/sec) | Bandwidth (MB/s) | p50 Latency (ms) | p99 Latency (ms) | Speedup vs. Dragonfly |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| **Counter Primitive** | `INCR` | **4,175,571** | 157.8 MB/s | **0.66** | **1.58** | **+4.4% (1.04x)** |
+| **Key-Value Read** | `GET (1KB)` | **3,698,356** | 2,364.3 MB/s | **0.60** | **1.71** | **+534.2% (6.34x)** |
+| **Sorted Sets** | `ZADD` | **3,468,035** | 194.6 MB/s | **0.81** | **1.96** | 0.90x |
+| **Key-Value Write** | `SET (1KB)` | **3,415,601** | 3,491.4 MB/s | **0.69** | **2.01** | **+72.4% (1.72x)** |
+| **Hash Table Read** | `HGET (1KB)` | **2,892,417** | 1,354.6 MB/s | **0.93** | **3.07** | **+450.2% (5.50x)** |
+| **Probabilistic Bloom** | `BF.ADD` | **2,806,122** | 178.7 MB/s | **0.51** | **1.18** | *N/A (Rudis Native)* |
+| **Lists** | `LPUSH (1KB)` | **2,774,462** | 2,840.5 MB/s | **1.02** | **2.58** | **+67.3% (1.67x)** |
+| **RedisJSON Read** | `JSON.GET` | **2,690,696** | 170.2 MB/s | **0.54** | **1.18** | *N/A (Rudis Native)* |
+| **RedisJSON Write** | `JSON.SET` | **2,656,600** | 186.1 MB/s | **0.54** | **1.26** | *N/A (Rudis Native)* |
+| **Hash Table Write** | `HSET (1KB)` | **2,636,209** | 2,722.4 MB/s | **0.99** | **2.93** | **+20.9% (1.21x)** |
+| **Probabilistic Cuckoo**| `CF.EXISTS` | **2,606,122** | 346.9 MB/s | **0.52** | **1.40** | *N/A (Rudis Native)* |
+| **Geospatial Distance**| `GEODIST` | **2,533,758** | 214.3 MB/s | **0.55** | **1.29** | *N/A (Rudis Native)* |
+| **Count-Min Sketch** | `CMS.QUERY` | **2,492,478** | 146.9 MB/s | **0.58** | **1.25** | *N/A (Rudis Native)* |
+| **Top-K Heavy Hitters**| `TOPK.ADD` | **2,551,940** | 153.1 MB/s | **0.54** | **1.33** | *N/A (Rudis Native)* |
+| **Geospatial Indexing**| `GEOADD` | **2,402,303** | 297.3 MB/s | **0.57** | **1.46** | *N/A (Rudis Native)* |
+| **Vector Search (HNSW)**| `VQUERY` | **1,687,465** | 139.7 MB/s | **0.74** | **2.13** | *N/A (Rudis Native)* |
+| **Streams Ingestion** | `XADD` | **1,560,679** | 161.9 MB/s | **0.90** | **2.35** | *N/A (Rudis Native)* |
+| **Socket Saturation** | `SET (64KB)` | 134,326 | **8,401.5 MB/s (67.2 Gbps)** | 10.18 | 34.05 | *N/A (Network Bound)* |
+
+---
+
+### 2. Multi-Core In-Memory Scaling & CPU Profiling (1 to 32 Cores, 1KB Payloads)
 
 Detailed Benchmark & Profiling report: [docs/benchmarks/scaling_and_profiling_report.md](docs/benchmarks/scaling_and_profiling_report.md)
-
-Benchmarked on **AMD EPYC 7B13 (64 vCPUs, 117 GiB RAM)** with server pinned to cores `0..(N-1)` and `memtier_benchmark` on cores `32-63` (Pipeline 100, 1M Keys):
 
 | Cores | 100% SET (1KB) | SET Bandwidth | 100% GET (1KB) | 50/50 SET/GET | p50 Latency | p99 Latency |
 | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -640,6 +669,10 @@ rudis/
 │   ├── rudis_internals_guide.md # Comprehensive internal architecture & contributor learning guide
 │   ├── components/            # Detailed documentation for all 15 core subsystems
 │   └── benchmarks/
+│       ├── README.md          # Benchmark index and directory catalog
+│       ├── comprehensive_performance_guide.md # Master performance whitepaper
+│       ├── scaling_and_profiling_report.md # 1-32 core scaling and perf report
+│       ├── multi_command_comparison.md # Multi-command head-to-head vs Dragonfly
 │       ├── baseline.md        # Detailed 1-32 thread baseline results
 │       ├── tiered_storage.md  # NVMe tiered storage benchmark vs Dragonfly
 │       ├── vector_search.md   # HNSW vector search and SQ8 quantization benchmark
