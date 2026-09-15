@@ -515,23 +515,23 @@ For cross-datacenter multi-region active-active replication, standard primary-re
 
 ## 11. Contributor Quick Reference: Subsystem Cheat Sheet
 
-| Subsystem | Source File | Core Responsibility |
-| :--- | :--- | :--- |
-| **Server Loop** | `src/server.rs` | `monoio` event loop, listener setup, thread spawn, signal handling. |
-| **Connection** | `src/connection.rs` | Socket read/write, client lifecycle, command execution dispatch. |
-| **RESP Engine** | `src/resp.rs` | Zero-copy RESP2 & RESP3 parsing and reply serialization. |
-| **Routing** | `src/router.rs` | Slot and shard hashing, remote shard message dispatching. |
-| **Storage Table**| `src/table.rs` | `RudisTable`, `RudisValue`, Listpack/Skiplist compact encodings. |
-| **Event Hub** | `src/block.rs` | Asynchronous wait/notify hub for `BLPOP`, `BZPOPMIN`, `BZMPOP`. |
-| **SSD Tiering** | `src/tiering.rs` | NVMe direct I/O, `SmallBins` packing, hole punching, cold offload. |
-| **Vector Engine**| `src/vector.rs` | HNSW graph, SQ8 quantization, PQ with ADC distance tables. |
-| **Full-Text** | `src/search.rs` | RediSearch inverted index, BM25 ranking, hybrid RRF fusion. |
-| **Cluster** | `src/cluster.rs` | 16384 slots, Gossip bus, automated failover, slot migrations. |
-| **CRDT Engine** | `src/crdt.rs` | Multi-region active-active synchronization, HLC, LWW, OR-Set. |
-| **Zero-Copy** | `src/zerocopy.rs` | Registered buffer pools, Linux `MSG_ZEROCOPY` TCP transmission. |
-| **Kernel Bypass**| `src/xdp.rs` | AF_XDP eBPF network bypass driver and token bucket rate limiter. |
-| **Lua Engine** | `src/scripting.rs`| Sandboxed `mlua` execution for `EVAL`, `EVALSHA`, and `FCALL`. |
-| **Security** | `src/acl.rs` | Redis ACL v2 user management, password hashing, key permissions. |
+| Subsystem | Component Doc | Primary Source | Core Responsibility |
+| :--- | :--- | :--- | :--- |
+| **Server Loop** | [**01_reactor_and_server.md**](components/01_reactor_and_server.md) | `src/server.rs`, `src/main.rs` | `monoio` event loop, listener setup, core affinity pinning, signal handling. |
+| **Connection** | [**02_connection_and_execution.md**](components/02_connection_and_execution.md) | `src/connection.rs` | Socket read/write, client lifecycle, command execution dispatch, pipeline squashing. |
+| **RESP Engine** | [**03_resp_protocol_engine.md**](components/03_resp_protocol_engine.md) | `src/resp.rs` | Zero-copy RESP2 & RESP3 parsing, AST command variants, exact Redis error strings. |
+| **Routing** | [**04_sharding_and_router_mesh.md**](components/04_sharding_and_router_mesh.md) | `src/router.rs`, `src/shard.rs` | Slot and shard hashing, remote shard message dispatching, multi-key fanout. |
+| **Storage Table**| [**05_storage_engine_and_encodings.md**](components/05_storage_engine_and_encodings.md) | `src/table.rs` | `RudisTable`, `RudisValue`, Listpack/Intset/Skiplist compact encodings, inlined TTL. |
+| **Event Hub** | [**06_blocking_hub_and_waiters.md**](components/06_blocking_hub_and_waiters.md) | `src/block.rs` | Asynchronous wait/notify hub for `BLPOP`, `BZPOPMIN`, `BZMPOP`, duplicate suppression. |
+| **SSD Tiering** | [**07_nvme_tiered_storage.md**](components/07_nvme_tiered_storage.md) | `src/tiering.rs` | NVMe direct I/O, `SmallBins` 4KB packing, hole punching (`fallocate`), cold offload. |
+| **Vector Engine**| [**08_vector_search_hnsw_quantization.md**](components/08_vector_search_hnsw_quantization.md) | `src/vector.rs` | HNSW graph, SQ8 quantization, PQ with ADC distance tables, tiered top-K reranking. |
+| **Full-Text** | [**09_redisearch_fulltext_and_rrf.md**](components/09_redisearch_fulltext_and_rrf.md) | `src/search.rs` | RediSearch inverted index, BM25 ranking, Reciprocal Rank Fusion (RRF) hybrid search. |
+| **Zero-Copy & Bypass** | [**10_kernel_bypass_and_zerocopy.md**](components/10_kernel_bypass_and_zerocopy.md) | `src/xdp.rs`, `src/zerocopy.rs` | AF_XDP eBPF network bypass driver, UMEM packet rings, Linux `MSG_ZEROCOPY` TCP. |
+| **Cluster** | [**11_cluster_bus_and_gossip.md**](components/11_cluster_bus_and_gossip.md) | `src/cluster.rs` | 16,384 slots, Gossip bus (port + 10000), epoch consensus, `MOVED`/`ASK` redirection. |
+| **CRDT Engine** | [**12_crdt_multi_region_replication.md**](components/12_crdt_multi_region_replication.md) | `src/crdt.rs` | Multi-region active-active synchronization, HLC, LWW-Register, PN-Counter, OR-Set. |
+| **Lua Engine** | [**13_lua_scripting_and_functions.md**](components/13_lua_scripting_and_functions.md) | `src/scripting.rs` | Sandboxed `mlua` execution for `EVAL`, `EVALSHA`, SHA1 bytecode caching, and `FCALL`. |
+| **Persistence** | [**14_persistence_and_replication.md**](components/14_persistence_and_replication.md) | `src/replication.rs`, `src/aof.rs`| Forkless in-process AOF rewrites, RDB snapshots, `PSYNC` circular backlog stream. |
+| **Security & Allocator** | [**15_security_allocator_and_tls.md**](components/15_security_allocator_and_tls.md) | `src/acl.rs`, `src/allocator.rs`, `src/tls.rs`| Redis ACL v2 user permissions, Jemalloc memory telemetry, in-memory TLS & Linux kTLS. |
 
 ---
 *Maintained by the Rudis Core Team. For questions or architecture reviews, consult the team issue tracker.*

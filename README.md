@@ -35,7 +35,9 @@ A ultra-high-performance, **multi-threaded**, **shared-nothing** Redis-compatibl
    - If the key resides on another shard, it dispatches the request through a lock-free cross-core channel mesh, where Monoio utilizes an `eventfd` waker to resume the peer core's `io_uring` ring.
 5. **Multi-Protocol Gateway**: Supports standard RESP2, RESP3 (`HELLO 3`), inline text commands, and a built-in **Dual-Protocol Memcached Gateway** sharing database 0 with zero configuration.
 
-> **Contributor Learning Guide**: For an exhaustive, self-contained walkthrough of the engine, data structures, lock-free routing, and subsystem algorithms without needing to read source code, consult the [Rudis Internals & Contributor Learning Guide](docs/rudis_internals_guide.md).
+> **Contributor Learning Guides**:
+> - [**Rudis Internals & Architecture Guide**](docs/rudis_internals_guide.md): Exhaustive, self-contained walkthrough of the engine, data structures, and lock-free routing.
+> - [**Component Architecture Documentation**](docs/components/README.md): Dedicated, deep-dive specifications for all 15 individual subsystems (`RudisTable`, `BlockHub`, Tiering, Vector, Search, XDP, CRDTs, etc.).
 
 ---
 
@@ -619,6 +621,7 @@ rudis/
 ├── Cargo.toml
 ├── docs/
 │   ├── rudis_internals_guide.md # Comprehensive internal architecture & contributor learning guide
+│   ├── components/            # Detailed documentation for all 15 core subsystems
 │   └── benchmarks/
 │       ├── baseline.md        # Detailed 1-32 thread baseline results
 │       ├── tiered_storage.md  # NVMe tiered storage benchmark vs Dragonfly
