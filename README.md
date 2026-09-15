@@ -208,6 +208,27 @@ Rudis includes full Redis Cluster bus protocol implementation, dynamic multi-nod
   - Active cluster masters vote at most once per epoch with `FAILOVER_AUTH_ACK`.
   - Upon achieving majority quorum, the candidate promotes to master, inherits slot ranges, broadcasts `FAILOVER_ANNOUNCE`, and seamlessly transitions replication roles.
 
+### 19. RediSearch Full-Text Search, BM25 Relevance Scoring & Hybrid Vector Retrieval
+Rudis provides native secondary indexing and full-text search with RediSearch specification parity:
+- **Inverted Index & Text Tokenization**: Real-time tokenization, stop-word elimination, suffix stemming, and prefix indexing (`term*`).
+- **Okapi BM25 Ranking**: Industry-standard $k_1 = 1.2, b = 0.75$ document scoring with document length normalization and inverse document frequency (IDF).
+- **Multi-Type Schema Support**:
+  - `TEXT`: Weighted, sortable, stemmable text fields.
+  - `NUMERIC`: Range queries (`@price:[min max]`) and sorting (`SORTBY`).
+  - `TAG`: Exact multi-tag filters (`@category:{electronics | books}`) with custom separators.
+  - `VECTOR`: Integrated HNSW indexing for hybrid search.
+- **Hybrid Search & Reciprocal Rank Fusion (RRF)**: Merges text BM25 ranking and vector cosine similarity using rank-based fusion ($RRF(d) = \sum \frac{1}{60 + \text{rank}(d)}$).
+- **Automatic Lifecycle Hooks**: Transparently indexes documents upon `HSET`, `HMSET`, or `JSON.SET`, and removes postings upon `DEL`.
+- **Commands**: `FT.CREATE`, `FT.SEARCH`, `FT.INFO`, `FT.DROPINDEX`, `FT.EXPLAIN`, `FT.ADD`.
+
+### 20. AF_XDP (eXpress Data Path) Kernel Bypass & eBPF Wire-Speed Ingress Filter
+Rudis incorporates an advanced Linux kernel-bypass networking subsystem powered by AF_XDP and eBPF:
+- **Zero-Copy AF_XDP (XSK) Architecture**: Direct packet delivery from network interface cards (NICs) into pre-allocated userspace memory (UMEM) rings, bypassing Linux sk_buff overhead and conntrack tables.
+- **eBPF Wire-Speed Packet Filter**: Evaluates CIDR block/pass rules at driver/NIC speed (`XDP_DROP`, `XDP_PASS`, `XDP_REDIRECT`), dropping flood traffic before socket or memory allocations.
+- **Per-IP Token Bucket Rate Limiting**: Built-in algorithmic rate limiter throttling malicious flood sources at L2/L3.
+- **Multi-Mode Operation**: Driver mode (native hardware offload), SKB mode (generic Linux XDP), and userspace simulated bypass mode.
+- **Commands**: `XDP.INFO`, `XDP.RULE ADD/DEL/LIST`, `XDP.STATS`, `XDP.PACKET` (packet diagnostics).
+
 ---
 
 ## Testing
@@ -309,10 +330,12 @@ rudis/
 │   ├── resp.rs         # RESP2/RESP3 & inline frame parser and serializer
 │   ├── router.rs       # CRC16 key partitioner and cross-core message dispatcher
 │   ├── scripting.rs    # Lua scripting and Redis 7 Function engine
+│   ├── search.rs       # RediSearch full-text engine, BM25 scoring, inverted index, RRF
 │   ├── shard.rs        # Thread-local in-memory key-value database and message types
 │   ├── tiering.rs      # NVMe tiered storage, io_uring Direct I/O, zero-copy snapshots
 │   ├── tls.rs          # Hardware-accelerated Linux Kernel TLS (kTLS) and rustls integration
 │   ├── vector.rs       # HNSW vector search engine, AVX2 SIMD acceleration, SQ8 quantization
+│   ├── xdp.rs          # AF_XDP kernel bypass, eBPF wire-speed packet filter, UMEM rings
 │   └── zerocopy.rs     # SO_ZEROCOPY and io_uring fixed registered buffer pool
 └── tests/
     ├── test_cross_thread.rs # Validates cross-core eventfd waker with Monoio

@@ -908,6 +908,43 @@ pub enum Command {
     },
     TopkList(Bytes),
     TopkInfo(Bytes),
+    // Full-Text Search (FT.*)
+    FtCreate {
+        index: String,
+        on_type: String,
+        prefixes: Vec<String>,
+        fields: std::collections::HashMap<String, crate::search::FieldType>,
+    },
+    FtSearch {
+        index: String,
+        query: String,
+        options: crate::search::SearchOptions,
+    },
+    FtInfo(String),
+    FtDropIndex {
+        index: String,
+        dd: bool,
+    },
+    FtExplain {
+        index: String,
+        query: String,
+    },
+    FtAdd {
+        index: String,
+        doc_id: String,
+        score: f64,
+        fields: Vec<(String, String)>,
+    },
+    // AF_XDP & eBPF (XDP.*)
+    XdpInfo,
+    XdpRuleAdd {
+        action: crate::xdp::XdpAction,
+        cidr: String,
+    },
+    XdpRuleDel(u32),
+    XdpRuleList,
+    XdpStats,
+    XdpPacket(Bytes),
     Unknown(String),
 }
 
@@ -4950,6 +4987,275 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'topk.info' command".to_string());
             }
             Ok(Some(Command::TopkInfo(args[1].clone())))
+        }
+        "FT.CREATE" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'ft.create' command".to_string());
+            }
+            let index = String::from_utf8_lossy(&args[1]).to_string();
+            let mut on_type = "HASH".to_string();
+            let mut prefixes = Vec::new();
+            let mut i = 2;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                if opt == "ON" && i + 1 < args.len() {
+                    on_type = String::from_utf8_lossy(&args[i + 1]).to_uppercase();
+                    i += 2;
+                } else if opt == "PREFIX" && i + 1 < args.len() {
+                    let count: usize = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(1);
+                    i += 2;
+                    for _ in 0..count {
+                        if i < args.len() {
+                            prefixes.push(String::from_utf8_lossy(&args[i]).to_string());
+                            i += 1;
+                        }
+                    }
+                } else if opt == "SCHEMA" {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+
+            let mut fields = std::collections::HashMap::new();
+            while i < args.len() {
+                let fname = String::from_utf8_lossy(&args[i]).to_string();
+                i += 1;
+                if i >= args.len() {
+                    break;
+                }
+                let ftype_str = String::from_utf8_lossy(&args[i]).to_uppercase();
+                i += 1;
+                match ftype_str.as_str() {
+                    "TEXT" => {
+                        let mut weight = 1.0;
+                        let mut sortable = false;
+                        let mut nostem = false;
+                        while i < args.len() {
+                            let sub_opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                            if sub_opt == "WEIGHT" && i + 1 < args.len() {
+                                weight = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(1.0);
+                                i += 2;
+                            } else if sub_opt == "SORTABLE" {
+                                sortable = true;
+                                i += 1;
+                            } else if sub_opt == "NOSTEM" {
+                                nostem = true;
+                                i += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        fields.insert(fname, crate::search::FieldType::Text { weight, sortable, nostem });
+                    }
+                    "NUMERIC" => {
+                        let mut sortable = false;
+                        if i < args.len() && String::from_utf8_lossy(&args[i]).to_uppercase() == "SORTABLE" {
+                            sortable = true;
+                            i += 1;
+                        }
+                        fields.insert(fname, crate::search::FieldType::Numeric { sortable });
+                    }
+                    "TAG" => {
+                        let mut separator = ',';
+                        let mut casesensitive = false;
+                        while i < args.len() {
+                            let sub_opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                            if sub_opt == "SEPARATOR" && i + 1 < args.len() {
+                                separator = String::from_utf8_lossy(&args[i + 1]).chars().next().unwrap_or(',');
+                                i += 2;
+                            } else if sub_opt == "CASESENSITIVE" {
+                                casesensitive = true;
+                                i += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        fields.insert(fname, crate::search::FieldType::Tag { separator, casesensitive });
+                    }
+                    "VECTOR" => {
+                        let algorithm = if i < args.len() { String::from_utf8_lossy(&args[i]).to_string() } else { "HNSW".to_string() };
+                        i += 1;
+                        let mut dim = 128;
+                        let mut distance_metric = "COSINE".to_string();
+                        while i < args.len() {
+                            let sub_opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                            if sub_opt == "DIM" && i + 1 < args.len() {
+                                dim = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(128);
+                                i += 2;
+                            } else if sub_opt == "DISTANCE_METRIC" && i + 1 < args.len() {
+                                distance_metric = String::from_utf8_lossy(&args[i + 1]).to_uppercase();
+                                i += 2;
+                            } else if sub_opt == "TYPE" || sub_opt == "FLOAT32" || sub_opt == "M" || sub_opt == "EF_CONSTRUCTION" {
+                                i += 2;
+                            } else if sub_opt == "HNSW" || sub_opt == "FLAT" {
+                                i += 1;
+                            } else if sub_opt.parse::<usize>().is_ok() {
+                                i += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        fields.insert(fname, crate::search::FieldType::Vector { dim, distance_metric, algorithm });
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Some(Command::FtCreate { index, on_type, prefixes, fields }))
+        }
+        "FT.SEARCH" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'ft.search' command".to_string());
+            }
+            let index = String::from_utf8_lossy(&args[1]).to_string();
+            let query = String::from_utf8_lossy(&args[2]).to_string();
+            let mut options = crate::search::SearchOptions::default();
+
+            let mut i = 3;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                if opt == "NOCONTENT" {
+                    options.nocontent = true;
+                    i += 1;
+                } else if opt == "LIMIT" && i + 2 < args.len() {
+                    options.offset = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(0);
+                    options.limit = String::from_utf8_lossy(&args[i + 2]).parse().unwrap_or(10);
+                    i += 3;
+                } else if opt == "SORTBY" && i + 1 < args.len() {
+                    let field = String::from_utf8_lossy(&args[i + 1]).to_string();
+                    let mut asc = true;
+                    i += 2;
+                    if i < args.len() {
+                        let dir = String::from_utf8_lossy(&args[i]).to_uppercase();
+                        if dir == "DESC" {
+                            asc = false;
+                            i += 1;
+                        } else if dir == "ASC" {
+                            asc = true;
+                            i += 1;
+                        }
+                    }
+                    options.sortby = Some((field, asc));
+                } else if opt == "RETURN" && i + 1 < args.len() {
+                    let count: usize = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(0);
+                    i += 2;
+                    let mut r_fields = Vec::new();
+                    for _ in 0..count {
+                        if i < args.len() {
+                            r_fields.push(String::from_utf8_lossy(&args[i]).to_string());
+                            i += 1;
+                        }
+                    }
+                    options.return_fields = Some(r_fields);
+                } else if opt == "PARAMS" && i + 1 < args.len() {
+                    let count: usize = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(0);
+                    i += 2;
+                    for _ in 0..(count / 2) {
+                        if i + 1 < args.len() {
+                            let k = String::from_utf8_lossy(&args[i]).to_string();
+                            let v = args[i + 1].to_vec();
+                            options.params.insert(k, v);
+                            i += 2;
+                        }
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            Ok(Some(Command::FtSearch { index, query, options }))
+        }
+        "FT.INFO" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'ft.info' command".to_string());
+            }
+            Ok(Some(Command::FtInfo(String::from_utf8_lossy(&args[1]).to_string())))
+        }
+        "FT.DROPINDEX" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'ft.dropindex' command".to_string());
+            }
+            let index = String::from_utf8_lossy(&args[1]).to_string();
+            let dd = args.len() >= 3 && String::from_utf8_lossy(&args[2]).to_uppercase() == "DD";
+            Ok(Some(Command::FtDropIndex { index, dd }))
+        }
+        "FT.EXPLAIN" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'ft.explain' command".to_string());
+            }
+            let index = String::from_utf8_lossy(&args[1]).to_string();
+            let query = String::from_utf8_lossy(&args[2]).to_string();
+            Ok(Some(Command::FtExplain { index, query }))
+        }
+        "FT.ADD" => {
+            if args.len() < 5 {
+                return Err("wrong number of arguments for 'ft.add' command".to_string());
+            }
+            let index = String::from_utf8_lossy(&args[1]).to_string();
+            let doc_id = String::from_utf8_lossy(&args[2]).to_string();
+            let score: f64 = String::from_utf8_lossy(&args[3]).parse().unwrap_or(1.0);
+            let mut fields = Vec::new();
+            let mut i = 4;
+            while i < args.len() {
+                if String::from_utf8_lossy(&args[i]).to_uppercase() == "FIELDS" {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            while i + 1 < args.len() {
+                let f = String::from_utf8_lossy(&args[i]).to_string();
+                let v = String::from_utf8_lossy(&args[i + 1]).to_string();
+                fields.push((f, v));
+                i += 2;
+            }
+            Ok(Some(Command::FtAdd { index, doc_id, score, fields }))
+        }
+        "XDP.INFO" => {
+            Ok(Some(Command::XdpInfo))
+        }
+        "XDP.RULE" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'xdp.rule' command".to_string());
+            }
+            let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
+            match sub.as_str() {
+                "ADD" => {
+                    if args.len() < 4 {
+                        return Err("wrong number of arguments for 'xdp.rule add' command".to_string());
+                    }
+                    let action_str = String::from_utf8_lossy(&args[2]).to_uppercase();
+                    let action = match action_str.as_str() {
+                        "DROP" => crate::xdp::XdpAction::Drop,
+                        "PASS" => crate::xdp::XdpAction::Pass,
+                        "REDIRECT" => crate::xdp::XdpAction::Redirect,
+                        "TX" => crate::xdp::XdpAction::Tx,
+                        _ => return Err(format!("Unknown XDP action: {}", action_str)),
+                    };
+                    let cidr = String::from_utf8_lossy(&args[3]).to_string();
+                    Ok(Some(Command::XdpRuleAdd { action, cidr }))
+                }
+                "DEL" => {
+                    if args.len() != 3 {
+                        return Err("wrong number of arguments for 'xdp.rule del' command".to_string());
+                    }
+                    let id: u32 = String::from_utf8_lossy(&args[2]).parse().map_err(|_| "Invalid rule ID".to_string())?;
+                    Ok(Some(Command::XdpRuleDel(id)))
+                }
+                "LIST" => {
+                    Ok(Some(Command::XdpRuleList))
+                }
+                _ => Err(format!("Unknown xdp.rule subcommand: {}", sub)),
+            }
+        }
+        "XDP.STATS" => {
+            Ok(Some(Command::XdpStats))
+        }
+        "XDP.PACKET" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'xdp.packet' command".to_string());
+            }
+            Ok(Some(Command::XdpPacket(args[1].clone())))
         }
         _ => Ok(Some(Command::Unknown(cmd_name))),
 

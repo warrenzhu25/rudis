@@ -3754,6 +3754,182 @@ fn test_cluster_bus_shards_and_automated_failover_e2e() {
     assert!(nodes3.contains("myself,master"), "Node 3 should be promoted to myself,master. Nodes:\n{}", nodes3);
 }
 
+#[test]
+fn test_redisearch_fulltext_and_hybrid_vector_e2e() {
+    let port = 16620;
+    start_test_server(port, 2);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Create index on HASH
+    let create_resp = send_and_read(
+        &mut client,
+        b"FT.CREATE idx:books ON HASH PREFIX 1 book: SCHEMA title TEXT WEIGHT 2.0 author TEXT price NUMERIC SORTABLE category TAG SEPARATOR ,\r\n"
+    );
+    assert_eq!(create_resp, "+OK\r\n");
+
+    // 2. Duplicate index creation should fail
+    let dup_resp = send_and_read(
+        &mut client,
+        b"FT.CREATE idx:books ON HASH PREFIX 1 book: SCHEMA title TEXT\r\n"
+    );
+    assert!(dup_resp.contains("ERR Index already exists"));
+
+    // 3. Inspect index metadata via FT.INFO
+    let info_resp = send_and_read(&mut client, b"FT.INFO idx:books\r\n");
+    assert!(info_resp.contains("idx:books"));
+    assert!(info_resp.contains("num_docs"));
+
+    // 4. Populate books via HSET (automatically indexed via hook)
+    let hset1 = b"*10\r\n$4\r\nHSET\r\n$6\r\nbook:1\r\n$5\r\ntitle\r\n$14\r\nRust in Action\r\n$6\r\nauthor\r\n$12\r\nTim McNamara\r\n$5\r\nprice\r\n$4\r\n45.0\r\n$8\r\ncategory\r\n$16\r\ntech,programming\r\n";
+    assert_eq!(send_and_read(&mut client, hset1), ":4\r\n");
+
+    let hset2 = b"*10\r\n$4\r\nHSET\r\n$6\r\nbook:2\r\n$5\r\ntitle\r\n$29\r\nThe Rust Programming Language\r\n$6\r\nauthor\r\n$13\r\nSteve Klabnik\r\n$5\r\nprice\r\n$5\r\n39.99\r\n$8\r\ncategory\r\n$9\r\ntech,rust\r\n";
+    assert_eq!(send_and_read(&mut client, hset2), ":4\r\n");
+
+    let hset3 = b"*10\r\n$4\r\nHSET\r\n$6\r\nbook:3\r\n$5\r\ntitle\r\n$37\r\nDesigning Data-Intensive Applications\r\n$6\r\nauthor\r\n$16\r\nMartin Kleppmann\r\n$5\r\nprice\r\n$4\r\n55.0\r\n$8\r\ncategory\r\n$13\r\ntech,database\r\n";
+    assert_eq!(send_and_read(&mut client, hset3), ":4\r\n");
+
+    // 5. Query 1: Keyword search for "Rust" (matches book:1 and book:2)
+    let search1 = send_and_read(&mut client, b"*3\r\n$9\r\nFT.SEARCH\r\n$9\r\nidx:books\r\n$4\r\nRust\r\n");
+    assert!(search1.starts_with("*5\r\n:2\r\n"), "Search 'Rust' should return 2 hits. Resp: {}", search1);
+    assert!(search1.contains("book:1"));
+    assert!(search1.contains("book:2"));
+
+    // 6. Query 2: Keyword search for "Data-Intensive" (matches book:3)
+    let search2 = send_and_read(&mut client, b"*3\r\n$9\r\nFT.SEARCH\r\n$9\r\nidx:books\r\n$14\r\nData-Intensive\r\n");
+    assert!(search2.starts_with("*3\r\n:1\r\n"), "Search 'Data-Intensive' should return 1 hit. Resp: {}", search2);
+    assert!(search2.contains("book:3"));
+
+    // 7. Query 3: Numeric range query: @price:[40 50] (matches book:1 with price 45.0)
+    let search3 = send_and_read(&mut client, b"*3\r\n$9\r\nFT.SEARCH\r\n$9\r\nidx:books\r\n$14\r\n@price:[40 50]\r\n");
+    assert!(search3.starts_with("*3\r\n:1\r\n"), "Range query should return 1 hit. Resp: {}", search3);
+    assert!(search3.contains("book:1"));
+
+    // 8. Query 4: Tag filter: @category:{database} (matches book:3)
+    let search4 = send_and_read(&mut client, b"*3\r\n$9\r\nFT.SEARCH\r\n$9\r\nidx:books\r\n$20\r\n@category:{database}\r\n");
+    assert!(search4.starts_with("*3\r\n:1\r\n"), "Tag query should return 1 hit. Resp: {}", search4);
+    assert!(search4.contains("book:3"));
+
+    // 9. Query 5: Prefix query: "progra*" (matches programming in book:2 title)
+    let search5 = send_and_read(&mut client, b"*3\r\n$9\r\nFT.SEARCH\r\n$9\r\nidx:books\r\n$7\r\nprogra*\r\n");
+    assert!(search5.starts_with("*3\r\n:1\r\n"), "Prefix query should return 1 hit for book:2. Resp: {}", search5);
+    assert!(search5.contains("book:2"));
+
+    // 10. Query 6: NOCONTENT flag (returns doc IDs only)
+    let search_nocontent = send_and_read(&mut client, b"*4\r\n$9\r\nFT.SEARCH\r\n$9\r\nidx:books\r\n$4\r\nRust\r\n$9\r\nNOCONTENT\r\n");
+    assert_eq!(search_nocontent, "*3\r\n:2\r\n$6\r\nbook:1\r\n$6\r\nbook:2\r\n");
+
+    // 11. Query 7: FT.EXPLAIN
+    let explain_resp = send_and_read(&mut client, b"*3\r\n$10\r\nFT.EXPLAIN\r\n$9\r\nidx:books\r\n$15\r\nRust | database\r\n");
+    assert!(explain_resp.contains("Or"), "Explain output should describe parsed AST");
+
+    // 12. Document deletion via DEL automatically removes from index
+    assert_eq!(send_and_read(&mut client, b"DEL book:1\r\n"), ":1\r\n");
+    let search_after_del = send_and_read(&mut client, b"FT.SEARCH idx:books Action\r\n");
+    assert_eq!(search_after_del, "*1\r\n:0\r\n");
+
+    // 13. Drop index
+    assert_eq!(send_and_read(&mut client, b"FT.DROPINDEX idx:books\r\n"), "+OK\r\n");
+    let search_after_drop = send_and_read(&mut client, b"FT.SEARCH idx:books Rust\r\n");
+    assert!(search_after_drop.contains("ERR Unknown Index name"));
+
+    // 14. JSON Document Indexing via FT.CREATE and JSON.SET
+    assert_eq!(
+        send_and_read(
+            &mut client,
+            b"FT.CREATE idx:users ON JSON PREFIX 1 user: SCHEMA name TEXT role TAG\r\n"
+        ),
+        "+OK\r\n"
+    );
+    let json_payload = b"{\"name\":\"Alice Engineer\",\"role\":\"admin\"}";
+    let mut json_set_cmd = format!("*4\r\n$8\r\nJSON.SET\r\n$6\r\nuser:1\r\n$1\r\n$\r\n${}\r\n", json_payload.len()).into_bytes();
+    json_set_cmd.extend_from_slice(json_payload);
+    json_set_cmd.extend_from_slice(b"\r\n");
+    assert_eq!(send_and_read(&mut client, &json_set_cmd), "+OK\r\n");
+
+    let search_json = send_and_read(&mut client, b"*3\r\n$9\r\nFT.SEARCH\r\n$9\r\nidx:users\r\n$5\r\nAlice\r\n");
+    assert!(search_json.contains("user:1"));
+    assert!(search_json.contains("Alice Engineer"));
+}
+
+#[test]
+fn test_af_xdp_ebpf_kernel_bypass_e2e() {
+    let port = 16621;
+    start_test_server(port, 2);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Inspect XDP engine info
+    let info = send_and_read(&mut client, b"XDP.INFO\r\n");
+    assert!(info.contains("interface:eth0"));
+    assert!(info.contains("mode:"));
+    assert!(info.contains("umem_frame_size:2048"));
+
+    // 2. Add eBPF packet filter rules
+    let r1 = send_and_read(&mut client, b"XDP.RULE ADD DROP 10.0.0.0/8\r\n");
+    assert_eq!(r1, ":1\r\n");
+
+    let r2 = send_and_read(&mut client, b"XDP.RULE ADD PASS 192.168.1.0/24\r\n");
+    assert_eq!(r2, ":2\r\n");
+
+    // 3. List active eBPF rules
+    let rules = send_and_read(&mut client, b"XDP.RULE LIST\r\n");
+    assert!(rules.starts_with("*2\r\n"));
+    assert!(rules.contains("action:DROP cidr:10.0.0.0/8"));
+    assert!(rules.contains("action:PASS cidr:192.168.1.0/24"));
+
+    // 4. Inject test packets via XDP.PACKET diagnostic command
+    // Packet from 10.1.2.3 (should be DROPPED by rule 1)
+    let mut pkt_drop = vec![0u8; 40];
+    pkt_drop[0] = 0x45;
+    pkt_drop[12] = 10;
+    pkt_drop[13] = 1;
+    pkt_drop[14] = 2;
+    pkt_drop[15] = 3;
+    let mut cmd_drop = format!("*2\r\n$10\r\nXDP.PACKET\r\n${}\r\n", pkt_drop.len()).into_bytes();
+    cmd_drop.extend_from_slice(&pkt_drop);
+    cmd_drop.extend_from_slice(b"\r\n");
+    assert_eq!(send_and_read(&mut client, &cmd_drop), "+DROP\r\n");
+
+    // Packet from 192.168.1.50 (should be PASSED by rule 2)
+    let mut pkt_pass = vec![0u8; 40];
+    pkt_pass[0] = 0x45;
+    pkt_pass[12] = 192;
+    pkt_pass[13] = 168;
+    pkt_pass[14] = 1;
+    pkt_pass[15] = 50;
+    let mut cmd_pass = format!("*2\r\n$10\r\nXDP.PACKET\r\n${}\r\n", pkt_pass.len()).into_bytes();
+    cmd_pass.extend_from_slice(&pkt_pass);
+    cmd_pass.extend_from_slice(b"\r\n");
+    assert_eq!(send_and_read(&mut client, &cmd_pass), "+PASS\r\n");
+
+    // Packet from 172.16.0.1 (no match -> redirected to userspace UMEM ring)
+    let mut pkt_redir = vec![0u8; 40];
+    pkt_redir[0] = 0x45;
+    pkt_redir[12] = 172;
+    pkt_redir[13] = 16;
+    pkt_redir[14] = 0;
+    pkt_redir[15] = 1;
+    let mut cmd_redir = format!("*2\r\n$10\r\nXDP.PACKET\r\n${}\r\n", pkt_redir.len()).into_bytes();
+    cmd_redir.extend_from_slice(&pkt_redir);
+    cmd_redir.extend_from_slice(b"\r\n");
+    assert_eq!(send_and_read(&mut client, &cmd_redir), "+REDIRECT\r\n");
+
+    // 5. Check real-time XDP stats
+    let stats = send_and_read(&mut client, b"XDP.STATS\r\n");
+    assert!(stats.contains("dropped_packets"));
+    assert!(stats.contains("pass_packets"));
+    assert!(stats.contains("redirected_packets"));
+
+    // 6. Delete rule 1
+    assert_eq!(send_and_read(&mut client, b"XDP.RULE DEL 1\r\n"), "+OK\r\n");
+
+    // Packet from 10.1.2.3 now redirects instead of dropping
+    assert_eq!(send_and_read(&mut client, &cmd_drop), "+REDIRECT\r\n");
+}
+
+
 
 
 

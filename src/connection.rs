@@ -1732,6 +1732,18 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         | Command::TopkQuery { .. }
         | Command::TopkList(_)
         | Command::TopkInfo(_) => "TOPK",
+        Command::FtCreate { .. }
+        | Command::FtSearch { .. }
+        | Command::FtInfo(_)
+        | Command::FtDropIndex { .. }
+        | Command::FtExplain { .. }
+        | Command::FtAdd { .. } => "FT",
+        Command::XdpInfo
+        | Command::XdpRuleAdd { .. }
+        | Command::XdpRuleDel(_)
+        | Command::XdpRuleList
+        | Command::XdpStats
+        | Command::XdpPacket(_) => "XDP",
         Command::Unknown(_) => "UNKNOWN",
     }
 }
@@ -1885,8 +1897,9 @@ async fn execute_command(
             let mut count = 0usize;
             for key in keys.clone() {
                 notify_key_invalidation(router.port, key.as_ref(), client_id);
-                if router.del(key).await {
+                if router.del(key.clone()).await {
                     count += 1;
+                    crate::search::delete_document_hook(&String::from_utf8_lossy(&key));
                 }
             }
 
@@ -4224,6 +4237,151 @@ async fn execute_command(
             }
             false
         }
+        Command::FtCreate { index, on_type, prefixes, fields } => {
+            let schema = crate::search::IndexSchema {
+                name: index,
+                on_type,
+                prefixes,
+                fields,
+            };
+            match crate::search::create_search_index(schema) {
+                Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                Err(e) => out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes()),
+            }
+            false
+        }
+        Command::FtSearch { index, query, options } => {
+            if let Some(idx_arc) = crate::search::get_search_index(&index) {
+                let idx = idx_arc.read().unwrap();
+                let ast = crate::search::parse_query(&query);
+                let (total, hits) = crate::search::execute_search(&idx, &ast, &options);
+
+                if options.nocontent {
+                    out.extend_from_slice(format!("*{}\r\n:{}\r\n", 1 + hits.len(), total).as_bytes());
+                    for hit in hits {
+                        write_resp_bulk(out, hit.doc_id.as_bytes());
+                    }
+                } else {
+                    let mut num_elems = 1;
+                    for _ in &hits {
+                        num_elems += 2;
+                    }
+                    out.extend_from_slice(format!("*{}\r\n:{}\r\n", num_elems, total).as_bytes());
+                    for hit in hits {
+                        write_resp_bulk(out, hit.doc_id.as_bytes());
+                        out.extend_from_slice(format!("*{}\r\n", hit.fields.len() * 2).as_bytes());
+                        for (k, v) in hit.fields {
+                            write_resp_bulk(out, k.as_bytes());
+                            write_resp_bulk(out, v.as_bytes());
+                        }
+                    }
+                }
+            } else {
+                out.extend_from_slice(format!("-ERR Unknown Index name: {}\r\n", index).as_bytes());
+            }
+            false
+        }
+        Command::FtInfo(index) => {
+            if let Some(idx_arc) = crate::search::get_search_index(&index) {
+                let idx = idx_arc.read().unwrap();
+                if let Some(schema) = &idx.schema {
+                    out.extend_from_slice(b"*12\r\n");
+                    write_resp_bulk(out, b"index_name");
+                    write_resp_bulk(out, schema.name.as_bytes());
+                    write_resp_bulk(out, b"index_options");
+                    out.extend_from_slice(b"*0\r\n");
+                    write_resp_bulk(out, b"num_docs");
+                    write_resp_integer(out, idx.total_docs as i64);
+                    write_resp_bulk(out, b"num_terms");
+                    write_resp_integer(out, idx.inverted.len() as i64);
+                    write_resp_bulk(out, b"total_inverted_index_blocks");
+                    write_resp_integer(out, idx.total_terms as i64);
+                    write_resp_bulk(out, b"indexing");
+                    write_resp_bulk(out, b"0");
+                } else {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+            } else {
+                out.extend_from_slice(format!("-ERR Unknown Index name: {}\r\n", index).as_bytes());
+            }
+            false
+        }
+        Command::FtDropIndex { index, dd: _ } => {
+            match crate::search::drop_search_index(&index) {
+                Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                Err(e) => out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes()),
+            }
+            false
+        }
+        Command::FtExplain { index: _, query } => {
+            let ast = crate::search::parse_query(&query);
+            let repr = format!("{:?}", ast);
+            write_resp_bulk(out, repr.as_bytes());
+            false
+        }
+        Command::FtAdd { index, doc_id, score: _, fields } => {
+            if let Some(idx_arc) = crate::search::get_search_index(&index) {
+                let mut idx = idx_arc.write().unwrap();
+                let map: std::collections::HashMap<String, String> = fields.into_iter().collect();
+                idx.add_document(&doc_id, map, None);
+                out.extend_from_slice(b"+OK\r\n");
+            } else {
+                out.extend_from_slice(format!("-ERR Unknown Index name: {}\r\n", index).as_bytes());
+            }
+            false
+        }
+        Command::XdpInfo => {
+            let info = crate::xdp::get_xdp_engine().info();
+            write_resp_bulk(out, info.as_bytes());
+            false
+        }
+        Command::XdpRuleAdd { action, cidr } => {
+            match crate::xdp::get_xdp_engine().add_rule(action, &cidr) {
+                Ok(id) => write_resp_integer(out, id as i64),
+                Err(e) => out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes()),
+            }
+            false
+        }
+        Command::XdpRuleDel(id) => {
+            match crate::xdp::get_xdp_engine().del_rule(id) {
+                Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                Err(e) => out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes()),
+            }
+            false
+        }
+        Command::XdpRuleList => {
+            let rules = crate::xdp::get_xdp_engine().list_rules();
+            out.extend_from_slice(format!("*{}\r\n", rules.len()).as_bytes());
+            for r in rules {
+                let line = format!("id:{} action:{} cidr:{}", r.id, r.action, r.cidr);
+                write_resp_bulk(out, line.as_bytes());
+            }
+            false
+        }
+        Command::XdpStats => {
+            use std::sync::atomic::Ordering;
+            let engine = crate::xdp::get_xdp_engine();
+            out.extend_from_slice(b"*12\r\n");
+            write_resp_bulk(out, b"rx_packets");
+            write_resp_integer(out, engine.rx_packets.load(Ordering::Relaxed) as i64);
+            write_resp_bulk(out, b"rx_bytes");
+            write_resp_integer(out, engine.rx_bytes.load(Ordering::Relaxed) as i64);
+            write_resp_bulk(out, b"dropped_packets");
+            write_resp_integer(out, engine.dropped_packets.load(Ordering::Relaxed) as i64);
+            write_resp_bulk(out, b"redirected_packets");
+            write_resp_integer(out, engine.redirected_packets.load(Ordering::Relaxed) as i64);
+            write_resp_bulk(out, b"pass_packets");
+            write_resp_integer(out, engine.pass_packets.load(Ordering::Relaxed) as i64);
+            write_resp_bulk(out, b"rate_limit_drops");
+            write_resp_integer(out, engine.rate_limit_drops.load(Ordering::Relaxed) as i64);
+            false
+        }
+        Command::XdpPacket(payload) => {
+            let action = crate::xdp::get_xdp_engine().process_packet(&payload);
+            let s = format!("+{}\r\n", action);
+            out.extend_from_slice(s.as_bytes());
+            false
+        }
         Command::Quit => {
 
             out.extend_from_slice(b"+OK\r\n");
@@ -4514,6 +4672,7 @@ pub fn execute_local_command(
             for k in keys {
                 if db.del(k) {
                     count += 1;
+                    crate::search::delete_document_hook(&String::from_utf8_lossy(k));
                 }
             }
             if count > 0 {
@@ -4573,6 +4732,11 @@ pub fn execute_local_command(
             match db.hset(key.clone(), fields.clone()) {
                 Ok(count) => {
                     record_change!(cmd);
+                    let str_fields: std::collections::HashMap<String, String> = fields
+                        .iter()
+                        .map(|(k, v)| (String::from_utf8_lossy(k).to_string(), String::from_utf8_lossy(v).to_string()))
+                        .collect();
+                    crate::search::index_document_hook(&String::from_utf8_lossy(key), str_fields);
                     write_resp_integer(out, count as i64);
                 }
                 Err(err) => {
@@ -4585,6 +4749,11 @@ pub fn execute_local_command(
             match db.hset(key.clone(), fields.clone()) {
                 Ok(_) => {
                     record_change!(cmd);
+                    let str_fields: std::collections::HashMap<String, String> = fields
+                        .iter()
+                        .map(|(k, v)| (String::from_utf8_lossy(k).to_string(), String::from_utf8_lossy(v).to_string()))
+                        .collect();
+                    crate::search::index_document_hook(&String::from_utf8_lossy(key), str_fields);
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 Err(err) => {
@@ -6686,6 +6855,21 @@ pub fn execute_local_command(
         Command::JsonSet { key, path, json_val, nx, xx } => {
             match db.json_store.json_set(key, path, json_val, *nx, *xx) {
                 Ok(true) => {
+                    if path == "$" {
+                        if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(json_val) {
+                            let mut str_fields = std::collections::HashMap::new();
+                            for (k, v) in map {
+                                let val_str = match v {
+                                    serde_json::Value::String(s) => s,
+                                    serde_json::Value::Number(n) => n.to_string(),
+                                    serde_json::Value::Bool(b) => b.to_string(),
+                                    other => other.to_string(),
+                                };
+                                str_fields.insert(k, val_str);
+                            }
+                            crate::search::index_document_hook(&String::from_utf8_lossy(key), str_fields);
+                        }
+                    }
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 Ok(false) => {

@@ -21,6 +21,8 @@ pub mod zerocopy;
 pub mod json;
 pub mod geo;
 pub mod probabilistic;
+pub mod search;
+pub mod xdp;
 
 
 #[global_allocator]
