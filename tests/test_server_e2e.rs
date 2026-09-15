@@ -2546,7 +2546,7 @@ fn test_primary_replica_replication_e2e() {
     assert_eq!(send_and_read(&mut master_client, b"SET init_k2 val2\r\n"), "+OK\r\n");
     assert_eq!(send_and_read(&mut master_client, b"HSET myhash field1 hello\r\n"), ":1\r\n");
 
-    // 3. Initiate replication on replica
+    // 3. Initiate replication on replica (dispatches PSYNC to master)
     let rep_resp = send_and_read(&mut replica_client, format!("REPLICAOF 127.0.0.1 {}\r\n", master_port).as_bytes());
     assert_eq!(rep_resp, "+OK\r\n");
 
@@ -4017,6 +4017,76 @@ fn test_dragonfly_compatibility_suite_e2e() {
     assert_eq!(send_and_read(&mut client, b"delete mc_fruit\r\n"), "DELETED\r\n");
     assert_eq!(send_and_read(&mut client, b"delete mc_fruit\r\n"), "NOT_FOUND\r\n");
 }
+
+#[test]
+fn test_harness_and_extended_command_coverage_e2e() {
+    let port = 16428;
+    start_test_server(port, 2);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Harness commands (SELECT, CLIENT KILL, SLOWLOG)
+    assert_eq!(send_and_read(&mut client, b"SELECT 0\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"SELECT 9\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"CLIENT KILL 127.0.0.1:9999\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"SLOWLOG RESET\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"SLOWLOG LEN\r\n"), ":0\r\n");
+    assert_eq!(send_and_read(&mut client, b"SLOWLOG GET\r\n"), "*0\r\n");
+
+    // 2. HMSET & FLUSHALL
+    assert_eq!(send_and_read(&mut client, b"HMSET hm_key f1 v1 f2 v2\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"HGET hm_key f1\r\n"), "$2\r\nv1\r\n");
+    assert_eq!(send_and_read(&mut client, b"FLUSHALL\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"EXISTS hm_key\r\n"), ":0\r\n");
+
+    // 3. PEXPIRE & PTTL
+    assert_eq!(send_and_read(&mut client, b"SET exp_key hello\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"PEXPIRE exp_key 60000\r\n"), ":1\r\n");
+    let pttl_resp = send_and_read(&mut client, b"PTTL exp_key\r\n");
+    assert!(pttl_resp.starts_with(":"));
+
+    // 4. RedisJSON extended commands
+    assert_eq!(send_and_read(&mut client, b"JSON.SET jext $ {\"num\":10,\"str\":\"hello\",\"arr\":[1,2,3]}\r\n"), "+OK\r\n");
+    let mult_res = send_and_read(&mut client, b"JSON.NUMMULTBY jext $.num 2\r\n");
+    assert!(mult_res.contains("20") || mult_res.contains("+OK") || mult_res.contains(":20"));
+    let str_append = send_and_read(&mut client, b"JSON.STRAPPEND jext $.str world\r\n");
+    assert!(str_append.contains("10") || str_append.contains(":10"));
+    let str_len = send_and_read(&mut client, b"JSON.STRLEN jext $.str\r\n");
+    assert!(str_len.contains("10") || str_len.contains(":10"));
+    assert_eq!(send_and_read(&mut client, b"JSON.CLEAR jext $.arr\r\n"), ":1\r\n");
+    let mget_res = send_and_read(&mut client, b"JSON.MGET jext $.num\r\n");
+    assert!(mget_res.contains("20") || mget_res.contains("*1\r\n"));
+
+    // 5. Probabilistic & CRDT & Search
+    assert_eq!(send_and_read(&mut client, b"CMS.INITBYPROB cms_sketch 0.01 0.01\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"CRDT.SADD crdt_tag item1\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"CRDT.SREM crdt_tag item1\r\n"), ":1\r\n");
+
+    // 6. RediSearch FT.ADD
+    assert_eq!(send_and_read(&mut client, b"FT.CREATE ft_idx ON HASH SCHEMA title TEXT\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"FT.ADD ft_idx doc99 1.0 FIELDS title \"distributed systems\"\r\n"), "+OK\r\n");
+
+    // 7. Sorted Set ZREVRANGEBYSCORE & PUNSUBSCRIBE
+    assert_eq!(send_and_read(&mut client, b"ZADD zrev_k 10 a 20 b 30 c\r\n"), ":3\r\n");
+    let zrev_res = send_and_read(&mut client, b"ZREVRANGEBYSCORE zrev_k 25 5\r\n");
+    assert!(zrev_res.contains("b") && zrev_res.contains("a"));
+    let _ = send_and_read(&mut client, b"PUNSUBSCRIBE mypat*\r\n");
+
+    // 8. REPLCONF & QUIT
+    assert_eq!(send_and_read(&mut client, b"REPLCONF listening-port 6380\r\n"), "+OK\r\n");
+    let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    assert_eq!(send_and_read(&mut client2, b"QUIT\r\n"), "+OK\r\n");
+}
+
+#[test]
+fn test_ping_resp_array_tcp() {
+    let port = 16399;
+    let num_shards = 2;
+    start_test_server(port, num_shards);
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let resp = send_and_read(&mut stream, b"*1\r\n$4\r\nPING\r\n");
+    assert_eq!(resp, "+PONG\r\n");
+}
+
 
 
 

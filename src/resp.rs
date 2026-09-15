@@ -79,6 +79,7 @@ pub enum ClientSubcommand {
     SetName(String),
     GetName,
     Id,
+    Kill(Vec<Bytes>),
     Tracking {
         enabled: bool,
         bcast: bool,
@@ -110,6 +111,11 @@ pub enum Command {
     },
     Acl(AclSubcommand),
     Get(Bytes),
+    Getex {
+        key: Bytes,
+        expire_in: Option<Duration>,
+        persist: bool,
+    },
     Set {
         key: Bytes,
         value: Bytes,
@@ -315,6 +321,9 @@ pub enum Command {
     // GENERIC & DATABASE COMMANDS
     Type(Bytes),
     Dbsize,
+    Select(u32),
+    Slowlog(Bytes),
+    Debug,
     Flushdb,
     Flushall,
     Touch(Vec<Bytes>),
@@ -726,6 +735,7 @@ pub enum Command {
     },
     FunctionList,
     FunctionDelete(String),
+    FunctionFlush,
     // REDISJSON COMMANDS
     JsonSet {
         key: Bytes,
@@ -1266,6 +1276,72 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 Ok(Some(Command::MemcachedGet { keys: args[1..].to_vec() }))
             }
         }
+        "GETEX" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'getex' command".to_string());
+            }
+            let key = args[1].clone();
+            let mut expire_in = None;
+            let mut persist = false;
+            let mut i = 2;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "EX" => {
+                        if i + 1 >= args.len() { return Err("syntax error".to_string()); }
+                        let sec: u64 = std::str::from_utf8(&args[i + 1])
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                        expire_in = Some(Duration::from_secs(sec));
+                        i += 2;
+                    }
+                    "PX" => {
+                        if i + 1 >= args.len() { return Err("syntax error".to_string()); }
+                        let ms: u64 = std::str::from_utf8(&args[i + 1])
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                        expire_in = Some(Duration::from_millis(ms));
+                        i += 2;
+                    }
+                    "EXAT" => {
+                        if i + 1 >= args.len() { return Err("syntax error".to_string()); }
+                        let ts: u64 = std::str::from_utf8(&args[i + 1])
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                        let now_unix = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let dur = if ts <= now_unix { Duration::from_millis(1) } else { Duration::from_secs(ts - now_unix) };
+                        expire_in = Some(dur);
+                        i += 2;
+                    }
+                    "PXAT" => {
+                        if i + 1 >= args.len() { return Err("syntax error".to_string()); }
+                        let ts: u64 = std::str::from_utf8(&args[i + 1])
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                        let now_unix_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        let dur = if ts <= now_unix_ms { Duration::from_millis(1) } else { Duration::from_millis(ts - now_unix_ms) };
+                        expire_in = Some(dur);
+                        i += 2;
+                    }
+                    "PERSIST" => {
+                        persist = true;
+                        i += 1;
+                    }
+                    _ => { return Err("syntax error".to_string()); }
+                }
+            }
+            Ok(Some(Command::Getex { key, expire_in, persist }))
+        }
         "SET" | "PUT" => {
             if args.len() < 3 {
                 return Err("wrong number of arguments for 'set'/'put' command".to_string());
@@ -1776,6 +1852,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
                 "GETNAME" => Ok(Some(Command::Client(ClientSubcommand::GetName))),
                 "ID" => Ok(Some(Command::Client(ClientSubcommand::Id))),
+                "KILL" => Ok(Some(Command::Client(ClientSubcommand::Kill(args[2..].to_vec())))),
                 "TRACKING" => {
                     if args.len() < 3 {
                         return Err("wrong number of arguments for 'client tracking' command".to_string());
@@ -2693,6 +2770,25 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             Ok(Some(Command::Dbsize))
         }
+        "SELECT" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'select' command".to_string());
+            }
+            let idx: u32 = std::str::from_utf8(&args[1])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            Ok(Some(Command::Select(idx)))
+        }
+        "SLOWLOG" => {
+            let sub = if args.len() > 1 {
+                args[1].clone()
+            } else {
+                Bytes::from_static(b"GET")
+            };
+            Ok(Some(Command::Slowlog(sub)))
+        }
+        "DEBUG" => Ok(Some(Command::Debug)),
         "EXPIREAT" => {
             if args.len() != 3 {
                 return Err("wrong number of arguments for 'expireat' command".to_string());
@@ -3127,6 +3223,8 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     }
                     Ok(Some(Command::ConfigSet(args[2].clone(), args[3].clone())))
                 }
+                "RESETSTAT" => Ok(Some(Command::ConfigSet(Bytes::from_static(b"resetstat"), Bytes::new()))),
+                "REWRITE" => Ok(Some(Command::ConfigSet(Bytes::from_static(b"rewrite"), Bytes::new()))),
                 _ => Err(format!("ERR unknown subcommand '{}' for CONFIG", sub)),
             }
         }
@@ -4652,6 +4750,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     Ok(Some(Command::FunctionLoad { replace, code }))
                 }
                 "LIST" => Ok(Some(Command::FunctionList)),
+                "FLUSH" => Ok(Some(Command::FunctionFlush)),
                 "DELETE" => {
                     if args.len() != 3 {
                         return Err("wrong number of arguments for 'function delete' command".to_string());

@@ -559,3 +559,9 @@ pub fn delete_function(lib_name: &str) -> bool {
     FUNCTION_LIBS.write().unwrap().remove(lib_name).is_some()
 }
 
+/// Flush all registered function libraries
+pub fn flush_functions() {
+    FUNCTION_LIBS.write().unwrap().clear();
+}
+
+

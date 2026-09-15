@@ -38,6 +38,10 @@ struct Args {
     /// Upload streaming memory threshold percentage (default: 80)
     #[arg(long, default_value_t = 80)]
     tiered_upload_threshold: u64,
+
+    /// Disable CPU core affinity pinning
+    #[arg(long, default_value_t = false)]
+    no_pin: bool,
 }
 
 fn main() {
@@ -103,7 +107,7 @@ fn main() {
         let port = args.port;
         let shard_senders = senders.clone();
         let shard_aof_config = aof_config.clone();
-        let core_id = if shard_id < core_ids.len() {
+        let core_id = if !args.no_pin && shard_id < core_ids.len() {
             Some(core_ids[shard_id])
         } else {
             None

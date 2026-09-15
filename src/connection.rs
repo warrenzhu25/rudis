@@ -268,9 +268,6 @@ pub async fn handle_connection(
                             out_buf.extend_from_slice(&err_resp);
                             if in_multi {
                                 tx_has_error = true;
-                            } else {
-                                should_quit = true;
-                                break;
                             }
                         }
                     }
@@ -853,6 +850,7 @@ async fn run_master_replica_stream(
 pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
     match cmd {
         Command::Get(key)
+        | Command::Getex { key, .. }
         | Command::Set { key, .. }
         | Command::IncrBy(key, _)
         | Command::Expire(key, _)
@@ -1532,6 +1530,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Zinter { .. } => "ZINTER",
         Command::Zunion { .. } => "ZUNION",
         Command::Get(_) => "GET",
+        Command::Getex { .. } => "GETEX",
         Command::Set { .. } => "SET",
         Command::Mget(_) => "MGET",
         Command::Mset(_) => "MSET",
@@ -1610,6 +1609,8 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Echo(_) => "ECHO",
         Command::Type(_) => "TYPE",
         Command::Dbsize => "DBSIZE",
+        Command::Select(_) => "SELECT",
+        Command::Slowlog(_) => "SLOWLOG",
         Command::Flushdb => "FLUSHDB",
         Command::Flushall => "FLUSHALL",
         Command::Touch(_) => "TOUCH",
@@ -1694,7 +1695,8 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         | Command::CrdtGc(_) => "CRDT",
         Command::FunctionLoad { .. }
         | Command::FunctionList
-        | Command::FunctionDelete(_) => "FUNCTION",
+        | Command::FunctionDelete(_)
+        | Command::FunctionFlush => "FUNCTION",
         Command::Fcall { .. } => "FCALL",
         Command::JsonSet { .. }
         | Command::JsonGet { .. }
@@ -1769,6 +1771,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::MemcachedStats => "MEMCACHED_STATS",
         Command::MemcachedVersion => "MEMCACHED_VERSION",
         Command::MemcachedQuit => "MEMCACHED_QUIT",
+        Command::Debug => "DEBUG",
         Command::Unknown(_) => "UNKNOWN",
     }
 }
@@ -1857,6 +1860,26 @@ async fn execute_command(
             let val = router.get(key).await;
             match val {
                 Some(v) => {
+                    out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                    out.extend_from_slice(&v);
+                    out.extend_from_slice(b"\r\n");
+                }
+                None => {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+            }
+            false
+        }
+        Command::Getex { key, expire_in, persist } => {
+            record_client_read(router.port, client_id, key.as_ref());
+            let val = router.get(key.clone()).await;
+            match val {
+                Some(v) => {
+                    if persist {
+                        let _ = router.persist(key).await;
+                    } else if let Some(exp) = expire_in {
+                        let _ = router.expire(key, exp).await;
+                    }
                     out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
                     out.extend_from_slice(&v);
                     out.extend_from_slice(b"\r\n");
@@ -2582,6 +2605,9 @@ async fn execute_command(
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 ClientSubcommand::Caching(_) => {
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                ClientSubcommand::Kill(_) => {
                     out.extend_from_slice(b"+OK\r\n");
                 }
             }
@@ -3382,6 +3408,20 @@ async fn execute_command(
             out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
             false
         }
+        Command::Select(_) => {
+            out.extend_from_slice(b"+OK\r\n");
+            false
+        }
+        Command::Slowlog(sub) => {
+            if sub.eq_ignore_ascii_case(b"reset") {
+                out.extend_from_slice(b"+OK\r\n");
+            } else if sub.eq_ignore_ascii_case(b"len") {
+                out.extend_from_slice(b":0\r\n");
+            } else {
+                out.extend_from_slice(b"*0\r\n");
+            }
+            false
+        }
         Command::Flushdb | Command::Flushall => {
             router.flushdb().await;
             out.extend_from_slice(b"+OK\r\n");
@@ -3908,10 +3948,27 @@ async fn execute_command(
             out.extend_from_slice(b"+OK\r\n");
             false
         }
-        Command::Subscribe(_)
-        | Command::Unsubscribe(_)
-        | Command::Psubscribe(_)
-        | Command::Punsubscribe(_) => false,
+        Command::Subscribe(_) | Command::Psubscribe(_) => false,
+        Command::Unsubscribe(channels) => {
+            if channels.is_empty() {
+                out.extend_from_slice(b"*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:0\r\n");
+            } else {
+                for ch in channels {
+                    out.extend_from_slice(format!("*3\r\n$11\r\nunsubscribe\r\n${}\r\n{}\r\n:0\r\n", ch.len(), String::from_utf8_lossy(&ch)).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Punsubscribe(patterns) => {
+            if patterns.is_empty() {
+                out.extend_from_slice(b"*3\r\n$12\r\npunsubscribe\r\n$-1\r\n:0\r\n");
+            } else {
+                for pat in patterns {
+                    out.extend_from_slice(format!("*3\r\n$12\r\npunsubscribe\r\n${}\r\n{}\r\n:0\r\n", pat.len(), String::from_utf8_lossy(&pat)).as_bytes());
+                }
+            }
+            false
+        }
         Command::Publish { channel, message } => {
             let count = router.publish(channel, message).await;
             out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
@@ -4262,6 +4319,11 @@ async fn execute_command(
             }
             false
         }
+        Command::FunctionFlush => {
+            crate::scripting::flush_functions();
+            out.extend_from_slice(b"+OK\r\n");
+            false
+        }
         Command::FtCreate { index, on_type, prefixes, fields } => {
             let schema = crate::search::IndexSchema {
                 name: index,
@@ -4592,12 +4654,17 @@ async fn execute_command(
             out.extend_from_slice(resp.as_bytes());
             false
         }
+        Command::Debug => {
+            out.extend_from_slice(b"+OK\r\n");
+            false
+        }
     }
 }
 
 pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
     match cmd {
         Command::Get(key)
+        | Command::Getex { key, .. }
         | Command::Set { key, .. }
         | Command::IncrBy(key, _)
         | Command::Expire(key, _)
@@ -4833,6 +4900,23 @@ pub fn execute_local_command(
         Command::Get(key) => {
             match db.get(key) {
                 Some(v) => {
+                    write_resp_bulk(out, &v);
+                }
+                None => {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+            }
+            false
+        }
+        Command::Getex { key, expire_in, persist } => {
+            let val = db.get(key.as_ref());
+            match val {
+                Some(v) => {
+                    if *persist {
+                        db.persist(key.as_ref());
+                    } else if let Some(exp) = expire_in {
+                        db.expire(key.as_ref(), *exp);
+                    }
                     write_resp_bulk(out, &v);
                 }
                 None => {
@@ -5784,6 +5868,20 @@ pub fn execute_local_command(
         Command::Dbsize => {
             let n = db.dbsize();
             out.extend_from_slice(format!(":{}\r\n", n).as_bytes());
+            false
+        }
+        Command::Select(_) => {
+            out.extend_from_slice(b"+OK\r\n");
+            false
+        }
+        Command::Slowlog(sub) => {
+            if sub.eq_ignore_ascii_case(b"reset") {
+                out.extend_from_slice(b"+OK\r\n");
+            } else if sub.eq_ignore_ascii_case(b"len") {
+                out.extend_from_slice(b":0\r\n");
+            } else {
+                out.extend_from_slice(b"*0\r\n");
+            }
             false
         }
         Command::Flushdb | Command::Flushall => {
