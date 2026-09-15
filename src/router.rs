@@ -9,12 +9,11 @@ use crate::shard::{ShardDb, ShardMessage};
 /// Extracts the hash tag from a key if present (e.g. "{user:1}:profile" -> "user:1").
 #[inline]
 pub fn extract_hash_tag(key: &[u8]) -> &[u8] {
-    if let Some(open) = key.iter().position(|&b| b == b'{') {
-        if let Some(close) = key[open + 1..].iter().position(|&b| b == b'}') {
-            if close > 0 {
-                return &key[open + 1..open + 1 + close];
-            }
-        }
+    if let Some(open) = key.iter().position(|&b| b == b'{')
+        && let Some(close) = key[open + 1..].iter().position(|&b| b == b'}')
+        && close > 0
+    {
+        return &key[open + 1..open + 1 + close];
     }
     key
 }
@@ -23,7 +22,7 @@ pub fn extract_hash_tag(key: &[u8]) -> &[u8] {
 #[inline]
 pub fn key_slot(key: &[u8]) -> u16 {
     let tag = extract_hash_tag(key);
-    (crc16::State::<crc16::XMODEM>::calculate(tag) % 16384) as u16
+    crc16::State::<crc16::XMODEM>::calculate(tag) % 16384
 }
 
 /// Maps a slot (0..16383) to an owning shard (0..num_shards-1).
@@ -172,7 +171,8 @@ impl Router {
             return self.decommit_local(Some(key)) > 0;
         }
 
-        let (entry_data, val_type) = match self.local_db.borrow_mut().table.get_value_for_spill(key) {
+        let (entry_data, val_type) = match self.local_db.borrow_mut().table.get_value_for_spill(key)
+        {
             Some(p) => p,
             None => return false,
         };
@@ -188,15 +188,26 @@ impl Router {
             Err(_) => return false,
         };
 
-        let mut db = self.local_db.borrow_mut();
-        let stats = db.tier_manager.as_ref().map(|tm| tm.stats.clone());
-        if db.table.set_tiered_pointer(key, ptr) {
-            if let Some(stats) = stats {
-                stats.tiered_keys.fetch_add(1, Ordering::Relaxed);
-                stats.tiered_bytes.fetch_add(ptr.length as u64, Ordering::Relaxed);
-                stats.ram_saved_bytes.fetch_add(entry_data.len() as u64, Ordering::Relaxed);
+        let updated = {
+            let mut db = self.local_db.borrow_mut();
+            let stats = db.tier_manager.as_ref().map(|tm| tm.stats.clone());
+            if db.table.set_tiered_pointer(key, ptr) {
+                if let Some(stats) = stats {
+                    stats.tiered_keys.fetch_add(1, Ordering::Relaxed);
+                    stats
+                        .tiered_bytes
+                        .fetch_add(ptr.length as u64, Ordering::Relaxed);
+                    stats
+                        .ram_saved_bytes
+                        .fetch_add(entry_data.len() as u64, Ordering::Relaxed);
+                }
+                true
+            } else {
+                false
             }
-            drop(db);
+        };
+
+        if updated {
             if flush_bin {
                 let _ = tm.flush_active_bin().await;
             }
@@ -228,7 +239,9 @@ impl Router {
             Some(&tm.small_bins),
             ptr,
             &tm.stats,
-        ).await {
+        )
+        .await
+        {
             Ok(pair) => pair,
             Err(_) => return false,
         };
@@ -243,7 +256,9 @@ impl Router {
             tm.stats.total_fetches.fetch_add(1, Ordering::Relaxed);
             tm.stats.tiered_keys.fetch_sub(1, Ordering::Relaxed);
             tm.stats.cooled_keys.fetch_add(1, Ordering::Relaxed);
-            tm.stats.ram_saved_bytes.fetch_sub(val_payload.len() as u64, Ordering::Relaxed);
+            tm.stats
+                .ram_saved_bytes
+                .fetch_sub(val_payload.len() as u64, Ordering::Relaxed);
             true
         } else {
             false
@@ -260,7 +275,8 @@ impl Router {
             return false;
         }
 
-        let (entry_data, val_type) = match self.local_db.borrow_mut().table.get_value_for_spill(key) {
+        let (entry_data, val_type) = match self.local_db.borrow_mut().table.get_value_for_spill(key)
+        {
             Some(p) => p,
             None => return false,
         };
@@ -276,14 +292,23 @@ impl Router {
             Err(_) => return false,
         };
 
-        let mut db = self.local_db.borrow_mut();
-        let stats = db.tier_manager.as_ref().map(|tm| tm.stats.clone());
-        if db.table.set_cooled_pointer(key, ptr) {
-            if let Some(stats) = stats {
-                stats.cooled_keys.fetch_add(1, Ordering::Relaxed);
-                stats.tiered_bytes.fetch_add(ptr.length as u64, Ordering::Relaxed);
+        let updated = {
+            let mut db = self.local_db.borrow_mut();
+            let stats = db.tier_manager.as_ref().map(|tm| tm.stats.clone());
+            if db.table.set_cooled_pointer(key, ptr) {
+                if let Some(stats) = stats {
+                    stats.cooled_keys.fetch_add(1, Ordering::Relaxed);
+                    stats
+                        .tiered_bytes
+                        .fetch_add(ptr.length as u64, Ordering::Relaxed);
+                }
+                true
+            } else {
+                false
             }
-            drop(db);
+        };
+
+        if updated {
             let _ = tm.flush_active_bin().await;
             true
         } else {
@@ -304,11 +329,13 @@ impl Router {
             Some(&tm.small_bins),
             ptr,
             &tm.stats,
-        ).await.ok()?;
+        )
+        .await
+        .ok()?;
         let (val, _) = crate::table::RudisTable::deserialize_val_payload(&val_payload).ok()?;
         match val {
             crate::table::RudisValue::String(s) => Some(s),
-            crate::table::RudisValue::Int(n) => Some(Bytes::from(crate::table::RudisTable::format_i64(n))),
+            crate::table::RudisValue::Int(n) => Some(crate::table::RudisTable::format_i64(n)),
             _ => None,
         }
     }
@@ -322,10 +349,18 @@ impl Router {
 
         if let Some(k) = key {
             if let Some((_, freed)) = db.table.decommit_cooled_key(k) {
-                stats.cooled_keys.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                stats.tiered_keys.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                stats.ram_saved_bytes.fetch_add(freed as u64, std::sync::atomic::Ordering::Relaxed);
-                stats.decommit_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                stats
+                    .cooled_keys
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                stats
+                    .tiered_keys
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                stats
+                    .ram_saved_bytes
+                    .fetch_add(freed as u64, std::sync::atomic::Ordering::Relaxed);
+                stats
+                    .decommit_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 1
             } else {
                 0
@@ -333,10 +368,18 @@ impl Router {
         } else {
             let (count, freed) = db.table.decommit_all_cooled();
             if count > 0 {
-                stats.cooled_keys.fetch_sub(count as u64, std::sync::atomic::Ordering::Relaxed);
-                stats.tiered_keys.fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
-                stats.ram_saved_bytes.fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
-                stats.decommit_count.fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+                stats
+                    .cooled_keys
+                    .fetch_sub(count as u64, std::sync::atomic::Ordering::Relaxed);
+                stats
+                    .tiered_keys
+                    .fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+                stats
+                    .ram_saved_bytes
+                    .fetch_add(freed, std::sync::atomic::Ordering::Relaxed);
+                stats
+                    .decommit_count
+                    .fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
             }
             count
         }
@@ -516,11 +559,7 @@ impl Router {
 
     pub fn gc_local(&self) -> usize {
         let tm = self.local_db.borrow().tier_manager.clone();
-        if let Some(tm) = tm {
-            tm.run_gc()
-        } else {
-            0
-        }
+        if let Some(tm) = tm { tm.run_gc() } else { 0 }
     }
 
     pub async fn gc_all(&self) -> usize {
@@ -528,7 +567,10 @@ impl Router {
         for s in 0..self.num_shards {
             if s != self.shard_id {
                 let (tx, rx) = flume::bounded(1);
-                if self.senders[s].send(ShardMessage::TierGc { responder: tx }).is_ok() {
+                if self.senders[s]
+                    .send(ShardMessage::TierGc { responder: tx })
+                    .is_ok()
+                {
                     total += rx.recv_async().await.unwrap_or(0);
                 }
             }
@@ -536,7 +578,10 @@ impl Router {
         total
     }
 
-    pub async fn snapshot_local(&self, backup_dir: &std::path::Path) -> Result<(bool, u64), String> {
+    pub async fn snapshot_local(
+        &self,
+        backup_dir: &std::path::Path,
+    ) -> Result<(bool, u64), String> {
         let tm = self.local_db.borrow().tier_manager.clone();
         if let Some(tm) = tm {
             tm.snapshot(backup_dir).await.map_err(|e| e.to_string())
@@ -545,7 +590,10 @@ impl Router {
         }
     }
 
-    pub async fn tier_snapshot_all(&self, backup_dir: std::path::PathBuf) -> Result<(bool, u64, usize), String> {
+    pub async fn tier_snapshot_all(
+        &self,
+        backup_dir: std::path::PathBuf,
+    ) -> Result<(bool, u64, usize), String> {
         let (local_reflink, local_bytes) = self.snapshot_local(&backup_dir).await?;
         let mut total_bytes = local_bytes;
         let mut all_reflink = local_reflink;
@@ -554,10 +602,13 @@ impl Router {
         for s in 0..self.num_shards {
             if s != self.shard_id {
                 let (tx, rx) = flume::bounded(1);
-                if self.senders[s].send(ShardMessage::TierSnapshot {
-                    backup_dir: backup_dir.clone(),
-                    responder: tx,
-                }).is_ok() {
+                if self.senders[s]
+                    .send(ShardMessage::TierSnapshot {
+                        backup_dir: backup_dir.clone(),
+                        responder: tx,
+                    })
+                    .is_ok()
+                {
                     let res = rx.recv_async().await.map_err(|e| e.to_string())??;
                     total_bytes += res.1;
                     if !res.0 {
@@ -569,7 +620,6 @@ impl Router {
         }
         Ok((all_reflink, total_bytes, shard_count))
     }
-
 
     pub async fn get(&self, key: Bytes) -> Option<Bytes> {
         let target = target_shard(&key, self.num_shards);
@@ -642,8 +692,8 @@ impl Router {
             self.local_db
                 .borrow_mut()
                 .set(key.clone(), value.clone(), expire_in);
-            if let Some(aof) = &self.aof {
-                if let Some(bytes) = crate::aof::command_to_resp(&Command::Set {
+            if let Some(aof) = &self.aof
+                && let Some(bytes) = crate::aof::command_to_resp(&Command::Set {
                     key,
                     value,
                     expire_in,
@@ -651,9 +701,9 @@ impl Router {
                     get: false,
                     keepttl: false,
                     past_expired: false,
-                }) {
-                    aof.borrow_mut().append(&bytes);
-                }
+                })
+            {
+                aof.borrow_mut().append(&bytes);
             }
             let max_mem = crate::tiering::get_max_memory(self.port);
             if max_mem > 0 {
@@ -662,7 +712,9 @@ impl Router {
                 if used > shard_max_mem && !self.is_auto_tiering.get() {
                     let decommitted = self.decommit_local(None);
                     let used_after = self.local_db.borrow().table.used_memory;
-                    if (decommitted == 0 || used_after > shard_max_mem) && !self.is_auto_tiering.get() {
+                    if (decommitted == 0 || used_after > shard_max_mem)
+                        && !self.is_auto_tiering.get()
+                    {
                         let r = self.clone();
                         monoio::spawn(async move {
                             r.check_auto_tier().await;
@@ -688,12 +740,11 @@ impl Router {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
             let deleted = self.local_db.borrow_mut().del(&key);
-            if deleted {
-                if let Some(aof) = &self.aof {
-                    if let Some(bytes) = crate::aof::command_to_resp(&Command::Del(vec![key])) {
-                        aof.borrow_mut().append(&bytes);
-                    }
-                }
+            if deleted
+                && let Some(aof) = &self.aof
+                && let Some(bytes) = crate::aof::command_to_resp(&Command::Del(vec![key]))
+            {
+                aof.borrow_mut().append(&bytes);
             }
             deleted
         } else {
@@ -726,12 +777,11 @@ impl Router {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
             let res = self.local_db.borrow_mut().incr_by(key.clone(), delta);
-            if res.is_ok() {
-                if let Some(aof) = &self.aof {
-                    if let Some(bytes) = crate::aof::command_to_resp(&Command::IncrBy(key, delta)) {
-                        aof.borrow_mut().append(&bytes);
-                    }
-                }
+            if res.is_ok()
+                && let Some(aof) = &self.aof
+                && let Some(bytes) = crate::aof::command_to_resp(&Command::IncrBy(key, delta))
+            {
+                aof.borrow_mut().append(&bytes);
             }
             res
         } else {
@@ -755,14 +805,11 @@ impl Router {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
             let res = self.local_db.borrow_mut().expire(&key, duration);
-            if res {
-                if let Some(aof) = &self.aof {
-                    if let Some(bytes) =
-                        crate::aof::command_to_resp(&Command::Expire(key, duration))
-                    {
-                        aof.borrow_mut().append(&bytes);
-                    }
-                }
+            if res
+                && let Some(aof) = &self.aof
+                && let Some(bytes) = crate::aof::command_to_resp(&Command::Expire(key, duration))
+            {
+                aof.borrow_mut().append(&bytes);
             }
             res
         } else {
@@ -784,12 +831,11 @@ impl Router {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
             let res = self.local_db.borrow_mut().persist(&key);
-            if res {
-                if let Some(aof) = &self.aof {
-                    if let Some(bytes) = crate::aof::command_to_resp(&Command::Persist(key)) {
-                        aof.borrow_mut().append(&bytes);
-                    }
-                }
+            if res
+                && let Some(aof) = &self.aof
+                && let Some(bytes) = crate::aof::command_to_resp(&Command::Persist(key))
+            {
+                aof.borrow_mut().append(&bytes);
             }
             res
         } else {
@@ -984,8 +1030,14 @@ impl Router {
                         match op.to_uppercase().as_str() {
                             "IFEQ" => val == expected,
                             "IFNE" => val != expected,
-                            "IFDEQ" => crate::table::compute_digest(&val) == String::from_utf8_lossy(&expected),
-                            "IFDNE" => crate::table::compute_digest(&val) != String::from_utf8_lossy(&expected),
+                            "IFDEQ" => {
+                                crate::table::compute_digest(&val)
+                                    == String::from_utf8_lossy(&expected)
+                            }
+                            "IFDNE" => {
+                                crate::table::compute_digest(&val)
+                                    != String::from_utf8_lossy(&expected)
+                            }
                             "IFGT" => val > expected,
                             "IFLT" => val < expected,
                             _ => false,
@@ -995,11 +1047,7 @@ impl Router {
                     }
                 }
             };
-            if should_del {
-                db.del(&key)
-            } else {
-                false
-            }
+            if should_del { db.del(&key) } else { false }
         } else {
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::Delex {
@@ -1028,7 +1076,10 @@ impl Router {
             }
             let age = now.duration_since(client.connected_at).as_secs();
             let idle = now.duration_since(client.last_active).as_secs();
-            let is_blocked = crate::block::get_block_hub_for_port(self.port).lock().unwrap().is_blocked(client.id);
+            let is_blocked = crate::block::get_block_hub_for_port(self.port)
+                .lock()
+                .unwrap()
+                .is_blocked(client.id);
             let flags = if is_blocked { "b" } else { "N" };
             out.push_str(&format!(
                 "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=20448 argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem=0 omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name= lib-ver= io-thread=0 tot-net-in=0 tot-net-out=0 tot-cmds=0 read-events=0 avg-pipeline-len-sum=0 avg-pipeline-len-cnt=0\n",
@@ -1050,10 +1101,10 @@ impl Router {
                     filter_ids: filter_ids.to_vec(),
                     responder: tx,
                 };
-                if sender.send(msg).is_ok() {
-                    if let Ok(peer_list) = rx.recv_async().await {
-                        out.push_str(&peer_list);
-                    }
+                if sender.send(msg).is_ok()
+                    && let Ok(peer_list) = rx.recv_async().await
+                {
+                    out.push_str(&peer_list);
                 }
             }
         }
@@ -1068,12 +1119,11 @@ impl Router {
             responder: tx,
             is_resp3,
         };
-        if self.senders[target].send(msg).is_ok() {
-            if let Ok(mut res) = rx.recv_async().await {
-                if let Some((_, out)) = res.pop() {
-                    return out.into_vec();
-                }
-            }
+        if self.senders[target].send(msg).is_ok()
+            && let Ok(mut res) = rx.recv_async().await
+            && let Some((_, out)) = res.pop()
+        {
+            return out.into_vec();
         }
         b"-ERR internal shard routing error\r\n".to_vec()
     }
@@ -1083,13 +1133,11 @@ impl Router {
         for sid in 0..self.num_shards {
             if sid != self.shard_id {
                 let res = self.execute_remote(sid, Command::Dbsize).await;
-                if let Ok(s) = std::str::from_utf8(&res) {
-                    if let Some(num_str) = s.strip_prefix(':').and_then(|x| x.split("\r\n").next())
-                    {
-                        if let Ok(n) = num_str.parse::<usize>() {
-                            total += n;
-                        }
-                    }
+                if let Ok(s) = std::str::from_utf8(&res)
+                    && let Some(num_str) = s.strip_prefix(':').and_then(|x| x.split("\r\n").next())
+                    && let Ok(n) = num_str.parse::<usize>()
+                {
+                    total += n;
                 }
             }
         }
@@ -1098,10 +1146,10 @@ impl Router {
 
     pub async fn flushdb(&self) {
         self.local_db.borrow_mut().flushdb();
-        if let Some(aof) = &self.aof {
-            if let Some(bytes) = crate::aof::command_to_resp(&Command::Flushdb) {
-                aof.borrow_mut().append(&bytes);
-            }
+        if let Some(aof) = &self.aof
+            && let Some(bytes) = crate::aof::command_to_resp(&Command::Flushdb)
+        {
+            aof.borrow_mut().append(&bytes);
         }
         for sid in 0..self.num_shards {
             if sid != self.shard_id {
@@ -1293,10 +1341,12 @@ impl Router {
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
                 let (tx, rx) = flume::bounded(1);
-                if sender.send(ShardMessage::RandomKey { responder: tx }).is_ok() {
-                    if let Ok(Some(k)) = rx.recv_async().await {
-                        return Some(k);
-                    }
+                if sender
+                    .send(ShardMessage::RandomKey { responder: tx })
+                    .is_ok()
+                    && let Ok(Some(k)) = rx.recv_async().await
+                {
+                    return Some(k);
                 }
             }
         }
@@ -1377,7 +1427,9 @@ impl Router {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let _ = self.last_save_time.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
+            let _ =
+                self.last_save_time
+                    .compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
             self.last_save_time.load(Ordering::Relaxed)
         } else {
             ts
@@ -1385,7 +1437,11 @@ impl Router {
     }
 
     pub async fn save_rdb(&self) -> Result<(), String> {
-        if self.is_saving.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        if self
+            .is_saving
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             return Err("Background save already in progress".to_string());
         }
         self.sync_aof().await;
@@ -1393,7 +1449,11 @@ impl Router {
     }
 
     pub async fn bgsave(&self) -> Result<(), String> {
-        if self.is_saving.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+        if self
+            .is_saving
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
             return Err("Background save already in progress".to_string());
         }
         let router_clone = self.clone();
@@ -1417,7 +1477,10 @@ impl Router {
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
                 let (tx, rx) = flume::bounded(1);
-                if sender.send(ShardMessage::SaveRdbChunk { responder: tx }).is_ok() {
+                if sender
+                    .send(ShardMessage::SaveRdbChunk { responder: tx })
+                    .is_ok()
+                {
                     responders.push(rx);
                 }
             }
@@ -1473,10 +1536,7 @@ impl Router {
                 );
             } else {
                 let (tx, rx) = flume::bounded(1);
-                let msg = ShardMessage::ExecuteReplicaCmd {
-                    cmd,
-                    responder: tx,
-                };
+                let msg = ShardMessage::ExecuteReplicaCmd { cmd, responder: tx };
                 if self.senders[target].send(msg).is_ok() {
                     let _ = rx.recv_async().await;
                 }
@@ -1528,9 +1588,9 @@ impl Router {
         static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let tmp_id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let filename = self.db_dir.join("dump.rdb");
-        let tmp_filename = self
-            .db_dir
-            .join(format!("dump.rdb.tmp.{}_{}", std::process::id(), tmp_id));
+        let tmp_filename =
+            self.db_dir
+                .join(format!("dump.rdb.tmp.{}_{}", std::process::id(), tmp_id));
         let res = (|| -> Result<(), String> {
             use std::io::Write;
             let mut file = std::fs::File::create(&tmp_filename).map_err(|e| e.to_string())?;

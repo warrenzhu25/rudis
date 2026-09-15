@@ -36,10 +36,23 @@ pub fn get_allocator_stats() -> AllocatorStats {
 }
 
 /// Format memory section for INFO command.
-pub fn format_memory_info(used_mem: usize, max_mem: u64, cooled_keys: u64, tiered_keys: u64) -> String {
+pub fn format_memory_info(
+    used_mem: usize,
+    max_mem: u64,
+    cooled_keys: u64,
+    tiered_keys: u64,
+) -> String {
     let stats = get_allocator_stats();
-    let rss = if stats.resident > 0 { stats.resident } else { used_mem };
-    let frag = if stats.allocated > 0 { stats.fragmentation_ratio } else { 1.00 };
+    let rss = if stats.resident > 0 {
+        stats.resident
+    } else {
+        used_mem
+    };
+    let frag = if stats.allocated > 0 {
+        stats.fragmentation_ratio
+    } else {
+        1.00
+    };
 
     format!(
         "# Memory\r\n\

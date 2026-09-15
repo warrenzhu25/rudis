@@ -451,7 +451,7 @@ fn test_cluster_slot_migration_and_redirection() {
     assert_eq!(resp, "$6\r\nvalue1\r\n");
 
     // Non-existing key on migrating slot should return -ASK
-    let tagged_missing = format!("{{local_key}}missing");
+    let tagged_missing = "{local_key}missing".to_string();
     assert_eq!(
         rudis::router::key_slot(tagged_missing.as_bytes()),
         local_slot
@@ -1332,7 +1332,10 @@ fn test_keyspace_inspection_e2e() {
     assert_eq!(resp, "*0\r\n");
 
     // 2. Populate keys across multiple shards
-    assert_eq!(send_and_read(&mut stream, b"SET user:1 alice\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"SET user:1 alice\r\n"),
+        "+OK\r\n"
+    );
     assert_eq!(send_and_read(&mut stream, b"SET user:2 bob\r\n"), "+OK\r\n");
     assert_eq!(
         send_and_read(&mut stream, b"SET product:100 apple\r\n"),
@@ -1514,19 +1517,13 @@ fn test_transactions_multi_exec_e2e() {
     );
 
     let exec_resp = send_and_read(&mut stream, b"EXEC\r\n");
-    assert_eq!(
-        exec_resp,
-        "*4\r\n+OK\r\n:10\r\n:2\r\n$5\r\nmyval\r\n"
-    );
+    assert_eq!(exec_resp, "*4\r\n+OK\r\n:10\r\n:2\r\n$5\r\nmyval\r\n");
 
     assert_eq!(
         send_and_read(&mut stream, b"GET tx:counter\r\n"),
         "$2\r\n10\r\n"
     );
-    assert_eq!(
-        send_and_read(&mut stream, b"LLEN tx:list\r\n"),
-        ":2\r\n"
-    );
+    assert_eq!(send_and_read(&mut stream, b"LLEN tx:list\r\n"), ":2\r\n");
 
     // 4. Runtime error inside transaction (non-aborting, error returned as element in array)
     assert_eq!(send_and_read(&mut stream, b"MULTI\r\n"), "+OK\r\n");
@@ -1538,13 +1535,13 @@ fn test_transactions_multi_exec_e2e() {
         send_and_read(&mut stream, b"LPUSH tx:str world\r\n"),
         "+QUEUED\r\n"
     );
-    assert_eq!(
-        send_and_read(&mut stream, b"GET tx:str\r\n"),
-        "+QUEUED\r\n"
-    );
+    assert_eq!(send_and_read(&mut stream, b"GET tx:str\r\n"), "+QUEUED\r\n");
 
     let exec_resp = send_and_read(&mut stream, b"EXEC\r\n");
-    assert!(exec_resp.starts_with("*3\r\n+OK\r\n-ERR") || exec_resp.starts_with("*3\r\n+OK\r\n-WRONGTYPE"));
+    assert!(
+        exec_resp.starts_with("*3\r\n+OK\r\n-ERR")
+            || exec_resp.starts_with("*3\r\n+OK\r\n-WRONGTYPE")
+    );
     assert!(exec_resp.ends_with("$5\r\nhello\r\n"));
 
     // 5. Syntax error causing EXECABORT
@@ -1665,7 +1662,7 @@ fn test_vll_multi_shard_transactions_e2e() {
 #[test]
 fn test_bitmaps_and_hyperloglog_e2e() {
     let port = 16391;
-    let _server = start_test_server(port, 4);
+    start_test_server(port, 4);
 
     let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
 
@@ -1687,30 +1684,63 @@ fn test_bitmaps_and_hyperloglog_e2e() {
     // 2. BITCOUNT
     assert_eq!(send_and_read(&mut client, b"BITCOUNT mybm\r\n"), ":3\r\n");
     // Set offset 15 (byte 1, bit 7)
-    assert_eq!(send_and_read(&mut client, b"SETBIT mybm 15 1\r\n"), ":0\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"SETBIT mybm 15 1\r\n"),
+        ":0\r\n"
+    );
     assert_eq!(send_and_read(&mut client, b"BITCOUNT mybm\r\n"), ":4\r\n");
-    assert_eq!(send_and_read(&mut client, b"BITCOUNT mybm 0 0\r\n"), ":3\r\n");
-    assert_eq!(send_and_read(&mut client, b"BITCOUNT mybm 1 1\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"BITCOUNT mybm 0 0\r\n"),
+        ":3\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"BITCOUNT mybm 1 1\r\n"),
+        ":1\r\n"
+    );
 
     // 3. BITPOS
     assert_eq!(send_and_read(&mut client, b"BITPOS mybm 1\r\n"), ":1\r\n");
     assert_eq!(send_and_read(&mut client, b"BITPOS mybm 0\r\n"), ":0\r\n");
-    assert_eq!(send_and_read(&mut client, b"BITPOS mybm 1 1\r\n"), ":15\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"BITPOS mybm 1 1\r\n"),
+        ":15\r\n"
+    );
 
     // 4. BITOP (AND, OR, XOR, NOT) using same hashtag to guarantee same shard
     assert_eq!(send_and_read(&mut client, b"SET {t}k1 \x0f\r\n"), "+OK\r\n");
     assert_eq!(send_and_read(&mut client, b"SET {t}k2 \x33\r\n"), "+OK\r\n");
 
-    assert_eq!(send_and_read(&mut client, b"BITOP AND {t}and {t}k1 {t}k2\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut client, b"GET {t}and\r\n"), "$1\r\n\x03\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"BITOP AND {t}and {t}k1 {t}k2\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"GET {t}and\r\n"),
+        "$1\r\n\x03\r\n"
+    );
 
-    assert_eq!(send_and_read(&mut client, b"BITOP OR {t}or {t}k1 {t}k2\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut client, b"GET {t}or\r\n"), "$1\r\n\x3f\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"BITOP OR {t}or {t}k1 {t}k2\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"GET {t}or\r\n"),
+        "$1\r\n\x3f\r\n"
+    );
 
-    assert_eq!(send_and_read(&mut client, b"BITOP XOR {t}xor {t}k1 {t}k2\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut client, b"GET {t}xor\r\n"), "$1\r\n\x3c\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"BITOP XOR {t}xor {t}k1 {t}k2\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"GET {t}xor\r\n"),
+        "$1\r\n\x3c\r\n"
+    );
 
-    assert_eq!(send_and_read(&mut client, b"BITOP NOT {t}not {t}k1\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"BITOP NOT {t}not {t}k1\r\n"),
+        ":1\r\n"
+    );
     assert_eq!(
         send_and_read_bytes(&mut client, b"GET {t}not\r\n"),
         b"$1\r\n\xf0\r\n".to_vec()
@@ -1735,20 +1765,29 @@ fn test_bitmaps_and_hyperloglog_e2e() {
     assert_eq!(send_and_read(&mut client, b"PFCOUNT {h}2\r\n"), ":4\r\n");
 
     // Combined PFCOUNT across same shard keys
-    assert_eq!(send_and_read(&mut client, b"PFCOUNT {h}1 {h}2\r\n"), ":6\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"PFCOUNT {h}1 {h}2\r\n"),
+        ":6\r\n"
+    );
 
     // PFMERGE
-    assert_eq!(send_and_read(&mut client, b"PFMERGE {h}dest {h}1 {h}2\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"PFMERGE {h}dest {h}1 {h}2\r\n"),
+        "+OK\r\n"
+    );
     assert_eq!(send_and_read(&mut client, b"PFCOUNT {h}dest\r\n"), ":6\r\n");
 
     // TYPE of HLL returns string
-    assert_eq!(send_and_read(&mut client, b"TYPE {h}dest\r\n"), "+string\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"TYPE {h}dest\r\n"),
+        "+string\r\n"
+    );
 }
 
 #[test]
 fn test_dump_and_restore_e2e() {
     let port = 16394;
-    let _server = start_test_server(port, 4);
+    start_test_server(port, 4);
 
     let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
 
@@ -1756,7 +1795,10 @@ fn test_dump_and_restore_e2e() {
     assert_eq!(send_and_read(&mut client, b"DUMP non_exist\r\n"), "$-1\r\n");
 
     // 2. SET and DUMP string
-    assert_eq!(send_and_read(&mut client, b"SET mykey hello_world\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"SET mykey hello_world\r\n"),
+        "+OK\r\n"
+    );
     let dump_resp = send_and_read_bytes(&mut client, b"DUMP mykey\r\n");
     assert!(dump_resp.starts_with(b"$"));
 
@@ -1766,12 +1808,21 @@ fn test_dump_and_restore_e2e() {
 
     // 3. RESTORE to a new key
     let mut restore_cmd = Vec::new();
-    restore_cmd.extend_from_slice(format!("*4\r\n$7\r\nRESTORE\r\n$7\r\ncopykey\r\n$1\r\n0\r\n${}\r\n", payload.len()).as_bytes());
+    restore_cmd.extend_from_slice(
+        format!(
+            "*4\r\n$7\r\nRESTORE\r\n$7\r\ncopykey\r\n$1\r\n0\r\n${}\r\n",
+            payload.len()
+        )
+        .as_bytes(),
+    );
     restore_cmd.extend_from_slice(payload);
     restore_cmd.extend_from_slice(b"\r\n");
 
     assert_eq!(send_and_read(&mut client, &restore_cmd), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client, b"GET copykey\r\n"), "$11\r\nhello_world\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"GET copykey\r\n"),
+        "$11\r\nhello_world\r\n"
+    );
 
     // 4. RESTORE without REPLACE on existing key -> BUSYKEY error
     assert_eq!(
@@ -1781,19 +1832,34 @@ fn test_dump_and_restore_e2e() {
 
     // 5. RESTORE with REPLACE
     let mut restore_replace_cmd = Vec::new();
-    restore_replace_cmd.extend_from_slice(format!("*5\r\n$7\r\nRESTORE\r\n$7\r\ncopykey\r\n$1\r\n0\r\n${}\r\n", payload.len()).as_bytes());
+    restore_replace_cmd.extend_from_slice(
+        format!(
+            "*5\r\n$7\r\nRESTORE\r\n$7\r\ncopykey\r\n$1\r\n0\r\n${}\r\n",
+            payload.len()
+        )
+        .as_bytes(),
+    );
     restore_replace_cmd.extend_from_slice(payload);
     restore_replace_cmd.extend_from_slice(b"\r\n$7\r\nREPLACE\r\n");
 
     assert_eq!(send_and_read(&mut client, &restore_replace_cmd), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client, b"GET copykey\r\n"), "$11\r\nhello_world\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"GET copykey\r\n"),
+        "$11\r\nhello_world\r\n"
+    );
 
     // 6. Corrupt checksum
     let mut corrupt_cmd = Vec::new();
     let mut corrupt_payload = payload.to_vec();
     let last = corrupt_payload.len() - 1;
     corrupt_payload[last] ^= 0xFF;
-    corrupt_cmd.extend_from_slice(format!("*4\r\n$7\r\nRESTORE\r\n$9\r\ncorrupt_k\r\n$1\r\n0\r\n${}\r\n", corrupt_payload.len()).as_bytes());
+    corrupt_cmd.extend_from_slice(
+        format!(
+            "*4\r\n$7\r\nRESTORE\r\n$9\r\ncorrupt_k\r\n$1\r\n0\r\n${}\r\n",
+            corrupt_payload.len()
+        )
+        .as_bytes(),
+    );
     corrupt_cmd.extend_from_slice(&corrupt_payload);
     corrupt_cmd.extend_from_slice(b"\r\n");
 
@@ -1804,7 +1870,13 @@ fn test_dump_and_restore_e2e() {
 
     // 7. RESTORE with TTL (150ms)
     let mut restore_ttl_cmd = Vec::new();
-    restore_ttl_cmd.extend_from_slice(format!("*4\r\n$7\r\nRESTORE\r\n$6\r\nttlkey\r\n$3\r\n150\r\n${}\r\n", payload.len()).as_bytes());
+    restore_ttl_cmd.extend_from_slice(
+        format!(
+            "*4\r\n$7\r\nRESTORE\r\n$6\r\nttlkey\r\n$3\r\n150\r\n${}\r\n",
+            payload.len()
+        )
+        .as_bytes(),
+    );
     restore_ttl_cmd.extend_from_slice(payload);
     restore_ttl_cmd.extend_from_slice(b"\r\n");
 
@@ -1834,7 +1906,10 @@ fn test_streams_engine_e2e() {
     assert_eq!(r1, "$6\r\n1000-1\r\n");
 
     // 3. TYPE mystream -> "stream"
-    assert_eq!(send_and_read(&mut client, b"TYPE mystream\r\n"), "+stream\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"TYPE mystream\r\n"),
+        "+stream\r\n"
+    );
 
     // 4. Monotonicity validation: specified ID <= top item
     let r_err = send_and_read(&mut client, b"XADD mystream 1000-1 f v\r\n");
@@ -1882,7 +1957,10 @@ fn test_streams_engine_e2e() {
     assert_eq!(read_dollar, "$-1\r\n");
 
     // 11. XDEL
-    assert_eq!(send_and_read(&mut client, b"XDEL mystream 1000-2\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"XDEL mystream 1000-2\r\n"),
+        ":1\r\n"
+    );
     assert_eq!(send_and_read(&mut client, b"XLEN mystream\r\n"), ":2\r\n");
 
     // 12. XTRIM with MAXLEN
@@ -1891,7 +1969,10 @@ fn test_streams_engine_e2e() {
         let _ = send_and_read(&mut client, cmd.as_bytes());
     }
     assert_eq!(send_and_read(&mut client, b"XLEN mystream\r\n"), ":12\r\n");
-    assert_eq!(send_and_read(&mut client, b"XTRIM mystream MAXLEN = 5\r\n"), ":7\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"XTRIM mystream MAXLEN = 5\r\n"),
+        ":7\r\n"
+    );
     assert_eq!(send_and_read(&mut client, b"XLEN mystream\r\n"), ":5\r\n");
 
     // 13. DUMP & RESTORE of stream
@@ -1901,12 +1982,24 @@ fn test_streams_engine_e2e() {
     let payload = &dump_resp[crlf_pos + 2..dump_resp.len() - 2];
 
     let mut restore_cmd = Vec::new();
-    restore_cmd.extend_from_slice(format!("*4\r\n$7\r\nRESTORE\r\n$11\r\nstream_copy\r\n$1\r\n0\r\n${}\r\n", payload.len()).as_bytes());
+    restore_cmd.extend_from_slice(
+        format!(
+            "*4\r\n$7\r\nRESTORE\r\n$11\r\nstream_copy\r\n$1\r\n0\r\n${}\r\n",
+            payload.len()
+        )
+        .as_bytes(),
+    );
     restore_cmd.extend_from_slice(payload);
     restore_cmd.extend_from_slice(b"\r\n");
     assert_eq!(send_and_read(&mut client, &restore_cmd), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client, b"XLEN stream_copy\r\n"), ":5\r\n");
-    assert_eq!(send_and_read(&mut client, b"TYPE stream_copy\r\n"), "+stream\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"XLEN stream_copy\r\n"),
+        ":5\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"TYPE stream_copy\r\n"),
+        "+stream\r\n"
+    );
 }
 
 #[test]
@@ -1925,16 +2018,37 @@ fn test_rdb_snapshot_forkless_e2e() {
     let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
 
     // 1. Write various data types across shards
-    assert_eq!(send_and_read(&mut client, b"SET rdb_str hello_world\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client, b"SET rdb_int 12345\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client, b"HSET rdb_hash f1 v1 f2 v2\r\n"), ":2\r\n");
-    assert_eq!(send_and_read(&mut client, b"RPUSH rdb_list a b c\r\n"), ":3\r\n");
-    assert_eq!(send_and_read(&mut client, b"SADD rdb_set m1 m2\r\n"), ":2\r\n");
-    assert_eq!(send_and_read(&mut client, b"ZADD rdb_zset 10 one 20 two\r\n"), ":2\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"SET rdb_str hello_world\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"SET rdb_int 12345\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"HSET rdb_hash f1 v1 f2 v2\r\n"),
+        ":2\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"RPUSH rdb_list a b c\r\n"),
+        ":3\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"SADD rdb_set m1 m2\r\n"),
+        ":2\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"ZADD rdb_zset 10 one 20 two\r\n"),
+        ":2\r\n"
+    );
 
     // 2. Test LASTSAVE
     let lastsave_resp = send_and_read(&mut client, b"LASTSAVE\r\n");
-    assert!(lastsave_resp.starts_with(':'), "LASTSAVE should return integer timestamp");
+    assert!(
+        lastsave_resp.starts_with(':'),
+        "LASTSAVE should return integer timestamp"
+    );
 
     // 3. Test synchronous SAVE
     let save_resp = send_and_read(&mut client, b"SAVE\r\n");
@@ -1944,7 +2058,10 @@ fn test_rdb_snapshot_forkless_e2e() {
     let rdb_path = rdb_dir.join("dump.rdb");
     assert!(rdb_path.exists(), "dump.rdb should exist after SAVE");
     let content = std::fs::read(&rdb_path).unwrap();
-    assert!(content.starts_with(b"REDIS0011"), "RDB file should have REDIS0011 header");
+    assert!(
+        content.starts_with(b"REDIS0011"),
+        "RDB file should have REDIS0011 header"
+    );
 
     // 5. Test asynchronous BGSAVE
     let bgsave_resp = send_and_read(&mut client, b"BGSAVE\r\n");
@@ -1969,21 +2086,54 @@ fn test_memory_compact_encodings_e2e() {
     assert_eq!(send_and_read(&mut client, b"STRLEN count\r\n"), ":2\r\n");
 
     // INCRBY on inlined integer (mutated in place without allocation)
-    assert_eq!(send_and_read(&mut client, b"INCRBY count 10\r\n"), ":52\r\n");
-    assert_eq!(send_and_read(&mut client, b"INCRBY count -100\r\n"), ":-48\r\n");
-    assert_eq!(send_and_read(&mut client, b"GET count\r\n"), "$3\r\n-48\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"INCRBY count 10\r\n"),
+        ":52\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"INCRBY count -100\r\n"),
+        ":-48\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"GET count\r\n"),
+        "$3\r\n-48\r\n"
+    );
 
     // APPEND promotes inlined Int to String
-    assert_eq!(send_and_read(&mut client, b"APPEND count _extra\r\n"), ":9\r\n");
-    assert_eq!(send_and_read(&mut client, b"GET count\r\n"), "$9\r\n-48_extra\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"APPEND count _extra\r\n"),
+        ":9\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"GET count\r\n"),
+        "$9\r\n-48_extra\r\n"
+    );
 
     // 2. Small Hash flat vector representation (RudisValue::SmallHash)
-    assert_eq!(send_and_read(&mut client, b"HSET compact_hash a 1 b 2 c 3\r\n"), ":3\r\n");
-    assert_eq!(send_and_read(&mut client, b"HLEN compact_hash\r\n"), ":3\r\n");
-    assert_eq!(send_and_read(&mut client, b"HEXISTS compact_hash b\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut client, b"HGET compact_hash b\r\n"), "$1\r\n2\r\n");
-    assert_eq!(send_and_read(&mut client, b"HDEL compact_hash b\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut client, b"HLEN compact_hash\r\n"), ":2\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"HSET compact_hash a 1 b 2 c 3\r\n"),
+        ":3\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"HLEN compact_hash\r\n"),
+        ":3\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"HEXISTS compact_hash b\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"HGET compact_hash b\r\n"),
+        "$1\r\n2\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"HDEL compact_hash b\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"HLEN compact_hash\r\n"),
+        ":2\r\n"
+    );
 
     // Auto-promotion from SmallHash to full Hash when exceeding 64 keys
     let mut large_hset = String::from("HSET compact_hash");
@@ -1995,8 +2145,14 @@ fn test_memory_compact_encodings_e2e() {
     assert!(resp.starts_with(':'));
 
     // Should now be promoted to full Hash and readable
-    assert_eq!(send_and_read(&mut client, b"HLEN compact_hash\r\n"), ":72\r\n");
-    assert_eq!(send_and_read(&mut client, b"HGET compact_hash k50\r\n"), "$3\r\nv50\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"HLEN compact_hash\r\n"),
+        ":72\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"HGET compact_hash k50\r\n"),
+        "$3\r\nv50\r\n"
+    );
 }
 
 #[test]
@@ -2021,11 +2177,17 @@ fn test_streams_consumer_groups_e2e() {
 
     // Duplicate creation returns BUSYGROUP
     let dup_resp = send_and_read(&mut client, b"XGROUP CREATE stream_cg groupA $\r\n");
-    assert!(dup_resp.contains("BUSYGROUP"), "Duplicate group should return BUSYGROUP");
+    assert!(
+        dup_resp.contains("BUSYGROUP"),
+        "Duplicate group should return BUSYGROUP"
+    );
 
     // 3. Create consumer
     assert_eq!(
-        send_and_read(&mut client, b"XGROUP CREATECONSUMER stream_cg groupA worker1\r\n"),
+        send_and_read(
+            &mut client,
+            b"XGROUP CREATECONSUMER stream_cg groupA worker1\r\n"
+        ),
         ":1\r\n"
     );
 
@@ -2042,13 +2204,16 @@ fn test_streams_consumer_groups_e2e() {
     // 5. Read from group as consumer worker1
     let read_resp = send_and_read(
         &mut client,
-        b"XREADGROUP GROUP groupA worker1 COUNT 1 STREAMS stream_cg >\r\n"
+        b"XREADGROUP GROUP groupA worker1 COUNT 1 STREAMS stream_cg >\r\n",
     );
     assert!(read_resp.contains("1001-0"), "Should receive entry 1001-0");
 
     // 6. Inspect PEL using XPENDING summary
     let pending_summary = send_and_read(&mut client, b"XPENDING stream_cg groupA\r\n");
-    assert!(pending_summary.starts_with("*4\r\n:1\r\n"), "Summary should report 1 pending entry");
+    assert!(
+        pending_summary.starts_with("*4\r\n:1\r\n"),
+        "Summary should report 1 pending entry"
+    );
     assert!(pending_summary.contains("1001-0"));
     assert!(pending_summary.contains("worker1"));
 
@@ -2065,7 +2230,10 @@ fn test_streams_consumer_groups_e2e() {
 
     // 9. Confirm PEL is now 0
     let pending_after = send_and_read(&mut client, b"XPENDING stream_cg groupA\r\n");
-    assert!(pending_after.starts_with("*4\r\n:0\r\n"), "PEL should now be empty");
+    assert!(
+        pending_after.starts_with("*4\r\n:0\r\n"),
+        "PEL should now be empty"
+    );
 
     // 10. Destroy consumer group
     assert_eq!(
@@ -2102,8 +2270,14 @@ fn test_cluster_gossip_and_meet_e2e() {
 
     // 4. CLUSTER NODES shows local and met remote node
     let nodes = send_and_read(&mut client1, b"CLUSTER NODES\r\n");
-    assert!(nodes.contains("myself,master"), "Should show myself as master");
-    assert!(nodes.contains(&format!("127.0.0.1:{}", port2)), "Should list the met remote node");
+    assert!(
+        nodes.contains("myself,master"),
+        "Should show myself as master"
+    );
+    assert!(
+        nodes.contains(&format!("127.0.0.1:{}", port2)),
+        "Should list the met remote node"
+    );
 }
 
 #[test]
@@ -2122,12 +2296,30 @@ fn test_rdb_cold_start_restore_e2e() {
     let mut client1 = TcpStream::connect(("127.0.0.1", port1)).unwrap();
 
     // Populate keys across shards
-    assert_eq!(send_and_read(&mut client1, b"SET cold_str \"rudis_is_fast\"\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client1, b"SET cold_int 424242\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client1, b"HSET cold_hash name rudis speed maximum\r\n"), ":2\r\n");
-    assert_eq!(send_and_read(&mut client1, b"RPUSH cold_list alpha beta gamma\r\n"), ":3\r\n");
-    assert_eq!(send_and_read(&mut client1, b"SADD cold_set s1 s2 s3\r\n"), ":3\r\n");
-    assert_eq!(send_and_read(&mut client1, b"ZADD cold_zset 100 z1 200 z2\r\n"), ":2\r\n");
+    assert_eq!(
+        send_and_read(&mut client1, b"SET cold_str \"rudis_is_fast\"\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, b"SET cold_int 424242\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, b"HSET cold_hash name rudis speed maximum\r\n"),
+        ":2\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, b"RPUSH cold_list alpha beta gamma\r\n"),
+        ":3\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, b"SADD cold_set s1 s2 s3\r\n"),
+        ":3\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, b"ZADD cold_zset 100 z1 200 z2\r\n"),
+        ":2\r\n"
+    );
 
     // Save RDB snapshot
     assert_eq!(send_and_read(&mut client1, b"SAVE\r\n"), "+OK\r\n");
@@ -2149,14 +2341,32 @@ fn test_rdb_cold_start_restore_e2e() {
     let mut client2 = TcpStream::connect(("127.0.0.1", port2)).unwrap();
 
     // Verify all keys restored cleanly across shards
-    assert_eq!(send_and_read(&mut client2, b"GET cold_str\r\n"), "$15\r\n\"rudis_is_fast\"\r\n");
-    assert_eq!(send_and_read(&mut client2, b"GET cold_int\r\n"), "$6\r\n424242\r\n");
-    assert_eq!(send_and_read(&mut client2, b"HGET cold_hash name\r\n"), "$5\r\nrudis\r\n");
-    assert_eq!(send_and_read(&mut client2, b"HGET cold_hash speed\r\n"), "$7\r\nmaximum\r\n");
+    assert_eq!(
+        send_and_read(&mut client2, b"GET cold_str\r\n"),
+        "$15\r\n\"rudis_is_fast\"\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client2, b"GET cold_int\r\n"),
+        "$6\r\n424242\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client2, b"HGET cold_hash name\r\n"),
+        "$5\r\nrudis\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client2, b"HGET cold_hash speed\r\n"),
+        "$7\r\nmaximum\r\n"
+    );
     assert_eq!(send_and_read(&mut client2, b"LLEN cold_list\r\n"), ":3\r\n");
-    assert_eq!(send_and_read(&mut client2, b"LRANGE cold_list 0 -1\r\n"), "*3\r\n$5\r\nalpha\r\n$4\r\nbeta\r\n$5\r\ngamma\r\n");
+    assert_eq!(
+        send_and_read(&mut client2, b"LRANGE cold_list 0 -1\r\n"),
+        "*3\r\n$5\r\nalpha\r\n$4\r\nbeta\r\n$5\r\ngamma\r\n"
+    );
     assert_eq!(send_and_read(&mut client2, b"SCARD cold_set\r\n"), ":3\r\n");
-    assert_eq!(send_and_read(&mut client2, b"ZCARD cold_zset\r\n"), ":2\r\n");
+    assert_eq!(
+        send_and_read(&mut client2, b"ZCARD cold_zset\r\n"),
+        ":2\r\n"
+    );
 
     let _ = std::fs::remove_dir_all(&rdb_dir);
 }
@@ -2174,22 +2384,43 @@ fn test_cluster_migrate_slot_e2e() {
     // Write a key on server1
     let key = "migrated_key";
     let slot = rudis::router::key_slot(key.as_bytes());
-    assert_eq!(send_and_read(&mut client1, format!("SET {} \"transferred\"\r\n", key).as_bytes()), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client1, format!("GET {}\r\n", key).as_bytes()), "$13\r\n\"transferred\"\r\n");
+    assert_eq!(
+        send_and_read(
+            &mut client1,
+            format!("SET {} \"transferred\"\r\n", key).as_bytes()
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, format!("GET {}\r\n", key).as_bytes()),
+        "$13\r\n\"transferred\"\r\n"
+    );
 
     // Migrate this slot to server2
     let migrate_cmd = format!("CLUSTER MIGRATE-SLOT {} 127.0.0.1 {}\r\n", slot, port2);
-    assert_eq!(send_and_read(&mut client1, migrate_cmd.as_bytes()), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client1, migrate_cmd.as_bytes()),
+        "+OK\r\n"
+    );
 
     // Server 1 should now redirect with MOVED for this slot
     let moved_resp = send_and_read(&mut client1, format!("GET {}\r\n", key).as_bytes());
-    assert_eq!(moved_resp, format!("-MOVED {} 127.0.0.1:{}\r\n", slot, port2));
+    assert_eq!(
+        moved_resp,
+        format!("-MOVED {} 127.0.0.1:{}\r\n", slot, port2)
+    );
 
     // Server 2 should now have the key
-    assert_eq!(send_and_read(&mut client2, format!("GET {}\r\n", key).as_bytes()), "$13\r\n\"transferred\"\r\n");
+    assert_eq!(
+        send_and_read(&mut client2, format!("GET {}\r\n", key).as_bytes()),
+        "$13\r\n\"transferred\"\r\n"
+    );
 
     // Test CLUSTER REBALANCE
-    let rebal_resp = send_and_read(&mut client1, format!("CLUSTER REBALANCE 127.0.0.1 {} 2\r\n", port2).as_bytes());
+    let rebal_resp = send_and_read(
+        &mut client1,
+        format!("CLUSTER REBALANCE 127.0.0.1 {} 2\r\n", port2).as_bytes(),
+    );
     assert_eq!(rebal_resp, ":2\r\n");
 }
 
@@ -2199,10 +2430,15 @@ fn test_blocking_operations_e2e() {
     start_test_server(port, 2);
 
     let mut client1 = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    client1.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+    client1
+        .set_read_timeout(Some(Duration::from_secs(4)))
+        .unwrap();
 
     // 1. Immediate BLPOP and BRPOP
-    assert_eq!(send_and_read(&mut client1, b"RPUSH {t}:list a b c\r\n"), ":3\r\n");
+    assert_eq!(
+        send_and_read(&mut client1, b"RPUSH {t}:list a b c\r\n"),
+        ":3\r\n"
+    );
     let resp = send_and_read(&mut client1, b"BLPOP {t}:list 1\r\n");
     assert_eq!(resp, "*2\r\n$8\r\n{t}:list\r\n$1\r\na\r\n");
 
@@ -2210,7 +2446,10 @@ fn test_blocking_operations_e2e() {
     assert_eq!(resp, "*2\r\n$8\r\n{t}:list\r\n$1\r\nc\r\n");
 
     // Pop the remaining element 'b'
-    assert_eq!(send_and_read(&mut client1, b"LPOP {t}:list\r\n"), "$1\r\nb\r\n");
+    assert_eq!(
+        send_and_read(&mut client1, b"LPOP {t}:list\r\n"),
+        "$1\r\nb\r\n"
+    );
 
     // 2. BLPOP timeout on empty list
     let start = std::time::Instant::now();
@@ -2245,9 +2484,18 @@ fn test_multi_key_set_and_zset_e2e() {
     let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
 
     // 1. SET MULTI-KEY OPERATIONS
-    assert_eq!(send_and_read(&mut client, b"SADD {s}:1 a b c\r\n"), ":3\r\n");
-    assert_eq!(send_and_read(&mut client, b"SADD {s}:2 b c d\r\n"), ":3\r\n");
-    assert_eq!(send_and_read(&mut client, b"SADD {s}:3 c d e\r\n"), ":3\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"SADD {s}:1 a b c\r\n"),
+        ":3\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"SADD {s}:2 b c d\r\n"),
+        ":3\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"SADD {s}:3 c d e\r\n"),
+        ":3\r\n"
+    );
 
     // SINTER {s}:1 {s}:2 -> b, c (order independent check)
     let sinter_resp = send_and_read(&mut client, b"SINTER {s}:1 {s}:2\r\n");
@@ -2256,34 +2504,61 @@ fn test_multi_key_set_and_zset_e2e() {
     assert!(!sinter_resp.contains("$1\r\na\r\n"));
 
     // SDIFF {s}:1 {s}:2 -> a
-    assert_eq!(send_and_read(&mut client, b"SDIFF {s}:1 {s}:2\r\n"), "*1\r\n$1\r\na\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"SDIFF {s}:1 {s}:2\r\n"),
+        "*1\r\n$1\r\na\r\n"
+    );
 
     // SUNION {s}:1 {s}:2 -> a, b, c, d
     let sunion_resp = send_and_read(&mut client, b"SUNION {s}:1 {s}:2\r\n");
     assert_eq!(sunion_resp.lines().next().unwrap(), "*4");
 
     // SINTERSTORE
-    assert_eq!(send_and_read(&mut client, b"SINTERSTORE {s}:inter {s}:1 {s}:2\r\n"), ":2\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"SINTERSTORE {s}:inter {s}:1 {s}:2\r\n"),
+        ":2\r\n"
+    );
     assert_eq!(send_and_read(&mut client, b"SCARD {s}:inter\r\n"), ":2\r\n");
 
     // SUNIONSTORE
-    assert_eq!(send_and_read(&mut client, b"SUNIONSTORE {s}:union {s}:1 {s}:2\r\n"), ":4\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"SUNIONSTORE {s}:union {s}:1 {s}:2\r\n"),
+        ":4\r\n"
+    );
     assert_eq!(send_and_read(&mut client, b"SCARD {s}:union\r\n"), ":4\r\n");
 
     // SDIFFSTORE
-    assert_eq!(send_and_read(&mut client, b"SDIFFSTORE {s}:diff {s}:1 {s}:2\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut client, b"SMEMBERS {s}:diff\r\n"), "*1\r\n$1\r\na\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"SDIFFSTORE {s}:diff {s}:1 {s}:2\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"SMEMBERS {s}:diff\r\n"),
+        "*1\r\n$1\r\na\r\n"
+    );
 
     // 2. ZSET MULTI-KEY OPERATIONS
-    assert_eq!(send_and_read(&mut client, b"ZADD {z}:1 1.0 a 2.0 b 3.0 c\r\n"), ":3\r\n");
-    assert_eq!(send_and_read(&mut client, b"ZADD {z}:2 2.0 b 3.0 c 4.0 d\r\n"), ":3\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"ZADD {z}:1 1.0 a 2.0 b 3.0 c\r\n"),
+        ":3\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"ZADD {z}:2 2.0 b 3.0 c 4.0 d\r\n"),
+        ":3\r\n"
+    );
 
     // ZDIFF {z}:1 {z}:2 -> a
-    assert_eq!(send_and_read(&mut client, b"ZDIFF 2 {z}:1 {z}:2\r\n"), "*1\r\n$1\r\na\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"ZDIFF 2 {z}:1 {z}:2\r\n"),
+        "*1\r\n$1\r\na\r\n"
+    );
 
     // ZINTER {z}:1 {z}:2 WITHSCORES -> b:4, c:6
     let zinter_resp = send_and_read(&mut client, b"ZINTER 2 {z}:1 {z}:2 WITHSCORES\r\n");
-    assert_eq!(zinter_resp, "*4\r\n$1\r\nb\r\n$1\r\n4\r\n$1\r\nc\r\n$1\r\n6\r\n");
+    assert_eq!(
+        zinter_resp,
+        "*4\r\n$1\r\nb\r\n$1\r\n4\r\n$1\r\nc\r\n$1\r\n6\r\n"
+    );
 
     // ZUNION {z}:1 {z}:2 -> a, b, c, d
     let zunion_resp = send_and_read(&mut client, b"ZUNION 2 {z}:1 {z}:2\r\n");
@@ -2291,18 +2566,30 @@ fn test_multi_key_set_and_zset_e2e() {
 
     // ZUNIONSTORE with WEIGHTS and AGGREGATE MAX
     assert_eq!(
-        send_and_read(&mut client, b"ZUNIONSTORE {z}:out 2 {z}:1 {z}:2 WEIGHTS 2 3 AGGREGATE MAX\r\n"),
+        send_and_read(
+            &mut client,
+            b"ZUNIONSTORE {z}:out 2 {z}:1 {z}:2 WEIGHTS 2 3 AGGREGATE MAX\r\n"
+        ),
         ":4\r\n"
     );
     // c was (3.0*2=6 vs 3.0*3=9) -> MAX is 9.0
-    assert_eq!(send_and_read(&mut client, b"ZSCORE {z}:out c\r\n"), "$1\r\n9\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"ZSCORE {z}:out c\r\n"),
+        "$1\r\n9\r\n"
+    );
 
     // ZINTERSTORE
-    assert_eq!(send_and_read(&mut client, b"ZINTERSTORE {z}:inter 2 {z}:1 {z}:2\r\n"), ":2\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"ZINTERSTORE {z}:inter 2 {z}:1 {z}:2\r\n"),
+        ":2\r\n"
+    );
     assert_eq!(send_and_read(&mut client, b"ZCARD {z}:inter\r\n"), ":2\r\n");
 
     // ZDIFFSTORE
-    assert_eq!(send_and_read(&mut client, b"ZDIFFSTORE {z}:diff 2 {z}:1 {z}:2\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"ZDIFFSTORE {z}:diff 2 {z}:1 {z}:2\r\n"),
+        ":1\r\n"
+    );
     assert_eq!(send_and_read(&mut client, b"ZCARD {z}:diff\r\n"), ":1\r\n");
 }
 
@@ -2314,7 +2601,10 @@ fn test_auth_and_acl_e2e() {
     let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
 
     // 1. Check default user info
-    assert_eq!(send_and_read(&mut client, b"ACL WHOAMI\r\n"), "$7\r\ndefault\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"ACL WHOAMI\r\n"),
+        "$7\r\ndefault\r\n"
+    );
     let users = send_and_read(&mut client, b"ACL USERS\r\n");
     assert!(users.contains("$7\r\ndefault\r\n"));
 
@@ -2331,15 +2621,27 @@ fn test_auth_and_acl_e2e() {
     assert!(getuser.contains("$9\r\nsecret123\r\n"));
 
     // 3. Authenticate as alice
-    assert_eq!(send_and_read(&mut client, b"AUTH alice secret123\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client, b"ACL WHOAMI\r\n"), "$5\r\nalice\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"AUTH alice secret123\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"ACL WHOAMI\r\n"),
+        "$5\r\nalice\r\n"
+    );
 
     // Wrong password check
     assert!(send_and_read(&mut client, b"AUTH alice wrongpass\r\n").starts_with("-WRONGPASS"));
 
     // 4. Delete user alice
-    assert_eq!(send_and_read(&mut client, b"ACL DELUSER alice\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut client, b"ACL GETUSER alice\r\n"), "$-1\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"ACL DELUSER alice\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"ACL GETUSER alice\r\n"),
+        "$-1\r\n"
+    );
 
     // 5. Enforce password on default user and verify NOAUTH
     assert_eq!(
@@ -2353,7 +2655,10 @@ fn test_auth_and_acl_e2e() {
     assert_eq!(noauth_resp, "-NOAUTH Authentication required.\r\n");
 
     // Authenticate
-    assert_eq!(send_and_read(&mut new_client, b"AUTH default defpass\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut new_client, b"AUTH default defpass\r\n"),
+        "+OK\r\n"
+    );
     assert_eq!(send_and_read(&mut new_client, b"PING\r\n"), "+PONG\r\n");
 
     // Restore default user to nopass for subsequent tests
@@ -2420,7 +2725,11 @@ fn test_valkey_missing_features_e2e() {
     assert_eq!(smismember_resp, "*3\r\n:1\r\n:0\r\n:1\r\n");
 
     let srand_single = send_and_read(&mut client, b"SRANDMEMBER {s1}\r\n");
-    assert!(srand_single == "$1\r\na\r\n" || srand_single == "$1\r\nb\r\n" || srand_single == "$1\r\nc\r\n");
+    assert!(
+        srand_single == "$1\r\na\r\n"
+            || srand_single == "$1\r\nb\r\n"
+            || srand_single == "$1\r\nc\r\n"
+    );
 
     let srand_count = send_and_read(&mut client, b"SRANDMEMBER {s1} 2\r\n");
     assert_eq!(srand_count.lines().next().unwrap(), "*2");
@@ -2431,8 +2740,14 @@ fn test_valkey_missing_features_e2e() {
     // SMOVE same slot (using hash tags {s1})
     let smove_ok = send_and_read(&mut client, b"SMOVE {s1} {s1}_dst a\r\n");
     assert_eq!(smove_ok, ":1\r\n");
-    assert_eq!(send_and_read(&mut client, b"SISMEMBER {s1} a\r\n"), ":0\r\n");
-    assert_eq!(send_and_read(&mut client, b"SISMEMBER {s1}_dst a\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"SISMEMBER {s1} a\r\n"),
+        ":0\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"SISMEMBER {s1}_dst a\r\n"),
+        ":1\r\n"
+    );
 
     // SMOVE cross-slot error
     let smove_cross = send_and_read(&mut client, b"SMOVE {s1} cross_slot_dest b\r\n");
@@ -2493,7 +2808,10 @@ fn test_valkey_missing_features_e2e() {
     assert_eq!(blmove_immediate, "$3\r\none\r\n");
 
     // BLMOVE timeout
-    let blmove_timeout = send_and_read(&mut client, b"BLMOVE {empty_q} {empty_q}_dst LEFT RIGHT 0.1\r\n");
+    let blmove_timeout = send_and_read(
+        &mut client,
+        b"BLMOVE {empty_q} {empty_q}_dst LEFT RIGHT 0.1\r\n",
+    );
     assert_eq!(blmove_timeout, "$-1\r\n");
 
     // BLMOVE blocking cross-thread notification
@@ -2504,7 +2822,10 @@ fn test_valkey_missing_features_e2e() {
         send_and_read(&mut pusher, b"LPUSH {blmove_q} blocked_item\r\n");
     });
 
-    let blmove_blocked = send_and_read(&mut client, b"BLMOVE {blmove_q} {blmove_q}_dst LEFT RIGHT 2.0\r\n");
+    let blmove_blocked = send_and_read(
+        &mut client,
+        b"BLMOVE {blmove_q} {blmove_q}_dst LEFT RIGHT 2.0\r\n",
+    );
     assert_eq!(blmove_blocked, "$12\r\nblocked_item\r\n");
     let dest_pop = send_and_read(&mut client, b"RPOP {blmove_q}_dst\r\n");
     assert_eq!(dest_pop, "$12\r\nblocked_item\r\n");
@@ -2519,7 +2840,10 @@ fn test_valkey_missing_features_e2e() {
 
     let setrange_resp = send_and_read(&mut client, b"SETRANGE str1 6 world\r\n");
     assert_eq!(setrange_resp, ":12\r\n");
-    assert_eq!(send_and_read(&mut client, b"GET str1\r\n"), "$12\r\nhello_worldy\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"GET str1\r\n"),
+        "$12\r\nhello_worldy\r\n"
+    );
 
     send_and_read(&mut client, b"SET num 10.5\r\n");
     let incrbyfloat_resp = send_and_read(&mut client, b"INCRBYFLOAT num 2.25\r\n");
@@ -2531,8 +2855,8 @@ fn test_primary_replica_replication_e2e() {
     let master_port = 16420;
     let replica_port = 16421;
 
-    let _master = start_test_server(master_port, 2);
-    let _replica = start_test_server(replica_port, 2);
+    start_test_server(master_port, 2);
+    start_test_server(replica_port, 2);
 
     let mut master_client = TcpStream::connect(format!("127.0.0.1:{}", master_port)).unwrap();
     let mut replica_client = TcpStream::connect(format!("127.0.0.1:{}", replica_port)).unwrap();
@@ -2542,12 +2866,24 @@ fn test_primary_replica_replication_e2e() {
     assert!(master_role.starts_with("*3\r\n$6\r\nmaster\r\n"));
 
     // 2. Pre-populate data on master before replica connects
-    assert_eq!(send_and_read(&mut master_client, b"SET init_k1 val1\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut master_client, b"SET init_k2 val2\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut master_client, b"HSET myhash field1 hello\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut master_client, b"SET init_k1 val1\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut master_client, b"SET init_k2 val2\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut master_client, b"HSET myhash field1 hello\r\n"),
+        ":1\r\n"
+    );
 
     // 3. Initiate replication on replica (dispatches PSYNC to master)
-    let rep_resp = send_and_read(&mut replica_client, format!("REPLICAOF 127.0.0.1 {}\r\n", master_port).as_bytes());
+    let rep_resp = send_and_read(
+        &mut replica_client,
+        format!("REPLICAOF 127.0.0.1 {}\r\n", master_port).as_bytes(),
+    );
     assert_eq!(rep_resp, "+OK\r\n");
 
     // Wait for handshake, RDB snapshot generation, transfer, and restore
@@ -2555,45 +2891,97 @@ fn test_primary_replica_replication_e2e() {
 
     // 4. Verify replica role and link status
     let replica_role = send_and_read(&mut replica_client, b"ROLE\r\n");
-    assert!(replica_role.contains("slave"), "Expected slave role, got {}", replica_role);
-    assert!(replica_role.contains("connected"), "Expected connected state, got {}", replica_role);
+    assert!(
+        replica_role.contains("slave"),
+        "Expected slave role, got {}",
+        replica_role
+    );
+    assert!(
+        replica_role.contains("connected"),
+        "Expected connected state, got {}",
+        replica_role
+    );
 
     // 5. Verify pre-existing data was restored from RDB on replica
-    assert_eq!(send_and_read(&mut replica_client, b"GET init_k1\r\n"), "$4\r\nval1\r\n");
-    assert_eq!(send_and_read(&mut replica_client, b"GET init_k2\r\n"), "$4\r\nval2\r\n");
-    assert_eq!(send_and_read(&mut replica_client, b"HGET myhash field1\r\n"), "$5\r\nhello\r\n");
+    assert_eq!(
+        send_and_read(&mut replica_client, b"GET init_k1\r\n"),
+        "$4\r\nval1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut replica_client, b"GET init_k2\r\n"),
+        "$4\r\nval2\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut replica_client, b"HGET myhash field1\r\n"),
+        "$5\r\nhello\r\n"
+    );
 
     // 6. Test read-only replica enforcement
     let write_resp = send_and_read(&mut replica_client, b"SET forbidden_key write_val\r\n");
-    assert!(write_resp.contains("READONLY"), "Expected READONLY error, got: {}", write_resp);
+    assert!(
+        write_resp.contains("READONLY"),
+        "Expected READONLY error, got: {}",
+        write_resp
+    );
 
     // 7. Live streaming mutation replication
-    assert_eq!(send_and_read(&mut master_client, b"SET live_key live_val\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut master_client, b"INCRBY live_counter 42\r\n"), ":42\r\n");
-    assert_eq!(send_and_read(&mut master_client, b"RPUSH mylist itemA itemB\r\n"), ":2\r\n");
+    assert_eq!(
+        send_and_read(&mut master_client, b"SET live_key live_val\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut master_client, b"INCRBY live_counter 42\r\n"),
+        ":42\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut master_client, b"RPUSH mylist itemA itemB\r\n"),
+        ":2\r\n"
+    );
 
     // Wait for replication stream propagation
     thread::sleep(Duration::from_millis(150));
 
     // Verify replicated on replica
-    assert_eq!(send_and_read(&mut replica_client, b"GET live_key\r\n"), "$8\r\nlive_val\r\n");
-    assert_eq!(send_and_read(&mut replica_client, b"GET live_counter\r\n"), "$2\r\n42\r\n");
-    assert_eq!(send_and_read(&mut replica_client, b"LRANGE mylist 0 -1\r\n"), "*2\r\n$5\r\nitemA\r\n$5\r\nitemB\r\n");
+    assert_eq!(
+        send_and_read(&mut replica_client, b"GET live_key\r\n"),
+        "$8\r\nlive_val\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut replica_client, b"GET live_counter\r\n"),
+        "$2\r\n42\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut replica_client, b"LRANGE mylist 0 -1\r\n"),
+        "*2\r\n$5\r\nitemA\r\n$5\r\nitemB\r\n"
+    );
 
     // 8. Promotion via REPLICAOF NO ONE
-    assert_eq!(send_and_read(&mut replica_client, b"REPLICAOF NO ONE\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut replica_client, b"REPLICAOF NO ONE\r\n"),
+        "+OK\r\n"
+    );
     let promoted_role = send_and_read(&mut replica_client, b"ROLE\r\n");
-    assert!(promoted_role.starts_with("*3\r\n$6\r\nmaster\r\n"), "Expected master after promotion, got {}", promoted_role);
+    assert!(
+        promoted_role.starts_with("*3\r\n$6\r\nmaster\r\n"),
+        "Expected master after promotion, got {}",
+        promoted_role
+    );
 
     // Writes should now succeed on promoted node
-    assert_eq!(send_and_read(&mut replica_client, b"SET promoted_key promoted_value\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut replica_client, b"GET promoted_key\r\n"), "$14\r\npromoted_value\r\n");
+    assert_eq!(
+        send_and_read(&mut replica_client, b"SET promoted_key promoted_value\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut replica_client, b"GET promoted_key\r\n"),
+        "$14\r\npromoted_value\r\n"
+    );
 }
 
 #[test]
 fn test_lua_scripting_engine_e2e() {
     let port = 16430;
-    let _server = start_test_server(port, 2);
+    start_test_server(port, 2);
 
     let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
 
@@ -2606,81 +2994,125 @@ fn test_lua_scripting_engine_e2e() {
     }
 
     // 1. Primitive Return Values
-    assert_eq!(send_cmd(&mut client, &["EVAL", "return 42", "0"]), ":42\r\n");
-    assert_eq!(send_cmd(&mut client, &["EVAL", "return 'hello world'", "0"]), "$11\r\nhello world\r\n");
-    assert_eq!(send_cmd(&mut client, &["EVAL", "return true", "0"]), ":1\r\n");
-    assert_eq!(send_cmd(&mut client, &["EVAL", "return false", "0"]), "$-1\r\n");
-    assert_eq!(send_cmd(&mut client, &["EVAL", "return {10, 'rudis', false}", "0"]), "*3\r\n:10\r\n$5\r\nrudis\r\n$-1\r\n");
+    assert_eq!(
+        send_cmd(&mut client, &["EVAL", "return 42", "0"]),
+        ":42\r\n"
+    );
+    assert_eq!(
+        send_cmd(&mut client, &["EVAL", "return 'hello world'", "0"]),
+        "$11\r\nhello world\r\n"
+    );
+    assert_eq!(
+        send_cmd(&mut client, &["EVAL", "return true", "0"]),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_cmd(&mut client, &["EVAL", "return false", "0"]),
+        "$-1\r\n"
+    );
+    assert_eq!(
+        send_cmd(&mut client, &["EVAL", "return {10, 'rudis', false}", "0"]),
+        "*3\r\n:10\r\n$5\r\nrudis\r\n$-1\r\n"
+    );
 
     // 2. KEYS and ARGV Passing
-    let keys_argv_resp = send_cmd(&mut client, &[
-        "EVAL",
-        "return {KEYS[1], KEYS[2], ARGV[1], ARGV[2]}",
-        "2",
-        "keyA",
-        "keyB",
-        "val1",
-        "val2",
-    ]);
-    assert_eq!(keys_argv_resp, "*4\r\n$4\r\nkeyA\r\n$4\r\nkeyB\r\n$4\r\nval1\r\n$4\r\nval2\r\n");
+    let keys_argv_resp = send_cmd(
+        &mut client,
+        &[
+            "EVAL",
+            "return {KEYS[1], KEYS[2], ARGV[1], ARGV[2]}",
+            "2",
+            "keyA",
+            "keyB",
+            "val1",
+            "val2",
+        ],
+    );
+    assert_eq!(
+        keys_argv_resp,
+        "*4\r\n$4\r\nkeyA\r\n$4\r\nkeyB\r\n$4\r\nval1\r\n$4\r\nval2\r\n"
+    );
 
     // 3. redis.call SET and GET
-    let set_resp = send_cmd(&mut client, &[
-        "EVAL",
-        "return redis.call('SET', KEYS[1], ARGV[1])",
-        "1",
-        "lua_key",
-        "lua_val",
-    ]);
+    let set_resp = send_cmd(
+        &mut client,
+        &[
+            "EVAL",
+            "return redis.call('SET', KEYS[1], ARGV[1])",
+            "1",
+            "lua_key",
+            "lua_val",
+        ],
+    );
     assert_eq!(set_resp, "+OK\r\n");
 
-    let get_resp = send_cmd(&mut client, &[
-        "EVAL",
-        "return redis.call('GET', KEYS[1])",
-        "1",
-        "lua_key",
-    ]);
+    let get_resp = send_cmd(
+        &mut client,
+        &["EVAL", "return redis.call('GET', KEYS[1])", "1", "lua_key"],
+    );
     assert_eq!(get_resp, "$7\r\nlua_val\r\n");
 
     // Multiple operations and table inspection
-    let multi_resp = send_cmd(&mut client, &[
-        "EVAL",
-        "redis.call('SET', KEYS[1], ARGV[1]); return redis.call('INCRBY', KEYS[2], ARGV[2])",
-        "2",
-        "k_str",
-        "k_num",
-        "hello",
-        "50",
-    ]);
+    let multi_resp = send_cmd(
+        &mut client,
+        &[
+            "EVAL",
+            "redis.call('SET', KEYS[1], ARGV[1]); return redis.call('INCRBY', KEYS[2], ARGV[2])",
+            "2",
+            "k_str",
+            "k_num",
+            "hello",
+            "50",
+        ],
+    );
     assert_eq!(multi_resp, ":50\r\n");
 
     // 4. redis.pcall error handling
-    let pcall_resp = send_cmd(&mut client, &[
-        "EVAL",
-        "local res = redis.pcall('INCRBY', KEYS[1], 'not_a_num'); if res['err'] then return res['err'] else return 'ok' end",
-        "1",
-        "k_num",
-    ]);
-    assert!(pcall_resp.starts_with("$"), "Expected bulk string error returned from pcall, got {}", pcall_resp);
+    let pcall_resp = send_cmd(
+        &mut client,
+        &[
+            "EVAL",
+            "local res = redis.pcall('INCRBY', KEYS[1], 'not_a_num'); if res['err'] then return res['err'] else return 'ok' end",
+            "1",
+            "k_num",
+        ],
+    );
+    assert!(
+        pcall_resp.starts_with("$"),
+        "Expected bulk string error returned from pcall, got {}",
+        pcall_resp
+    );
     assert!(pcall_resp.contains("integer") || pcall_resp.contains("ERR"));
 
     // 5. redis.sha1hex helper
-    let sha_calc = send_cmd(&mut client, &[
-        "EVAL",
-        "return redis.sha1hex('test-string')",
-        "0",
-    ]);
+    let sha_calc = send_cmd(
+        &mut client,
+        &["EVAL", "return redis.sha1hex('test-string')", "0"],
+    );
     // sha1 of 'test-string' is 4f49d69613b186e71104c7ca1b26c1e5b78c9193
-    assert_eq!(sha_calc, "$40\r\n4f49d69613b186e71104c7ca1b26c1e5b78c9193\r\n");
+    assert_eq!(
+        sha_calc,
+        "$40\r\n4f49d69613b186e71104c7ca1b26c1e5b78c9193\r\n"
+    );
 
     // 6. SCRIPT LOAD, SCRIPT EXISTS, EVALSHA, SCRIPT FLUSH
     let script_code = "return redis.call('GET', KEYS[1])";
     let load_resp = send_cmd(&mut client, &["SCRIPT", "LOAD", script_code]);
     assert!(load_resp.starts_with("$40\r\n"));
-    let sha = load_resp.trim_start_matches("$40\r\n").trim_end_matches("\r\n");
+    let sha = load_resp
+        .trim_start_matches("$40\r\n")
+        .trim_end_matches("\r\n");
 
     // SCRIPT EXISTS
-    let exists_resp = send_cmd(&mut client, &["SCRIPT", "EXISTS", sha, "0000000000000000000000000000000000000000"]);
+    let exists_resp = send_cmd(
+        &mut client,
+        &[
+            "SCRIPT",
+            "EXISTS",
+            sha,
+            "0000000000000000000000000000000000000000",
+        ],
+    );
     assert_eq!(exists_resp, "*2\r\n:1\r\n:0\r\n");
 
     // EVALSHA execution
@@ -2696,7 +3128,11 @@ fn test_lua_scripting_engine_e2e() {
 
     // EVALSHA after flush should return NOSCRIPT error
     let evalsha_err = send_cmd(&mut client, &["EVALSHA", sha, "1", "k_str"]);
-    assert!(evalsha_err.starts_with("-NOSCRIPT"), "Expected -NOSCRIPT error, got {}", evalsha_err);
+    assert!(
+        evalsha_err.starts_with("-NOSCRIPT"),
+        "Expected -NOSCRIPT error, got {}",
+        evalsha_err
+    );
 }
 
 #[test]
@@ -2705,9 +3141,9 @@ fn test_cluster_bus_gossip_failover_e2e() {
     let port2 = 16441;
     let port3 = 16442;
 
-    let _s1 = start_test_server(port1, 2);
-    let _s2 = start_test_server(port2, 2);
-    let _s3 = start_test_server(port3, 2);
+    start_test_server(port1, 2);
+    start_test_server(port2, 2);
+    start_test_server(port3, 2);
 
     let mut c1 = TcpStream::connect(format!("127.0.0.1:{}", port1)).unwrap();
     let mut c2 = TcpStream::connect(format!("127.0.0.1:{}", port2)).unwrap();
@@ -2715,68 +3151,135 @@ fn test_cluster_bus_gossip_failover_e2e() {
 
     // 1. Verify Cluster Bus listeners on port + 10000 are active
     let bus_stream1 = TcpStream::connect(format!("127.0.0.1:{}", port1 + 10000));
-    assert!(bus_stream1.is_ok(), "Cluster bus on port {} should be listening", port1 + 10000);
+    assert!(
+        bus_stream1.is_ok(),
+        "Cluster bus on port {} should be listening",
+        port1 + 10000
+    );
     drop(bus_stream1);
 
     // 2. Initial CLUSTER MYID & INFO
     let myid1_resp = send_and_read(&mut c1, b"CLUSTER MYID\r\n");
-    let myid1 = myid1_resp.trim_start_matches('$').split("\r\n").nth(1).unwrap().to_string();
+    let myid1 = myid1_resp
+        .trim_start_matches('$')
+        .split("\r\n")
+        .nth(1)
+        .unwrap()
+        .to_string();
     assert_eq!(myid1.len(), 40);
 
     let myid2_resp = send_and_read(&mut c2, b"CLUSTER MYID\r\n");
-    let myid2 = myid2_resp.trim_start_matches('$').split("\r\n").nth(1).unwrap().to_string();
+    let myid2 = myid2_resp
+        .trim_start_matches('$')
+        .split("\r\n")
+        .nth(1)
+        .unwrap()
+        .to_string();
     assert_eq!(myid2.len(), 40);
 
     let myid3_resp = send_and_read(&mut c3, b"CLUSTER MYID\r\n");
-    let myid3 = myid3_resp.trim_start_matches('$').split("\r\n").nth(1).unwrap().to_string();
+    let myid3 = myid3_resp
+        .trim_start_matches('$')
+        .split("\r\n")
+        .nth(1)
+        .unwrap()
+        .to_string();
     assert_eq!(myid3.len(), 40);
 
     // 3. CLUSTER MEET: Node 1 meets Node 2, Node 2 meets Node 3
-    assert_eq!(send_and_read(&mut c1, format!("CLUSTER MEET 127.0.0.1 {}\r\n", port2).as_bytes()), "+OK\r\n");
-    assert_eq!(send_and_read(&mut c2, format!("CLUSTER MEET 127.0.0.1 {}\r\n", port3).as_bytes()), "+OK\r\n");
+    assert_eq!(
+        send_and_read(
+            &mut c1,
+            format!("CLUSTER MEET 127.0.0.1 {}\r\n", port2).as_bytes()
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut c2,
+            format!("CLUSTER MEET 127.0.0.1 {}\r\n", port3).as_bytes()
+        ),
+        "+OK\r\n"
+    );
 
     // Wait for cluster bus gossip heartbeats to propagate transitively
     thread::sleep(Duration::from_millis(1200));
 
     // Verify Node 1 cluster nodes shows cport (26440, 26441)
     let nodes1 = send_and_read(&mut c1, b"CLUSTER NODES\r\n");
-    assert!(nodes1.contains("myself,master"), "Node 1 should be myself,master");
-    assert!(nodes1.contains(&format!("127.0.0.1:{}@{}", port2, port2 + 10000)), "Node 1 should have met Node 2 with cport");
+    assert!(
+        nodes1.contains("myself,master"),
+        "Node 1 should be myself,master"
+    );
+    assert!(
+        nodes1.contains(&format!("127.0.0.1:{}@{}", port2, port2 + 10000)),
+        "Node 1 should have met Node 2 with cport"
+    );
 
     // Verify transitive gossip: Node 1 should discover Node 3
-    assert!(nodes1.contains(&myid3) || nodes1.contains(&format!("127.0.0.1:{}", port3)),
-        "Node 1 should discover Node 3 transitively through gossip! Nodes:\n{}", nodes1);
+    assert!(
+        nodes1.contains(&myid3) || nodes1.contains(&format!("127.0.0.1:{}", port3)),
+        "Node 1 should discover Node 3 transitively through gossip! Nodes:\n{}",
+        nodes1
+    );
 
     // 4. Test CLUSTER REPLICATE
-    let rep_resp = send_and_read(&mut c2, format!("CLUSTER REPLICATE {}\r\n", myid1).as_bytes());
+    let rep_resp = send_and_read(
+        &mut c2,
+        format!("CLUSTER REPLICATE {}\r\n", myid1).as_bytes(),
+    );
     assert_eq!(rep_resp, "+OK\r\n");
 
     let nodes2_after_rep = send_and_read(&mut c2, b"CLUSTER NODES\r\n");
-    assert!(nodes2_after_rep.contains("myself,slave"), "Node 2 should be myself,slave");
-    assert!(nodes2_after_rep.contains(&myid1), "Node 2 should list Node 1 as its master");
+    assert!(
+        nodes2_after_rep.contains("myself,slave"),
+        "Node 2 should be myself,slave"
+    );
+    assert!(
+        nodes2_after_rep.contains(&myid1),
+        "Node 2 should list Node 1 as its master"
+    );
 
     // 5. Test CLUSTER FAILOVER
     let failover_resp = send_and_read(&mut c2, b"CLUSTER FAILOVER\r\n");
     assert_eq!(failover_resp, "+OK\r\n");
 
     let nodes2_after_failover = send_and_read(&mut c2, b"CLUSTER NODES\r\n");
-    assert!(nodes2_after_failover.contains("myself,master"), "Node 2 should be promoted to myself,master after failover");
+    assert!(
+        nodes2_after_failover.contains("myself,master"),
+        "Node 2 should be promoted to myself,master after failover"
+    );
 
     let info2 = send_and_read(&mut c2, b"CLUSTER INFO\r\n");
     assert!(info2.contains("cluster_state:ok"));
-    assert!(info2.contains("cluster_current_epoch:2") || info2.contains("cluster_my_epoch:2"),
-        "Epoch should increment after failover. Info: {}", info2);
+    assert!(
+        info2.contains("cluster_current_epoch:2") || info2.contains("cluster_my_epoch:2"),
+        "Epoch should increment after failover. Info: {}",
+        info2
+    );
 
     // 6. Test CLUSTER FORGET
-    assert_eq!(send_and_read(&mut c1, format!("CLUSTER FORGET {}\r\n", myid3).as_bytes()), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut c1, format!("CLUSTER FORGET {}\r\n", myid3).as_bytes()),
+        "+OK\r\n"
+    );
     let nodes1_after_forget = send_and_read(&mut c1, b"CLUSTER NODES\r\n");
-    assert!(!nodes1_after_forget.contains(&myid3), "Node 3 should be forgotten from Node 1");
+    assert!(
+        !nodes1_after_forget.contains(&myid3),
+        "Node 3 should be forgotten from Node 1"
+    );
 
     // 7. Test CLUSTER RESET HARD
     assert_eq!(send_and_read(&mut c3, b"CLUSTER RESET HARD\r\n"), "+OK\r\n");
     let info3_reset = send_and_read(&mut c3, b"CLUSTER INFO\r\n");
-    assert!(info3_reset.contains("cluster_known_nodes:1"), "Reset node should only know itself");
-    assert!(info3_reset.contains("cluster_current_epoch:1"), "Current epoch should reset to 1");
+    assert!(
+        info3_reset.contains("cluster_known_nodes:1"),
+        "Reset node should only know itself"
+    );
+    assert!(
+        info3_reset.contains("cluster_current_epoch:1"),
+        "Current epoch should reset to 1"
+    );
 }
 
 #[test]
@@ -2799,11 +3302,17 @@ fn test_nvme_tiered_storage_e2e() {
     let val_256 = "A".repeat(256);
     let val_512 = "B".repeat(512);
     assert_eq!(
-        send_and_read(&mut client, format!("SET key:256 {}\r\n", val_256).as_bytes()),
+        send_and_read(
+            &mut client,
+            format!("SET key:256 {}\r\n", val_256).as_bytes()
+        ),
         "+OK\r\n"
     );
     assert_eq!(
-        send_and_read(&mut client, format!("SET key:512 {}\r\n", val_512).as_bytes()),
+        send_and_read(
+            &mut client,
+            format!("SET key:512 {}\r\n", val_512).as_bytes()
+        ),
         "+OK\r\n"
     );
 
@@ -2812,7 +3321,10 @@ fn test_nvme_tiered_storage_e2e() {
     assert_eq!(spill_resp, ":1\r\n");
 
     // Re-spilling already tiered key returns :0
-    assert_eq!(send_and_read(&mut client, b"TIER SPILL key:256\r\n"), ":0\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"TIER SPILL key:256\r\n"),
+        ":0\r\n"
+    );
 
     // 4. Verify stats after spill
     let info_after_spill = send_and_read(&mut client, b"TIER INFO\r\n");
@@ -2821,7 +3333,10 @@ fn test_nvme_tiered_storage_e2e() {
 
     // 5. EXISTS works on tiered key without disk retrieval
     assert_eq!(send_and_read(&mut client, b"EXISTS key:256\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut client, b"TYPE key:256\r\n"), "+string\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"TYPE key:256\r\n"),
+        "+string\r\n"
+    );
 
     // 6. Transparent async GET reads from NVMe via io_uring
     let get_resp = send_and_read(&mut client, b"GET key:256\r\n");
@@ -2836,7 +3351,10 @@ fn test_nvme_tiered_storage_e2e() {
     let load_resp = send_and_read(&mut client, b"TIER LOAD key:512\r\n");
     assert_eq!(load_resp, ":1\r\n");
     // Loading already-loaded key returns :0
-    assert_eq!(send_and_read(&mut client, b"TIER LOAD key:512\r\n"), ":0\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"TIER LOAD key:512\r\n"),
+        ":0\r\n"
+    );
     // Verify data intact
     let get_512 = send_and_read(&mut client, b"GET key:512\r\n");
     assert_eq!(get_512, format!("${}\r\n{}\r\n", val_512.len(), val_512));
@@ -2845,13 +3363,20 @@ fn test_nvme_tiered_storage_e2e() {
     for i in 0..10 {
         let val = format!("val_{}", i).repeat(20);
         assert_eq!(
-            send_and_read(&mut client, format!("SET item:{} {}\r\n", i, val).as_bytes()),
+            send_and_read(
+                &mut client,
+                format!("SET item:{} {}\r\n", i, val).as_bytes()
+            ),
             "+OK\r\n"
         );
     }
     let spillall_resp = send_and_read(&mut client, b"TIER SPILLALL\r\n");
     assert!(spillall_resp.starts_with(':'));
-    let count: i64 = spillall_resp.trim_start_matches(':').trim().parse().unwrap();
+    let count: i64 = spillall_resp
+        .trim_start_matches(':')
+        .trim()
+        .parse()
+        .unwrap();
     assert!(count >= 10);
 
     // Read back all keys from disk
@@ -2862,13 +3387,25 @@ fn test_nvme_tiered_storage_e2e() {
     }
 
     // 9. Mutate and Delete tiered keys
-    assert_eq!(send_and_read(&mut client, b"TIER SPILL item:0\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"TIER SPILL item:0\r\n"),
+        ":1\r\n"
+    );
     // Overwrite tiered key
-    assert_eq!(send_and_read(&mut client, b"SET item:0 new_overwritten_value\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client, b"GET item:0\r\n"), "$21\r\nnew_overwritten_value\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"SET item:0 new_overwritten_value\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"GET item:0\r\n"),
+        "$21\r\nnew_overwritten_value\r\n"
+    );
 
     // Delete tiered key
-    assert_eq!(send_and_read(&mut client, b"TIER SPILL item:1\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"TIER SPILL item:1\r\n"),
+        ":1\r\n"
+    );
     assert_eq!(send_and_read(&mut client, b"DEL item:1\r\n"), ":1\r\n");
     assert_eq!(send_and_read(&mut client, b"EXISTS item:1\r\n"), ":0\r\n");
     assert_eq!(send_and_read(&mut client, b"GET item:1\r\n"), "$-1\r\n");
@@ -2905,7 +3442,10 @@ fn test_auto_tiering_memory_pressure_e2e() {
     // 3. Test Three-State Value Lifecycle: Hot -> Cooled -> Cold -> Cooled
     let val_payload = "X".repeat(300);
     assert_eq!(
-        send_and_read(&mut client, format!("SET cool_key {}\r\n", val_payload).as_bytes()),
+        send_and_read(
+            &mut client,
+            format!("SET cool_key {}\r\n", val_payload).as_bytes()
+        ),
         "+OK\r\n"
     );
 
@@ -2919,7 +3459,10 @@ fn test_auto_tiering_memory_pressure_e2e() {
 
     // Reading Cooled key is an instant DRAM hit with ZERO disk reads!
     let get_cooled = send_and_read(&mut client, b"GET cool_key\r\n");
-    assert_eq!(get_cooled, format!("${}\r\n{}\r\n", val_payload.len(), val_payload));
+    assert_eq!(
+        get_cooled,
+        format!("${}\r\n{}\r\n", val_payload.len(), val_payload)
+    );
     let tier_info2 = send_and_read(&mut client, b"TIER INFO\r\n");
     assert!(tier_info2.contains("disk_reads:0"));
 
@@ -2935,7 +3478,10 @@ fn test_auto_tiering_memory_pressure_e2e() {
 
     // Reading Cold key fetches from disk via io_uring and promotes to Cooled!
     let get_cold = send_and_read(&mut client, b"GET cool_key\r\n");
-    assert_eq!(get_cold, format!("${}\r\n{}\r\n", val_payload.len(), val_payload));
+    assert_eq!(
+        get_cold,
+        format!("${}\r\n{}\r\n", val_payload.len(), val_payload)
+    );
     let tier_info4 = send_and_read(&mut client, b"TIER INFO\r\n");
     assert!(tier_info4.contains("disk_reads:1"));
     assert!(tier_info4.contains("cooled_keys:1"));
@@ -2943,7 +3489,10 @@ fn test_auto_tiering_memory_pressure_e2e() {
 
     // Subsequent read is again a fast zero-I/O DRAM hit!
     let get_again = send_and_read(&mut client, b"GET cool_key\r\n");
-    assert_eq!(get_again, format!("${}\r\n{}\r\n", val_payload.len(), val_payload));
+    assert_eq!(
+        get_again,
+        format!("${}\r\n{}\r\n", val_payload.len(), val_payload)
+    );
     let tier_info5 = send_and_read(&mut client, b"TIER INFO\r\n");
     assert!(tier_info5.contains("disk_reads:1")); // disk_reads did NOT increment!
 
@@ -2961,19 +3510,30 @@ fn test_auto_tiering_memory_pressure_e2e() {
         .lines()
         .find(|l| l.starts_with("used_memory:"))
         .unwrap();
-    let cur_used: u64 = used_mem_line.strip_prefix("used_memory:").unwrap().trim().parse().unwrap();
+    let cur_used: u64 = used_mem_line
+        .strip_prefix("used_memory:")
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
 
     // Set maxmemory just slightly above current used memory (+500 bytes)
     let limit = cur_used + 500;
     assert_eq!(
-        send_and_read(&mut client, format!("CONFIG SET maxmemory {}\r\n", limit).as_bytes()),
+        send_and_read(
+            &mut client,
+            format!("CONFIG SET maxmemory {}\r\n", limit).as_bytes()
+        ),
         "+OK\r\n"
     );
 
     // Insert multiple keys that will exceed the threshold
     for i in 0..10 {
         let val = "Z".repeat(200);
-        let resp = send_and_read(&mut client, format!("SET autotier:{} {}\r\n", i, val).as_bytes());
+        let resp = send_and_read(
+            &mut client,
+            format!("SET autotier:{} {}\r\n", i, val).as_bytes(),
+        );
         assert_eq!(resp, "+OK\r\n");
     }
 
@@ -3091,10 +3651,16 @@ fn test_tiered_storage_gc_and_hole_punching_e2e() {
     // 1. Spill a large key (>2KB)
     let large_val = "Z".repeat(3000);
     assert_eq!(
-        send_and_read(&mut client, format!("SET large_key {}\r\n", large_val).as_bytes()),
+        send_and_read(
+            &mut client,
+            format!("SET large_key {}\r\n", large_val).as_bytes()
+        ),
         "+OK\r\n"
     );
-    assert_eq!(send_and_read(&mut client, b"TIER SPILL large_key\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"TIER SPILL large_key\r\n"),
+        ":1\r\n"
+    );
 
     // 2. Delete the large key - should immediately punch hole in the physical NVMe storage!
     assert_eq!(send_and_read(&mut client, b"DEL large_key\r\n"), ":1\r\n");
@@ -3116,8 +3682,14 @@ fn test_option1_zero_copy_snapshots_e2e() {
     let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
 
     // 1. Write keys and spill one to tier
-    assert_eq!(send_and_read(&mut client, b"SET snap_key1 hello\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client, b"SET snap_key2 world\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"SET snap_key1 hello\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"SET snap_key2 world\r\n"),
+        "+OK\r\n"
+    );
     let spill_resp = send_and_read(&mut client, b"TIER SPILL snap_key1\r\n");
     assert_eq!(spill_resp, ":1\r\n");
 
@@ -3145,9 +3717,18 @@ fn test_option2_vector_search_hnsw_e2e() {
     let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
 
     // 1. Add vectors to HNSW index
-    assert_eq!(send_and_read(&mut client, b"VADD v_idx doc1 1.0 0.0 0.0\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client, b"VADD v_idx doc2 0.0 1.0 0.0\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client, b"VADD v_idx doc3 0.9 0.1 0.0\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"VADD v_idx doc1 1.0 0.0 0.0\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"VADD v_idx doc2 0.0 1.0 0.0\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"VADD v_idx doc3 0.9 0.1 0.0\r\n"),
+        "+OK\r\n"
+    );
 
     // 2. Query index info
     let info = send_and_read(&mut client, b"VINFO v_idx\r\n");
@@ -3181,7 +3762,9 @@ fn test_option3_modern_redis7_features_e2e() {
     let port = 16530;
     start_test_server(port, 2);
     let mut client1 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
-    client1.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    client1
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
 
     // 1. RESP3 Negotiation via HELLO 3
     let hello_resp = send_and_read(&mut client1, b"HELLO 3\r\n");
@@ -3191,14 +3774,20 @@ fn test_option3_modern_redis7_features_e2e() {
     assert!(hello_resp.contains("proto"));
 
     // 2. Client tracking & invalidation
-    assert_eq!(send_and_read(&mut client1, b"CLIENT TRACKING on\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client1, b"CLIENT TRACKING on\r\n"),
+        "+OK\r\n"
+    );
 
     // Client 1 reads a key to track it
     assert_eq!(send_and_read(&mut client1, b"GET track_k1\r\n"), "$-1\r\n");
 
     // Client 2 modifies track_k1
     let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
-    assert_eq!(send_and_read(&mut client2, b"SET track_k1 updated_val\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client2, b"SET track_k1 updated_val\r\n"),
+        "+OK\r\n"
+    );
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     // Client 1 should receive the invalidation message on next interaction or read
@@ -3212,7 +3801,11 @@ fn test_option3_modern_redis7_features_e2e() {
 
     // 3. Redis 7 Functions: FUNCTION LOAD and FCALL
     let func_code = "#!lua name=mathlib\nredis.register_function('add_nums', function(keys, args) return tonumber(args[1]) + tonumber(args[2]) end)\n";
-    let load_cmd = format!("*3\r\n$8\r\nFUNCTION\r\n$4\r\nLOAD\r\n${}\r\n{}\r\n", func_code.len(), func_code);
+    let load_cmd = format!(
+        "*3\r\n$8\r\nFUNCTION\r\n$4\r\nLOAD\r\n${}\r\n{}\r\n",
+        func_code.len(),
+        func_code
+    );
     let load_resp = send_and_read(&mut client2, load_cmd.as_bytes());
     assert_eq!(load_resp, "$7\r\nmathlib\r\n");
 
@@ -3227,7 +3820,10 @@ fn test_option3_modern_redis7_features_e2e() {
     assert!(list_resp.contains("add_nums"));
 
     // FUNCTION DELETE
-    assert_eq!(send_and_read(&mut client2, b"FUNCTION DELETE mathlib\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client2, b"FUNCTION DELETE mathlib\r\n"),
+        "+OK\r\n"
+    );
 }
 
 #[test]
@@ -3259,16 +3855,34 @@ fn test_crdt_multi_region_replication_and_gc_e2e() {
     // 1. LWW-Register on Node 1
     let set_resp = send_and_read(&mut client1, b"CRDT.SET geo_key region_us_east\r\n");
     assert!(set_resp.starts_with("+OK"));
-    assert_eq!(send_and_read(&mut client1, b"CRDT.GET geo_key\r\n"), "$14\r\nregion_us_east\r\n");
+    assert_eq!(
+        send_and_read(&mut client1, b"CRDT.GET geo_key\r\n"),
+        "$14\r\nregion_us_east\r\n"
+    );
 
     // 2. PN-Counters across both nodes
-    assert_eq!(send_and_read(&mut client1, b"CRDT.INCRBY user_counter 42\r\n"), ":42\r\n");
-    assert_eq!(send_and_read(&mut client2, b"CRDT.INCRBY user_counter 8\r\n"), ":8\r\n");
+    assert_eq!(
+        send_and_read(&mut client1, b"CRDT.INCRBY user_counter 42\r\n"),
+        ":42\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client2, b"CRDT.INCRBY user_counter 8\r\n"),
+        ":8\r\n"
+    );
 
     // 3. OR-Sets across both nodes
-    assert_eq!(send_and_read(&mut client1, b"CRDT.SADD active_tags tag_gaming\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut client1, b"CRDT.SADD active_tags tag_social\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut client2, b"CRDT.SADD active_tags tag_mobile\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut client1, b"CRDT.SADD active_tags tag_gaming\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, b"CRDT.SADD active_tags tag_social\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client2, b"CRDT.SADD active_tags tag_mobile\r\n"),
+        ":1\r\n"
+    );
 
     // 4. Cross-Region Replication: Dump Node 1 state and merge into Node 2
     let dump_bytes = send_and_read_bytes(&mut client1, b"CRDT.DUMP\r\n");
@@ -3278,23 +3892,36 @@ fn test_crdt_multi_region_replication_and_gc_e2e() {
     let payload = &dump_bytes[first_newline + 1..dump_bytes.len() - 2];
 
     let mut merge_cmd = Vec::new();
-    merge_cmd.extend_from_slice(format!("*2\r\n$10\r\nCRDT.MERGE\r\n${}\r\n", payload.len()).as_bytes());
+    merge_cmd
+        .extend_from_slice(format!("*2\r\n$10\r\nCRDT.MERGE\r\n${}\r\n", payload.len()).as_bytes());
     merge_cmd.extend_from_slice(payload);
     merge_cmd.extend_from_slice(b"\r\n");
     let merge_resp = send_and_read(&mut client2, &merge_cmd);
     assert!(merge_resp.starts_with(":"));
 
     // Verify converged state on Node 2
-    assert_eq!(send_and_read(&mut client2, b"CRDT.GET geo_key\r\n"), "$14\r\nregion_us_east\r\n");
-    assert_eq!(send_and_read(&mut client2, b"CRDT.INCRBY user_counter 0\r\n"), ":50\r\n"); // 42 + 8 = 50
+    assert_eq!(
+        send_and_read(&mut client2, b"CRDT.GET geo_key\r\n"),
+        "$14\r\nregion_us_east\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client2, b"CRDT.INCRBY user_counter 0\r\n"),
+        ":50\r\n"
+    ); // 42 + 8 = 50
     let members = send_and_read(&mut client2, b"CRDT.SMEMBERS active_tags\r\n");
     assert!(members.contains("tag_gaming"));
     assert!(members.contains("tag_social"));
     assert!(members.contains("tag_mobile"));
 
     // 5. Automated Tombstone TTL Garbage Collection
-    assert_eq!(send_and_read(&mut client1, b"CRDT.DEL geo_key\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut client1, b"CRDT.GET geo_key\r\n"), "$-1\r\n");
+    assert_eq!(
+        send_and_read(&mut client1, b"CRDT.DEL geo_key\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, b"CRDT.GET geo_key\r\n"),
+        "$-1\r\n"
+    );
     // Run CRDT.GC with 0ms cutoff to instantly reclaim tombstones
     let gc_resp = send_and_read(&mut client1, b"CRDT.GC 0\r\n");
     assert!(gc_resp.contains("registers_pruned"));
@@ -3309,15 +3936,24 @@ fn test_sq8_quantized_vector_and_rerank_e2e() {
 
     // 1. Ingest vectors with SQ8 quantization and tiered storage flag
     assert_eq!(
-        send_and_read(&mut client, b"VADD doc_sq8 docA 1.0 0.0 0.0 QUANTIZE TIERED\r\n"),
+        send_and_read(
+            &mut client,
+            b"VADD doc_sq8 docA 1.0 0.0 0.0 QUANTIZE TIERED\r\n"
+        ),
         "+OK\r\n"
     );
     assert_eq!(
-        send_and_read(&mut client, b"VADD doc_sq8 docB 0.0 1.0 0.0 QUANTIZE TIERED\r\n"),
+        send_and_read(
+            &mut client,
+            b"VADD doc_sq8 docB 0.0 1.0 0.0 QUANTIZE TIERED\r\n"
+        ),
         "+OK\r\n"
     );
     assert_eq!(
-        send_and_read(&mut client, b"VADD doc_sq8 docC 0.88 0.12 0.0 QUANTIZE TIERED\r\n"),
+        send_and_read(
+            &mut client,
+            b"VADD doc_sq8 docC 0.88 0.12 0.0 QUANTIZE TIERED\r\n"
+        ),
         "+OK\r\n"
     );
 
@@ -3337,7 +3973,8 @@ fn test_tls_in_memory_cert_and_ktls_e2e() {
     let (cert_der, key_der) = rudis::tls::generate_self_signed_cert(vec![
         "localhost".to_string(),
         "127.0.0.1".to_string(),
-    ]).expect("Failed to generate test self-signed cert");
+    ])
+    .expect("Failed to generate test self-signed cert");
     assert!(!cert_der.is_empty());
     assert!(!key_der.is_empty());
 
@@ -3353,60 +3990,97 @@ fn test_tls_in_memory_cert_and_ktls_e2e() {
 #[test]
 fn test_redis_json_engine_e2e() {
     let port = 16570;
-    let _server = start_test_server(port, 2);
+    start_test_server(port, 2);
     std::thread::sleep(Duration::from_millis(50));
 
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
 
     // 1. JSON.SET root
     let doc = r#"{"name":"Bob","age":28,"tags":["rust","io_uring"],"online":true}"#;
-    let set_cmd = format!("*4\r\n$8\r\nJSON.SET\r\n$6\r\nuser:1\r\n$1\r\n$\r\n${}\r\n{}\r\n", doc.len(), doc);
+    let set_cmd = format!(
+        "*4\r\n$8\r\nJSON.SET\r\n$6\r\nuser:1\r\n$1\r\n$\r\n${}\r\n{}\r\n",
+        doc.len(),
+        doc
+    );
     assert_eq!(send_and_read(&mut stream, set_cmd.as_bytes()), "+OK\r\n");
 
     // 2. JSON.GET root
-    let resp = send_and_read(&mut stream, b"*3\r\n$8\r\nJSON.GET\r\n$6\r\nuser:1\r\n$1\r\n$\r\n");
+    let resp = send_and_read(
+        &mut stream,
+        b"*3\r\n$8\r\nJSON.GET\r\n$6\r\nuser:1\r\n$1\r\n$\r\n",
+    );
     assert!(resp.contains("Bob"));
     assert!(resp.contains("io_uring"));
 
     // 3. JSON.GET path $.name
-    let resp = send_and_read(&mut stream, b"*3\r\n$8\r\nJSON.GET\r\n$6\r\nuser:1\r\n$6\r\n$.name\r\n");
+    let resp = send_and_read(
+        &mut stream,
+        b"*3\r\n$8\r\nJSON.GET\r\n$6\r\nuser:1\r\n$6\r\n$.name\r\n",
+    );
     assert!(resp.contains("\"Bob\""));
 
     // 4. JSON.TYPE
-    let resp = send_and_read(&mut stream, b"*3\r\n$9\r\nJSON.TYPE\r\n$6\r\nuser:1\r\n$6\r\n$.tags\r\n");
+    let resp = send_and_read(
+        &mut stream,
+        b"*3\r\n$9\r\nJSON.TYPE\r\n$6\r\nuser:1\r\n$6\r\n$.tags\r\n",
+    );
     assert_eq!(resp, "+array\r\n");
 
     // 5. JSON.NUMINCRBY
-    let resp = send_and_read(&mut stream, b"*4\r\n$14\r\nJSON.NUMINCRBY\r\n$6\r\nuser:1\r\n$5\r\n$.age\r\n$1\r\n2\r\n");
+    let resp = send_and_read(
+        &mut stream,
+        b"*4\r\n$14\r\nJSON.NUMINCRBY\r\n$6\r\nuser:1\r\n$5\r\n$.age\r\n$1\r\n2\r\n",
+    );
     assert!(resp.contains("30"));
 
     // 6. JSON.ARRAPPEND
-    let resp = send_and_read(&mut stream, b"*4\r\n$14\r\nJSON.ARRAPPEND\r\n$6\r\nuser:1\r\n$6\r\n$.tags\r\n$11\r\n\"high_perf\"\r\n");
+    let resp = send_and_read(
+        &mut stream,
+        b"*4\r\n$14\r\nJSON.ARRAPPEND\r\n$6\r\nuser:1\r\n$6\r\n$.tags\r\n$11\r\n\"high_perf\"\r\n",
+    );
     assert_eq!(resp, ":3\r\n");
 
     // 7. JSON.ARRLEN
-    let resp = send_and_read(&mut stream, b"*3\r\n$11\r\nJSON.ARRLEN\r\n$6\r\nuser:1\r\n$6\r\n$.tags\r\n");
+    let resp = send_and_read(
+        &mut stream,
+        b"*3\r\n$11\r\nJSON.ARRLEN\r\n$6\r\nuser:1\r\n$6\r\n$.tags\r\n",
+    );
     assert_eq!(resp, ":3\r\n");
 
     // 8. JSON.ARRPOP
-    let resp = send_and_read(&mut stream, b"*3\r\n$11\r\nJSON.ARRPOP\r\n$6\r\nuser:1\r\n$6\r\n$.tags\r\n");
+    let resp = send_and_read(
+        &mut stream,
+        b"*3\r\n$11\r\nJSON.ARRPOP\r\n$6\r\nuser:1\r\n$6\r\n$.tags\r\n",
+    );
     assert!(resp.contains("\"high_perf\""));
 
     // 9. JSON.TOGGLE
-    let resp = send_and_read(&mut stream, b"*3\r\n$11\r\nJSON.TOGGLE\r\n$6\r\nuser:1\r\n$8\r\n$.online\r\n");
+    let resp = send_and_read(
+        &mut stream,
+        b"*3\r\n$11\r\nJSON.TOGGLE\r\n$6\r\nuser:1\r\n$8\r\n$.online\r\n",
+    );
     assert!(resp.contains("false"));
 
     // 10. JSON.OBJKEYS
-    let resp = send_and_read(&mut stream, b"*3\r\n$12\r\nJSON.OBJKEYS\r\n$6\r\nuser:1\r\n$1\r\n$\r\n");
+    let resp = send_and_read(
+        &mut stream,
+        b"*3\r\n$12\r\nJSON.OBJKEYS\r\n$6\r\nuser:1\r\n$1\r\n$\r\n",
+    );
     assert!(resp.contains("name"));
     assert!(resp.contains("age"));
 
     // 11. JSON.OBJLEN
-    let resp = send_and_read(&mut stream, b"*3\r\n$11\r\nJSON.OBJLEN\r\n$6\r\nuser:1\r\n$1\r\n$\r\n");
+    let resp = send_and_read(
+        &mut stream,
+        b"*3\r\n$11\r\nJSON.OBJLEN\r\n$6\r\nuser:1\r\n$1\r\n$\r\n",
+    );
     assert_eq!(resp, ":4\r\n");
 
     // 12. JSON.DEL nested
-    let resp = send_and_read(&mut stream, b"*3\r\n$8\r\nJSON.DEL\r\n$6\r\nuser:1\r\n$8\r\n$.online\r\n");
+    let resp = send_and_read(
+        &mut stream,
+        b"*3\r\n$8\r\nJSON.DEL\r\n$6\r\nuser:1\r\n$8\r\n$.online\r\n",
+    );
     assert_eq!(resp, ":1\r\n");
 
     // 13. JSON.DEL root
@@ -3421,8 +4095,8 @@ fn test_redis_json_engine_e2e() {
 #[test]
 fn test_zero_copy_network_engine_e2e() {
     use rudis::zerocopy::{PAGE_SIZE, RegisteredBufferPool, ZeroCopyEngine, ZeroCopyStats};
-    use std::sync::atomic::Ordering;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     let stats = Arc::new(ZeroCopyStats::new());
     let mut pool = RegisteredBufferPool::new(8, PAGE_SIZE, stats.clone())
@@ -3470,14 +4144,26 @@ fn test_zero_copy_network_engine_e2e() {
 #[test]
 fn test_geospatial_engine_e2e() {
     let port = 16580;
-    let _server = start_test_server(port, 2);
+    start_test_server(port, 2);
     std::thread::sleep(Duration::from_millis(50));
 
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
 
     // 1. GEOADD
-    assert_eq!(send_and_read(&mut stream, b"GEOADD sicily 13.361389 38.115556 Palermo\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut stream, b"GEOADD sicily 15.087269 37.502669 Catania\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            b"GEOADD sicily 13.361389 38.115556 Palermo\r\n"
+        ),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            b"GEOADD sicily 15.087269 37.502669 Catania\r\n"
+        ),
+        ":1\r\n"
+    );
 
     // 2. GEODIST
     let dist_resp = send_and_read(&mut stream, b"GEODIST sicily Palermo Catania km\r\n");
@@ -3501,24 +4187,36 @@ fn test_geospatial_engine_e2e() {
     assert!(hash_resp.contains("$11\r\ntc26yj70z7h"));
 
     // 5. GEORADIUS with WITHDIST and WITHCOORD
-    let rad_resp = send_and_read(&mut stream, b"GEORADIUS sicily 15 37 200 km WITHDIST WITHCOORD\r\n");
+    let rad_resp = send_and_read(
+        &mut stream,
+        b"GEORADIUS sicily 15 37 200 km WITHDIST WITHCOORD\r\n",
+    );
     assert!(rad_resp.starts_with("*2\r\n"));
     assert!(rad_resp.contains("Palermo"));
     assert!(rad_resp.contains("Catania"));
 
     // 6. GEORADIUSBYMEMBER
-    let rad_member = send_and_read(&mut stream, b"GEORADIUSBYMEMBER sicily Palermo 100 km WITHDIST\r\n");
+    let rad_member = send_and_read(
+        &mut stream,
+        b"GEORADIUSBYMEMBER sicily Palermo 100 km WITHDIST\r\n",
+    );
     assert!(rad_member.contains("Palermo"));
     assert!(!rad_member.contains("Catania")); // Catania is > 166km away
 
     // 7. GEOSEARCH FROMLONLAT BYRADIUS
-    let search_resp = send_and_read(&mut stream, b"GEOSEARCH sicily FROMLONLAT 15 37 BYRADIUS 200 km ASC WITHDIST\r\n");
+    let search_resp = send_and_read(
+        &mut stream,
+        b"GEOSEARCH sicily FROMLONLAT 15 37 BYRADIUS 200 km ASC WITHDIST\r\n",
+    );
     let pos_catania = search_resp.find("Catania").unwrap();
     let pos_palermo = search_resp.find("Palermo").unwrap();
     assert!(pos_catania < pos_palermo); // ASC order: Catania closer to (15, 37) than Palermo
 
     // 8. GEOSEARCH FROMMEMBER BYBOX
-    let box_resp = send_and_read(&mut stream, b"GEOSEARCH sicily FROMMEMBER Palermo BYBOX 400 400 km\r\n");
+    let box_resp = send_and_read(
+        &mut stream,
+        b"GEOSEARCH sicily FROMMEMBER Palermo BYBOX 400 400 km\r\n",
+    );
     assert!(box_resp.contains("Palermo"));
     assert!(box_resp.contains("Catania"));
 }
@@ -3526,49 +4224,109 @@ fn test_geospatial_engine_e2e() {
 #[test]
 fn test_probabilistic_data_structures_e2e() {
     let port = 16590;
-    let _server = start_test_server(port, 2);
+    start_test_server(port, 2);
     std::thread::sleep(Duration::from_millis(50));
 
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
 
     // 1. Bloom Filter (BF.*)
-    assert_eq!(send_and_read(&mut stream, b"BF.RESERVE mybf 0.01 1000\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut stream, b"BF.RESERVE mybf 0.01 1000\r\n"), "-ERR item exists\r\n");
-    assert_eq!(send_and_read(&mut stream, b"BF.ADD mybf apple\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut stream, b"BF.ADD mybf apple\r\n"), ":0\r\n");
-    assert_eq!(send_and_read(&mut stream, b"BF.EXISTS mybf apple\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut stream, b"BF.EXISTS mybf orange\r\n"), ":0\r\n");
-    assert_eq!(send_and_read(&mut stream, b"BF.MADD mybf banana grape\r\n"), "*2\r\n:1\r\n:1\r\n");
-    assert_eq!(send_and_read(&mut stream, b"BF.MEXISTS mybf apple banana melon\r\n"), "*3\r\n:1\r\n:1\r\n:0\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"BF.RESERVE mybf 0.01 1000\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"BF.RESERVE mybf 0.01 1000\r\n"),
+        "-ERR item exists\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"BF.ADD mybf apple\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"BF.ADD mybf apple\r\n"),
+        ":0\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"BF.EXISTS mybf apple\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"BF.EXISTS mybf orange\r\n"),
+        ":0\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"BF.MADD mybf banana grape\r\n"),
+        "*2\r\n:1\r\n:1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"BF.MEXISTS mybf apple banana melon\r\n"),
+        "*3\r\n:1\r\n:1\r\n:0\r\n"
+    );
     let info = send_and_read(&mut stream, b"BF.INFO mybf\r\n");
     assert!(info.contains("Capacity"));
     assert!(info.contains("1000"));
 
     // 2. Cuckoo Filter (CF.*)
-    assert_eq!(send_and_read(&mut stream, b"CF.RESERVE mycf 1000\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut stream, b"CF.RESERVE mycf 1000\r\n"), "-ERR item exists\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"CF.RESERVE mycf 1000\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"CF.RESERVE mycf 1000\r\n"),
+        "-ERR item exists\r\n"
+    );
     assert_eq!(send_and_read(&mut stream, b"CF.ADD mycf foo\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut stream, b"CF.ADDNX mycf foo\r\n"), ":0\r\n");
-    assert_eq!(send_and_read(&mut stream, b"CF.ADDNX mycf bar\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut stream, b"CF.EXISTS mycf foo\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"CF.ADDNX mycf foo\r\n"),
+        ":0\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"CF.ADDNX mycf bar\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"CF.EXISTS mycf foo\r\n"),
+        ":1\r\n"
+    );
     assert_eq!(send_and_read(&mut stream, b"CF.DEL mycf foo\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut stream, b"CF.EXISTS mycf foo\r\n"), ":0\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"CF.EXISTS mycf foo\r\n"),
+        ":0\r\n"
+    );
     let cf_info = send_and_read(&mut stream, b"CF.INFO mycf\r\n");
     assert!(cf_info.contains("Number of buckets"));
 
     // 3. Count-Min Sketch (CMS.*)
-    assert_eq!(send_and_read(&mut stream, b"CMS.INITBYDIM mycms 200 5\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut stream, b"CMS.INCRBY mycms item1 42 item2 17\r\n"), "*2\r\n:42\r\n:17\r\n");
-    assert_eq!(send_and_read(&mut stream, b"CMS.QUERY mycms item1 item2 item3\r\n"), "*3\r\n:42\r\n:17\r\n:0\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"CMS.INITBYDIM mycms 200 5\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"CMS.INCRBY mycms item1 42 item2 17\r\n"),
+        "*2\r\n:42\r\n:17\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"CMS.QUERY mycms item1 item2 item3\r\n"),
+        "*3\r\n:42\r\n:17\r\n:0\r\n"
+    );
     let cms_info = send_and_read(&mut stream, b"CMS.INFO mycms\r\n");
     assert!(cms_info.contains("width"));
     assert!(cms_info.contains("depth"));
 
     // 4. Top-K (TOPK.*)
-    assert_eq!(send_and_read(&mut stream, b"TOPK.RESERVE mytopk 3\r\n"), "+OK\r\n");
-    let add_res = send_and_read(&mut stream, b"TOPK.ADD mytopk alpha alpha alpha beta beta gamma\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"TOPK.RESERVE mytopk 3\r\n"),
+        "+OK\r\n"
+    );
+    let add_res = send_and_read(
+        &mut stream,
+        b"TOPK.ADD mytopk alpha alpha alpha beta beta gamma\r\n",
+    );
     assert!(add_res.starts_with("*6\r\n"));
-    assert_eq!(send_and_read(&mut stream, b"TOPK.QUERY mytopk alpha beta gamma delta\r\n"), "*4\r\n:1\r\n:1\r\n:1\r\n:0\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"TOPK.QUERY mytopk alpha beta gamma delta\r\n"),
+        "*4\r\n:1\r\n:1\r\n:1\r\n:0\r\n"
+    );
     let topk_list = send_and_read(&mut stream, b"TOPK.LIST mytopk\r\n");
     assert!(topk_list.contains("alpha"));
     assert!(topk_list.contains("beta"));
@@ -3580,7 +4338,7 @@ fn test_probabilistic_data_structures_e2e() {
 #[test]
 fn test_product_quantization_adc_e2e() {
     let port = 16600;
-    let _server = start_test_server(port, 2);
+    start_test_server(port, 2);
     std::thread::sleep(Duration::from_millis(50));
 
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
@@ -3633,55 +4391,143 @@ fn test_cluster_bus_shards_and_automated_failover_e2e() {
 
     // 1. Cluster Slot Mutations: ADDSLOTS, DELSLOTS, ADDSLOTSRANGE, DELSLOTSRANGE
     // Node 1 clears all slots then adds 0..=8191
-    assert_eq!(send_and_read(&mut c1, b"CLUSTER DELSLOTSRANGE 0 16383\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut c1, b"CLUSTER ADDSLOTSRANGE 0 8191\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut c1, b"CLUSTER DELSLOTSRANGE 0 16383\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut c1, b"CLUSTER ADDSLOTSRANGE 0 8191\r\n"),
+        "+OK\r\n"
+    );
 
     // Test DELSLOTS and ADDSLOTS on Node 1
-    assert_eq!(send_and_read(&mut c1, b"CLUSTER DELSLOTS 100\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut c1, b"CLUSTER ADDSLOTS 100\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut c1, b"CLUSTER DELSLOTS 100\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut c1, b"CLUSTER ADDSLOTS 100\r\n"),
+        "+OK\r\n"
+    );
 
     // Node 2 clears all slots then adds 8192..=16383
-    assert_eq!(send_and_read(&mut c2, b"CLUSTER DELSLOTSRANGE 0 16383\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut c2, b"CLUSTER ADDSLOTSRANGE 8192 16383\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut c2, b"CLUSTER DELSLOTSRANGE 0 16383\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut c2, b"CLUSTER ADDSLOTSRANGE 8192 16383\r\n"),
+        "+OK\r\n"
+    );
 
     // Node 3 clears slots (will act as replica)
-    assert_eq!(send_and_read(&mut c3, b"CLUSTER DELSLOTSRANGE 0 16383\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut c3, b"CLUSTER DELSLOTSRANGE 0 16383\r\n"),
+        "+OK\r\n"
+    );
 
     // 2. Fetch Node IDs
     let myid1_resp = send_and_read(&mut c1, b"CLUSTER MYID\r\n");
-    let _myid1 = myid1_resp.trim_start_matches('$').split("\r\n").nth(1).unwrap().to_string();
+    let _myid1 = myid1_resp
+        .trim_start_matches('$')
+        .split("\r\n")
+        .nth(1)
+        .unwrap()
+        .to_string();
 
     let myid2_resp = send_and_read(&mut c2, b"CLUSTER MYID\r\n");
-    let myid2 = myid2_resp.trim_start_matches('$').split("\r\n").nth(1).unwrap().to_string();
+    let myid2 = myid2_resp
+        .trim_start_matches('$')
+        .split("\r\n")
+        .nth(1)
+        .unwrap()
+        .to_string();
 
     let myid3_resp = send_and_read(&mut c3, b"CLUSTER MYID\r\n");
-    let myid3 = myid3_resp.trim_start_matches('$').split("\r\n").nth(1).unwrap().to_string();
+    let myid3 = myid3_resp
+        .trim_start_matches('$')
+        .split("\r\n")
+        .nth(1)
+        .unwrap()
+        .to_string();
 
     // 3. CLUSTER MEET: Node 1 meets Node 2, Node 2 meets Node 3
-    assert_eq!(send_and_read(&mut c1, format!("CLUSTER MEET 127.0.0.1 {}\r\n", port2).as_bytes()), "+OK\r\n");
-    assert_eq!(send_and_read(&mut c2, format!("CLUSTER MEET 127.0.0.1 {}\r\n", port3).as_bytes()), "+OK\r\n");
+    assert_eq!(
+        send_and_read(
+            &mut c1,
+            format!("CLUSTER MEET 127.0.0.1 {}\r\n", port2).as_bytes()
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut c2,
+            format!("CLUSTER MEET 127.0.0.1 {}\r\n", port3).as_bytes()
+        ),
+        "+OK\r\n"
+    );
 
     // Wait for gossip tick & slot exchange over cluster bus
     thread::sleep(Duration::from_millis(1500));
 
     // 4. Test CLUSTER SLOTS introspection
     let slots_resp1 = send_and_read(&mut c1, b"CLUSTER SLOTS\r\n");
-    assert!(slots_resp1.contains(":0\r\n:8191\r\n"), "Node 1 should report range 0-8191. Resp: {}", slots_resp1);
-    assert!(slots_resp1.contains(":8192\r\n:16383\r\n"), "Node 1 should report peer range 8192-16383. Resp: {}", slots_resp1);
+    assert!(
+        slots_resp1.contains(":0\r\n:8191\r\n"),
+        "Node 1 should report range 0-8191. Resp: {}",
+        slots_resp1
+    );
+    assert!(
+        slots_resp1.contains(":8192\r\n:16383\r\n"),
+        "Node 1 should report peer range 8192-16383. Resp: {}",
+        slots_resp1
+    );
 
     // 5. Test CLUSTER SHARDS (Redis 7 specification)
     let shards_resp = send_and_read(&mut c1, b"CLUSTER SHARDS\r\n");
-    assert!(shards_resp.contains("slots"), "Shards output should contain 'slots'. Resp: {}", shards_resp);
-    assert!(shards_resp.contains("nodes"), "Shards output should contain 'nodes'. Resp: {}", shards_resp);
-    assert!(shards_resp.contains("endpoint"), "Shards output should contain 'endpoint'. Resp: {}", shards_resp);
-    assert!(shards_resp.contains("health"), "Shards output should contain 'health'. Resp: {}", shards_resp);
-    assert!(shards_resp.contains("online"), "Shards output should contain 'online'. Resp: {}", shards_resp);
+    assert!(
+        shards_resp.contains("slots"),
+        "Shards output should contain 'slots'. Resp: {}",
+        shards_resp
+    );
+    assert!(
+        shards_resp.contains("nodes"),
+        "Shards output should contain 'nodes'. Resp: {}",
+        shards_resp
+    );
+    assert!(
+        shards_resp.contains("endpoint"),
+        "Shards output should contain 'endpoint'. Resp: {}",
+        shards_resp
+    );
+    assert!(
+        shards_resp.contains("health"),
+        "Shards output should contain 'health'. Resp: {}",
+        shards_resp
+    );
+    assert!(
+        shards_resp.contains("online"),
+        "Shards output should contain 'online'. Resp: {}",
+        shards_resp
+    );
 
     // 6. Test CLUSTER LINKS telemetry
     let links_resp = send_and_read(&mut c1, b"CLUSTER LINKS\r\n");
-    assert!(links_resp.contains("direction"), "Links output should contain 'direction'. Resp: {}", links_resp);
-    assert!(links_resp.contains("to") || links_resp.contains("from"), "Links output should contain 'to' or 'from'. Resp: {}", links_resp);
-    assert!(links_resp.contains("events"), "Links output should contain 'events'. Resp: {}", links_resp);
+    assert!(
+        links_resp.contains("direction"),
+        "Links output should contain 'direction'. Resp: {}",
+        links_resp
+    );
+    assert!(
+        links_resp.contains("to") || links_resp.contains("from"),
+        "Links output should contain 'to' or 'from'. Resp: {}",
+        links_resp
+    );
+    assert!(
+        links_resp.contains("events"),
+        "Links output should contain 'events'. Resp: {}",
+        links_resp
+    );
 
     // 7. Test Dynamic -MOVED Redirection:
     let slot_foo = rudis::router::key_slot(b"foo");
@@ -3720,35 +4566,56 @@ fn test_cluster_bus_shards_and_automated_failover_e2e() {
     // 8. Test Consensus-based Failover:
     // Node 3 replicates Node 2
     assert_eq!(
-        send_and_read(&mut c3, format!("CLUSTER REPLICATE {}\r\n", myid2).as_bytes()),
+        send_and_read(
+            &mut c3,
+            format!("CLUSTER REPLICATE {}\r\n", myid2).as_bytes()
+        ),
         "+OK\r\n"
     );
 
     // Verify FAILOVER_AUTH_REQUEST vote handling directly on cluster bus
     let mut bus_client = TcpStream::connect(format!("127.0.0.1:{}", port1 + 10000)).unwrap();
     // First, request vote without master being failed -> should reject
-    bus_client.write_all(format!("FAILOVER_AUTH_REQUEST {} 10 {}\r\n", myid3, myid2).as_bytes()).unwrap();
+    bus_client
+        .write_all(format!("FAILOVER_AUTH_REQUEST {} 10 {}\r\n", myid3, myid2).as_bytes())
+        .unwrap();
     let mut vbuf = [0u8; 128];
     let n = bus_client.read(&mut vbuf).unwrap();
     let vote_resp = String::from_utf8_lossy(&vbuf[..n]);
-    assert!(vote_resp.contains("ERR vote rejected"), "Should reject vote if master is not failed");
+    assert!(
+        vote_resp.contains("ERR vote rejected"),
+        "Should reject vote if master is not failed"
+    );
 
     // Now mark Node 2 as fail on Node 1 via CLUSTER bus FAIL message
-    bus_client.write_all(format!("FAIL {}\r\n", myid2).as_bytes()).unwrap();
+    bus_client
+        .write_all(format!("FAIL {}\r\n", myid2).as_bytes())
+        .unwrap();
     let n = bus_client.read(&mut vbuf).unwrap();
     assert_eq!(&vbuf[..n], b"+OK\r\n");
 
     // Now request vote again with epoch 11 -> should grant ACK!
-    bus_client.write_all(format!("FAILOVER_AUTH_REQUEST {} 11 {}\r\n", myid3, myid2).as_bytes()).unwrap();
+    bus_client
+        .write_all(format!("FAILOVER_AUTH_REQUEST {} 11 {}\r\n", myid3, myid2).as_bytes())
+        .unwrap();
     let n = bus_client.read(&mut vbuf).unwrap();
     let vote_ack = String::from_utf8_lossy(&vbuf[..n]);
-    assert!(vote_ack.starts_with("+FAILOVER_AUTH_ACK"), "Master Node 1 should grant vote ACK to Node 3. Resp: {}", vote_ack);
+    assert!(
+        vote_ack.starts_with("+FAILOVER_AUTH_ACK"),
+        "Master Node 1 should grant vote ACK to Node 3. Resp: {}",
+        vote_ack
+    );
 
     // Duplicate vote in same epoch should be rejected
-    bus_client.write_all(format!("FAILOVER_AUTH_REQUEST {} 11 {}\r\n", myid3, myid2).as_bytes()).unwrap();
+    bus_client
+        .write_all(format!("FAILOVER_AUTH_REQUEST {} 11 {}\r\n", myid3, myid2).as_bytes())
+        .unwrap();
     let n = bus_client.read(&mut vbuf).unwrap();
     let dup_vote = String::from_utf8_lossy(&vbuf[..n]);
-    assert!(dup_vote.contains("ERR vote rejected"), "Duplicate vote in same epoch should be rejected");
+    assert!(
+        dup_vote.contains("ERR vote rejected"),
+        "Duplicate vote in same epoch should be rejected"
+    );
 
     // Trigger failover on Node 3
     assert_eq!(send_and_read(&mut c3, b"CLUSTER FAILOVER\r\n"), "+OK\r\n");
@@ -3756,7 +4623,11 @@ fn test_cluster_bus_shards_and_automated_failover_e2e() {
 
     // Verify Node 3 is now master with config epoch updated
     let nodes3 = send_and_read(&mut c3, b"CLUSTER NODES\r\n");
-    assert!(nodes3.contains("myself,master"), "Node 3 should be promoted to myself,master. Nodes:\n{}", nodes3);
+    assert!(
+        nodes3.contains("myself,master"),
+        "Node 3 should be promoted to myself,master. Nodes:\n{}",
+        nodes3
+    );
 }
 
 #[test]
@@ -3776,7 +4647,7 @@ fn test_redisearch_fulltext_and_hybrid_vector_e2e() {
     // 2. Duplicate index creation should fail
     let dup_resp = send_and_read(
         &mut client,
-        b"FT.CREATE idx:books ON HASH PREFIX 1 book: SCHEMA title TEXT\r\n"
+        b"FT.CREATE idx:books ON HASH PREFIX 1 book: SCHEMA title TEXT\r\n",
     );
     assert!(dup_resp.contains("ERR Index already exists"));
 
@@ -3796,38 +4667,85 @@ fn test_redisearch_fulltext_and_hybrid_vector_e2e() {
     assert_eq!(send_and_read(&mut client, hset3), ":4\r\n");
 
     // 5. Query 1: Keyword search for "Rust" (matches book:1 and book:2)
-    let search1 = send_and_read(&mut client, b"*3\r\n$9\r\nFT.SEARCH\r\n$9\r\nidx:books\r\n$4\r\nRust\r\n");
-    assert!(search1.starts_with("*5\r\n:2\r\n"), "Search 'Rust' should return 2 hits. Resp: {}", search1);
+    let search1 = send_and_read(
+        &mut client,
+        b"*3\r\n$9\r\nFT.SEARCH\r\n$9\r\nidx:books\r\n$4\r\nRust\r\n",
+    );
+    assert!(
+        search1.starts_with("*5\r\n:2\r\n"),
+        "Search 'Rust' should return 2 hits. Resp: {}",
+        search1
+    );
     assert!(search1.contains("book:1"));
     assert!(search1.contains("book:2"));
 
     // 6. Query 2: Keyword search for "Data-Intensive" (matches book:3)
-    let search2 = send_and_read(&mut client, b"*3\r\n$9\r\nFT.SEARCH\r\n$9\r\nidx:books\r\n$14\r\nData-Intensive\r\n");
-    assert!(search2.starts_with("*3\r\n:1\r\n"), "Search 'Data-Intensive' should return 1 hit. Resp: {}", search2);
+    let search2 = send_and_read(
+        &mut client,
+        b"*3\r\n$9\r\nFT.SEARCH\r\n$9\r\nidx:books\r\n$14\r\nData-Intensive\r\n",
+    );
+    assert!(
+        search2.starts_with("*3\r\n:1\r\n"),
+        "Search 'Data-Intensive' should return 1 hit. Resp: {}",
+        search2
+    );
     assert!(search2.contains("book:3"));
 
     // 7. Query 3: Numeric range query: @price:[40 50] (matches book:1 with price 45.0)
-    let search3 = send_and_read(&mut client, b"*3\r\n$9\r\nFT.SEARCH\r\n$9\r\nidx:books\r\n$14\r\n@price:[40 50]\r\n");
-    assert!(search3.starts_with("*3\r\n:1\r\n"), "Range query should return 1 hit. Resp: {}", search3);
+    let search3 = send_and_read(
+        &mut client,
+        b"*3\r\n$9\r\nFT.SEARCH\r\n$9\r\nidx:books\r\n$14\r\n@price:[40 50]\r\n",
+    );
+    assert!(
+        search3.starts_with("*3\r\n:1\r\n"),
+        "Range query should return 1 hit. Resp: {}",
+        search3
+    );
     assert!(search3.contains("book:1"));
 
     // 8. Query 4: Tag filter: @category:{database} (matches book:3)
-    let search4 = send_and_read(&mut client, b"*3\r\n$9\r\nFT.SEARCH\r\n$9\r\nidx:books\r\n$20\r\n@category:{database}\r\n");
-    assert!(search4.starts_with("*3\r\n:1\r\n"), "Tag query should return 1 hit. Resp: {}", search4);
+    let search4 = send_and_read(
+        &mut client,
+        b"*3\r\n$9\r\nFT.SEARCH\r\n$9\r\nidx:books\r\n$20\r\n@category:{database}\r\n",
+    );
+    assert!(
+        search4.starts_with("*3\r\n:1\r\n"),
+        "Tag query should return 1 hit. Resp: {}",
+        search4
+    );
     assert!(search4.contains("book:3"));
 
     // 9. Query 5: Prefix query: "progra*" (matches programming in book:2 title)
-    let search5 = send_and_read(&mut client, b"*3\r\n$9\r\nFT.SEARCH\r\n$9\r\nidx:books\r\n$7\r\nprogra*\r\n");
-    assert!(search5.starts_with("*3\r\n:1\r\n"), "Prefix query should return 1 hit for book:2. Resp: {}", search5);
+    let search5 = send_and_read(
+        &mut client,
+        b"*3\r\n$9\r\nFT.SEARCH\r\n$9\r\nidx:books\r\n$7\r\nprogra*\r\n",
+    );
+    assert!(
+        search5.starts_with("*3\r\n:1\r\n"),
+        "Prefix query should return 1 hit for book:2. Resp: {}",
+        search5
+    );
     assert!(search5.contains("book:2"));
 
     // 10. Query 6: NOCONTENT flag (returns doc IDs only)
-    let search_nocontent = send_and_read(&mut client, b"*4\r\n$9\r\nFT.SEARCH\r\n$9\r\nidx:books\r\n$4\r\nRust\r\n$9\r\nNOCONTENT\r\n");
-    assert_eq!(search_nocontent, "*3\r\n:2\r\n$6\r\nbook:1\r\n$6\r\nbook:2\r\n");
+    let search_nocontent = send_and_read(
+        &mut client,
+        b"*4\r\n$9\r\nFT.SEARCH\r\n$9\r\nidx:books\r\n$4\r\nRust\r\n$9\r\nNOCONTENT\r\n",
+    );
+    assert_eq!(
+        search_nocontent,
+        "*3\r\n:2\r\n$6\r\nbook:1\r\n$6\r\nbook:2\r\n"
+    );
 
     // 11. Query 7: FT.EXPLAIN
-    let explain_resp = send_and_read(&mut client, b"*3\r\n$10\r\nFT.EXPLAIN\r\n$9\r\nidx:books\r\n$15\r\nRust | database\r\n");
-    assert!(explain_resp.contains("Or"), "Explain output should describe parsed AST");
+    let explain_resp = send_and_read(
+        &mut client,
+        b"*3\r\n$10\r\nFT.EXPLAIN\r\n$9\r\nidx:books\r\n$15\r\nRust | database\r\n",
+    );
+    assert!(
+        explain_resp.contains("Or"),
+        "Explain output should describe parsed AST"
+    );
 
     // 12. Document deletion via DEL automatically removes from index
     assert_eq!(send_and_read(&mut client, b"DEL book:1\r\n"), ":1\r\n");
@@ -3835,7 +4753,10 @@ fn test_redisearch_fulltext_and_hybrid_vector_e2e() {
     assert_eq!(search_after_del, "*1\r\n:0\r\n");
 
     // 13. Drop index
-    assert_eq!(send_and_read(&mut client, b"FT.DROPINDEX idx:books\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"FT.DROPINDEX idx:books\r\n"),
+        "+OK\r\n"
+    );
     let search_after_drop = send_and_read(&mut client, b"FT.SEARCH idx:books Rust\r\n");
     assert!(search_after_drop.contains("ERR Unknown Index name"));
 
@@ -3848,12 +4769,19 @@ fn test_redisearch_fulltext_and_hybrid_vector_e2e() {
         "+OK\r\n"
     );
     let json_payload = b"{\"name\":\"Alice Engineer\",\"role\":\"admin\"}";
-    let mut json_set_cmd = format!("*4\r\n$8\r\nJSON.SET\r\n$6\r\nuser:1\r\n$1\r\n$\r\n${}\r\n", json_payload.len()).into_bytes();
+    let mut json_set_cmd = format!(
+        "*4\r\n$8\r\nJSON.SET\r\n$6\r\nuser:1\r\n$1\r\n$\r\n${}\r\n",
+        json_payload.len()
+    )
+    .into_bytes();
     json_set_cmd.extend_from_slice(json_payload);
     json_set_cmd.extend_from_slice(b"\r\n");
     assert_eq!(send_and_read(&mut client, &json_set_cmd), "+OK\r\n");
 
-    let search_json = send_and_read(&mut client, b"*3\r\n$9\r\nFT.SEARCH\r\n$9\r\nidx:users\r\n$5\r\nAlice\r\n");
+    let search_json = send_and_read(
+        &mut client,
+        b"*3\r\n$9\r\nFT.SEARCH\r\n$9\r\nidx:users\r\n$5\r\nAlice\r\n",
+    );
     assert!(search_json.contains("user:1"));
     assert!(search_json.contains("Alice Engineer"));
 }
@@ -3947,7 +4875,11 @@ fn test_dragonfly_compatibility_suite_e2e() {
 
     // 2. Test DFLYCLUSTER CONFIG with JSON
     let cfg_json = r#"{"slot_ranges": [[0, 8191], [8192, 16383]]}"#;
-    let cfg_cmd = format!("*3\r\n$11\r\nDFLYCLUSTER\r\n$6\r\nCONFIG\r\n${}\r\n{}\r\n", cfg_json.len(), cfg_json);
+    let cfg_cmd = format!(
+        "*3\r\n$11\r\nDFLYCLUSTER\r\n$6\r\nCONFIG\r\n${}\r\n{}\r\n",
+        cfg_json.len(),
+        cfg_json
+    );
     assert_eq!(send_and_read(&mut client, cfg_cmd.as_bytes()), "+OK\r\n");
 
     // 3. Test DFLYCLUSTER GETSLOTINFO
@@ -3957,42 +4889,84 @@ fn test_dragonfly_compatibility_suite_e2e() {
     assert!(slot_info.contains(":200\r\n"));
 
     // 4. Test STICK, UNSTICK, STICKY
-    assert_eq!(send_and_read(&mut client, b"SET stick_key1 val1\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client, b"STICKY stick_key1\r\n"), ":0\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"SET stick_key1 val1\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"STICKY stick_key1\r\n"),
+        ":0\r\n"
+    );
     // STICK key1 key_missing -> should mark key1, return 1
-    assert_eq!(send_and_read(&mut client, b"STICK stick_key1 key_missing\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut client, b"STICKY stick_key1\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"STICK stick_key1 key_missing\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"STICKY stick_key1\r\n"),
+        ":1\r\n"
+    );
     // UNSTICK key1
-    assert_eq!(send_and_read(&mut client, b"UNSTICK stick_key1\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut client, b"STICKY stick_key1\r\n"), ":0\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"UNSTICK stick_key1\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"STICKY stick_key1\r\n"),
+        ":0\r\n"
+    );
 
     // 5. Test DELEX (conditional deletion)
-    assert_eq!(send_and_read(&mut client, b"SET cond_key 100\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"SET cond_key 100\r\n"),
+        "+OK\r\n"
+    );
     // IFEQ mismatch -> returns 0
-    assert_eq!(send_and_read(&mut client, b"DELEX cond_key IFEQ 999\r\n"), ":0\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"DELEX cond_key IFEQ 999\r\n"),
+        ":0\r\n"
+    );
     assert_eq!(send_and_read(&mut client, b"EXISTS cond_key\r\n"), ":1\r\n");
     // IFEQ match -> returns 1 and deletes
-    assert_eq!(send_and_read(&mut client, b"DELEX cond_key IFEQ 100\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"DELEX cond_key IFEQ 100\r\n"),
+        ":1\r\n"
+    );
     assert_eq!(send_and_read(&mut client, b"EXISTS cond_key\r\n"), ":0\r\n");
 
     // 6. Test DFLYCLUSTER FLUSHSLOTS
     let slot = rudis::router::key_slot(b"slot_test_key");
-    assert_eq!(send_and_read(&mut client, b"SET slot_test_key hello\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client, b"EXISTS slot_test_key\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"SET slot_test_key hello\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"EXISTS slot_test_key\r\n"),
+        ":1\r\n"
+    );
     let flush_cmd = format!("DFLYCLUSTER FLUSHSLOTS {} {}\r\n", slot, slot);
     assert_eq!(send_and_read(&mut client, flush_cmd.as_bytes()), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client, b"EXISTS slot_test_key\r\n"), ":0\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"EXISTS slot_test_key\r\n"),
+        ":0\r\n"
+    );
 
     // 7. Test DFLYCLUSTER SLOT-MIGRATION-STATUS & DFLYMIGRATE
     let mig_status = send_and_read(&mut client, b"DFLYCLUSTER SLOT-MIGRATION-STATUS\r\n");
     assert!(mig_status.contains("IDLE"));
     // Init migration
-    assert_eq!(send_and_read(&mut client, b"DFLYMIGRATE INIT node123 2 0 100\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"DFLYMIGRATE INIT node123 2 0 100\r\n"),
+        "+OK\r\n"
+    );
     let mig_status2 = send_and_read(&mut client, b"DFLYCLUSTER SLOT-MIGRATION-STATUS\r\n");
     assert!(mig_status2.contains("MIGRATING"));
     assert!(mig_status2.contains("node123"));
     // Ack migration
-    assert_eq!(send_and_read(&mut client, b"DFLYMIGRATE ACK 42\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"DFLYMIGRATE ACK 42\r\n"),
+        "+OK\r\n"
+    );
     let mig_status3 = send_and_read(&mut client, b"DFLYCLUSTER SLOT-MIGRATION-STATUS\r\n");
     assert!(mig_status3.contains("IDLE"));
 
@@ -4002,11 +4976,17 @@ fn test_dragonfly_compatibility_suite_e2e() {
     assert_eq!(send_and_read(&mut client, mc_set), "STORED\r\n");
 
     // Shared Keyspace: read via Redis protocol
-    assert_eq!(send_and_read(&mut client, b"GET mc_fruit\r\n"), "$5\r\napple\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"GET mc_fruit\r\n"),
+        "$5\r\napple\r\n"
+    );
 
     // Memcached GET command (retrieves multiple keys)
     let mc_get = b"get mc_fruit non_existent\r\n";
-    assert_eq!(send_and_read(&mut client, mc_get), "VALUE mc_fruit 0 5\r\napple\r\nEND\r\n");
+    assert_eq!(
+        send_and_read(&mut client, mc_get),
+        "VALUE mc_fruit 0 5\r\napple\r\nEND\r\n"
+    );
 
     // Memcached STATS
     let mc_stats = send_and_read(&mut client, b"stats\r\n");
@@ -4019,8 +4999,14 @@ fn test_dragonfly_compatibility_suite_e2e() {
     assert_eq!(mc_ver, "VERSION 1.6.0-rudis-dragonfly\r\n");
 
     // Memcached DELETE
-    assert_eq!(send_and_read(&mut client, b"delete mc_fruit\r\n"), "DELETED\r\n");
-    assert_eq!(send_and_read(&mut client, b"delete mc_fruit\r\n"), "NOT_FOUND\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"delete mc_fruit\r\n"),
+        "DELETED\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"delete mc_fruit\r\n"),
+        "NOT_FOUND\r\n"
+    );
 }
 
 #[test]
@@ -4032,58 +5018,112 @@ fn test_harness_and_extended_command_coverage_e2e() {
     // 1. Harness commands (SELECT, CLIENT KILL, SLOWLOG)
     assert_eq!(send_and_read(&mut client, b"SELECT 0\r\n"), "+OK\r\n");
     assert_eq!(send_and_read(&mut client, b"SELECT 9\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client, b"CLIENT KILL 127.0.0.1:9999\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"CLIENT KILL 127.0.0.1:9999\r\n"),
+        "+OK\r\n"
+    );
     assert_eq!(send_and_read(&mut client, b"SLOWLOG RESET\r\n"), "+OK\r\n");
     assert_eq!(send_and_read(&mut client, b"SLOWLOG LEN\r\n"), ":0\r\n");
     assert_eq!(send_and_read(&mut client, b"SLOWLOG GET\r\n"), "*0\r\n");
 
     // 2. HMSET & FLUSHALL
-    assert_eq!(send_and_read(&mut client, b"HMSET hm_key f1 v1 f2 v2\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client, b"HGET hm_key f1\r\n"), "$2\r\nv1\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"HMSET hm_key f1 v1 f2 v2\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"HGET hm_key f1\r\n"),
+        "$2\r\nv1\r\n"
+    );
     assert_eq!(send_and_read(&mut client, b"FLUSHALL\r\n"), "+OK\r\n");
     assert_eq!(send_and_read(&mut client, b"EXISTS hm_key\r\n"), ":0\r\n");
 
     // 3. PEXPIRE & PTTL
-    assert_eq!(send_and_read(&mut client, b"SET exp_key hello\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client, b"PEXPIRE exp_key 60000\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"SET exp_key hello\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"PEXPIRE exp_key 60000\r\n"),
+        ":1\r\n"
+    );
     let pttl_resp = send_and_read(&mut client, b"PTTL exp_key\r\n");
     assert!(pttl_resp.starts_with(":"));
 
     // 4. RedisJSON extended commands
-    assert_eq!(send_and_read(&mut client, b"JSON.SET jext $ {\"num\":10,\"str\":\"hello\",\"arr\":[1,2,3]}\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(
+            &mut client,
+            b"JSON.SET jext $ {\"num\":10,\"str\":\"hello\",\"arr\":[1,2,3]}\r\n"
+        ),
+        "+OK\r\n"
+    );
     let mult_res = send_and_read(&mut client, b"JSON.NUMMULTBY jext $.num 2\r\n");
     assert!(mult_res.contains("20") || mult_res.contains("+OK") || mult_res.contains(":20"));
     let str_append = send_and_read(&mut client, b"JSON.STRAPPEND jext $.str world\r\n");
     assert!(str_append.contains("10") || str_append.contains(":10"));
     let str_len = send_and_read(&mut client, b"JSON.STRLEN jext $.str\r\n");
     assert!(str_len.contains("10") || str_len.contains(":10"));
-    assert_eq!(send_and_read(&mut client, b"JSON.CLEAR jext $.arr\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"JSON.CLEAR jext $.arr\r\n"),
+        ":1\r\n"
+    );
     let mget_res = send_and_read(&mut client, b"JSON.MGET jext $.num\r\n");
     assert!(mget_res.contains("20") || mget_res.contains("*1\r\n"));
 
     // 5. Probabilistic & CRDT & Search
-    assert_eq!(send_and_read(&mut client, b"CMS.INITBYPROB cms_sketch 0.01 0.01\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client, b"CRDT.SADD crdt_tag item1\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut client, b"CRDT.SREM crdt_tag item1\r\n"), ":1\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"CMS.INITBYPROB cms_sketch 0.01 0.01\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"CRDT.SADD crdt_tag item1\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"CRDT.SREM crdt_tag item1\r\n"),
+        ":1\r\n"
+    );
 
     // 6. RediSearch FT.ADD
-    assert_eq!(send_and_read(&mut client, b"FT.CREATE ft_idx ON HASH SCHEMA title TEXT\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client, b"FT.ADD ft_idx doc99 1.0 FIELDS title \"distributed systems\"\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(
+            &mut client,
+            b"FT.CREATE ft_idx ON HASH SCHEMA title TEXT\r\n"
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut client,
+            b"FT.ADD ft_idx doc99 1.0 FIELDS title \"distributed systems\"\r\n"
+        ),
+        "+OK\r\n"
+    );
 
     // 7. Sorted Set ZREVRANGEBYSCORE & PUNSUBSCRIBE
-    assert_eq!(send_and_read(&mut client, b"ZADD zrev_k 10 a 20 b 30 c\r\n"), ":3\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"ZADD zrev_k 10 a 20 b 30 c\r\n"),
+        ":3\r\n"
+    );
     let zrev_res = send_and_read(&mut client, b"ZREVRANGEBYSCORE zrev_k 25 5\r\n");
     assert!(zrev_res.contains("b") && zrev_res.contains("a"));
     let _ = send_and_read(&mut client, b"PUNSUBSCRIBE mypat*\r\n");
 
     // 8. MEMORY USAGE & STATS
-    assert_eq!(send_and_read(&mut client, b"SET mem_key foobar\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"SET mem_key foobar\r\n"),
+        "+OK\r\n"
+    );
     let mem_res = send_and_read(&mut client, b"MEMORY USAGE mem_key\r\n");
     assert!(mem_res.starts_with(":"));
     assert_eq!(send_and_read(&mut client, b"MEMORY PURGE\r\n"), "+OK\r\n");
 
     // 9. REPLCONF & QUIT
-    assert_eq!(send_and_read(&mut client, b"REPLCONF listening-port 6380\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"REPLCONF listening-port 6380\r\n"),
+        "+OK\r\n"
+    );
     let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     assert_eq!(send_and_read(&mut client2, b"QUIT\r\n"), "+OK\r\n");
 }
@@ -4108,8 +5148,14 @@ fn test_msetex_e2e() {
     // 1. Basic MSETEX with EX
     let resp = send_and_read(&mut stream, b"MSETEX 2 mkey1 mval1 mkey2 mval2 EX 10\r\n");
     assert_eq!(resp, "+OK\r\n");
-    assert_eq!(send_and_read(&mut stream, b"GET mkey1\r\n"), "$5\r\nmval1\r\n");
-    assert_eq!(send_and_read(&mut stream, b"GET mkey2\r\n"), "$5\r\nmval2\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"GET mkey1\r\n"),
+        "$5\r\nmval1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"GET mkey2\r\n"),
+        "$5\r\nmval2\r\n"
+    );
 
     // 2. MSETEX with NX when key exists -> 0
     let resp = send_and_read(&mut stream, b"MSETEX 1 mkey1 newval NX EX 10\r\n");
@@ -4118,12 +5164,18 @@ fn test_msetex_e2e() {
     // 3. MSETEX with XX when key exists -> 1
     let resp = send_and_read(&mut stream, b"MSETEX 1 mkey1 newval XX EX 10\r\n");
     assert_eq!(resp, ":1\r\n");
-    assert_eq!(send_and_read(&mut stream, b"GET mkey1\r\n"), "$6\r\nnewval\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"GET mkey1\r\n"),
+        "$6\r\nnewval\r\n"
+    );
 
     // 4. MSETEX KEEPTTL
     let resp = send_and_read(&mut stream, b"MSETEX 1 mkey1 finalval KEEPTTL\r\n");
     assert_eq!(resp, "+OK\r\n");
-    assert_eq!(send_and_read(&mut stream, b"GET mkey1\r\n"), "$8\r\nfinalval\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"GET mkey1\r\n"),
+        "$8\r\nfinalval\r\n"
+    );
 }
 
 #[test]
@@ -4134,27 +5186,57 @@ fn test_all_remaining_uncovered_commands_e2e() {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
 
     // 1. GETEX
-    assert_eq!(send_and_read(&mut stream, b"SET getex_k val EX 100\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"SET getex_k val EX 100\r\n"),
+        "+OK\r\n"
+    );
     let resp = send_and_read(&mut stream, b"GETEX getex_k PERSIST\r\n");
     assert_eq!(resp, "$3\r\nval\r\n");
 
     // 2. HSETNX, HSTRLEN, HGETDEL
-    assert_eq!(send_and_read(&mut stream, b"HSETNX myh f1 v1\r\n"), ":1\r\n");
-    assert_eq!(send_and_read(&mut stream, b"HSETNX myh f1 v2\r\n"), ":0\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"HSETNX myh f1 v1\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"HSETNX myh f1 v2\r\n"),
+        ":0\r\n"
+    );
     assert_eq!(send_and_read(&mut stream, b"HSTRLEN myh f1\r\n"), ":2\r\n");
     let resp = send_and_read(&mut stream, b"HGETDEL myh FIELDS 1 f1\r\n");
     assert_eq!(resp, "*1\r\n$2\r\nv1\r\n");
 
     // 3. LPUSHX, RPUSHX
-    assert_eq!(send_and_read(&mut stream, b"LPUSHX nonex_list elem\r\n"), ":0\r\n");
-    assert_eq!(send_and_read(&mut stream, b"RPUSHX nonex_list elem\r\n"), ":0\r\n");
-    assert_eq!(send_and_read(&mut stream, b"RPUSH mylist a b\r\n"), ":2\r\n");
-    assert_eq!(send_and_read(&mut stream, b"LPUSHX mylist first\r\n"), ":3\r\n");
-    assert_eq!(send_and_read(&mut stream, b"RPUSHX mylist last\r\n"), ":4\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"LPUSHX nonex_list elem\r\n"),
+        ":0\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"RPUSHX nonex_list elem\r\n"),
+        ":0\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"RPUSH mylist a b\r\n"),
+        ":2\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"LPUSHX mylist first\r\n"),
+        ":3\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"RPUSHX mylist last\r\n"),
+        ":4\r\n"
+    );
 
     // 4. RPOPLPUSH, BRPOPLPUSH
-    assert_eq!(send_and_read(&mut stream, b"RPOPLPUSH mylist dstlist\r\n"), "$4\r\nlast\r\n");
-    assert_eq!(send_and_read(&mut stream, b"BRPOPLPUSH mylist dstlist 1\r\n"), "$1\r\nb\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"RPOPLPUSH mylist dstlist\r\n"),
+        "$4\r\nlast\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"BRPOPLPUSH mylist dstlist 1\r\n"),
+        "$1\r\nb\r\n"
+    );
 
     // 5. LMPOP, BLMPOP
     let resp = send_and_read(&mut stream, b"LMPOP 1 mylist LEFT COUNT 1\r\n");
@@ -4163,9 +5245,18 @@ fn test_all_remaining_uncovered_commands_e2e() {
     assert_eq!(resp, "*2\r\n$6\r\nmylist\r\n*1\r\n$1\r\na\r\n");
 
     // 6. LCS
-    assert_eq!(send_and_read(&mut stream, b"SET str1 AGGTAB\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut stream, b"SET str2 GXTXAYB\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut stream, b"LCS str1 str2 LEN\r\n"), ":4\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"SET str1 AGGTAB\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"SET str2 GXTXAYB\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"LCS str1 str2 LEN\r\n"),
+        ":4\r\n"
+    );
 
     // 7. DIGEST & DEBUG
     let digest_res = send_and_read(&mut stream, b"DIGEST str1\r\n");
@@ -4174,17 +5265,3 @@ fn test_all_remaining_uncovered_commands_e2e() {
     eprintln!("DEBUG RES: {:?}", debug_res);
     assert!(debug_res.starts_with("+") || debug_res.starts_with("$") || debug_res.starts_with(":"));
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-

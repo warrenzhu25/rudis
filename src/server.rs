@@ -106,7 +106,7 @@ pub fn run_shard_worker(
                                 let _ = file.write_all_at(chunk, offset).await;
                             }
                             ticker += 1;
-                            if fsync_every_sec && ticker % 20 == 0 {
+                            if fsync_every_sec && ticker.is_multiple_of(20) {
                                 let file = flush_writer.borrow().get_file();
                                 if let Some(file) = file {
                                     let _ = file.sync_data().await;
@@ -243,8 +243,8 @@ pub fn run_shard_worker(
                         cross_shard_db
                             .borrow_mut()
                             .set(key.clone(), value.clone(), expire_in);
-                        if let Some(aof) = &cross_shard_aof {
-                            if let Some(bytes) =
+                        if let Some(aof) = &cross_shard_aof
+                            && let Some(bytes) =
                                 crate::aof::command_to_resp(&crate::resp::Command::Set {
                                     key,
                                     value,
@@ -257,7 +257,6 @@ pub fn run_shard_worker(
                             {
                                 aof.borrow_mut().append(&bytes);
                             }
-                        }
                         let r = cross_shard_router.clone();
                         monoio::spawn(async move {
                             r.check_auto_tier().await;
@@ -266,17 +265,15 @@ pub fn run_shard_worker(
                     }
                     ShardMessage::Del { key, responder } => {
                         let deleted = cross_shard_db.borrow_mut().del(&key);
-                        if deleted {
-                            if let Some(aof) = &cross_shard_aof {
-                                if let Some(bytes) =
+                        if deleted
+                            && let Some(aof) = &cross_shard_aof
+                                && let Some(bytes) =
                                     crate::aof::command_to_resp(&crate::resp::Command::Del(vec![
                                         key,
                                     ]))
                                 {
                                     aof.borrow_mut().append(&bytes);
                                 }
-                            }
-                        }
                         let _ = responder.send(deleted);
                     }
                     ShardMessage::Exists { key, responder } => {
@@ -289,15 +286,13 @@ pub fn run_shard_worker(
                         responder,
                     } => {
                         let res = cross_shard_db.borrow_mut().incr_by(key.clone(), delta);
-                        if res.is_ok() {
-                            if let Some(aof) = &cross_shard_aof {
-                                if let Some(bytes) = crate::aof::command_to_resp(
+                        if res.is_ok()
+                            && let Some(aof) = &cross_shard_aof
+                                && let Some(bytes) = crate::aof::command_to_resp(
                                     &crate::resp::Command::IncrBy(key, delta),
                                 ) {
                                     aof.borrow_mut().append(&bytes);
                                 }
-                            }
-                        }
                         let _ = responder.send(res);
                     }
                     ShardMessage::Expire {
@@ -306,28 +301,24 @@ pub fn run_shard_worker(
                         responder,
                     } => {
                         let res = cross_shard_db.borrow_mut().expire(&key, duration);
-                        if res {
-                            if let Some(aof) = &cross_shard_aof {
-                                if let Some(bytes) = crate::aof::command_to_resp(
+                        if res
+                            && let Some(aof) = &cross_shard_aof
+                                && let Some(bytes) = crate::aof::command_to_resp(
                                     &crate::resp::Command::Expire(key, duration),
                                 ) {
                                     aof.borrow_mut().append(&bytes);
                                 }
-                            }
-                        }
                         let _ = responder.send(res);
                     }
                     ShardMessage::Persist { key, responder } => {
                         let res = cross_shard_db.borrow_mut().persist(&key);
-                        if res {
-                            if let Some(aof) = &cross_shard_aof {
-                                if let Some(bytes) =
+                        if res
+                            && let Some(aof) = &cross_shard_aof
+                                && let Some(bytes) =
                                     crate::aof::command_to_resp(&crate::resp::Command::Persist(key))
                                 {
                                     aof.borrow_mut().append(&bytes);
                                 }
-                            }
-                        }
                         let _ = responder.send(res);
                     }
                     ShardMessage::Ttl {

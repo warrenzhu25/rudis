@@ -24,12 +24,27 @@ pub enum ClusterSubcommand {
     DelSlotsRange(Vec<(u16, u16)>),
     Nodes,
     Info,
-    Meet { ip: String, port: u16 },
+    Meet {
+        ip: String,
+        port: u16,
+    },
     MyId,
-    MigrateSlot { slot: u16, host: String, port: u16 },
-    Rebalance { host: String, port: u16, slots: Option<usize> },
-    Failover { force: bool },
-    Reset { hard: bool },
+    MigrateSlot {
+        slot: u16,
+        host: String,
+        port: u16,
+    },
+    Rebalance {
+        host: String,
+        port: u16,
+        slots: Option<usize>,
+    },
+    Failover {
+        force: bool,
+    },
+    Reset {
+        hard: bool,
+    },
     Forget(String),
     Replicate(String),
     SaveConfig,
@@ -105,7 +120,6 @@ pub enum TierSubcommand {
     Snapshot(std::path::PathBuf),
 }
 
-
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ClientSubcommand {
     List(Vec<u64>),
@@ -128,7 +142,6 @@ pub enum ClientSubcommand {
     Unpause,
     NoTouch(bool),
 }
-
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum AclSubcommand {
@@ -661,7 +674,12 @@ pub enum Command {
     Xpending {
         key: Bytes,
         group: Bytes,
-        range: Option<(crate::table::StreamId, crate::table::StreamId, usize, Option<Bytes>)>,
+        range: Option<(
+            crate::table::StreamId,
+            crate::table::StreamId,
+            usize,
+            Option<Bytes>,
+        )>,
     },
     // VALKEY EXTENDED COMMANDS
     Hello {
@@ -1181,7 +1199,6 @@ pub enum Command {
     Unknown(String),
 }
 
-
 fn parse_memcached_storage_command(buf: &mut BytesMut) -> Result<Option<Option<Command>>, String> {
     let newline_pos = match find_crlf(buf) {
         Some(pos) => pos,
@@ -1199,19 +1216,31 @@ fn parse_memcached_storage_command(buf: &mut BytesMut) -> Result<Option<Option<C
     if !is_set && !is_add && !is_replace {
         return Ok(None);
     }
-    let parts: Vec<&[u8]> = line.split(|&b| b == b' ' || b == b'\t').filter(|p| !p.is_empty()).collect();
+    let parts: Vec<&[u8]> = line
+        .split(|&b| b == b' ' || b == b'\t')
+        .filter(|p| !p.is_empty())
+        .collect();
     if parts.len() < 5 {
         return Ok(None);
     }
-    let flags: u32 = match std::str::from_utf8(parts[2]).ok().and_then(|s| s.parse().ok()) {
+    let flags: u32 = match std::str::from_utf8(parts[2])
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
         Some(f) => f,
         None => return Ok(None),
     };
-    let exptime: u32 = match std::str::from_utf8(parts[3]).ok().and_then(|s| s.parse().ok()) {
+    let exptime: u32 = match std::str::from_utf8(parts[3])
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
         Some(e) => e,
         None => return Ok(None),
     };
-    let bytes_len: usize = match std::str::from_utf8(parts[4]).ok().and_then(|s| s.parse().ok()) {
+    let bytes_len: usize = match std::str::from_utf8(parts[4])
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
         Some(b) => b,
         None => return Ok(None),
     };
@@ -1221,20 +1250,41 @@ fn parse_memcached_storage_command(buf: &mut BytesMut) -> Result<Option<Option<C
     if buf.len() < total_len {
         return Ok(Some(None));
     }
-    if &buf[newline_pos + 2 + bytes_len .. total_len] != b"\r\n" {
+    if &buf[newline_pos + 2 + bytes_len..total_len] != b"\r\n" {
         return Err("CLIENT_ERROR bad data chunk".to_string());
     }
 
     let key = Bytes::copy_from_slice(parts[1]);
-    let data = Bytes::copy_from_slice(&buf[newline_pos + 2 .. newline_pos + 2 + bytes_len]);
+    let data = Bytes::copy_from_slice(&buf[newline_pos + 2..newline_pos + 2 + bytes_len]);
     buf.advance(total_len);
 
     let cmd = if is_set {
-        Command::MemcachedSet { key, flags, exptime, bytes: bytes_len, noreply, data }
+        Command::MemcachedSet {
+            key,
+            flags,
+            exptime,
+            bytes: bytes_len,
+            noreply,
+            data,
+        }
     } else if is_add {
-        Command::MemcachedAdd { key, flags, exptime, bytes: bytes_len, noreply, data }
+        Command::MemcachedAdd {
+            key,
+            flags,
+            exptime,
+            bytes: bytes_len,
+            noreply,
+            data,
+        }
     } else {
-        Command::MemcachedReplace { key, flags, exptime, bytes: bytes_len, noreply, data }
+        Command::MemcachedReplace {
+            key,
+            flags,
+            exptime,
+            bytes: bytes_len,
+            noreply,
+            data,
+        }
     };
     Ok(Some(Some(cmd)))
 }
@@ -1365,11 +1415,17 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
         "AUTH" => {
             if args.len() == 2 {
                 let password = String::from_utf8_lossy(&args[1]).to_string();
-                Ok(Some(Command::Auth { username: None, password }))
+                Ok(Some(Command::Auth {
+                    username: None,
+                    password,
+                }))
             } else if args.len() == 3 {
                 let username = String::from_utf8_lossy(&args[1]).to_string();
                 let password = String::from_utf8_lossy(&args[2]).to_string();
-                Ok(Some(Command::Auth { username: Some(username), password }))
+                Ok(Some(Command::Auth {
+                    username: Some(username),
+                    password,
+                }))
             } else {
                 Err("wrong number of arguments for 'auth' command".to_string())
             }
@@ -1386,24 +1442,39 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "CAT" => Ok(Some(Command::Acl(AclSubcommand::Cat))),
                 "GETUSER" => {
                     if args.len() != 3 {
-                        return Err("wrong number of arguments for 'acl|getuser' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'acl|getuser' command".to_string()
+                        );
                     }
                     let username = String::from_utf8_lossy(&args[2]).to_string();
                     Ok(Some(Command::Acl(AclSubcommand::GetUser(username))))
                 }
                 "SETUSER" => {
                     if args.len() < 3 {
-                        return Err("wrong number of arguments for 'acl|setuser' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'acl|setuser' command".to_string()
+                        );
                     }
                     let username = String::from_utf8_lossy(&args[2]).to_string();
-                    let rules = args[3..].iter().map(|a| String::from_utf8_lossy(a).to_string()).collect();
-                    Ok(Some(Command::Acl(AclSubcommand::SetUser { username, rules })))
+                    let rules = args[3..]
+                        .iter()
+                        .map(|a| String::from_utf8_lossy(a).to_string())
+                        .collect();
+                    Ok(Some(Command::Acl(AclSubcommand::SetUser {
+                        username,
+                        rules,
+                    })))
                 }
                 "DELUSER" => {
                     if args.len() < 3 {
-                        return Err("wrong number of arguments for 'acl|deluser' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'acl|deluser' command".to_string()
+                        );
                     }
-                    let usernames = args[2..].iter().map(|a| String::from_utf8_lossy(a).to_string()).collect();
+                    let usernames = args[2..]
+                        .iter()
+                        .map(|a| String::from_utf8_lossy(a).to_string())
+                        .collect();
                     Ok(Some(Command::Acl(AclSubcommand::DelUser(usernames))))
                 }
                 _ => Err(format!("unknown subcommand '{}' for 'acl'", sub)),
@@ -1416,7 +1487,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() == 2 {
                 Ok(Some(Command::Get(args[1].clone())))
             } else {
-                Ok(Some(Command::MemcachedGet { keys: args[1..].to_vec() }))
+                Ok(Some(Command::MemcachedGet {
+                    keys: args[1..].to_vec(),
+                }))
             }
         }
         "GETEX" => {
@@ -1431,7 +1504,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
                 match opt.as_str() {
                     "EX" => {
-                        if i + 1 >= args.len() { return Err("syntax error".to_string()); }
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
                         let sec: u64 = std::str::from_utf8(&args[i + 1])
                             .ok()
                             .and_then(|s| s.parse().ok())
@@ -1440,7 +1515,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         i += 2;
                     }
                     "PX" => {
-                        if i + 1 >= args.len() { return Err("syntax error".to_string()); }
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
                         let ms: u64 = std::str::from_utf8(&args[i + 1])
                             .ok()
                             .and_then(|s| s.parse().ok())
@@ -1449,7 +1526,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         i += 2;
                     }
                     "EXAT" => {
-                        if i + 1 >= args.len() { return Err("syntax error".to_string()); }
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
                         let ts: u64 = std::str::from_utf8(&args[i + 1])
                             .ok()
                             .and_then(|s| s.parse().ok())
@@ -1458,12 +1537,18 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(0);
-                        let dur = if ts <= now_unix { Duration::from_millis(1) } else { Duration::from_secs(ts - now_unix) };
+                        let dur = if ts <= now_unix {
+                            Duration::from_millis(1)
+                        } else {
+                            Duration::from_secs(ts - now_unix)
+                        };
                         expire_in = Some(dur);
                         i += 2;
                     }
                     "PXAT" => {
-                        if i + 1 >= args.len() { return Err("syntax error".to_string()); }
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
                         let ts: u64 = std::str::from_utf8(&args[i + 1])
                             .ok()
                             .and_then(|s| s.parse().ok())
@@ -1472,7 +1557,11 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_millis() as u64)
                             .unwrap_or(0);
-                        let dur = if ts <= now_unix_ms { Duration::from_millis(1) } else { Duration::from_millis(ts - now_unix_ms) };
+                        let dur = if ts <= now_unix_ms {
+                            Duration::from_millis(1)
+                        } else {
+                            Duration::from_millis(ts - now_unix_ms)
+                        };
                         expire_in = Some(dur);
                         i += 2;
                     }
@@ -1480,10 +1569,16 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         persist = true;
                         i += 1;
                     }
-                    _ => { return Err("syntax error".to_string()); }
+                    _ => {
+                        return Err("syntax error".to_string());
+                    }
                 }
             }
-            Ok(Some(Command::Getex { key, expire_in, persist }))
+            Ok(Some(Command::Getex {
+                key,
+                expire_in,
+                persist,
+            }))
         }
         "SET" | "PUT" => {
             if args.len() < 3 {
@@ -1662,7 +1757,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::Mget(args[1..].to_vec())))
         }
         "MSET" => {
-            if args.len() < 3 || (args.len() - 1) % 2 != 0 {
+            if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
                 return Err("wrong number of arguments for 'mset' command".to_string());
             }
             let mut pairs = Vec::with_capacity((args.len() - 1) / 2);
@@ -1677,8 +1772,11 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() < 2 {
                 return Err("wrong number of arguments for 'msetex' command".to_string());
             }
-            let numkeys_str = std::str::from_utf8(&args[1]).map_err(|_| "invalid numkeys value".to_string())?;
-            let numkeys: i64 = numkeys_str.parse().map_err(|_| "invalid numkeys value".to_string())?;
+            let numkeys_str =
+                std::str::from_utf8(&args[1]).map_err(|_| "invalid numkeys value".to_string())?;
+            let numkeys: i64 = numkeys_str
+                .parse()
+                .map_err(|_| "invalid numkeys value".to_string())?;
             if numkeys < 0 || numkeys > i32::MAX as i64 {
                 return Err("invalid numkeys value".to_string());
             }
@@ -1718,7 +1816,8 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         if expiry != MsetexExpiry::None || idx + 1 >= args.len() {
                             return Err("syntax error".to_string());
                         }
-                        let sec_str = std::str::from_utf8(&args[idx + 1]).map_err(|_| "syntax error".to_string())?;
+                        let sec_str = std::str::from_utf8(&args[idx + 1])
+                            .map_err(|_| "syntax error".to_string())?;
                         let sec: u64 = sec_str.parse().map_err(|_| "syntax error".to_string())?;
                         expiry = MsetexExpiry::ExpireIn(Duration::from_secs(sec));
                         idx += 2;
@@ -1727,7 +1826,8 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         if expiry != MsetexExpiry::None || idx + 1 >= args.len() {
                             return Err("syntax error".to_string());
                         }
-                        let ms_str = std::str::from_utf8(&args[idx + 1]).map_err(|_| "syntax error".to_string())?;
+                        let ms_str = std::str::from_utf8(&args[idx + 1])
+                            .map_err(|_| "syntax error".to_string())?;
                         let ms: u64 = ms_str.parse().map_err(|_| "syntax error".to_string())?;
                         expiry = MsetexExpiry::ExpireIn(Duration::from_millis(ms));
                         idx += 2;
@@ -1736,9 +1836,13 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         if expiry != MsetexExpiry::None || idx + 1 >= args.len() {
                             return Err("syntax error".to_string());
                         }
-                        let ts_str = std::str::from_utf8(&args[idx + 1]).map_err(|_| "syntax error".to_string())?;
+                        let ts_str = std::str::from_utf8(&args[idx + 1])
+                            .map_err(|_| "syntax error".to_string())?;
                         let ts: u64 = ts_str.parse().map_err(|_| "syntax error".to_string())?;
-                        let now_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                        let now_epoch = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
                         let dur = if ts > now_epoch {
                             Duration::from_secs(ts - now_epoch)
                         } else {
@@ -1751,9 +1855,13 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         if expiry != MsetexExpiry::None || idx + 1 >= args.len() {
                             return Err("syntax error".to_string());
                         }
-                        let ts_str = std::str::from_utf8(&args[idx + 1]).map_err(|_| "syntax error".to_string())?;
+                        let ts_str = std::str::from_utf8(&args[idx + 1])
+                            .map_err(|_| "syntax error".to_string())?;
                         let ts: u128 = ts_str.parse().map_err(|_| "syntax error".to_string())?;
-                        let now_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+                        let now_epoch = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis();
                         let dur = if ts > now_epoch {
                             Duration::from_millis((ts - now_epoch) as u64)
                         } else {
@@ -1834,7 +1942,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
 
             if len_only && idx {
-                return Err("If you want both the length and indexes, please just use IDX.".to_string());
+                return Err(
+                    "If you want both the length and indexes, please just use IDX.".to_string(),
+                );
             }
 
             Ok(Some(Command::Lcs {
@@ -1852,7 +1962,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             if cmd_name == "DELETE" {
                 let noreply = args.len() > 2 && args[2].eq_ignore_ascii_case(b"noreply");
-                Ok(Some(Command::MemcachedDelete { key: args[1].clone(), noreply }))
+                Ok(Some(Command::MemcachedDelete {
+                    key: args[1].clone(),
+                    noreply,
+                }))
             } else {
                 Ok(Some(Command::Del(args[1..].to_vec())))
             }
@@ -1867,11 +1980,17 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() < 2 {
                 return Err("wrong number of arguments for 'incr' command".to_string());
             }
-            if args.len() >= 3 {
-                if let Some(val) = std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<u64>().ok()) {
-                    let noreply = args.len() > 3 && args[3].eq_ignore_ascii_case(b"noreply");
-                    return Ok(Some(Command::MemcachedIncr { key: args[1].clone(), value: val, noreply }));
-                }
+            if args.len() >= 3
+                && let Some(val) = std::str::from_utf8(&args[2])
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+            {
+                let noreply = args.len() > 3 && args[3].eq_ignore_ascii_case(b"noreply");
+                return Ok(Some(Command::MemcachedIncr {
+                    key: args[1].clone(),
+                    value: val,
+                    noreply,
+                }));
             }
             Ok(Some(Command::IncrBy(args[1].clone(), 1)))
         }
@@ -1879,11 +1998,17 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() < 2 {
                 return Err("wrong number of arguments for 'decr' command".to_string());
             }
-            if args.len() >= 3 {
-                if let Some(val) = std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<u64>().ok()) {
-                    let noreply = args.len() > 3 && args[3].eq_ignore_ascii_case(b"noreply");
-                    return Ok(Some(Command::MemcachedDecr { key: args[1].clone(), value: val, noreply }));
-                }
+            if args.len() >= 3
+                && let Some(val) = std::str::from_utf8(&args[2])
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+            {
+                let noreply = args.len() > 3 && args[3].eq_ignore_ascii_case(b"noreply");
+                return Ok(Some(Command::MemcachedDecr {
+                    key: args[1].clone(),
+                    value: val,
+                    noreply,
+                }));
             }
             Ok(Some(Command::IncrBy(args[1].clone(), -1)))
         }
@@ -2069,7 +2194,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "LINKS" => Ok(Some(Command::Cluster(ClusterSubcommand::Links))),
                 "ADDSLOTS" => {
                     if args.len() < 3 {
-                        return Err("wrong number of arguments for 'cluster addslots' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'cluster addslots' command".to_string()
+                        );
                     }
                     let mut slots = Vec::with_capacity(args.len() - 2);
                     for a in &args[2..] {
@@ -2083,7 +2210,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
                 "DELSLOTS" => {
                     if args.len() < 3 {
-                        return Err("wrong number of arguments for 'cluster delslots' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'cluster delslots' command".to_string()
+                        );
                     }
                     let mut slots = Vec::with_capacity(args.len() - 2);
                     for a in &args[2..] {
@@ -2096,8 +2225,11 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     Ok(Some(Command::Cluster(ClusterSubcommand::DelSlots(slots))))
                 }
                 "ADDSLOTSRANGE" => {
-                    if args.len() < 4 || (args.len() - 2) % 2 != 0 {
-                        return Err("wrong number of arguments for 'cluster addslotsrange' command".to_string());
+                    if args.len() < 4 || !(args.len() - 2).is_multiple_of(2) {
+                        return Err(
+                            "wrong number of arguments for 'cluster addslotsrange' command"
+                                .to_string(),
+                        );
                     }
                     let mut ranges = Vec::new();
                     for chunk in args[2..].chunks(2) {
@@ -2111,11 +2243,16 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             .ok_or_else(|| "value is not an integer or out of range".to_string())?;
                         ranges.push((start, end));
                     }
-                    Ok(Some(Command::Cluster(ClusterSubcommand::AddSlotsRange(ranges))))
+                    Ok(Some(Command::Cluster(ClusterSubcommand::AddSlotsRange(
+                        ranges,
+                    ))))
                 }
                 "DELSLOTSRANGE" => {
-                    if args.len() < 4 || (args.len() - 2) % 2 != 0 {
-                        return Err("wrong number of arguments for 'cluster delslotsrange' command".to_string());
+                    if args.len() < 4 || !(args.len() - 2).is_multiple_of(2) {
+                        return Err(
+                            "wrong number of arguments for 'cluster delslotsrange' command"
+                                .to_string(),
+                        );
                     }
                     let mut ranges = Vec::new();
                     for chunk in args[2..].chunks(2) {
@@ -2129,14 +2266,18 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             .ok_or_else(|| "value is not an integer or out of range".to_string())?;
                         ranges.push((start, end));
                     }
-                    Ok(Some(Command::Cluster(ClusterSubcommand::DelSlotsRange(ranges))))
+                    Ok(Some(Command::Cluster(ClusterSubcommand::DelSlotsRange(
+                        ranges,
+                    ))))
                 }
                 "NODES" => Ok(Some(Command::Cluster(ClusterSubcommand::Nodes))),
                 "INFO" => Ok(Some(Command::Cluster(ClusterSubcommand::Info))),
                 "MYID" => Ok(Some(Command::Cluster(ClusterSubcommand::MyId))),
                 "MEET" => {
                     if args.len() < 4 {
-                        return Err("wrong number of arguments for 'cluster meet' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'cluster meet' command".to_string()
+                        );
                     }
                     let ip = String::from_utf8_lossy(&args[2]).to_string();
                     let port: u16 = std::str::from_utf8(&args[3])
@@ -2170,8 +2311,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "REBALANCE" => {
                     if args.len() < 4 {
                         return Err(
-                            "wrong number of arguments for 'cluster rebalance' command"
-                                .to_string(),
+                            "wrong number of arguments for 'cluster rebalance' command".to_string()
                         );
                     }
                     let host = String::from_utf8_lossy(&args[2]).to_string();
@@ -2180,7 +2320,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         .and_then(|s| s.parse().ok())
                         .ok_or_else(|| "value is not an integer or out of range".to_string())?;
                     let slots = if args.len() > 4 {
-                        std::str::from_utf8(&args[4]).ok().and_then(|s| s.parse().ok())
+                        std::str::from_utf8(&args[4])
+                            .ok()
+                            .and_then(|s| s.parse().ok())
                     } else {
                         None
                     };
@@ -2192,7 +2334,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
                 "FAILOVER" => {
                     let force = args.len() > 2 && args[2].eq_ignore_ascii_case(b"force");
-                    Ok(Some(Command::Cluster(ClusterSubcommand::Failover { force })))
+                    Ok(Some(Command::Cluster(ClusterSubcommand::Failover {
+                        force,
+                    })))
                 }
                 "RESET" => {
                     let hard = args.len() > 2 && args[2].eq_ignore_ascii_case(b"hard");
@@ -2200,17 +2344,23 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
                 "FORGET" => {
                     if args.len() < 3 {
-                        return Err("wrong number of arguments for 'cluster forget' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'cluster forget' command".to_string()
+                        );
                     }
                     let node_id = String::from_utf8_lossy(&args[2]).to_string();
                     Ok(Some(Command::Cluster(ClusterSubcommand::Forget(node_id))))
                 }
                 "REPLICATE" => {
                     if args.len() < 3 {
-                        return Err("wrong number of arguments for 'cluster replicate' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'cluster replicate' command".to_string()
+                        );
                     }
                     let node_id = String::from_utf8_lossy(&args[2]).to_string();
-                    Ok(Some(Command::Cluster(ClusterSubcommand::Replicate(node_id))))
+                    Ok(Some(Command::Cluster(ClusterSubcommand::Replicate(
+                        node_id,
+                    ))))
                 }
                 "SAVECONFIG" => Ok(Some(Command::Cluster(ClusterSubcommand::SaveConfig))),
                 _ => Ok(Some(Command::Unknown(format!("CLUSTER {}", sub)))),
@@ -2292,7 +2442,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         if opt == "ID" {
                             i += 1;
                             while i < args.len() {
-                                if let Ok(id) = std::str::from_utf8(&args[i]).unwrap_or("").parse::<u64>() {
+                                if let Ok(id) =
+                                    std::str::from_utf8(&args[i]).unwrap_or("").parse::<u64>()
+                                {
                                     ids.push(id);
                                     i += 1;
                                 } else {
@@ -2319,10 +2471,14 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
                 "GETNAME" => Ok(Some(Command::Client(ClientSubcommand::GetName))),
                 "ID" => Ok(Some(Command::Client(ClientSubcommand::Id))),
-                "KILL" => Ok(Some(Command::Client(ClientSubcommand::Kill(args[2..].to_vec())))),
+                "KILL" => Ok(Some(Command::Client(ClientSubcommand::Kill(
+                    args[2..].to_vec(),
+                )))),
                 "TRACKING" => {
                     if args.len() < 3 {
-                        return Err("wrong number of arguments for 'client tracking' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'client tracking' command".to_string()
+                        );
                     }
                     let state = String::from_utf8_lossy(&args[2]).to_uppercase();
                     let enabled = match state.as_str() {
@@ -2340,15 +2496,13 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                                 bcast = true;
                                 i += 1;
                             }
-                            "PREFIX" => {
-                                if i + 1 < args.len() {
-                                    prefixes.push(args[i + 1].clone());
-                                    i += 2;
-                                } else {
-                                    i += 1;
-                                }
+                            "PREFIX" if i + 1 < args.len() => {
+                                prefixes.push(args[i + 1].clone());
+                                i += 2;
                             }
-                            _ => { i += 1; }
+                            _ => {
+                                i += 1;
+                            }
                         }
                     }
                     Ok(Some(Command::Client(ClientSubcommand::Tracking {
@@ -2359,7 +2513,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
                 "CACHING" => {
                     if args.len() < 3 {
-                        return Err("wrong number of arguments for 'client caching' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'client caching' command".to_string()
+                        );
                     }
                     let state = String::from_utf8_lossy(&args[2]).to_uppercase();
                     let flag = state == "YES";
@@ -2367,7 +2523,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
                 "UNBLOCK" => {
                     if args.len() < 3 || args.len() > 4 {
-                        return Err("wrong number of arguments for 'client unblock' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'client unblock' command".to_string()
+                        );
                     }
                     let client_id: u64 = std::str::from_utf8(&args[2])
                         .map_err(|_| "value is not an integer or out of range".to_string())?
@@ -2383,11 +2541,16 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     } else {
                         crate::block::ClientUnblockType::Timeout
                     };
-                    Ok(Some(Command::Client(ClientSubcommand::Unblock { client_id, unblock_type })))
+                    Ok(Some(Command::Client(ClientSubcommand::Unblock {
+                        client_id,
+                        unblock_type,
+                    })))
                 }
                 "PAUSE" => {
                     if args.len() < 3 {
-                        return Err("wrong number of arguments for 'client pause' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'client pause' command".to_string()
+                        );
                     }
                     let timeout: u64 = std::str::from_utf8(&args[2])
                         .map_err(|_| "value is not an integer or out of range".to_string())?
@@ -2395,12 +2558,12 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         .map_err(|_| "value is not an integer or out of range".to_string())?;
                     Ok(Some(Command::Client(ClientSubcommand::Pause(timeout))))
                 }
-                "UNPAUSE" => {
-                    Ok(Some(Command::Client(ClientSubcommand::Unpause)))
-                }
+                "UNPAUSE" => Ok(Some(Command::Client(ClientSubcommand::Unpause))),
                 "NO-TOUCH" => {
                     if args.len() < 3 {
-                        return Err("wrong number of arguments for 'client no-touch' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'client no-touch' command".to_string()
+                        );
                     }
                     let opt = String::from_utf8_lossy(&args[2]).to_uppercase();
                     let enabled = opt == "ON" || opt == "YES" || opt == "1";
@@ -2411,7 +2574,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
         }
 
         "HSET" => {
-            if args.len() < 4 || (args.len() - 2) % 2 != 0 {
+            if args.len() < 4 || !(args.len() - 2).is_multiple_of(2) {
                 return Err("wrong number of arguments for 'hset' command".to_string());
             }
             let key = args[1].clone();
@@ -2434,7 +2597,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }))
         }
         "HMSET" => {
-            if args.len() < 4 || (args.len() - 2) % 2 != 0 {
+            if args.len() < 4 || !(args.len() - 2).is_multiple_of(2) {
                 return Err("wrong number of arguments for 'hmset' command".to_string());
             }
             let key = args[1].clone();
@@ -2522,14 +2685,19 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if !args[2].eq_ignore_ascii_case(b"FIELDS") {
                 return Err("ERR argument FIELDS is missing or invalid".to_string());
             }
-            let s = std::str::from_utf8(&args[3]).map_err(|_| "ERR Number of fields must be a positive integer".to_string())?;
-            let numfields = s.parse::<i64>().map_err(|_| "ERR Number of fields must be a positive integer".to_string())?;
+            let s = std::str::from_utf8(&args[3])
+                .map_err(|_| "ERR Number of fields must be a positive integer".to_string())?;
+            let numfields = s
+                .parse::<i64>()
+                .map_err(|_| "ERR Number of fields must be a positive integer".to_string())?;
             if numfields <= 0 {
                 return Err("ERR Number of fields must be a positive integer".to_string());
             }
             let fields = args[4..].to_vec();
             if fields.len() != numfields as usize {
-                return Err("ERR numfields parameter must match the number of arguments".to_string());
+                return Err(
+                    "ERR numfields parameter must match the number of arguments".to_string()
+                );
             }
             Ok(Some(Command::Hgetdel {
                 key: args[1].clone(),
@@ -2651,19 +2819,21 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             let s = std::str::from_utf8(args.last().unwrap())
                 .map_err(|_| "timeout is not a float or out of range".to_string())?;
-            let timeout: f64 = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-                match u128::from_str_radix(hex, 16) {
-                    Ok(v) => {
-                        if v > (i64::MAX / 1000) as u128 {
-                            return Err("timeout is out of range".to_string());
+            let timeout: f64 =
+                if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                    match u128::from_str_radix(hex, 16) {
+                        Ok(v) => {
+                            if v > (i64::MAX / 1000) as u128 {
+                                return Err("timeout is out of range".to_string());
+                            }
+                            v as f64
                         }
-                        v as f64
+                        Err(_) => return Err("timeout is out of range".to_string()),
                     }
-                    Err(_) => return Err("timeout is out of range".to_string()),
-                }
-            } else {
-                s.parse::<f64>().map_err(|_| "timeout is not a float or out of range".to_string())?
-            };
+                } else {
+                    s.parse::<f64>()
+                        .map_err(|_| "timeout is not a float or out of range".to_string())?
+                };
             if timeout < 0.0 || timeout.is_nan() {
                 return Err("timeout is negative".to_string());
             }
@@ -2679,19 +2849,21 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             let s = std::str::from_utf8(args.last().unwrap())
                 .map_err(|_| "timeout is not a float or out of range".to_string())?;
-            let timeout: f64 = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-                match u128::from_str_radix(hex, 16) {
-                    Ok(v) => {
-                        if v > (i64::MAX / 1000) as u128 {
-                            return Err("timeout is out of range".to_string());
+            let timeout: f64 =
+                if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                    match u128::from_str_radix(hex, 16) {
+                        Ok(v) => {
+                            if v > (i64::MAX / 1000) as u128 {
+                                return Err("timeout is out of range".to_string());
+                            }
+                            v as f64
                         }
-                        v as f64
+                        Err(_) => return Err("timeout is out of range".to_string()),
                     }
-                    Err(_) => return Err("timeout is out of range".to_string()),
-                }
-            } else {
-                s.parse::<f64>().map_err(|_| "timeout is not a float or out of range".to_string())?
-            };
+                } else {
+                    s.parse::<f64>()
+                        .map_err(|_| "timeout is not a float or out of range".to_string())?
+                };
             if timeout < 0.0 || timeout.is_nan() {
                 return Err("timeout is negative".to_string());
             }
@@ -2908,7 +3080,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
         }
         "SINTERCARD" | "SUNIONCARD" | "SDIFFCARD" => {
             if args.len() < 3 {
-                return Err(format!("wrong number of arguments for '{}' command", cmd_name.to_lowercase()));
+                return Err(format!(
+                    "wrong number of arguments for '{}' command",
+                    cmd_name.to_lowercase()
+                ));
             }
             let numkeys: i64 = std::str::from_utf8(&args[1])
                 .ok()
@@ -2997,7 +3172,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("NX and GT, LT options are not compatible".to_string());
             }
             let remaining = &args[i..];
-            if remaining.is_empty() || remaining.len() % 2 != 0 {
+            if remaining.is_empty() || !remaining.len().is_multiple_of(2) {
                 return Err("syntax error".to_string());
             }
             if flags.incr && remaining.len() != 2 {
@@ -3172,7 +3347,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX".to_string());
             }
             if with_scores && by_lex {
-                return Err("syntax error, WITHSCORES not supported in combination with BYLEX".to_string());
+                return Err(
+                    "syntax error, WITHSCORES not supported in combination with BYLEX".to_string(),
+                );
             }
 
             let mut opts = crate::table::ZRangeOpts {
@@ -3195,8 +3372,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 opts.max_inc = max_i;
             } else if by_lex {
                 let (min_idx, max_idx) = if rev { (3, 2) } else { (2, 3) };
-                let min = crate::table::parse_lex_bound(&args[min_idx]).map_err(|e| e.to_string())?;
-                let max = crate::table::parse_lex_bound(&args[max_idx]).map_err(|e| e.to_string())?;
+                let min =
+                    crate::table::parse_lex_bound(&args[min_idx]).map_err(|e| e.to_string())?;
+                let max =
+                    crate::table::parse_lex_bound(&args[max_idx]).map_err(|e| e.to_string())?;
                 opts.min_lex = min;
                 opts.max_lex = max;
             } else {
@@ -3504,8 +3683,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 opts.max_inc = max_i;
             } else if by_lex {
                 let (min_idx, max_idx) = if rev { (4, 3) } else { (3, 4) };
-                let min = crate::table::parse_lex_bound(&args[min_idx]).map_err(|e| e.to_string())?;
-                let max = crate::table::parse_lex_bound(&args[max_idx]).map_err(|e| e.to_string())?;
+                let min =
+                    crate::table::parse_lex_bound(&args[min_idx]).map_err(|e| e.to_string())?;
+                let max =
+                    crate::table::parse_lex_bound(&args[max_idx]).map_err(|e| e.to_string())?;
                 opts.min_lex = min;
                 opts.max_lex = max;
             } else {
@@ -3530,7 +3711,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
         "ZPOPMIN" | "ZPOPMAX" => {
             let is_min = cmd_name == "ZPOPMIN";
             if args.len() < 2 {
-                return Err(format!("wrong number of arguments for '{}' command", cmd_name.to_lowercase()));
+                return Err(format!(
+                    "wrong number of arguments for '{}' command",
+                    cmd_name.to_lowercase()
+                ));
             }
             let count = if args.len() > 2 {
                 let val = std::str::from_utf8(&args[2])
@@ -3559,7 +3743,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
         "BZPOPMIN" | "BZPOPMAX" => {
             let is_min = cmd_name == "BZPOPMIN";
             if args.len() < 3 {
-                return Err(format!("wrong number of arguments for '{}' command", cmd_name.to_lowercase()));
+                return Err(format!(
+                    "wrong number of arguments for '{}' command",
+                    cmd_name.to_lowercase()
+                ));
             }
             let timeout: f64 = std::str::from_utf8(&args[args.len() - 1])
                 .ok()
@@ -3618,7 +3805,11 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
                 count = c as usize;
             }
-            Ok(Some(Command::Zmpop { keys, is_min, count }))
+            Ok(Some(Command::Zmpop {
+                keys,
+                is_min,
+                count,
+            }))
         }
         "BZMPOP" => {
             if args.len() < 5 {
@@ -3670,12 +3861,20 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
                 count = c as usize;
             }
-            Ok(Some(Command::Bzmpop { timeout, keys, is_min, count }))
+            Ok(Some(Command::Bzmpop {
+                timeout,
+                keys,
+                is_min,
+                count,
+            }))
         }
         "ZUNIONSTORE" | "ZINTERSTORE" => {
             let is_union = cmd_name == "ZUNIONSTORE";
             if args.len() < 4 {
-                return Err(format!("wrong number of arguments for '{}' command", cmd_name.to_lowercase()));
+                return Err(format!(
+                    "wrong number of arguments for '{}' command",
+                    cmd_name.to_lowercase()
+                ));
             }
             let destination = args[1].clone();
             let numkeys: i64 = std::str::from_utf8(&args[2])
@@ -3683,7 +3882,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| "value is not an integer or out of range".to_string())?;
             if numkeys <= 0 {
-                return Err(format!("at least 1 input key is needed for '{}' command", cmd_name.to_lowercase()));
+                return Err(format!(
+                    "at least 1 input key is needed for '{}' command",
+                    cmd_name.to_lowercase()
+                ));
             }
             let numkeys = numkeys as usize;
             if args.len() < 3 + numkeys {
@@ -3726,9 +3928,19 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
             }
             if is_union {
-                Ok(Some(Command::Zunionstore { destination, keys, weights, aggregate }))
+                Ok(Some(Command::Zunionstore {
+                    destination,
+                    keys,
+                    weights,
+                    aggregate,
+                }))
             } else {
-                Ok(Some(Command::Zinterstore { destination, keys, weights, aggregate }))
+                Ok(Some(Command::Zinterstore {
+                    destination,
+                    keys,
+                    weights,
+                    aggregate,
+                }))
             }
         }
         "ZDIFFSTORE" => {
@@ -3780,14 +3992,20 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
         "ZUNION" | "ZINTER" => {
             let is_union = cmd_name == "ZUNION";
             if args.len() < 3 {
-                return Err(format!("wrong number of arguments for '{}' command", cmd_name.to_lowercase()));
+                return Err(format!(
+                    "wrong number of arguments for '{}' command",
+                    cmd_name.to_lowercase()
+                ));
             }
             let numkeys: i64 = std::str::from_utf8(&args[1])
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| "value is not an integer or out of range".to_string())?;
             if numkeys <= 0 {
-                return Err(format!("at least 1 input key is needed for '{}' command", cmd_name.to_lowercase()));
+                return Err(format!(
+                    "at least 1 input key is needed for '{}' command",
+                    cmd_name.to_lowercase()
+                ));
             }
             let numkeys = numkeys as usize;
             if args.len() < 2 + numkeys {
@@ -3834,9 +4052,19 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
             }
             if is_union {
-                Ok(Some(Command::Zunion { keys, weights, aggregate, with_scores }))
+                Ok(Some(Command::Zunion {
+                    keys,
+                    weights,
+                    aggregate,
+                    with_scores,
+                }))
             } else {
-                Ok(Some(Command::Zinter { keys, weights, aggregate, with_scores }))
+                Ok(Some(Command::Zinter {
+                    keys,
+                    weights,
+                    aggregate,
+                    with_scores,
+                }))
             }
         }
         "ZINTERCARD" => {
@@ -3923,9 +4151,13 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             match sub.as_str() {
                 "USAGE" => {
                     if args.len() < 3 {
-                        return Err("wrong number of arguments for 'memory|usage' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'memory|usage' command".to_string()
+                        );
                     }
-                    Ok(Some(Command::Memory(MemorySubcommand::Usage { key: args[2].clone() })))
+                    Ok(Some(Command::Memory(MemorySubcommand::Usage {
+                        key: args[2].clone(),
+                    })))
                 }
                 "STATS" => Ok(Some(Command::Memory(MemorySubcommand::Stats))),
                 "PURGE" => Ok(Some(Command::Memory(MemorySubcommand::Purge))),
@@ -4075,7 +4307,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::Strlen(args[1].clone())))
         }
         "MSETNX" => {
-            if args.len() < 3 || (args.len() - 1) % 2 != 0 {
+            if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
                 return Err("wrong number of arguments for 'msetnx' command".to_string());
             }
             let mut pairs = Vec::with_capacity((args.len() - 1) / 2);
@@ -4112,7 +4344,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'psync' command".to_string());
             }
             let replid = args[1].clone();
-            let offset = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<i64>().ok()) {
+            let offset = match std::str::from_utf8(&args[2])
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+            {
                 Some(o) => o,
                 None => return Err("ERR value is not an integer or out of range".to_string()),
             };
@@ -4130,7 +4365,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'eval' command".to_string());
             }
             let script = args[1].clone();
-            let numkeys: usize = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<usize>().ok()) {
+            let numkeys: usize = match std::str::from_utf8(&args[2])
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+            {
                 Some(n) => n,
                 None => return Err("ERR value is not an integer or out of range".to_string()),
             };
@@ -4139,14 +4377,21 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             let keys = args[3..3 + numkeys].to_vec();
             let script_args = args[3 + numkeys..].to_vec();
-            Ok(Some(Command::Eval { script, keys, args: script_args }))
+            Ok(Some(Command::Eval {
+                script,
+                keys,
+                args: script_args,
+            }))
         }
         "EVALSHA" => {
             if args.len() < 3 {
                 return Err("wrong number of arguments for 'evalsha' command".to_string());
             }
             let sha = args[1].clone();
-            let numkeys: usize = match std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<usize>().ok()) {
+            let numkeys: usize = match std::str::from_utf8(&args[2])
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+            {
                 Some(n) => n,
                 None => return Err("ERR value is not an integer or out of range".to_string()),
             };
@@ -4155,7 +4400,11 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             let keys = args[3..3 + numkeys].to_vec();
             let script_args = args[3 + numkeys..].to_vec();
-            Ok(Some(Command::Evalsha { sha, keys, args: script_args }))
+            Ok(Some(Command::Evalsha {
+                sha,
+                keys,
+                args: script_args,
+            }))
         }
         "SCRIPT" => {
             if args.len() < 2 {
@@ -4165,20 +4414,25 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             match sub.as_str() {
                 "LOAD" => {
                     if args.len() != 3 {
-                        return Err("wrong number of arguments for 'script|load' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'script|load' command".to_string()
+                        );
                     }
                     Ok(Some(Command::ScriptLoad(args[2].clone())))
                 }
                 "EXISTS" => {
                     if args.len() < 3 {
-                        return Err("wrong number of arguments for 'script|exists' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'script|exists' command".to_string()
+                        );
                     }
                     Ok(Some(Command::ScriptExists(args[2..].to_vec())))
                 }
-                "FLUSH" => {
-                    Ok(Some(Command::ScriptFlush))
-                }
-                _ => Err(format!("ERR Unknown SCRIPT subcommand or wrong number of arguments for '{}'", sub)),
+                "FLUSH" => Ok(Some(Command::ScriptFlush)),
+                _ => Err(format!(
+                    "ERR Unknown SCRIPT subcommand or wrong number of arguments for '{}'",
+                    sub
+                )),
             }
         }
         "TIER" => {
@@ -4189,7 +4443,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             match sub.as_str() {
                 "SPILL" => {
                     if args.len() != 3 {
-                        return Err("wrong number of arguments for 'tier spill' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'tier spill' command".to_string()
+                        );
                     }
                     Ok(Some(Command::Tier(TierSubcommand::Spill(args[2].clone()))))
                 }
@@ -4209,7 +4465,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     if args.len() == 2 {
                         Ok(Some(Command::Tier(TierSubcommand::Decommit(None))))
                     } else if args.len() == 3 {
-                        Ok(Some(Command::Tier(TierSubcommand::Decommit(Some(args[2].clone())))))
+                        Ok(Some(Command::Tier(TierSubcommand::Decommit(Some(
+                            args[2].clone(),
+                        )))))
                     } else {
                         Err("wrong number of arguments for 'tier decommit' command".to_string())
                     }
@@ -4219,16 +4477,19 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "GC" => Ok(Some(Command::Tier(TierSubcommand::Gc))),
                 "SNAPSHOT" | "BACKUP" => {
                     if args.len() < 3 {
-                        return Err("wrong number of arguments for 'tier snapshot' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'tier snapshot' command".to_string()
+                        );
                     }
                     let dir = String::from_utf8_lossy(&args[2]).to_string();
-                    Ok(Some(Command::Tier(TierSubcommand::Snapshot(std::path::PathBuf::from(dir)))))
+                    Ok(Some(Command::Tier(TierSubcommand::Snapshot(
+                        std::path::PathBuf::from(dir),
+                    ))))
                 }
                 _ => Err(format!(
                     "ERR unknown subcommand '{}'. Try TIER SPILL, TIER COOL, TIER DECOMMIT, TIER LOAD, TIER INFO, TIER SPILLALL, TIER GC, TIER SNAPSHOT.",
                     sub
                 )),
-
             }
         }
         "DFLYCLUSTER" => {
@@ -4240,10 +4501,15 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "MYID" => Ok(Some(Command::DflyCluster(DflyClusterSubcommand::MyId))),
                 "CONFIG" => {
                     if args.len() != 3 {
-                        return Err("ERR wrong number of arguments for 'dflycluster config' command".to_string());
+                        return Err(
+                            "ERR wrong number of arguments for 'dflycluster config' command"
+                                .to_string(),
+                        );
                     }
                     let json = String::from_utf8_lossy(&args[2]).to_string();
-                    Ok(Some(Command::DflyCluster(DflyClusterSubcommand::Config(json))))
+                    Ok(Some(Command::DflyCluster(DflyClusterSubcommand::Config(
+                        json,
+                    ))))
                 }
                 "GETSLOTINFO" => {
                     if args.len() < 4 || !args[2].eq_ignore_ascii_case(b"slots") {
@@ -4251,32 +4517,42 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     }
                     let mut slots = Vec::new();
                     for a in &args[3..] {
-                        let s: u16 = std::str::from_utf8(a).ok().and_then(|s| s.parse().ok())
+                        let s: u16 = std::str::from_utf8(a)
+                            .ok()
+                            .and_then(|s| s.parse().ok())
                             .ok_or_else(|| "ERR Invalid slot id".to_string())?;
                         slots.push(s);
                     }
-                    Ok(Some(Command::DflyCluster(DflyClusterSubcommand::GetSlotInfo(slots))))
+                    Ok(Some(Command::DflyCluster(
+                        DflyClusterSubcommand::GetSlotInfo(slots),
+                    )))
                 }
                 "FLUSHSLOTS" => {
-                    if args.len() < 4 || (args.len() - 2) % 2 != 0 {
+                    if args.len() < 4 || !(args.len() - 2).is_multiple_of(2) {
                         return Err("ERR syntax error, expected DFLYCLUSTER FLUSHSLOTS start end [start end ...]".to_string());
                     }
                     let mut ranges = Vec::new();
                     for chunk in args[2..].chunks(2) {
-                        let s: u16 = std::str::from_utf8(&chunk[0]).ok().and_then(|s| s.parse().ok())
+                        let s: u16 = std::str::from_utf8(&chunk[0])
+                            .ok()
+                            .and_then(|s| s.parse().ok())
                             .ok_or_else(|| "ERR Invalid start slot".to_string())?;
-                        let e: u16 = std::str::from_utf8(&chunk[1]).ok().and_then(|s| s.parse().ok())
+                        let e: u16 = std::str::from_utf8(&chunk[1])
+                            .ok()
+                            .and_then(|s| s.parse().ok())
                             .ok_or_else(|| "ERR Invalid end slot".to_string())?;
                         if s > e || e >= 16384 {
                             return Err("ERR Slot out of range".to_string());
                         }
                         ranges.push((s, e));
                     }
-                    Ok(Some(Command::DflyCluster(DflyClusterSubcommand::FlushSlots(ranges))))
+                    Ok(Some(Command::DflyCluster(
+                        DflyClusterSubcommand::FlushSlots(ranges),
+                    )))
                 }
-                "SLOT-MIGRATION-STATUS" => {
-                    Ok(Some(Command::DflyCluster(DflyClusterSubcommand::SlotMigrationStatus)))
-                }
+                "SLOT-MIGRATION-STATUS" => Ok(Some(Command::DflyCluster(
+                    DflyClusterSubcommand::SlotMigrationStatus,
+                ))),
                 _ => Err(format!("ERR unknown subcommand '{}' for DFLYCLUSTER", sub)),
             }
         }
@@ -4288,37 +4564,67 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             match sub.as_str() {
                 "INIT" => {
                     if args.len() < 5 {
-                        return Err("ERR wrong number of arguments for 'dflymigrate init' command".to_string());
+                        return Err(
+                            "ERR wrong number of arguments for 'dflymigrate init' command"
+                                .to_string(),
+                        );
                     }
                     let source_id = String::from_utf8_lossy(&args[2]).to_string();
-                    let num_shards = std::str::from_utf8(&args[3]).ok().and_then(|s| s.parse().ok())
+                    let num_shards = std::str::from_utf8(&args[3])
+                        .ok()
+                        .and_then(|s| s.parse().ok())
                         .ok_or_else(|| "ERR Invalid num_shards".to_string())?;
                     let mut slots = Vec::new();
                     for chunk in args[4..].chunks(2) {
                         if chunk.len() == 2 {
-                            let s: u16 = std::str::from_utf8(&chunk[0]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-                            let e: u16 = std::str::from_utf8(&chunk[1]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                            let s: u16 = std::str::from_utf8(&chunk[0])
+                                .ok()
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0);
+                            let e: u16 = std::str::from_utf8(&chunk[1])
+                                .ok()
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(0);
                             slots.push((s, e));
                         }
                     }
-                    Ok(Some(Command::DflyMigrate(DflyMigrateSubcommand::Init { source_id, num_shards, slots })))
+                    Ok(Some(Command::DflyMigrate(DflyMigrateSubcommand::Init {
+                        source_id,
+                        num_shards,
+                        slots,
+                    })))
                 }
                 "FLOW" => {
                     if args.len() != 4 {
-                        return Err("ERR wrong number of arguments for 'dflymigrate flow' command".to_string());
+                        return Err(
+                            "ERR wrong number of arguments for 'dflymigrate flow' command"
+                                .to_string(),
+                        );
                     }
                     let source_id = String::from_utf8_lossy(&args[2]).to_string();
-                    let flow_id = std::str::from_utf8(&args[3]).ok().and_then(|s| s.parse().ok())
+                    let flow_id = std::str::from_utf8(&args[3])
+                        .ok()
+                        .and_then(|s| s.parse().ok())
                         .ok_or_else(|| "ERR Invalid flow_id".to_string())?;
-                    Ok(Some(Command::DflyMigrate(DflyMigrateSubcommand::Flow { source_id, flow_id })))
+                    Ok(Some(Command::DflyMigrate(DflyMigrateSubcommand::Flow {
+                        source_id,
+                        flow_id,
+                    })))
                 }
                 "ACK" => {
                     if args.len() != 3 {
-                        return Err("ERR wrong number of arguments for 'dflymigrate ack' command".to_string());
+                        return Err(
+                            "ERR wrong number of arguments for 'dflymigrate ack' command"
+                                .to_string(),
+                        );
                     }
-                    let flow_id = std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok())
+                    let flow_id = std::str::from_utf8(&args[2])
+                        .ok()
+                        .and_then(|s| s.parse().ok())
                         .ok_or_else(|| "ERR Invalid flow_id".to_string())?;
-                    Ok(Some(Command::DflyMigrate(DflyMigrateSubcommand::Ack { flow_id })))
+                    Ok(Some(Command::DflyMigrate(DflyMigrateSubcommand::Ack {
+                        flow_id,
+                    })))
                 }
                 _ => Err(format!("ERR unknown subcommand '{}' for DFLYMIGRATE", sub)),
             }
@@ -4370,18 +4676,28 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             match sub.as_str() {
                 "GET" => {
                     if args.len() != 3 {
-                        return Err("wrong number of arguments for 'config get' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'config get' command".to_string()
+                        );
                     }
                     Ok(Some(Command::ConfigGet(args[2].clone())))
                 }
                 "SET" => {
                     if args.len() != 4 {
-                        return Err("wrong number of arguments for 'config set' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'config set' command".to_string()
+                        );
                     }
                     Ok(Some(Command::ConfigSet(args[2].clone(), args[3].clone())))
                 }
-                "RESETSTAT" => Ok(Some(Command::ConfigSet(Bytes::from_static(b"resetstat"), Bytes::new()))),
-                "REWRITE" => Ok(Some(Command::ConfigSet(Bytes::from_static(b"rewrite"), Bytes::new()))),
+                "RESETSTAT" => Ok(Some(Command::ConfigSet(
+                    Bytes::from_static(b"resetstat"),
+                    Bytes::new(),
+                ))),
+                "REWRITE" => Ok(Some(Command::ConfigSet(
+                    Bytes::from_static(b"rewrite"),
+                    Bytes::new(),
+                ))),
                 _ => Err(format!("ERR unknown subcommand '{}' for CONFIG", sub)),
             }
         }
@@ -4744,7 +5060,8 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     }
                     "MAXLEN" => {
                         i += 1;
-                        if i < args.len() && (args[i].as_ref() == b"=" || args[i].as_ref() == b"~") {
+                        if i < args.len() && (args[i].as_ref() == b"=" || args[i].as_ref() == b"~")
+                        {
                             i += 1;
                         }
                         if i >= args.len() {
@@ -4759,14 +5076,16 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     }
                     "MINID" => {
                         i += 1;
-                        if i < args.len() && (args[i].as_ref() == b"=" || args[i].as_ref() == b"~") {
+                        if i < args.len() && (args[i].as_ref() == b"=" || args[i].as_ref() == b"~")
+                        {
                             i += 1;
                         }
                         if i >= args.len() {
                             return Err("syntax error".to_string());
                         }
-                        let id_str = std::str::from_utf8(&args[i])
-                            .map_err(|_| "Invalid stream ID specified as stream command argument")?;
+                        let id_str = std::str::from_utf8(&args[i]).map_err(
+                            |_| "Invalid stream ID specified as stream command argument",
+                        )?;
                         let parsed_id = crate::table::StreamId::parse_exact(id_str)
                             .map_err(|e| e.to_string())?;
                         minid = Some(parsed_id);
@@ -4786,11 +5105,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             let id_str = std::str::from_utf8(&args[i])
                 .map_err(|_| "Invalid stream ID specified as stream command argument")?;
-            let id = crate::table::StreamAddId::parse(id_str)
-                .map_err(|e| e.to_string())?;
+            let id = crate::table::StreamAddId::parse(id_str).map_err(|e| e.to_string())?;
             i += 1;
             let rem = args.len() - i;
-            if rem == 0 || rem % 2 != 0 {
+            if rem == 0 || !rem.is_multiple_of(2) {
                 return Err("wrong number of arguments for 'xadd' command".to_string());
             }
             let mut fields = Vec::with_capacity(rem / 2);
@@ -4909,7 +5227,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
             }
             let rem = args.len() - i;
-            if rem < 2 || rem % 2 != 0 {
+            if rem < 2 || !rem.is_multiple_of(2) {
                 return Err("ERR Unbalanced XREAD list of streams and IDs".to_string());
             }
             let n = rem / 2;
@@ -4934,8 +5252,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             for arg in &args[2..] {
                 let s = std::str::from_utf8(arg)
                     .map_err(|_| "Invalid stream ID specified as stream command argument")?;
-                let id = crate::table::StreamId::parse_exact(s)
-                    .map_err(|e| e.to_string())?;
+                let id = crate::table::StreamId::parse_exact(s).map_err(|e| e.to_string())?;
                 ids.push(id);
             }
             Ok(Some(Command::Xdel { key, ids }))
@@ -4953,7 +5270,8 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 match opt.as_str() {
                     "MAXLEN" => {
                         i += 1;
-                        if i < args.len() && (args[i].as_ref() == b"=" || args[i].as_ref() == b"~") {
+                        if i < args.len() && (args[i].as_ref() == b"=" || args[i].as_ref() == b"~")
+                        {
                             i += 1;
                         }
                         if i >= args.len() {
@@ -4968,14 +5286,16 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     }
                     "MINID" => {
                         i += 1;
-                        if i < args.len() && (args[i].as_ref() == b"=" || args[i].as_ref() == b"~") {
+                        if i < args.len() && (args[i].as_ref() == b"=" || args[i].as_ref() == b"~")
+                        {
                             i += 1;
                         }
                         if i >= args.len() {
                             return Err("syntax error".to_string());
                         }
-                        let id_str = std::str::from_utf8(&args[i])
-                            .map_err(|_| "Invalid stream ID specified as stream command argument")?;
+                        let id_str = std::str::from_utf8(&args[i]).map_err(
+                            |_| "Invalid stream ID specified as stream command argument",
+                        )?;
                         let parsed_id = crate::table::StreamId::parse_exact(id_str)
                             .map_err(|e| e.to_string())?;
                         minid = Some(parsed_id);
@@ -4992,11 +5312,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     }
                 }
             }
-            Ok(Some(Command::Xtrim {
-                key,
-                maxlen,
-                minid,
-            }))
+            Ok(Some(Command::Xtrim { key, maxlen, minid }))
         }
         "XGROUP" => {
             if args.len() < 2 {
@@ -5006,7 +5322,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             match sub.as_str() {
                 "CREATE" => {
                     if args.len() < 5 {
-                        return Err("wrong number of arguments for 'xgroup create' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'xgroup create' command".to_string()
+                        );
                     }
                     let key = args[2].clone();
                     let group = args[3].clone();
@@ -5017,11 +5335,18 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             mkstream = true;
                         }
                     }
-                    Ok(Some(Command::XgroupCreate { key, group, id, mkstream }))
+                    Ok(Some(Command::XgroupCreate {
+                        key,
+                        group,
+                        id,
+                        mkstream,
+                    }))
                 }
                 "DESTROY" => {
                     if args.len() < 4 {
-                        return Err("wrong number of arguments for 'xgroup destroy' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'xgroup destroy' command".to_string()
+                        );
                     }
                     let key = args[2].clone();
                     let group = args[3].clone();
@@ -5029,21 +5354,33 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
                 "CREATECONSUMER" => {
                     if args.len() < 5 {
-                        return Err("wrong number of arguments for 'xgroup createconsumer' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'xgroup createconsumer' command"
+                                .to_string(),
+                        );
                     }
                     let key = args[2].clone();
                     let group = args[3].clone();
                     let consumer = args[4].clone();
-                    Ok(Some(Command::XgroupCreateConsumer { key, group, consumer }))
+                    Ok(Some(Command::XgroupCreateConsumer {
+                        key,
+                        group,
+                        consumer,
+                    }))
                 }
                 "DELCONSUMER" => {
                     if args.len() < 5 {
-                        return Err("wrong number of arguments for 'xgroup delconsumer' command".to_string());
+                        return Err("wrong number of arguments for 'xgroup delconsumer' command"
+                            .to_string());
                     }
                     let key = args[2].clone();
                     let group = args[3].clone();
                     let consumer = args[4].clone();
-                    Ok(Some(Command::XgroupDelConsumer { key, group, consumer }))
+                    Ok(Some(Command::XgroupDelConsumer {
+                        key,
+                        group,
+                        consumer,
+                    }))
                 }
                 _ => Ok(Some(Command::Unknown(format!("XGROUP {}", sub)))),
             }
@@ -5098,7 +5435,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
             }
             let rem = args.len() - i;
-            if rem < 2 || rem % 2 != 0 {
+            if rem < 2 || !rem.is_multiple_of(2) {
                 return Err("ERR Unbalanced XREADGROUP list of streams and IDs".to_string());
             }
             let n = rem / 2;
@@ -5127,8 +5464,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             for arg in &args[3..] {
                 let s = std::str::from_utf8(arg)
                     .map_err(|_| "Invalid stream ID specified as stream command argument")?;
-                let id = crate::table::StreamId::parse_exact(s)
-                    .map_err(|e| e.to_string())?;
+                let id = crate::table::StreamId::parse_exact(s).map_err(|e| e.to_string())?;
                 ids.push(id);
             }
             Ok(Some(Command::Xack { key, group, ids }))
@@ -5140,7 +5476,11 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let key = args[1].clone();
             let group = args[2].clone();
             if args.len() == 3 {
-                Ok(Some(Command::Xpending { key, group, range: None }))
+                Ok(Some(Command::Xpending {
+                    key,
+                    group,
+                    range: None,
+                }))
             } else {
                 let mut start_idx = 3;
                 if args[start_idx].eq_ignore_ascii_case(b"IDLE") {
@@ -5150,9 +5490,18 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     return Err("syntax error".to_string());
                 }
                 let start_s = std::str::from_utf8(&args[start_idx]).map_err(|_| "syntax error")?;
-                let start = if start_s == "-" { crate::table::StreamId::default() } else { crate::table::StreamId::parse(start_s)? };
-                let end_s = std::str::from_utf8(&args[start_idx + 1]).map_err(|_| "syntax error")?;
-                let end = if end_s == "+" { crate::table::StreamId::new(u64::MAX, u64::MAX) } else { crate::table::StreamId::parse(end_s)? };
+                let start = if start_s == "-" {
+                    crate::table::StreamId::default()
+                } else {
+                    crate::table::StreamId::parse(start_s)?
+                };
+                let end_s =
+                    std::str::from_utf8(&args[start_idx + 1]).map_err(|_| "syntax error")?;
+                let end = if end_s == "+" {
+                    crate::table::StreamId::new(u64::MAX, u64::MAX)
+                } else {
+                    crate::table::StreamId::parse(end_s)?
+                };
                 let count: usize = std::str::from_utf8(&args[start_idx + 2])
                     .map_err(|_| "value is not an integer or out of range")?
                     .parse()
@@ -5174,11 +5523,11 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let mut auth = None;
             let mut setname = None;
             let mut i = 1;
-            if i < args.len() {
-                if let Ok(p) = String::from_utf8_lossy(&args[i]).parse::<u8>() {
-                    proto = Some(p);
-                    i += 1;
-                }
+            if i < args.len()
+                && let Ok(p) = String::from_utf8_lossy(&args[i]).parse::<u8>()
+            {
+                proto = Some(p);
+                i += 1;
             }
             while i < args.len() {
                 let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
@@ -5205,7 +5554,11 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     }
                 }
             }
-            Ok(Some(Command::Hello { proto, auth, setname }))
+            Ok(Some(Command::Hello {
+                proto,
+                auth,
+                setname,
+            }))
         }
         "RESET" => Ok(Some(Command::Reset)),
         "TIME" => Ok(Some(Command::Time)),
@@ -5235,8 +5588,8 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             let s = std::str::from_utf8(&args[3])
                 .map_err(|_| "value is not a valid float".to_string())?;
-            let increment: f64 = parse_redis_f64(s)
-                .ok_or_else(|| "value is not a valid float".to_string())?;
+            let increment: f64 =
+                parse_redis_f64(s).ok_or_else(|| "value is not a valid float".to_string())?;
             if increment.is_nan() || increment.is_infinite() {
                 return Err("value is NaN or Infinity".to_string());
             }
@@ -5266,10 +5619,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() == 4 {
                 if String::from_utf8_lossy(&args[3]).eq_ignore_ascii_case("WITHVALUES") {
                     with_values = true;
-                    if let Some(c) = count {
-                        if c.checked_mul(2).is_none() {
-                            return Err("value is out of range".to_string());
-                        }
+                    if let Some(c) = count
+                        && c.checked_mul(2).is_none()
+                    {
+                        return Err("value is out of range".to_string());
                     }
                 } else {
                     return Err("syntax error".to_string());
@@ -5434,10 +5787,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() == 4 {
                 if String::from_utf8_lossy(&args[3]).eq_ignore_ascii_case("WITHSCORES") {
                     with_scores = true;
-                    if let Some(c) = count {
-                        if c.checked_mul(2).is_none() {
-                            return Err("value is out of range".to_string());
-                        }
+                    if let Some(c) = count
+                        && c.checked_mul(2).is_none()
+                    {
+                        return Err("value is out of range".to_string());
                     }
                 } else {
                     return Err("syntax error".to_string());
@@ -5741,9 +6094,18 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             while i < args.len() {
                 let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
                 match opt.as_str() {
-                    "ASC" => { desc = false; i += 1; }
-                    "DESC" => { desc = true; i += 1; }
-                    "ALPHA" => { alpha = true; i += 1; }
+                    "ASC" => {
+                        desc = false;
+                        i += 1;
+                    }
+                    "DESC" => {
+                        desc = true;
+                        i += 1;
+                    }
+                    "ALPHA" => {
+                        alpha = true;
+                        i += 1;
+                    }
                     "STORE" => {
                         if i + 1 >= args.len() {
                             return Err("syntax error".to_string());
@@ -5766,7 +6128,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         limit = Some((offset, count));
                         i += 3;
                     }
-                    _ => { i += 1; }
+                    _ => {
+                        i += 1;
+                    }
                 }
             }
             Ok(Some(Command::Sort {
@@ -5816,8 +6180,8 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             let s = std::str::from_utf8(&args[2])
                 .map_err(|_| "value is not a valid float".to_string())?;
-            let increment: f64 = parse_redis_f64(s)
-                .ok_or_else(|| "value is not a valid float".to_string())?;
+            let increment: f64 =
+                parse_redis_f64(s).ok_or_else(|| "value is not a valid float".to_string())?;
             if increment.is_nan() || increment.is_infinite() {
                 return Err("value is NaN or Infinity".to_string());
             }
@@ -5842,7 +6206,11 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
         }
         "GETRANGE" | "SUBSTR" => {
             if args.len() != 4 {
-                let name = if cmd_name == "SUBSTR" { "substr" } else { "getrange" };
+                let name = if cmd_name == "SUBSTR" {
+                    "substr"
+                } else {
+                    "getrange"
+                };
                 return Err(format!("wrong number of arguments for '{}' command", name));
             }
             let start: i64 = std::str::from_utf8(&args[2])
@@ -5912,13 +6280,21 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     query.push(val);
                 }
             }
-            Ok(Some(Command::Vquery { index, k, query, rerank }))
+            Ok(Some(Command::Vquery {
+                index,
+                k,
+                query,
+                rerank,
+            }))
         }
         "CRDT.SET" => {
             if args.len() != 3 {
                 return Err("wrong number of arguments for 'crdt.set' command".to_string());
             }
-            Ok(Some(Command::CrdtSet { key: args[1].clone(), val: args[2].clone() }))
+            Ok(Some(Command::CrdtSet {
+                key: args[1].clone(),
+                val: args[2].clone(),
+            }))
         }
         "CRDT.GET" => {
             if args.len() != 2 {
@@ -5940,13 +6316,19 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 .map_err(|_| "value is not an integer or out of range")?
                 .parse()
                 .map_err(|_| "value is not an integer or out of range")?;
-            Ok(Some(Command::CrdtIncrby { key: args[1].clone(), delta }))
+            Ok(Some(Command::CrdtIncrby {
+                key: args[1].clone(),
+                delta,
+            }))
         }
         "CRDT.SADD" => {
             if args.len() < 3 {
                 return Err("wrong number of arguments for 'crdt.sadd' command".to_string());
             }
-            Ok(Some(Command::CrdtSadd { key: args[1].clone(), member: args[2].clone() }))
+            Ok(Some(Command::CrdtSadd {
+                key: args[1].clone(),
+                member: args[2].clone(),
+            }))
         }
         "CRDT.SMEMBERS" => {
             if args.len() != 2 {
@@ -5958,11 +6340,12 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() != 3 {
                 return Err("wrong number of arguments for 'crdt.srem' command".to_string());
             }
-            Ok(Some(Command::CrdtSrem { key: args[1].clone(), member: args[2].clone() }))
+            Ok(Some(Command::CrdtSrem {
+                key: args[1].clone(),
+                member: args[2].clone(),
+            }))
         }
-        "CRDT.DUMP" => {
-            Ok(Some(Command::CrdtDump))
-        }
+        "CRDT.DUMP" => Ok(Some(Command::CrdtDump)),
         "CRDT.MERGE" => {
             if args.len() != 2 {
                 return Err("wrong number of arguments for 'crdt.merge' command".to_string());
@@ -5990,11 +6373,16 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let k2 = args[3].clone();
             let metric = if args.len() > 4 {
                 let s = String::from_utf8_lossy(&args[4]);
-                crate::vector::VectorMetric::from_str(&s)
+                s.parse::<crate::vector::VectorMetric>().ok()
             } else {
                 None
             };
-            Ok(Some(Command::Vsim { index, k1, k2, metric }))
+            Ok(Some(Command::Vsim {
+                index,
+                k1,
+                k2,
+                metric,
+            }))
         }
         "VDEL" => {
             if args.len() != 3 {
@@ -6019,11 +6407,15 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             match sub.as_str() {
                 "LOAD" => {
                     if args.len() < 3 {
-                        return Err("wrong number of arguments for 'function load' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'function load' command".to_string()
+                        );
                     }
                     let mut replace = false;
                     let mut code_idx = 2;
-                    if args.len() >= 4 && String::from_utf8_lossy(&args[2]).to_uppercase() == "REPLACE" {
+                    if args.len() >= 4
+                        && String::from_utf8_lossy(&args[2]).to_uppercase() == "REPLACE"
+                    {
                         replace = true;
                         code_idx = 3;
                     }
@@ -6034,7 +6426,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "FLUSH" => Ok(Some(Command::FunctionFlush)),
                 "DELETE" => {
                     if args.len() != 3 {
-                        return Err("wrong number of arguments for 'function delete' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'function delete' command".to_string()
+                        );
                     }
                     let lib = String::from_utf8_lossy(&args[2]).to_string();
                     Ok(Some(Command::FunctionDelete(lib)))
@@ -6079,7 +6473,13 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     xx = true;
                 }
             }
-            Ok(Some(Command::JsonSet { key, path, json_val, nx, xx }))
+            Ok(Some(Command::JsonSet {
+                key,
+                path,
+                json_val,
+                nx,
+                xx,
+            }))
         }
         "JSON.GET" => {
             if args.len() < 2 {
@@ -6087,7 +6487,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             let key = args[1].clone();
             let paths = if args.len() > 2 {
-                args[2..].iter().map(|a| String::from_utf8_lossy(a).to_string()).collect()
+                args[2..]
+                    .iter()
+                    .map(|a| String::from_utf8_lossy(a).to_string())
+                    .collect()
             } else {
                 vec!["$".to_string()]
             };
@@ -6123,7 +6526,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             let key = args[1].clone();
             let path = String::from_utf8_lossy(&args[2]).to_string();
-            let delta = String::from_utf8_lossy(&args[3]).parse::<f64>().map_err(|_| "not a number")?;
+            let delta = String::from_utf8_lossy(&args[3])
+                .parse::<f64>()
+                .map_err(|_| "not a number")?;
             Ok(Some(Command::JsonNumIncrBy { key, path, delta }))
         }
         "JSON.NUMMULTBY" => {
@@ -6132,7 +6537,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             let key = args[1].clone();
             let path = String::from_utf8_lossy(&args[2]).to_string();
-            let factor = String::from_utf8_lossy(&args[3]).parse::<f64>().map_err(|_| "not a number")?;
+            let factor = String::from_utf8_lossy(&args[3])
+                .parse::<f64>()
+                .map_err(|_| "not a number")?;
             Ok(Some(Command::JsonNumMultBy { key, path, factor }))
         }
         "JSON.STRAPPEND" => {
@@ -6143,7 +6550,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let (path, value) = if args.len() == 3 {
                 (None, String::from_utf8_lossy(&args[2]).to_string())
             } else {
-                (Some(String::from_utf8_lossy(&args[2]).to_string()), String::from_utf8_lossy(&args[3]).to_string())
+                (
+                    Some(String::from_utf8_lossy(&args[2]).to_string()),
+                    String::from_utf8_lossy(&args[3]).to_string(),
+                )
             };
             Ok(Some(Command::JsonStrAppend { key, path, value }))
         }
@@ -6165,7 +6575,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             let key = args[1].clone();
             let path = String::from_utf8_lossy(&args[2]).to_string();
-            let values = args[3..].iter().map(|a| String::from_utf8_lossy(a).to_string()).collect();
+            let values = args[3..]
+                .iter()
+                .map(|a| String::from_utf8_lossy(a).to_string())
+                .collect();
             Ok(Some(Command::JsonArrAppend { key, path, values }))
         }
         "JSON.ARRLEN" => {
@@ -6273,7 +6686,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     break;
                 }
             }
-            if (args.len() - idx) % 3 != 0 || idx == args.len() {
+            if !(args.len() - idx).is_multiple_of(3) || idx == args.len() {
                 return Err("syntax error".to_string());
             }
             let mut items = Vec::new();
@@ -6290,7 +6703,13 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 items.push((lon, lat, member));
                 idx += 3;
             }
-            Ok(Some(Command::Geoadd { key, items, nx, xx, ch }))
+            Ok(Some(Command::Geoadd {
+                key,
+                items,
+                nx,
+                xx,
+                ch,
+            }))
         }
         "GEODIST" => {
             if args.len() < 4 || args.len() > 5 {
@@ -6300,7 +6719,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let m1 = args[2].clone();
             let m2 = args[3].clone();
             let unit = if args.len() == 5 {
-                Some(crate::geo::GeoUnit::parse(&String::from_utf8_lossy(&args[4]))?)
+                Some(crate::geo::GeoUnit::parse(&String::from_utf8_lossy(
+                    &args[4],
+                ))?)
             } else {
                 None
             };
@@ -6370,7 +6791,16 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 idx += 1;
             }
             Ok(Some(Command::Georadius {
-                key, lon, lat, radius, unit, withcoord, withdist, withhash, count, asc,
+                key,
+                lon,
+                lat,
+                radius,
+                unit,
+                withcoord,
+                withdist,
+                withhash,
+                count,
+                asc,
             }))
         }
         "GEORADIUSBYMEMBER" => {
@@ -6414,7 +6844,15 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 idx += 1;
             }
             Ok(Some(Command::Georadiusbymember {
-                key, member, radius, unit, withcoord, withdist, withhash, count, asc,
+                key,
+                member,
+                radius,
+                unit,
+                withcoord,
+                withdist,
+                withhash,
+                count,
+                asc,
             }))
         }
         "GEOSEARCH" => {
@@ -6436,50 +6874,68 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 let opt = String::from_utf8_lossy(&args[idx]).to_uppercase();
                 match opt.as_str() {
                     "FROMMEMBER" => {
-                        if idx + 1 >= args.len() { return Err("syntax error".to_string()); }
+                        if idx + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
                         idx += 1;
                         from_member = Some(args[idx].clone());
                     }
                     "FROMLONLAT" => {
-                        if idx + 2 >= args.len() { return Err("syntax error".to_string()); }
+                        if idx + 2 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
                         let lon: f64 = std::str::from_utf8(&args[idx + 1])
                             .map_err(|_| "value is not a valid float")?
-                            .parse().map_err(|_| "value is not a valid float")?;
+                            .parse()
+                            .map_err(|_| "value is not a valid float")?;
                         let lat: f64 = std::str::from_utf8(&args[idx + 2])
                             .map_err(|_| "value is not a valid float")?
-                            .parse().map_err(|_| "value is not a valid float")?;
+                            .parse()
+                            .map_err(|_| "value is not a valid float")?;
                         idx += 2;
                         from_lonlat = Some((lon, lat));
                     }
                     "BYRADIUS" => {
-                        if idx + 2 >= args.len() { return Err("syntax error".to_string()); }
+                        if idx + 2 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
                         let rad: f64 = std::str::from_utf8(&args[idx + 1])
                             .map_err(|_| "value is not a valid float")?
-                            .parse().map_err(|_| "value is not a valid float")?;
-                        let u = crate::geo::GeoUnit::parse(&String::from_utf8_lossy(&args[idx + 2]))?;
+                            .parse()
+                            .map_err(|_| "value is not a valid float")?;
+                        let u =
+                            crate::geo::GeoUnit::parse(&String::from_utf8_lossy(&args[idx + 2]))?;
                         idx += 2;
                         by_radius = Some((rad, u));
                     }
                     "BYBOX" => {
-                        if idx + 3 >= args.len() { return Err("syntax error".to_string()); }
+                        if idx + 3 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
                         let w: f64 = std::str::from_utf8(&args[idx + 1])
                             .map_err(|_| "value is not a valid float")?
-                            .parse().map_err(|_| "value is not a valid float")?;
+                            .parse()
+                            .map_err(|_| "value is not a valid float")?;
                         let h: f64 = std::str::from_utf8(&args[idx + 2])
                             .map_err(|_| "value is not a valid float")?
-                            .parse().map_err(|_| "value is not a valid float")?;
-                        let u = crate::geo::GeoUnit::parse(&String::from_utf8_lossy(&args[idx + 3]))?;
+                            .parse()
+                            .map_err(|_| "value is not a valid float")?;
+                        let u =
+                            crate::geo::GeoUnit::parse(&String::from_utf8_lossy(&args[idx + 3]))?;
                         idx += 3;
                         by_box = Some((w, h, u));
                     }
                     "ASC" => asc = Some(true),
                     "DESC" => asc = Some(false),
                     "COUNT" => {
-                        if idx + 1 >= args.len() { return Err("syntax error".to_string()); }
+                        if idx + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
                         idx += 1;
                         let c: usize = std::str::from_utf8(&args[idx])
                             .map_err(|_| "value is not an integer or out of range")?
-                            .parse().map_err(|_| "value is not an integer or out of range")?;
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
                         count = Some(c);
                     }
                     "WITHCOORD" => withcoord = true,
@@ -6490,7 +6946,16 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 idx += 1;
             }
             Ok(Some(Command::Geosearch {
-                key, from_member, from_lonlat, by_radius, by_box, asc, count, withcoord, withdist, withhash,
+                key,
+                from_member,
+                from_lonlat,
+                by_radius,
+                by_box,
+                asc,
+                count,
+                withcoord,
+                withdist,
+                withhash,
             }))
         }
         "BF.RESERVE" => {
@@ -6499,34 +6964,54 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             let key = args[1].clone();
             let error_rate: f64 = std::str::from_utf8(&args[2])
-                .map_err(|_| "not a valid float")?.parse().map_err(|_| "not a valid float")?;
+                .map_err(|_| "not a valid float")?
+                .parse()
+                .map_err(|_| "not a valid float")?;
             let capacity: usize = std::str::from_utf8(&args[3])
-                .map_err(|_| "not an integer")?.parse().map_err(|_| "not an integer")?;
-            Ok(Some(Command::BfReserve { key, error_rate, capacity }))
+                .map_err(|_| "not an integer")?
+                .parse()
+                .map_err(|_| "not an integer")?;
+            Ok(Some(Command::BfReserve {
+                key,
+                error_rate,
+                capacity,
+            }))
         }
         "BF.ADD" => {
             if args.len() != 3 {
                 return Err("wrong number of arguments for 'bf.add' command".to_string());
             }
-            Ok(Some(Command::BfAdd { key: args[1].clone(), item: args[2].clone() }))
+            Ok(Some(Command::BfAdd {
+                key: args[1].clone(),
+                item: args[2].clone(),
+            }))
         }
         "BF.MADD" => {
             if args.len() < 3 {
                 return Err("wrong number of arguments for 'bf.madd' command".to_string());
             }
-            Ok(Some(Command::BfMadd { key: args[1].clone(), items: args[2..].to_vec() }))
+            Ok(Some(Command::BfMadd {
+                key: args[1].clone(),
+                items: args[2..].to_vec(),
+            }))
         }
         "BF.EXISTS" => {
             if args.len() != 3 {
                 return Err("wrong number of arguments for 'bf.exists' command".to_string());
             }
-            Ok(Some(Command::BfExists { key: args[1].clone(), item: args[2].clone() }))
+            Ok(Some(Command::BfExists {
+                key: args[1].clone(),
+                item: args[2].clone(),
+            }))
         }
         "BF.MEXISTS" => {
             if args.len() < 3 {
                 return Err("wrong number of arguments for 'bf.mexists' command".to_string());
             }
-            Ok(Some(Command::BfMexists { key: args[1].clone(), items: args[2..].to_vec() }))
+            Ok(Some(Command::BfMexists {
+                key: args[1].clone(),
+                items: args[2..].to_vec(),
+            }))
         }
         "BF.INFO" => {
             if args.len() != 2 {
@@ -6540,32 +7025,46 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             let key = args[1].clone();
             let capacity: usize = std::str::from_utf8(&args[2])
-                .map_err(|_| "not an integer")?.parse().map_err(|_| "not an integer")?;
+                .map_err(|_| "not an integer")?
+                .parse()
+                .map_err(|_| "not an integer")?;
             Ok(Some(Command::CfReserve { key, capacity }))
         }
         "CF.ADD" => {
             if args.len() != 3 {
                 return Err("wrong number of arguments for 'cf.add' command".to_string());
             }
-            Ok(Some(Command::CfAdd { key: args[1].clone(), item: args[2].clone() }))
+            Ok(Some(Command::CfAdd {
+                key: args[1].clone(),
+                item: args[2].clone(),
+            }))
         }
         "CF.ADDNX" => {
             if args.len() != 3 {
                 return Err("wrong number of arguments for 'cf.addnx' command".to_string());
             }
-            Ok(Some(Command::CfAddnx { key: args[1].clone(), item: args[2].clone() }))
+            Ok(Some(Command::CfAddnx {
+                key: args[1].clone(),
+                item: args[2].clone(),
+            }))
         }
         "CF.EXISTS" => {
             if args.len() != 3 {
                 return Err("wrong number of arguments for 'cf.exists' command".to_string());
             }
-            Ok(Some(Command::CfExists { key: args[1].clone(), item: args[2].clone() }))
+            Ok(Some(Command::CfExists {
+                key: args[1].clone(),
+                item: args[2].clone(),
+            }))
         }
         "CF.DEL" => {
             if args.len() != 3 {
                 return Err("wrong number of arguments for 'cf.del' command".to_string());
             }
-            Ok(Some(Command::CfDel { key: args[1].clone(), item: args[2].clone() }))
+            Ok(Some(Command::CfDel {
+                key: args[1].clone(),
+                item: args[2].clone(),
+            }))
         }
         "CF.INFO" => {
             if args.len() != 2 {
@@ -6579,9 +7078,13 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             let key = args[1].clone();
             let width: usize = std::str::from_utf8(&args[2])
-                .map_err(|_| "not an integer")?.parse().map_err(|_| "not an integer")?;
+                .map_err(|_| "not an integer")?
+                .parse()
+                .map_err(|_| "not an integer")?;
             let depth: usize = std::str::from_utf8(&args[3])
-                .map_err(|_| "not an integer")?.parse().map_err(|_| "not an integer")?;
+                .map_err(|_| "not an integer")?
+                .parse()
+                .map_err(|_| "not an integer")?;
             Ok(Some(Command::CmsInitbydim { key, width, depth }))
         }
         "CMS.INITBYPROB" => {
@@ -6590,13 +7093,21 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             let key = args[1].clone();
             let error: f64 = std::str::from_utf8(&args[2])
-                .map_err(|_| "not a valid float")?.parse().map_err(|_| "not a valid float")?;
+                .map_err(|_| "not a valid float")?
+                .parse()
+                .map_err(|_| "not a valid float")?;
             let probability: f64 = std::str::from_utf8(&args[3])
-                .map_err(|_| "not a valid float")?.parse().map_err(|_| "not a valid float")?;
-            Ok(Some(Command::CmsInitbyprob { key, error, probability }))
+                .map_err(|_| "not a valid float")?
+                .parse()
+                .map_err(|_| "not a valid float")?;
+            Ok(Some(Command::CmsInitbyprob {
+                key,
+                error,
+                probability,
+            }))
         }
         "CMS.INCRBY" => {
-            if args.len() < 4 || (args.len() - 2) % 2 != 0 {
+            if args.len() < 4 || !(args.len() - 2).is_multiple_of(2) {
                 return Err("wrong number of arguments for 'cms.incrby' command".to_string());
             }
             let key = args[1].clone();
@@ -6605,7 +7116,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             while i < args.len() {
                 let item = args[i].clone();
                 let inc: u64 = std::str::from_utf8(&args[i + 1])
-                    .map_err(|_| "not an integer")?.parse().map_err(|_| "not an integer")?;
+                    .map_err(|_| "not an integer")?
+                    .parse()
+                    .map_err(|_| "not an integer")?;
                 pairs.push((item, inc));
                 i += 2;
             }
@@ -6615,7 +7128,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() < 3 {
                 return Err("wrong number of arguments for 'cms.query' command".to_string());
             }
-            Ok(Some(Command::CmsQuery { key: args[1].clone(), items: args[2..].to_vec() }))
+            Ok(Some(Command::CmsQuery {
+                key: args[1].clone(),
+                items: args[2..].to_vec(),
+            }))
         }
         "CMS.INFO" => {
             if args.len() != 2 {
@@ -6629,20 +7145,28 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             let key = args[1].clone();
             let topk: usize = std::str::from_utf8(&args[2])
-                .map_err(|_| "not an integer")?.parse().map_err(|_| "not an integer")?;
+                .map_err(|_| "not an integer")?
+                .parse()
+                .map_err(|_| "not an integer")?;
             Ok(Some(Command::TopkReserve { key, topk }))
         }
         "TOPK.ADD" => {
             if args.len() < 3 {
                 return Err("wrong number of arguments for 'topk.add' command".to_string());
             }
-            Ok(Some(Command::TopkAdd { key: args[1].clone(), items: args[2..].to_vec() }))
+            Ok(Some(Command::TopkAdd {
+                key: args[1].clone(),
+                items: args[2..].to_vec(),
+            }))
         }
         "TOPK.QUERY" => {
             if args.len() < 3 {
                 return Err("wrong number of arguments for 'topk.query' command".to_string());
             }
-            Ok(Some(Command::TopkQuery { key: args[1].clone(), items: args[2..].to_vec() }))
+            Ok(Some(Command::TopkQuery {
+                key: args[1].clone(),
+                items: args[2..].to_vec(),
+            }))
         }
         "TOPK.LIST" => {
             if args.len() != 2 {
@@ -6703,7 +7227,8 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         while i < args.len() {
                             let sub_opt = String::from_utf8_lossy(&args[i]).to_uppercase();
                             if sub_opt == "WEIGHT" && i + 1 < args.len() {
-                                weight = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(1.0);
+                                weight =
+                                    String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(1.0);
                                 i += 2;
                             } else if sub_opt == "SORTABLE" {
                                 sortable = true;
@@ -6715,11 +7240,20 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                                 break;
                             }
                         }
-                        fields.insert(fname, crate::search::FieldType::Text { weight, sortable, nostem });
+                        fields.insert(
+                            fname,
+                            crate::search::FieldType::Text {
+                                weight,
+                                sortable,
+                                nostem,
+                            },
+                        );
                     }
                     "NUMERIC" => {
                         let mut sortable = false;
-                        if i < args.len() && String::from_utf8_lossy(&args[i]).to_uppercase() == "SORTABLE" {
+                        if i < args.len()
+                            && String::from_utf8_lossy(&args[i]).to_uppercase() == "SORTABLE"
+                        {
                             sortable = true;
                             i += 1;
                         }
@@ -6731,7 +7265,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         while i < args.len() {
                             let sub_opt = String::from_utf8_lossy(&args[i]).to_uppercase();
                             if sub_opt == "SEPARATOR" && i + 1 < args.len() {
-                                separator = String::from_utf8_lossy(&args[i + 1]).chars().next().unwrap_or(',');
+                                separator = String::from_utf8_lossy(&args[i + 1])
+                                    .chars()
+                                    .next()
+                                    .unwrap_or(',');
                                 i += 2;
                             } else if sub_opt == "CASESENSITIVE" {
                                 casesensitive = true;
@@ -6740,10 +7277,20 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                                 break;
                             }
                         }
-                        fields.insert(fname, crate::search::FieldType::Tag { separator, casesensitive });
+                        fields.insert(
+                            fname,
+                            crate::search::FieldType::Tag {
+                                separator,
+                                casesensitive,
+                            },
+                        );
                     }
                     "VECTOR" => {
-                        let algorithm = if i < args.len() { String::from_utf8_lossy(&args[i]).to_string() } else { "HNSW".to_string() };
+                        let algorithm = if i < args.len() {
+                            String::from_utf8_lossy(&args[i]).to_string()
+                        } else {
+                            "HNSW".to_string()
+                        };
                         i += 1;
                         let mut dim = 128;
                         let mut distance_metric = "COSINE".to_string();
@@ -6753,24 +7300,42 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                                 dim = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(128);
                                 i += 2;
                             } else if sub_opt == "DISTANCE_METRIC" && i + 1 < args.len() {
-                                distance_metric = String::from_utf8_lossy(&args[i + 1]).to_uppercase();
+                                distance_metric =
+                                    String::from_utf8_lossy(&args[i + 1]).to_uppercase();
                                 i += 2;
-                            } else if sub_opt == "TYPE" || sub_opt == "FLOAT32" || sub_opt == "M" || sub_opt == "EF_CONSTRUCTION" {
+                            } else if sub_opt == "TYPE"
+                                || sub_opt == "FLOAT32"
+                                || sub_opt == "M"
+                                || sub_opt == "EF_CONSTRUCTION"
+                            {
                                 i += 2;
-                            } else if sub_opt == "HNSW" || sub_opt == "FLAT" {
-                                i += 1;
-                            } else if sub_opt.parse::<usize>().is_ok() {
+                            } else if sub_opt == "HNSW"
+                                || sub_opt == "FLAT"
+                                || sub_opt.parse::<usize>().is_ok()
+                            {
                                 i += 1;
                             } else {
                                 break;
                             }
                         }
-                        fields.insert(fname, crate::search::FieldType::Vector { dim, distance_metric, algorithm });
+                        fields.insert(
+                            fname,
+                            crate::search::FieldType::Vector {
+                                dim,
+                                distance_metric,
+                                algorithm,
+                            },
+                        );
                     }
                     _ => {}
                 }
             }
-            Ok(Some(Command::FtCreate { index, on_type, prefixes, fields }))
+            Ok(Some(Command::FtCreate {
+                index,
+                on_type,
+                prefixes,
+                fields,
+            }))
         }
         "FT.SEARCH" => {
             if args.len() < 3 {
@@ -6831,13 +7396,19 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     i += 1;
                 }
             }
-            Ok(Some(Command::FtSearch { index, query, options }))
+            Ok(Some(Command::FtSearch {
+                index,
+                query,
+                options,
+            }))
         }
         "FT.INFO" => {
             if args.len() != 2 {
                 return Err("wrong number of arguments for 'ft.info' command".to_string());
             }
-            Ok(Some(Command::FtInfo(String::from_utf8_lossy(&args[1]).to_string())))
+            Ok(Some(Command::FtInfo(
+                String::from_utf8_lossy(&args[1]).to_string(),
+            )))
         }
         "FT.DROPINDEX" => {
             if args.len() < 2 {
@@ -6877,11 +7448,14 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 fields.push((f, v));
                 i += 2;
             }
-            Ok(Some(Command::FtAdd { index, doc_id, score, fields }))
+            Ok(Some(Command::FtAdd {
+                index,
+                doc_id,
+                score,
+                fields,
+            }))
         }
-        "XDP.INFO" => {
-            Ok(Some(Command::XdpInfo))
-        }
+        "XDP.INFO" => Ok(Some(Command::XdpInfo)),
         "XDP.RULE" => {
             if args.len() < 2 {
                 return Err("wrong number of arguments for 'xdp.rule' command".to_string());
@@ -6890,7 +7464,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             match sub.as_str() {
                 "ADD" => {
                     if args.len() < 4 {
-                        return Err("wrong number of arguments for 'xdp.rule add' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'xdp.rule add' command".to_string()
+                        );
                     }
                     let action_str = String::from_utf8_lossy(&args[2]).to_uppercase();
                     let action = match action_str.as_str() {
@@ -6905,20 +7481,20 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
                 "DEL" => {
                     if args.len() != 3 {
-                        return Err("wrong number of arguments for 'xdp.rule del' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'xdp.rule del' command".to_string()
+                        );
                     }
-                    let id: u32 = String::from_utf8_lossy(&args[2]).parse().map_err(|_| "Invalid rule ID".to_string())?;
+                    let id: u32 = String::from_utf8_lossy(&args[2])
+                        .parse()
+                        .map_err(|_| "Invalid rule ID".to_string())?;
                     Ok(Some(Command::XdpRuleDel(id)))
                 }
-                "LIST" => {
-                    Ok(Some(Command::XdpRuleList))
-                }
+                "LIST" => Ok(Some(Command::XdpRuleList)),
                 _ => Err(format!("Unknown xdp.rule subcommand: {}", sub)),
             }
         }
-        "XDP.STATS" => {
-            Ok(Some(Command::XdpStats))
-        }
+        "XDP.STATS" => Ok(Some(Command::XdpStats)),
         "XDP.PACKET" => {
             if args.len() != 2 {
                 return Err("wrong number of arguments for 'xdp.packet' command".to_string());
@@ -6926,7 +7502,6 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::XdpPacket(args[1].clone())))
         }
         _ => Ok(Some(Command::Unknown(cmd_name))),
-
     }
 }
 
@@ -6960,13 +7535,11 @@ pub fn parse_redis_f64(s: &str) -> Option<f64> {
         unsafe {
             let mut end: *mut libc::c_char = std::ptr::null_mut();
             let val = libc::strtod(c_str.as_ptr(), &mut end);
-            if !end.is_null() && *end == 0 && end != c_str.as_ptr() as *mut libc::c_char {
-                if !val.is_nan() {
-                    if val.is_infinite() && !is_literal_inf {
-                        return None;
-                    }
-                    return Some(val);
+            if !end.is_null() && *end == 0 && !std::ptr::eq(end, c_str.as_ptr()) && !val.is_nan() {
+                if val.is_infinite() && !is_literal_inf {
+                    return None;
                 }
+                return Some(val);
             }
         }
     }
@@ -7313,7 +7886,8 @@ mod tests {
         );
 
         // RESTORE
-        let mut buf = BytesMut::from("*4\r\n$7\r\nRESTORE\r\n$5\r\nmykey\r\n$1\r\n0\r\n$4\r\ndata\r\n");
+        let mut buf =
+            BytesMut::from("*4\r\n$7\r\nRESTORE\r\n$5\r\nmykey\r\n$1\r\n0\r\n$4\r\ndata\r\n");
         assert_eq!(
             parse_command(&mut buf).unwrap().unwrap(),
             Command::Restore {
@@ -7326,7 +7900,9 @@ mod tests {
         );
 
         // RESTORE with REPLACE and ABSTTL
-        let mut buf = BytesMut::from("*6\r\n$7\r\nRESTORE\r\n$5\r\nmykey\r\n$4\r\n1000\r\n$4\r\ndata\r\n$7\r\nREPLACE\r\n$6\r\nABSTTL\r\n");
+        let mut buf = BytesMut::from(
+            "*6\r\n$7\r\nRESTORE\r\n$5\r\nmykey\r\n$4\r\n1000\r\n$4\r\ndata\r\n$7\r\nREPLACE\r\n$6\r\nABSTTL\r\n",
+        );
         assert_eq!(
             parse_command(&mut buf).unwrap().unwrap(),
             Command::Restore {
@@ -7456,66 +8032,251 @@ mod tests {
         let mut buf = BytesMut::from("TIME\r\n");
         assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Time);
         let mut buf = BytesMut::from("ECHO hi\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Echo(Bytes::from_static(b"hi")));
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Echo(Bytes::from_static(b"hi"))
+        );
 
         // HASHES: HINCRBY, HINCRBYFLOAT, HRANDFIELD, HSCAN
         let mut buf = BytesMut::from("HINCRBY h f 5\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Hincrby { key: Bytes::from_static(b"h"), field: Bytes::from_static(b"f"), increment: 5 });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Hincrby {
+                key: Bytes::from_static(b"h"),
+                field: Bytes::from_static(b"f"),
+                increment: 5
+            }
+        );
         let mut buf = BytesMut::from("HINCRBYFLOAT h f 2.5\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Hincrbyfloat { key: Bytes::from_static(b"h"), field: Bytes::from_static(b"f"), increment: 2.5 });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Hincrbyfloat {
+                key: Bytes::from_static(b"h"),
+                field: Bytes::from_static(b"f"),
+                increment: 2.5
+            }
+        );
         let mut buf = BytesMut::from("HRANDFIELD h 3 WITHVALUES\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Hrandfield { key: Bytes::from_static(b"h"), count: Some(3), with_values: true });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Hrandfield {
+                key: Bytes::from_static(b"h"),
+                count: Some(3),
+                with_values: true
+            }
+        );
         let mut buf = BytesMut::from("HSCAN h 0 MATCH pat* COUNT 20\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Hscan { key: Bytes::from_static(b"h"), cursor: 0, pattern: Some(Bytes::from_static(b"pat*")), count: Some(20) });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Hscan {
+                key: Bytes::from_static(b"h"),
+                cursor: 0,
+                pattern: Some(Bytes::from_static(b"pat*")),
+                count: Some(20)
+            }
+        );
 
         // SETS: SMISMEMBER, SRANDMEMBER, SMOVE, SSCAN
         let mut buf = BytesMut::from("SMISMEMBER s m1 m2\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Smismember { key: Bytes::from_static(b"s"), members: vec![Bytes::from_static(b"m1"), Bytes::from_static(b"m2")] });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Smismember {
+                key: Bytes::from_static(b"s"),
+                members: vec![Bytes::from_static(b"m1"), Bytes::from_static(b"m2")]
+            }
+        );
         let mut buf = BytesMut::from("SRANDMEMBER s 2\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Srandmember { key: Bytes::from_static(b"s"), count: Some(2) });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Srandmember {
+                key: Bytes::from_static(b"s"),
+                count: Some(2)
+            }
+        );
         let mut buf = BytesMut::from("SMOVE s1 s2 m\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Smove { source: Bytes::from_static(b"s1"), destination: Bytes::from_static(b"s2"), member: Bytes::from_static(b"m") });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Smove {
+                source: Bytes::from_static(b"s1"),
+                destination: Bytes::from_static(b"s2"),
+                member: Bytes::from_static(b"m")
+            }
+        );
         let mut buf = BytesMut::from("SSCAN s 0\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Sscan { key: Bytes::from_static(b"s"), cursor: 0, pattern: None, count: None });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Sscan {
+                key: Bytes::from_static(b"s"),
+                cursor: 0,
+                pattern: None,
+                count: None
+            }
+        );
 
         // ZSETS: ZMSCORE, ZRANDMEMBER, ZREMRANGEBYRANK, ZREMRANGEBYSCORE, ZREMRANGEBYLEX, ZLEXCOUNT, ZSCAN
         let mut buf = BytesMut::from("ZMSCORE z m1 m2\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Zmscore { key: Bytes::from_static(b"z"), members: vec![Bytes::from_static(b"m1"), Bytes::from_static(b"m2")] });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Zmscore {
+                key: Bytes::from_static(b"z"),
+                members: vec![Bytes::from_static(b"m1"), Bytes::from_static(b"m2")]
+            }
+        );
         let mut buf = BytesMut::from("ZRANDMEMBER z 2 WITHSCORES\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Zrandmember { key: Bytes::from_static(b"z"), count: Some(2), with_scores: true });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Zrandmember {
+                key: Bytes::from_static(b"z"),
+                count: Some(2),
+                with_scores: true
+            }
+        );
         let mut buf = BytesMut::from("ZREMRANGEBYRANK z 0 2\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Zremrangebyrank { key: Bytes::from_static(b"z"), start: 0, stop: 2 });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Zremrangebyrank {
+                key: Bytes::from_static(b"z"),
+                start: 0,
+                stop: 2
+            }
+        );
         let mut buf = BytesMut::from("ZREMRANGEBYSCORE z (1.5 5.0\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Zremrangebyscore { key: Bytes::from_static(b"z"), min_score: 1.5, min_inc: false, max_score: 5.0, max_inc: true });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Zremrangebyscore {
+                key: Bytes::from_static(b"z"),
+                min_score: 1.5,
+                min_inc: false,
+                max_score: 5.0,
+                max_inc: true
+            }
+        );
         let mut buf = BytesMut::from("ZREMRANGEBYLEX z [a (c\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Zremrangebylex { key: Bytes::from_static(b"z"), min: crate::table::LexBound::Inclusive(Bytes::from_static(b"a")), max: crate::table::LexBound::Exclusive(Bytes::from_static(b"c")) });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Zremrangebylex {
+                key: Bytes::from_static(b"z"),
+                min: crate::table::LexBound::Inclusive(Bytes::from_static(b"a")),
+                max: crate::table::LexBound::Exclusive(Bytes::from_static(b"c"))
+            }
+        );
         let mut buf = BytesMut::from("ZLEXCOUNT z - +\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Zlexcount { key: Bytes::from_static(b"z"), min: crate::table::LexBound::UnboundedMin, max: crate::table::LexBound::UnboundedMax });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Zlexcount {
+                key: Bytes::from_static(b"z"),
+                min: crate::table::LexBound::UnboundedMin,
+                max: crate::table::LexBound::UnboundedMax
+            }
+        );
         let mut buf = BytesMut::from("ZSCAN z 0\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Zscan { key: Bytes::from_static(b"z"), cursor: 0, pattern: None, count: None });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Zscan {
+                key: Bytes::from_static(b"z"),
+                cursor: 0,
+                pattern: None,
+                count: None
+            }
+        );
 
         // LISTS: LTRIM, LSET, LREM, LPOS, LINSERT, LMOVE, BLMOVE
         let mut buf = BytesMut::from("LTRIM l 1 2\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Ltrim { key: Bytes::from_static(b"l"), start: 1, stop: 2 });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Ltrim {
+                key: Bytes::from_static(b"l"),
+                start: 1,
+                stop: 2
+            }
+        );
         let mut buf = BytesMut::from("LSET l 0 val\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Lset { key: Bytes::from_static(b"l"), index: 0, element: Bytes::from_static(b"val") });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Lset {
+                key: Bytes::from_static(b"l"),
+                index: 0,
+                element: Bytes::from_static(b"val")
+            }
+        );
         let mut buf = BytesMut::from("LREM l 2 val\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Lrem { key: Bytes::from_static(b"l"), count: 2, element: Bytes::from_static(b"val") });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Lrem {
+                key: Bytes::from_static(b"l"),
+                count: 2,
+                element: Bytes::from_static(b"val")
+            }
+        );
         let mut buf = BytesMut::from("LPOS l val RANK 2 COUNT 3 MAXLEN 100\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Lpos { key: Bytes::from_static(b"l"), element: Bytes::from_static(b"val"), rank: Some(2), count: Some(3), maxlen: Some(100) });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Lpos {
+                key: Bytes::from_static(b"l"),
+                element: Bytes::from_static(b"val"),
+                rank: Some(2),
+                count: Some(3),
+                maxlen: Some(100)
+            }
+        );
         let mut buf = BytesMut::from("LINSERT l AFTER p e\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Linsert { key: Bytes::from_static(b"l"), before: false, pivot: Bytes::from_static(b"p"), element: Bytes::from_static(b"e") });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Linsert {
+                key: Bytes::from_static(b"l"),
+                before: false,
+                pivot: Bytes::from_static(b"p"),
+                element: Bytes::from_static(b"e")
+            }
+        );
         let mut buf = BytesMut::from("LMOVE l1 l2 LEFT RIGHT\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Lmove { source: Bytes::from_static(b"l1"), destination: Bytes::from_static(b"l2"), where_from: crate::table::ListDirection::Left, where_to: crate::table::ListDirection::Right });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Lmove {
+                source: Bytes::from_static(b"l1"),
+                destination: Bytes::from_static(b"l2"),
+                where_from: crate::table::ListDirection::Left,
+                where_to: crate::table::ListDirection::Right
+            }
+        );
         let mut buf = BytesMut::from("BLMOVE l1 l2 RIGHT LEFT 1.5\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Blmove { source: Bytes::from_static(b"l1"), destination: Bytes::from_static(b"l2"), where_from: crate::table::ListDirection::Right, where_to: crate::table::ListDirection::Left, timeout: 1.5 });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Blmove {
+                source: Bytes::from_static(b"l1"),
+                destination: Bytes::from_static(b"l2"),
+                where_from: crate::table::ListDirection::Right,
+                where_to: crate::table::ListDirection::Left,
+                timeout: 1.5
+            }
+        );
 
         // STRINGS: INCRBYFLOAT, SETRANGE, GETRANGE
         let mut buf = BytesMut::from("INCRBYFLOAT num 1.25\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Incrbyfloat { key: Bytes::from_static(b"num"), increment: 1.25 });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Incrbyfloat {
+                key: Bytes::from_static(b"num"),
+                increment: 1.25
+            }
+        );
         let mut buf = BytesMut::from("SETRANGE k 2 world\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Setrange { key: Bytes::from_static(b"k"), offset: 2, value: Bytes::from_static(b"world") });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Setrange {
+                key: Bytes::from_static(b"k"),
+                offset: 2,
+                value: Bytes::from_static(b"world")
+            }
+        );
         let mut buf = BytesMut::from("GETRANGE k 0 -1\r\n");
-        assert_eq!(parse_command(&mut buf).unwrap().unwrap(), Command::Getrange { key: Bytes::from_static(b"k"), start: 0, end: -1 });
+        assert_eq!(
+            parse_command(&mut buf).unwrap().unwrap(),
+            Command::Getrange {
+                key: Bytes::from_static(b"k"),
+                start: 0,
+                end: -1
+            }
+        );
     }
 }

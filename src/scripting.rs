@@ -24,7 +24,10 @@ pub fn sha1_hex(data: &[u8]) -> String {
 pub fn load_script(script: &[u8]) -> String {
     let sha = sha1_hex(script);
     let script_str = String::from_utf8_lossy(script).to_string();
-    SCRIPT_CACHE.write().unwrap().insert(sha.clone(), script_str);
+    SCRIPT_CACHE
+        .write()
+        .unwrap()
+        .insert(sha.clone(), script_str);
     sha
 }
 
@@ -62,7 +65,9 @@ pub fn eval_script(
         let s = lua.create_string(k.as_ref()).map_err(|e| e.to_string())?;
         keys_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
     }
-    lua.globals().set("KEYS", keys_tbl).map_err(|e| e.to_string())?;
+    lua.globals()
+        .set("KEYS", keys_tbl)
+        .map_err(|e| e.to_string())?;
 
     // Set ARGV table (1-indexed)
     let argv_tbl = lua.create_table().map_err(|e| e.to_string())?;
@@ -70,7 +75,9 @@ pub fn eval_script(
         let s = lua.create_string(a.as_ref()).map_err(|e| e.to_string())?;
         argv_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
     }
-    lua.globals().set("ARGV", argv_tbl).map_err(|e| e.to_string())?;
+    lua.globals()
+        .set("ARGV", argv_tbl)
+        .map_err(|e| e.to_string())?;
 
     // Create redis global table
     let redis = lua.create_table().map_err(|e| e.to_string())?;
@@ -149,7 +156,8 @@ pub fn eval_script(
             );
 
             if out.starts_with(b"-") {
-                let err_str = String::from_utf8_lossy(&out[1..out.len().saturating_sub(2)]).to_string();
+                let err_str =
+                    String::from_utf8_lossy(&out[1..out.len().saturating_sub(2)]).to_string();
                 let tbl = lua.create_table()?;
                 tbl.set("err", err_str)?;
                 Ok(Value::Table(tbl))
@@ -167,7 +175,9 @@ pub fn eval_script(
             Ok(Value::Table(tbl))
         })
         .map_err(|e| e.to_string())?;
-    redis.set("status_reply", status_reply).map_err(|e| e.to_string())?;
+    redis
+        .set("status_reply", status_reply)
+        .map_err(|e| e.to_string())?;
 
     let error_reply = lua
         .create_function(|lua, msg: String| {
@@ -176,19 +186,25 @@ pub fn eval_script(
             Ok(Value::Table(tbl))
         })
         .map_err(|e| e.to_string())?;
-    redis.set("error_reply", error_reply).map_err(|e| e.to_string())?;
+    redis
+        .set("error_reply", error_reply)
+        .map_err(|e| e.to_string())?;
 
     let sha1hex_fn = lua
-        .create_function(|_lua, s: String| {
-            Ok(sha1_hex(s.as_bytes()))
-        })
+        .create_function(|_lua, s: String| Ok(sha1_hex(s.as_bytes())))
         .map_err(|e| e.to_string())?;
-    redis.set("sha1hex", sha1hex_fn).map_err(|e| e.to_string())?;
+    redis
+        .set("sha1hex", sha1hex_fn)
+        .map_err(|e| e.to_string())?;
 
-    lua.globals().set("redis", redis).map_err(|e| e.to_string())?;
+    lua.globals()
+        .set("redis", redis)
+        .map_err(|e| e.to_string())?;
 
     let chunk = lua.load(script_content);
-    let val: Value = chunk.eval().map_err(|e| format!("ERR user_script: {}", e))?;
+    let val: Value = chunk
+        .eval()
+        .map_err(|e| format!("ERR user_script: {}", e))?;
 
     let mut resp = Vec::new();
     lua_val_to_resp(&val, &mut resp)?;
@@ -305,7 +321,9 @@ fn parse_resp_array_to_lua(lua: &Lua, buf: &mut bytes::BytesMut) -> mlua::Result
                     Some(pos) => pos,
                     None => break,
                 };
-                let s = std::str::from_utf8(&buf[1..elem_crlf]).unwrap_or("").to_string();
+                let s = std::str::from_utf8(&buf[1..elem_crlf])
+                    .unwrap_or("")
+                    .to_string();
                 buf.advance(elem_crlf + 2);
                 let ok_tbl = lua.create_table()?;
                 ok_tbl.set("ok", s)?;
@@ -389,14 +407,18 @@ pub fn load_function(code: &str, replace: bool) -> Result<String, String> {
     let mut lib_name = "default_lib".to_string();
     for line in code.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("#!lua") || trimmed.starts_with("--") {
-            if let Some(pos) = trimmed.find("name=") {
-                let rest = &trimmed[pos + 5..];
-                let name = rest.split_whitespace().next().unwrap_or("").trim_matches('"');
-                if !name.is_empty() {
-                    lib_name = name.to_string();
-                    break;
-                }
+        if (trimmed.starts_with("#!lua") || trimmed.starts_with("--"))
+            && let Some(pos) = trimmed.find("name=")
+        {
+            let rest = &trimmed[pos + 5..];
+            let name = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches('"');
+            if !name.is_empty() {
+                lib_name = name.to_string();
+                break;
             }
         }
     }
@@ -414,12 +436,18 @@ pub fn load_function(code: &str, replace: bool) -> Result<String, String> {
     let func_names_clone = func_names.clone();
 
     let redis_tbl = lua.create_table().map_err(|e| e.to_string())?;
-    let reg_fn = lua.create_function(move |_, (name, _): (String, Value)| {
-        func_names_clone.borrow_mut().push(name);
-        Ok(())
-    }).map_err(|e| e.to_string())?;
-    redis_tbl.set("register_function", reg_fn).map_err(|e| e.to_string())?;
-    lua.globals().set("redis", redis_tbl).map_err(|e| e.to_string())?;
+    let reg_fn = lua
+        .create_function(move |_, (name, _): (String, Value)| {
+            func_names_clone.borrow_mut().push(name);
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+    redis_tbl
+        .set("register_function", reg_fn)
+        .map_err(|e| e.to_string())?;
+    lua.globals()
+        .set("redis", redis_tbl)
+        .map_err(|e| e.to_string())?;
 
     let lua_code: String = code
         .lines()
@@ -433,7 +461,9 @@ pub fn load_function(code: &str, replace: bool) -> Result<String, String> {
         .collect::<Vec<_>>()
         .join("\n");
 
-    lua.load(&lua_code).exec().map_err(|e| format!("ERR Error registering function: {}", e))?;
+    lua.load(&lua_code)
+        .exec()
+        .map_err(|e| format!("ERR Error registering function: {}", e))?;
 
     let registered = func_names.borrow().clone();
     let lib = FunctionLib {
@@ -458,7 +488,8 @@ pub fn call_function(
     // Find which library contains this function
     let lib = {
         let cache = FUNCTION_LIBS.read().unwrap();
-        cache.values()
+        cache
+            .values()
             .find(|l| l.functions.iter().any(|f| f == func_name))
             .cloned()
             .ok_or_else(|| format!("ERR Function '{}' not found", func_name))?
@@ -523,25 +554,39 @@ pub fn call_function(
         .map_err(|e| e.to_string())?;
     redis_tbl.set("call", call_fn).map_err(|e| e.to_string())?;
 
-    let reg_fn = lua.create_function(move |lua, (name, f): (String, mlua::Function)| {
-        if name == target_name {
-            let key = lua.create_registry_value(f)?;
-            *target_fn_clone.borrow_mut() = Some(key);
-        }
-        Ok(())
-    }).map_err(|e| e.to_string())?;
-    redis_tbl.set("register_function", reg_fn).map_err(|e| e.to_string())?;
+    let reg_fn = lua
+        .create_function(move |lua, (name, f): (String, mlua::Function)| {
+            if name == target_name {
+                let key = lua.create_registry_value(f)?;
+                *target_fn_clone.borrow_mut() = Some(key);
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+    redis_tbl
+        .set("register_function", reg_fn)
+        .map_err(|e| e.to_string())?;
 
-    lua.globals().set("redis", redis_tbl).map_err(|e| e.to_string())?;
+    lua.globals()
+        .set("redis", redis_tbl)
+        .map_err(|e| e.to_string())?;
 
     // Run library script to define functions
-    lua.load(&lib.raw_code).exec().map_err(|e| format!("ERR Failed to compile library: {}", e))?;
+    lua.load(&lib.raw_code)
+        .exec()
+        .map_err(|e| format!("ERR Failed to compile library: {}", e))?;
 
-    let fn_key = target_fn.borrow_mut().take()
-        .ok_or_else(|| format!("ERR Function '{}' registered but failed to capture", func_name))?;
+    let fn_key = target_fn.borrow_mut().take().ok_or_else(|| {
+        format!(
+            "ERR Function '{}' registered but failed to capture",
+            func_name
+        )
+    })?;
     let f: mlua::Function = lua.registry_value(&fn_key).map_err(|e| e.to_string())?;
 
-    let res: Value = f.call((keys_tbl, argv_tbl)).map_err(|e| format!("ERR Error running function '{}': {}", func_name, e))?;
+    let res: Value = f
+        .call((keys_tbl, argv_tbl))
+        .map_err(|e| format!("ERR Error running function '{}': {}", func_name, e))?;
 
     let mut out = Vec::new();
     lua_val_to_resp(&res, &mut out)?;
@@ -563,5 +608,3 @@ pub fn delete_function(lib_name: &str) -> bool {
 pub fn flush_functions() {
     FUNCTION_LIBS.write().unwrap().clear();
 }
-
-

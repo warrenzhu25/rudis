@@ -191,10 +191,10 @@ impl PubSubHub {
             frame.extend_from_slice(b"\r\n");
 
             for client_id in subscribers {
-                if let Some(tx) = self.clients.get(client_id) {
-                    if tx.send(frame.clone()).is_ok() {
-                        count += 1;
-                    }
+                if let Some(tx) = self.clients.get(client_id)
+                    && tx.send(frame.clone()).is_ok()
+                {
+                    count += 1;
                 }
             }
         }
@@ -218,10 +218,10 @@ impl PubSubHub {
                 frame.extend_from_slice(b"\r\n");
 
                 for client_id in subscribers {
-                    if let Some(tx) = self.clients.get(client_id) {
-                        if tx.send(frame.clone()).is_ok() {
-                            count += 1;
-                        }
+                    if let Some(tx) = self.clients.get(client_id)
+                        && tx.send(frame.clone()).is_ok()
+                    {
+                        count += 1;
                     }
                 }
             }

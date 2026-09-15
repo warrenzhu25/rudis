@@ -37,7 +37,7 @@ pub struct ClusterHub {
     pub config_epoch: AtomicU64,
     pub last_vote_epoch: AtomicU64,
     pub election_in_progress: AtomicBool,
-    pub role: RwLock<String>, // "master" or "slave"
+    pub role: RwLock<String>,      // "master" or "slave"
     pub master_id: RwLock<String>, // "-" or ID
     pub nodes: RwLock<HashMap<String, ClusterNodeInfo>>,
     pub my_slots: RwLock<Vec<(u16, u16)>>,
@@ -75,7 +75,8 @@ impl ClusterHub {
     pub fn new(port: u16) -> Self {
         let my_id = generate_node_id(port);
         let cport = port + 10000;
-        let hub = Self {
+
+        Self {
             port,
             cport,
             my_id: RwLock::new(my_id),
@@ -91,8 +92,7 @@ impl ClusterHub {
             bus_running: AtomicBool::new(false),
             cancel_bus: RwLock::new(None),
             active_migration: RwLock::new(None),
-        };
-        hub
+        }
     }
 
     pub fn my_id(&self) -> String {
@@ -253,7 +253,10 @@ impl ClusterHub {
             }
             let meet_frame = format!(
                 "MEET 127.0.0.1 {} {} {} {}\r\n",
-                self.port, self.my_id(), my_epoch, slots_repr
+                self.port,
+                self.my_id(),
+                my_epoch,
+                slots_repr
             );
             if stream.write_all(meet_frame.as_bytes()).is_ok() {
                 let mut buf = [0u8; 512];
@@ -261,7 +264,7 @@ impl ClusterHub {
                     let resp = String::from_utf8_lossy(&buf[..n]);
                     // Parse: "+PONG <id> <epoch> <role> <slots>"
                     if resp.starts_with("+PONG") {
-                        let parts: Vec<&str> = resp.trim().split_whitespace().collect();
+                        let parts: Vec<&str> = resp.split_whitespace().collect();
                         if parts.len() >= 4 {
                             let remote_id = parts[1].to_string();
                             let remote_epoch: u64 = parts[2].parse().unwrap_or(1);
@@ -269,10 +272,11 @@ impl ClusterHub {
                             let mut remote_slots = Vec::new();
                             if parts.len() >= 5 {
                                 for r in parts[4].split(',') {
-                                    if let Some((start, end)) = r.split_once('-') {
-                                        if let (Ok(s), Ok(e)) = (start.parse::<u16>(), end.parse::<u16>()) {
-                                            remote_slots.push((s, e));
-                                        }
+                                    if let Some((start, end)) = r.split_once('-')
+                                        && let (Ok(s), Ok(e)) =
+                                            (start.parse::<u16>(), end.parse::<u16>())
+                                    {
+                                        remote_slots.push((s, e));
                                     }
                                 }
                             }
@@ -349,10 +353,9 @@ impl ClusterHub {
         let nodes = self.nodes.read().unwrap();
         for peer in nodes.values() {
             let addr = format!("{}:{}", peer.ip, peer.cport);
-            if let Ok(mut stream) = TcpStream::connect_timeout(
-                &addr.parse().unwrap(),
-                Duration::from_millis(200),
-            ) {
+            if let Ok(mut stream) =
+                TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200))
+            {
                 let mut slots_repr = String::new();
                 for (s, e) in &inherited_slots {
                     slots_repr.push_str(&format!("{}-{},", s, e));
@@ -360,10 +363,7 @@ impl ClusterHub {
                 if slots_repr.ends_with(',') {
                     slots_repr.pop();
                 }
-                let msg = format!(
-                    "FAILOVER {} {} {}\r\n",
-                    my_id, new_epoch, slots_repr
-                );
+                let msg = format!("FAILOVER {} {} {}\r\n", my_id, new_epoch, slots_repr);
                 let _ = stream.write_all(msg.as_bytes());
             }
         }
@@ -507,11 +507,27 @@ impl ClusterHub {
         // 1. Shard for myself if master
         if my_role == "master" {
             let mut shard_nodes = Vec::new();
-            shard_nodes.push((my_id.clone(), self.port, "127.0.0.1".to_string(), "master".to_string(), "online".to_string()));
+            shard_nodes.push((
+                my_id.clone(),
+                self.port,
+                "127.0.0.1".to_string(),
+                "master".to_string(),
+                "online".to_string(),
+            ));
             for n in nodes.values() {
                 if n.master_id == my_id {
-                    let health = if n.flags.contains("fail") { "fail" } else { "online" };
-                    shard_nodes.push((n.id.clone(), n.port, n.ip.clone(), "replica".to_string(), health.to_string()));
+                    let health = if n.flags.contains("fail") {
+                        "fail"
+                    } else {
+                        "online"
+                    };
+                    shard_nodes.push((
+                        n.id.clone(),
+                        n.port,
+                        n.ip.clone(),
+                        "replica".to_string(),
+                        health.to_string(),
+                    ));
                 }
             }
             shards.push(ShardItem {
@@ -524,17 +540,43 @@ impl ClusterHub {
         for peer in nodes.values() {
             if peer.flags.contains("master") {
                 let mut shard_nodes = Vec::new();
-                let master_health = if peer.flags.contains("fail") { "fail" } else { "online" };
-                shard_nodes.push((peer.id.clone(), peer.port, peer.ip.clone(), "master".to_string(), master_health.to_string()));
+                let master_health = if peer.flags.contains("fail") {
+                    "fail"
+                } else {
+                    "online"
+                };
+                shard_nodes.push((
+                    peer.id.clone(),
+                    peer.port,
+                    peer.ip.clone(),
+                    "master".to_string(),
+                    master_health.to_string(),
+                ));
                 for n in nodes.values() {
                     if n.master_id == peer.id {
-                        let health = if n.flags.contains("fail") { "fail" } else { "online" };
-                        shard_nodes.push((n.id.clone(), n.port, n.ip.clone(), "replica".to_string(), health.to_string()));
+                        let health = if n.flags.contains("fail") {
+                            "fail"
+                        } else {
+                            "online"
+                        };
+                        shard_nodes.push((
+                            n.id.clone(),
+                            n.port,
+                            n.ip.clone(),
+                            "replica".to_string(),
+                            health.to_string(),
+                        ));
                     }
                 }
                 // If myself is replica of this peer
                 if *self.master_id.read().unwrap() == peer.id {
-                    shard_nodes.push((my_id.clone(), self.port, "127.0.0.1".to_string(), "replica".to_string(), "online".to_string()));
+                    shard_nodes.push((
+                        my_id.clone(),
+                        self.port,
+                        "127.0.0.1".to_string(),
+                        "replica".to_string(),
+                        "online".to_string(),
+                    ));
                 }
                 shards.push(ShardItem {
                     slots: peer.slots.clone(),
@@ -545,8 +587,13 @@ impl ClusterHub {
 
         if shards.is_empty() {
             // Fallback for single node
-            let mut shard_nodes = Vec::new();
-            shard_nodes.push((my_id, self.port, "127.0.0.1".to_string(), my_role, "online".to_string()));
+            let shard_nodes = vec![(
+                my_id,
+                self.port,
+                "127.0.0.1".to_string(),
+                my_role,
+                "online".to_string(),
+            )];
             shards.push(ShardItem {
                 slots: my_slots,
                 nodes: shard_nodes,
@@ -658,10 +705,9 @@ impl ClusterHub {
         };
         for (ip, cport) in peers {
             let addr = format!("{}:{}", ip, cport);
-            if let Ok(mut stream) = TcpStream::connect_timeout(
-                &addr.parse().unwrap(),
-                Duration::from_millis(200),
-            ) {
+            if let Ok(mut stream) =
+                TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200))
+            {
                 let _ = stream.write_all(msg.as_bytes());
             }
         }
@@ -690,23 +736,24 @@ impl ClusterHub {
 
         for (ip, cport) in &masters {
             let addr = format!("{}:{}", ip, cport);
-            if let Ok(parsed) = addr.parse::<SocketAddr>() {
-                if let Ok(mut stream) = TcpStream::connect_timeout(&parsed, Duration::from_millis(200)) {
-                    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-                    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-                    let req = format!(
-                        "FAILOVER_AUTH_REQUEST {} {} {}\r\n",
-                        self.my_id(),
-                        req_epoch,
-                        master_id
-                    );
-                    if stream.write_all(req.as_bytes()).is_ok() {
-                        let mut buf = [0u8; 128];
-                        if let Ok(n) = stream.read(&mut buf) {
-                            let resp = String::from_utf8_lossy(&buf[..n]);
-                            if resp.starts_with("+FAILOVER_AUTH_ACK") {
-                                votes += 1;
-                            }
+            if let Ok(parsed) = addr.parse::<SocketAddr>()
+                && let Ok(mut stream) =
+                    TcpStream::connect_timeout(&parsed, Duration::from_millis(200))
+            {
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+                let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
+                let req = format!(
+                    "FAILOVER_AUTH_REQUEST {} {} {}\r\n",
+                    self.my_id(),
+                    req_epoch,
+                    master_id
+                );
+                if stream.write_all(req.as_bytes()).is_ok() {
+                    let mut buf = [0u8; 128];
+                    if let Ok(n) = stream.read(&mut buf) {
+                        let resp = String::from_utf8_lossy(&buf[..n]);
+                        if resp.starts_with("+FAILOVER_AUTH_ACK") {
+                            votes += 1;
                         }
                     }
                 }
@@ -772,48 +819,56 @@ impl ClusterHub {
     pub fn dfly_cluster_config(&self, config_json: &str) -> Result<(), String> {
         let val: serde_json::Value = serde_json::from_str(config_json)
             .map_err(|e| format!("ERR Invalid JSON configuration: {}", e))?;
-        
+
         let mut new_slots = Vec::new();
         let my_id = self.my_id();
 
         if let Some(arr) = val.as_array() {
             for item in arr {
-                let node_id = item.get("master_id").or_else(|| item.get("id")).and_then(|v| v.as_str()).unwrap_or("");
+                let node_id = item
+                    .get("master_id")
+                    .or_else(|| item.get("id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let is_me = node_id == my_id || node_id.is_empty();
                 if let Some(ranges) = item.get("slot_ranges").and_then(|r| r.as_array()) {
                     for r in ranges {
                         if let Some(pair) = r.as_array() {
-                            if pair.len() == 2 {
-                                if let (Some(s), Some(e)) = (pair[0].as_u64(), pair[1].as_u64()) {
-                                    if is_me {
-                                        new_slots.push((s as u16, e as u16));
-                                    }
-                                }
+                            if pair.len() == 2
+                                && let (Some(s), Some(e)) = (pair[0].as_u64(), pair[1].as_u64())
+                                && is_me
+                            {
+                                new_slots.push((s as u16, e as u16));
                             }
-                        } else if let Some(obj) = r.as_object() {
-                            if let (Some(s), Some(e)) = (obj.get("start").and_then(|v| v.as_u64()), obj.get("end").and_then(|v| v.as_u64())) {
-                                if is_me {
-                                    new_slots.push((s as u16, e as u16));
-                                }
-                            }
+                        } else if let Some(obj) = r.as_object()
+                            && let (Some(s), Some(e)) = (
+                                obj.get("start").and_then(|v| v.as_u64()),
+                                obj.get("end").and_then(|v| v.as_u64()),
+                            )
+                            && is_me
+                        {
+                            new_slots.push((s as u16, e as u16));
                         }
                     }
                 }
             }
-        } else if let Some(obj) = val.as_object() {
-            if let Some(ranges) = obj.get("slot_ranges").and_then(|r| r.as_array()) {
-                for r in ranges {
-                    if let Some(pair) = r.as_array() {
-                        if pair.len() == 2 {
-                            if let (Some(s), Some(e)) = (pair[0].as_u64(), pair[1].as_u64()) {
-                                new_slots.push((s as u16, e as u16));
-                            }
-                        }
-                    } else if let Some(obj) = r.as_object() {
-                        if let (Some(s), Some(e)) = (obj.get("start").and_then(|v| v.as_u64()), obj.get("end").and_then(|v| v.as_u64())) {
-                            new_slots.push((s as u16, e as u16));
-                        }
+        } else if let Some(obj) = val.as_object()
+            && let Some(ranges) = obj.get("slot_ranges").and_then(|r| r.as_array())
+        {
+            for r in ranges {
+                if let Some(pair) = r.as_array() {
+                    if pair.len() == 2
+                        && let (Some(s), Some(e)) = (pair[0].as_u64(), pair[1].as_u64())
+                    {
+                        new_slots.push((s as u16, e as u16));
                     }
+                } else if let Some(obj) = r.as_object()
+                    && let (Some(s), Some(e)) = (
+                        obj.get("start").and_then(|v| v.as_u64()),
+                        obj.get("end").and_then(|v| v.as_u64()),
+                    )
+                {
+                    new_slots.push((s as u16, e as u16));
                 }
             }
         }
@@ -830,14 +885,18 @@ impl ClusterHub {
         let mig = self.active_migration.read().unwrap();
         match &*mig {
             None => {
-                out.extend_from_slice(b"*4\r\n$5\r\nstate\r\n$4\r\nIDLE\r\n$10\r\nmigrations\r\n*0\r\n");
+                out.extend_from_slice(
+                    b"*4\r\n$5\r\nstate\r\n$4\r\nIDLE\r\n$10\r\nmigrations\r\n*0\r\n",
+                );
             }
             Some(m) => {
                 out.extend_from_slice(b"*6\r\n");
                 out.extend_from_slice(b"$5\r\nstate\r\n");
                 out.extend_from_slice(format!("${}\r\n{}\r\n", m.state.len(), m.state).as_bytes());
                 out.extend_from_slice(b"$9\r\nsource_id\r\n");
-                out.extend_from_slice(format!("${}\r\n{}\r\n", m.source_id.len(), m.source_id).as_bytes());
+                out.extend_from_slice(
+                    format!("${}\r\n{}\r\n", m.source_id.len(), m.source_id).as_bytes(),
+                );
                 out.extend_from_slice(b"$13\r\nkeys_migrated\r\n");
                 out.extend_from_slice(format!(":{}\r\n", m.keys_migrated).as_bytes());
             }
@@ -981,116 +1040,121 @@ fn handle_cluster_bus_conn(mut stream: TcpStream, hub: &Arc<ClusterHub>) {
         }
         let msg = String::from_utf8_lossy(&buf[..n]);
         for line in msg.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.is_empty() {
-            continue;
-        }
-        match parts[0] {
-            "MEET" => {
-                // MEET <ip> <port> <node_id> <epoch> <slots>
-                if parts.len() >= 4 {
-                    let peer_ip = parts[1].to_string();
-                    let peer_port: u16 = parts[2].parse().unwrap_or(0);
-                    let peer_id = parts[3].to_string();
-                    let peer_epoch: u64 = if parts.len() >= 5 {
-                        parts[4].parse().unwrap_or(1)
-                    } else {
-                        1
-                    };
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.is_empty() {
+                continue;
+            }
+            match parts[0] {
+                "MEET" => {
+                    // MEET <ip> <port> <node_id> <epoch> <slots>
+                    if parts.len() >= 4 {
+                        let peer_ip = parts[1].to_string();
+                        let peer_port: u16 = parts[2].parse().unwrap_or(0);
+                        let peer_id = parts[3].to_string();
+                        let peer_epoch: u64 = if parts.len() >= 5 {
+                            parts[4].parse().unwrap_or(1)
+                        } else {
+                            1
+                        };
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
 
-                    let mut peer_slots = Vec::new();
-                    if parts.len() >= 6 {
-                        for r in parts[5].split(',') {
-                            if let Some((s, e)) = r.split_once('-') {
-                                if let (Ok(s), Ok(e)) = (s.parse::<u16>(), e.parse::<u16>()) {
+                        let mut peer_slots = Vec::new();
+                        if parts.len() >= 6 {
+                            for r in parts[5].split(',') {
+                                if let Some((s, e)) = r.split_once('-')
+                                    && let (Ok(s), Ok(e)) = (s.parse::<u16>(), e.parse::<u16>())
+                                {
                                     peer_slots.push((s, e));
                                 }
                             }
                         }
-                    }
 
-                    {
-                        let mut nodes = hub.nodes.write().unwrap();
-                        nodes.insert(
-                            peer_id.clone(),
-                            ClusterNodeInfo {
-                                id: peer_id,
-                                ip: peer_ip,
-                                port: peer_port,
-                                cport: peer_port + 10000,
-                                flags: "master".to_string(),
-                                master_id: "-".to_string(),
-                                ping_sent: now,
-                                pong_recv: now,
-                                config_epoch: peer_epoch,
-                                link_state: "connected".to_string(),
-                                slots: peer_slots,
-                            },
+                        {
+                            let mut nodes = hub.nodes.write().unwrap();
+                            nodes.insert(
+                                peer_id.clone(),
+                                ClusterNodeInfo {
+                                    id: peer_id,
+                                    ip: peer_ip,
+                                    port: peer_port,
+                                    cport: peer_port + 10000,
+                                    flags: "master".to_string(),
+                                    master_id: "-".to_string(),
+                                    ping_sent: now,
+                                    pong_recv: now,
+                                    config_epoch: peer_epoch,
+                                    link_state: "connected".to_string(),
+                                    slots: peer_slots,
+                                },
+                            );
+                        }
+
+                        // Respond PONG
+                        let my_epoch = hub.config_epoch.load(Ordering::Relaxed);
+                        let role = hub.role.read().unwrap().clone();
+                        let my_slots = hub.my_slots.read().unwrap().clone();
+                        let mut slots_repr = String::new();
+                        for (s, e) in my_slots {
+                            slots_repr.push_str(&format!("{}-{},", s, e));
+                        }
+                        if slots_repr.ends_with(',') {
+                            slots_repr.pop();
+                        }
+                        let resp = format!(
+                            "+PONG {} {} {} {}\r\n",
+                            hub.my_id(),
+                            my_epoch,
+                            role,
+                            slots_repr
                         );
+                        let _ = stream.write_all(resp.as_bytes());
                     }
-
-                    // Respond PONG
-                    let my_epoch = hub.config_epoch.load(Ordering::Relaxed);
-                    let role = hub.role.read().unwrap().clone();
-                    let my_slots = hub.my_slots.read().unwrap().clone();
-                    let mut slots_repr = String::new();
-                    for (s, e) in my_slots {
-                        slots_repr.push_str(&format!("{}-{},", s, e));
-                    }
-                    if slots_repr.ends_with(',') {
-                        slots_repr.pop();
-                    }
-                    let resp = format!(
-                        "+PONG {} {} {} {}\r\n",
-                        hub.my_id(), my_epoch, role, slots_repr
-                    );
-                    let _ = stream.write_all(resp.as_bytes());
                 }
-            }
-            "PING" => {
-                // PING <node_id> <epoch> <flags> <slots> [GOSSIP <peers...>]
-                if parts.len() >= 2 {
-                    let peer_id = parts[1].to_string();
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
+                "PING" => {
+                    // PING <node_id> <epoch> <flags> <slots> [GOSSIP <peers...>]
+                    if parts.len() >= 2 {
+                        let peer_id = parts[1].to_string();
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
 
-                    {
-                        let mut nodes = hub.nodes.write().unwrap();
-                        if let Some(node) = nodes.get_mut(&peer_id) {
-                            node.pong_recv = now;
-                            node.link_state = "connected".to_string();
-                            if parts.len() >= 4 {
-                                node.flags = parts[3].to_string();
-                            }
-                            if parts.len() >= 5 {
-                                let mut peer_slots = Vec::new();
-                                for r in parts[4].split(',') {
-                                    if let Some((s, e)) = r.split_once('-') {
-                                        if let (Ok(s), Ok(e)) = (s.parse::<u16>(), e.parse::<u16>()) {
+                        {
+                            let mut nodes = hub.nodes.write().unwrap();
+                            if let Some(node) = nodes.get_mut(&peer_id) {
+                                node.pong_recv = now;
+                                node.link_state = "connected".to_string();
+                                if parts.len() >= 4 {
+                                    node.flags = parts[3].to_string();
+                                }
+                                if parts.len() >= 5 {
+                                    let mut peer_slots = Vec::new();
+                                    for r in parts[4].split(',') {
+                                        if let Some((s, e)) = r.split_once('-')
+                                            && let (Ok(s), Ok(e)) =
+                                                (s.parse::<u16>(), e.parse::<u16>())
+                                        {
                                             peer_slots.push((s, e));
                                         }
                                     }
-                                }
-                                if !peer_slots.is_empty() {
-                                    node.slots = peer_slots;
+                                    if !peer_slots.is_empty() {
+                                        node.slots = peer_slots;
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    // Parse gossip section if present
-                    if let Some(gossip_pos) = parts.iter().position(|&p| p == "GOSSIP") {
-                        if gossip_pos + 1 < parts.len() {
+                        // Parse gossip section if present
+                        if let Some(gossip_pos) = parts.iter().position(|&p| p == "GOSSIP")
+                            && gossip_pos + 1 < parts.len()
+                        {
                             let gossip_data = parts[gossip_pos + 1];
                             for peer_repr in gossip_data.split(';') {
                                 let fields: Vec<&str> = peer_repr.split(',').collect();
@@ -1128,130 +1192,136 @@ fn handle_cluster_bus_conn(mut stream: TcpStream, hub: &Arc<ClusterHub>) {
                                 }
                             }
                         }
-                    }
 
-                    let my_epoch = hub.config_epoch.load(Ordering::Relaxed);
-                    let role = hub.role.read().unwrap().clone();
-                    let my_slots = hub.my_slots.read().unwrap().clone();
-                    let mut slots_repr = String::new();
-                    for (s, e) in my_slots {
-                        slots_repr.push_str(&format!("{}-{},", s, e));
+                        let my_epoch = hub.config_epoch.load(Ordering::Relaxed);
+                        let role = hub.role.read().unwrap().clone();
+                        let my_slots = hub.my_slots.read().unwrap().clone();
+                        let mut slots_repr = String::new();
+                        for (s, e) in my_slots {
+                            slots_repr.push_str(&format!("{}-{},", s, e));
+                        }
+                        if slots_repr.ends_with(',') {
+                            slots_repr.pop();
+                        }
+                        let resp = format!(
+                            "+PONG {} {} {} {}\r\n",
+                            hub.my_id(),
+                            my_epoch,
+                            role,
+                            slots_repr
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
                     }
-                    if slots_repr.ends_with(',') {
-                        slots_repr.pop();
-                    }
-                    let resp = format!(
-                        "+PONG {} {} {} {}\r\n",
-                        hub.my_id(), my_epoch, role, slots_repr
-                    );
-                    let _ = stream.write_all(resp.as_bytes());
                 }
-            }
-            "FAIL" => {
-                // FAIL <failed_node_id>
-                if parts.len() >= 2 {
-                    let failed_id = parts[1];
-                    let mut nodes = hub.nodes.write().unwrap();
-                    if let Some(node) = nodes.get_mut(failed_id) {
-                        node.flags = "fail".to_string();
-                        node.link_state = "disconnected".to_string();
+                "FAIL" => {
+                    // FAIL <failed_node_id>
+                    if parts.len() >= 2 {
+                        let failed_id = parts[1];
+                        let mut nodes = hub.nodes.write().unwrap();
+                        if let Some(node) = nodes.get_mut(failed_id) {
+                            node.flags = "fail".to_string();
+                            node.link_state = "disconnected".to_string();
+                        }
+                        let _ = stream.write_all(b"+OK\r\n");
                     }
-                    let _ = stream.write_all(b"+OK\r\n");
                 }
-            }
-            "FAILOVER" => {
-                // FAILOVER <new_master_id> <epoch> <slots>
-                if parts.len() >= 3 {
-                    let master_id = parts[1].to_string();
-                    let epoch: u64 = parts[2].parse().unwrap_or(1);
-                    let mut peer_slots = Vec::new();
-                    if parts.len() >= 4 {
-                        for r in parts[3].split(',') {
-                            if let Some((s, e)) = r.split_once('-') {
-                                if let (Ok(s), Ok(e)) = (s.parse::<u16>(), e.parse::<u16>()) {
+                "FAILOVER" => {
+                    // FAILOVER <new_master_id> <epoch> <slots>
+                    if parts.len() >= 3 {
+                        let master_id = parts[1].to_string();
+                        let epoch: u64 = parts[2].parse().unwrap_or(1);
+                        let mut peer_slots = Vec::new();
+                        if parts.len() >= 4 {
+                            for r in parts[3].split(',') {
+                                if let Some((s, e)) = r.split_once('-')
+                                    && let (Ok(s), Ok(e)) = (s.parse::<u16>(), e.parse::<u16>())
+                                {
                                     peer_slots.push((s, e));
                                 }
                             }
                         }
+                        let mut nodes = hub.nodes.write().unwrap();
+                        if let Some(node) = nodes.get_mut(&master_id) {
+                            node.flags = "master".to_string();
+                            node.master_id = "-".to_string();
+                            node.config_epoch = epoch;
+                            if !peer_slots.is_empty() {
+                                node.slots = peer_slots;
+                            }
+                        }
+                        let _ = stream.write_all(b"+OK\r\n");
                     }
-                    let mut nodes = hub.nodes.write().unwrap();
-                    if let Some(node) = nodes.get_mut(&master_id) {
-                        node.flags = "master".to_string();
-                        node.master_id = "-".to_string();
-                        node.config_epoch = epoch;
-                        if !peer_slots.is_empty() {
-                            node.slots = peer_slots;
+                }
+                "FAILOVER_AUTH_REQUEST" => {
+                    // FAILOVER_AUTH_REQUEST <replica_id> <epoch> <master_id>
+                    if parts.len() >= 4 {
+                        let req_epoch: u64 = parts[2].parse().unwrap_or(0);
+                        let claimed_master = parts[3];
+                        let is_master = *hub.role.read().unwrap() == "master";
+                        let last_vote = hub.last_vote_epoch.load(Ordering::Relaxed);
+                        let master_is_down = {
+                            let nodes = hub.nodes.read().unwrap();
+                            nodes
+                                .get(claimed_master)
+                                .map(|n| n.flags.contains("fail"))
+                                .unwrap_or(false)
+                        };
+
+                        if is_master && req_epoch > last_vote && master_is_down {
+                            hub.last_vote_epoch.store(req_epoch, Ordering::SeqCst);
+                            let ack =
+                                format!("+FAILOVER_AUTH_ACK {} {}\r\n", hub.my_id(), req_epoch);
+                            let _ = stream.write_all(ack.as_bytes());
+                        } else {
+                            let _ = stream.write_all(b"-ERR vote rejected\r\n");
                         }
                     }
-                    let _ = stream.write_all(b"+OK\r\n");
                 }
-            }
-            "FAILOVER_AUTH_REQUEST" => {
-                // FAILOVER_AUTH_REQUEST <replica_id> <epoch> <master_id>
-                if parts.len() >= 4 {
-                    let req_epoch: u64 = parts[2].parse().unwrap_or(0);
-                    let claimed_master = parts[3];
-                    let is_master = *hub.role.read().unwrap() == "master";
-                    let last_vote = hub.last_vote_epoch.load(Ordering::Relaxed);
-                    let master_is_down = {
-                        let nodes = hub.nodes.read().unwrap();
-                        nodes.get(claimed_master).map(|n| n.flags.contains("fail")).unwrap_or(false)
-                    };
-
-                    if is_master && req_epoch > last_vote && master_is_down {
-                        hub.last_vote_epoch.store(req_epoch, Ordering::SeqCst);
-                        let ack = format!("+FAILOVER_AUTH_ACK {} {}\r\n", hub.my_id(), req_epoch);
-                        let _ = stream.write_all(ack.as_bytes());
-                    } else {
-                        let _ = stream.write_all(b"-ERR vote rejected\r\n");
-                    }
-                }
-            }
-            "FAILOVER_ANNOUNCE" => {
-                // FAILOVER_ANNOUNCE <new_master_id> <epoch> <slots>
-                if parts.len() >= 3 {
-                    let new_master_id = parts[1].to_string();
-                    let epoch: u64 = parts[2].parse().unwrap_or(1);
-                    let mut peer_slots = Vec::new();
-                    if parts.len() >= 4 {
-                        for r in parts[3].split(',') {
-                            if let Some((s, e)) = r.split_once('-') {
-                                if let (Ok(s), Ok(e)) = (s.parse::<u16>(), e.parse::<u16>()) {
+                "FAILOVER_ANNOUNCE" => {
+                    // FAILOVER_ANNOUNCE <new_master_id> <epoch> <slots>
+                    if parts.len() >= 3 {
+                        let new_master_id = parts[1].to_string();
+                        let epoch: u64 = parts[2].parse().unwrap_or(1);
+                        let mut peer_slots = Vec::new();
+                        if parts.len() >= 4 {
+                            for r in parts[3].split(',') {
+                                if let Some((s, e)) = r.split_once('-')
+                                    && let (Ok(s), Ok(e)) = (s.parse::<u16>(), e.parse::<u16>())
+                                {
                                     peer_slots.push((s, e));
                                 }
                             }
                         }
-                    }
-                    let mut nodes = hub.nodes.write().unwrap();
-                    if let Some(node) = nodes.get_mut(&new_master_id) {
-                        node.flags = "master".to_string();
-                        node.master_id = "-".to_string();
-                        node.config_epoch = epoch;
+                        let mut nodes = hub.nodes.write().unwrap();
+                        if let Some(node) = nodes.get_mut(&new_master_id) {
+                            node.flags = "master".to_string();
+                            node.master_id = "-".to_string();
+                            node.config_epoch = epoch;
+                            if !peer_slots.is_empty() {
+                                node.slots = peer_slots.clone();
+                            }
+                        }
                         if !peer_slots.is_empty() {
-                            node.slots = peer_slots.clone();
-                        }
-                    }
-                    if !peer_slots.is_empty() {
-                        let mut to_remove = Vec::new();
-                        for &(s, e) in &peer_slots {
-                            for slot in s..=e {
-                                to_remove.push(slot);
+                            let mut to_remove = Vec::new();
+                            for &(s, e) in &peer_slots {
+                                for slot in s..=e {
+                                    to_remove.push(slot);
+                                }
+                            }
+                            for (other_id, other_node) in nodes.iter_mut() {
+                                if other_id != &new_master_id {
+                                    remove_slots(&mut other_node.slots, &to_remove);
+                                }
                             }
                         }
-                        for (other_id, other_node) in nodes.iter_mut() {
-                            if other_id != &new_master_id {
-                                remove_slots(&mut other_node.slots, &to_remove);
-                            }
-                        }
+                        let _ = stream.write_all(b"+OK\r\n");
                     }
-                    let _ = stream.write_all(b"+OK\r\n");
                 }
-            }
-            _ => {
-                let _ = stream.write_all(b"-ERR unknown clusterbus command\r\n");
+                _ => {
+                    let _ = stream.write_all(b"-ERR unknown clusterbus command\r\n");
+                }
             }
         }
-    }
     }
 }
 
@@ -1303,35 +1373,39 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
         };
 
         // Record ping_sent
-        if let Ok(mut nodes) = hub.nodes.write() {
-            if let Some(node) = nodes.get_mut(&id) {
-                node.ping_sent = now;
-            }
+        if let Ok(mut nodes) = hub.nodes.write()
+            && let Some(node) = nodes.get_mut(&id)
+        {
+            node.ping_sent = now;
         }
 
-        if let Ok(mut stream) =
-            TcpStream::connect_timeout(&parsed_addr, Duration::from_millis(200))
+        if let Ok(mut stream) = TcpStream::connect_timeout(&parsed_addr, Duration::from_millis(200))
         {
             let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
             let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
             let ping_msg = format!(
                 "PING {} {} {} {} GOSSIP {}\r\n",
-                hub.my_id(), my_epoch, role, slots_repr, gossip_payload
+                hub.my_id(),
+                my_epoch,
+                role,
+                slots_repr,
+                gossip_payload
             );
-            let (success, peer_slots, peer_epoch) = if stream.write_all(ping_msg.as_bytes()).is_ok() {
+            let (success, peer_slots, peer_epoch) = if stream.write_all(ping_msg.as_bytes()).is_ok()
+            {
                 let mut buf = [0u8; 512];
                 if let Ok(n) = stream.read(&mut buf) {
                     let resp = String::from_utf8_lossy(&buf[..n]);
                     if resp.starts_with("+PONG") {
-                        let parts: Vec<&str> = resp.trim().split_whitespace().collect();
+                        let parts: Vec<&str> = resp.split_whitespace().collect();
                         let ep = parts.get(2).and_then(|val| val.parse::<u64>().ok());
                         let mut slots = Vec::new();
                         if parts.len() >= 5 {
                             for r in parts[4].split(',') {
-                                if let Some((s, e)) = r.split_once('-') {
-                                    if let (Ok(s), Ok(e)) = (s.parse::<u16>(), e.parse::<u16>()) {
-                                        slots.push((s, e));
-                                    }
+                                if let Some((s, e)) = r.split_once('-')
+                                    && let (Ok(s), Ok(e)) = (s.parse::<u16>(), e.parse::<u16>())
+                                {
+                                    slots.push((s, e));
                                 }
                             }
                         }
@@ -1346,42 +1420,42 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
                 (false, None, None)
             };
 
-            if let Ok(mut nodes) = hub.nodes.write() {
-                if let Some(node) = nodes.get_mut(&id) {
-                    if success {
-                        node.pong_recv = now;
-                        node.link_state = "connected".to_string();
-                        if let Some(slots) = peer_slots {
-                            if !slots.is_empty() {
-                                node.slots = slots;
-                            }
-                        }
-                        if let Some(ep) = peer_epoch {
-                            node.config_epoch = ep;
-                        }
-                        if node.flags == "fail?" || node.flags == "fail" {
-                            node.flags = "master".to_string();
-                        }
-                    } else {
-                        let elapsed = now.saturating_sub(node.pong_recv);
-                        if elapsed > 10000 {
-                            node.flags = "fail".to_string();
-                            node.link_state = "disconnected".to_string();
-                        } else if elapsed > 5000 {
-                            node.flags = "fail?".to_string();
-                        }
+            if let Ok(mut nodes) = hub.nodes.write()
+                && let Some(node) = nodes.get_mut(&id)
+            {
+                if success {
+                    node.pong_recv = now;
+                    node.link_state = "connected".to_string();
+                    if let Some(slots) = peer_slots
+                        && !slots.is_empty()
+                    {
+                        node.slots = slots;
+                    }
+                    if let Some(ep) = peer_epoch {
+                        node.config_epoch = ep;
+                    }
+                    if node.flags == "fail?" || node.flags == "fail" {
+                        node.flags = "master".to_string();
+                    }
+                } else {
+                    let elapsed = now.saturating_sub(node.pong_recv);
+                    if elapsed > 10000 {
+                        node.flags = "fail".to_string();
+                        node.link_state = "disconnected".to_string();
+                    } else if elapsed > 5000 {
+                        node.flags = "fail?".to_string();
                     }
                 }
             }
-        } else if let Ok(mut nodes) = hub.nodes.write() {
-            if let Some(node) = nodes.get_mut(&id) {
-                let elapsed = now.saturating_sub(node.pong_recv);
-                if elapsed > 10000 {
-                    node.flags = "fail".to_string();
-                    node.link_state = "disconnected".to_string();
-                } else if elapsed > 5000 {
-                    node.flags = "fail?".to_string();
-                }
+        } else if let Ok(mut nodes) = hub.nodes.write()
+            && let Some(node) = nodes.get_mut(&id)
+        {
+            let elapsed = now.saturating_sub(node.pong_recv);
+            if elapsed > 10000 {
+                node.flags = "fail".to_string();
+                node.link_state = "disconnected".to_string();
+            } else if elapsed > 5000 {
+                node.flags = "fail?".to_string();
             }
         }
     }
@@ -1392,7 +1466,10 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
         let master_id = hub.master_id.read().unwrap().clone();
         if is_slave && master_id != "-" && !master_id.is_empty() {
             let nodes = hub.nodes.read().unwrap();
-            nodes.get(&master_id).map(|n| n.flags.contains("fail")).unwrap_or(false)
+            nodes
+                .get(&master_id)
+                .map(|n| n.flags.contains("fail"))
+                .unwrap_or(false)
         } else {
             false
         }

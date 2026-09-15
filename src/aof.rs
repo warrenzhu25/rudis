@@ -131,7 +131,11 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             Some(buf)
         }
-        Command::Msetex { pairs, condition, expiry } => {
+        Command::Msetex {
+            pairs,
+            condition,
+            expiry,
+        } => {
             let mut num_args = 2 + pairs.len() * 2;
             if *condition != crate::resp::MsetexCondition::None {
                 num_args += 1;
@@ -143,7 +147,9 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             buf.extend_from_slice(format!("*{}\r\n$6\r\nMSETEX\r\n", num_args).as_bytes());
             let numkeys_str = pairs.len().to_string();
-            buf.extend_from_slice(format!("${}\r\n{}\r\n", numkeys_str.len(), numkeys_str).as_bytes());
+            buf.extend_from_slice(
+                format!("${}\r\n{}\r\n", numkeys_str.len(), numkeys_str).as_bytes(),
+            );
             for (k, v) in pairs {
                 buf.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
                 buf.extend_from_slice(k);
@@ -162,7 +168,9 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                 crate::resp::MsetexExpiry::ExpireIn(d) => {
                     buf.extend_from_slice(b"$2\r\nPX\r\n");
                     let ms_str = d.as_millis().to_string();
-                    buf.extend_from_slice(format!("${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes());
+                    buf.extend_from_slice(
+                        format!("${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
+                    );
                 }
                 crate::resp::MsetexExpiry::None => {}
             }
@@ -220,9 +228,7 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             Some(buf)
         }
         Command::Hsetnx { key, field, value } => {
-            buf.extend_from_slice(
-                format!("*4\r\n$6\r\nHSETNX\r\n${}\r\n", key.len()).as_bytes(),
-            );
+            buf.extend_from_slice(format!("*4\r\n$6\r\nHSETNX\r\n${}\r\n", key.len()).as_bytes());
             buf.extend_from_slice(key);
             buf.extend_from_slice(b"\r\n");
             buf.extend_from_slice(format!("${}\r\n", field.len()).as_bytes());
@@ -485,7 +491,14 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             srckeys,
         } => {
             buf.extend_from_slice(
-                format!("*{}\r\n$5\r\nBITOP\r\n${}\r\n{}\r\n${}\r\n", 3 + srckeys.len(), op.len(), op, destkey.len()).as_bytes(),
+                format!(
+                    "*{}\r\n$5\r\nBITOP\r\n${}\r\n{}\r\n${}\r\n",
+                    3 + srckeys.len(),
+                    op.len(),
+                    op,
+                    destkey.len()
+                )
+                .as_bytes(),
             );
             buf.extend_from_slice(destkey);
             buf.extend_from_slice(b"\r\n");
@@ -498,7 +511,12 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
         }
         Command::Pfadd { key, elements } => {
             buf.extend_from_slice(
-                format!("*{}\r\n$5\r\nPFADD\r\n${}\r\n", 2 + elements.len(), key.len()).as_bytes(),
+                format!(
+                    "*{}\r\n$5\r\nPFADD\r\n${}\r\n",
+                    2 + elements.len(),
+                    key.len()
+                )
+                .as_bytes(),
             );
             buf.extend_from_slice(key);
             buf.extend_from_slice(b"\r\n");
@@ -511,7 +529,12 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
         }
         Command::Pfmerge { destkey, srckeys } => {
             buf.extend_from_slice(
-                format!("*{}\r\n$7\r\nPFMERGE\r\n${}\r\n", 2 + srckeys.len(), destkey.len()).as_bytes(),
+                format!(
+                    "*{}\r\n$7\r\nPFMERGE\r\n${}\r\n",
+                    2 + srckeys.len(),
+                    destkey.len()
+                )
+                .as_bytes(),
             );
             buf.extend_from_slice(destkey);
             buf.extend_from_slice(b"\r\n");
@@ -624,11 +647,7 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             Some(buf)
         }
-        Command::Xtrim {
-            key,
-            maxlen,
-            minid,
-        } => {
+        Command::Xtrim { key, maxlen, minid } => {
             let mut num_args = 2;
             if maxlen.is_some() {
                 num_args += 2;
@@ -653,14 +672,24 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             Some(buf)
         }
-        Command::XgroupCreate { key, group, id, mkstream } => {
+        Command::XgroupCreate {
+            key,
+            group,
+            id,
+            mkstream,
+        } => {
             let id_str = id.to_string();
             let mut num_args = 5;
             if *mkstream {
                 num_args += 1;
             }
             buf.extend_from_slice(
-                format!("*{}\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n${}\r\n", num_args, key.len()).as_bytes(),
+                format!(
+                    "*{}\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n${}\r\n",
+                    num_args,
+                    key.len()
+                )
+                .as_bytes(),
             );
             buf.extend_from_slice(key);
             buf.extend_from_slice(format!("\r\n${}\r\n", group.len()).as_bytes());
@@ -695,7 +724,11 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             Some(buf)
         }
-        Command::Hincrby { key, field, increment } => {
+        Command::Hincrby {
+            key,
+            field,
+            increment,
+        } => {
             let s = increment.to_string();
             buf.extend_from_slice(format!("*4\r\n$7\r\nHINCRBY\r\n${}\r\n", key.len()).as_bytes());
             buf.extend_from_slice(key);
@@ -704,16 +737,26 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", s.len(), s).as_bytes());
             Some(buf)
         }
-        Command::Hincrbyfloat { key, field, increment } => {
+        Command::Hincrbyfloat {
+            key,
+            field,
+            increment,
+        } => {
             let s = increment.to_string();
-            buf.extend_from_slice(format!("*4\r\n$12\r\nHINCRBYFLOAT\r\n${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(
+                format!("*4\r\n$12\r\nHINCRBYFLOAT\r\n${}\r\n", key.len()).as_bytes(),
+            );
             buf.extend_from_slice(key);
             buf.extend_from_slice(format!("\r\n${}\r\n", field.len()).as_bytes());
             buf.extend_from_slice(field);
             buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", s.len(), s).as_bytes());
             Some(buf)
         }
-        Command::Smove { source, destination, member } => {
+        Command::Smove {
+            source,
+            destination,
+            member,
+        } => {
             buf.extend_from_slice(format!("*4\r\n$5\r\nSMOVE\r\n${}\r\n", source.len()).as_bytes());
             buf.extend_from_slice(source);
             buf.extend_from_slice(format!("\r\n${}\r\n", destination.len()).as_bytes());
@@ -726,17 +769,46 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
         Command::Zremrangebyrank { key, start, stop } => {
             let st = start.to_string();
             let sp = stop.to_string();
-            buf.extend_from_slice(format!("*4\r\n$16\r\nZREMRANGEBYRANK\r\n${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(
+                format!("*4\r\n$16\r\nZREMRANGEBYRANK\r\n${}\r\n", key.len()).as_bytes(),
+            );
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n${}\r\n{}\r\n", st.len(), st, sp.len(), sp).as_bytes());
+            buf.extend_from_slice(
+                format!("\r\n${}\r\n{}\r\n${}\r\n{}\r\n", st.len(), st, sp.len(), sp).as_bytes(),
+            );
             Some(buf)
         }
-        Command::Zremrangebyscore { key, min_score, min_inc, max_score, max_inc } => {
-            let min_s = if *min_inc { min_score.to_string() } else { format!("({}", min_score) };
-            let max_s = if *max_inc { max_score.to_string() } else { format!("({}", max_score) };
-            buf.extend_from_slice(format!("*4\r\n$17\r\nZREMRANGEBYSCORE\r\n${}\r\n", key.len()).as_bytes());
+        Command::Zremrangebyscore {
+            key,
+            min_score,
+            min_inc,
+            max_score,
+            max_inc,
+        } => {
+            let min_s = if *min_inc {
+                min_score.to_string()
+            } else {
+                format!("({}", min_score)
+            };
+            let max_s = if *max_inc {
+                max_score.to_string()
+            } else {
+                format!("({}", max_score)
+            };
+            buf.extend_from_slice(
+                format!("*4\r\n$17\r\nZREMRANGEBYSCORE\r\n${}\r\n", key.len()).as_bytes(),
+            );
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n${}\r\n{}\r\n", min_s.len(), min_s, max_s.len(), max_s).as_bytes());
+            buf.extend_from_slice(
+                format!(
+                    "\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    min_s.len(),
+                    min_s,
+                    max_s.len(),
+                    max_s
+                )
+                .as_bytes(),
+            );
             Some(buf)
         }
         Command::Zremrangebylex { key, min, max } => {
@@ -752,9 +824,20 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                 crate::table::LexBound::Inclusive(b) => format!("[{}", String::from_utf8_lossy(b)),
                 crate::table::LexBound::Exclusive(b) => format!("({}", String::from_utf8_lossy(b)),
             };
-            buf.extend_from_slice(format!("*4\r\n$15\r\nZREMRANGEBYLEX\r\n${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(
+                format!("*4\r\n$15\r\nZREMRANGEBYLEX\r\n${}\r\n", key.len()).as_bytes(),
+            );
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n${}\r\n{}\r\n", min_s.len(), min_s, max_s.len(), max_s).as_bytes());
+            buf.extend_from_slice(
+                format!(
+                    "\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    min_s.len(),
+                    min_s,
+                    max_s.len(),
+                    max_s
+                )
+                .as_bytes(),
+            );
             Some(buf)
         }
         Command::Ltrim { key, start, stop } => {
@@ -762,51 +845,106 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             let sp = stop.to_string();
             buf.extend_from_slice(format!("*4\r\n$5\r\nLTRIM\r\n${}\r\n", key.len()).as_bytes());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n${}\r\n{}\r\n", st.len(), st, sp.len(), sp).as_bytes());
+            buf.extend_from_slice(
+                format!("\r\n${}\r\n{}\r\n${}\r\n{}\r\n", st.len(), st, sp.len(), sp).as_bytes(),
+            );
             Some(buf)
         }
-        Command::Lset { key, index, element } => {
+        Command::Lset {
+            key,
+            index,
+            element,
+        } => {
             let idx_s = index.to_string();
             buf.extend_from_slice(format!("*4\r\n$4\r\nLSET\r\n${}\r\n", key.len()).as_bytes());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n${}\r\n", idx_s.len(), idx_s, element.len()).as_bytes());
+            buf.extend_from_slice(
+                format!(
+                    "\r\n${}\r\n{}\r\n${}\r\n",
+                    idx_s.len(),
+                    idx_s,
+                    element.len()
+                )
+                .as_bytes(),
+            );
             buf.extend_from_slice(element);
             buf.extend_from_slice(b"\r\n");
             Some(buf)
         }
-        Command::Lrem { key, count, element } => {
+        Command::Lrem {
+            key,
+            count,
+            element,
+        } => {
             let cnt_s = count.to_string();
             buf.extend_from_slice(format!("*4\r\n$4\r\nLREM\r\n${}\r\n", key.len()).as_bytes());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n${}\r\n", cnt_s.len(), cnt_s, element.len()).as_bytes());
+            buf.extend_from_slice(
+                format!(
+                    "\r\n${}\r\n{}\r\n${}\r\n",
+                    cnt_s.len(),
+                    cnt_s,
+                    element.len()
+                )
+                .as_bytes(),
+            );
             buf.extend_from_slice(element);
             buf.extend_from_slice(b"\r\n");
             Some(buf)
         }
-        Command::Linsert { key, before, pivot, element } => {
+        Command::Linsert {
+            key,
+            before,
+            pivot,
+            element,
+        } => {
             let dir = if *before { "BEFORE" } else { "AFTER" };
             buf.extend_from_slice(format!("*5\r\n$7\r\nLINSERT\r\n${}\r\n", key.len()).as_bytes());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n${}\r\n", dir.len(), dir, pivot.len()).as_bytes());
+            buf.extend_from_slice(
+                format!("\r\n${}\r\n{}\r\n${}\r\n", dir.len(), dir, pivot.len()).as_bytes(),
+            );
             buf.extend_from_slice(pivot);
             buf.extend_from_slice(format!("\r\n${}\r\n", element.len()).as_bytes());
             buf.extend_from_slice(element);
             buf.extend_from_slice(b"\r\n");
             Some(buf)
         }
-        Command::Lmove { source, destination, where_from, where_to } => {
-            let from_s = match where_from { crate::table::ListDirection::Left => "LEFT", crate::table::ListDirection::Right => "RIGHT" };
-            let to_s = match where_to { crate::table::ListDirection::Left => "LEFT", crate::table::ListDirection::Right => "RIGHT" };
+        Command::Lmove {
+            source,
+            destination,
+            where_from,
+            where_to,
+        } => {
+            let from_s = match where_from {
+                crate::table::ListDirection::Left => "LEFT",
+                crate::table::ListDirection::Right => "RIGHT",
+            };
+            let to_s = match where_to {
+                crate::table::ListDirection::Left => "LEFT",
+                crate::table::ListDirection::Right => "RIGHT",
+            };
             buf.extend_from_slice(format!("*5\r\n$5\r\nLMOVE\r\n${}\r\n", source.len()).as_bytes());
             buf.extend_from_slice(source);
             buf.extend_from_slice(format!("\r\n${}\r\n", destination.len()).as_bytes());
             buf.extend_from_slice(destination);
-            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n${}\r\n{}\r\n", from_s.len(), from_s, to_s.len(), to_s).as_bytes());
+            buf.extend_from_slice(
+                format!(
+                    "\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                    from_s.len(),
+                    from_s,
+                    to_s.len(),
+                    to_s
+                )
+                .as_bytes(),
+            );
             Some(buf)
         }
         Command::Incrbyfloat { key, increment } => {
             let s = increment.to_string();
-            buf.extend_from_slice(format!("*3\r\n$11\r\nINCRBYFLOAT\r\n${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(
+                format!("*3\r\n$11\r\nINCRBYFLOAT\r\n${}\r\n", key.len()).as_bytes(),
+            );
             buf.extend_from_slice(key);
             buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", s.len(), s).as_bytes());
             Some(buf)
@@ -815,12 +953,20 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             let off_s = offset.to_string();
             buf.extend_from_slice(format!("*4\r\n$8\r\nSETRANGE\r\n${}\r\n", key.len()).as_bytes());
             buf.extend_from_slice(key);
-            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n${}\r\n", off_s.len(), off_s, value.len()).as_bytes());
+            buf.extend_from_slice(
+                format!("\r\n${}\r\n{}\r\n${}\r\n", off_s.len(), off_s, value.len()).as_bytes(),
+            );
             buf.extend_from_slice(value);
             buf.extend_from_slice(b"\r\n");
             Some(buf)
         }
-        Command::Sort { key, desc, alpha, store: Some(dest), limit } => {
+        Command::Sort {
+            key,
+            desc,
+            alpha,
+            store: Some(dest),
+            limit,
+        } => {
             let mut args: Vec<Vec<u8>> = vec![b"SORT".to_vec(), key.to_vec()];
             if let Some((offset, count)) = limit {
                 args.push(b"LIMIT".to_vec());

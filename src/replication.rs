@@ -46,7 +46,8 @@ impl ReplicationBacklog {
         if self.buffer.len() > self.max_size {
             let overflow = self.buffer.len() - self.max_size;
             self.buffer.drain(..overflow);
-            self.first_byte_offset = current_master_offset.saturating_sub(self.buffer.len() as u64) + 1;
+            self.first_byte_offset =
+                current_master_offset.saturating_sub(self.buffer.len() as u64) + 1;
         }
     }
 }
@@ -123,7 +124,11 @@ impl ReplicationHub {
         }
     }
 
-    pub fn register_replica(&self, id: u64, sender: flume::Sender<Vec<u8>>) -> Arc<ConnectedReplica> {
+    pub fn register_replica(
+        &self,
+        id: u64,
+        sender: flume::Sender<Vec<u8>>,
+    ) -> Arc<ConnectedReplica> {
         let rep = Arc::new(ConnectedReplica {
             id,
             sender,
@@ -165,7 +170,9 @@ impl ReplicationHub {
         if !self.has_replicas.load(Ordering::Relaxed) || !self.is_master() {
             return;
         }
-        let new_offset = self.master_repl_offset.fetch_add(bytes.len() as u64, Ordering::SeqCst)
+        let new_offset = self
+            .master_repl_offset
+            .fetch_add(bytes.len() as u64, Ordering::SeqCst)
             + bytes.len() as u64;
         self.backlog.write().unwrap().append(bytes, new_offset);
 
@@ -224,7 +231,11 @@ impl ReplicationHub {
                 out.extend_from_slice(b"\r\n");
                 out.extend_from_slice(master_host.as_bytes());
                 out.extend_from_slice(format!("\r\n:{}\r\n$", master_port).as_bytes());
-                let state_str = if link_status == "up" { "connected" } else { "connect" };
+                let state_str = if link_status == "up" {
+                    "connected"
+                } else {
+                    "connect"
+                };
                 out.extend_from_slice(state_str.len().to_string().as_bytes());
                 out.extend_from_slice(b"\r\n");
                 out.extend_from_slice(state_str.as_bytes());
@@ -456,7 +467,7 @@ async fn run_replica_worker(
     }
 
     let line_str = String::from_utf8_lossy(&line);
-    let parts: Vec<&str> = line_str.trim().split_whitespace().collect();
+    let parts: Vec<&str> = line_str.split_whitespace().collect();
     let initial_offset: u64 = if parts.len() >= 3 {
         parts[2].parse().unwrap_or(0)
     } else {
@@ -538,7 +549,6 @@ async fn run_replica_worker(
                         }
                         crate::resp::Command::Ping(_) => {}
                         _ => {
-                            
                             router.execute_replica_command(cmd).await;
                         }
                     }

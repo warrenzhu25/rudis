@@ -244,7 +244,6 @@ pub enum ShardMessage {
     },
 }
 
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SlotState {
     Stable,
@@ -281,7 +280,6 @@ impl ShardDb {
         }
     }
 
-
     #[inline]
     pub fn get_entry(
         &mut self,
@@ -303,36 +301,58 @@ impl ShardDb {
         if let Some(ptr) = self.table.is_tiered(&key) {
             if let Some(tm) = &self.tier_manager {
                 tm.on_key_deleted(ptr);
-                tm.stats.tiered_keys.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                tm.stats.total_deletes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tm.stats
+                    .tiered_keys
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                tm.stats
+                    .total_deletes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-        } else if let Some(ptr) = self.table.is_cooled(&key) {
-            if let Some(tm) = &self.tier_manager {
-                tm.on_key_deleted(ptr);
-                tm.stats.cooled_keys.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                tm.stats.total_deletes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+        } else if let Some(ptr) = self.table.is_cooled(&key)
+            && let Some(tm) = &self.tier_manager
+        {
+            tm.on_key_deleted(ptr);
+            tm.stats
+                .cooled_keys
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            tm.stats
+                .total_deletes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.table.set(key, value, expire_in);
     }
 
     #[inline]
-    pub fn set_extended(&mut self, key: Bytes, value: Bytes, expire_in: Option<Duration>, keepttl: bool) {
+    pub fn set_extended(
+        &mut self,
+        key: Bytes,
+        value: Bytes,
+        expire_in: Option<Duration>,
+        keepttl: bool,
+    ) {
         if let Some(tm) = &self.tier_manager {
             tm.op_manager.cancel_pending_stash(&key);
         }
         if let Some(ptr) = self.table.is_tiered(&key) {
             if let Some(tm) = &self.tier_manager {
                 tm.on_key_deleted(ptr);
-                tm.stats.tiered_keys.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                tm.stats.total_deletes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tm.stats
+                    .tiered_keys
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                tm.stats
+                    .total_deletes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-        } else if let Some(ptr) = self.table.is_cooled(&key) {
-            if let Some(tm) = &self.tier_manager {
-                tm.on_key_deleted(ptr);
-                tm.stats.cooled_keys.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                tm.stats.total_deletes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+        } else if let Some(ptr) = self.table.is_cooled(&key)
+            && let Some(tm) = &self.tier_manager
+        {
+            tm.on_key_deleted(ptr);
+            tm.stats
+                .cooled_keys
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            tm.stats
+                .total_deletes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.table.set_extended(key, value, expire_in, keepttl);
     }
@@ -343,22 +363,34 @@ impl ShardDb {
             tm.op_manager.cancel_pending_stash(key);
         }
         let ptr = self.table.is_tiered(key);
-        let cooled_ptr = if ptr.is_none() { self.table.is_cooled(key) } else { None };
+        let cooled_ptr = if ptr.is_none() {
+            self.table.is_cooled(key)
+        } else {
+            None
+        };
         let deleted = self.table.del(key);
         if deleted {
             self.sticky_keys.remove(key);
             if let Some(ptr) = ptr {
                 if let Some(tm) = &self.tier_manager {
                     tm.on_key_deleted(ptr);
-                    tm.stats.tiered_keys.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    tm.stats.total_deletes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tm.stats
+                        .tiered_keys
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    tm.stats
+                        .total_deletes
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
-            } else if let Some(ptr) = cooled_ptr {
-                if let Some(tm) = &self.tier_manager {
-                    tm.on_key_deleted(ptr);
-                    tm.stats.cooled_keys.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    tm.stats.total_deletes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
+            } else if let Some(ptr) = cooled_ptr
+                && let Some(tm) = &self.tier_manager
+            {
+                tm.on_key_deleted(ptr);
+                tm.stats
+                    .cooled_keys
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                tm.stats
+                    .total_deletes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
         deleted
@@ -425,7 +457,12 @@ impl ShardDb {
     }
 
     #[inline]
-    pub fn hsetnx(&mut self, key: Bytes, field: Bytes, value: Bytes) -> Result<usize, &'static str> {
+    pub fn hsetnx(
+        &mut self,
+        key: Bytes,
+        field: Bytes,
+        value: Bytes,
+    ) -> Result<usize, &'static str> {
         self.table.hsetnx(key, field, value)
     }
 
@@ -479,7 +516,11 @@ impl ShardDb {
     }
 
     #[inline]
-    pub fn hgetdel(&mut self, key: &[u8], fields: &[Bytes]) -> Result<(Vec<Option<Bytes>>, Vec<Bytes>), &'static str> {
+    pub fn hgetdel(
+        &mut self,
+        key: &[u8],
+        fields: &[Bytes],
+    ) -> Result<(Vec<Option<Bytes>>, Vec<Bytes>), &'static str> {
         self.table.hgetdel(key, fields)
     }
 
@@ -494,7 +535,12 @@ impl ShardDb {
     }
 
     #[inline]
-    pub fn hincrbyfloat(&mut self, key: Bytes, field: Bytes, delta: f64) -> Result<f64, &'static str> {
+    pub fn hincrbyfloat(
+        &mut self,
+        key: Bytes,
+        field: Bytes,
+        delta: f64,
+    ) -> Result<f64, &'static str> {
         self.table.hincrbyfloat(key, field, delta)
     }
 
@@ -701,12 +747,21 @@ impl ShardDb {
     }
 
     #[inline]
-    pub fn srandmember(&mut self, key: &[u8], count: Option<i64>) -> Result<Vec<Bytes>, &'static str> {
+    pub fn srandmember(
+        &mut self,
+        key: &[u8],
+        count: Option<i64>,
+    ) -> Result<Vec<Bytes>, &'static str> {
         self.table.srandmember(key, count)
     }
 
     #[inline]
-    pub fn smove(&mut self, source: &[u8], destination: Bytes, member: Bytes) -> Result<crate::table::SmoveResult, &'static str> {
+    pub fn smove(
+        &mut self,
+        source: &[u8],
+        destination: Bytes,
+        member: Bytes,
+    ) -> Result<crate::table::SmoveResult, &'static str> {
         self.table.smove(source, destination, member)
     }
 
@@ -831,7 +886,11 @@ impl ShardDb {
     }
 
     #[inline]
-    pub fn zdiff(&mut self, keys: &[Bytes], with_scores: bool) -> Result<Vec<(Bytes, f64)>, &'static str> {
+    pub fn zdiff(
+        &mut self,
+        keys: &[Bytes],
+        with_scores: bool,
+    ) -> Result<Vec<(Bytes, f64)>, &'static str> {
         self.table.zdiff(keys, with_scores)
     }
 
@@ -863,7 +922,11 @@ impl ShardDb {
     }
 
     #[inline]
-    pub fn zmscore(&mut self, key: &[u8], members: &[Bytes]) -> Result<Vec<Option<f64>>, &'static str> {
+    pub fn zmscore(
+        &mut self,
+        key: &[u8],
+        members: &[Bytes],
+    ) -> Result<Vec<Option<f64>>, &'static str> {
         self.table.zmscore(key, members)
     }
 
@@ -878,7 +941,12 @@ impl ShardDb {
     }
 
     #[inline]
-    pub fn zremrangebyrank(&mut self, key: &[u8], start: i64, stop: i64) -> Result<usize, &'static str> {
+    pub fn zremrangebyrank(
+        &mut self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+    ) -> Result<usize, &'static str> {
         self.table.zremrangebyrank(key, start, stop)
     }
 
@@ -981,7 +1049,12 @@ impl ShardDb {
     }
 
     #[inline]
-    pub fn setrange(&mut self, key: Bytes, offset: usize, value: &[u8]) -> Result<usize, &'static str> {
+    pub fn setrange(
+        &mut self,
+        key: Bytes,
+        offset: usize,
+        value: &[u8],
+    ) -> Result<usize, &'static str> {
         self.table.setrange(key, offset, value)
     }
 
@@ -1123,7 +1196,8 @@ impl ShardDb {
         maxlen: Option<usize>,
         minid: Option<crate::table::StreamId>,
     ) -> Result<Option<crate::table::StreamId>, &'static str> {
-        self.table.xadd(key, add_id, fields, nomkstream, maxlen, minid)
+        self.table
+            .xadd(key, add_id, fields, nomkstream, maxlen, minid)
     }
 
     #[inline]
@@ -1159,12 +1233,17 @@ impl ShardDb {
         keys: &[Bytes],
         ids: &[String],
         count: Option<usize>,
-    ) -> Result<Vec<(Bytes, Vec<(crate::table::StreamId, Vec<(Bytes, Bytes)>)>)>, &'static str> {
+    ) -> Result<Vec<(Bytes, Vec<(crate::table::StreamId, Vec<(Bytes, Bytes)>)>)>, &'static str>
+    {
         self.table.xread(keys, ids, count)
     }
 
     #[inline]
-    pub fn xdel(&mut self, key: &[u8], ids: &[crate::table::StreamId]) -> Result<usize, &'static str> {
+    pub fn xdel(
+        &mut self,
+        key: &[u8],
+        ids: &[crate::table::StreamId],
+    ) -> Result<usize, &'static str> {
         self.table.xdel(key, ids)
     }
 
@@ -1234,7 +1313,8 @@ impl ShardDb {
         count: Option<usize>,
         noack: bool,
     ) -> Result<Vec<(crate::table::StreamId, Vec<(Bytes, Bytes)>)>, &'static str> {
-        self.table.xreadgroup(key, group, consumer, id_str, count, noack)
+        self.table
+            .xreadgroup(key, group, consumer, id_str, count, noack)
     }
 
     #[inline]
@@ -1252,7 +1332,15 @@ impl ShardDb {
         &mut self,
         key: &[u8],
         group: &[u8],
-    ) -> Result<(usize, Option<crate::table::StreamId>, Option<crate::table::StreamId>, Vec<(Bytes, usize)>), &'static str> {
+    ) -> Result<
+        (
+            usize,
+            Option<crate::table::StreamId>,
+            Option<crate::table::StreamId>,
+            Vec<(Bytes, usize)>,
+        ),
+        &'static str,
+    > {
         self.table.xpending_summary(key, group)
     }
 
@@ -1266,7 +1354,8 @@ impl ShardDb {
         count: usize,
         consumer: Option<&[u8]>,
     ) -> Result<Vec<(crate::table::StreamId, Bytes, u64, usize)>, &'static str> {
-        self.table.xpending_range(key, group, start, end, count, consumer)
+        self.table
+            .xpending_range(key, group, start, end, count, consumer)
     }
 
     // Vector operations
@@ -1281,17 +1370,26 @@ impl ShardDb {
         tiered: bool,
     ) -> Result<(), &'static str> {
         let dim = vector.len();
-        let idx = self.vector_indexes.entry(index_name.to_string()).or_insert_with(|| {
-            crate::vector::HnswIndex::new(
-                index_name.to_string(),
-                dim,
-                metric.unwrap_or(crate::vector::VectorMetric::Cosine),
-            )
-        });
+        let idx = self
+            .vector_indexes
+            .entry(index_name.to_string())
+            .or_insert_with(|| {
+                crate::vector::HnswIndex::new(
+                    index_name.to_string(),
+                    dim,
+                    metric.unwrap_or(crate::vector::VectorMetric::Cosine),
+                )
+            });
         idx.add_quantized_ext(key, vector, quantize, pq, tiered)
     }
 
-    pub fn vquery(&self, index_name: &str, query: &[f32], k: usize, rerank: bool) -> Vec<(Bytes, f32)> {
+    pub fn vquery(
+        &self,
+        index_name: &str,
+        query: &[f32],
+        k: usize,
+        rerank: bool,
+    ) -> Vec<(Bytes, f32)> {
         if let Some(idx) = self.vector_indexes.get(index_name) {
             idx.search_tiered(query, k, rerank)
         } else {
@@ -1325,9 +1423,9 @@ impl ShardDb {
     }
 
     pub fn vinfo(&self, index_name: &str) -> Option<(usize, usize, &'static str, usize)> {
-        self.vector_indexes.get(index_name).map(|idx| {
-            (idx.len(), idx.dim, idx.metric.as_str(), idx.max_layer)
-        })
+        self.vector_indexes
+            .get(index_name)
+            .map(|idx| (idx.len(), idx.dim, idx.metric.as_str(), idx.max_layer))
     }
 
     // Active-Active CRDT operations
@@ -1376,4 +1474,3 @@ impl ShardDb {
         self.crdt_store.gc_tombstones(ttl)
     }
 }
-

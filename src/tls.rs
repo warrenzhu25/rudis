@@ -10,8 +10,8 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
 use std::sync::Arc;
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 /// Generates an in-memory self-signed TLS certificate and private key for development/tests.
 pub fn generate_self_signed_cert(
@@ -19,12 +19,16 @@ pub fn generate_self_signed_cert(
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
     let mut params = rcgen::CertificateParams::new(subject_alt_names)
         .map_err(|e| format!("rcgen CertificateParams error: {}", e))?;
-    params.distinguished_name.push(rcgen::DnType::CommonName, "Rudis In-Memory Dev Cert");
-    params.distinguished_name.push(rcgen::DnType::OrganizationName, "Rudis Server");
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "Rudis In-Memory Dev Cert");
+    params
+        .distinguished_name
+        .push(rcgen::DnType::OrganizationName, "Rudis Server");
 
-    let key_pair = rcgen::KeyPair::generate()
-        .map_err(|e| format!("rcgen KeyPair error: {}", e))?;
-    let cert = params.self_signed(&key_pair)
+    let key_pair = rcgen::KeyPair::generate().map_err(|e| format!("rcgen KeyPair error: {}", e))?;
+    let cert = params
+        .self_signed(&key_pair)
         .map_err(|e| format!("rcgen self_signed error: {}", e))?;
 
     let cert_der = cert.der().to_vec();
@@ -33,10 +37,7 @@ pub fn generate_self_signed_cert(
 }
 
 /// Builds a `rustls::ServerConfig` from DER-encoded certificate and private key.
-pub fn create_server_config(
-    cert_der: &[u8],
-    key_der: &[u8],
-) -> Result<Arc<ServerConfig>, String> {
+pub fn create_server_config(cert_der: &[u8], key_der: &[u8]) -> Result<Arc<ServerConfig>, String> {
     let cert = CertificateDer::from(cert_der.to_vec());
     let key = PrivateKeyDer::try_from(key_der.to_vec())
         .map_err(|e| format!("Invalid private key DER: {:?}", e))?;
@@ -57,12 +58,16 @@ pub fn load_certs_and_key_from_files(
     let cert_file = File::open(cert_path).map_err(|e| format!("Cannot open cert file: {}", e))?;
     let mut cert_reader = BufReader::new(cert_file);
     let mut cert_bytes = Vec::new();
-    cert_reader.read_to_end(&mut cert_bytes).map_err(|e| format!("Read cert error: {}", e))?;
+    cert_reader
+        .read_to_end(&mut cert_bytes)
+        .map_err(|e| format!("Read cert error: {}", e))?;
 
     let key_file = File::open(key_path).map_err(|e| format!("Cannot open key file: {}", e))?;
     let mut key_reader = BufReader::new(key_file);
     let mut key_bytes = Vec::new();
-    key_reader.read_to_end(&mut key_bytes).map_err(|e| format!("Read key error: {}", e))?;
+    key_reader
+        .read_to_end(&mut key_bytes)
+        .map_err(|e| format!("Read key error: {}", e))?;
 
     // Parse PEM using rcgen/rustls or fallback to raw DER
     create_server_config(&cert_bytes, &key_bytes)

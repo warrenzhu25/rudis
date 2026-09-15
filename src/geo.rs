@@ -110,8 +110,8 @@ pub fn haversine_distance(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
     let lat1_rad = lat1.to_radians();
     let lat2_rad = lat2.to_radians();
 
-    let a = (dlat / 2.0).sin().powi(2)
-        + lat1_rad.cos() * lat2_rad.cos() * (dlon / 2.0).sin().powi(2);
+    let a =
+        (dlat / 2.0).sin().powi(2) + lat1_rad.cos() * lat2_rad.cos() * (dlon / 2.0).sin().powi(2);
     let c = 2.0 * a.sqrt().clamp(0.0, 1.0).asin();
     EARTH_RADIUS_METERS * c
 }
@@ -131,9 +131,15 @@ pub fn format_geo_results(out: &mut Vec<u8>, results: &[GeoItemResult], has_opti
             crate::connection::write_resp_bulk(out, &item.member);
         } else {
             let mut sub_count = 1;
-            if item.dist.is_some() { sub_count += 1; }
-            if item.hash.is_some() { sub_count += 1; }
-            if item.coord.is_some() { sub_count += 1; }
+            if item.dist.is_some() {
+                sub_count += 1;
+            }
+            if item.hash.is_some() {
+                sub_count += 1;
+            }
+            if item.coord.is_some() {
+                sub_count += 1;
+            }
 
             out.extend_from_slice(format!("*{}\r\n", sub_count).as_bytes());
             crate::connection::write_resp_bulk(out, &item.member);

@@ -3,10 +3,23 @@ use std::sync::{Arc, LazyLock, RwLock};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldType {
-    Text { weight: f64, sortable: bool, nostem: bool },
-    Numeric { sortable: bool },
-    Tag { separator: char, casesensitive: bool },
-    Vector { dim: usize, distance_metric: String, algorithm: String },
+    Text {
+        weight: f64,
+        sortable: bool,
+        nostem: bool,
+    },
+    Numeric {
+        sortable: bool,
+    },
+    Tag {
+        separator: char,
+        casesensitive: bool,
+    },
+    Vector {
+        dim: usize,
+        distance_metric: String,
+        algorithm: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -47,26 +60,180 @@ pub struct InvertedIndex {
 
 static ENGLISH_STOP_WORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     [
-        "a", "about", "above", "after", "again", "against", "all", "am", "an", "and",
-        "any", "are", "aren't", "as", "at", "be", "because", "been", "before", "being",
-        "below", "between", "both", "but", "by", "can't", "cannot", "could", "couldn't",
-        "did", "didn't", "do", "does", "doesn't", "doing", "don't", "down", "during",
-        "each", "few", "for", "from", "further", "had", "hadn't", "has", "hasn't",
-        "have", "haven't", "having", "he", "he'd", "he'll", "he's", "her", "here",
-        "here's", "hers", "herself", "him", "himself", "his", "how", "how's", "i",
-        "i'd", "i'll", "i'm", "i've", "if", "in", "into", "is", "isn't", "it", "it's",
-        "its", "itself", "let's", "me", "more", "most", "mustn't", "my", "myself",
-        "no", "nor", "not", "of", "off", "on", "once", "only", "or", "other", "ought",
-        "our", "ours", "ourselves", "out", "over", "own", "same", "shan't", "she",
-        "she'd", "she'll", "she's", "should", "shouldn't", "so", "some", "such",
-        "than", "that", "that's", "the", "their", "theirs", "them", "themselves",
-        "then", "there", "there's", "these", "they", "they'd", "they'll", "they're",
-        "they've", "this", "those", "through", "to", "too", "under", "until", "up",
-        "very", "was", "wasn't", "we", "we'd", "we'll", "we're", "we've", "were",
-        "weren't", "what", "what's", "when", "when's", "where", "where's", "which",
-        "while", "who", "who's", "whom", "why", "why's", "with", "won't", "would",
-        "wouldn't", "you", "you'd", "you'll", "you're", "you've", "your", "yours",
-        "yourself", "yourselves",
+        "a",
+        "about",
+        "above",
+        "after",
+        "again",
+        "against",
+        "all",
+        "am",
+        "an",
+        "and",
+        "any",
+        "are",
+        "aren't",
+        "as",
+        "at",
+        "be",
+        "because",
+        "been",
+        "before",
+        "being",
+        "below",
+        "between",
+        "both",
+        "but",
+        "by",
+        "can't",
+        "cannot",
+        "could",
+        "couldn't",
+        "did",
+        "didn't",
+        "do",
+        "does",
+        "doesn't",
+        "doing",
+        "don't",
+        "down",
+        "during",
+        "each",
+        "few",
+        "for",
+        "from",
+        "further",
+        "had",
+        "hadn't",
+        "has",
+        "hasn't",
+        "have",
+        "haven't",
+        "having",
+        "he",
+        "he'd",
+        "he'll",
+        "he's",
+        "her",
+        "here",
+        "here's",
+        "hers",
+        "herself",
+        "him",
+        "himself",
+        "his",
+        "how",
+        "how's",
+        "i",
+        "i'd",
+        "i'll",
+        "i'm",
+        "i've",
+        "if",
+        "in",
+        "into",
+        "is",
+        "isn't",
+        "it",
+        "it's",
+        "its",
+        "itself",
+        "let's",
+        "me",
+        "more",
+        "most",
+        "mustn't",
+        "my",
+        "myself",
+        "no",
+        "nor",
+        "not",
+        "of",
+        "off",
+        "on",
+        "once",
+        "only",
+        "or",
+        "other",
+        "ought",
+        "our",
+        "ours",
+        "ourselves",
+        "out",
+        "over",
+        "own",
+        "same",
+        "shan't",
+        "she",
+        "she'd",
+        "she'll",
+        "she's",
+        "should",
+        "shouldn't",
+        "so",
+        "some",
+        "such",
+        "than",
+        "that",
+        "that's",
+        "the",
+        "their",
+        "theirs",
+        "them",
+        "themselves",
+        "then",
+        "there",
+        "there's",
+        "these",
+        "they",
+        "they'd",
+        "they'll",
+        "they're",
+        "they've",
+        "this",
+        "those",
+        "through",
+        "to",
+        "too",
+        "under",
+        "until",
+        "up",
+        "very",
+        "was",
+        "wasn't",
+        "we",
+        "we'd",
+        "we'll",
+        "we're",
+        "we've",
+        "were",
+        "weren't",
+        "what",
+        "what's",
+        "when",
+        "when's",
+        "where",
+        "where's",
+        "which",
+        "while",
+        "who",
+        "who's",
+        "whom",
+        "why",
+        "why's",
+        "with",
+        "won't",
+        "would",
+        "wouldn't",
+        "you",
+        "you'd",
+        "you'll",
+        "you're",
+        "you've",
+        "your",
+        "yours",
+        "yourself",
+        "yourselves",
     ]
     .into_iter()
     .collect()
@@ -164,7 +331,10 @@ impl InvertedIndex {
                             numeric_fields.insert(field_name.clone(), num);
                         }
                     }
-                    FieldType::Tag { separator, casesensitive } => {
+                    FieldType::Tag {
+                        separator,
+                        casesensitive,
+                    } => {
                         let mut tags = HashSet::new();
                         for t in field_val.split(*separator) {
                             let clean = t.trim();
@@ -311,13 +481,27 @@ pub enum QueryAst {
     Term(String),
     Prefix(String),
     Exact(String),
-    FieldScope { field: String, inner: Box<QueryAst> },
-    NumericRange { field: String, min: f64, max: f64 },
-    TagFilter { field: String, tags: Vec<String> },
+    FieldScope {
+        field: String,
+        inner: Box<QueryAst>,
+    },
+    NumericRange {
+        field: String,
+        min: f64,
+        max: f64,
+    },
+    TagFilter {
+        field: String,
+        tags: Vec<String>,
+    },
     And(Vec<QueryAst>),
     Or(Vec<QueryAst>),
     Not(Box<QueryAst>),
-    KnnVector { field: String, k: usize, query_vec: Vec<f32> },
+    KnnVector {
+        field: String,
+        k: usize,
+        query_vec: Vec<f32>,
+    },
     MatchAll,
 }
 
@@ -337,8 +521,14 @@ pub fn parse_query(q: &str) -> QueryAst {
 
         if let Some((args_part, _)) = knn_part.split_once(']') {
             let tokens: Vec<&str> = args_part.split_whitespace().collect();
-            let k: usize = tokens.first().and_then(|val| val.parse().ok()).unwrap_or(10);
-            let field = tokens.get(1).map(|s| s.trim_start_matches('@').to_string()).unwrap_or_default();
+            let k: usize = tokens
+                .first()
+                .and_then(|val| val.parse().ok())
+                .unwrap_or(10);
+            let field = tokens
+                .get(1)
+                .map(|s| s.trim_start_matches('@').to_string())
+                .unwrap_or_default();
             let knn_ast = QueryAst::KnnVector {
                 field,
                 k,
@@ -359,9 +549,9 @@ pub fn parse_query(q: &str) -> QueryAst {
             terms.push(QueryAst::Not(Box::new(inner)));
         } else if w.starts_with('@') && w.contains(':') {
             let (field, rest) = w[1..].split_once(':').unwrap();
-            if rest.starts_with('[') {
+            if let Some(stripped) = rest.strip_prefix('[') {
                 // Numeric range: @price:[10 100]
-                let mut range_str = rest[1..].to_string();
+                let mut range_str = stripped.to_string();
                 if !range_str.contains(']') {
                     while i + 1 < words.len() {
                         i += 1;
@@ -374,16 +564,22 @@ pub fn parse_query(q: &str) -> QueryAst {
                 }
                 let clean = range_str.trim_end_matches(']');
                 let parts: Vec<&str> = clean.split_whitespace().collect();
-                let min = parts.first().and_then(|v| v.parse().ok()).unwrap_or(f64::NEG_INFINITY);
-                let max = parts.get(1).and_then(|v| v.parse().ok()).unwrap_or(f64::INFINITY);
+                let min = parts
+                    .first()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(f64::NEG_INFINITY);
+                let max = parts
+                    .get(1)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(f64::INFINITY);
                 terms.push(QueryAst::NumericRange {
                     field: field.to_string(),
                     min,
                     max,
                 });
-            } else if rest.starts_with('{') {
+            } else if let Some(stripped) = rest.strip_prefix('{') {
                 // Tag filter: @category:{electronics | books}
-                let mut tag_str = rest[1..].to_string();
+                let mut tag_str = stripped.to_string();
                 if !tag_str.contains('}') {
                     while i + 1 < words.len() {
                         i += 1;
@@ -434,7 +630,9 @@ pub fn parse_query(q: &str) -> QueryAst {
             };
             let sub_tokens = tokenize_text(clean, true);
             if sub_tokens.len() > 1 {
-                terms.push(QueryAst::And(sub_tokens.into_iter().map(QueryAst::Term).collect()));
+                terms.push(QueryAst::And(
+                    sub_tokens.into_iter().map(QueryAst::Term).collect(),
+                ));
             } else if sub_tokens.len() == 1 {
                 terms.push(QueryAst::Term(sub_tokens[0].clone()));
             } else {
@@ -494,7 +692,7 @@ pub fn execute_search(
     // 1. Evaluate AST to produce candidate matching documents with scores
     match ast {
         QueryAst::MatchAll => {
-            for (doc_id, _) in &index.docs {
+            for doc_id in index.docs.keys() {
                 candidate_scores.insert(doc_id.clone(), 1.0);
             }
         }
@@ -531,23 +729,31 @@ pub fn execute_search(
             }
         }
         QueryAst::FieldScope { field, inner } => {
-            let (total, hits) = execute_search(index, inner, &SearchOptions { limit: usize::MAX, ..Default::default() });
+            let (total, hits) = execute_search(
+                index,
+                inner,
+                &SearchOptions {
+                    limit: usize::MAX,
+                    ..Default::default()
+                },
+            );
             if total > 0 {
                 for h in hits {
-                    if let Some(doc) = index.docs.get(&h.doc_id) {
-                        if doc.fields.contains_key(field) {
-                            candidate_scores.insert(h.doc_id, h.score);
-                        }
+                    if let Some(doc) = index.docs.get(&h.doc_id)
+                        && doc.fields.contains_key(field)
+                    {
+                        candidate_scores.insert(h.doc_id, h.score);
                     }
                 }
             }
         }
         QueryAst::NumericRange { field, min, max } => {
             for (doc_id, doc) in &index.docs {
-                if let Some(&val) = doc.numeric_fields.get(field) {
-                    if val >= *min && val <= *max {
-                        candidate_scores.insert(doc_id.clone(), 1.0);
-                    }
+                if let Some(&val) = doc.numeric_fields.get(field)
+                    && val >= *min
+                    && val <= *max
+                {
+                    candidate_scores.insert(doc_id.clone(), 1.0);
                 }
             }
         }
@@ -567,8 +773,16 @@ pub fn execute_search(
                 let mut first = true;
                 let mut current_set = HashMap::new();
                 for sub in sub_asts {
-                    let (_, hits) = execute_search(index, sub, &SearchOptions { limit: usize::MAX, ..Default::default() });
-                    let sub_map: HashMap<String, f64> = hits.into_iter().map(|h| (h.doc_id, h.score)).collect();
+                    let (_, hits) = execute_search(
+                        index,
+                        sub,
+                        &SearchOptions {
+                            limit: usize::MAX,
+                            ..Default::default()
+                        },
+                    );
+                    let sub_map: HashMap<String, f64> =
+                        hits.into_iter().map(|h| (h.doc_id, h.score)).collect();
                     if first {
                         current_set = sub_map;
                         first = false;
@@ -588,30 +802,49 @@ pub fn execute_search(
         }
         QueryAst::Or(sub_asts) => {
             for sub in sub_asts {
-                let (_, hits) = execute_search(index, sub, &SearchOptions { limit: usize::MAX, ..Default::default() });
+                let (_, hits) = execute_search(
+                    index,
+                    sub,
+                    &SearchOptions {
+                        limit: usize::MAX,
+                        ..Default::default()
+                    },
+                );
                 for h in hits {
                     *candidate_scores.entry(h.doc_id).or_default() += h.score;
                 }
             }
         }
         QueryAst::Not(sub) => {
-            let (_, hits) = execute_search(index, sub, &SearchOptions { limit: usize::MAX, ..Default::default() });
+            let (_, hits) = execute_search(
+                index,
+                sub,
+                &SearchOptions {
+                    limit: usize::MAX,
+                    ..Default::default()
+                },
+            );
             let excluded: HashSet<String> = hits.into_iter().map(|h| h.doc_id).collect();
-            for (doc_id, _) in &index.docs {
+            for doc_id in index.docs.keys() {
                 if !excluded.contains(doc_id) {
                     candidate_scores.insert(doc_id.clone(), 1.0);
                 }
             }
         }
-        QueryAst::KnnVector { field, k, query_vec } => {
+        QueryAst::KnnVector {
+            field,
+            k,
+            query_vec,
+        } => {
             // Compute vector cosine distance against all docs having this vector field
             let mut vector_dists = Vec::new();
             for (doc_id, doc) in &index.docs {
-                if let Some(doc_vec) = doc.vector_fields.get(field) {
-                    if !query_vec.is_empty() && query_vec.len() == doc_vec.len() {
-                        let sim = cosine_similarity(query_vec, doc_vec);
-                        vector_dists.push((doc_id.clone(), sim));
-                    }
+                if let Some(doc_vec) = doc.vector_fields.get(field)
+                    && !query_vec.is_empty()
+                    && query_vec.len() == doc_vec.len()
+                {
+                    let sim = cosine_similarity(query_vec, doc_vec);
+                    vector_dists.push((doc_id.clone(), sim));
                 }
             }
             vector_dists.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -630,14 +863,20 @@ pub fn execute_search(
         scored_docs.sort_by(|a, b| {
             let doc_a = index.docs.get(&a.0);
             let doc_b = index.docs.get(&b.0);
-            let val_a = doc_a.and_then(|d| d.numeric_fields.get(sort_field).copied())
+            let val_a = doc_a
+                .and_then(|d| d.numeric_fields.get(sort_field).copied())
                 .unwrap_or(f64::NEG_INFINITY);
-            let val_b = doc_b.and_then(|d| d.numeric_fields.get(sort_field).copied())
+            let val_b = doc_b
+                .and_then(|d| d.numeric_fields.get(sort_field).copied())
                 .unwrap_or(f64::NEG_INFINITY);
             if *asc {
-                val_a.partial_cmp(&val_b).unwrap_or(std::cmp::Ordering::Equal)
+                val_a
+                    .partial_cmp(&val_b)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             } else {
-                val_b.partial_cmp(&val_a).unwrap_or(std::cmp::Ordering::Equal)
+                val_b
+                    .partial_cmp(&val_a)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             }
         });
     } else {
@@ -646,26 +885,23 @@ pub fn execute_search(
     }
 
     // 3. Paginate
-    let paged = scored_docs
-        .into_iter()
-        .skip(opts.offset)
-        .take(opts.limit);
+    let paged = scored_docs.into_iter().skip(opts.offset).take(opts.limit);
 
     // 4. Construct SearchHit results
     let mut hits = Vec::new();
     for (doc_id, score) in paged {
         let mut fields = HashMap::new();
-        if !opts.nocontent {
-            if let Some(doc) = index.docs.get(&doc_id) {
-                if let Some(ret_fields) = &opts.return_fields {
-                    for rf in ret_fields {
-                        if let Some(v) = doc.fields.get(rf) {
-                            fields.insert(rf.clone(), v.clone());
-                        }
+        if !opts.nocontent
+            && let Some(doc) = index.docs.get(&doc_id)
+        {
+            if let Some(ret_fields) = &opts.return_fields {
+                for rf in ret_fields {
+                    if let Some(v) = doc.fields.get(rf) {
+                        fields.insert(rf.clone(), v.clone());
                     }
-                } else {
-                    fields = doc.fields.clone();
                 }
+            } else {
+                fields = doc.fields.clone();
             }
         }
         hits.push(SearchHit {
@@ -688,11 +924,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         norm_b += y * y;
     }
     let denom = (norm_a * norm_b).sqrt();
-    if denom == 0.0 {
-        0.0
-    } else {
-        dot / denom
-    }
+    if denom == 0.0 { 0.0 } else { dot / denom }
 }
 
 // Reciprocal Rank Fusion (RRF) for Hybrid Keyword + Vector Retrieval
@@ -707,13 +939,17 @@ pub fn reciprocal_rank_fusion(
     for (rank, hit) in bm25_hits.iter().enumerate() {
         let rrf = 1.0 / (k + (rank as f64) + 1.0);
         *rrf_scores.entry(hit.doc_id.clone()).or_default() += rrf;
-        doc_map.entry(hit.doc_id.clone()).or_insert_with(|| hit.fields.clone());
+        doc_map
+            .entry(hit.doc_id.clone())
+            .or_insert_with(|| hit.fields.clone());
     }
 
     for (rank, hit) in vector_hits.iter().enumerate() {
         let rrf = 1.0 / (k + (rank as f64) + 1.0);
         *rrf_scores.entry(hit.doc_id.clone()).or_default() += rrf;
-        doc_map.entry(hit.doc_id.clone()).or_insert_with(|| hit.fields.clone());
+        doc_map
+            .entry(hit.doc_id.clone())
+            .or_insert_with(|| hit.fields.clone());
     }
 
     let mut merged: Vec<SearchHit> = rrf_scores
@@ -725,7 +961,11 @@ pub fn reciprocal_rank_fusion(
         })
         .collect();
 
-    merged.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    merged.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     merged
 }
 
@@ -736,9 +976,22 @@ mod tests {
     #[test]
     fn test_bm25_inverted_index_crud() {
         let mut schema_fields = HashMap::new();
-        schema_fields.insert("title".to_string(), FieldType::Text { weight: 1.0, sortable: true, nostem: false });
+        schema_fields.insert(
+            "title".to_string(),
+            FieldType::Text {
+                weight: 1.0,
+                sortable: true,
+                nostem: false,
+            },
+        );
         schema_fields.insert("price".to_string(), FieldType::Numeric { sortable: true });
-        schema_fields.insert("tags".to_string(), FieldType::Tag { separator: ',', casesensitive: false });
+        schema_fields.insert(
+            "tags".to_string(),
+            FieldType::Tag {
+                separator: ',',
+                casesensitive: false,
+            },
+        );
 
         let schema = IndexSchema {
             name: "idx:products".to_string(),
@@ -750,12 +1003,18 @@ mod tests {
         let mut idx = InvertedIndex::new(schema);
 
         let mut doc1 = HashMap::new();
-        doc1.insert("title".to_string(), "High performance Rust redis engine".to_string());
+        doc1.insert(
+            "title".to_string(),
+            "High performance Rust redis engine".to_string(),
+        );
         doc1.insert("price".to_string(), "99.5".to_string());
         doc1.insert("tags".to_string(), "database, rust, cache".to_string());
 
         let mut doc2 = HashMap::new();
-        doc2.insert("title".to_string(), "Dragonfly memory store in C++".to_string());
+        doc2.insert(
+            "title".to_string(),
+            "Dragonfly memory store in C++".to_string(),
+        );
         doc2.insert("price".to_string(), "49.0".to_string());
         doc2.insert("tags".to_string(), "database, memory".to_string());
 
@@ -791,9 +1050,21 @@ mod tests {
 
     #[test]
     fn test_reciprocal_rank_fusion() {
-        let h1 = SearchHit { doc_id: "doc1".to_string(), score: 10.0, fields: HashMap::new() };
-        let h2 = SearchHit { doc_id: "doc2".to_string(), score: 8.0, fields: HashMap::new() };
-        let h3 = SearchHit { doc_id: "doc3".to_string(), score: 6.0, fields: HashMap::new() };
+        let h1 = SearchHit {
+            doc_id: "doc1".to_string(),
+            score: 10.0,
+            fields: HashMap::new(),
+        };
+        let h2 = SearchHit {
+            doc_id: "doc2".to_string(),
+            score: 8.0,
+            fields: HashMap::new(),
+        };
+        let h3 = SearchHit {
+            doc_id: "doc3".to_string(),
+            score: 6.0,
+            fields: HashMap::new(),
+        };
 
         let bm25_hits = vec![h1, h2];
         let vec_hits = vec![h2_clone(&bm25_hits[1]), h3];

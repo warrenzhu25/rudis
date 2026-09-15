@@ -1,8 +1,8 @@
-use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::io;
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Default page size for buffer memory alignment (4 KB)
 pub const PAGE_SIZE: usize = 4096;
@@ -94,10 +94,14 @@ impl RegisteredBufferPool {
     /// Acquires an available buffer slot from the pool.
     pub fn acquire_slot(&mut self) -> Option<usize> {
         if let Some(slot_idx) = self.free_slots.pop() {
-            self.stats.registered_buffer_hits.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .registered_buffer_hits
+                .fetch_add(1, Ordering::Relaxed);
             Some(slot_idx)
         } else {
-            self.stats.registered_buffer_misses.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .registered_buffer_misses
+                .fetch_add(1, Ordering::Relaxed);
             None
         }
     }
@@ -206,19 +210,15 @@ impl ZeroCopyEngine {
             libc::MSG_NOSIGNAL
         };
 
-        let ret = unsafe {
-            libc::send(
-                fd,
-                data.as_ptr() as *const libc::c_void,
-                data.len(),
-                flags,
-            )
-        };
+        let ret =
+            unsafe { libc::send(fd, data.as_ptr() as *const libc::c_void, data.len(), flags) };
 
         if ret >= 0 {
             let sent = ret as usize;
             self.stats.zc_send_calls.fetch_add(1, Ordering::Relaxed);
-            self.stats.zc_bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+            self.stats
+                .zc_bytes_sent
+                .fetch_add(sent as u64, Ordering::Relaxed);
             Ok(sent)
         } else {
             let err = io::Error::last_os_error();
@@ -235,7 +235,9 @@ impl ZeroCopyEngine {
                 };
                 if fallback_ret >= 0 {
                     let sent = fallback_ret as usize;
-                    self.stats.zc_bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
+                    self.stats
+                        .zc_bytes_sent
+                        .fetch_add(sent as u64, Ordering::Relaxed);
                     return Ok(sent);
                 }
             }
@@ -250,11 +252,7 @@ impl ZeroCopyEngine {
         len: u32,
         slot_index: Option<u16>,
     ) -> io_uring::squeue::Entry {
-        let mut op = io_uring::opcode::SendZc::new(
-            io_uring::types::Fd(fd),
-            buf_ptr,
-            len,
-        );
+        let mut op = io_uring::opcode::SendZc::new(io_uring::types::Fd(fd), buf_ptr, len);
         if let Some(idx) = slot_index {
             op = op.buf_index(Some(idx));
         }
@@ -346,6 +344,9 @@ mod tests {
         assert_eq!(n as usize, msg.len());
         assert_eq!(&recv_buf[..n as usize], msg);
         assert_eq!(stats.zc_send_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.zc_bytes_sent.load(Ordering::Relaxed), msg.len() as u64);
+        assert_eq!(
+            stats.zc_bytes_sent.load(Ordering::Relaxed),
+            msg.len() as u64
+        );
     }
 }

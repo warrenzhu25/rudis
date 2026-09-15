@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use hashbrown::HashMap;
-use serde_json::{json, Number, Value};
+use serde_json::{Number, Value, json};
 
 /// Represents a parsed segment in a JSONPath expression (e.g. `$.users[0].name`).
 #[derive(Clone, Debug, PartialEq)]
@@ -81,12 +81,12 @@ pub fn parse_json_path(path_str: &str) -> Result<Vec<PathSegment>, String> {
             } else if inner.contains(':') {
                 // Slice: [0:2] or [:] or [1:] or [:3]
                 let parts: Vec<&str> = inner.split(':').collect();
-                let start = if parts.first().map_or(true, |p| p.trim().is_empty()) {
+                let start = if parts.first().is_none_or(|p| p.trim().is_empty()) {
                     None
                 } else {
                     parts[0].trim().parse::<isize>().ok()
                 };
-                let end = if parts.get(1).map_or(true, |p| p.trim().is_empty()) {
+                let end = if parts.get(1).is_none_or(|p| p.trim().is_empty()) {
                     None
                 } else {
                     parts[1].trim().parse::<isize>().ok()
@@ -137,10 +137,10 @@ pub fn query_json_path<'a>(root: &'a Value, segments: &[PathSegment]) -> Vec<&'a
             match seg {
                 PathSegment::Root => next.push(val),
                 PathSegment::Field(name) => {
-                    if let Value::Object(map) = val {
-                        if let Some(child) = map.get(name) {
-                            next.push(child);
-                        }
+                    if let Value::Object(map) = val
+                        && let Some(child) = map.get(name)
+                    {
+                        next.push(child);
                     }
                 }
                 PathSegment::Index(idx) => {
@@ -170,9 +170,17 @@ pub fn query_json_path<'a>(root: &'a Value, segments: &[PathSegment]) -> Vec<&'a
                     if let Value::Array(arr) = val {
                         let len = arr.len() as isize;
                         let s = start.unwrap_or(0);
-                        let s_idx = if s < 0 { (len + s).max(0) as usize } else { s.min(len) as usize };
+                        let s_idx = if s < 0 {
+                            (len + s).max(0) as usize
+                        } else {
+                            s.min(len) as usize
+                        };
                         let e = end.unwrap_or(len);
-                        let e_idx = if e < 0 { (len + e).max(0) as usize } else { e.min(len) as usize };
+                        let e_idx = if e < 0 {
+                            (len + e).max(0) as usize
+                        } else {
+                            e.min(len) as usize
+                        };
                         if s_idx < e_idx {
                             for item in &arr[s_idx..e_idx] {
                                 next.push(item);
@@ -192,7 +200,10 @@ pub fn query_json_path<'a>(root: &'a Value, segments: &[PathSegment]) -> Vec<&'a
 }
 
 /// Evaluates a JSONPath query against a mutable JSON `Value`, returning mutable references to matching nodes.
-pub fn query_json_path_mut<'a>(root: &'a mut Value, segments: &[PathSegment]) -> Vec<&'a mut Value> {
+pub fn query_json_path_mut<'a>(
+    root: &'a mut Value,
+    segments: &[PathSegment],
+) -> Vec<&'a mut Value> {
     if segments.is_empty() || (segments.len() == 1 && segments[0] == PathSegment::Root) {
         return vec![root];
     }
@@ -209,16 +220,20 @@ pub fn query_json_path_mut<'a>(root: &'a mut Value, segments: &[PathSegment]) ->
             match seg {
                 PathSegment::Root => next.push(val),
                 PathSegment::Field(name) => {
-                    if let Value::Object(map) = val {
-                        if let Some(child) = map.get_mut(name) {
-                            next.push(child);
-                        }
+                    if let Value::Object(map) = val
+                        && let Some(child) = map.get_mut(name)
+                    {
+                        next.push(child);
                     }
                 }
                 PathSegment::Index(idx) => {
                     if let Value::Array(arr) = val {
                         let len = arr.len() as isize;
-                        let actual_idx = if *idx < 0 { (len + idx) as usize } else { *idx as usize };
+                        let actual_idx = if *idx < 0 {
+                            (len + idx) as usize
+                        } else {
+                            *idx as usize
+                        };
                         if actual_idx < arr.len() {
                             next.push(&mut arr[actual_idx]);
                         }
@@ -239,9 +254,17 @@ pub fn query_json_path_mut<'a>(root: &'a mut Value, segments: &[PathSegment]) ->
                     if let Value::Array(arr) = val {
                         let len = arr.len() as isize;
                         let s = start.unwrap_or(0);
-                        let s_idx = if s < 0 { (len + s).max(0) as usize } else { s.min(len) as usize };
+                        let s_idx = if s < 0 {
+                            (len + s).max(0) as usize
+                        } else {
+                            s.min(len) as usize
+                        };
                         let e = end.unwrap_or(len);
-                        let e_idx = if e < 0 { (len + e).max(0) as usize } else { e.min(len) as usize };
+                        let e_idx = if e < 0 {
+                            (len + e).max(0) as usize
+                        } else {
+                            e.min(len) as usize
+                        };
                         if s_idx < e_idx {
                             for item in &mut arr[s_idx..e_idx] {
                                 next.push(item);
@@ -312,7 +335,11 @@ pub fn set_json_path(
                     *curr = Value::Array(Vec::new());
                 }
                 let arr = curr.as_array_mut().unwrap();
-                let actual_idx = if *idx < 0 { (arr.len() as isize + idx) as usize } else { *idx as usize };
+                let actual_idx = if *idx < 0 {
+                    (arr.len() as isize + idx) as usize
+                } else {
+                    *idx as usize
+                };
                 while arr.len() <= actual_idx {
                     arr.push(Value::Null);
                 }
@@ -327,7 +354,9 @@ pub fn set_json_path(
             if !curr.is_object() {
                 *curr = Value::Object(serde_json::Map::new());
             }
-            curr.as_object_mut().unwrap().insert(name.clone(), new_value);
+            curr.as_object_mut()
+                .unwrap()
+                .insert(name.clone(), new_value);
             Ok(true)
         }
         PathSegment::Index(idx) => {
@@ -335,7 +364,11 @@ pub fn set_json_path(
                 *curr = Value::Array(Vec::new());
             }
             let arr = curr.as_array_mut().unwrap();
-            let actual_idx = if *idx < 0 { (arr.len() as isize + idx) as usize } else { *idx as usize };
+            let actual_idx = if *idx < 0 {
+                (arr.len() as isize + idx) as usize
+            } else {
+                *idx as usize
+            };
             while arr.len() <= actual_idx {
                 arr.push(Value::Null);
             }
@@ -367,10 +400,10 @@ pub fn delete_json_path(root: &mut Value, path: &str) -> usize {
     for parent in parents {
         match last_seg {
             PathSegment::Field(name) => {
-                if let Value::Object(map) = parent {
-                    if map.remove(name).is_some() {
-                        deleted += 1;
-                    }
+                if let Value::Object(map) = parent
+                    && map.remove(name).is_some()
+                {
+                    deleted += 1;
                 }
             }
             PathSegment::Index(idx) => {
@@ -413,9 +446,16 @@ impl JsonStore {
     }
 
     /// JSON.SET <key> <path> <json_value> [NX|XX]
-    pub fn json_set(&mut self, key: &[u8], path: &str, json_str: &str, nx: bool, xx: bool) -> Result<bool, String> {
-        let new_val: Value = serde_json::from_str(json_str)
-            .map_err(|e| format!("ERR invalid JSON value: {}", e))?;
+    pub fn json_set(
+        &mut self,
+        key: &[u8],
+        path: &str,
+        json_str: &str,
+        nx: bool,
+        xx: bool,
+    ) -> Result<bool, String> {
+        let new_val: Value =
+            serde_json::from_str(json_str).map_err(|e| format!("ERR invalid JSON value: {}", e))?;
 
         let key_bytes = Bytes::copy_from_slice(key);
 
@@ -429,14 +469,13 @@ impl JsonStore {
             if xx {
                 return Ok(false);
             }
-            let segments = parse_json_path(path).map_err(|e| e)?;
+            let segments = parse_json_path(path)?;
             if segments.is_empty() || (segments.len() == 1 && segments[0] == PathSegment::Root) {
                 self.docs.insert(key_bytes, new_val);
                 Ok(true)
             } else {
                 let mut root = Value::Object(serde_json::Map::new());
-                set_json_path(&mut root, path, new_val, false, false)
-                    .map_err(|e| e.to_string())?;
+                set_json_path(&mut root, path, new_val, false, false).map_err(|e| e.to_string())?;
                 self.docs.insert(key_bytes, root);
                 Ok(true)
             }
@@ -521,7 +560,10 @@ impl JsonStore {
     /// JSON.NUMINCRBY <key> <path> <number>
     pub fn json_numincrby(&mut self, key: &[u8], path: &str, delta: f64) -> Result<String, String> {
         let key_bytes = Bytes::copy_from_slice(key);
-        let doc = self.docs.get_mut(&key_bytes).ok_or("ERR could not find key")?;
+        let doc = self
+            .docs
+            .get_mut(&key_bytes)
+            .ok_or("ERR could not find key")?;
         let segments = parse_json_path(path)?;
         let matches = query_json_path_mut(doc, &segments);
         if matches.is_empty() {
@@ -554,9 +596,17 @@ impl JsonStore {
     }
 
     /// JSON.STRAPPEND <key> [path] <string>
-    pub fn json_strappend(&mut self, key: &[u8], path: Option<&str>, append_str: &str) -> Result<usize, String> {
+    pub fn json_strappend(
+        &mut self,
+        key: &[u8],
+        path: Option<&str>,
+        append_str: &str,
+    ) -> Result<usize, String> {
         let key_bytes = Bytes::copy_from_slice(key);
-        let doc = self.docs.get_mut(&key_bytes).ok_or("ERR could not find key")?;
+        let doc = self
+            .docs
+            .get_mut(&key_bytes)
+            .ok_or("ERR could not find key")?;
         let p = path.unwrap_or("$");
         let segments = parse_json_path(p)?;
         let matches = query_json_path_mut(doc, &segments);
@@ -583,13 +633,23 @@ impl JsonStore {
         let p = path.unwrap_or("$");
         let segments = parse_json_path(p).ok()?;
         let matches = query_json_path(doc, &segments);
-        matches.first().and_then(|val| val.as_str().map(|s| s.len()))
+        matches
+            .first()
+            .and_then(|val| val.as_str().map(|s| s.len()))
     }
 
     /// JSON.ARRAPPEND <key> <path> <values...>
-    pub fn json_arrappend(&mut self, key: &[u8], path: &str, values_json: &[&str]) -> Result<usize, String> {
+    pub fn json_arrappend(
+        &mut self,
+        key: &[u8],
+        path: &str,
+        values_json: &[&str],
+    ) -> Result<usize, String> {
         let key_bytes = Bytes::copy_from_slice(key);
-        let doc = self.docs.get_mut(&key_bytes).ok_or("ERR could not find key")?;
+        let doc = self
+            .docs
+            .get_mut(&key_bytes)
+            .ok_or("ERR could not find key")?;
         let segments = parse_json_path(path)?;
         let matches = query_json_path_mut(doc, &segments);
         if matches.is_empty() {
@@ -598,8 +658,8 @@ impl JsonStore {
 
         let mut parsed_values = Vec::with_capacity(values_json.len());
         for &v in values_json {
-            let parsed: Value = serde_json::from_str(v)
-                .map_err(|e| format!("ERR invalid JSON element: {}", e))?;
+            let parsed: Value =
+                serde_json::from_str(v).map_err(|e| format!("ERR invalid JSON element: {}", e))?;
             parsed_values.push(parsed);
         }
 
@@ -624,11 +684,18 @@ impl JsonStore {
         let p = path.unwrap_or("$");
         let segments = parse_json_path(p).ok()?;
         let matches = query_json_path(doc, &segments);
-        matches.first().and_then(|val| val.as_array().map(|a| a.len()))
+        matches
+            .first()
+            .and_then(|val| val.as_array().map(|a| a.len()))
     }
 
     /// JSON.ARRPOP <key> [path] [index]
-    pub fn json_arrpop(&mut self, key: &[u8], path: Option<&str>, index: Option<isize>) -> Option<String> {
+    pub fn json_arrpop(
+        &mut self,
+        key: &[u8],
+        path: Option<&str>,
+        index: Option<isize>,
+    ) -> Option<String> {
         let key_bytes = Bytes::copy_from_slice(key);
         let doc = self.docs.get_mut(&key_bytes)?;
         let p = path.unwrap_or("$");
@@ -660,9 +727,9 @@ impl JsonStore {
         let p = path.unwrap_or("$");
         let segments = parse_json_path(p).ok()?;
         let matches = query_json_path(doc, &segments);
-        matches.first().and_then(|val| {
-            val.as_object().map(|m| m.keys().cloned().collect())
-        })
+        matches
+            .first()
+            .and_then(|val| val.as_object().map(|m| m.keys().cloned().collect()))
     }
 
     /// JSON.OBJLEN <key> [path]
@@ -672,13 +739,18 @@ impl JsonStore {
         let p = path.unwrap_or("$");
         let segments = parse_json_path(p).ok()?;
         let matches = query_json_path(doc, &segments);
-        matches.first().and_then(|val| val.as_object().map(|m| m.len()))
+        matches
+            .first()
+            .and_then(|val| val.as_object().map(|m| m.len()))
     }
 
     /// JSON.TOGGLE <key> [path]
     pub fn json_toggle(&mut self, key: &[u8], path: &str) -> Result<String, String> {
         let key_bytes = Bytes::copy_from_slice(key);
-        let doc = self.docs.get_mut(&key_bytes).ok_or("ERR could not find key")?;
+        let doc = self
+            .docs
+            .get_mut(&key_bytes)
+            .ok_or("ERR could not find key")?;
         let segments = parse_json_path(path)?;
         let matches = query_json_path_mut(doc, &segments);
         if matches.is_empty() {
@@ -730,11 +802,9 @@ impl JsonStore {
                         cleared += 1;
                     }
                 }
-                Value::Number(num) => {
-                    if num.as_f64() != Some(0.0) {
-                        *val = json!(0);
-                        cleared += 1;
-                    }
+                Value::Number(num) if num.as_f64() != Some(0.0) => {
+                    *val = json!(0);
+                    cleared += 1;
                 }
                 _ => {}
             }
@@ -761,7 +831,13 @@ mod tests {
         let key = b"doc:1";
 
         // JSON.SET root
-        let res = store.json_set(key, "$", r#"{"name":"Alice","age":30,"tags":["rust","database"],"active":true}"#, false, false);
+        let res = store.json_set(
+            key,
+            "$",
+            r#"{"name":"Alice","age":30,"tags":["rust","database"],"active":true}"#,
+            false,
+            false,
+        );
         assert_eq!(res, Ok(true));
 
         // JSON.GET root
@@ -773,15 +849,23 @@ mod tests {
         assert_eq!(name_str, "\"Alice\"");
 
         // JSON.TYPE
-        assert_eq!(store.json_type(key, Some("$.age")), Some("number".to_string()));
-        assert_eq!(store.json_type(key, Some("$.tags")), Some("array".to_string()));
+        assert_eq!(
+            store.json_type(key, Some("$.age")),
+            Some("number".to_string())
+        );
+        assert_eq!(
+            store.json_type(key, Some("$.tags")),
+            Some("array".to_string())
+        );
 
         // JSON.NUMINCRBY
         let new_age = store.json_numincrby(key, "$.age", 2.0).unwrap();
         assert_eq!(new_age, "32");
 
         // JSON.ARRAPPEND
-        let new_len = store.json_arrappend(key, "$.tags", &[r#""redis""#, r#""performance""#]).unwrap();
+        let new_len = store
+            .json_arrappend(key, "$.tags", &[r#""redis""#, r#""performance""#])
+            .unwrap();
         assert_eq!(new_len, 4);
         assert_eq!(store.json_arrlen(key, Some("$.tags")), Some(4));
 

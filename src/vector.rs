@@ -3,29 +3,28 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
 /// Supported vector distance metrics
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VectorMetric {
+    #[default]
     Cosine,
     L2,
     IP, // Inner Product / Dot Product
 }
 
-impl Default for VectorMetric {
-    fn default() -> Self {
-        Self::Cosine
+impl std::str::FromStr for VectorMetric {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_uppercase().as_str() {
+            "COSINE" => Ok(Self::Cosine),
+            "L2" | "EUCLIDEAN" => Ok(Self::L2),
+            "IP" | "DOT" | "INNERPRODUCT" => Ok(Self::IP),
+            _ => Err(()),
+        }
     }
 }
 
 impl VectorMetric {
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_uppercase().as_str() {
-            "COSINE" => Some(Self::Cosine),
-            "L2" | "EUCLIDEAN" => Some(Self::L2),
-            "IP" | "DOT" | "INNERPRODUCT" => Some(Self::IP),
-            _ => None,
-        }
-    }
-
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Cosine => "COSINE",
@@ -210,7 +209,6 @@ unsafe fn l2_f32_u8_avx2(query: &[f32], u8_data: &[u8], min_val: f32, scale: f32
     sum
 }
 
-
 /// Computes SIMD-accelerated dot product of two float vectors with runtime AVX2 detection.
 #[inline]
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
@@ -226,12 +224,10 @@ pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 fn dot_product_portable(a: &[f32], b: &[f32]) -> f32 {
     let mut sum = 0.0f32;
-    let chunks_a = a.chunks_exact(8);
-    let chunks_b = b.chunks_exact(8);
-    let rem_a = chunks_a.remainder();
-    let rem_b = chunks_b.remainder();
+    let (chunks_a, rem_a) = a.as_chunks::<8>();
+    let (chunks_b, rem_b) = b.as_chunks::<8>();
 
-    for (ca, cb) in chunks_a.zip(chunks_b) {
+    for (ca, cb) in chunks_a.iter().zip(chunks_b.iter()) {
         let mut s = 0.0f32;
         for i in 0..8 {
             s += ca[i] * cb[i];
@@ -259,12 +255,10 @@ pub fn l2_distance_sq(a: &[f32], b: &[f32]) -> f32 {
 #[inline]
 fn l2_distance_sq_portable(a: &[f32], b: &[f32]) -> f32 {
     let mut sum = 0.0f32;
-    let chunks_a = a.chunks_exact(8);
-    let chunks_b = b.chunks_exact(8);
-    let rem_a = chunks_a.remainder();
-    let rem_b = chunks_b.remainder();
+    let (chunks_a, rem_a) = a.as_chunks::<8>();
+    let (chunks_b, rem_b) = b.as_chunks::<8>();
 
-    for (ca, cb) in chunks_a.zip(chunks_b) {
+    for (ca, cb) in chunks_a.iter().zip(chunks_b.iter()) {
         let mut s = 0.0f32;
         for i in 0..8 {
             let diff = ca[i] - cb[i];
@@ -314,8 +308,12 @@ impl QuantizedVector {
         let mut min_val = f32::INFINITY;
         let mut max_val = f32::NEG_INFINITY;
         for &x in v {
-            if x < min_val { min_val = x; }
-            if x > max_val { max_val = x; }
+            if x < min_val {
+                min_val = x;
+            }
+            if x > max_val {
+                max_val = x;
+            }
         }
         let diff = max_val - min_val;
         let scale = if diff == 0.0 { 1.0 } else { diff / 255.0 };
@@ -331,12 +329,21 @@ impl QuantizedVector {
             sum_q_sq += q_f * q_f;
             data.push(q);
         }
-        Self { min_val, scale, sum_q, sum_q_sq, data }
+        Self {
+            min_val,
+            scale,
+            sum_q,
+            sum_q_sq,
+            data,
+        }
     }
 
     /// Dequantizes back to full-precision float vector.
     pub fn dequantize(&self) -> Vec<f32> {
-        self.data.iter().map(|&q| self.min_val + (q as f32) * self.scale).collect()
+        self.data
+            .iter()
+            .map(|&q| self.min_val + (q as f32) * self.scale)
+            .collect()
     }
 
     /// Fast asymmetric distance computation between full-precision query vector and SQ8 vector.
@@ -360,11 +367,18 @@ impl QuantizedVector {
                 let dot = min_val * sum_query + scale * dot_u8;
 
                 let dim = self.data.len() as f32;
-                let norm_b_sq = (dim * min_val * min_val + 2.0 * min_val * scale * self.sum_q + scale * scale * self.sum_q_sq).max(0.0);
+                let norm_b_sq = (dim * min_val * min_val
+                    + 2.0 * min_val * scale * self.sum_q
+                    + scale * scale * self.sum_q_sq)
+                    .max(0.0);
                 let norm_a_sq = dot_product(query, query);
 
                 let denom = norm_a_sq.sqrt() * norm_b_sq.sqrt();
-                if denom == 0.0 { 1.0 } else { (1.0 - (dot / denom)).max(0.0) }
+                if denom == 0.0 {
+                    1.0
+                } else {
+                    (1.0 - (dot / denom)).max(0.0)
+                }
             }
         }
     }
@@ -444,21 +458,26 @@ impl ProductQuantizer {
                     // Negative basis vector
                     centroid[c - d_sub - 1] = -1.0;
                 } else {
-                    for i in 0..d_sub {
+                    for (i, val) in centroid.iter_mut().enumerate() {
                         let mut h = (c as u64).wrapping_mul(0x9E3779B97F4A7C15)
                             ^ ((sub + 1) as u64).wrapping_mul(0xC6A4A7935BD1E995)
                             ^ ((i + 1) as u64).wrapping_mul(0x517CC1B727220A95);
                         h = (h ^ (h >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
                         h = (h ^ (h >> 27)).wrapping_mul(0x94D049BB133111EB);
                         h ^= h >> 31;
-                        centroid[i] = ((h & 0xFFFF) as f32 / 32767.5) - 1.0;
+                        *val = ((h & 0xFFFF) as f32 / 32767.5) - 1.0;
                     }
                 }
                 centroids.push(centroid);
             }
             codebooks.push(centroids);
         }
-        Self { dim, m, d_sub, codebooks }
+        Self {
+            dim,
+            m,
+            d_sub,
+            codebooks,
+        }
     }
 
     pub fn encode(&self, v: &[f32]) -> PQVector {
@@ -487,18 +506,18 @@ impl ProductQuantizer {
 
     pub fn compute_distance_table(&self, query: &[f32]) -> Vec<[f32; 256]> {
         let mut table = vec![[0.0f32; 256]; self.m];
-        for m in 0..self.m {
+        for (m, row) in table.iter_mut().enumerate() {
             let start = m * self.d_sub;
             let end = (start + self.d_sub).min(query.len());
             let sub_q = &query[start..end];
-            for c in 0..256 {
+            for (c, cell) in row.iter_mut().enumerate() {
                 let centroid = &self.codebooks[m][c];
                 let mut sq = 0.0f32;
                 for (i, &q) in sub_q.iter().enumerate() {
                     let diff = q - centroid[i];
                     sq += diff * diff;
                 }
-                table[m][c] = sq;
+                *cell = sq;
             }
         }
         table
@@ -544,7 +563,10 @@ impl Eq for Candidate {}
 impl Ord for Candidate {
     fn cmp(&self, other: &Self) -> Ordering {
         // Min-heap by distance (smaller distance has higher priority)
-        other.distance.partial_cmp(&self.distance).unwrap_or(Ordering::Equal)
+        other
+            .distance
+            .partial_cmp(&self.distance)
+            .unwrap_or(Ordering::Equal)
     }
 }
 
@@ -565,7 +587,9 @@ impl Eq for FurthestCandidate {}
 impl Ord for FurthestCandidate {
     fn cmp(&self, other: &Self) -> Ordering {
         // Max-heap by distance (furthest distance has higher priority)
-        self.distance.partial_cmp(&other.distance).unwrap_or(Ordering::Equal)
+        self.distance
+            .partial_cmp(&other.distance)
+            .unwrap_or(Ordering::Equal)
     }
 }
 
@@ -642,17 +666,19 @@ impl HnswIndex {
     }
 
     pub fn get_vector(&self, key: &Bytes) -> Option<&[f32]> {
-        self.key_to_id
-            .get(key)
-            .and_then(|&id| self.nodes.get(id).and_then(|n| n.as_ref().map(|n| n.vector.as_slice())))
+        self.key_to_id.get(key).and_then(|&id| {
+            self.nodes
+                .get(id)
+                .and_then(|n| n.as_ref().map(|n| n.vector.as_slice()))
+        })
     }
 
     #[inline]
     pub fn dist_to_node(&self, query: &[f32], node: &HnswNode) -> f32 {
-        if let Some(pq) = &node.pq {
-            if let Some(quantizer) = &self.pq_quantizer {
-                return quantizer.compute_distance_with_vec(query, pq);
-            }
+        if let Some(pq) = &node.pq
+            && let Some(quantizer) = &self.pq_quantizer
+        {
+            return quantizer.compute_distance_with_vec(query, pq);
         }
         if let Some(quant) = &node.quantized {
             quant.compute_distance(query, self.metric)
@@ -706,7 +732,7 @@ impl HnswIndex {
 
         let pq = if quantize_pq {
             if self.pq_quantizer.is_none() {
-                let m = (self.dim / 8).max(1).min(16);
+                let m = (self.dim / 8).clamp(1, 16);
                 self.pq_quantizer = Some(ProductQuantizer::new(self.dim, m));
             }
             self.pq_quantizer.as_ref().map(|q| q.encode(&vector))
@@ -740,16 +766,16 @@ impl HnswIndex {
             let mut changed = true;
             while changed {
                 changed = false;
-                if let Some(curr_node) = &self.nodes[curr_obj] {
-                    if lc < curr_node.neighbors.len() {
-                        for &neighbor in &curr_node.neighbors[lc] {
-                            if let Some(n) = &self.nodes[neighbor] {
-                                let d = self.dist_to_node(&vector, n);
-                                if d < curr_dist {
-                                    curr_dist = d;
-                                    curr_obj = neighbor;
-                                    changed = true;
-                                }
+                if let Some(curr_node) = &self.nodes[curr_obj]
+                    && lc < curr_node.neighbors.len()
+                {
+                    for &neighbor in &curr_node.neighbors[lc] {
+                        if let Some(n) = &self.nodes[neighbor] {
+                            let d = self.dist_to_node(&vector, n);
+                            if d < curr_dist {
+                                curr_dist = d;
+                                curr_obj = neighbor;
+                                changed = true;
                             }
                         }
                     }
@@ -774,13 +800,13 @@ impl HnswIndex {
 
             // Connect neighbors back to new node
             for &nbr_id in &neighbors {
-                if let Some(nbr) = &mut self.nodes[nbr_id] {
-                    if lc < nbr.neighbors.len() {
-                        nbr.neighbors[lc].push(new_id);
-                        if nbr.neighbors[lc].len() > m_max {
-                            // Prune furthest neighbor
-                            self.prune_neighbors(nbr_id, lc, m_max);
-                        }
+                if let Some(nbr) = &mut self.nodes[nbr_id]
+                    && lc < nbr.neighbors.len()
+                {
+                    nbr.neighbors[lc].push(new_id);
+                    if nbr.neighbors[lc].len() > m_max {
+                        // Prune furthest neighbor
+                        self.prune_neighbors(nbr_id, lc, m_max);
                     }
                 }
             }
@@ -844,33 +870,34 @@ impl HnswIndex {
         });
 
         while let Some(curr) = candidates.pop() {
-            if let Some(furthest) = w.peek() {
-                if curr.distance > furthest.distance && w.len() >= ef {
-                    break;
-                }
+            if let Some(furthest) = w.peek()
+                && curr.distance > furthest.distance
+                && w.len() >= ef
+            {
+                break;
             }
 
-            if let Some(node) = &self.nodes[curr.id] {
-                if layer < node.neighbors.len() {
-                    for &nbr_id in &node.neighbors[layer] {
-                        if visited.insert(nbr_id) {
-                            if let Some(nbr_node) = &self.nodes[nbr_id] {
-                                let d = self.dist_to_node(query, nbr_node);
-                                let furthest_dist = w.peek().map(|f| f.distance).unwrap_or(f32::MAX);
+            if let Some(node) = &self.nodes[curr.id]
+                && layer < node.neighbors.len()
+            {
+                for &nbr_id in &node.neighbors[layer] {
+                    if visited.insert(nbr_id)
+                        && let Some(nbr_node) = &self.nodes[nbr_id]
+                    {
+                        let d = self.dist_to_node(query, nbr_node);
+                        let furthest_dist = w.peek().map(|f| f.distance).unwrap_or(f32::MAX);
 
-                                if d < furthest_dist || w.len() < ef {
-                                    candidates.push(Candidate {
-                                        id: nbr_id,
-                                        distance: d,
-                                    });
-                                    w.push(FurthestCandidate {
-                                        id: nbr_id,
-                                        distance: d,
-                                    });
-                                    if w.len() > ef {
-                                        w.pop();
-                                    }
-                                }
+                        if d < furthest_dist || w.len() < ef {
+                            candidates.push(Candidate {
+                                id: nbr_id,
+                                distance: d,
+                            });
+                            w.push(FurthestCandidate {
+                                id: nbr_id,
+                                distance: d,
+                            });
+                            if w.len() > ef {
+                                w.pop();
                             }
                         }
                     }
@@ -885,7 +912,11 @@ impl HnswIndex {
                 distance: f.distance,
             })
             .collect();
-        results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(Ordering::Equal));
+        results.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(Ordering::Equal)
+        });
         results
     }
 
@@ -908,16 +939,16 @@ impl HnswIndex {
             let mut changed = true;
             while changed {
                 changed = false;
-                if let Some(curr_node) = &self.nodes[curr_obj] {
-                    if lc < curr_node.neighbors.len() {
-                        for &nbr in &curr_node.neighbors[lc] {
-                            if let Some(n) = &self.nodes[nbr] {
-                                let d = self.dist_to_node(query, n);
-                                if d < curr_dist {
-                                    curr_dist = d;
-                                    curr_obj = nbr;
-                                    changed = true;
-                                }
+                if let Some(curr_node) = &self.nodes[curr_obj]
+                    && lc < curr_node.neighbors.len()
+                {
+                    for &nbr in &curr_node.neighbors[lc] {
+                        if let Some(n) = &self.nodes[nbr] {
+                            let d = self.dist_to_node(query, n);
+                            if d < curr_dist {
+                                curr_dist = d;
+                                curr_obj = nbr;
+                                changed = true;
                             }
                         }
                     }
@@ -966,10 +997,10 @@ impl HnswIndex {
             if let Some(nbrs_by_layer) = nbrs_by_layer {
                 for (layer, nbrs) in nbrs_by_layer.into_iter().enumerate() {
                     for nbr_id in nbrs {
-                        if let Some(nbr_node) = &mut self.nodes[nbr_id] {
-                            if layer < nbr_node.neighbors.len() {
-                                nbr_node.neighbors[layer].retain(|&x| x != id);
-                            }
+                        if let Some(nbr_node) = &mut self.nodes[nbr_id]
+                            && layer < nbr_node.neighbors.len()
+                        {
+                            nbr_node.neighbors[layer].retain(|&x| x != id);
                         }
                     }
                 }
@@ -1008,7 +1039,7 @@ mod tests {
         let results = index.search(&query, 2);
         assert_eq!(results.len(), 2);
         // doc1 or doc3 should be closest
-        assert!(results[0].0 == Bytes::from("doc1") || results[0].0 == Bytes::from("doc3"));
+        assert!(results[0].0 == "doc1" || results[0].0 == "doc3");
 
         assert!(index.remove(&Bytes::from("doc1")));
         assert_eq!(index.len(), 2);
@@ -1021,12 +1052,21 @@ mod tests {
         assert_eq!(q.data.len(), 5);
         let deq = q.dequantize();
         for (orig, recon) in v.iter().zip(&deq) {
-            assert!((orig - recon).abs() < 0.02, "orig: {}, recon: {}", orig, recon);
+            assert!(
+                (orig - recon).abs() < 0.02,
+                "orig: {}, recon: {}",
+                orig,
+                recon
+            );
         }
 
         let mut index = HnswIndex::new("sq8_idx".to_string(), 5, VectorMetric::Cosine);
-        index.add_quantized(Bytes::from("k1"), v.clone(), true, true).unwrap();
-        index.add_quantized(Bytes::from("k2"), vec![0.0, 1.0, 0.0, 0.0, 0.0], true, true).unwrap();
+        index
+            .add_quantized(Bytes::from("k1"), v.clone(), true, true)
+            .unwrap();
+        index
+            .add_quantized(Bytes::from("k2"), vec![0.0, 1.0, 0.0, 0.0, 0.0], true, true)
+            .unwrap();
 
         let query = vec![0.10, -0.40, 0.95, 0.08, 0.30];
         let res_approx = index.search_tiered(&query, 1, false);
@@ -1052,11 +1092,20 @@ mod tests {
         let query = vec![0.48; dim];
         let d1 = pq.compute_distance_with_vec(&query, &code1);
         let d2 = pq.compute_distance_with_vec(&query, &code2);
-        assert!(d1 < d2, "v1 should be much closer to query than v2: d1={}, d2={}", d1, d2);
+        assert!(
+            d1 < d2,
+            "v1 should be much closer to query than v2: d1={}, d2={}",
+            d1,
+            d2
+        );
 
         let mut index = HnswIndex::new("pq_idx".to_string(), dim, VectorMetric::L2);
-        index.add_quantized_ext(Bytes::from("doc_pos"), v1, false, true, false).unwrap();
-        index.add_quantized_ext(Bytes::from("doc_neg"), v2, false, true, false).unwrap();
+        index
+            .add_quantized_ext(Bytes::from("doc_pos"), v1, false, true, false)
+            .unwrap();
+        index
+            .add_quantized_ext(Bytes::from("doc_neg"), v2, false, true, false)
+            .unwrap();
 
         let res = index.search(&query, 1);
         assert_eq!(res.len(), 1);

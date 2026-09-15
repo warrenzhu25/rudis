@@ -85,8 +85,14 @@ impl HybridLogicalClock {
                 (cur_phys, cur_log + 1)
             };
 
-            if self.latest_physical_ms
-                .compare_exchange(cur_phys, next_phys, AtomicOrdering::Release, AtomicOrdering::Relaxed)
+            if self
+                .latest_physical_ms
+                .compare_exchange(
+                    cur_phys,
+                    next_phys,
+                    AtomicOrdering::Release,
+                    AtomicOrdering::Relaxed,
+                )
                 .is_ok()
             {
                 self.latest_logical.store(next_log, AtomicOrdering::Release);
@@ -117,8 +123,14 @@ impl HybridLogicalClock {
                 0
             };
 
-            if self.latest_physical_ms
-                .compare_exchange(cur_phys, max_phys, AtomicOrdering::Release, AtomicOrdering::Relaxed)
+            if self
+                .latest_physical_ms
+                .compare_exchange(
+                    cur_phys,
+                    max_phys,
+                    AtomicOrdering::Release,
+                    AtomicOrdering::Relaxed,
+                )
                 .is_ok()
             {
                 self.latest_logical.store(next_log, AtomicOrdering::Release);
@@ -244,7 +256,8 @@ impl OrSet {
     /// Returns the number of tombstones pruned.
     pub fn prune_tombstones(&mut self, cutoff_physical_ms: u64) -> usize {
         let before_len = self.tombstones.len();
-        self.tombstones.retain(|ts| ts.physical_ms >= cutoff_physical_ms);
+        self.tombstones
+            .retain(|ts| ts.physical_ms >= cutoff_physical_ms);
         before_len - self.tombstones.len()
     }
 }
@@ -329,12 +342,12 @@ impl CrdtStore {
 
     pub fn del(&mut self, key: &Bytes) -> bool {
         let ts = self.clock.now();
-        if let Some(r) = self.registers.get_mut(key) {
-            if !r.tombstone {
-                r.tombstone = true;
-                r.timestamp = ts;
-                return true;
-            }
+        if let Some(r) = self.registers.get_mut(key)
+            && !r.tombstone
+        {
+            r.tombstone = true;
+            r.timestamp = ts;
+            return true;
         }
         false
     }
@@ -440,13 +453,17 @@ impl CrdtStore {
             match item_type {
                 1 => {
                     // Register
-                    if offset + 4 > data.len() { break; }
-                    let k_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                    if offset + 4 > data.len() {
+                        break;
+                    }
+                    let k_len =
+                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
                     let k = Bytes::copy_from_slice(&data[offset..offset + k_len]);
                     offset += k_len;
 
-                    let v_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                    let v_len =
+                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
                     let v = Bytes::copy_from_slice(&data[offset..offset + v_len]);
                     offset += v_len;
@@ -468,19 +485,26 @@ impl CrdtStore {
                         timestamp: ts,
                         tombstone,
                     };
-                    self.registers.entry(k).or_insert_with(|| remote_reg.clone()).merge(&remote_reg);
+                    self.registers
+                        .entry(k)
+                        .or_insert_with(|| remote_reg.clone())
+                        .merge(&remote_reg);
                     merged_items += 1;
                 }
                 2 => {
                     // Counter
-                    if offset + 4 > data.len() { break; }
-                    let k_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                    if offset + 4 > data.len() {
+                        break;
+                    }
+                    let k_len =
+                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
                     let k = Bytes::copy_from_slice(&data[offset..offset + k_len]);
                     offset += k_len;
 
                     let mut p = HashMap::new();
-                    let p_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                    let p_len =
+                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
                     for _ in 0..p_len {
                         let nid = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap());
@@ -491,7 +515,8 @@ impl CrdtStore {
                     }
 
                     let mut n = HashMap::new();
-                    let n_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                    let n_len =
+                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
                     for _ in 0..n_len {
                         let nid = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap());
@@ -507,30 +532,40 @@ impl CrdtStore {
                 }
                 3 => {
                     // Set
-                    if offset + 4 > data.len() { break; }
-                    let k_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                    if offset + 4 > data.len() {
+                        break;
+                    }
+                    let k_len =
+                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
                     let k = Bytes::copy_from_slice(&data[offset..offset + k_len]);
                     offset += k_len;
 
                     let mut elements = HashMap::new();
-                    let elem_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                    let elem_count =
+                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
                     for _ in 0..elem_count {
-                        let e_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                        let e_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
+                            as usize;
                         offset += 4;
                         let elem = Bytes::copy_from_slice(&data[offset..offset + e_len]);
                         offset += e_len;
 
-                        let tag_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                        let tag_count =
+                            u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
+                                as usize;
                         offset += 4;
                         let mut tags = HashSet::new();
                         for _ in 0..tag_count {
-                            let phys = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+                            let phys =
+                                u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
                             offset += 8;
-                            let log = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+                            let log =
+                                u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
                             offset += 4;
-                            let nid = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap());
+                            let nid =
+                                u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap());
                             offset += 2;
                             let ts = HlcTimestamp::new(phys, log, nid);
                             self.clock.update(&ts);
@@ -540,7 +575,8 @@ impl CrdtStore {
                     }
 
                     let mut tombstones = HashSet::new();
-                    let tomb_count = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+                    let tomb_count =
+                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
                     for _ in 0..tomb_count {
                         let phys = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
@@ -554,7 +590,10 @@ impl CrdtStore {
                         tombstones.insert(ts);
                     }
 
-                    let remote_set = OrSet { elements, tombstones };
+                    let remote_set = OrSet {
+                        elements,
+                        tombstones,
+                    };
                     self.sets.entry(k).or_default().merge(&remote_set);
                     merged_items += 1;
                 }
@@ -574,7 +613,8 @@ impl CrdtStore {
         let cutoff = now.saturating_sub(ttl_ms);
 
         let before_regs = self.registers.len();
-        self.registers.retain(|_, reg| !reg.tombstone || reg.timestamp.physical_ms >= cutoff);
+        self.registers
+            .retain(|_, reg| !reg.tombstone || reg.timestamp.physical_ms >= cutoff);
         let reg_pruned = before_regs - self.registers.len();
 
         let mut set_pruned = 0;

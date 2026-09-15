@@ -123,18 +123,13 @@ impl Default for ZRangeOpts {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Aggregate {
+    #[default]
     Sum,
     Min,
     Max,
     Count,
-}
-
-impl Default for Aggregate {
-    fn default() -> Self {
-        Aggregate::Sum
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,7 +176,10 @@ impl RudisZSet {
     #[inline]
     pub fn get_score(&self, member: &[u8]) -> Option<f64> {
         match self {
-            RudisZSet::Small(v) => v.iter().find(|(_, m)| m.as_ref() == member).map(|(s, _)| s.0),
+            RudisZSet::Small(v) => v
+                .iter()
+                .find(|(_, m)| m.as_ref() == member)
+                .map(|(s, _)| s.0),
             RudisZSet::Full { dict, .. } => dict.get(member).copied(),
         }
     }
@@ -219,13 +217,10 @@ impl RudisZSet {
 
     pub fn remove(&mut self, member: &[u8]) -> Option<f64> {
         match self {
-            RudisZSet::Small(v) => {
-                if let Some(pos) = v.iter().position(|(_, m)| m.as_ref() == member) {
-                    Some(v.remove(pos).0.0)
-                } else {
-                    None
-                }
-            }
+            RudisZSet::Small(v) => v
+                .iter()
+                .position(|(_, m)| m.as_ref() == member)
+                .map(|pos| v.remove(pos).0.0),
             RudisZSet::Full { dict, tree } => {
                 if let Some(old_score) = dict.remove(member) {
                     tree.remove(&(OrderedScore(old_score), Bytes::copy_from_slice(member)));
@@ -261,16 +256,22 @@ impl RudisZSet {
 
     pub fn count(&self, min: f64, min_inc: bool, max: f64, max_inc: bool) -> usize {
         match self {
-            RudisZSet::Small(v) => v.iter().filter(|(OrderedScore(s), _)| {
-                let ge_min = if min_inc { *s >= min } else { *s > min };
-                let le_max = if max_inc { *s <= max } else { *s < max };
-                ge_min && le_max
-            }).count(),
-            RudisZSet::Full { tree, .. } => tree.iter().filter(|(OrderedScore(s), _)| {
-                let ge_min = if min_inc { *s >= min } else { *s > min };
-                let le_max = if max_inc { *s <= max } else { *s < max };
-                ge_min && le_max
-            }).count(),
+            RudisZSet::Small(v) => v
+                .iter()
+                .filter(|(OrderedScore(s), _)| {
+                    let ge_min = if min_inc { *s >= min } else { *s > min };
+                    let le_max = if max_inc { *s <= max } else { *s < max };
+                    ge_min && le_max
+                })
+                .count(),
+            RudisZSet::Full { tree, .. } => tree
+                .iter()
+                .filter(|(OrderedScore(s), _)| {
+                    let ge_min = if min_inc { *s >= min } else { *s > min };
+                    let le_max = if max_inc { *s <= max } else { *s < max };
+                    ge_min && le_max
+                })
+                .count(),
         }
     }
 
@@ -289,8 +290,16 @@ impl RudisZSet {
             };
             if opts.rev {
                 let items: Vec<(Bytes, f64)> = match self {
-                    RudisZSet::Small(v) => v.iter().filter(|(_, m)| filter_fn(m)).map(|(s, m)| (m.clone(), s.0)).collect(),
-                    RudisZSet::Full { tree, .. } => tree.iter().filter(|(_, m)| filter_fn(m)).map(|(s, m)| (m.clone(), s.0)).collect(),
+                    RudisZSet::Small(v) => v
+                        .iter()
+                        .filter(|(_, m)| filter_fn(m))
+                        .map(|(s, m)| (m.clone(), s.0))
+                        .collect(),
+                    RudisZSet::Full { tree, .. } => tree
+                        .iter()
+                        .filter(|(_, m)| filter_fn(m))
+                        .map(|(s, m)| (m.clone(), s.0))
+                        .collect(),
                 };
                 let skipped = items.into_iter().rev().skip(opts.offset);
                 if let Some(c) = opts.count {
@@ -300,8 +309,16 @@ impl RudisZSet {
                 }
             } else {
                 let items: Box<dyn Iterator<Item = (Bytes, f64)>> = match self {
-                    RudisZSet::Small(v) => Box::new(v.iter().filter(|(_, m)| filter_fn(m)).map(|(s, m)| (m.clone(), s.0))),
-                    RudisZSet::Full { tree, .. } => Box::new(tree.iter().filter(|(_, m)| filter_fn(m)).map(|(s, m)| (m.clone(), s.0))),
+                    RudisZSet::Small(v) => Box::new(
+                        v.iter()
+                            .filter(|(_, m)| filter_fn(m))
+                            .map(|(s, m)| (m.clone(), s.0)),
+                    ),
+                    RudisZSet::Full { tree, .. } => Box::new(
+                        tree.iter()
+                            .filter(|(_, m)| filter_fn(m))
+                            .map(|(s, m)| (m.clone(), s.0)),
+                    ),
                 };
                 let skipped = items.skip(opts.offset);
                 if let Some(c) = opts.count {
@@ -334,25 +351,41 @@ impl RudisZSet {
                 let rev_items: Vec<_> = get_items.collect();
                 let skipped = rev_items.into_iter().rev().skip(opts.offset);
                 if let Some(c) = opts.count {
-                    skipped.take(c).map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                    skipped
+                        .take(c)
+                        .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                        .collect()
                 } else {
-                    skipped.map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                    skipped
+                        .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                        .collect()
                 }
             } else {
                 let skipped = get_items.skip(opts.offset);
                 if let Some(c) = opts.count {
-                    skipped.take(c).map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                    skipped
+                        .take(c)
+                        .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                        .collect()
                 } else {
-                    skipped.map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                    skipped
+                        .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                        .collect()
                 }
             }
         } else {
             let mut start = opts.start;
             let mut stop = opts.stop;
             let n_i = n as i64;
-            if start < 0 { start = (n_i + start).max(0); }
-            if stop < 0 { stop = n_i + stop; }
-            if start > stop || start >= n_i { return Vec::new(); }
+            if start < 0 {
+                start = (n_i + start).max(0);
+            }
+            if stop < 0 {
+                stop += n_i;
+            }
+            if start > stop || start >= n_i {
+                return Vec::new();
+            }
             let start_u = start.max(0) as usize;
             let stop_u = (stop.min(n_i - 1) as usize).max(start_u);
             let limit = stop_u - start_u + 1;
@@ -360,16 +393,34 @@ impl RudisZSet {
             match self {
                 RudisZSet::Small(v) => {
                     if opts.rev {
-                        v.iter().rev().skip(start_u).take(limit).map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                        v.iter()
+                            .rev()
+                            .skip(start_u)
+                            .take(limit)
+                            .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                            .collect()
                     } else {
-                        v.iter().skip(start_u).take(limit).map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                        v.iter()
+                            .skip(start_u)
+                            .take(limit)
+                            .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                            .collect()
                     }
                 }
                 RudisZSet::Full { tree, .. } => {
                     if opts.rev {
-                        tree.iter().rev().skip(start_u).take(limit).map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                        tree.iter()
+                            .rev()
+                            .skip(start_u)
+                            .take(limit)
+                            .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                            .collect()
                     } else {
-                        tree.iter().skip(start_u).take(limit).map(|(OrderedScore(s), m)| (m.clone(), *s)).collect()
+                        tree.iter()
+                            .skip(start_u)
+                            .take(limit)
+                            .map(|(OrderedScore(s), m)| (m.clone(), *s))
+                            .collect()
                     }
                 }
             }
@@ -459,7 +510,7 @@ impl RudisZSet {
             s = (n + s).max(0);
         }
         if e < 0 {
-            e = n + e;
+            e += n;
         }
         if s > e || s >= n {
             return 0;
@@ -525,16 +576,12 @@ impl RudisZSet {
         let to_remove: Vec<Bytes> = match self {
             RudisZSet::Small(v) => v
                 .iter()
-                .filter(|(_, m)| {
-                    min.matches(m.as_ref(), true) && max.matches(m.as_ref(), false)
-                })
+                .filter(|(_, m)| min.matches(m.as_ref(), true) && max.matches(m.as_ref(), false))
                 .map(|(_, m)| m.clone())
                 .collect(),
             RudisZSet::Full { tree, .. } => tree
                 .iter()
-                .filter(|(_, m)| {
-                    min.matches(m.as_ref(), true) && max.matches(m.as_ref(), false)
-                })
+                .filter(|(_, m)| min.matches(m.as_ref(), true) && max.matches(m.as_ref(), false))
                 .map(|(_, m)| m.clone())
                 .collect(),
         };
@@ -749,9 +796,7 @@ impl PartialEq for RudisSet {
             return false;
         }
         match (self, other) {
-            (RudisSet::Small(a), RudisSet::Small(b)) => {
-                a.iter().all(|m| b.iter().any(|x| x == m))
-            }
+            (RudisSet::Small(a), RudisSet::Small(b)) => a.iter().all(|m| b.iter().any(|x| x == m)),
             (RudisSet::Full(a), RudisSet::Full(b)) => a == b,
             _ => {
                 for m in self.iter() {
@@ -777,11 +822,15 @@ impl StreamId {
     pub fn new(ms: u64, seq: u64) -> Self {
         Self { ms, seq }
     }
+}
 
-    pub fn to_string(&self) -> String {
-        format!("{}-{}", self.ms, self.seq)
+impl std::fmt::Display for StreamId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}-{}", self.ms, self.seq)
     }
+}
 
+impl StreamId {
     pub fn parse_exact(s: &str) -> Result<Self, &'static str> {
         let parts: Vec<&str> = s.split('-').collect();
         if parts.len() != 2 {
@@ -801,11 +850,17 @@ impl StreamId {
             return Ok(Self::new(0, 0));
         }
         if let Some((ms_s, seq_s)) = s.split_once('-') {
-            let ms: u64 = ms_s.parse().map_err(|_| "Invalid stream ID specified as stream command argument")?;
-            let seq: u64 = seq_s.parse().map_err(|_| "Invalid stream ID specified as stream command argument")?;
+            let ms: u64 = ms_s
+                .parse()
+                .map_err(|_| "Invalid stream ID specified as stream command argument")?;
+            let seq: u64 = seq_s
+                .parse()
+                .map_err(|_| "Invalid stream ID specified as stream command argument")?;
             Ok(Self::new(ms, seq))
         } else {
-            let ms: u64 = s.parse().map_err(|_| "Invalid stream ID specified as stream command argument")?;
+            let ms: u64 = s
+                .parse()
+                .map_err(|_| "Invalid stream ID specified as stream command argument")?;
             Ok(Self::new(ms, 0))
         }
     }
@@ -903,6 +958,12 @@ pub struct RudisStream {
     pub entries: std::collections::BTreeMap<StreamId, Vec<(Bytes, Bytes)>>,
     pub last_id: StreamId,
     pub groups: HashMap<Bytes, StreamGroup>,
+}
+
+impl Default for RudisStream {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RudisStream {
@@ -1071,10 +1132,10 @@ impl RudisFlatTable {
             while bits != 0 {
                 let offset = bits.trailing_zeros() as usize;
                 let slot_idx = (idx + offset) & self.mask;
-                if let Some(ref entry) = self.slots[slot_idx] {
-                    if entry.key.as_ref() == key {
-                        return Some(slot_idx);
-                    }
+                if let Some(ref entry) = self.slots[slot_idx]
+                    && entry.key.as_ref() == key
+                {
+                    return Some(slot_idx);
                 }
                 bits &= bits - 1;
             }
@@ -1103,10 +1164,10 @@ impl RudisFlatTable {
             while bits != 0 {
                 let offset = bits.trailing_zeros() as usize;
                 let slot_idx = (idx + offset) & self.mask;
-                if let Some(ref entry) = self.slots[slot_idx] {
-                    if entry.key.as_ref() == key {
-                        return (Some(slot_idx), slot_idx);
-                    }
+                if let Some(ref entry) = self.slots[slot_idx]
+                    && entry.key.as_ref() == key
+                {
+                    return (Some(slot_idx), slot_idx);
                 }
                 bits &= bits - 1;
             }
@@ -1138,16 +1199,14 @@ impl RudisFlatTable {
 
     fn resize(&mut self, new_cap: usize) {
         let mut new_table = RudisFlatTable::new(new_cap);
-        for opt in self.slots.drain(..) {
-            if let Some(entry) = opt {
-                let h = hash_key(&entry.key);
-                let (_, insert_idx) = new_table.find_or_prepare_insert(&entry.key, h);
-                let tag = fingerprint(h);
-                new_table.set_ctrl(insert_idx, tag);
-                new_table.slots[insert_idx] = Some(entry);
-                new_table.items += 1;
-                new_table.growth_left = new_table.growth_left.saturating_sub(1);
-            }
+        for entry in self.slots.drain(..).flatten() {
+            let h = hash_key(&entry.key);
+            let (_, insert_idx) = new_table.find_or_prepare_insert(&entry.key, h);
+            let tag = fingerprint(h);
+            new_table.set_ctrl(insert_idx, tag);
+            new_table.slots[insert_idx] = Some(entry);
+            new_table.items += 1;
+            new_table.growth_left = new_table.growth_left.saturating_sub(1);
         }
         new_table.slot_counts = self.slot_counts.clone();
         *self = new_table;
@@ -1162,8 +1221,7 @@ impl RudisFlatTable {
         let (existing, insert_idx) = self.find_or_prepare_insert(&entry.key, h);
 
         if let Some(idx) = existing {
-            let old = self.slots[idx].replace(entry);
-            old
+            self.slots[idx].replace(entry)
         } else {
             let tag = fingerprint(h);
             self.set_ctrl(insert_idx, tag);
@@ -1187,7 +1245,6 @@ impl RudisFlatTable {
         entry
     }
 
-
     #[inline(always)]
     pub fn get_slot(&self, idx: usize) -> Option<&RudisEntry> {
         self.slots[idx].as_ref()
@@ -1201,6 +1258,11 @@ impl RudisFlatTable {
     #[inline(always)]
     pub fn len(&self) -> usize {
         self.items
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.items == 0
     }
 
     #[inline(always)]
@@ -1255,6 +1317,12 @@ pub struct SmoveResult {
     pub dst_added: bool,
 }
 
+impl Default for RudisTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RudisTable {
     pub fn new() -> Self {
         let base_mem = 64 * std::mem::size_of::<Option<RudisEntry>>() + 64 + GROUP_SIZE + 16384 * 4;
@@ -1270,15 +1338,12 @@ impl RudisTable {
         let mut total = self.table.capacity * std::mem::size_of::<Option<RudisEntry>>()
             + self.table.ctrl.len()
             + 16384 * 4;
-        for slot in &self.table.slots {
-            if let Some(entry) = slot {
-                total += entry.key.len() + entry.val.approx_bytes() + 64;
-            }
+        for entry in self.table.slots.iter().flatten() {
+            total += entry.key.len() + entry.val.approx_bytes() + 64;
         }
         self.used_memory = total;
         total
     }
-
 
     #[inline]
     fn check_expired_slot(&mut self, slot_idx: usize) -> bool {
@@ -1460,16 +1525,16 @@ impl RudisTable {
         };
         let val_bytes = val.approx_bytes();
         let (existing, _) = self.table.find_or_prepare_insert(&key, h);
-        if let Some(idx) = existing {
-            if let Some(entry) = self.table.get_slot_mut(idx) {
-                let old_bytes = entry.val.approx_bytes();
-                entry.val = val;
-                if !keepttl {
-                    entry.expire_at = expire_in.map(|d| Instant::now() + d);
-                }
-                self.used_memory = self.used_memory.saturating_sub(old_bytes) + val_bytes;
-                return;
+        if let Some(idx) = existing
+            && let Some(entry) = self.table.get_slot_mut(idx)
+        {
+            let old_bytes = entry.val.approx_bytes();
+            entry.val = val;
+            if !keepttl {
+                entry.expire_at = expire_in.map(|d| Instant::now() + d);
             }
+            self.used_memory = self.used_memory.saturating_sub(old_bytes) + val_bytes;
+            return;
         }
 
         let expire_at = if keepttl {
@@ -1486,7 +1551,6 @@ impl RudisTable {
         self.table.insert(entry);
         self.used_memory += entry_mem;
     }
-
 
     pub fn del(&mut self, key: &[u8]) -> bool {
         let h = hash_key(key);
@@ -1507,11 +1571,7 @@ impl RudisTable {
     pub fn exists(&mut self, key: &[u8]) -> bool {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
-            if self.check_expired_slot(idx) {
-                false
-            } else {
-                true
-            }
+            !self.check_expired_slot(idx)
         } else {
             false
         }
@@ -1522,29 +1582,29 @@ impl RudisTable {
         let (existing, _) = self.table.find_or_prepare_insert(&key, h);
         if let Some(idx) = existing {
             let was_exp = self.check_expired_slot(idx);
-            if !was_exp {
-                if let Some(entry) = self.table.get_slot_mut(idx) {
-                    match &mut entry.val {
-                        RudisValue::Int(n) => {
-                            let nv = n.checked_add(delta).ok_or_else(|| {
-                                "increment or decrement would overflow".to_string()
-                            })?;
-                            *n = nv;
-                            return Ok(nv);
-                        }
-                        RudisValue::String(b) => {
-                            let current = Self::parse_i64_bytes(b).ok_or_else(|| {
-                                "value is not an integer or out of range".to_string()
-                            })?;
-                            let nv = current.checked_add(delta).ok_or_else(|| {
-                                "increment or decrement would overflow".to_string()
-                            })?;
-                            entry.val = RudisValue::Int(nv);
-                            return Ok(nv);
-                        }
-                        _ => {
-                            return Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string());
-                        }
+            if !was_exp && let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::Int(n) => {
+                        let nv = n
+                            .checked_add(delta)
+                            .ok_or_else(|| "increment or decrement would overflow".to_string())?;
+                        *n = nv;
+                        return Ok(nv);
+                    }
+                    RudisValue::String(b) => {
+                        let current = Self::parse_i64_bytes(b)
+                            .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                        let nv = current
+                            .checked_add(delta)
+                            .ok_or_else(|| "increment or decrement would overflow".to_string())?;
+                        entry.val = RudisValue::Int(nv);
+                        return Ok(nv);
+                    }
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value"
+                                .to_string(),
+                        );
                     }
                 }
             }
@@ -1580,11 +1640,11 @@ impl RudisTable {
             if self.check_expired_slot(idx) {
                 return false;
             }
-            if let Some(entry) = self.table.get_slot_mut(idx) {
-                if entry.expire_at.is_some() {
-                    entry.expire_at = None;
-                    return true;
-                }
+            if let Some(entry) = self.table.get_slot_mut(idx)
+                && entry.expire_at.is_some()
+            {
+                entry.expire_at = None;
+                return true;
             }
         }
         false
@@ -1665,10 +1725,10 @@ impl RudisTable {
             if self.check_expired_slot(i) {
                 continue;
             }
-            if let Some(entry) = self.table.get_slot(i) {
-                if crate::pubsub::glob_match(pattern, &entry.key) {
-                    res.push(entry.key.clone());
-                }
+            if let Some(entry) = self.table.get_slot(i)
+                && crate::pubsub::glob_match(pattern, &entry.key)
+            {
+                res.push(entry.key.clone());
             }
         }
         res
@@ -1687,15 +1747,15 @@ impl RudisTable {
         let mut res = Vec::new();
         let mut idx = cursor;
         while idx < cap {
-            if !self.check_expired_slot(idx) {
-                if let Some(entry) = self.table.get_slot(idx) {
-                    let matches = match pattern {
-                        Some(pat) => crate::pubsub::glob_match(pat, &entry.key),
-                        None => true,
-                    };
-                    if matches {
-                        res.push(entry.key.clone());
-                    }
+            if !self.check_expired_slot(idx)
+                && let Some(entry) = self.table.get_slot(idx)
+            {
+                let matches = match pattern {
+                    Some(pat) => crate::pubsub::glob_match(pat, &entry.key),
+                    None => true,
+                };
+                if matches {
+                    res.push(entry.key.clone());
                 }
             }
             idx += 1;
@@ -1709,7 +1769,7 @@ impl RudisTable {
 
     pub fn random_key(&mut self) -> Option<Bytes> {
         let cap = self.table.capacity();
-        if self.table.len() == 0 || cap == 0 {
+        if self.table.is_empty() || cap == 0 {
             return None;
         }
         self.sample_cursor = (self.sample_cursor + 17) & (cap - 1);
@@ -1819,14 +1879,14 @@ impl RudisTable {
     #[inline]
     pub fn set_tiered_pointer(&mut self, key: &[u8], ptr: TieredPointer) -> bool {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h) {
-            if let Some(entry) = self.table.get_slot_mut(idx) {
-                let old_bytes = entry.val.approx_bytes();
-                entry.val = RudisValue::Tiered(ptr);
-                let new_bytes = entry.val.approx_bytes();
-                self.used_memory = self.used_memory.saturating_sub(old_bytes) + new_bytes;
-                return true;
-            }
+        if let Some(idx) = self.table.find(key, h)
+            && let Some(entry) = self.table.get_slot_mut(idx)
+        {
+            let old_bytes = entry.val.approx_bytes();
+            entry.val = RudisValue::Tiered(ptr);
+            let new_bytes = entry.val.approx_bytes();
+            self.used_memory = self.used_memory.saturating_sub(old_bytes) + new_bytes;
+            return true;
         }
         false
     }
@@ -1834,18 +1894,17 @@ impl RudisTable {
     #[inline]
     pub fn set_cooled_pointer(&mut self, key: &[u8], ptr: TieredPointer) -> bool {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h) {
-            if let Some(entry) = self.table.get_slot_mut(idx) {
-                if !matches!(entry.val, RudisValue::Tiered(_) | RudisValue::Cooled { .. }) {
-                    let old_val = std::mem::replace(&mut entry.val, RudisValue::Tiered(ptr));
-                    entry.val = RudisValue::Cooled {
-                        ptr,
-                        val: Box::new(old_val),
-                    };
-                    self.used_memory += 24;
-                    return true;
-                }
-            }
+        if let Some(idx) = self.table.find(key, h)
+            && let Some(entry) = self.table.get_slot_mut(idx)
+            && !matches!(entry.val, RudisValue::Tiered(_) | RudisValue::Cooled { .. })
+        {
+            let old_val = std::mem::replace(&mut entry.val, RudisValue::Tiered(ptr));
+            entry.val = RudisValue::Cooled {
+                ptr,
+                val: Box::new(old_val),
+            };
+            self.used_memory += 24;
+            return true;
         }
         false
     }
@@ -1853,18 +1912,17 @@ impl RudisTable {
     #[inline]
     pub fn restore_tiered_value(&mut self, key: &[u8], val: RudisValue) -> bool {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h) {
-            if let Some(entry) = self.table.get_slot_mut(idx) {
-                if let RudisValue::Tiered(ptr) = entry.val {
-                    let val_bytes = val.approx_bytes();
-                    entry.val = RudisValue::Cooled {
-                        ptr,
-                        val: Box::new(val),
-                    };
-                    self.used_memory += val_bytes;
-                    return true;
-                }
-            }
+        if let Some(idx) = self.table.find(key, h)
+            && let Some(entry) = self.table.get_slot_mut(idx)
+            && let RudisValue::Tiered(ptr) = entry.val
+        {
+            let val_bytes = val.approx_bytes();
+            entry.val = RudisValue::Cooled {
+                ptr,
+                val: Box::new(val),
+            };
+            self.used_memory += val_bytes;
+            return true;
         }
         false
     }
@@ -1889,15 +1947,15 @@ impl RudisTable {
         let mut count = 0;
         let mut total_freed = 0u64;
         for opt in self.table.slots.iter_mut() {
-            if let Some(entry) = opt {
-                if let RudisValue::Cooled { ptr, val } = &entry.val {
-                    let p = *ptr;
-                    let freed = val.approx_bytes() as u64;
-                    entry.val = RudisValue::Tiered(p);
-                    self.used_memory = self.used_memory.saturating_sub(freed as usize);
-                    total_freed += freed;
-                    count += 1;
-                }
+            if let Some(entry) = opt
+                && let RudisValue::Cooled { ptr, val } = &entry.val
+            {
+                let p = *ptr;
+                let freed = val.approx_bytes() as u64;
+                entry.val = RudisValue::Tiered(p);
+                self.used_memory = self.used_memory.saturating_sub(freed as usize);
+                total_freed += freed;
+                count += 1;
             }
         }
         (count, total_freed)
@@ -1912,13 +1970,13 @@ impl RudisTable {
         let start = self.spill_cursor % total_slots;
         let mut idx = start;
         for _ in 0..total_slots {
-            if let Some(entry) = &self.table.slots[idx] {
-                if !matches!(entry.val, RudisValue::Tiered(_) | RudisValue::Cooled { .. }) {
-                    hot.push(entry.key.clone());
-                    if hot.len() >= limit {
-                        self.spill_cursor = (idx + 1) % total_slots;
-                        return hot;
-                    }
+            if let Some(entry) = &self.table.slots[idx]
+                && !matches!(entry.val, RudisValue::Tiered(_) | RudisValue::Cooled { .. })
+            {
+                hot.push(entry.key.clone());
+                if hot.len() >= limit {
+                    self.spill_cursor = (idx + 1) % total_slots;
+                    return hot;
                 }
             }
             idx = (idx + 1) % total_slots;
@@ -1958,10 +2016,10 @@ impl RudisTable {
         let mut count = 0;
         for k in keys {
             let h = hash_key(k);
-            if let Some(idx) = self.table.find(k, h) {
-                if !self.check_expired_slot(idx) {
-                    count += 1;
-                }
+            if let Some(idx) = self.table.find(k, h)
+                && !self.check_expired_slot(idx)
+            {
+                count += 1;
             }
         }
         count
@@ -1970,10 +2028,10 @@ impl RudisTable {
     pub fn rename(&mut self, src: &[u8], dst: Bytes, nx: bool) -> Result<bool, &'static str> {
         if src == dst.as_ref() {
             let h = hash_key(src);
-            if let Some(idx) = self.table.find(src, h) {
-                if !self.check_expired_slot(idx) {
-                    return if nx { Ok(false) } else { Ok(true) };
-                }
+            if let Some(idx) = self.table.find(src, h)
+                && !self.check_expired_slot(idx)
+            {
+                return if nx { Ok(false) } else { Ok(true) };
             }
             return Err("no such key");
         }
@@ -1991,10 +2049,10 @@ impl RudisTable {
 
         if nx {
             let h_dst = hash_key(&dst);
-            if let Some(dst_idx) = self.table.find(&dst, h_dst) {
-                if !self.check_expired_slot(dst_idx) {
-                    return Ok(false);
-                }
+            if let Some(dst_idx) = self.table.find(&dst, h_dst)
+                && !self.check_expired_slot(dst_idx)
+            {
+                return Ok(false);
             }
         }
 
@@ -2016,10 +2074,10 @@ impl RudisTable {
 
     pub fn setnx(&mut self, key: Bytes, value: Bytes) -> bool {
         let h = hash_key(&key);
-        if let Some(idx) = self.table.find(&key, h) {
-            if !self.check_expired_slot(idx) {
-                return false;
-            }
+        if let Some(idx) = self.table.find(&key, h)
+            && !self.check_expired_slot(idx)
+        {
+            return false;
         }
         self.set(key, value, None);
         true
@@ -2162,10 +2220,10 @@ impl RudisTable {
             return Ok(Bytes::new());
         }
         if start < 0 {
-            start = n + start;
+            start += n;
         }
         if end < 0 {
-            end = n + end;
+            end += n;
         }
         if start < 0 {
             start = 0;
@@ -2197,7 +2255,11 @@ impl RudisTable {
                         let formatted = Self::format_i64(*n);
                         return Self::slice_range(&formatted, start, end);
                     }
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
                 };
                 return Self::slice_range(slice, start, end);
             }
@@ -2205,32 +2267,40 @@ impl RudisTable {
         Ok(Bytes::new())
     }
 
-    pub fn setrange(&mut self, key: Bytes, offset: usize, value: &[u8]) -> Result<usize, &'static str> {
+    pub fn setrange(
+        &mut self,
+        key: Bytes,
+        offset: usize,
+        value: &[u8],
+    ) -> Result<usize, &'static str> {
         if offset.saturating_add(value.len()) > 536870912 {
             return Err("ERR string exceeds maximum allowed size (512MB)");
         }
         let h = hash_key(&key);
         let (existing, _) = self.table.find_or_prepare_insert(&key, h);
-        if let Some(idx) = existing {
-            if !self.check_expired_slot(idx) {
-                if let Some(entry) = self.table.get_slot_mut(idx) {
-                    let mut bytes: Vec<u8> = match &entry.val {
-                        RudisValue::String(s) => s.to_vec(),
-                        RudisValue::Int(n) => Self::format_i64(*n).to_vec(),
-                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
-                    };
-                    if offset > bytes.len() {
-                        bytes.resize(offset, 0);
-                    }
-                    if offset + value.len() > bytes.len() {
-                        bytes.resize(offset + value.len(), 0);
-                    }
-                    bytes[offset..offset + value.len()].copy_from_slice(value);
-                    let len = bytes.len();
-                    entry.val = RudisValue::String(Bytes::from(bytes));
-                    return Ok(len);
+        if let Some(idx) = existing
+            && !self.check_expired_slot(idx)
+            && let Some(entry) = self.table.get_slot_mut(idx)
+        {
+            let mut bytes: Vec<u8> = match &entry.val {
+                RudisValue::String(s) => s.to_vec(),
+                RudisValue::Int(n) => Self::format_i64(*n).to_vec(),
+                _ => {
+                    return Err(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
                 }
+            };
+            if offset > bytes.len() {
+                bytes.resize(offset, 0);
             }
+            if offset + value.len() > bytes.len() {
+                bytes.resize(offset + value.len(), 0);
+            }
+            bytes[offset..offset + value.len()].copy_from_slice(value);
+            let len = bytes.len();
+            entry.val = RudisValue::String(Bytes::from(bytes));
+            return Ok(len);
         }
         if value.is_empty() && offset == 0 {
             return Ok(0);
@@ -2250,25 +2320,31 @@ impl RudisTable {
     pub fn incrbyfloat(&mut self, key: Bytes, delta: f64) -> Result<f64, &'static str> {
         let h = hash_key(&key);
         let (existing, _) = self.table.find_or_prepare_insert(&key, h);
-        if let Some(idx) = existing {
-            if !self.check_expired_slot(idx) {
-                if let Some(entry) = self.table.get_slot_mut(idx) {
-                    let curr: f64 = match &entry.val {
-                        RudisValue::String(s) => {
-                            let str_val = std::str::from_utf8(s).map_err(|_| "ERR value is not a valid float")?;
-                            str_val.parse::<f64>().map_err(|_| "ERR value is not a valid float")?
-                        }
-                        RudisValue::Int(n) => *n as f64,
-                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
-                    };
-                    let new_val = curr + delta;
-                    if new_val.is_nan() || new_val.is_infinite() {
-                        return Err("ERR increment would produce NaN or Infinity");
-                    }
-                    entry.val = RudisValue::String(Bytes::from(new_val.to_string()));
-                    return Ok(new_val);
+        if let Some(idx) = existing
+            && !self.check_expired_slot(idx)
+            && let Some(entry) = self.table.get_slot_mut(idx)
+        {
+            let curr: f64 = match &entry.val {
+                RudisValue::String(s) => {
+                    let str_val =
+                        std::str::from_utf8(s).map_err(|_| "ERR value is not a valid float")?;
+                    str_val
+                        .parse::<f64>()
+                        .map_err(|_| "ERR value is not a valid float")?
                 }
+                RudisValue::Int(n) => *n as f64,
+                _ => {
+                    return Err(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
+                }
+            };
+            let new_val = curr + delta;
+            if new_val.is_nan() || new_val.is_infinite() {
+                return Err("ERR increment would produce NaN or Infinity");
             }
+            entry.val = RudisValue::String(Bytes::from(new_val.to_string()));
+            return Ok(new_val);
         }
         if delta.is_nan() || delta.is_infinite() {
             return Err("ERR increment would produce NaN or Infinity");
@@ -2283,50 +2359,59 @@ impl RudisTable {
     }
 
     pub fn hset(&mut self, key: Bytes, fields: Vec<(Bytes, Bytes)>) -> Result<usize, &'static str> {
-        let max_entries = crate::connection::HASH_MAX_ENTRIES.load(std::sync::atomic::Ordering::Relaxed);
-        let max_value = crate::connection::HASH_MAX_VALUE.load(std::sync::atomic::Ordering::Relaxed);
+        let max_entries =
+            crate::connection::HASH_MAX_ENTRIES.load(std::sync::atomic::Ordering::Relaxed);
+        let max_value =
+            crate::connection::HASH_MAX_VALUE.load(std::sync::atomic::Ordering::Relaxed);
         let h = hash_key(&key);
         let (existing, _) = self.table.find_or_prepare_insert(&key, h);
-        if let Some(idx) = existing {
-            if !self.check_expired_slot(idx) {
-                if let Some(entry) = self.table.get_slot_mut(idx) {
-                    match &mut entry.val {
-                        RudisValue::SmallHash(pairs) => {
-                            let mut added = 0;
-                            for (f, v) in fields {
-                                if let Some(pos) = pairs.iter().position(|(k, _)| *k == f) {
-                                    pairs[pos].1 = v;
-                                } else {
-                                    pairs.push((f, v));
-                                    added += 1;
-                                }
-                            }
-                            if pairs.len() > max_entries || pairs.iter().any(|(k, v)| k.len() > max_value || v.len() > max_value) {
-                                let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
-                                entry.val = RudisValue::Hash(map);
-                            }
-                            return Ok(added);
-                        }
-                        RudisValue::Hash(map) => {
-                            let mut added = 0;
-                            for (f, v) in fields {
-                                if map.insert(f, v).is_none() {
-                                    added += 1;
-                                }
-                            }
-                            return Ok(added);
-                        }
-                        _ => {
-                            return Err(
-                                "WRONGTYPE Operation against a key holding the wrong kind of value",
-                            );
+        if let Some(idx) = existing
+            && !self.check_expired_slot(idx)
+            && let Some(entry) = self.table.get_slot_mut(idx)
+        {
+            match &mut entry.val {
+                RudisValue::SmallHash(pairs) => {
+                    let mut added = 0;
+                    for (f, v) in fields {
+                        if let Some(pos) = pairs.iter().position(|(k, _)| *k == f) {
+                            pairs[pos].1 = v;
+                        } else {
+                            pairs.push((f, v));
+                            added += 1;
                         }
                     }
+                    if pairs.len() > max_entries
+                        || pairs
+                            .iter()
+                            .any(|(k, v)| k.len() > max_value || v.len() > max_value)
+                    {
+                        let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
+                        entry.val = RudisValue::Hash(map);
+                    }
+                    return Ok(added);
+                }
+                RudisValue::Hash(map) => {
+                    let mut added = 0;
+                    for (f, v) in fields {
+                        if map.insert(f, v).is_none() {
+                            added += 1;
+                        }
+                    }
+                    return Ok(added);
+                }
+                _ => {
+                    return Err(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
                 }
             }
         }
 
-        let (val, added) = if fields.len() <= max_entries && !fields.iter().any(|(k, v)| k.len() > max_value || v.len() > max_value) {
+        let (val, added) = if fields.len() <= max_entries
+            && !fields
+                .iter()
+                .any(|(k, v)| k.len() > max_value || v.len() > max_value)
+        {
             let mut pairs = Vec::with_capacity(fields.len());
             let mut added = 0;
             for (f, v) in fields {
@@ -2357,40 +2442,48 @@ impl RudisTable {
         Ok(added)
     }
 
-    pub fn hsetnx(&mut self, key: Bytes, field: Bytes, value: Bytes) -> Result<usize, &'static str> {
-        let max_entries = crate::connection::HASH_MAX_ENTRIES.load(std::sync::atomic::Ordering::Relaxed);
-        let max_value = crate::connection::HASH_MAX_VALUE.load(std::sync::atomic::Ordering::Relaxed);
+    pub fn hsetnx(
+        &mut self,
+        key: Bytes,
+        field: Bytes,
+        value: Bytes,
+    ) -> Result<usize, &'static str> {
+        let max_entries =
+            crate::connection::HASH_MAX_ENTRIES.load(std::sync::atomic::Ordering::Relaxed);
+        let max_value =
+            crate::connection::HASH_MAX_VALUE.load(std::sync::atomic::Ordering::Relaxed);
         let h = hash_key(&key);
         let (existing, _) = self.table.find_or_prepare_insert(&key, h);
-        if let Some(idx) = existing {
-            if !self.check_expired_slot(idx) {
-                if let Some(entry) = self.table.get_slot_mut(idx) {
-                    match &mut entry.val {
-                        RudisValue::SmallHash(pairs) => {
-                            if pairs.iter().any(|(k, _)| *k == field) {
-                                return Ok(0);
-                            }
-                            let should_promote = pairs.len() >= max_entries || field.len() > max_value || value.len() > max_value;
-                            pairs.push((field, value));
-                            if should_promote {
-                                let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
-                                entry.val = RudisValue::Hash(map);
-                            }
-                            return Ok(1);
-                        }
-                        RudisValue::Hash(map) => {
-                            if map.contains_key(&field) {
-                                return Ok(0);
-                            }
-                            map.insert(field, value);
-                            return Ok(1);
-                        }
-                        _ => {
-                            return Err(
-                                "WRONGTYPE Operation against a key holding the wrong kind of value",
-                            );
-                        }
+        if let Some(idx) = existing
+            && !self.check_expired_slot(idx)
+            && let Some(entry) = self.table.get_slot_mut(idx)
+        {
+            match &mut entry.val {
+                RudisValue::SmallHash(pairs) => {
+                    if pairs.iter().any(|(k, _)| *k == field) {
+                        return Ok(0);
                     }
+                    let should_promote = pairs.len() >= max_entries
+                        || field.len() > max_value
+                        || value.len() > max_value;
+                    pairs.push((field, value));
+                    if should_promote {
+                        let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
+                        entry.val = RudisValue::Hash(map);
+                    }
+                    return Ok(1);
+                }
+                RudisValue::Hash(map) => {
+                    if map.contains_key(&field) {
+                        return Ok(0);
+                    }
+                    map.insert(field, value);
+                    return Ok(1);
+                }
+                _ => {
+                    return Err(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
                 }
             }
         }
@@ -2419,9 +2512,10 @@ impl RudisTable {
             }
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
-                    RudisValue::SmallHash(pairs) => {
-                        Ok(pairs.iter().find(|(k, _)| k == field).map(|(_, v)| v.clone()))
-                    }
+                    RudisValue::SmallHash(pairs) => Ok(pairs
+                        .iter()
+                        .find(|(k, _)| k == field)
+                        .map(|(_, v)| v.clone())),
                     RudisValue::Hash(map) => Ok(map.get(field).cloned()),
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
@@ -2445,9 +2539,10 @@ impl RudisTable {
             }
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
-                    RudisValue::SmallHash(pairs) => {
-                        Ok(fields.iter().map(|f| pairs.iter().find(|(k, _)| k == f).map(|(_, v)| v.clone())).collect())
-                    }
+                    RudisValue::SmallHash(pairs) => Ok(fields
+                        .iter()
+                        .map(|f| pairs.iter().find(|(k, _)| k == f).map(|(_, v)| v.clone()))
+                        .collect()),
                     RudisValue::Hash(map) => {
                         Ok(fields.iter().map(|f| map.get(f).cloned()).collect())
                     }
@@ -2577,7 +2672,9 @@ impl RudisTable {
             }
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
-                    RudisValue::SmallHash(pairs) => Ok(pairs.iter().map(|(k, _)| k.clone()).collect()),
+                    RudisValue::SmallHash(pairs) => {
+                        Ok(pairs.iter().map(|(k, _)| k.clone()).collect())
+                    }
                     RudisValue::Hash(map) => Ok(map.keys().cloned().collect()),
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
@@ -2597,7 +2694,9 @@ impl RudisTable {
             }
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
-                    RudisValue::SmallHash(pairs) => Ok(pairs.iter().map(|(_, v)| v.clone()).collect()),
+                    RudisValue::SmallHash(pairs) => {
+                        Ok(pairs.iter().map(|(_, v)| v.clone()).collect())
+                    }
                     RudisValue::Hash(map) => Ok(map.values().cloned().collect()),
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
@@ -2641,46 +2740,53 @@ impl RudisTable {
         }
     }
 
-    pub fn hgetdel(&mut self, key: &[u8], fields: &[Bytes]) -> Result<(Vec<Option<Bytes>>, Vec<Bytes>), &'static str> {
+    pub fn hgetdel(
+        &mut self,
+        key: &[u8],
+        fields: &[Bytes],
+    ) -> Result<(Vec<Option<Bytes>>, Vec<Bytes>), &'static str> {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
                 return Ok((vec![None; fields.len()], Vec::new()));
             }
-            let (results, deleted_fields, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
-                let mut results = Vec::with_capacity(fields.len());
-                let mut deleted_fields = Vec::new();
-                match &mut entry.val {
-                    RudisValue::SmallHash(pairs) => {
-                        for f in fields {
-                            if let Some(pos) = pairs.iter().position(|(k, _)| k == f) {
-                                let (_, v) = pairs.remove(pos);
-                                results.push(Some(v));
-                                deleted_fields.push(f.clone());
-                            } else {
-                                results.push(None);
+            let (results, deleted_fields, is_empty) =
+                if let Some(entry) = self.table.get_slot_mut(idx) {
+                    let mut results = Vec::with_capacity(fields.len());
+                    let mut deleted_fields = Vec::new();
+                    match &mut entry.val {
+                        RudisValue::SmallHash(pairs) => {
+                            for f in fields {
+                                if let Some(pos) = pairs.iter().position(|(k, _)| k == f) {
+                                    let (_, v) = pairs.remove(pos);
+                                    results.push(Some(v));
+                                    deleted_fields.push(f.clone());
+                                } else {
+                                    results.push(None);
+                                }
                             }
+                            (results, deleted_fields, pairs.is_empty())
                         }
-                        (results, deleted_fields, pairs.is_empty())
-                    }
-                    RudisValue::Hash(map) => {
-                        for f in fields {
-                            if let Some(v) = map.remove(f) {
-                                results.push(Some(v));
-                                deleted_fields.push(f.clone());
-                            } else {
-                                results.push(None);
+                        RudisValue::Hash(map) => {
+                            for f in fields {
+                                if let Some(v) = map.remove(f) {
+                                    results.push(Some(v));
+                                    deleted_fields.push(f.clone());
+                                } else {
+                                    results.push(None);
+                                }
                             }
+                            (results, deleted_fields, map.is_empty())
                         }
-                        (results, deleted_fields, map.is_empty())
+                        _ => {
+                            return Err(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            );
+                        }
                     }
-                    _ => {
-                        return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
-                    }
-                }
-            } else {
-                (vec![None; fields.len()], Vec::new(), false)
-            };
+                } else {
+                    (vec![None; fields.len()], Vec::new(), false)
+                };
 
             if is_empty {
                 self.table.remove(idx);
@@ -2700,7 +2806,11 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 return match &entry.val {
                     RudisValue::String(s) => {
-                        if std::str::from_utf8(s).ok().and_then(|t| t.parse::<i64>().ok()).is_some() {
+                        if std::str::from_utf8(s)
+                            .ok()
+                            .and_then(|t| t.parse::<i64>().ok())
+                            .is_some()
+                        {
                             Some("int")
                         } else {
                             Some("raw")
@@ -2723,48 +2833,65 @@ impl RudisTable {
     }
 
     pub fn hincrby(&mut self, key: Bytes, field: Bytes, delta: i64) -> Result<i64, &'static str> {
-        let max_entries = crate::connection::HASH_MAX_ENTRIES.load(std::sync::atomic::Ordering::Relaxed);
-        let max_value = crate::connection::HASH_MAX_VALUE.load(std::sync::atomic::Ordering::Relaxed);
+        let max_entries =
+            crate::connection::HASH_MAX_ENTRIES.load(std::sync::atomic::Ordering::Relaxed);
+        let max_value =
+            crate::connection::HASH_MAX_VALUE.load(std::sync::atomic::Ordering::Relaxed);
         let h = hash_key(&key);
         let (existing, _) = self.table.find_or_prepare_insert(&key, h);
-        if let Some(idx) = existing {
-            if !self.check_expired_slot(idx) {
-                if let Some(entry) = self.table.get_slot_mut(idx) {
-                    match &mut entry.val {
-                        RudisValue::SmallHash(pairs) => {
-                            let curr = if let Some((_, v)) = pairs.iter().find(|(k, _)| k == &field) {
-                                let s = std::str::from_utf8(v).map_err(|_| "ERR hash value is not an integer")?;
-                                s.parse::<i64>().map_err(|_| "ERR hash value is not an integer")?
-                            } else {
-                                0
-                            };
-                            let new_val = curr.checked_add(delta).ok_or("ERR increment or decrement would overflow")?;
-                            let new_bytes = Bytes::from(new_val.to_string());
-                            if let Some(pos) = pairs.iter().position(|(k, _)| k == &field) {
-                                pairs[pos].1 = new_bytes;
-                            } else {
-                                pairs.push((field, new_bytes));
-                                if pairs.len() > max_entries || pairs.iter().any(|(k, v)| k.len() > max_value || v.len() > max_value) {
-                                    let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
-                                    entry.val = RudisValue::Hash(map);
-                                }
-                            }
-                            return Ok(new_val);
+        if let Some(idx) = existing
+            && !self.check_expired_slot(idx)
+            && let Some(entry) = self.table.get_slot_mut(idx)
+        {
+            match &mut entry.val {
+                RudisValue::SmallHash(pairs) => {
+                    let curr = if let Some((_, v)) = pairs.iter().find(|(k, _)| k == &field) {
+                        let s = std::str::from_utf8(v)
+                            .map_err(|_| "ERR hash value is not an integer")?;
+                        s.parse::<i64>()
+                            .map_err(|_| "ERR hash value is not an integer")?
+                    } else {
+                        0
+                    };
+                    let new_val = curr
+                        .checked_add(delta)
+                        .ok_or("ERR increment or decrement would overflow")?;
+                    let new_bytes = Bytes::from(new_val.to_string());
+                    if let Some(pos) = pairs.iter().position(|(k, _)| k == &field) {
+                        pairs[pos].1 = new_bytes;
+                    } else {
+                        pairs.push((field, new_bytes));
+                        if pairs.len() > max_entries
+                            || pairs
+                                .iter()
+                                .any(|(k, v)| k.len() > max_value || v.len() > max_value)
+                        {
+                            let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
+                            entry.val = RudisValue::Hash(map);
                         }
-                        RudisValue::Hash(map) => {
-                            let curr = if let Some(v) = map.get(&field) {
-                                let s = std::str::from_utf8(v).map_err(|_| "ERR hash value is not an integer")?;
-                                s.parse::<i64>().map_err(|_| "ERR hash value is not an integer")?
-                            } else {
-                                0
-                            };
-                            let new_val = curr.checked_add(delta).ok_or("ERR increment or decrement would overflow")?;
-                            let new_bytes = Bytes::from(new_val.to_string());
-                            map.insert(field, new_bytes);
-                            return Ok(new_val);
-                        }
-                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                     }
+                    return Ok(new_val);
+                }
+                RudisValue::Hash(map) => {
+                    let curr = if let Some(v) = map.get(&field) {
+                        let s = std::str::from_utf8(v)
+                            .map_err(|_| "ERR hash value is not an integer")?;
+                        s.parse::<i64>()
+                            .map_err(|_| "ERR hash value is not an integer")?
+                    } else {
+                        0
+                    };
+                    let new_val = curr
+                        .checked_add(delta)
+                        .ok_or("ERR increment or decrement would overflow")?;
+                    let new_bytes = Bytes::from(new_val.to_string());
+                    map.insert(field, new_bytes);
+                    return Ok(new_val);
+                }
+                _ => {
+                    return Err(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
                 }
             }
         }
@@ -2778,55 +2905,73 @@ impl RudisTable {
         Ok(delta)
     }
 
-    pub fn hincrbyfloat(&mut self, key: Bytes, field: Bytes, delta: f64) -> Result<f64, &'static str> {
-        let max_entries = crate::connection::HASH_MAX_ENTRIES.load(std::sync::atomic::Ordering::Relaxed);
-        let max_value = crate::connection::HASH_MAX_VALUE.load(std::sync::atomic::Ordering::Relaxed);
+    pub fn hincrbyfloat(
+        &mut self,
+        key: Bytes,
+        field: Bytes,
+        delta: f64,
+    ) -> Result<f64, &'static str> {
+        let max_entries =
+            crate::connection::HASH_MAX_ENTRIES.load(std::sync::atomic::Ordering::Relaxed);
+        let max_value =
+            crate::connection::HASH_MAX_VALUE.load(std::sync::atomic::Ordering::Relaxed);
         let h = hash_key(&key);
         let (existing, _) = self.table.find_or_prepare_insert(&key, h);
-        if let Some(idx) = existing {
-            if !self.check_expired_slot(idx) {
-                if let Some(entry) = self.table.get_slot_mut(idx) {
-                    match &mut entry.val {
-                        RudisValue::SmallHash(pairs) => {
-                            let curr = if let Some((_, v)) = pairs.iter().find(|(k, _)| k == &field) {
-                                let s = std::str::from_utf8(v).map_err(|_| "ERR hash value is not a valid float")?;
-                                s.parse::<f64>().map_err(|_| "ERR hash value is not a valid float")?
-                            } else {
-                                0.0
-                            };
-                            let new_val = curr + delta;
-                            if new_val.is_nan() || new_val.is_infinite() {
-                                return Err("ERR increment would produce NaN or Infinity");
-                            }
-                            let new_bytes = Bytes::from(new_val.to_string());
-                            if let Some(pos) = pairs.iter().position(|(k, _)| k == &field) {
-                                pairs[pos].1 = new_bytes;
-                            } else {
-                                pairs.push((field, new_bytes));
-                                if pairs.len() > max_entries || pairs.iter().any(|(k, v)| k.len() > max_value || v.len() > max_value) {
-                                    let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
-                                    entry.val = RudisValue::Hash(map);
-                                }
-                            }
-                            return Ok(new_val);
-                        }
-                        RudisValue::Hash(map) => {
-                            let curr = if let Some(v) = map.get(&field) {
-                                let s = std::str::from_utf8(v).map_err(|_| "ERR hash value is not a valid float")?;
-                                s.parse::<f64>().map_err(|_| "ERR hash value is not a valid float")?
-                            } else {
-                                0.0
-                            };
-                            let new_val = curr + delta;
-                            if new_val.is_nan() || new_val.is_infinite() {
-                                return Err("ERR increment would produce NaN or Infinity");
-                            }
-                            let new_bytes = Bytes::from(new_val.to_string());
-                            map.insert(field, new_bytes);
-                            return Ok(new_val);
-                        }
-                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        if let Some(idx) = existing
+            && !self.check_expired_slot(idx)
+            && let Some(entry) = self.table.get_slot_mut(idx)
+        {
+            match &mut entry.val {
+                RudisValue::SmallHash(pairs) => {
+                    let curr = if let Some((_, v)) = pairs.iter().find(|(k, _)| k == &field) {
+                        let s = std::str::from_utf8(v)
+                            .map_err(|_| "ERR hash value is not a valid float")?;
+                        s.parse::<f64>()
+                            .map_err(|_| "ERR hash value is not a valid float")?
+                    } else {
+                        0.0
+                    };
+                    let new_val = curr + delta;
+                    if new_val.is_nan() || new_val.is_infinite() {
+                        return Err("ERR increment would produce NaN or Infinity");
                     }
+                    let new_bytes = Bytes::from(new_val.to_string());
+                    if let Some(pos) = pairs.iter().position(|(k, _)| k == &field) {
+                        pairs[pos].1 = new_bytes;
+                    } else {
+                        pairs.push((field, new_bytes));
+                        if pairs.len() > max_entries
+                            || pairs
+                                .iter()
+                                .any(|(k, v)| k.len() > max_value || v.len() > max_value)
+                        {
+                            let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
+                            entry.val = RudisValue::Hash(map);
+                        }
+                    }
+                    return Ok(new_val);
+                }
+                RudisValue::Hash(map) => {
+                    let curr = if let Some(v) = map.get(&field) {
+                        let s = std::str::from_utf8(v)
+                            .map_err(|_| "ERR hash value is not a valid float")?;
+                        s.parse::<f64>()
+                            .map_err(|_| "ERR hash value is not a valid float")?
+                    } else {
+                        0.0
+                    };
+                    let new_val = curr + delta;
+                    if new_val.is_nan() || new_val.is_infinite() {
+                        return Err("ERR increment would produce NaN or Infinity");
+                    }
+                    let new_bytes = Bytes::from(new_val.to_string());
+                    map.insert(field, new_bytes);
+                    return Ok(new_val);
+                }
+                _ => {
+                    return Err(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
                 }
             }
         }
@@ -2858,7 +3003,11 @@ impl RudisTable {
                 match &entry.val {
                     RudisValue::SmallHash(p) => p.clone(),
                     RudisValue::Hash(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
                 }
             } else {
                 return Ok(Vec::new());
@@ -2924,7 +3073,11 @@ impl RudisTable {
                 match &entry.val {
                     RudisValue::SmallHash(p) => p.clone(),
                     RudisValue::Hash(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
                 }
             } else {
                 return Ok((0, Vec::new()));
@@ -3224,7 +3377,7 @@ impl RudisTable {
                             start = (n + start).max(0);
                         }
                         if stop < 0 {
-                            stop = n + stop;
+                            stop += n;
                         }
                         if start > stop || start >= n {
                             return Ok(Vec::new());
@@ -3266,7 +3419,7 @@ impl RudisTable {
                                 start = (n + start).max(0);
                             }
                             if stop < 0 {
-                                stop = n + stop;
+                                stop += n;
                             }
                             if start > stop || start >= n {
                                 deque.clear();
@@ -3274,12 +3427,20 @@ impl RudisTable {
                             } else {
                                 let start_u = start.max(0) as usize;
                                 let stop_u = (stop.min(n - 1) as usize).max(start_u);
-                                *deque = deque.drain(..).skip(start_u).take(stop_u - start_u + 1).collect();
+                                *deque = deque
+                                    .drain(..)
+                                    .skip(start_u)
+                                    .take(stop_u - start_u + 1)
+                                    .collect();
                                 deque.is_empty()
                             }
                         }
                     }
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
                 }
             } else {
                 false
@@ -3362,7 +3523,11 @@ impl RudisTable {
                         }
                         (removed, deque.is_empty())
                     }
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
                 }
             } else {
                 (0, false)
@@ -3385,7 +3550,9 @@ impl RudisTable {
         maxlen: Option<usize>,
     ) -> Result<Vec<usize>, &'static str> {
         if rank == 0 {
-            return Err("ERR RANK can't be zero: use 1 to start from the first match, use -1 from the last");
+            return Err(
+                "ERR RANK can't be zero: use 1 to start from the first match, use -1 from the last",
+            );
         }
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
@@ -3501,14 +3668,12 @@ impl RudisTable {
         };
 
         let h_dst = hash_key(&destination);
-        if let Some(dst_idx) = self.table.find(&destination, h_dst) {
-            if !self.check_expired_slot(dst_idx) {
-                if let Some(entry) = self.table.get_slot(dst_idx) {
-                    if !matches!(entry.val, RudisValue::List(_)) {
-                        return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
-                    }
-                }
-            }
+        if let Some(dst_idx) = self.table.find(&destination, h_dst)
+            && !self.check_expired_slot(dst_idx)
+            && let Some(entry) = self.table.get_slot(dst_idx)
+            && !matches!(entry.val, RudisValue::List(_))
+        {
+            return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
         }
 
         let (popped, is_empty) = match self.table.get_slot_mut(src_idx) {
@@ -3520,7 +3685,11 @@ impl RudisTable {
                     };
                     (elem, deque.is_empty())
                 }
-                _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                _ => {
+                    return Err(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
+                }
             },
             None => return Ok(None),
         };
@@ -3536,19 +3705,22 @@ impl RudisTable {
 
         let h_dst = hash_key(&destination);
         let (existing, _) = self.table.find_or_prepare_insert(&destination, h_dst);
-        if let Some(dst_idx) = existing {
-            if !self.check_expired_slot(dst_idx) {
-                if let Some(entry) = self.table.get_slot_mut(dst_idx) {
-                    match &mut entry.val {
-                        RudisValue::List(deque) => {
-                            match where_to {
-                                ListDirection::Left => deque.push_front(val.clone()),
-                                ListDirection::Right => deque.push_back(val.clone()),
-                            }
-                            return Ok(Some(val));
-                        }
-                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        if let Some(dst_idx) = existing
+            && !self.check_expired_slot(dst_idx)
+            && let Some(entry) = self.table.get_slot_mut(dst_idx)
+        {
+            match &mut entry.val {
+                RudisValue::List(deque) => {
+                    match where_to {
+                        ListDirection::Left => deque.push_front(val.clone()),
+                        ListDirection::Right => deque.push_back(val.clone()),
                     }
+                    return Ok(Some(val));
+                }
+                _ => {
+                    return Err(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
                 }
             }
         }
@@ -3668,11 +3840,11 @@ impl RudisTable {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if let Some(entry) = self.table.get_slot(idx) {
-                if let Some(expire_at) = entry.expire_at {
-                    if Instant::now() >= expire_at {
-                        self.table.remove(idx);
-                        return Ok(false);
-                    }
+                if let Some(expire_at) = entry.expire_at
+                    && Instant::now() >= expire_at
+                {
+                    self.table.remove(idx);
+                    return Ok(false);
                 }
                 match &entry.val {
                     RudisValue::Set(set) => Ok(set.contains(member)),
@@ -3760,7 +3932,11 @@ impl RudisTable {
                 if let Some(entry) = self.table.get_slot(idx) {
                     match &entry.val {
                         RudisValue::Set(s) => sets.push(s.clone()),
-                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                        _ => {
+                            return Err(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            );
+                        }
                     }
                 } else {
                     missing = true;
@@ -3798,7 +3974,11 @@ impl RudisTable {
                                 union_set.insert(m.clone());
                             }
                         }
-                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                        _ => {
+                            return Err(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            );
+                        }
                     }
                 }
             }
@@ -3817,7 +3997,9 @@ impl RudisTable {
             let h = hash_key(k);
             if let Some(idx) = self.table.find(k, h) {
                 if self.check_expired_slot(idx) {
-                    if i == 0 { first_missing = true; }
+                    if i == 0 {
+                        first_missing = true;
+                    }
                     continue;
                 }
                 if let Some(entry) = self.table.get_slot(idx) {
@@ -3829,7 +4011,11 @@ impl RudisTable {
                                 other_sets.push(s.clone());
                             }
                         }
-                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                        _ => {
+                            return Err(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            );
+                        }
                     }
                 } else if i == 0 {
                     first_missing = true;
@@ -3897,7 +4083,11 @@ impl RudisTable {
                 if let Some(entry) = self.table.get_slot(idx) {
                     match &entry.val {
                         RudisValue::Set(s) => sets.push(s.clone()),
-                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                        _ => {
+                            return Err(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            );
+                        }
                     }
                 } else {
                     missing = true;
@@ -3937,7 +4127,11 @@ impl RudisTable {
                 if let Some(entry) = self.table.get_slot(idx) {
                     match &entry.val {
                         RudisValue::Set(s) => sets.push(s.clone()),
-                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                        _ => {
+                            return Err(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            );
+                        }
                     }
                 }
             }
@@ -3965,7 +4159,9 @@ impl RudisTable {
             let h = hash_key(k);
             if let Some(idx) = self.table.find(k, h) {
                 if self.check_expired_slot(idx) {
-                    if i == 0 { first_missing = true; }
+                    if i == 0 {
+                        first_missing = true;
+                    }
                     continue;
                 }
                 if let Some(entry) = self.table.get_slot(idx) {
@@ -3977,7 +4173,11 @@ impl RudisTable {
                                 other_sets.push(s.clone());
                             }
                         }
-                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                        _ => {
+                            return Err(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            );
+                        }
                     }
                 } else if i == 0 {
                     first_missing = true;
@@ -4023,7 +4223,11 @@ impl RudisTable {
         }
     }
 
-    pub fn srandmember(&mut self, key: &[u8], count: Option<i64>) -> Result<Vec<Bytes>, &'static str> {
+    pub fn srandmember(
+        &mut self,
+        key: &[u8],
+        count: Option<i64>,
+    ) -> Result<Vec<Bytes>, &'static str> {
         let h = hash_key(key);
         let items: Vec<Bytes> = if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
@@ -4032,7 +4236,11 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
                     RudisValue::Set(set) => set.to_vec(),
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
                 }
             } else {
                 return Ok(Vec::new());
@@ -4073,24 +4281,27 @@ impl RudisTable {
         }
     }
 
-    pub fn smove(&mut self, source: &[u8], destination: Bytes, member: Bytes) -> Result<SmoveResult, &'static str> {
+    pub fn smove(
+        &mut self,
+        source: &[u8],
+        destination: Bytes,
+        member: Bytes,
+    ) -> Result<SmoveResult, &'static str> {
         let h_src = hash_key(source);
-        let src_idx = match self.table.find(source, h_src) {
-            Some(idx) => {
-                if self.check_expired_slot(idx) {
-                    None
-                } else {
-                    Some(idx)
-                }
-            }
-            None => None,
-        };
+        let src_idx = self
+            .table
+            .find(source, h_src)
+            .filter(|&idx| !self.check_expired_slot(idx));
 
-        if let Some(idx) = src_idx {
-            if let Some(entry) = self.table.get_slot(idx) {
-                match &entry.val {
-                    RudisValue::Set(_) => {}
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        if let Some(idx) = src_idx
+            && let Some(entry) = self.table.get_slot(idx)
+        {
+            match &entry.val {
+                RudisValue::Set(_) => {}
+                _ => {
+                    return Err(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
                 }
             }
         }
@@ -4102,7 +4313,11 @@ impl RudisTable {
             } else if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
                     RudisValue::Set(_) => true,
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
                 }
             } else {
                 false
@@ -4113,7 +4328,12 @@ impl RudisTable {
 
         let src_idx = match src_idx {
             Some(idx) => idx,
-            None => return Ok(SmoveResult { moved: false, dst_added: false }),
+            None => {
+                return Ok(SmoveResult {
+                    moved: false,
+                    dst_added: false,
+                });
+            }
         };
 
         let contains_member = match self.table.get_slot(src_idx).map(|e| &e.val) {
@@ -4122,7 +4342,10 @@ impl RudisTable {
         };
 
         if !contains_member {
-            return Ok(SmoveResult { moved: false, dst_added: false });
+            return Ok(SmoveResult {
+                moved: false,
+                dst_added: false,
+            });
         }
 
         let empty_after = if let Some(entry) = self.table.get_slot_mut(src_idx) {
@@ -4168,7 +4391,10 @@ impl RudisTable {
             true
         };
 
-        Ok(SmoveResult { moved: true, dst_added })
+        Ok(SmoveResult {
+            moved: true,
+            dst_added,
+        })
     }
 
     pub fn sscan(
@@ -4186,7 +4412,11 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
                     RudisValue::Set(s) => s.to_vec(),
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
                 }
             } else {
                 return Ok((0, Vec::new()));
@@ -4340,7 +4570,11 @@ impl RudisTable {
                                     .or_insert(if val.is_nan() { 0.0 } else { val });
                             }
                         }
-                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                        _ => {
+                            return Err(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            );
+                        }
                     }
                 }
             }
@@ -4389,7 +4623,11 @@ impl RudisTable {
                                 map.insert(m.clone(), 1.0 * weight);
                             }
                         }
-                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                        _ => {
+                            return Err(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            );
+                        }
                     }
                     key_maps.push(map);
                 } else {
@@ -4470,7 +4708,11 @@ impl RudisTable {
                     match &entry.val {
                         RudisValue::ZSet(zs) => collections.push(SetOrZSet::ZSet(zs.clone())),
                         RudisValue::Set(s) => collections.push(SetOrZSet::Set(s.clone())),
-                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                        _ => {
+                            return Err(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            );
+                        }
                     }
                 } else {
                     missing = true;
@@ -4484,9 +4726,8 @@ impl RudisTable {
         }
         collections.sort_by_key(|c| c.len());
         let mut count = 0;
-        let check_other = |m: &[u8], cols: &[SetOrZSet]| -> bool {
-            cols.iter().all(|c| c.contains(m))
-        };
+        let check_other =
+            |m: &[u8], cols: &[SetOrZSet]| -> bool { cols.iter().all(|c| c.contains(m)) };
         match &collections[0] {
             SetOrZSet::Set(s) => {
                 for m in s.iter() {
@@ -4501,7 +4742,9 @@ impl RudisTable {
             SetOrZSet::ZSet(zs) => {
                 let mut early_exit = false;
                 zs.for_each(|m, _| {
-                    if early_exit { return; }
+                    if early_exit {
+                        return;
+                    }
                     if check_other(m.as_ref(), &collections[1..]) {
                         count += 1;
                         if limit > 0 && count >= limit {
@@ -4514,7 +4757,11 @@ impl RudisTable {
         Ok(count)
     }
 
-    pub fn zdiff(&mut self, keys: &[Bytes], _with_scores: bool) -> Result<Vec<(Bytes, f64)>, &'static str> {
+    pub fn zdiff(
+        &mut self,
+        keys: &[Bytes],
+        _with_scores: bool,
+    ) -> Result<Vec<(Bytes, f64)>, &'static str> {
         if keys.is_empty() {
             return Ok(Vec::new());
         }
@@ -4525,7 +4772,9 @@ impl RudisTable {
             let h = hash_key(k);
             if let Some(idx) = self.table.find(k, h) {
                 if self.check_expired_slot(idx) {
-                    if i == 0 { first_missing = true; }
+                    if i == 0 {
+                        first_missing = true;
+                    }
                     continue;
                 }
                 if let Some(entry) = self.table.get_slot(idx) {
@@ -4554,7 +4803,11 @@ impl RudisTable {
                                 }
                             }
                         }
-                        _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                        _ => {
+                            return Err(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                            );
+                        }
                     }
                 } else if i == 0 {
                     first_missing = true;
@@ -4587,16 +4840,16 @@ impl RudisTable {
         let mut count = 0;
         let mut expired_indices = Vec::new();
         for (idx, opt) in self.table.slots.iter().enumerate() {
-            if let Some(entry) = opt {
-                if crate::router::key_slot(&entry.key) == slot {
-                    if let Some(exp) = entry.expire_at {
-                        if now >= exp {
-                            expired_indices.push(idx);
-                            continue;
-                        }
-                    }
-                    count += 1;
+            if let Some(entry) = opt
+                && crate::router::key_slot(&entry.key) == slot
+            {
+                if let Some(exp) = entry.expire_at
+                    && now >= exp
+                {
+                    expired_indices.push(idx);
+                    continue;
                 }
+                count += 1;
             }
         }
         for idx in expired_indices {
@@ -4610,18 +4863,18 @@ impl RudisTable {
         let mut result = Vec::new();
         let mut expired_indices = Vec::new();
         for (idx, opt) in self.table.slots.iter().enumerate() {
-            if let Some(entry) = opt {
-                if crate::router::key_slot(&entry.key) == slot {
-                    if let Some(exp) = entry.expire_at {
-                        if now >= exp {
-                            expired_indices.push(idx);
-                            continue;
-                        }
-                    }
-                    result.push(entry.key.clone());
-                    if result.len() >= count {
-                        break;
-                    }
+            if let Some(entry) = opt
+                && crate::router::key_slot(&entry.key) == slot
+            {
+                if let Some(exp) = entry.expire_at
+                    && now >= exp
+                {
+                    expired_indices.push(idx);
+                    continue;
+                }
+                result.push(entry.key.clone());
+                if result.len() >= count {
+                    break;
                 }
             }
         }
@@ -4810,7 +5063,11 @@ impl RudisTable {
                 match &entry.val {
                     RudisValue::ZSet(zset) => {
                         if let Some(rank) = zset.rank(member, rev) {
-                            let score = if with_score { zset.get_score(member) } else { None };
+                            let score = if with_score {
+                                zset.get_score(member)
+                            } else {
+                                None
+                            };
                             Ok(Some((rank, score)))
                         } else {
                             Ok(None)
@@ -5044,7 +5301,11 @@ impl RudisTable {
         }
     }
 
-    pub fn zmscore(&mut self, key: &[u8], members: &[Bytes]) -> Result<Vec<Option<f64>>, &'static str> {
+    pub fn zmscore(
+        &mut self,
+        key: &[u8],
+        members: &[Bytes],
+    ) -> Result<Vec<Option<f64>>, &'static str> {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
@@ -5079,7 +5340,11 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
                     RudisValue::ZSet(zset) => zset.to_vec(),
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
                 }
             } else {
                 return Ok(Vec::new());
@@ -5120,7 +5385,12 @@ impl RudisTable {
         }
     }
 
-    pub fn zremrangebyrank(&mut self, key: &[u8], start: i64, stop: i64) -> Result<usize, &'static str> {
+    pub fn zremrangebyrank(
+        &mut self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+    ) -> Result<usize, &'static str> {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
@@ -5249,7 +5519,11 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot(idx) {
                 match &entry.val {
                     RudisValue::ZSet(zset) => zset.to_vec(),
-                    _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
                 }
             } else {
                 return Ok((0, Vec::new()));
@@ -5282,7 +5556,7 @@ impl RudisTable {
     /// Active sampling cycle: samples up to 20 slots starting from cursor and evicts expired keys.
     pub fn active_expire_cycle(&mut self) -> usize {
         let cap = self.table.capacity();
-        if cap == 0 || self.table.len() == 0 {
+        if cap == 0 || self.table.is_empty() {
             return 0;
         }
 
@@ -5320,44 +5594,42 @@ impl RudisTable {
         let h = hash_key(&key);
         if let Some(idx) = self.table.find(&key, h) {
             let was_exp = self.check_expired_slot(idx);
-            if !was_exp {
-                if let Some(entry) = self.table.get_slot_mut(idx) {
-                    match &mut entry.val {
-                        RudisValue::String(b) => {
-                            let mut vec = b.to_vec();
-                            if vec.len() <= byte_idx {
-                                vec.resize(byte_idx + 1, 0);
-                            }
-                            let old_byte = vec[byte_idx];
-                            let old_bit = (old_byte >> bit_idx) & 1;
-                            if value == 1 {
-                                vec[byte_idx] |= 1 << bit_idx;
-                            } else {
-                                vec[byte_idx] &= !(1 << bit_idx);
-                            }
-                            *b = Bytes::from(vec);
-                            return Ok(old_bit);
+            if !was_exp && let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::String(b) => {
+                        let mut vec = b.to_vec();
+                        if vec.len() <= byte_idx {
+                            vec.resize(byte_idx + 1, 0);
                         }
-                        RudisValue::Int(n) => {
-                            let mut vec = Self::format_i64(*n).to_vec();
-                            if vec.len() <= byte_idx {
-                                vec.resize(byte_idx + 1, 0);
-                            }
-                            let old_byte = vec[byte_idx];
-                            let old_bit = (old_byte >> bit_idx) & 1;
-                            if value == 1 {
-                                vec[byte_idx] |= 1 << bit_idx;
-                            } else {
-                                vec[byte_idx] &= !(1 << bit_idx);
-                            }
-                            entry.val = RudisValue::String(Bytes::from(vec));
-                            return Ok(old_bit);
+                        let old_byte = vec[byte_idx];
+                        let old_bit = (old_byte >> bit_idx) & 1;
+                        if value == 1 {
+                            vec[byte_idx] |= 1 << bit_idx;
+                        } else {
+                            vec[byte_idx] &= !(1 << bit_idx);
                         }
-                        _ => {
-                            return Err(
-                                "WRONGTYPE Operation against a key holding the wrong kind of value",
-                            )
+                        *b = Bytes::from(vec);
+                        return Ok(old_bit);
+                    }
+                    RudisValue::Int(n) => {
+                        let mut vec = Self::format_i64(*n).to_vec();
+                        if vec.len() <= byte_idx {
+                            vec.resize(byte_idx + 1, 0);
                         }
+                        let old_byte = vec[byte_idx];
+                        let old_bit = (old_byte >> bit_idx) & 1;
+                        if value == 1 {
+                            vec[byte_idx] |= 1 << bit_idx;
+                        } else {
+                            vec[byte_idx] &= !(1 << bit_idx);
+                        }
+                        entry.val = RudisValue::String(Bytes::from(vec));
+                        return Ok(old_bit);
+                    }
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
                     }
                 }
             }
@@ -5407,7 +5679,7 @@ impl RudisTable {
                     _ => {
                         return Err(
                             "WRONGTYPE Operation against a key holding the wrong kind of value",
-                        )
+                        );
                     }
                 }
             }
@@ -5461,8 +5733,7 @@ impl RudisTable {
                         return Ok(0);
                     }
                     let slice = &b[s..=e.min(b.len() - 1)];
-                    let count: usize =
-                        slice.iter().map(|byte| byte.count_ones() as usize).sum();
+                    let count: usize = slice.iter().map(|byte| byte.count_ones() as usize).sum();
                     return Ok(count);
                 } else {
                     return Err(
@@ -5570,7 +5841,7 @@ impl RudisTable {
                         _ => {
                             return Err(
                                 "WRONGTYPE Operation against a key holding the wrong kind of value",
-                            )
+                            );
                         }
                     }
                 } else {
@@ -5586,38 +5857,38 @@ impl RudisTable {
         let mut result = vec![0u8; max_len];
         match op.as_str() {
             "AND" => {
-                for i in 0..max_len {
+                for (i, out) in result.iter_mut().enumerate() {
                     let mut b = 0xFF;
                     for buf in &buffers {
                         b &= buf.get(i).copied().unwrap_or(0);
                     }
-                    result[i] = b;
+                    *out = b;
                 }
             }
             "OR" => {
-                for i in 0..max_len {
+                for (i, out) in result.iter_mut().enumerate() {
                     let mut b = 0;
                     for buf in &buffers {
                         b |= buf.get(i).copied().unwrap_or(0);
                     }
-                    result[i] = b;
+                    *out = b;
                 }
             }
             "XOR" => {
-                for i in 0..max_len {
+                for (i, out) in result.iter_mut().enumerate() {
                     let mut b = 0;
                     for buf in &buffers {
                         b ^= buf.get(i).copied().unwrap_or(0);
                     }
-                    result[i] = b;
+                    *out = b;
                 }
             }
             "NOT" => {
                 if buffers.len() != 1 {
                     return Err("BITOP NOT takes only one source key");
                 }
-                for i in 0..max_len {
-                    result[i] = !buffers[0].get(i).copied().unwrap_or(0);
+                for (i, out) in result.iter_mut().enumerate() {
+                    *out = !buffers[0].get(i).copied().unwrap_or(0);
                 }
             }
             _ => return Err("syntax error"),
@@ -5632,7 +5903,7 @@ impl RudisTable {
     pub fn pfadd(&mut self, key: Bytes, elements: &[Bytes]) -> Result<bool, &'static str> {
         let mut updated = false;
         let h = hash_key(&key);
-        let mut existing_registers = if let Some(idx) = self.table.find(&key, h) {
+        let existing_registers = if let Some(idx) = self.table.find(&key, h) {
             let was_exp = self.check_expired_slot(idx);
             if !was_exp {
                 if let Some(entry) = self.table.get_slot_mut(idx) {
@@ -5650,7 +5921,7 @@ impl RudisTable {
                         _ => {
                             return Err(
                                 "WRONGTYPE Operation against a key holding the wrong kind of value",
-                            )
+                            );
                         }
                     }
                 } else {
@@ -5663,7 +5934,7 @@ impl RudisTable {
             None
         };
 
-        if let Some(regs) = existing_registers.as_deref_mut() {
+        if let Some(regs) = existing_registers {
             for elem in elements {
                 let h = hash_key(elem);
                 let reg_idx = (h & 0x3FFF) as usize; // 14 bits (0..16383)
@@ -5701,28 +5972,27 @@ impl RudisTable {
 
         for k in keys {
             let h = hash_key(k);
-            if let Some(idx) = self.table.find(k, h) {
-                if !self.check_expired_slot(idx) {
-                    if let Some(entry) = self.table.get_slot(idx) {
-                        match &entry.val {
-                            RudisValue::HyperLogLog(regs) => {
-                                has_hll = true;
-                                for i in 0..16384 {
-                                    merged[i] = merged[i].max(regs[i]);
-                                }
-                            }
-                            RudisValue::String(s) if s.len() == 16384 => {
-                                has_hll = true;
-                                for i in 0..16384 {
-                                    merged[i] = merged[i].max(s[i]);
-                                }
-                            }
-                            _ => {
-                                return Err(
-                                    "WRONGTYPE Operation against a key holding the wrong kind of value",
-                                )
-                            }
+            if let Some(idx) = self.table.find(k, h)
+                && !self.check_expired_slot(idx)
+                && let Some(entry) = self.table.get_slot(idx)
+            {
+                match &entry.val {
+                    RudisValue::HyperLogLog(regs) => {
+                        has_hll = true;
+                        for i in 0..16384 {
+                            merged[i] = merged[i].max(regs[i]);
                         }
+                    }
+                    RudisValue::String(s) if s.len() == 16384 => {
+                        has_hll = true;
+                        for i in 0..16384 {
+                            merged[i] = merged[i].max(s[i]);
+                        }
+                    }
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
                     }
                 }
             }
@@ -5755,63 +6025,61 @@ impl RudisTable {
     pub fn pfmerge(&mut self, destkey: Bytes, srckeys: &[Bytes]) -> Result<(), &'static str> {
         let mut merged = [0u8; 16384];
         let h = hash_key(&destkey);
-        if let Some(idx) = self.table.find(&destkey, h) {
-            if !self.check_expired_slot(idx) {
-                if let Some(entry) = self.table.get_slot(idx) {
-                    match &entry.val {
-                        RudisValue::HyperLogLog(regs) => {
-                            for i in 0..16384 {
-                                merged[i] = merged[i].max(regs[i]);
-                            }
-                        }
-                        RudisValue::String(s) if s.len() == 16384 => {
-                            for i in 0..16384 {
-                                merged[i] = merged[i].max(s[i]);
-                            }
-                        }
-                        _ => {
-                            return Err(
-                                "WRONGTYPE Operation against a key holding the wrong kind of value",
-                            )
-                        }
+        if let Some(idx) = self.table.find(&destkey, h)
+            && !self.check_expired_slot(idx)
+            && let Some(entry) = self.table.get_slot(idx)
+        {
+            match &entry.val {
+                RudisValue::HyperLogLog(regs) => {
+                    for i in 0..16384 {
+                        merged[i] = merged[i].max(regs[i]);
                     }
+                }
+                RudisValue::String(s) if s.len() == 16384 => {
+                    for i in 0..16384 {
+                        merged[i] = merged[i].max(s[i]);
+                    }
+                }
+                _ => {
+                    return Err(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
                 }
             }
         }
 
         for k in srckeys {
             let h = hash_key(k);
-            if let Some(idx) = self.table.find(k, h) {
-                if !self.check_expired_slot(idx) {
-                    if let Some(entry) = self.table.get_slot(idx) {
-                        match &entry.val {
-                            RudisValue::HyperLogLog(regs) => {
-                                for i in 0..16384 {
-                                    merged[i] = merged[i].max(regs[i]);
-                                }
-                            }
-                            RudisValue::String(s) if s.len() == 16384 => {
-                                for i in 0..16384 {
-                                    merged[i] = merged[i].max(s[i]);
-                                }
-                            }
-                            _ => {
-                                return Err(
-                                    "WRONGTYPE Operation against a key holding the wrong kind of value",
-                                )
-                            }
+            if let Some(idx) = self.table.find(k, h)
+                && !self.check_expired_slot(idx)
+                && let Some(entry) = self.table.get_slot(idx)
+            {
+                match &entry.val {
+                    RudisValue::HyperLogLog(regs) => {
+                        for i in 0..16384 {
+                            merged[i] = merged[i].max(regs[i]);
                         }
+                    }
+                    RudisValue::String(s) if s.len() == 16384 => {
+                        for i in 0..16384 {
+                            merged[i] = merged[i].max(s[i]);
+                        }
+                    }
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
                     }
                 }
             }
         }
 
         let h = hash_key(&destkey);
-        if let Some(idx) = self.table.find(&destkey, h) {
-            if let Some(entry) = self.table.get_slot_mut(idx) {
-                entry.val = RudisValue::HyperLogLog(Box::new(merged));
-                return Ok(());
-            }
+        if let Some(idx) = self.table.find(&destkey, h)
+            && let Some(entry) = self.table.get_slot_mut(idx)
+        {
+            entry.val = RudisValue::HyperLogLog(Box::new(merged));
+            return Ok(());
         }
 
         let entry = RudisEntry {
@@ -5871,12 +6139,12 @@ impl RudisTable {
                 if id.ms == 0 && id.seq == 0 {
                     return Err("ERR The ID specified in XADD must be greater than 0-0");
                 }
-                if !stream.entries.is_empty() || stream.last_id != StreamId::default() {
-                    if id <= stream.last_id {
-                        return Err(
-                            "ERR The ID specified in XADD is equal or smaller than the target stream top item",
-                        );
-                    }
+                if (!stream.entries.is_empty() || stream.last_id != StreamId::default())
+                    && id <= stream.last_id
+                {
+                    return Err(
+                        "ERR The ID specified in XADD is equal or smaller than the target stream top item",
+                    );
                 }
                 id
             }
@@ -6135,7 +6403,7 @@ impl RudisTable {
                         _ => {
                             return Err(
                                 "WRONGTYPE Operation against a key holding the wrong kind of value",
-                            )
+                            );
                         }
                     }
                 }
@@ -6307,14 +6575,16 @@ impl RudisTable {
                 if cursor + 4 > data.len() {
                     return Err("DUMP payload version or checksum are wrong");
                 }
-                let count = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                let count =
+                    u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
                 cursor += 4;
                 let mut list = std::collections::VecDeque::with_capacity(count);
                 for _ in 0..count {
                     if cursor + 4 > data.len() {
                         return Err("DUMP payload version or checksum are wrong");
                     }
-                    let len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                    let len =
+                        u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
                     cursor += 4;
                     if cursor + len > data.len() {
                         return Err("DUMP payload version or checksum are wrong");
@@ -6328,14 +6598,16 @@ impl RudisTable {
                 if cursor + 4 > data.len() {
                     return Err("DUMP payload version or checksum are wrong");
                 }
-                let count = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                let count =
+                    u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
                 cursor += 4;
                 let mut set = RudisSet::with_capacity(count);
                 for _ in 0..count {
                     if cursor + 4 > data.len() {
                         return Err("DUMP payload version or checksum are wrong");
                     }
-                    let len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                    let len =
+                        u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
                     cursor += 4;
                     if cursor + len > data.len() {
                         return Err("DUMP payload version or checksum are wrong");
@@ -6349,14 +6621,16 @@ impl RudisTable {
                 if cursor + 4 > data.len() {
                     return Err("DUMP payload version or checksum are wrong");
                 }
-                let count = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                let count =
+                    u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
                 cursor += 4;
                 let mut zset = RudisZSet::new();
                 for _ in 0..count {
                     if cursor + 4 > data.len() {
                         return Err("DUMP payload version or checksum are wrong");
                     }
-                    let len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                    let len =
+                        u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
                     cursor += 4;
                     if cursor + len > data.len() {
                         return Err("DUMP payload version or checksum are wrong");
@@ -6366,7 +6640,8 @@ impl RudisTable {
                     if cursor + 8 > data.len() {
                         return Err("DUMP payload version or checksum are wrong");
                     }
-                    let score_bits = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                    let score_bits =
+                        u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
                     cursor += 8;
                     let score = f64::from_bits(score_bits);
                     zset.insert(score, member);
@@ -6377,7 +6652,8 @@ impl RudisTable {
                 if cursor + 4 > data.len() {
                     return Err("DUMP payload version or checksum are wrong");
                 }
-                let count = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                let count =
+                    u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
                 cursor += 4;
                 if count <= 64 {
                     let mut pairs = Vec::with_capacity(count);
@@ -6385,7 +6661,8 @@ impl RudisTable {
                         if cursor + 4 > data.len() {
                             return Err("DUMP payload version or checksum are wrong");
                         }
-                        let f_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                        let f_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap())
+                            as usize;
                         cursor += 4;
                         if cursor + f_len > data.len() {
                             return Err("DUMP payload version or checksum are wrong");
@@ -6396,7 +6673,8 @@ impl RudisTable {
                         if cursor + 4 > data.len() {
                             return Err("DUMP payload version or checksum are wrong");
                         }
-                        let v_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                        let v_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap())
+                            as usize;
                         cursor += 4;
                         if cursor + v_len > data.len() {
                             return Err("DUMP payload version or checksum are wrong");
@@ -6413,7 +6691,8 @@ impl RudisTable {
                         if cursor + 4 > data.len() {
                             return Err("DUMP payload version or checksum are wrong");
                         }
-                        let f_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                        let f_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap())
+                            as usize;
                         cursor += 4;
                         if cursor + f_len > data.len() {
                             return Err("DUMP payload version or checksum are wrong");
@@ -6424,7 +6703,8 @@ impl RudisTable {
                         if cursor + 4 > data.len() {
                             return Err("DUMP payload version or checksum are wrong");
                         }
-                        let v_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                        let v_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap())
+                            as usize;
                         cursor += 4;
                         if cursor + v_len > data.len() {
                             return Err("DUMP payload version or checksum are wrong");
@@ -6450,43 +6730,32 @@ impl RudisTable {
                 if cursor + 4 + 8 + 8 > data.len() {
                     return Err("DUMP payload version or checksum are wrong");
                 }
-                let count = u32::from_le_bytes(
-                    data[cursor..cursor + 4].try_into().unwrap(),
-                ) as usize;
+                let count =
+                    u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
                 cursor += 4;
-                let last_ms = u64::from_le_bytes(
-                    data[cursor..cursor + 8].try_into().unwrap(),
-                );
+                let last_ms = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
                 cursor += 8;
-                let last_seq = u64::from_le_bytes(
-                    data[cursor..cursor + 8].try_into().unwrap(),
-                );
+                let last_seq = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
                 cursor += 8;
                 let mut entries = std::collections::BTreeMap::new();
                 for _ in 0..count {
                     if cursor + 8 + 8 + 4 > data.len() {
                         return Err("DUMP payload version or checksum are wrong");
                     }
-                    let ms = u64::from_le_bytes(
-                        data[cursor..cursor + 8].try_into().unwrap(),
-                    );
+                    let ms = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
                     cursor += 8;
-                    let seq = u64::from_le_bytes(
-                        data[cursor..cursor + 8].try_into().unwrap(),
-                    );
+                    let seq = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
                     cursor += 8;
-                    let f_count = u32::from_le_bytes(
-                        data[cursor..cursor + 4].try_into().unwrap(),
-                    ) as usize;
+                    let f_count =
+                        u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
                     cursor += 4;
                     let mut fields = Vec::with_capacity(f_count);
                     for _ in 0..f_count {
                         if cursor + 4 > data.len() {
                             return Err("DUMP payload version or checksum are wrong");
                         }
-                        let k_len = u32::from_le_bytes(
-                            data[cursor..cursor + 4].try_into().unwrap(),
-                        ) as usize;
+                        let k_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap())
+                            as usize;
                         cursor += 4;
                         if cursor + k_len > data.len() {
                             return Err("DUMP payload version or checksum are wrong");
@@ -6496,9 +6765,8 @@ impl RudisTable {
                         if cursor + 4 > data.len() {
                             return Err("DUMP payload version or checksum are wrong");
                         }
-                        let v_len = u32::from_le_bytes(
-                            data[cursor..cursor + 4].try_into().unwrap(),
-                        ) as usize;
+                        let v_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap())
+                            as usize;
                         cursor += 4;
                         if cursor + v_len > data.len() {
                             return Err("DUMP payload version or checksum are wrong");
@@ -6650,10 +6918,14 @@ impl RudisTable {
                 data = &data[9..];
                 if exp_unix_ms <= unix_now {
                     // Already expired - skip key and value
-                    if data.len() < 4 { return Err("Truncated RDB key"); }
+                    if data.len() < 4 {
+                        return Err("Truncated RDB key");
+                    }
                     let k_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
                     data = &data[4..];
-                    if data.len() < k_len { return Err("Truncated RDB key"); }
+                    if data.len() < k_len {
+                        return Err("Truncated RDB key");
+                    }
                     data = &data[k_len..];
                     let (_, consumed) = Self::deserialize_val_payload(data)?;
                     data = &data[consumed..];
@@ -6662,10 +6934,14 @@ impl RudisTable {
                 let rem_ms = exp_unix_ms - unix_now;
                 expire_at = Some(Instant::now() + Duration::from_millis(rem_ms));
             }
-            if data.len() < 4 { return Err("Truncated RDB key"); }
+            if data.len() < 4 {
+                return Err("Truncated RDB key");
+            }
             let k_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
             data = &data[4..];
-            if data.len() < k_len { return Err("Truncated RDB key"); }
+            if data.len() < k_len {
+                return Err("Truncated RDB key");
+            }
             let key = Bytes::copy_from_slice(&data[..k_len]);
             data = &data[k_len..];
             let (val, consumed) = Self::deserialize_val_payload(data)?;
@@ -6691,15 +6967,7 @@ impl RudisTable {
     ) -> Result<(), &'static str> {
         let h = hash_key(&key);
         let idx_opt = self.table.find(&key, h);
-        let stream_slot = if let Some(idx) = idx_opt {
-            if self.check_expired_slot(idx) {
-                None
-            } else {
-                Some(idx)
-            }
-        } else {
-            None
-        };
+        let stream_slot = idx_opt.filter(|&idx| !self.check_expired_slot(idx));
 
         if stream_slot.is_none() {
             if !mkstream {
@@ -6747,9 +7015,7 @@ impl RudisTable {
             }
             if let Some(entry) = self.table.get_slot_mut(idx) {
                 match &mut entry.val {
-                    RudisValue::Stream(stream) => {
-                        Ok(stream.groups.remove(group).is_some())
-                    }
+                    RudisValue::Stream(stream) => Ok(stream.groups.remove(group).is_some()),
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
@@ -6774,16 +7040,25 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot_mut(idx) {
                 match &mut entry.val {
                     RudisValue::Stream(stream) => {
-                        let grp = stream.groups.get_mut(group).ok_or("NOGROUP No such consumer group for key name")?;
+                        let grp = stream
+                            .groups
+                            .get_mut(group)
+                            .ok_or("NOGROUP No such consumer group for key name")?;
                         if grp.consumers.contains_key(&consumer) {
                             Ok(false)
                         } else {
-                            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
-                            grp.consumers.insert(consumer.clone(), StreamConsumer {
-                                name: consumer,
-                                seen_time_ms: now,
-                                pel: std::collections::BTreeMap::new(),
-                            });
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            grp.consumers.insert(
+                                consumer.clone(),
+                                StreamConsumer {
+                                    name: consumer,
+                                    seen_time_ms: now,
+                                    pel: std::collections::BTreeMap::new(),
+                                },
+                            );
                             Ok(true)
                         }
                     }
@@ -6811,7 +7086,10 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot_mut(idx) {
                 match &mut entry.val {
                     RudisValue::Stream(stream) => {
-                        let grp = stream.groups.get_mut(group).ok_or("NOGROUP No such consumer group for key name")?;
+                        let grp = stream
+                            .groups
+                            .get_mut(group)
+                            .ok_or("NOGROUP No such consumer group for key name")?;
                         if let Some(cons) = grp.consumers.remove(consumer) {
                             let pending = cons.pel.len();
                             for id in cons.pel.keys() {
@@ -6852,23 +7130,35 @@ impl RudisTable {
             None => return Ok(Vec::new()),
         };
 
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         let limit = count.unwrap_or(usize::MAX);
 
         let entry = self.table.get_slot_mut(idx).unwrap();
         match &mut entry.val {
             RudisValue::Stream(stream) => {
-                let grp = stream.groups.get_mut(group).ok_or("NOGROUP No such key or consumer group")?;
-                let cons = grp.consumers.entry(consumer.clone()).or_insert_with(|| StreamConsumer {
-                    name: consumer.clone(),
-                    seen_time_ms: now,
-                    pel: std::collections::BTreeMap::new(),
-                });
+                let grp = stream
+                    .groups
+                    .get_mut(group)
+                    .ok_or("NOGROUP No such key or consumer group")?;
+                let cons =
+                    grp.consumers
+                        .entry(consumer.clone())
+                        .or_insert_with(|| StreamConsumer {
+                            name: consumer.clone(),
+                            seen_time_ms: now,
+                            pel: std::collections::BTreeMap::new(),
+                        });
                 cons.seen_time_ms = now;
 
                 if id_str == ">" {
                     let mut results = Vec::new();
-                    let range = stream.entries.range((std::ops::Bound::Excluded(grp.last_delivered_id), std::ops::Bound::Unbounded));
+                    let range = stream.entries.range((
+                        std::ops::Bound::Excluded(grp.last_delivered_id),
+                        std::ops::Bound::Unbounded,
+                    ));
                     for (&id, fields) in range {
                         if results.len() >= limit {
                             break;
@@ -6879,11 +7169,14 @@ impl RudisTable {
                     for (id, _) in &results {
                         grp.last_delivered_id = std::cmp::max(grp.last_delivered_id, *id);
                         if !noack {
-                            grp.pel.insert(*id, StreamPelEntry {
-                                consumer: consumer.clone(),
-                                delivery_time_ms: now,
-                                delivery_count: 1,
-                            });
+                            grp.pel.insert(
+                                *id,
+                                StreamPelEntry {
+                                    consumer: consumer.clone(),
+                                    delivery_time_ms: now,
+                                    delivery_count: 1,
+                                },
+                            );
                             let cons = grp.consumers.get_mut(&consumer).unwrap();
                             cons.pel.insert(*id, now);
                         }
@@ -6892,7 +7185,10 @@ impl RudisTable {
                 } else {
                     let start_id = StreamId::parse(id_str)?;
                     let mut results = Vec::new();
-                    for (&id, _) in cons.pel.range((std::ops::Bound::Excluded(start_id), std::ops::Bound::Unbounded)) {
+                    for (&id, _) in cons.pel.range((
+                        std::ops::Bound::Excluded(start_id),
+                        std::ops::Bound::Unbounded,
+                    )) {
                         if results.len() >= limit {
                             break;
                         }
@@ -6959,7 +7255,15 @@ impl RudisTable {
         &mut self,
         key: &[u8],
         group: &[u8],
-    ) -> Result<(usize, Option<StreamId>, Option<StreamId>, Vec<(Bytes, usize)>), &'static str> {
+    ) -> Result<
+        (
+            usize,
+            Option<StreamId>,
+            Option<StreamId>,
+            Vec<(Bytes, usize)>,
+        ),
+        &'static str,
+    > {
         let h = hash_key(key);
         let idx = match self.table.find(key, h) {
             Some(i) => {
@@ -6974,7 +7278,10 @@ impl RudisTable {
         let entry = self.table.get_slot_mut(idx).unwrap();
         match &entry.val {
             RudisValue::Stream(stream) => {
-                let grp = stream.groups.get(group).ok_or("NOGROUP No such key or consumer group")?;
+                let grp = stream
+                    .groups
+                    .get(group)
+                    .ok_or("NOGROUP No such key or consumer group")?;
                 let count = grp.pel.len();
                 let min_id = grp.pel.keys().next().copied();
                 let max_id = grp.pel.keys().next_back().copied();
@@ -7010,21 +7317,32 @@ impl RudisTable {
             None => return Err("NOGROUP No such key or consumer group"),
         };
 
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
 
         let entry = self.table.get_slot_mut(idx).unwrap();
         match &entry.val {
             RudisValue::Stream(stream) => {
-                let grp = stream.groups.get(group).ok_or("NOGROUP No such key or consumer group")?;
+                let grp = stream
+                    .groups
+                    .get(group)
+                    .ok_or("NOGROUP No such key or consumer group")?;
                 let mut results = Vec::new();
                 for (&id, pel_entry) in grp.pel.range(start..=end) {
-                    if let Some(c) = consumer {
-                        if pel_entry.consumer.as_ref() != c {
-                            continue;
-                        }
+                    if let Some(c) = consumer
+                        && pel_entry.consumer.as_ref() != c
+                    {
+                        continue;
                     }
                     let idle = now.saturating_sub(pel_entry.delivery_time_ms);
-                    results.push((id, pel_entry.consumer.clone(), idle, pel_entry.delivery_count));
+                    results.push((
+                        id,
+                        pel_entry.consumer.clone(),
+                        idle,
+                        pel_entry.delivery_count,
+                    ));
                     if results.len() >= count {
                         break;
                     }
@@ -7123,12 +7441,19 @@ pub fn load_rdb_bytes(
             cursor += 8;
             if exp_unix_ms <= unix_now {
                 // Expired - skip key and value
-                if cursor + 4 > content_len { break; }
-                let k_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                if cursor + 4 > content_len {
+                    break;
+                }
+                let k_len =
+                    u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
                 cursor += 4;
-                if cursor + k_len > content_len { break; }
+                if cursor + k_len > content_len {
+                    break;
+                }
                 cursor += k_len;
-                if let Ok((_, consumed)) = RudisTable::deserialize_val_payload(&data[cursor..content_len]) {
+                if let Ok((_, consumed)) =
+                    RudisTable::deserialize_val_payload(&data[cursor..content_len])
+                {
                     cursor += consumed;
                 } else {
                     break;
@@ -7142,16 +7467,24 @@ pub fn load_rdb_bytes(
             if cursor + 4 > content_len {
                 break;
             }
-            let exp_unix_sec = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as u64;
+            let exp_unix_sec =
+                u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as u64;
             cursor += 4;
             let exp_unix_ms = exp_unix_sec * 1000;
             if exp_unix_ms <= unix_now {
-                if cursor + 4 > content_len { break; }
-                let k_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                if cursor + 4 > content_len {
+                    break;
+                }
+                let k_len =
+                    u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
                 cursor += 4;
-                if cursor + k_len > content_len { break; }
+                if cursor + k_len > content_len {
+                    break;
+                }
                 cursor += k_len;
-                if let Ok((_, consumed)) = RudisTable::deserialize_val_payload(&data[cursor..content_len]) {
+                if let Ok((_, consumed)) =
+                    RudisTable::deserialize_val_payload(&data[cursor..content_len])
+                {
                     cursor += consumed;
                 } else {
                     break;
@@ -7172,7 +7505,8 @@ pub fn load_rdb_bytes(
         let key = Bytes::copy_from_slice(&data[cursor..cursor + k_len]);
         cursor += k_len;
 
-        let (val, consumed) = match RudisTable::deserialize_val_payload(&data[cursor..content_len]) {
+        let (val, consumed) = match RudisTable::deserialize_val_payload(&data[cursor..content_len])
+        {
             Ok(res) => res,
             Err(_) => break,
         };
@@ -7321,10 +7655,22 @@ mod tests {
         // 2. ZSCORE & ZRANK
         assert_eq!(table.zscore(b"myzset", b"m2").unwrap(), Some(20.5));
         assert_eq!(table.zscore(b"myzset", b"nonexistent").unwrap(), None);
-        assert_eq!(table.zrank(b"myzset", b"m3", false, false).unwrap(), Some((0, None))); // 5.0
-        assert_eq!(table.zrank(b"myzset", b"m1", false, false).unwrap(), Some((1, None))); // 10.0
-        assert_eq!(table.zrank(b"myzset", b"m2", false, false).unwrap(), Some((2, None))); // 20.5
-        assert_eq!(table.zrank(b"myzset", b"m3", true, false).unwrap(), Some((2, None))); // rev rank
+        assert_eq!(
+            table.zrank(b"myzset", b"m3", false, false).unwrap(),
+            Some((0, None))
+        ); // 5.0
+        assert_eq!(
+            table.zrank(b"myzset", b"m1", false, false).unwrap(),
+            Some((1, None))
+        ); // 10.0
+        assert_eq!(
+            table.zrank(b"myzset", b"m2", false, false).unwrap(),
+            Some((2, None))
+        ); // 20.5
+        assert_eq!(
+            table.zrank(b"myzset", b"m3", true, false).unwrap(),
+            Some((2, None))
+        ); // rev rank
 
         // 3. ZRANGE by index
         let opts = ZRangeOpts {
@@ -7386,9 +7732,21 @@ mod tests {
         assert_eq!(table.random_key(), None);
         assert_eq!(table.keys(b"*").len(), 0);
 
-        table.set(Bytes::from_static(b"alpha:1"), Bytes::from_static(b"a"), None);
-        table.set(Bytes::from_static(b"alpha:2"), Bytes::from_static(b"b"), None);
-        table.set(Bytes::from_static(b"beta:1"), Bytes::from_static(b"c"), None);
+        table.set(
+            Bytes::from_static(b"alpha:1"),
+            Bytes::from_static(b"a"),
+            None,
+        );
+        table.set(
+            Bytes::from_static(b"alpha:2"),
+            Bytes::from_static(b"b"),
+            None,
+        );
+        table.set(
+            Bytes::from_static(b"beta:1"),
+            Bytes::from_static(b"c"),
+            None,
+        );
 
         // KEYS
         let matched = table.keys(b"alpha:*");
@@ -7447,35 +7805,63 @@ mod tests {
         table.set(Bytes::from_static(b"k2"), Bytes::from_static(b"\x33"), None); // 00110011
         assert_eq!(
             table
-                .bitop("AND", Bytes::from_static(b"kand"), &[Bytes::from_static(b"k1"), Bytes::from_static(b"k2")])
+                .bitop(
+                    "AND",
+                    Bytes::from_static(b"kand"),
+                    &[Bytes::from_static(b"k1"), Bytes::from_static(b"k2")]
+                )
                 .unwrap(),
             1
         );
-        assert_eq!(table.get(b"kand").unwrap(), Some(Bytes::from_static(b"\x03")));
+        assert_eq!(
+            table.get(b"kand").unwrap(),
+            Some(Bytes::from_static(b"\x03"))
+        );
 
         assert_eq!(
             table
-                .bitop("OR", Bytes::from_static(b"kor"), &[Bytes::from_static(b"k1"), Bytes::from_static(b"k2")])
+                .bitop(
+                    "OR",
+                    Bytes::from_static(b"kor"),
+                    &[Bytes::from_static(b"k1"), Bytes::from_static(b"k2")]
+                )
                 .unwrap(),
             1
         );
-        assert_eq!(table.get(b"kor").unwrap(), Some(Bytes::from_static(b"\x3f")));
+        assert_eq!(
+            table.get(b"kor").unwrap(),
+            Some(Bytes::from_static(b"\x3f"))
+        );
 
         assert_eq!(
             table
-                .bitop("XOR", Bytes::from_static(b"kxor"), &[Bytes::from_static(b"k1"), Bytes::from_static(b"k2")])
+                .bitop(
+                    "XOR",
+                    Bytes::from_static(b"kxor"),
+                    &[Bytes::from_static(b"k1"), Bytes::from_static(b"k2")]
+                )
                 .unwrap(),
             1
         );
-        assert_eq!(table.get(b"kxor").unwrap(), Some(Bytes::from_static(b"\x3c")));
+        assert_eq!(
+            table.get(b"kxor").unwrap(),
+            Some(Bytes::from_static(b"\x3c"))
+        );
 
         assert_eq!(
             table
-                .bitop("NOT", Bytes::from_static(b"knot"), &[Bytes::from_static(b"k1")])
+                .bitop(
+                    "NOT",
+                    Bytes::from_static(b"knot"),
+                    &[Bytes::from_static(b"k1")]
+                )
                 .unwrap(),
             1
         );
-        assert_eq!(table.get(b"knot").unwrap(), Some(Bytes::from_static(b"\xf0")));
+        assert_eq!(
+            table.get(b"knot").unwrap(),
+            Some(Bytes::from_static(b"\xf0"))
+        );
 
         // 5. HYPERLOGLOG: PFADD & PFCOUNT
         let elements_a = vec![
@@ -7484,8 +7870,16 @@ mod tests {
             Bytes::from_static(b"zap"),
             Bytes::from_static(b"a"),
         ];
-        assert_eq!(table.pfadd(Bytes::from_static(b"hll1"), &elements_a).unwrap(), true);
-        assert_eq!(table.pfadd(Bytes::from_static(b"hll1"), &elements_a).unwrap(), false); // No updates
+        assert!(
+            table
+                .pfadd(Bytes::from_static(b"hll1"), &elements_a)
+                .unwrap()
+        );
+        assert!(
+            !table
+                .pfadd(Bytes::from_static(b"hll1"), &elements_a)
+                .unwrap()
+        ); // No updates
         let c1 = table.pfcount(&[Bytes::from_static(b"hll1")]).unwrap();
         assert_eq!(c1, 4);
 
@@ -7495,7 +7889,11 @@ mod tests {
             Bytes::from_static(b"c"),
             Bytes::from_static(b"foo"),
         ];
-        assert_eq!(table.pfadd(Bytes::from_static(b"hll2"), &elements_b).unwrap(), true);
+        assert!(
+            table
+                .pfadd(Bytes::from_static(b"hll2"), &elements_b)
+                .unwrap()
+        );
         let c2 = table.pfcount(&[Bytes::from_static(b"hll2")]).unwrap();
         assert_eq!(c2, 4);
 
@@ -7559,13 +7957,7 @@ mod tests {
 
         // Replace success
         table
-            .restore(
-                Bytes::from_static(b"restored_str"),
-                0,
-                &dumped,
-                true,
-                false,
-            )
+            .restore(Bytes::from_static(b"restored_str"), 0, &dumped, true, false)
             .expect("replace must succeed");
 
         // Checksum verification failure
@@ -7573,13 +7965,7 @@ mod tests {
         let last = corrupt.len() - 1;
         corrupt[last] ^= 0xFF;
         assert_eq!(
-            table.restore(
-                Bytes::from_static(b"corrupt"),
-                0,
-                &corrupt,
-                false,
-                false,
-            ),
+            table.restore(Bytes::from_static(b"corrupt"), 0, &corrupt, false, false,),
             Err("DUMP payload version or checksum are wrong")
         );
 
@@ -7804,9 +8190,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(table.xlen(b"restored_stream").unwrap(), 5);
-        let restored_range = table
-            .xrange(b"restored_stream", "-", "+", None)
-            .unwrap();
+        let restored_range = table.xrange(b"restored_stream", "-", "+", None).unwrap();
         assert_eq!(restored_range.len(), 5);
     }
 
@@ -7816,10 +8200,17 @@ mod tests {
         let initial_mem = table.used_memory;
 
         // 1. Hot key
-        table.set(Bytes::from_static(b"k1"), Bytes::from_static(b"hello_tiered_storage_world"), None);
+        table.set(
+            Bytes::from_static(b"k1"),
+            Bytes::from_static(b"hello_tiered_storage_world"),
+            None,
+        );
         assert!(table.used_memory > initial_mem);
         let hot_mem = table.used_memory;
-        assert_eq!(table.get(b"k1").unwrap(), Some(Bytes::from_static(b"hello_tiered_storage_world")));
+        assert_eq!(
+            table.get(b"k1").unwrap(),
+            Some(Bytes::from_static(b"hello_tiered_storage_world"))
+        );
 
         // 2. Transition Hot -> Cooled
         let ptr = TieredPointer {
@@ -7833,9 +8224,15 @@ mod tests {
         assert!(table.is_tiered(b"k1").is_none());
 
         // Fast DRAM hit on Cooled key
-        assert_eq!(table.get(b"k1").unwrap(), Some(Bytes::from_static(b"hello_tiered_storage_world")));
+        assert_eq!(
+            table.get(b"k1").unwrap(),
+            Some(Bytes::from_static(b"hello_tiered_storage_world"))
+        );
         let (entry_val, _) = table.get_entry(b"k1").unwrap();
-        assert_eq!(entry_val, RudisValue::String(Bytes::from_static(b"hello_tiered_storage_world")));
+        assert_eq!(
+            entry_val,
+            RudisValue::String(Bytes::from_static(b"hello_tiered_storage_world"))
+        );
 
         // 3. Instant Zero-I/O Decommit: Cooled -> Cold (Tiered)
         let (p, freed) = table.decommit_cooled_key(b"k1").unwrap();
@@ -7849,7 +8246,10 @@ mod tests {
         let restored_val = RudisValue::String(Bytes::from_static(b"hello_tiered_storage_world"));
         assert!(table.restore_tiered_value(b"k1", restored_val));
         assert!(table.is_cooled(b"k1").is_some());
-        assert_eq!(table.get(b"k1").unwrap(), Some(Bytes::from_static(b"hello_tiered_storage_world")));
+        assert_eq!(
+            table.get(b"k1").unwrap(),
+            Some(Bytes::from_static(b"hello_tiered_storage_world"))
+        );
 
         // 5. Decommit all cooled
         let (count, total_freed) = table.decommit_all_cooled();
@@ -7865,4 +8265,3 @@ mod tests {
         assert_eq!(digest, "00006c38adf31777");
     }
 }
-

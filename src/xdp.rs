@@ -192,7 +192,8 @@ impl XdpEngine {
     /// Process a raw Ethernet or IP packet frame through the eBPF / XDP pipeline
     pub fn process_packet(&self, packet: &[u8]) -> XdpAction {
         self.rx_packets.fetch_add(1, Ordering::Relaxed);
-        self.rx_bytes.fetch_add(packet.len() as u64, Ordering::Relaxed);
+        self.rx_bytes
+            .fetch_add(packet.len() as u64, Ordering::Relaxed);
 
         if packet.is_empty() {
             self.dropped_packets.fetch_add(1, Ordering::Relaxed);
@@ -201,11 +202,15 @@ impl XdpEngine {
 
         // Try extracting source IP from either raw Ethernet frame (header: 14 bytes)
         // or raw IPv4 packet (header: 20 bytes).
-        let (src_ip, _dst_port, payload_offset) = if packet.len() >= 14 && packet[12] == 0x08 && packet[13] == 0x00 {
+        let (src_ip, _dst_port, payload_offset) = if packet.len() >= 14
+            && packet[12] == 0x08
+            && packet[13] == 0x00
+        {
             // Ethernet frame with IPv4
             let ip_slice = &packet[14..];
             if ip_slice.len() >= 20 {
-                let src = u32::from_be_bytes([ip_slice[12], ip_slice[13], ip_slice[14], ip_slice[15]]);
+                let src =
+                    u32::from_be_bytes([ip_slice[12], ip_slice[13], ip_slice[14], ip_slice[15]]);
                 let protocol = ip_slice[9];
                 let (dst_port, payload_off) = if protocol == 6 && ip_slice.len() >= 40 {
                     let d_port = u16::from_be_bytes([ip_slice[22], ip_slice[23]]);
@@ -258,9 +263,9 @@ impl XdpEngine {
 
             // 2. Token Bucket IP Rate Limiter
             let mut limiters = self.rate_limiters.write().unwrap();
-            let bucket = limiters
-                .entry(ip)
-                .or_insert_with(|| TokenBucket::new(self.default_rate_capacity, self.default_rate_limit));
+            let bucket = limiters.entry(ip).or_insert_with(|| {
+                TokenBucket::new(self.default_rate_capacity, self.default_rate_limit)
+            });
 
             if !bucket.allow() {
                 self.rate_limit_drops.fetch_add(1, Ordering::Relaxed);

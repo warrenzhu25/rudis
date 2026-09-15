@@ -4,11 +4,11 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crate::table::{crc64, TieredPointer};
+use crate::table::{TieredPointer, crc64};
 
 /// Magic header for tiered disk records: "TIER"
 pub const TIER_MAGIC: &[u8; 4] = b"TIER";
@@ -42,7 +42,7 @@ pub struct TieringStats {
     pub gc_reclaimed_bytes: AtomicU64,
     pub gc_cycles: AtomicU64,
     pub offload_threshold_pct: AtomicU64, // e.g. 60 (trigger background offload when memory >= 60% maxmemory)
-    pub upload_threshold_pct: AtomicU64,  // e.g. 80 (stream cold reads without promotion when memory >= 80% maxmemory)
+    pub upload_threshold_pct: AtomicU64, // e.g. 80 (stream cold reads without promotion when memory >= 80% maxmemory)
 }
 
 impl Default for TieringStats {
@@ -75,7 +75,9 @@ impl Default for TieringStats {
 
 #[inline]
 pub fn set_max_memory(port: u16, bytes: u64) {
-    get_tier_stats(port).max_memory.store(bytes, Ordering::Relaxed);
+    get_tier_stats(port)
+        .max_memory
+        .store(bytes, Ordering::Relaxed);
 }
 
 #[inline]
@@ -85,22 +87,30 @@ pub fn get_max_memory(port: u16) -> u64 {
 
 #[inline]
 pub fn set_offload_threshold_pct(port: u16, pct: u64) {
-    get_tier_stats(port).offload_threshold_pct.store(pct.min(100), Ordering::Relaxed);
+    get_tier_stats(port)
+        .offload_threshold_pct
+        .store(pct.min(100), Ordering::Relaxed);
 }
 
 #[inline]
 pub fn get_offload_threshold_pct(port: u16) -> u64 {
-    get_tier_stats(port).offload_threshold_pct.load(Ordering::Relaxed)
+    get_tier_stats(port)
+        .offload_threshold_pct
+        .load(Ordering::Relaxed)
 }
 
 #[inline]
 pub fn set_upload_threshold_pct(port: u16, pct: u64) {
-    get_tier_stats(port).upload_threshold_pct.store(pct.min(100), Ordering::Relaxed);
+    get_tier_stats(port)
+        .upload_threshold_pct
+        .store(pct.min(100), Ordering::Relaxed);
 }
 
 #[inline]
 pub fn get_upload_threshold_pct(port: u16) -> u64 {
-    get_tier_stats(port).upload_threshold_pct.load(Ordering::Relaxed)
+    get_tier_stats(port)
+        .upload_threshold_pct
+        .load(Ordering::Relaxed)
 }
 
 pub fn format_bytes_human(bytes: u64) -> String {
@@ -169,6 +179,12 @@ pub struct OpManager {
     pub pending_stash_bytes: AtomicUsize,
 }
 
+impl Default for OpManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OpManager {
     pub fn new() -> Self {
         Self {
@@ -227,8 +243,8 @@ impl OpManager {
             let res = rx
                 .recv_async()
                 .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-            return res.map_err(|e| io::Error::new(io::ErrorKind::Other, e));
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            return res.map_err(io::Error::other);
         }
 
         // Initiator executes the physical read
@@ -251,7 +267,7 @@ impl OpManager {
             let _ = tx.send(result.clone());
         }
 
-        result.map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+        result.map_err(io::Error::other)
     }
 }
 
@@ -313,6 +329,12 @@ pub struct SmallBinsManager {
     pub dead_pages: Vec<u64>,
 }
 
+impl Default for SmallBinsManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SmallBinsManager {
     pub fn new() -> Self {
         Self {
@@ -323,13 +345,15 @@ impl SmallBinsManager {
     }
 
     pub fn decrement_page_key(&mut self, page_index: u64, stats: &TieringStats) {
-        if let Some(count) = self.page_active_counts.get_mut(&page_index) {
-            if *count > 0 {
-                *count -= 1;
-                if *count == 0 {
-                    stats.dead_bytes.fetch_add(PAGE_SIZE as u64, Ordering::Relaxed);
-                    self.dead_pages.push(page_index);
-                }
+        if let Some(count) = self.page_active_counts.get_mut(&page_index)
+            && *count > 0
+        {
+            *count -= 1;
+            if *count == 0 {
+                stats
+                    .dead_bytes
+                    .fetch_add(PAGE_SIZE as u64, Ordering::Relaxed);
+                self.dead_pages.push(page_index);
             }
         }
     }
@@ -353,7 +377,9 @@ impl ShardTierManager {
         let _ = std::fs::create_dir_all(dir);
         let path = dir.join(format!("tier_shard_{}.db", shard_id));
 
-        let direct_io_enabled = std::env::var("RUDIS_DIRECT_IO").map(|v| v != "0").unwrap_or(false);
+        let direct_io_enabled = std::env::var("RUDIS_DIRECT_IO")
+            .map(|v| v != "0")
+            .unwrap_or(false);
         let (file, is_direct) = if direct_io_enabled {
             let mut opts = monoio::fs::OpenOptions::new();
             opts.read(true).write(true).create(true);
@@ -374,7 +400,7 @@ impl ShardTierManager {
 
         let raw_len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
         // Align offset to 4KB page boundary
-        let current_offset = (raw_len + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64 * PAGE_SIZE as u64;
+        let current_offset = raw_len.div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;
         let stats = get_tier_stats(port);
         Ok(Self {
             shard_id,
@@ -391,7 +417,12 @@ impl ShardTierManager {
 
     /// Punches a hole in the physical NVMe storage at the given offset and length,
     /// releasing allocated physical disk blocks back to the OS via FALLOC_FL_PUNCH_HOLE.
-    pub fn punch_hole(file: &monoio::fs::File, offset: u64, length: u64, stats: &TieringStats) -> bool {
+    pub fn punch_hole(
+        file: &monoio::fs::File,
+        offset: u64,
+        length: u64,
+        stats: &TieringStats,
+    ) -> bool {
         use std::os::unix::io::AsRawFd;
         let fd = file.as_raw_fd();
         let ret = unsafe {
@@ -403,7 +434,9 @@ impl ShardTierManager {
             )
         };
         if ret == 0 {
-            stats.gc_reclaimed_bytes.fetch_add(length, Ordering::Relaxed);
+            stats
+                .gc_reclaimed_bytes
+                .fetch_add(length, Ordering::Relaxed);
             true
         } else {
             false
@@ -482,7 +515,9 @@ impl ShardTierManager {
         std::fs::create_dir_all(backup_dir)?;
         let backup_file = backup_dir.join(format!("tier_shard_{}.db", self.shard_id));
         let is_reflink = Self::snapshot_file(&self.path, &backup_file)?;
-        let file_size = std::fs::metadata(&backup_file).map(|m| m.len()).unwrap_or(0);
+        let file_size = std::fs::metadata(&backup_file)
+            .map(|m| m.len())
+            .unwrap_or(0);
 
         // 4. Write manifest
         let manifest_path = backup_dir.join(format!("tier_shard_{}.manifest", self.shard_id));
@@ -498,7 +533,6 @@ impl ShardTierManager {
         Ok((is_reflink, file_size))
     }
 
-
     /// Stash a single record onto disk.
     /// Values < 2048 bytes are packed into 4096-byte SmallBins with direct I/O alignment.
     /// Values >= 2048 bytes flush the active bin and write in aligned 4096-byte blocks.
@@ -509,7 +543,10 @@ impl ShardTierManager {
         val_type: u8,
     ) -> io::Result<TieredPointer> {
         if self.op_manager.check_write_backpressure() {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "write backpressure: stash buffer full"));
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "write backpressure: stash buffer full",
+            ));
         }
 
         let record = encode_tiered_record(key, val_payload, val_type);
@@ -529,7 +566,8 @@ impl ShardTierManager {
             if need_new_bin {
                 self.flush_active_bin().await?;
                 let next_page_idx = self.current_offset.get() / PAGE_SIZE as u64;
-                self.current_offset.set(self.current_offset.get() + PAGE_SIZE as u64);
+                self.current_offset
+                    .set(self.current_offset.get() + PAGE_SIZE as u64);
                 self.small_bins.borrow_mut().active_bin = Some(ActiveBin::new(next_page_idx));
             }
 
@@ -558,7 +596,7 @@ impl ShardTierManager {
             // Large record (>= 2KB)
             self.flush_active_bin().await?;
 
-            let aligned_len = (record_len + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
+            let aligned_len = record_len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
             let mut write_buf = record;
             if write_buf.len() < aligned_len {
                 write_buf.resize(aligned_len, 0);
@@ -600,7 +638,10 @@ impl ShardTierManager {
             res?;
             self.stats.disk_writes.fetch_add(1, Ordering::Relaxed);
             self.stats.bin_pages.fetch_add(1, Ordering::Relaxed);
-            self.small_bins.borrow_mut().page_active_counts.insert(page_idx, items_len);
+            self.small_bins
+                .borrow_mut()
+                .page_active_counts
+                .insert(page_idx, items_len);
         }
         Ok(())
     }
@@ -608,11 +649,17 @@ impl ShardTierManager {
     pub fn on_key_deleted(&self, ptr: TieredPointer) {
         if (ptr.length as usize) < SMALL_VALUE_LIMIT {
             let page_index = ptr.offset / PAGE_SIZE as u64;
-            self.small_bins.borrow_mut().decrement_page_key(page_index, &self.stats);
-            self.stats.dead_bytes.fetch_add(ptr.length as u64, Ordering::Relaxed);
+            self.small_bins
+                .borrow_mut()
+                .decrement_page_key(page_index, &self.stats);
+            self.stats
+                .dead_bytes
+                .fetch_add(ptr.length as u64, Ordering::Relaxed);
         } else {
-            let aligned_len = (ptr.length as usize + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE;
-            self.stats.dead_bytes.fetch_add(aligned_len as u64, Ordering::Relaxed);
+            let aligned_len = (ptr.length as usize).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+            self.stats
+                .dead_bytes
+                .fetch_add(aligned_len as u64, Ordering::Relaxed);
             Self::punch_hole(&self.file, ptr.offset, aligned_len as u64, &self.stats);
         }
     }
@@ -729,7 +776,9 @@ pub async fn read_tiered_record(
         if let Some(d) = in_mem {
             d
         } else {
-            let page_rc = op_manager.read_page_coalesced(file, page_start, stats).await?;
+            let page_rc = op_manager
+                .read_page_coalesced(file, page_start, stats)
+                .await?;
             page_rc[offset_in_page..offset_in_page + len].to_vec()
         }
     } else {

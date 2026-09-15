@@ -48,7 +48,7 @@ impl BloomFilter {
         let k = ((num_bits as f64 / cap as f64) * std::f64::consts::LN_2).round() as usize;
         let num_hashes = k.clamp(1, 30);
 
-        let u64_len = (num_bits + 63) / 64;
+        let u64_len = num_bits.div_ceil(64);
         Self {
             capacity: cap,
             error_rate: err,
@@ -174,7 +174,11 @@ impl CuckooFilter {
         }
 
         // Random cuckoo kick
-        let mut cur_i = if (fp as usize) % 2 == 0 { i1 } else { i2 };
+        let mut cur_i = if (fp as usize).is_multiple_of(2) {
+            i1
+        } else {
+            i2
+        };
         let mut cur_fp = fp;
 
         for _ in 0..MAX_KICKS {
@@ -338,7 +342,7 @@ impl TopK {
 
     pub fn list(&self) -> Vec<(Bytes, u64)> {
         let mut res: Vec<_> = self.items.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        res.sort_by(|a, b| b.1.cmp(&a.1));
+        res.sort_by_key(|a| std::cmp::Reverse(a.1));
         res
     }
 }

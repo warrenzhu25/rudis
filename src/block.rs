@@ -153,12 +153,17 @@ impl BlockHub {
         self.blocked_clients.insert(client_id, sender);
     }
 
-    pub fn register_blocked_zset_client(&mut self, client_id: u64, sender: Sender<BlockedZSetResult>) {
+    pub fn register_blocked_zset_client(
+        &mut self,
+        client_id: u64,
+        sender: Sender<BlockedZSetResult>,
+    ) {
         self.blocked_zset_clients.insert(client_id, sender);
     }
 
     pub fn is_blocked(&self, client_id: u64) -> bool {
-        self.blocked_clients.contains_key(&client_id) || self.blocked_zset_clients.contains_key(&client_id)
+        self.blocked_clients.contains_key(&client_id)
+            || self.blocked_zset_clients.contains_key(&client_id)
     }
 
     pub fn remove_waiters_for_client(&mut self, client_id: u64) {
@@ -260,8 +265,11 @@ impl BlockHub {
                         };
                         if let Some(vals) = popped {
                             if !vals.is_empty() {
-                                crate::connection::DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let _ = waiter.sender.send(BlockedListResult::Popped(key.clone(), vals));
+                                crate::connection::DIRTY_CHANGES
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                let _ = waiter
+                                    .sender
+                                    .send(BlockedListResult::Popped(key.clone(), vals));
                                 satisfied_clients.push(waiter.client_id);
                                 if !table.exists(key.as_ref()) {
                                     break;
@@ -276,26 +284,43 @@ impl BlockHub {
                             break;
                         }
                     }
-                    WaiterOp::Move { where_from, where_to, ref destination } => {
+                    WaiterOp::Move {
+                        where_from,
+                        where_to,
+                        ref destination,
+                    } => {
                         let dst_type = table.type_of(destination.as_ref());
                         if dst_type != "none" && dst_type != "list" {
-                            let _ = waiter.sender.send(BlockedListResult::Unblocked(ClientUnblockType::WrongType));
+                            let _ = waiter
+                                .sender
+                                .send(BlockedListResult::Unblocked(ClientUnblockType::WrongType));
                             satisfied_clients.push(waiter.client_id);
                             continue;
                         }
                         let popped = match where_from {
-                            ListPopType::Left => table.lpop(key.as_ref(), 1).ok().and_then(|mut v| v.pop()),
-                            ListPopType::Right => table.rpop(key.as_ref(), 1).ok().and_then(|mut v| v.pop()),
+                            ListPopType::Left => {
+                                table.lpop(key.as_ref(), 1).ok().and_then(|mut v| v.pop())
+                            }
+                            ListPopType::Right => {
+                                table.rpop(key.as_ref(), 1).ok().and_then(|mut v| v.pop())
+                            }
                         };
                         if let Some(val) = popped {
-                            crate::connection::DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            crate::connection::DIRTY_CHANGES
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             match where_to {
-                                ListPopType::Left => { let _ = table.lpush(destination.clone(), vec![val.clone()]); }
-                                ListPopType::Right => { let _ = table.rpush(destination.clone(), vec![val.clone()]); }
+                                ListPopType::Left => {
+                                    let _ = table.lpush(destination.clone(), vec![val.clone()]);
+                                }
+                                ListPopType::Right => {
+                                    let _ = table.rpush(destination.clone(), vec![val.clone()]);
+                                }
                             }
                             let dest_clone = destination.clone();
                             crate::connection::touch_watched_key(self.port, destination.as_ref());
-                            let _ = waiter.sender.send(BlockedListResult::Popped(key.clone(), vec![val]));
+                            let _ = waiter
+                                .sender
+                                .send(BlockedListResult::Popped(key.clone(), vec![val]));
                             satisfied_clients.push(waiter.client_id);
                             dest_to_notify = Some(dest_clone);
                             break;
@@ -346,7 +371,8 @@ impl BlockHub {
         let mut satisfied_clients = Vec::new();
         if let Some(waiters) = self.zset_waiters.get_mut(key) {
             while let Some(waiter) = waiters.pop_front() {
-                if waiter.sender.is_disconnected() || satisfied_clients.contains(&waiter.client_id) {
+                if waiter.sender.is_disconnected() || satisfied_clients.contains(&waiter.client_id)
+                {
                     continue;
                 }
                 let popped = match waiter.pop_type {
@@ -355,7 +381,8 @@ impl BlockHub {
                 };
                 if let Some(items) = popped {
                     if !items.is_empty() {
-                        crate::connection::DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        crate::connection::DIRTY_CHANGES
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let _ = waiter.sender.send(BlockedZSetResult::Popped {
                             key: key.clone(),
                             items,

@@ -96,7 +96,11 @@ impl AclManager {
         Self { users }
     }
 
-    pub fn check_auth(&self, username: Option<&str>, password: &str) -> Result<String, &'static str> {
+    pub fn check_auth(
+        &self,
+        username: Option<&str>,
+        password: &str,
+    ) -> Result<String, &'static str> {
         let user_name = username.unwrap_or("default");
         if let Some(user) = self.users.get(user_name) {
             if !user.enabled {
@@ -140,14 +144,17 @@ impl AclManager {
     }
 
     pub fn set_user(&mut self, username: &str, rules: &[String]) -> Result<(), String> {
-        let user = self.users.entry(username.to_string()).or_insert_with(|| AclUser {
-            name: username.to_string(),
-            enabled: false,
-            passwords: Vec::new(),
-            nopass: false,
-            all_commands: false,
-            all_keys: false,
-        });
+        let user = self
+            .users
+            .entry(username.to_string())
+            .or_insert_with(|| AclUser {
+                name: username.to_string(),
+                enabled: false,
+                passwords: Vec::new(),
+                nopass: false,
+                all_commands: false,
+                all_keys: false,
+            });
 
         for rule in rules {
             if rule == "on" {

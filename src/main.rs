@@ -47,10 +47,10 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
-    if let Some(ref m) = args.maxmemory {
-        if let Some(bytes) = rudis::tiering::parse_memory_bytes(m) {
-            rudis::tiering::set_max_memory(args.port, bytes);
-        }
+    if let Some(ref m) = args.maxmemory
+        && let Some(bytes) = rudis::tiering::parse_memory_bytes(m)
+    {
+        rudis::tiering::set_max_memory(args.port, bytes);
     }
     rudis::tiering::set_offload_threshold_pct(args.port, args.tiered_offload_threshold);
     rudis::tiering::set_upload_threshold_pct(args.port, args.tiered_upload_threshold);
