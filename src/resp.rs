@@ -36,6 +36,31 @@ pub enum ClusterSubcommand {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
+pub enum DflyClusterSubcommand {
+    MyId,
+    Config(String),
+    GetSlotInfo(Vec<u16>),
+    FlushSlots(Vec<(u16, u16)>),
+    SlotMigrationStatus,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum DflyMigrateSubcommand {
+    Init {
+        source_id: String,
+        num_shards: usize,
+        slots: Vec<(u16, u16)>,
+    },
+    Flow {
+        source_id: String,
+        flow_id: u64,
+    },
+    Ack {
+        flow_id: u64,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum TierSubcommand {
     Spill(Bytes),
     Load(Bytes),
@@ -945,9 +970,121 @@ pub enum Command {
     XdpRuleList,
     XdpStats,
     XdpPacket(Bytes),
+    // Dragonfly native extensions
+    DflyCluster(DflyClusterSubcommand),
+    DflyMigrate(DflyMigrateSubcommand),
+    Stick(Vec<Bytes>),
+    Unstick(Vec<Bytes>),
+    Sticky(Bytes),
+    Delex {
+        key: Bytes,
+        condition: Option<(String, Bytes)>,
+    },
+    // Memcached Protocol
+    MemcachedSet {
+        key: Bytes,
+        flags: u32,
+        exptime: u32,
+        bytes: usize,
+        noreply: bool,
+        data: Bytes,
+    },
+    MemcachedAdd {
+        key: Bytes,
+        flags: u32,
+        exptime: u32,
+        bytes: usize,
+        noreply: bool,
+        data: Bytes,
+    },
+    MemcachedReplace {
+        key: Bytes,
+        flags: u32,
+        exptime: u32,
+        bytes: usize,
+        noreply: bool,
+        data: Bytes,
+    },
+    MemcachedGet {
+        keys: Vec<Bytes>,
+    },
+    MemcachedDelete {
+        key: Bytes,
+        noreply: bool,
+    },
+    MemcachedIncr {
+        key: Bytes,
+        value: u64,
+        noreply: bool,
+    },
+    MemcachedDecr {
+        key: Bytes,
+        value: u64,
+        noreply: bool,
+    },
+    MemcachedStats,
+    MemcachedVersion,
+    MemcachedQuit,
     Unknown(String),
 }
 
+
+fn parse_memcached_storage_command(buf: &mut BytesMut) -> Result<Option<Option<Command>>, String> {
+    let newline_pos = match find_crlf(buf) {
+        Some(pos) => pos,
+        None => return Ok(None),
+    };
+    let line = &buf[..newline_pos];
+    let first_space = match line.iter().position(|&b| b == b' ' || b == b'\t') {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    let first_word = &line[..first_space];
+    let is_set = first_word.eq_ignore_ascii_case(b"set");
+    let is_add = first_word.eq_ignore_ascii_case(b"add");
+    let is_replace = first_word.eq_ignore_ascii_case(b"replace");
+    if !is_set && !is_add && !is_replace {
+        return Ok(None);
+    }
+    let parts: Vec<&[u8]> = line.split(|&b| b == b' ' || b == b'\t').filter(|p| !p.is_empty()).collect();
+    if parts.len() < 5 {
+        return Ok(None);
+    }
+    let flags: u32 = match std::str::from_utf8(parts[2]).ok().and_then(|s| s.parse().ok()) {
+        Some(f) => f,
+        None => return Ok(None),
+    };
+    let exptime: u32 = match std::str::from_utf8(parts[3]).ok().and_then(|s| s.parse().ok()) {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+    let bytes_len: usize = match std::str::from_utf8(parts[4]).ok().and_then(|s| s.parse().ok()) {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let noreply = parts.len() > 5 && parts[5].eq_ignore_ascii_case(b"noreply");
+
+    let total_len = newline_pos + 2 + bytes_len + 2;
+    if buf.len() < total_len {
+        return Ok(Some(None));
+    }
+    if &buf[newline_pos + 2 + bytes_len .. total_len] != b"\r\n" {
+        return Err("CLIENT_ERROR bad data chunk".to_string());
+    }
+
+    let key = Bytes::copy_from_slice(parts[1]);
+    let data = Bytes::copy_from_slice(&buf[newline_pos + 2 .. newline_pos + 2 + bytes_len]);
+    buf.advance(total_len);
+
+    let cmd = if is_set {
+        Command::MemcachedSet { key, flags, exptime, bytes: bytes_len, noreply, data }
+    } else if is_add {
+        Command::MemcachedAdd { key, flags, exptime, bytes: bytes_len, noreply, data }
+    } else {
+        Command::MemcachedReplace { key, flags, exptime, bytes: bytes_len, noreply, data }
+    };
+    Ok(Some(Some(cmd)))
+}
 
 /// Parse a single Redis command from the buffer.
 /// Supports both RESP arrays (e.g., `*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n`)
@@ -960,7 +1097,11 @@ pub fn parse_command(buf: &mut BytesMut) -> Result<Option<Command>, String> {
     if buf[0] == b'*' {
         parse_resp_array(buf)
     } else {
-        parse_inline_command(buf)
+        match parse_memcached_storage_command(buf)? {
+            Some(Some(cmd)) => Ok(Some(cmd)),
+            Some(None) => Ok(None),
+            None => parse_inline_command(buf),
+        }
     }
 }
 
@@ -1119,7 +1260,11 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() < 2 {
                 return Err("wrong number of arguments for 'get' command".to_string());
             }
-            Ok(Some(Command::Get(args[1].clone())))
+            if args.len() == 2 {
+                Ok(Some(Command::Get(args[1].clone())))
+            } else {
+                Ok(Some(Command::MemcachedGet { keys: args[1..].to_vec() }))
+            }
         }
         "SET" | "PUT" => {
             if args.len() < 3 {
@@ -1181,11 +1326,16 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             Ok(Some(Command::Mset(pairs)))
         }
-        "DEL" => {
+        "DEL" | "DELETE" => {
             if args.len() < 2 {
                 return Err("wrong number of arguments for 'del' command".to_string());
             }
-            Ok(Some(Command::Del(args[1..].to_vec())))
+            if cmd_name == "DELETE" {
+                let noreply = args.len() > 2 && args[2].eq_ignore_ascii_case(b"noreply");
+                Ok(Some(Command::MemcachedDelete { key: args[1].clone(), noreply }))
+            } else {
+                Ok(Some(Command::Del(args[1..].to_vec())))
+            }
         }
         "EXISTS" => {
             if args.len() < 2 {
@@ -1197,11 +1347,23 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() < 2 {
                 return Err("wrong number of arguments for 'incr' command".to_string());
             }
+            if args.len() >= 3 {
+                if let Some(val) = std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<u64>().ok()) {
+                    let noreply = args.len() > 3 && args[3].eq_ignore_ascii_case(b"noreply");
+                    return Ok(Some(Command::MemcachedIncr { key: args[1].clone(), value: val, noreply }));
+                }
+            }
             Ok(Some(Command::IncrBy(args[1].clone(), 1)))
         }
         "DECR" => {
             if args.len() < 2 {
                 return Err("wrong number of arguments for 'decr' command".to_string());
+            }
+            if args.len() >= 3 {
+                if let Some(val) = std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse::<u64>().ok()) {
+                    let noreply = args.len() > 3 && args[3].eq_ignore_ascii_case(b"noreply");
+                    return Ok(Some(Command::MemcachedDecr { key: args[1].clone(), value: val, noreply }));
+                }
             }
             Ok(Some(Command::IncrBy(args[1].clone(), -1)))
         }
@@ -2821,6 +2983,132 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
 
             }
         }
+        "DFLYCLUSTER" => {
+            if args.len() < 2 {
+                return Err("ERR wrong number of arguments for 'dflycluster' command".to_string());
+            }
+            let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
+            match sub.as_str() {
+                "MYID" => Ok(Some(Command::DflyCluster(DflyClusterSubcommand::MyId))),
+                "CONFIG" => {
+                    if args.len() != 3 {
+                        return Err("ERR wrong number of arguments for 'dflycluster config' command".to_string());
+                    }
+                    let json = String::from_utf8_lossy(&args[2]).to_string();
+                    Ok(Some(Command::DflyCluster(DflyClusterSubcommand::Config(json))))
+                }
+                "GETSLOTINFO" => {
+                    if args.len() < 4 || !args[2].eq_ignore_ascii_case(b"slots") {
+                        return Err("ERR syntax error, expected DFLYCLUSTER GETSLOTINFO SLOTS slot1 [slot2 ...]".to_string());
+                    }
+                    let mut slots = Vec::new();
+                    for a in &args[3..] {
+                        let s: u16 = std::str::from_utf8(a).ok().and_then(|s| s.parse().ok())
+                            .ok_or_else(|| "ERR Invalid slot id".to_string())?;
+                        slots.push(s);
+                    }
+                    Ok(Some(Command::DflyCluster(DflyClusterSubcommand::GetSlotInfo(slots))))
+                }
+                "FLUSHSLOTS" => {
+                    if args.len() < 4 || (args.len() - 2) % 2 != 0 {
+                        return Err("ERR syntax error, expected DFLYCLUSTER FLUSHSLOTS start end [start end ...]".to_string());
+                    }
+                    let mut ranges = Vec::new();
+                    for chunk in args[2..].chunks(2) {
+                        let s: u16 = std::str::from_utf8(&chunk[0]).ok().and_then(|s| s.parse().ok())
+                            .ok_or_else(|| "ERR Invalid start slot".to_string())?;
+                        let e: u16 = std::str::from_utf8(&chunk[1]).ok().and_then(|s| s.parse().ok())
+                            .ok_or_else(|| "ERR Invalid end slot".to_string())?;
+                        if s > e || e >= 16384 {
+                            return Err("ERR Slot out of range".to_string());
+                        }
+                        ranges.push((s, e));
+                    }
+                    Ok(Some(Command::DflyCluster(DflyClusterSubcommand::FlushSlots(ranges))))
+                }
+                "SLOT-MIGRATION-STATUS" => {
+                    Ok(Some(Command::DflyCluster(DflyClusterSubcommand::SlotMigrationStatus)))
+                }
+                _ => Err(format!("ERR unknown subcommand '{}' for DFLYCLUSTER", sub)),
+            }
+        }
+        "DFLYMIGRATE" => {
+            if args.len() < 2 {
+                return Err("ERR wrong number of arguments for 'dflymigrate' command".to_string());
+            }
+            let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
+            match sub.as_str() {
+                "INIT" => {
+                    if args.len() < 5 {
+                        return Err("ERR wrong number of arguments for 'dflymigrate init' command".to_string());
+                    }
+                    let source_id = String::from_utf8_lossy(&args[2]).to_string();
+                    let num_shards = std::str::from_utf8(&args[3]).ok().and_then(|s| s.parse().ok())
+                        .ok_or_else(|| "ERR Invalid num_shards".to_string())?;
+                    let mut slots = Vec::new();
+                    for chunk in args[4..].chunks(2) {
+                        if chunk.len() == 2 {
+                            let s: u16 = std::str::from_utf8(&chunk[0]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                            let e: u16 = std::str::from_utf8(&chunk[1]).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                            slots.push((s, e));
+                        }
+                    }
+                    Ok(Some(Command::DflyMigrate(DflyMigrateSubcommand::Init { source_id, num_shards, slots })))
+                }
+                "FLOW" => {
+                    if args.len() != 4 {
+                        return Err("ERR wrong number of arguments for 'dflymigrate flow' command".to_string());
+                    }
+                    let source_id = String::from_utf8_lossy(&args[2]).to_string();
+                    let flow_id = std::str::from_utf8(&args[3]).ok().and_then(|s| s.parse().ok())
+                        .ok_or_else(|| "ERR Invalid flow_id".to_string())?;
+                    Ok(Some(Command::DflyMigrate(DflyMigrateSubcommand::Flow { source_id, flow_id })))
+                }
+                "ACK" => {
+                    if args.len() != 3 {
+                        return Err("ERR wrong number of arguments for 'dflymigrate ack' command".to_string());
+                    }
+                    let flow_id = std::str::from_utf8(&args[2]).ok().and_then(|s| s.parse().ok())
+                        .ok_or_else(|| "ERR Invalid flow_id".to_string())?;
+                    Ok(Some(Command::DflyMigrate(DflyMigrateSubcommand::Ack { flow_id })))
+                }
+                _ => Err(format!("ERR unknown subcommand '{}' for DFLYMIGRATE", sub)),
+            }
+        }
+        "STICK" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'stick' command".to_string());
+            }
+            Ok(Some(Command::Stick(args[1..].to_vec())))
+        }
+        "UNSTICK" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'unstick' command".to_string());
+            }
+            Ok(Some(Command::Unstick(args[1..].to_vec())))
+        }
+        "STICKY" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'sticky' command".to_string());
+            }
+            Ok(Some(Command::Sticky(args[1].clone())))
+        }
+        "DELEX" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'delex' command".to_string());
+            }
+            let key = args[1].clone();
+            let condition = if args.len() >= 4 {
+                let op = String::from_utf8_lossy(&args[2]).to_uppercase();
+                let expected = args[3].clone();
+                Some((op, expected))
+            } else {
+                None
+            };
+            Ok(Some(Command::Delex { key, condition }))
+        }
+        "STATS" => Ok(Some(Command::MemcachedStats)),
+        "VERSION" => Ok(Some(Command::MemcachedVersion)),
         "CONFIG" => {
             if args.len() < 2 {
                 return Err("wrong number of arguments for 'config' command".to_string());

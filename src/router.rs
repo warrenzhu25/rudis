@@ -165,6 +165,9 @@ impl Router {
     }
 
     pub async fn spill_local_internal(&self, key: &[u8], flush_bin: bool) -> bool {
+        if self.local_db.borrow().is_sticky(key) {
+            return false;
+        }
         if self.local_db.borrow_mut().table.is_cooled(key).is_some() {
             return self.decommit_local(Some(key)) > 0;
         }
@@ -248,6 +251,9 @@ impl Router {
     }
 
     pub async fn cool_local(&self, key: &[u8]) -> bool {
+        if self.local_db.borrow().is_sticky(key) {
+            return false;
+        }
         if self.local_db.borrow_mut().table.is_tiered(key).is_some()
             || self.local_db.borrow_mut().table.is_cooled(key).is_some()
         {
@@ -878,6 +884,127 @@ impl Router {
                 rx.recv_async().await.unwrap_or_default()
             } else {
                 Vec::new()
+            }
+        }
+    }
+
+    pub async fn flush_slots(&self, ranges: &[(u16, u16)]) -> usize {
+        let mut total = 0;
+        for s in 0..self.num_shards {
+            if s == self.shard_id {
+                total += self.local_db.borrow_mut().flush_slots(ranges);
+            } else {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::FlushSlots {
+                    ranges: ranges.to_vec(),
+                    responder: tx,
+                };
+                if self.senders[s].send(msg).is_ok() {
+                    total += rx.recv_async().await.unwrap_or(0);
+                }
+            }
+        }
+        total
+    }
+
+    pub async fn stick(&self, keys: &[Bytes]) -> usize {
+        let mut count = 0;
+        for key in keys {
+            let target = target_shard(key, self.num_shards);
+            if target == self.shard_id {
+                if self.local_db.borrow_mut().stick(key.clone()) {
+                    count += 1;
+                }
+            } else {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::Stick {
+                    keys: vec![key.clone()],
+                    responder: tx,
+                };
+                if self.senders[target].send(msg).is_ok() {
+                    count += rx.recv_async().await.unwrap_or(0);
+                }
+            }
+        }
+        count
+    }
+
+    pub async fn unstick(&self, keys: &[Bytes]) -> usize {
+        let mut count = 0;
+        for key in keys {
+            let target = target_shard(key, self.num_shards);
+            if target == self.shard_id {
+                if self.local_db.borrow_mut().unstick(key) {
+                    count += 1;
+                }
+            } else {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::Unstick {
+                    keys: vec![key.clone()],
+                    responder: tx,
+                };
+                if self.senders[target].send(msg).is_ok() {
+                    count += rx.recv_async().await.unwrap_or(0);
+                }
+            }
+        }
+        count
+    }
+
+    pub async fn is_sticky(&self, key: &Bytes) -> bool {
+        let target = target_shard(key, self.num_shards);
+        if target == self.shard_id {
+            self.local_db.borrow().is_sticky(key)
+        } else {
+            let (tx, rx) = flume::bounded(1);
+            let msg = ShardMessage::IsSticky {
+                key: key.clone(),
+                responder: tx,
+            };
+            if self.senders[target].send(msg).is_ok() {
+                rx.recv_async().await.unwrap_or(false)
+            } else {
+                false
+            }
+        }
+    }
+
+    pub async fn delex(&self, key: Bytes, condition: Option<(String, Bytes)>) -> bool {
+        let target = target_shard(&key, self.num_shards);
+        if target == self.shard_id {
+            let mut db = self.local_db.borrow_mut();
+            let should_del = match condition {
+                None => true,
+                Some((op, expected)) => {
+                    if let Some(val) = db.get(&key) {
+                        match op.to_uppercase().as_str() {
+                            "IFEQ" => val == expected,
+                            "IFNE" => val != expected,
+                            "IFGT" => val > expected,
+                            "IFLT" => val < expected,
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    }
+                }
+            };
+            if should_del {
+                db.del(&key)
+            } else {
+                false
+            }
+        } else {
+            let (tx, rx) = flume::bounded(1);
+            let msg = ShardMessage::Delex {
+                key,
+                condition,
+                responder: tx,
+            };
+            if self.senders[target].send(msg).is_ok() {
+                rx.recv_async().await.unwrap_or(false)
+            } else {
+                false
             }
         }
     }

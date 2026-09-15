@@ -3929,6 +3929,95 @@ fn test_af_xdp_ebpf_kernel_bypass_e2e() {
     assert_eq!(send_and_read(&mut client, &cmd_drop), "+REDIRECT\r\n");
 }
 
+#[test]
+fn test_dragonfly_compatibility_suite_e2e() {
+    let port = 16630;
+    start_test_server(port, 2);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Test DFLYCLUSTER MYID
+    let myid = send_and_read(&mut client, b"DFLYCLUSTER MYID\r\n");
+    assert!(myid.starts_with("$40\r\n"));
+
+    // 2. Test DFLYCLUSTER CONFIG with JSON
+    let cfg_json = r#"{"slot_ranges": [[0, 8191], [8192, 16383]]}"#;
+    let cfg_cmd = format!("*3\r\n$11\r\nDFLYCLUSTER\r\n$6\r\nCONFIG\r\n${}\r\n{}\r\n", cfg_json.len(), cfg_json);
+    assert_eq!(send_and_read(&mut client, cfg_cmd.as_bytes()), "+OK\r\n");
+
+    // 3. Test DFLYCLUSTER GETSLOTINFO
+    let slot_info = send_and_read(&mut client, b"DFLYCLUSTER GETSLOTINFO SLOTS 100 200\r\n");
+    assert!(slot_info.starts_with("*2\r\n"));
+    assert!(slot_info.contains(":100\r\n"));
+    assert!(slot_info.contains(":200\r\n"));
+
+    // 4. Test STICK, UNSTICK, STICKY
+    assert_eq!(send_and_read(&mut client, b"SET stick_key1 val1\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"STICKY stick_key1\r\n"), ":0\r\n");
+    // STICK key1 key_missing -> should mark key1, return 1
+    assert_eq!(send_and_read(&mut client, b"STICK stick_key1 key_missing\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"STICKY stick_key1\r\n"), ":1\r\n");
+    // UNSTICK key1
+    assert_eq!(send_and_read(&mut client, b"UNSTICK stick_key1\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"STICKY stick_key1\r\n"), ":0\r\n");
+
+    // 5. Test DELEX (conditional deletion)
+    assert_eq!(send_and_read(&mut client, b"SET cond_key 100\r\n"), "+OK\r\n");
+    // IFEQ mismatch -> returns 0
+    assert_eq!(send_and_read(&mut client, b"DELEX cond_key IFEQ 999\r\n"), ":0\r\n");
+    assert_eq!(send_and_read(&mut client, b"EXISTS cond_key\r\n"), ":1\r\n");
+    // IFEQ match -> returns 1 and deletes
+    assert_eq!(send_and_read(&mut client, b"DELEX cond_key IFEQ 100\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"EXISTS cond_key\r\n"), ":0\r\n");
+
+    // 6. Test DFLYCLUSTER FLUSHSLOTS
+    let slot = rudis::router::key_slot(b"slot_test_key");
+    assert_eq!(send_and_read(&mut client, b"SET slot_test_key hello\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"EXISTS slot_test_key\r\n"), ":1\r\n");
+    let flush_cmd = format!("DFLYCLUSTER FLUSHSLOTS {} {}\r\n", slot, slot);
+    assert_eq!(send_and_read(&mut client, flush_cmd.as_bytes()), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"EXISTS slot_test_key\r\n"), ":0\r\n");
+
+    // 7. Test DFLYCLUSTER SLOT-MIGRATION-STATUS & DFLYMIGRATE
+    let mig_status = send_and_read(&mut client, b"DFLYCLUSTER SLOT-MIGRATION-STATUS\r\n");
+    assert!(mig_status.contains("IDLE"));
+    // Init migration
+    assert_eq!(send_and_read(&mut client, b"DFLYMIGRATE INIT node123 2 0 100\r\n"), "+OK\r\n");
+    let mig_status2 = send_and_read(&mut client, b"DFLYCLUSTER SLOT-MIGRATION-STATUS\r\n");
+    assert!(mig_status2.contains("MIGRATING"));
+    assert!(mig_status2.contains("node123"));
+    // Ack migration
+    assert_eq!(send_and_read(&mut client, b"DFLYMIGRATE ACK 42\r\n"), "+OK\r\n");
+    let mig_status3 = send_and_read(&mut client, b"DFLYCLUSTER SLOT-MIGRATION-STATUS\r\n");
+    assert!(mig_status3.contains("IDLE"));
+
+    // 8. Test Dual-Protocol Memcached Gateway
+    // Memcached SET command
+    let mc_set = b"set mc_fruit 0 0 5\r\napple\r\n";
+    assert_eq!(send_and_read(&mut client, mc_set), "STORED\r\n");
+
+    // Shared Keyspace: read via Redis protocol
+    assert_eq!(send_and_read(&mut client, b"GET mc_fruit\r\n"), "$5\r\napple\r\n");
+
+    // Memcached GET command (retrieves multiple keys)
+    let mc_get = b"get mc_fruit non_existent\r\n";
+    assert_eq!(send_and_read(&mut client, mc_get), "VALUE mc_fruit 0 5\r\napple\r\nEND\r\n");
+
+    // Memcached STATS
+    let mc_stats = send_and_read(&mut client, b"stats\r\n");
+    assert!(mc_stats.contains("STAT pid"));
+    assert!(mc_stats.contains("STAT version 1.6.0-rudis-dragonfly"));
+    assert!(mc_stats.contains("END\r\n"));
+
+    // Memcached VERSION
+    let mc_ver = send_and_read(&mut client, b"version\r\n");
+    assert_eq!(mc_ver, "VERSION 1.6.0-rudis-dragonfly\r\n");
+
+    // Memcached DELETE
+    assert_eq!(send_and_read(&mut client, b"delete mc_fruit\r\n"), "DELETED\r\n");
+    assert_eq!(send_and_read(&mut client, b"delete mc_fruit\r\n"), "NOT_FOUND\r\n");
+}
+
 
 
 

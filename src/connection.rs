@@ -1010,6 +1010,15 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         Command::Mset(pairs) | Command::Msetnx(pairs) => pairs.first().map(|(k, _)| k),
         Command::Bitop { destkey, .. } | Command::Pfmerge { destkey, .. } => Some(destkey),
         Command::Eval { keys, .. } | Command::Evalsha { keys, .. } => keys.first(),
+        Command::Sticky(key)
+        | Command::Delex { key, .. }
+        | Command::MemcachedSet { key, .. }
+        | Command::MemcachedAdd { key, .. }
+        | Command::MemcachedReplace { key, .. }
+        | Command::MemcachedDelete { key, .. }
+        | Command::MemcachedIncr { key, .. }
+        | Command::MemcachedDecr { key, .. } => Some(key),
+        Command::MemcachedGet { keys } => keys.first(),
         _ => None,
     }
 }
@@ -1744,6 +1753,22 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         | Command::XdpRuleList
         | Command::XdpStats
         | Command::XdpPacket(_) => "XDP",
+        Command::DflyCluster(_) => "DFLYCLUSTER",
+        Command::DflyMigrate(_) => "DFLYMIGRATE",
+        Command::Stick(_) => "STICK",
+        Command::Unstick(_) => "UNSTICK",
+        Command::Sticky(_) => "STICKY",
+        Command::Delex { .. } => "DELEX",
+        Command::MemcachedSet { .. } => "MEMCACHED_SET",
+        Command::MemcachedAdd { .. } => "MEMCACHED_ADD",
+        Command::MemcachedReplace { .. } => "MEMCACHED_REPLACE",
+        Command::MemcachedGet { .. } => "MEMCACHED_GET",
+        Command::MemcachedDelete { .. } => "MEMCACHED_DELETE",
+        Command::MemcachedIncr { .. } => "MEMCACHED_INCR",
+        Command::MemcachedDecr { .. } => "MEMCACHED_DECR",
+        Command::MemcachedStats => "MEMCACHED_STATS",
+        Command::MemcachedVersion => "MEMCACHED_VERSION",
+        Command::MemcachedQuit => "MEMCACHED_QUIT",
         Command::Unknown(_) => "UNKNOWN",
     }
 }
@@ -4382,6 +4407,181 @@ async fn execute_command(
             out.extend_from_slice(s.as_bytes());
             false
         }
+        Command::DflyCluster(sub) => {
+            match sub {
+                crate::resp::DflyClusterSubcommand::MyId => {
+                    let hub = crate::cluster::get_cluster_hub(router.port);
+                    let id = hub.my_id();
+                    write_resp_bulk(out, id.as_bytes());
+                }
+                crate::resp::DflyClusterSubcommand::Config(json) => {
+                    let hub = crate::cluster::get_cluster_hub(router.port);
+                    match hub.dfly_cluster_config(&json) {
+                        Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                        Err(e) => out.extend_from_slice(format!("-{}\r\n", e).as_bytes()),
+                    }
+                }
+                crate::resp::DflyClusterSubcommand::GetSlotInfo(slots) => {
+                    out.extend_from_slice(format!("*{}\r\n", slots.len()).as_bytes());
+                    for s in slots {
+                        let key_count = router.count_keys_in_slot(s).await;
+                        let mem_bytes = key_count * 128;
+                        out.extend_from_slice(b"*3\r\n");
+                        write_resp_integer(out, s as i64);
+                        write_resp_integer(out, key_count as i64);
+                        write_resp_integer(out, mem_bytes as i64);
+                    }
+                }
+                crate::resp::DflyClusterSubcommand::FlushSlots(ranges) => {
+                    let _ = router.flush_slots(&ranges).await;
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                crate::resp::DflyClusterSubcommand::SlotMigrationStatus => {
+                    let hub = crate::cluster::get_cluster_hub(router.port);
+                    hub.dfly_slot_migration_status(out);
+                }
+            }
+            false
+        }
+        Command::DflyMigrate(sub) => {
+            let hub = crate::cluster::get_cluster_hub(router.port);
+            match sub {
+                crate::resp::DflyMigrateSubcommand::Init { source_id, num_shards, slots } => {
+                    hub.dfly_migrate_init(&source_id, num_shards, &slots);
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                crate::resp::DflyMigrateSubcommand::Flow { source_id, flow_id } => {
+                    hub.dfly_migrate_flow(&source_id, flow_id);
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                crate::resp::DflyMigrateSubcommand::Ack { flow_id } => {
+                    hub.dfly_migrate_ack(flow_id);
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+            }
+            false
+        }
+        Command::Stick(keys) => {
+            let count = router.stick(&keys).await;
+            write_resp_integer(out, count as i64);
+            false
+        }
+        Command::Unstick(keys) => {
+            let count = router.unstick(&keys).await;
+            write_resp_integer(out, count as i64);
+            false
+        }
+        Command::Sticky(key) => {
+            let sticky = router.is_sticky(&key).await;
+            write_resp_integer(out, if sticky { 1 } else { 0 });
+            false
+        }
+        Command::Delex { key, condition } => {
+            let deleted = router.delex(key, condition).await;
+            write_resp_integer(out, if deleted { 1 } else { 0 });
+            false
+        }
+        Command::MemcachedSet { key, flags: _, exptime, bytes: _, noreply, data } => {
+            let dur = if exptime > 0 { Some(std::time::Duration::from_secs(exptime as u64)) } else { None };
+            router.set(key, data, dur).await;
+            if !noreply {
+                out.extend_from_slice(b"STORED\r\n");
+            }
+            false
+        }
+        Command::MemcachedAdd { key, flags: _, exptime, bytes: _, noreply, data } => {
+            if router.exists(key.clone()).await {
+                if !noreply {
+                    out.extend_from_slice(b"NOT_STORED\r\n");
+                }
+            } else {
+                let dur = if exptime > 0 { Some(std::time::Duration::from_secs(exptime as u64)) } else { None };
+                router.set(key, data, dur).await;
+                if !noreply {
+                    out.extend_from_slice(b"STORED\r\n");
+                }
+            }
+            false
+        }
+        Command::MemcachedReplace { key, flags: _, exptime, bytes: _, noreply, data } => {
+            if router.exists(key.clone()).await {
+                let dur = if exptime > 0 { Some(std::time::Duration::from_secs(exptime as u64)) } else { None };
+                router.set(key, data, dur).await;
+                if !noreply {
+                    out.extend_from_slice(b"STORED\r\n");
+                }
+            } else {
+                if !noreply {
+                    out.extend_from_slice(b"NOT_STORED\r\n");
+                }
+            }
+            false
+        }
+        Command::MemcachedGet { keys } => {
+            for k in keys {
+                if let Some(val) = router.get(k.clone()).await {
+                    out.extend_from_slice(format!("VALUE {} 0 {}\r\n", String::from_utf8_lossy(&k), val.len()).as_bytes());
+                    out.extend_from_slice(&val);
+                    out.extend_from_slice(b"\r\n");
+                }
+            }
+            out.extend_from_slice(b"END\r\n");
+            false
+        }
+        Command::MemcachedDelete { key, noreply } => {
+            let deleted = router.del(key).await;
+            if !noreply {
+                if deleted {
+                    out.extend_from_slice(b"DELETED\r\n");
+                } else {
+                    out.extend_from_slice(b"NOT_FOUND\r\n");
+                }
+            }
+            false
+        }
+        Command::MemcachedIncr { key, value, noreply } => {
+            match router.incr_by(key, value as i64).await {
+                Ok(new_val) => {
+                    if !noreply {
+                        out.extend_from_slice(format!("{}\r\n", new_val).as_bytes());
+                    }
+                }
+                Err(_) => {
+                    if !noreply {
+                        out.extend_from_slice(b"NOT_FOUND\r\n");
+                    }
+                }
+            }
+            false
+        }
+        Command::MemcachedDecr { key, value, noreply } => {
+            match router.incr_by(key, -(value as i64)).await {
+                Ok(new_val) => {
+                    let clamped = new_val.max(0);
+                    if !noreply {
+                        out.extend_from_slice(format!("{}\r\n", clamped).as_bytes());
+                    }
+                }
+                Err(_) => {
+                    if !noreply {
+                        out.extend_from_slice(b"NOT_FOUND\r\n");
+                    }
+                }
+            }
+            false
+        }
+        Command::MemcachedStats => {
+            let dbsize = router.dbsize().await;
+            out.extend_from_slice(format!("STAT pid {}\r\nSTAT uptime 3600\r\nSTAT version 1.6.0-rudis-dragonfly\r\nSTAT curr_items {}\r\nEND\r\n", std::process::id(), dbsize).as_bytes());
+            false
+        }
+        Command::MemcachedVersion => {
+            out.extend_from_slice(b"VERSION 1.6.0-rudis-dragonfly\r\n");
+            false
+        }
+        Command::MemcachedQuit => {
+            true
+        }
         Command::Quit => {
 
             out.extend_from_slice(b"+OK\r\n");
@@ -4528,7 +4728,15 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::TopkAdd { key, .. }
         | Command::TopkQuery { key, .. }
         | Command::TopkList(key)
-        | Command::TopkInfo(key) => Some(target_shard(key, num_shards)),
+        | Command::TopkInfo(key)
+        | Command::Sticky(key)
+        | Command::Delex { key, .. }
+        | Command::MemcachedSet { key, .. }
+        | Command::MemcachedAdd { key, .. }
+        | Command::MemcachedReplace { key, .. }
+        | Command::MemcachedDelete { key, .. }
+        | Command::MemcachedIncr { key, .. }
+        | Command::MemcachedDecr { key, .. } => Some(target_shard(key, num_shards)),
         Command::Smove { source, destination, .. } => {
             let s1 = target_shard(source, num_shards);
             let s2 = target_shard(destination, num_shards);
@@ -7599,6 +7807,13 @@ async fn execute_commands_squashed(
                     | Command::ConfigSet(_, _)
                     | Command::Xread { block_ms: Some(_), .. }
                     | Command::Xreadgroup { block_ms: Some(_), .. }
+                    | Command::DflyCluster(_)
+                    | Command::DflyMigrate(_)
+                    | Command::Stick(_)
+                    | Command::Unstick(_)
+                    | Command::MemcachedStats
+                    | Command::MemcachedVersion
+                    | Command::MemcachedQuit
             ) {
                 can_squash = false;
                 break;

@@ -4005,6 +4005,26 @@ impl RudisTable {
         result
     }
 
+    pub fn flush_slots(&mut self, ranges: &[(u16, u16)]) -> usize {
+        let mut to_remove = Vec::new();
+        for (idx, opt) in self.table.slots.iter().enumerate() {
+            if let Some(entry) = opt {
+                let slot = crate::router::key_slot(&entry.key);
+                for &(start, end) in ranges {
+                    if slot >= start && slot <= end {
+                        to_remove.push(idx);
+                        break;
+                    }
+                }
+            }
+        }
+        let count = to_remove.len();
+        for idx in to_remove {
+            self.table.remove(idx);
+        }
+        count
+    }
+
     // =========================================================================
     // SORTED SET (ZSET) OPERATIONS
     // =========================================================================

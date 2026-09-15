@@ -229,6 +229,19 @@ Rudis incorporates an advanced Linux kernel-bypass networking subsystem powered 
 - **Multi-Mode Operation**: Driver mode (native hardware offload), SKB mode (generic Linux XDP), and userspace simulated bypass mode.
 - **Commands**: `XDP.INFO`, `XDP.RULE ADD/DEL/LIST`, `XDP.STATS`, `XDP.PACKET` (packet diagnostics).
 
+### 21. Dragonfly Compatibility Suite (`DFLYCLUSTER`, `STICK`, `DELEX`, & Dual-Protocol Memcached Gateway)
+Rudis provides complete feature parity with Dragonfly's unique non-Redis extensions:
+- **DFLYCLUSTER Suite**: Dragonfly native cluster control plane commands:
+  - `DFLYCLUSTER MYID`: Queries unique node identifier.
+  - `DFLYCLUSTER CONFIG <json>`: Dynamically configures node roles and hash slot ownership via JSON configuration payload.
+  - `DFLYCLUSTER GETSLOTINFO SLOTS slot1 [slot2 ...]`: Returns granular metadata, key counts, and memory consumption per slot.
+  - `DFLYCLUSTER FLUSHSLOTS start end [start end ...]`: Atomically and efficiently flushes all keys belonging to specific slot ranges across shards.
+  - `DFLYCLUSTER SLOT-MIGRATION-STATUS`: Inspects real-time slot migration states and progress.
+- **DFLYMIGRATE Suite**: Dragonfly slot migration orchestration (`DFLYMIGRATE INIT`, `DFLYMIGRATE FLOW`, `DFLYMIGRATE ACK`).
+- **Cache Eviction Protection (`STICK`, `UNSTICK`, `STICKY`)**: Dragonfly's proprietary cache key pinning mechanism to prevent critical keys from ever being evicted or offloaded to NVMe tiering during memory pressure.
+- **Conditional Deletion (`DELEX`)**: Dragonfly's atomic conditional deletion command based on value comparisons (`IFEQ`, `IFNE`, `IFGT`, `IFLT`).
+- **Dual-Protocol Memcached Gateway**: Unified server supporting the standard text-based Memcached protocol (`set`, `add`, `replace`, `get`, `delete`, `incr`, `decr`, `stats`, `version`, `quit`), sharing database 0 with standard Redis clients with zero operational overhead.
+
 ---
 
 ## Testing

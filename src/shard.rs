@@ -216,6 +216,27 @@ pub enum ShardMessage {
         backup_dir: std::path::PathBuf,
         responder: flume::Sender<Result<(bool, u64), String>>,
     },
+    FlushSlots {
+        ranges: Vec<(u16, u16)>,
+        responder: flume::Sender<usize>,
+    },
+    Stick {
+        keys: Vec<Bytes>,
+        responder: flume::Sender<usize>,
+    },
+    Unstick {
+        keys: Vec<Bytes>,
+        responder: flume::Sender<usize>,
+    },
+    IsSticky {
+        key: Bytes,
+        responder: flume::Sender<bool>,
+    },
+    Delex {
+        key: Bytes,
+        condition: Option<(String, Bytes)>,
+        responder: flume::Sender<bool>,
+    },
 }
 
 
@@ -238,6 +259,7 @@ pub struct ShardDb {
     pub crdt_store: crate::crdt::CrdtStore,
     pub json_store: crate::json::JsonStore,
     pub probabilistic_store: crate::probabilistic::ProbabilisticStore,
+    pub sticky_keys: hashbrown::HashSet<Bytes>,
 }
 
 impl ShardDb {
@@ -250,6 +272,7 @@ impl ShardDb {
             crdt_store: crate::crdt::CrdtStore::new(port),
             json_store: crate::json::JsonStore::new(),
             probabilistic_store: crate::probabilistic::ProbabilisticStore::new(),
+            sticky_keys: hashbrown::HashSet::new(),
         }
     }
 
@@ -297,6 +320,7 @@ impl ShardDb {
         let cooled_ptr = if ptr.is_none() { self.table.is_cooled(key) } else { None };
         let deleted = self.table.del(key);
         if deleted {
+            self.sticky_keys.remove(key);
             if let Some(ptr) = ptr {
                 if let Some(tm) = &self.tier_manager {
                     tm.on_key_deleted(ptr);
@@ -312,6 +336,36 @@ impl ShardDb {
             }
         }
         deleted
+    }
+
+    #[inline]
+    pub fn is_sticky(&self, key: &[u8]) -> bool {
+        self.sticky_keys.contains(key)
+    }
+
+    #[inline]
+    pub fn stick(&mut self, key: Bytes) -> bool {
+        if self.table.exists(&key) {
+            self.sticky_keys.insert(key);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[inline]
+    pub fn unstick(&mut self, key: &[u8]) -> bool {
+        self.sticky_keys.remove(key)
+    }
+
+    #[inline]
+    pub fn flush_slots(&mut self, ranges: &[(u16, u16)]) -> usize {
+        let count = self.table.flush_slots(ranges);
+        self.sticky_keys.retain(|k| {
+            let s = crate::router::key_slot(k);
+            !ranges.iter().any(|&(start, end)| s >= start && s <= end)
+        });
+        count
     }
 
     #[inline]

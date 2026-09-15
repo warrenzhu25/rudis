@@ -626,6 +626,59 @@ pub fn run_shard_worker(
                             let _ = responder.send(res);
                         });
                     }
+                    ShardMessage::FlushSlots { ranges, responder } => {
+                        let count = cross_shard_db.borrow_mut().flush_slots(&ranges);
+                        let _ = responder.send(count);
+                    }
+                    ShardMessage::Stick { keys, responder } => {
+                        let mut db = cross_shard_db.borrow_mut();
+                        let mut count = 0;
+                        for k in keys {
+                            if db.stick(k) {
+                                count += 1;
+                            }
+                        }
+                        let _ = responder.send(count);
+                    }
+                    ShardMessage::Unstick { keys, responder } => {
+                        let mut db = cross_shard_db.borrow_mut();
+                        let mut count = 0;
+                        for k in &keys {
+                            if db.unstick(k) {
+                                count += 1;
+                            }
+                        }
+                        let _ = responder.send(count);
+                    }
+                    ShardMessage::IsSticky { key, responder } => {
+                        let sticky = cross_shard_db.borrow().is_sticky(&key);
+                        let _ = responder.send(sticky);
+                    }
+                    ShardMessage::Delex { key, condition, responder } => {
+                        let mut db = cross_shard_db.borrow_mut();
+                        let should_del = match condition {
+                            None => true,
+                            Some((op, expected)) => {
+                                if let Some(val) = db.get(&key) {
+                                    match op.to_uppercase().as_str() {
+                                        "IFEQ" => val == expected,
+                                        "IFNE" => val != expected,
+                                        "IFGT" => val > expected,
+                                        "IFLT" => val < expected,
+                                        _ => false,
+                                    }
+                                } else {
+                                    false
+                                }
+                            }
+                        };
+                        if should_del {
+                            let deleted = db.del(&key);
+                            let _ = responder.send(deleted);
+                        } else {
+                            let _ = responder.send(false);
+                        }
+                    }
                 }
 
             }

@@ -20,6 +20,15 @@ pub struct ClusterNodeInfo {
     pub slots: Vec<(u16, u16)>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ActiveMigration {
+    pub state: String,
+    pub source_id: String,
+    pub num_shards: usize,
+    pub slots: Vec<(u16, u16)>,
+    pub keys_migrated: u64,
+}
+
 pub struct ClusterHub {
     pub port: u16,
     pub cport: u16,
@@ -35,6 +44,7 @@ pub struct ClusterHub {
     pub pfail_reports: RwLock<HashMap<String, HashSet<String>>>,
     pub bus_running: AtomicBool,
     pub cancel_bus: RwLock<Option<flume::Sender<()>>>,
+    pub active_migration: RwLock<Option<ActiveMigration>>,
 }
 
 static CLUSTER_HUBS: LazyLock<RwLock<HashMap<u16, Arc<ClusterHub>>>> =
@@ -80,6 +90,7 @@ impl ClusterHub {
             pfail_reports: RwLock::new(HashMap::new()),
             bus_running: AtomicBool::new(false),
             cancel_bus: RwLock::new(None),
+            active_migration: RwLock::new(None),
         };
         hub
     }
@@ -756,6 +767,102 @@ impl ClusterHub {
             *self.my_slots.write().unwrap() = vec![(0, 16383)];
         }
         Ok(())
+    }
+
+    pub fn dfly_cluster_config(&self, config_json: &str) -> Result<(), String> {
+        let val: serde_json::Value = serde_json::from_str(config_json)
+            .map_err(|e| format!("ERR Invalid JSON configuration: {}", e))?;
+        
+        let mut new_slots = Vec::new();
+        let my_id = self.my_id();
+
+        if let Some(arr) = val.as_array() {
+            for item in arr {
+                let node_id = item.get("master_id").or_else(|| item.get("id")).and_then(|v| v.as_str()).unwrap_or("");
+                let is_me = node_id == my_id || node_id.is_empty();
+                if let Some(ranges) = item.get("slot_ranges").and_then(|r| r.as_array()) {
+                    for r in ranges {
+                        if let Some(pair) = r.as_array() {
+                            if pair.len() == 2 {
+                                if let (Some(s), Some(e)) = (pair[0].as_u64(), pair[1].as_u64()) {
+                                    if is_me {
+                                        new_slots.push((s as u16, e as u16));
+                                    }
+                                }
+                            }
+                        } else if let Some(obj) = r.as_object() {
+                            if let (Some(s), Some(e)) = (obj.get("start").and_then(|v| v.as_u64()), obj.get("end").and_then(|v| v.as_u64())) {
+                                if is_me {
+                                    new_slots.push((s as u16, e as u16));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else if let Some(obj) = val.as_object() {
+            if let Some(ranges) = obj.get("slot_ranges").and_then(|r| r.as_array()) {
+                for r in ranges {
+                    if let Some(pair) = r.as_array() {
+                        if pair.len() == 2 {
+                            if let (Some(s), Some(e)) = (pair[0].as_u64(), pair[1].as_u64()) {
+                                new_slots.push((s as u16, e as u16));
+                            }
+                        }
+                    } else if let Some(obj) = r.as_object() {
+                        if let (Some(s), Some(e)) = (obj.get("start").and_then(|v| v.as_u64()), obj.get("end").and_then(|v| v.as_u64())) {
+                            new_slots.push((s as u16, e as u16));
+                        }
+                    }
+                }
+            }
+        }
+
+        if !new_slots.is_empty() {
+            compact_slots(&mut new_slots);
+            *self.my_slots.write().unwrap() = new_slots;
+        }
+
+        Ok(())
+    }
+
+    pub fn dfly_slot_migration_status(&self, out: &mut Vec<u8>) {
+        let mig = self.active_migration.read().unwrap();
+        match &*mig {
+            None => {
+                out.extend_from_slice(b"*4\r\n$5\r\nstate\r\n$4\r\nIDLE\r\n$10\r\nmigrations\r\n*0\r\n");
+            }
+            Some(m) => {
+                out.extend_from_slice(b"*6\r\n");
+                out.extend_from_slice(b"$5\r\nstate\r\n");
+                out.extend_from_slice(format!("${}\r\n{}\r\n", m.state.len(), m.state).as_bytes());
+                out.extend_from_slice(b"$9\r\nsource_id\r\n");
+                out.extend_from_slice(format!("${}\r\n{}\r\n", m.source_id.len(), m.source_id).as_bytes());
+                out.extend_from_slice(b"$13\r\nkeys_migrated\r\n");
+                out.extend_from_slice(format!(":{}\r\n", m.keys_migrated).as_bytes());
+            }
+        }
+    }
+
+    pub fn dfly_migrate_init(&self, source_id: &str, num_shards: usize, slots: &[(u16, u16)]) {
+        *self.active_migration.write().unwrap() = Some(ActiveMigration {
+            state: "MIGRATING".to_string(),
+            source_id: source_id.to_string(),
+            num_shards,
+            slots: slots.to_vec(),
+            keys_migrated: 0,
+        });
+    }
+
+    pub fn dfly_migrate_flow(&self, _source_id: &str, flow_id: u64) {
+        if let Some(ref mut m) = *self.active_migration.write().unwrap() {
+            m.state = "SYNCING".to_string();
+            m.keys_migrated += flow_id.max(1);
+        }
+    }
+
+    pub fn dfly_migrate_ack(&self, _flow_id: u64) {
+        *self.active_migration.write().unwrap() = None;
     }
 }
 
