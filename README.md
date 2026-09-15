@@ -1,6 +1,6 @@
 # rudis (Redis in Rust)
 
-A high-performance, **multi-threaded**, **shared-nothing** Redis implementation in Rust built on **`io_uring`** via **Monoio**.
+A ultra-high-performance, **multi-threaded**, **shared-nothing** Redis-compatible in-memory and NVMe-tiered database implemented in Rust, built natively on Linux **`io_uring`** via **Monoio**.
 
 ---
 
@@ -30,10 +30,10 @@ A high-performance, **multi-threaded**, **shared-nothing** Redis implementation 
 2. **Ingress with `SO_REUSEPORT`**: Every worker thread binds its own TCP listener to the same port. The Linux kernel distributes incoming client connections across the worker threads with zero user-space coordination.
 3. **Partitioned In-Memory Storage**: State is strictly thread-local (`ShardDb`). Local operations execute in nanoseconds against a thread-local `HashMap` with **zero mutexes, zero atomic operations, and zero cross-core cache invalidation**.
 4. **CRC16 Key Routing & Cross-Shard Mesh**:
-   - Keys are mapped to shards using CRC16: `target_shard = crc16(key) % num_shards`.
+   - Keys are mapped to 16,384 cluster slots using CRC16: `slot = crc16(tag) % 16384`.
    - If a connection receives a command for a key on its local shard, it executes immediately.
    - If the key resides on another shard, it dispatches the request through a lock-free cross-core channel mesh, where Monoio utilizes an `eventfd` waker to resume the peer core's `io_uring` ring.
-5. **RESP & Inline Protocol**: Supports standard Redis protocol (RESP arrays) as well as inline commands (`GET`, `SET`, `PUT`, `PING`, `INFO`, `QUIT`).
+5. **Multi-Protocol Gateway**: Supports standard RESP2, RESP3 (`HELLO 3`), inline text commands, and a built-in **Dual-Protocol Memcached Gateway** sharing database 0 with zero configuration.
 
 ---
 
@@ -45,12 +45,12 @@ cargo build --release
 ```
 
 ### 2. Run
-By default, `rudis` detects CPU cores and runs up to 8 threads on port 6379:
+By default, `rudis` auto-detects CPU cores and runs worker threads on port 6379:
 ```bash
 ./target/release/rudis --port 6379 --threads 4
 ```
 
-### 3. Connect with `redis-cli`
+### 3. Connect with `redis-cli` (RESP2 / RESP3)
 ```bash
 redis-cli -p 6379
 127.0.0.1:6379> PING
@@ -59,13 +59,9 @@ PONG
 OK
 127.0.0.1:6379> GET user:1
 "alice"
-127.0.0.1:6379> PUT user:2 bob
-OK
-127.0.0.1:6379> GET user:2
-"bob"
 ```
 
-### 4. Connect with `nc` / `telnet` (Inline Protocol)
+### 4. Connect with `nc` / `telnet` (Inline Text Protocol)
 ```bash
 $ nc 127.0.0.1 6379
 SET foo bar
@@ -73,174 +69,471 @@ SET foo bar
 GET foo
 $3
 bar
-PUT hello world
-+OK
-GET hello
-$5
-world
 QUIT
 +OK
 ```
 
-### 5. NVMe Cold-Storage Tiering (`io_uring`)
+### 5. Connect with Memcached Clients (Dual-Protocol Gateway)
+```bash
+$ nc 127.0.0.1 6379
+set session:1 0 3600 5
+admin
+STORED
+get session:1
+VALUE session:1 0 5
+admin
+END
+stats
+STAT version 1.0.0-rudis
+STAT curr_connections 1
+END
+quit
+```
+
+---
+
+## Subsystem & Feature Matrix
+
+| Subsystem / Module | Status | Description |
+| :--- | :---: | :--- |
+| **Thread-per-Core Engine** | Complete | Shared-nothing architecture on Monoio / `io_uring` with lock-free cross-shard channel mesh. |
+| **Core Redis Data Structures** | Complete | Strings, Hashes, Lists, Sets, Sorted Sets (ZSets), Bitmaps, HyperLogLog. |
+| **Geospatial Engine** | Complete | 52-bit integer geohashes, Haversine spherical distance, Redis 6.2+ `GEOSEARCH`. |
+| **Streams & Consumer Groups** | Complete | Append-only log with radix tree indexing, consumer groups, PEL, and non-blocking / blocking `XREAD`. |
+| **Transactions & Multi-Key** | Complete | `MULTI`/`EXEC`/`DISCARD` with Very Lightweight Locking (VLL) multi-shard distributed isolation. |
+| **Pub/Sub Messaging** | Complete | High-throughput channels, glob pattern subscriptions (`PSUBSCRIBE`), and introspection. |
+| **Scripting & Functions** | Complete | Redis 7 Function libraries (`FUNCTION LOAD`, `FCALL`) and standard Lua scripting (`EVAL`, `EVALSHA`). |
+| **ACL & Security** | Complete | Granular user permissions, category selectors (`+@all`, `-@admin`), passwords, and `AUTH`. |
+| **Replication & Persistence** | Complete | Point-in-time RDB snapshots, streaming AOF with background rewrite replay, and `PSYNC` master-replica streaming. |
+| **Redis Cluster & Gossip** | Complete | Dedicated cluster bus (`port + 10000`), `-MOVED` / `-ASK` routing, dynamic slot migration, and Raft-like consensus failover. |
+| **Dragonfly Compatibility Suite** | Complete | `DFLYCLUSTER`, `DFLYMIGRATE`, cache key pinning (`STICK`/`UNSTICK`), `DELEX`, and Dual-Protocol Memcached Gateway. |
+| **RedisJSON Document Store** | Complete | RFC 8259 document store with recursive JSONPath parsing, array slices, and in-place atomic mutations. |
+| **RediSearch & Hybrid Fusion** | Complete | Multi-field schema index, Okapi BM25 scoring, inverted token index, and Reciprocal Rank Fusion (RRF). |
+| **RedisBloom Probabilistic Engine** | Complete | Bloom (`BF.*`), Cuckoo (`CF.*`), Count-Min Sketch (`CMS.*`), and Top-K (`TOPK.*`) heavy-hitter trackers. |
+| **HNSW Vector Search Engine** | Complete | Cosine, L2, IP metrics, AVX2 SIMD kernels, SQ8 scalar quantization, Product Quantization (PQ), and ADC. |
+| **NVMe Tiered Storage** | Complete | 3-state value lifecycle (Hot/Cooled/Cold), SmallBins 4KB bin packing, Direct I/O (`O_DIRECT`), and `fallocate` hole punching. |
+| **Zero-Copy Snapshots** | Complete | Linux `ioctl(FICLONE)` reflink snapshotting (<1ms point-in-time checkpointing without stopping traffic). |
+| **Multi-Region CRDTs** | Complete | Leaderless active-active replication with 16-byte Hybrid Logical Clocks, LWW, OR-Set, PN-Counter, and tombstone GC. |
+| **Hardware Zero-Copy I/O** | Complete | AF_XDP (XSK) kernel bypass, eBPF wire-speed packet filtering, `io_uring` fixed registered buffers, and Linux `SO_ZEROCOPY`. |
+| **Hardware Kernel TLS (kTLS)** | Complete | `rustls` user-space TLS 1.2/1.3 handshake offloaded to Linux `TCP_ULP` symmetric AES-GCM kernel cipher pipelines. |
+| **Jemalloc Per-Core Telemetry** | Complete | `tikv-jemallocator` integration with live memory metrics via `tikv-jemalloc-ctl` in `INFO memory`. |
+
+---
+
+## Complete Command Reference
+
+### 1. Strings & Basic Keyspace
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `SET` | `SET key value [EX seconds \| PX ms] [NX \| XX]` | Sets value with optional TTL expiration and conditional creation flags. |
+| `GET` | `GET key` | Returns string value or nil if non-existent or expired. Transparently loads tiered cold values. |
+| `PUT` | `PUT key value` | High-throughput inline alias for `SET`. |
+| `MSET` | `MSET key value [key value ...]` | Atomically sets multiple key-value pairs across single or multiple shards. |
+| `MGET` | `MGET key [key ...]` | Retrieves values for multiple keys across shards via parallel scatter-gather dispatch. |
+| `SETNX` | `SETNX key value` | Sets key only if it does not already exist. |
+| `MSETNX` | `MSETNX key value [key value ...]` | Sets multiple keys only if none of the specified keys exist. |
+| `GETSET` | `GETSET key value` | Atomically sets new value and returns previous value. |
+| `GETDEL` | `GETDEL key` | Atomically retrieves value and removes key from the database. |
+| `APPEND` | `APPEND key value` | Appends a string value to a key, returning the resulting length. |
+| `STRLEN` | `STRLEN key` | Returns byte length of string stored at key. |
+| `SETRANGE` | `SETRANGE key offset value` | Overwrites part of the string stored at key starting at specified offset. |
+| `GETRANGE` | `GETRANGE key start end` | Returns substring of value stored at key within 0-based signed offset bounds. |
+| `INCR` / `DECR` | `INCR key` / `DECR key` | Increments or decrements 64-bit integer value by 1. |
+| `INCRBY` / `DECRBY` | `INCRBY key delta` / `DECRBY key delta` | Increments or decrements 64-bit integer value by specified delta. |
+| `INCRBYFLOAT` | `INCRBYFLOAT key delta` | Increments floating-point value stored at key by specified float delta. |
+
+### 2. Hashes
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `HSET` / `HMSET` | `HSET key field value [field value ...]` | Sets one or more field-value pairs in hash. |
+| `HGET` | `HGET key field` | Returns value of specified field in hash. |
+| `HMGET` | `HMGET key field [field ...]` | Returns values of multiple specified fields in hash. |
+| `HDEL` | `HDEL key field [field ...]` | Deletes one or more fields from hash. |
+| `HEXISTS` | `HEXISTS key field` | Checks if field exists in hash (returns 1 or 0). |
+| `HLEN` | `HLEN key` | Returns number of fields contained within hash. |
+| `HGETALL` | `HGETALL key` | Returns all fields and values stored in hash. |
+| `HKEYS` / `HVALS` | `HKEYS key` / `HVALS key` | Returns all field names or all field values in hash. |
+| `HINCRBY` | `HINCRBY key field delta` | Increments integer value of hash field by specified integer. |
+| `HINCRBYFLOAT` | `HINCRBYFLOAT key field delta` | Increments floating-point value of hash field by specified float. |
+| `HRANDFIELD` | `HRANDFIELD key [count [WITHVALUES]]` | Returns random field(s) from hash, optionally including values. |
+| `HSCAN` | `HSCAN key cursor [MATCH pat] [COUNT n]` | Iterates incrementally over hash fields using cursor-based pagination. |
+
+### 3. Lists
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `LPUSH` / `RPUSH` | `LPUSH key val [...]` / `RPUSH key val [...]` | Inserts elements at head or tail of list. |
+| `LPOP` / `RPOP` | `LPOP key [count]` / `RPOP key [count]` | Removes and returns element(s) from head or tail of list. |
+| `LRANGE` | `LRANGE key start stop` | Returns elements of list within specified slice bounds. |
+| `LLEN` | `LLEN key` | Returns number of elements in list. |
+| `LINDEX` | `LINDEX key index` | Returns element at specified 0-based or negative index. |
+| `LTRIM` | `LTRIM key start stop` | Trims list to specified range in place. |
+| `LSET` | `LSET key index element` | Overwrites element at index with new value. |
+| `LREM` | `LREM key count element` | Removes occurrences of element from list based on count direction. |
+| `LPOS` | `LPOS key element [RANK r] [COUNT c]` | Returns index of matching element in list. |
+| `LINSERT` | `LINSERT key BEFORE\|AFTER pivot val` | Inserts value immediately before or after pivot element. |
+| `LMOVE` | `LMOVE src dst LEFT\|RIGHT LEFT\|RIGHT` | Atomically pops from source list and pushes to destination list. |
+| `BLMOVE` | `BLMOVE src dst LEFT\|RIGHT LEFT\|RIGHT timeout` | Blocking version of `LMOVE` with floating-point timeout in seconds. |
+| `BLPOP` / `BRPOP` | `BLPOP key [...] timeout` / `BRPOP key [...] timeout` | Blocking pop from head or tail of first non-empty list. |
+
+### 4. Sets
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `SADD` | `SADD key member [member ...]` | Adds one or more members to set. |
+| `SREM` | `SREM key member [member ...]` | Removes one or more members from set. |
+| `SMEMBERS` | `SMEMBERS key` | Returns all members of set. |
+| `SISMEMBER` | `SISMEMBER key member` | Returns 1 if member exists in set, else 0. |
+| `SMISMEMBER` | `SMISMEMBER key member [member ...]` | Batch checks existence of multiple members in set. |
+| `SCARD` | `SCARD key` | Returns cardinality (number of elements) of set. |
+| `SPOP` | `SPOP key [count]` | Removes and returns one or more random members from set. |
+| `SRANDMEMBER` | `SRANDMEMBER key [count]` | Returns one or more random members without removing them. |
+| `SMOVE` | `SMOVE source destination member` | Atomically moves member from source set to destination set. |
+| `SSCAN` | `SSCAN key cursor [MATCH pat] [COUNT n]` | Iterates incrementally over elements of set. |
+| `SINTER` / `SUNION` / `SDIFF` | `SINTER key [key ...]` / `SUNION ...` / `SDIFF ...` | Computes set intersection, union, or difference across multiple keys. |
+| `SINTERSTORE` / `SUNIONSTORE` / `SDIFFSTORE` | `SINTERSTORE dst key [key ...]` | Computes set algebraic operation and stores result into destination key. |
+
+### 5. Sorted Sets (ZSets)
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `ZADD` | `ZADD key [NX\|XX] [GT\|LT] [CH] score member [...]` | Adds members with scores or updates existing scores. |
+| `ZREM` | `ZREM key member [member ...]` | Removes one or more members from sorted set. |
+| `ZSCORE` | `ZSCORE key member` | Returns score of member as a floating-point string. |
+| `ZMSCORE` | `ZMSCORE key member [member ...]` | Returns scores for multiple members in single roundtrip. |
+| `ZCARD` | `ZCARD key` | Returns cardinality of sorted set. |
+| `ZRANK` / `ZREVRANK` | `ZRANK key member` / `ZREVRANK key member` | Returns 0-based rank ordered ascending or descending by score. |
+| `ZCOUNT` | `ZCOUNT key min max` | Returns number of elements with scores within `[min, max]`. |
+| `ZLEXCOUNT` | `ZLEXCOUNT key min max` | Returns number of elements within lexicographical interval. |
+| `ZINCRBY` | `ZINCRBY key delta member` | Increments member score by specified float delta. |
+| `ZRANGE` | `ZRANGE key min max [BYSCORE\|BYLEX] [REV] [LIMIT o c] [WITHSCORES]` | Flexible range queries by index, score, or lexicographical bounds. |
+| `ZPOPMIN` / `ZPOPMAX` | `ZPOPMIN key [count]` / `ZPOPMAX key [count]` | Removes and returns member(s) with lowest or highest scores. |
+| `ZRANDMEMBER` | `ZRANDMEMBER key [count [WITHSCORES]]` | Returns random member(s) from sorted set. |
+| `ZREMRANGEBYRANK` | `ZREMRANGEBYRANK key start stop` | Removes members within 0-based rank range. |
+| `ZREMRANGEBYSCORE`| `ZREMRANGEBYSCORE key min max` | Removes members with scores within `[min, max]`. |
+| `ZREMRANGEBYLEX` | `ZREMRANGEBYLEX key min max` | Removes members within lexicographical range. |
+| `ZSCAN` | `ZSCAN key cursor [MATCH pat] [COUNT n]` | Iterates incrementally over members and scores. |
+| `ZINTER` / `ZUNION` / `ZDIFF` | `ZINTER numkeys key [...] [WEIGHTS ...] [AGGREGATE ...]` | Computes intersection, union, or difference across sorted sets. |
+| `ZINTERSTORE` / `ZUNIONSTORE` / `ZDIFFSTORE` | `ZINTERSTORE dst numkeys key [...]` | Performs set algebra and stores result into destination key. |
+
+### 6. Bitmaps & Bitfields
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `SETBIT` | `SETBIT key offset value` | Sets or clears bit at offset (0 or 1), returning previous bit value. |
+| `GETBIT` | `GETBIT key offset` | Returns bit value stored at offset (0 or 1). |
+| `BITCOUNT` | `BITCOUNT key [start end [BYTE\|BIT]]` | Counts number of set bits (population count) in byte range. |
+| `BITPOS` | `BITPOS key bit [start [end]]` | Finds first bit set to 0 or 1 in string. |
+| `BITOP` | `BITOP AND\|OR\|XOR\|NOT destkey srckey [...]` | Bitwise logical operations across multiple source strings stored into destkey. |
+
+### 7. HyperLogLog
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `PFADD` | `PFADD key element [element ...]` | Adds elements to HyperLogLog approximate cardinality register. |
+| `PFCOUNT` | `PFCOUNT key [key ...]` | Returns approximated cardinality of single or merged HyperLogLogs. |
+| `PFMERGE` | `PFMERGE destkey sourcekey [sourcekey ...]`| Merges multiple HyperLogLog registers into destination register. |
+
+### 8. Geospatial (52-Bit Geohash & Haversine)
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `GEOADD` | `GEOADD key [NX\|XX\|CH] lon lat member [...]` | Stores geospatial coordinates as 52-bit geohash integer scores. |
+| `GEODIST` | `GEODIST key m1 m2 [m\|km\|mi\|ft]` | Computes Haversine great-circle distance between two members. |
+| `GEOPOS` | `GEOPOS key member [member ...]` | Returns normalized longitude and latitude coordinates for members. |
+| `GEOHASH` | `GEOHASH key member [member ...]` | Returns 11-character standard Base32 geohash strings for members. |
+| `GEORADIUS` | `GEORADIUS key lon lat r u [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT n] [ASC\|DESC]` | Queries elements within spherical radius of coordinate. |
+| `GEORADIUSBYMEMBER` | `GEORADIUSBYMEMBER key member r u [...]` | Radius query centered at location of existing set member. |
+| `GEOSEARCH` | `GEOSEARCH key [FROMMEMBER m \| FROMLONLAT lon lat] [BYRADIUS r u \| BYBOX w h u] [...]` | Redis 6.2+ multi-criterion geospatial search by circular radius or bounding box. |
+
+### 9. Streams & Consumer Groups
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `XADD` | `XADD key [NOMKSTREAM] [MAXLEN\|MINID threshold] ID field val [...]` | Appends new entry to stream with auto-generated (`*`) or explicit timestamp ID. |
+| `XLEN` | `XLEN key` | Returns number of entries in stream. |
+| `XRANGE` / `XREVRANGE` | `XRANGE key start end [COUNT n]` | Iterates through stream entries in ascending or descending ID order. |
+| `XDEL` | `XDEL key id [id ...]` | Deletes specific entry IDs from stream. |
+| `XTRIM` | `XTRIM key MAXLEN\|MINID threshold` | Trims stream length or drops entries older than specified ID. |
+| `XREAD` | `XREAD [COUNT n] [BLOCK ms] STREAMS key [...] id [...]` | Reads newer entries from one or more streams with optional async blocking. |
+| `XGROUP CREATE` | `XGROUP CREATE key group id [MKSTREAM]` | Creates consumer group anchored at stream ID or `$` (stream tail). |
+| `XGROUP DESTROY` | `XGROUP DESTROY key group` | Destroys consumer group and drops associated Pending Entries List (PEL). |
+| `XGROUP CREATECONSUMER` | `XGROUP CREATECONSUMER key group consumer` | Explicitly registers named consumer within consumer group. |
+| `XGROUP DELCONSUMER` | `XGROUP DELCONSUMER key group consumer` | Removes named consumer and reclaims consumer pending state. |
+| `XREADGROUP` | `XREADGROUP GROUP grp csn [COUNT n] [BLOCK ms] [NOACK] STREAMS key id` | Reads stream entries on behalf of consumer group, updating PEL state. |
+| `XACK` | `XACK key group id [id ...]` | Acknowledges successfully processed entries, removing them from group PEL. |
+| `XPENDING` | `XPENDING key group [start end count [consumer]]` | Inspects unacknowledged pending messages in consumer group. |
+
+### 10. Transactions & Multi-Key Isolation
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `MULTI` | `MULTI` | Enters transactional buffering mode for current client connection. |
+| `EXEC` | `EXEC` | Atomically executes buffered commands across shards using distributed lock ordering (VLL). |
+| `DISCARD` | `DISCARD` | Flushes transaction buffer and exits transactional mode. |
+
+### 11. Pub/Sub Messaging
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `SUBSCRIBE` | `SUBSCRIBE channel [channel ...]` | Subscribes client connection to one or more pub/sub channels. |
+| `UNSUBSCRIBE` | `UNSUBSCRIBE [channel ...]` | Unsubscribes client from specific channels or all channels. |
+| `PSUBSCRIBE` | `PSUBSCRIBE pattern [pattern ...]` | Subscribes client to glob-style channel patterns (e.g. `news.*`). |
+| `PUNSUBSCRIBE` | `PUNSUBSCRIBE [pattern ...]` | Unsubscribes client from glob-style channel patterns. |
+| `PUBLISH` | `PUBLISH channel message` | Broadcasts message to all subscribers across all shards, returning receiver count. |
+| `PUBSUB CHANNELS` | `PUBSUB CHANNELS [pattern]` | Lists active channels matching optional pattern. |
+| `PUBSUB NUMSUB` | `PUBSUB NUMSUB [channel ...]` | Returns subscriber counts for specified channels. |
+| `PUBSUB NUMPAT` | `PUBSUB NUMPAT` | Returns total number of active pattern subscriptions across the node. |
+
+### 12. Scripting & Redis 7 Functions
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `EVAL` | `EVAL script numkeys [key ...] [arg ...]` | Executes Lua script synchronously with keys mapped to local or mesh dispatchers. |
+| `EVALSHA` | `EVALSHA sha1 numkeys [key ...] [arg ...]` | Executes pre-cached script by its SHA1 hexadecimal digest. |
+| `SCRIPT LOAD` | `SCRIPT LOAD script` | Compiles Lua script into cache without execution, returning its SHA1 digest. |
+| `SCRIPT EXISTS` | `SCRIPT EXISTS sha1 [sha1 ...]` | Queries existence of script digests in the execution cache. |
+| `SCRIPT FLUSH` | `SCRIPT FLUSH` | Flushes script cache. |
+| `FUNCTION LOAD` | `FUNCTION LOAD [REPLACE] #!lua name=lib ...` | Compiles and registers persistent Redis 7 function library routines. |
+| `FCALL` | `FCALL function numkeys [key ...] [arg ...]` | Invokes registered function routine. |
+| `FUNCTION LIST` | `FUNCTION LIST` | Inspects loaded library names, descriptions, and exported routines. |
+| `FUNCTION DELETE` | `FUNCTION DELETE lib` | Purges registered function library from memory. |
+
+### 13. Access Control Lists (ACL) & Security
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `AUTH` | `AUTH [username] password` | Authenticates connection against configured ACL users. |
+| `ACL LIST` | `ACL LIST` | Dumps all configured users and their active permission rules. |
+| `ACL USERS` | `ACL USERS` | Returns list of all defined usernames. |
+| `ACL WHOAMI` | `ACL WHOAMI` | Returns username of current connection. |
+| `ACL CAT` | `ACL CAT` | Lists supported command categories (`read`, `write`, `admin`, `fast`, `slow`, etc.). |
+| `ACL GETUSER` | `ACL GETUSER username` | Returns granular map of rules, allowed commands, passwords, and flags for user. |
+| `ACL SETUSER` | `ACL SETUSER username [rules ...]` | Creates or updates user rules (`on`, `off`, `>password`, `+@all`, `+get`, etc.). |
+| `ACL DELUSER` | `ACL DELUSER username [username ...]` | Deletes user accounts. |
+
+### 14. Server, Keyspace & Client Management
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `PING` | `PING [message]` | Tests connection liveness, returning `PONG` or echoed message. |
+| `ECHO` | `ECHO message` | Echoes back supplied string argument. |
+| `TIME` | `TIME` | Returns server time as two-element array: `[unix_timestamp_seconds, microseconds]`. |
+| `RESET` | `RESET` | Resets client connection state (clears auth, multi, and tracking). |
+| `DBSIZE` | `DBSIZE` | Returns total number of active keys across all shards. |
+| `FLUSHDB` / `FLUSHALL` | `FLUSHDB` / `FLUSHALL` | Purges keys across all shards. |
+| `KEYS` | `KEYS pattern` | Returns all keys matching glob pattern across all shards. |
+| `SCAN` | `SCAN cursor [MATCH pat] [COUNT n]` | Cursor-based keyspace pagination across shards. |
+| `RANDOMKEY` | `RANDOMKEY` | Returns random key from keyspace or nil if empty. |
+| `TYPE` | `TYPE key` | Returns string representation of key type (`string`, `list`, `set`, `zset`, `hash`, `stream`, etc.). |
+| `EXPIRE` / `PEXPIRE` | `EXPIRE key sec` / `PEXPIRE key ms` | Sets TTL expiration in seconds or milliseconds. |
+| `EXPIREAT` / `PEXPIREAT` | `EXPIREAT key timestamp` | Sets absolute UNIX expiration timestamp in seconds or milliseconds. |
+| `EXPIRETIME` / `PEXPIRETIME` | `EXPIRETIME key` | Returns expiration UNIX timestamp in seconds or milliseconds. |
+| `PERSIST` | `PERSIST key` | Clears expiration timer, making key persistent. |
+| `TTL` / `PTTL` | `TTL key` / `PTTL key` | Returns remaining time-to-live in seconds or milliseconds (-2 if missing, -1 if no TTL). |
+| `TOUCH` | `TOUCH key [key ...]` | Updates last-access timestamp for key(s) to influence LRU eviction. |
+| `RENAME` / `RENAMENX` | `RENAME key newkey` / `RENAMENX ...` | Renames key, optionally failing if target exists (`NX`). |
+| `DUMP` / `RESTORE` | `DUMP key` / `RESTORE key ttl serialized` | Exports and imports binary serialized key representations. |
+| `INFO` | `INFO [section]` | Returns server status, memory stats, tiering info, replication offset, and shard health. |
+| `COMMAND` / `COMMAND DOCS` | `COMMAND` / `COMMAND DOCS` | Returns Redis command metadata for client driver introspection. |
+| `CONFIG GET` / `CONFIG SET` | `CONFIG GET param` / `CONFIG SET param val` | Inspects and mutates server configuration parameters at runtime. |
+| `HELLO` | `HELLO [2\|3] [AUTH user pass] [SETNAME name]` | Protocol handshake negotiating RESP2 or RESP3 mode and client naming. |
+| `CLIENT LIST` | `CLIENT LIST` | Returns detailed list of active client connections, file descriptors, and idle times. |
+| `CLIENT ID` | `CLIENT ID` | Returns unique 64-bit client connection ID. |
+| `CLIENT SETNAME` / `GETNAME` | `CLIENT SETNAME name` / `CLIENT GETNAME` | Sets or retrieves connection handle name. |
+| `CLIENT TRACKING` | `CLIENT TRACKING on\|off [BCAST] [PREFIX pre]` | Enables RESP3 client-side caching invalidation push notifications. |
+| `CLIENT CACHING` | `CLIENT CACHING yes\|no` | Opts in or out of tracking for next executed command. |
+
+### 15. Persistence (RDB & AOF) & Replication
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `SAVE` | `SAVE` | Synchronously writes point-in-time RDB snapshot to disk. |
+| `BGSAVE` | `BGSAVE` | Asynchronously dispatches RDB serialization without blocking client traffic. |
+| `LASTSAVE` | `LASTSAVE` | Returns UNIX timestamp of most recent successful snapshot. |
+| `REPLICAOF` / `SLAVEOF` | `REPLICAOF host port` / `REPLICAOF NO ONE` | Sets master replication target or promotes node to master. |
+| `PSYNC` | `PSYNC replid offset` | Initiates partial or full resynchronization stream. |
+| `REPLCONF` | `REPLCONF [listening-port port] [ack offset]` | Replication configuration negotiation and periodic ACK heartbeat. |
+| `ROLE` | `ROLE` | Reports replication role (`master` or `slave`), offset, and connected replicas. |
+
+### 16. Redis Cluster & Gossip Protocol
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `CLUSTER SLOTS` | `CLUSTER SLOTS` | Returns array of slot ranges mapped to master and replica endpoint addresses. |
+| `CLUSTER SHARDS` | `CLUSTER SHARDS` | Redis 7 specification reporting nested slot ranges and detailed node attributes. |
+| `CLUSTER LINKS` | `CLUSTER LINKS` | Telemetry on active cluster bus peer connections, direction, and buffer allocations. |
+| `CLUSTER NODES` | `CLUSTER NODES` | Returns standard space-delimited cluster topology string. |
+| `CLUSTER INFO` | `CLUSTER INFO` | Returns cluster state, assigned slots, current epoch, and peer stats. |
+| `CLUSTER MEET` | `CLUSTER MEET ip port` | Connects to peer on cluster bus (`port + 10000`) and joins gossip network. |
+| `CLUSTER MYID` | `CLUSTER MYID` | Returns 40-character hexadecimal node identifier. |
+| `CLUSTER COUNTKEYSINSLOT` | `CLUSTER COUNTKEYSINSLOT slot` | Returns number of keys currently assigned to hash slot. |
+| `CLUSTER GETKEYSINSLOT` | `CLUSTER GETKEYSINSLOT slot count` | Returns sample of keys belonging to hash slot. |
+| `CLUSTER SETSLOT` | `CLUSTER SETSLOT slot IMPORTING\|MIGRATING\|NODE\|STABLE` | Sets slot migration and ownership state. |
+| `CLUSTER ADDSLOTS` / `DELSLOTS` | `CLUSTER ADDSLOTS slot [...]` | Dynamically assigns or strips discrete slot IDs. |
+| `CLUSTER ADDSLOTSRANGE` / `DELSLOTSRANGE` | `CLUSTER ADDSLOTSRANGE start end [...]` | Bulk assigns or strips contiguous slot ranges. |
+| `CLUSTER FAILOVER` | `CLUSTER FAILOVER [FORCE]` | Initiates manual coordinated or forced failover election. |
+| `CLUSTER RESET` | `CLUSTER RESET [HARD\|SOFT]` | Resets cluster state, clearing slots and epochs. |
+| `CLUSTER FORGET` | `CLUSTER FORGET node_id` | Removes node from gossip peer tables. |
+| `CLUSTER REPLICATE` | `CLUSTER REPLICATE master_id` | Configures node as replica of specified master. |
+| `CLUSTER SAVECONFIG` | `CLUSTER SAVECONFIG` | Forces persistence of cluster topology state to disk. |
+| `ASKING` | `ASKING` | Flags client connection to accept next request targeting an `-ASK` slot. |
+| `MIGRATE` | `MIGRATE host port key\|"" dest_db timeout [COPY] [REPLACE] [KEYS ...]` | Transfers key(s) to destination node. |
+
+### 17. Dragonfly Compatibility Suite & Memcached Gateway
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `DFLYCLUSTER MYID` | `DFLYCLUSTER MYID` | Returns Dragonfly unique cluster node identifier. |
+| `DFLYCLUSTER CONFIG` | `DFLYCLUSTER CONFIG json_string` | Atomically configures slot ownership and node roles using JSON manifest. |
+| `DFLYCLUSTER GETSLOTINFO` | `DFLYCLUSTER GETSLOTINFO SLOTS s1 [s2 ...]` | Granular metadata, key count, and memory footprint per slot. |
+| `DFLYCLUSTER FLUSHSLOTS` | `DFLYCLUSTER FLUSHSLOTS s1 e1 [s2 e2 ...]` | Flushes all keys belonging to slot range(s) without wiping entire DB. |
+| `DFLYCLUSTER SLOT-MIGRATION-STATUS` | `DFLYCLUSTER SLOT-MIGRATION-STATUS` | Live telemetry on Dragonfly slot migration flows and transfer rates. |
+| `DFLYMIGRATE INIT` | `DFLYMIGRATE INIT source_id shards [slots...]` | Initializes multi-shard Dragonfly migration session. |
+| `DFLYMIGRATE FLOW` | `DFLYMIGRATE FLOW source_id flow_id` | Streams slot migration flow chunks. |
+| `DFLYMIGRATE ACK` | `DFLYMIGRATE ACK flow_id` | Acknowledges receipt of migration flow chunks. |
+| `STICK` | `STICK key [key ...]` | Pins key(s) in DRAM to prevent LRU eviction or NVMe tiering under memory pressure. |
+| `UNSTICK` | `UNSTICK key [key ...]` | Removes cache pinning flag, allowing normal tiering and eviction. |
+| `STICKY` | `STICKY key` | Returns 1 if key is pinned in memory, else 0. |
+| `DELEX` | `DELEX key [IFEQ val \| IFNE val \| IFGT val \| IFLT val]` | Atomic conditional deletion based on value equality or numerical comparison. |
+| **Memcached Gateway** | `set`, `add`, `replace`, `get`, `delete`, `incr`, `decr`, `stats`, `version`, `quit` | Seamless text-based Memcached protocol sharing database 0 with standard Redis clients. |
+
+### 18. RedisJSON Document Store (RFC 8259)
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `JSON.SET` | `JSON.SET key path json [NX\|XX]` | Stores JSON document or updates sub-tree with JSONPath selectors. |
+| `JSON.GET` | `JSON.GET key [path ...]` | Serializes document or sub-paths into JSON strings. |
+| `JSON.DEL` | `JSON.DEL key [path]` | Deletes entire JSON document or removes selected sub-path in place. |
+| `JSON.TYPE` | `JSON.TYPE key [path]` | Returns data type (`object`, `array`, `string`, `integer`, `number`, `boolean`, `null`). |
+| `JSON.NUMINCRBY` | `JSON.NUMINCRBY key path delta` | Increments numeric value at path in place without re-serialization. |
+| `JSON.NUMMULTBY` | `JSON.NUMMULTBY key path factor` | Multiplies numeric value at path by specified factor. |
+| `JSON.STRAPPEND` | `JSON.STRAPPEND key [path] json_string` | Appends string to existing string value at path. |
+| `JSON.STRLEN` | `JSON.STRLEN key [path]` | Returns character length of string located at path. |
+| `JSON.ARRAPPEND` | `JSON.ARRAPPEND key path val [val ...]` | Appends values to array container located at path. |
+| `JSON.ARRLEN` | `JSON.ARRLEN key [path]` | Returns length of array located at path. |
+| `JSON.ARRPOP` | `JSON.ARRPOP key [path [index]]` | Pops and returns element from array at index (default -1). |
+| `JSON.OBJKEYS` | `JSON.OBJKEYS key [path]` | Returns list of keys in JSON object located at path. |
+| `JSON.OBJLEN` | `JSON.OBJLEN key [path]` | Returns number of key-value attributes in JSON object. |
+| `JSON.TOGGLE` | `JSON.TOGGLE key path` | Toggles boolean value located at path (`true` $\leftrightarrow$ `false`). |
+| `JSON.CLEAR` | `JSON.CLEAR key [path]` | Clears container elements (empties array or object). |
+| `JSON.MGET` | `JSON.MGET key [key ...] path` | Scatter-gather query retrieving JSON sub-paths across multiple keys. |
+
+### 19. RediSearch & Hybrid Fusion (BM25 + Vector RRF)
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `FT.CREATE` | `FT.CREATE idx ON HASH\|JSON PREFIX 1 p SCHEMA field TYPE [...]` | Creates secondary index over Hashes or JSON docs (`TEXT`, `NUMERIC`, `TAG`, `VECTOR`). |
+| `FT.SEARCH` | `FT.SEARCH idx query [LIMIT o c] [RETURN n f...] [SORTBY f] [PARAMS ...]` | Full-text search with BM25 ranking, numeric filters, and tag matching. |
+| `FT.INFO` | `FT.INFO idx` | Inspects index statistics, field schemas, document count, and memory consumption. |
+| `FT.DROPINDEX` | `FT.DROPINDEX idx [DD]` | Drops index, optionally deleting underlying document keys (`DD`). |
+| `FT.EXPLAIN` | `FT.EXPLAIN idx query` | Returns parsed query execution plan and filter syntax tree. |
+| `FT.ADD` | `FT.ADD idx doc_id score FIELDS f v [...]` | Manually indexes document fields into search index. |
+
+### 20. RedisBloom Probabilistic Engine
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `BF.RESERVE` | `BF.RESERVE key error_rate capacity` | Initializes Bloom filter with optimal bit array sizing and hash counts. |
+| `BF.ADD` / `BF.MADD` | `BF.ADD key item` / `BF.MADD key item [...]` | Inserts one or more items into Bloom filter. |
+| `BF.EXISTS` / `BF.MEXISTS` | `BF.EXISTS key item` / `BF.MEXISTS ...` | Queries membership of item(s) in Bloom filter. |
+| `BF.INFO` | `BF.INFO key` | Inspects Bloom filter capacity, size, filter count, and items added. |
+| `CF.RESERVE` | `CF.RESERVE key capacity` | Initializes Cuckoo filter with 4-slot bucket tables and 16-bit fingerprints. |
+| `CF.ADD` / `CF.ADDNX` | `CF.ADD key item` / `CF.ADDNX key item` | Adds item to Cuckoo filter, optionally ensuring uniqueness (`ADDNX`). |
+| `CF.EXISTS` | `CF.EXISTS key item` | Queries presence of item in Cuckoo filter. |
+| `CF.DEL` | `CF.DEL key item` | Deletes item fingerprint from Cuckoo filter bucket. |
+| `CF.INFO` | `CF.INFO key` | Inspects Cuckoo filter bucket count, filters, and items stored. |
+| `CMS.INITBYDIM` | `CMS.INITBYDIM key width depth` | Initializes Count-Min Sketch with explicit width and depth. |
+| `CMS.INITBYPROB` | `CMS.INITBYPROB key error probability` | Initializes Count-Min Sketch derived from error tolerance and confidence. |
+| `CMS.INCRBY` | `CMS.INCRBY key item count [item count ...]`| Increments frequency counters for items in sketch. |
+| `CMS.QUERY` | `CMS.QUERY key item [item ...]` | Estimates point frequency for items using minimum across hash rows. |
+| `CMS.INFO` | `CMS.INFO key` | Returns Count-Min Sketch width, depth, and total count. |
+| `TOPK.RESERVE` | `TOPK.RESERVE key topk` | Initializes Space-Saving Top-K streaming heavy-hitter tracker. |
+| `TOPK.ADD` | `TOPK.ADD key item [item ...]` | Increments frequency of item(s) and adjusts dynamic top-$k$ ranks. |
+| `TOPK.QUERY` | `TOPK.QUERY key item [item ...]` | Checks if item(s) are currently in top-$k$ frequent element list. |
+| `TOPK.LIST` | `TOPK.LIST key` | Returns ordered list of current top-$k$ heavy hitters. |
+| `TOPK.INFO` | `TOPK.INFO key` | Inspects Top-K tracking capacity and decay parameters. |
+
+### 21. Vector Search Engine (HNSW, SQ8, PQ & ADC)
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `VADD` | `VADD idx key d0 d1 ... [METRIC cos\|l2\|ip] [QUANTIZE/SQ8] [PQ] [TIERED]` | Inserts embedding into HNSW graph with optional SQ8 or Product Quantization. |
+| `VQUERY` | `VQUERY idx k q0 q1 ... [RERANK]` | Approximate Nearest Neighbor (ANN) search with optional exact float reranking. |
+| `VSIM` | `VSIM idx key1 key2 [METRIC ...]` | Computes similarity distance between two indexed vectors in memory. |
+| `VDEL` | `VDEL idx key` | Removes vector from index and rewires neighboring graph edges. |
+| `VINFO` | `VINFO idx` | Returns index dimension, metric, element count, and layer distribution. |
+
+### 22. NVMe Tiered Storage & Zero-Copy Snapshots
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `TIER SPILL` | `TIER SPILL key` | Offloads key to NVMe disk, freeing DRAM value allocation. |
+| `TIER LOAD` | `TIER LOAD key` | Pre-fetches cold NVMe key back into DRAM memory. |
+| `TIER COOL` | `TIER COOL key` | Transitions key to Cooled state (persisted to disk, cached in DRAM). |
+| `TIER DECOMMIT` | `TIER DECOMMIT [key]` | Instantly drops DRAM copies of cooled keys without disk I/O. |
+| `TIER SPILLALL` | `TIER SPILLALL` | Spills all eligible in-memory keys across shards to NVMe storage. |
+| `TIER GC` | `TIER GC` | Triggers online zero-copy hole punching (`fallocate`) to reclaim freed disk bins. |
+| `TIER SNAPSHOT` | `TIER SNAPSHOT dir` | Parallel `<1ms` zero-copy reflink snapshot using Linux `ioctl(FICLONE)`. |
+| `TIER BACKUP` | `TIER BACKUP dir` | Alias for zero-copy point-in-time tiered backup. |
+| `TIER INFO` | `TIER INFO` | Reports live disk footprint, SmallBins count, and DRAM bytes saved. |
+
+### 23. Multi-Region Active-Active CRDTs
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `CRDT.SET` | `CRDT.SET key val` | Updates Last-Write-Wins (LWW) register tagged with 16-byte Hybrid Logical Clock. |
+| `CRDT.GET` | `CRDT.GET key` | Reads register value if not deleted by an active tombstone. |
+| `CRDT.DEL` | `CRDT.DEL key` | Emits deletion tombstone tagged with monotonic HLC timestamp. |
+| `CRDT.INCRBY` | `CRDT.INCRBY key delta` | Atomically updates positive or negative counter in distributed PN-Counter. |
+| `CRDT.SADD` | `CRDT.SADD key member` | Adds member to Observed-Remove Set (OR-Set) with unique dot tag. |
+| `CRDT.SMEMBERS` | `CRDT.SMEMBERS key` | Returns set members whose additions have not been observed as removed. |
+| `CRDT.SREM` | `CRDT.SREM key member` | Removes member from OR-Set by tombstining observed tags. |
+| `CRDT.DUMP` | `CRDT.DUMP` | Serializes state of all CRDT structures for multi-region replication replication. |
+| `CRDT.MERGE` | `CRDT.MERGE payload` | Deterministically merges remote datacenter state using causal HLC comparison. |
+| `CRDT.GC` | `CRDT.GC [ttl_ms]` | Prunes expired deletion tombstones to prevent metadata growth. |
+
+### 24. Zero-Copy Networking, AF_XDP & eBPF
+| Command | Syntax / Usage | Description |
+| :--- | :--- | :--- |
+| `XDP.INFO` | `XDP.INFO` | Reports active AF_XDP driver mode, NIC interface, and UMEM ring fill levels. |
+| `XDP.RULE ADD` | `XDP.RULE ADD DROP\|PASS cidr` | Injects wire-speed CIDR packet filter rules evaluated at driver/NIC speed. |
+| `XDP.RULE DEL` | `XDP.RULE DEL rule_id` | Deletes eBPF packet filtering rule by ID. |
+| `XDP.RULE LIST` | `XDP.RULE LIST` | Lists all active wire-speed eBPF rules and drop counters. |
+| `XDP.STATS` | `XDP.STATS` | Live telemetry on RX/TX packets, bytes, dropped flood packets, and rate limits. |
+| `XDP.PACKET` | `XDP.PACKET hex_payload` | Diagnoses and tests packet path through eBPF filter pipeline. |
+
+---
+
+## Technical Deep Dives
+
+### 1. NVMe Cold-Storage Tiering (`io_uring`)
 Rudis features a thread-per-core asynchronous storage tiering engine built natively on `io_uring`:
 - **Three-State Value Lifecycle**: Values transition through `Hot` (in DRAM) $\to$ `Cooled` (persisted to NVMe, cached in DRAM) $\to$ `Cold` (persisted to NVMe, pointer in DRAM).
-- **Zero-I/O Decommit**: `TIER DECOMMIT` instantly drops in-memory copies of cooled keys without I/O.
+- **Zero-I/O Decommit**: `TIER DECOMMIT` drops in-memory copies of cooled keys without performing disk writes.
 - **SmallBins 4KB Page Packing**: Values $<2$ KB are packed into aligned 4KB disk bins to eliminate NVMe space amplification.
-- **Direct I/O (`O_DIRECT`)**: Bypass Linux Page Cache overhead with hardware-aligned DMA writes and reads (`RUDIS_DIRECT_IO=1`).
+- **Direct I/O (`O_DIRECT`)**: Bypasses Linux Page Cache overhead with hardware-aligned DMA writes and reads (`RUDIS_DIRECT_IO=1`).
 - **Zero-Copy Online GC / Hole-Punching**: Reclaims NVMe storage on deletion via Linux `fallocate(FALLOC_FL_PUNCH_HOLE)` (`TIER GC`).
-- **Transparent Async Retrieval**: Any access (`GET`, `DUMP`, etc.) to a tiered key transparently reads from disk via `io_uring` without blocking the event loop or other connections.
-- **Bulk Operations & Metrics**: `TIER SPILLALL`, `TIER COOLALL`, and `TIER INFO` / `INFO storage` report live telemetry on disk footprint, RAM saved, and coalesced I/O.
+- **Transparent Async Retrieval**: Any access (`GET`, `DUMP`, etc.) to a tiered key transparently reads from disk via `io_uring` without blocking worker event loops.
 
-### 6. Zero-Copy Tiered Snapshots (`FICLONE` / Reflink CoW)
+### 2. Zero-Copy Tiered Snapshots (`FICLONE` / Reflink CoW)
 Rudis supports sub-millisecond, zero-copy snapshots of tiered storage on NVMe filesystems supporting copy-on-write (Btrfs, XFS reflink, ZFS, OCFS2):
 - **`TIER SNAPSHOT <dir>` / `TIER BACKUP <dir>`**: Dispatches parallel snapshot commands across all thread shards.
 - Uses kernel `ioctl(FICLONE)` reflink cloning with automatic fallbacks to `copy_file_range` and streaming copy.
 - Atomically creates point-in-time storage checkpoints with metadata manifests in $<1$ ms without stopping traffic or locking workers.
 
-### 7. Vector Search & SQ8 Quantization Engine (HNSW)
+### 3. Vector Search & Quantization Engine (HNSW, SQ8, PQ & ADC)
 Rudis includes an integrated Hierarchical Navigable Small World (HNSW) vector index:
-- **Metrics**: Cosine distance, Euclidean $L_2$ distance, and Inner Product (IP) with SIMD-friendly loop vectorization.
-- **8-Bit Scalar Quantization (SQ8)**: Compresses 32-bit floating-point embeddings by **75%** (512 bytes $\to$ 128 bytes per 128-dim vector) with asymmetric distance scoring.
-- **Tiered Vector Storage & Rerank**: Supports keeping quantized vectors in memory while retaining raw floats on tiered NVMe storage, reranking top candidate pools for exact precision.
-- **Commands**:
-  - `VADD <index> <key> <dim0> <dim1> ... [METRIC cosine|l2|ip] [QUANTIZE/SQ8] [TIERED]`: Insert or update embeddings with optional SQ8 compression and tiered offloading.
-  - `VQUERY <index> <k> <dim0> <dim1> ... [RERANK]`: Approximate Nearest Neighbor (ANN) search returning top-$k$ nearest keys and distances, with optional two-phase exact rerank.
-  - `VSIM <index> <key1> <key2> [METRIC ...]`: Compute pairwise vector similarity directly in memory.
-  - `VDEL <index> <key>`: Remove a vector element and rewire graph edges.
-  - `VINFO <index>`: Inspect index statistics (element count, dimension, metric, max layers).
+- **Metrics**: Cosine distance, Euclidean $L_2$ distance, and Inner Product (IP) with AVX2 SIMD acceleration.
+- **8-Bit Scalar Quantization (SQ8)**: Compresses 32-bit floating-point embeddings by **75%** (512 bytes $\to$ 128 bytes per 128-dim vector) with asymmetric distance scoring and $O(1)$ cosine norm expansion.
+- **Product Quantization (PQ) & Asymmetric Distance Computation (ADC)**: Decomposes embeddings into $M$ sub-vectors mapped to centroid codebooks (**up to 96.9% memory reduction**) with precomputed $M \times 256$ ADC lookup tables.
+- **Tiered Vector Storage & Rerank**: Keeps quantized codes in memory while storing full-precision vectors on tiered NVMe storage, reranking top candidates pool for exact precision.
 
-### 8. Modern Redis 7 / Valkey Parity & Client Tracking
+### 4. Modern Redis 7 / Valkey Parity & Client Tracking
 - **RESP3 Protocol**: Full protocol negotiation via `HELLO 3`, native RESP3 maps (`%`), sets (`~`), and push frames (`>`).
-- **Client-Side Caching (`CLIENT TRACKING`)**: High-performance invalidation broadcasts (`CLIENT TRACKING on [BCAST] [PREFIX ...]`). Subscribed clients receive asynchronous push notifications (`>2 invalidate ...`) whenever tracked keys are updated or deleted.
-- **Redis 7 Functions Engine**: Standalone, persistent Lua library routines loaded via `FUNCTION LOAD #!lua name=<lib>`, invoked with `FCALL <func> <numkeys> [key ...] [arg ...]`, queried via `FUNCTION LIST`, and purged via `FUNCTION DELETE <lib>`.
+- **Client-Side Caching (`CLIENT TRACKING`)**: Invalidation broadcasts (`CLIENT TRACKING on [BCAST] [PREFIX ...]`). Subscribed clients receive asynchronous push notifications (`>2 invalidate ...`) whenever tracked keys are updated or deleted.
+- **Redis 7 Functions Engine**: Standalone, persistent Lua library routines loaded via `FUNCTION LOAD #!lua name=<lib>`, invoked with `FCALL`, queried via `FUNCTION LIST`, and purged via `FUNCTION DELETE`.
 
-### 9. Jemalloc Per-Core Memory Allocator & Live Telemetry
-- Pinned to `tikv-jemallocator` as the global memory allocator for minimal lock contention and reduced memory fragmentation.
-- `INFO memory` outputs detailed jemalloc statistics via `tikv-jemalloc-ctl`:
-  - `used_memory_rss`, `allocator_allocated`, `allocator_active`, `allocator_resident`, `allocator_metadata`, and `mem_fragmentation_ratio`.
-
-### 10. Hardware-Accelerated Linux Kernel TLS (kTLS)
+### 5. Hardware-Accelerated Linux Kernel TLS (kTLS)
 Rudis supports zero-copy Transport Layer Security powered by `rustls` and Linux Kernel TLS (`kTLS`):
 - **User-Space Handshake**: Completes standard TLS 1.2/1.3 handshakes in user space via `rustls`.
 - **Kernel-Level Offload**: Once negotiated, symmetric cipher states (`TCP_ULP` $\to$ `tls`) offload encryption/decryption directly to the Linux kernel.
-- **Zero-Copy `io_uring` Pipelines**: Ingress and egress payloads bypass user-space encryption buffers, allowing direct DMA data transfers to and from NICs with AES-GCM acceleration.
+- **Zero-Copy `io_uring` Pipelines**: Ingress and egress payloads bypass user-space encryption buffers, allowing direct DMA data transfers to and from NICs with hardware AES-GCM acceleration.
 
-### 11. Active-Active Multi-Region Replication (CRDTs & Tombstone GC)
+### 6. Active-Active Multi-Region Replication (CRDTs & Tombstone GC)
 Rudis features a conflict-free replicated data type (CRDT) engine for leaderless, multi-datacenter active-active clusters:
 - **16-Byte Hybrid Logical Clocks (HLC)**: Monotonic physical time + logical counter guaranteeing causal ordering across asynchronous distributed nodes.
-- **Data Types**:
-  - **LWW-Register**: Last-Write-Wins registers with deterministic node-ID tiebreaking.
-  - **OR-Set**: Observed-Remove Sets supporting concurrent additions and deletions with add-wins semantics.
-  - **PN-Counter**: Positive-Negative distributed counters enabling atomic concurrent increments and decrements.
+- **Data Types**: LWW-Register, Observed-Remove Set (OR-Set), and Positive-Negative Counter (PN-Counter).
 - **Automated Tombstone TTL Garbage Collection**: Prunes deletion tombstones (`CRDT.GC [ttl_ms]`) to prevent metadata bloat without sacrificing convergence.
-- **Commands**: `CRDT.SET`, `CRDT.GET`, `CRDT.DEL`, `CRDT.INCRBY`, `CRDT.SADD`, `CRDT.SMEMBERS`, `CRDT.SREM`, `CRDT.DUMP`, `CRDT.MERGE`, `CRDT.GC`.
 
-### 12. Hardware Zero-Copy Network I/O (`io_uring` Fixed Buffers & `SO_ZEROCOPY`)
-Rudis leverages modern Linux kernel capabilities to eliminate intermediate memory copies on network I/O:
+### 7. Hardware Zero-Copy Network I/O (`io_uring` Fixed Buffers & `SO_ZEROCOPY`)
 - **Registered Fixed Buffers (`IORING_REGISTER_BUFFERS`)**: Memory pages (4KB-aligned) are pre-registered with the kernel during startup via `RegisteredBufferPool`. The kernel pins page frames directly, avoiding `get_user_pages` and page table walks during high-throughput `io_uring` reads and writes.
-- **Linux `SO_ZEROCOPY` & `send_zc` (`MSG_ZEROCOPY`)**: Bypasses kernel skb socket buffer allocations by allowing network interface cards (NICs) to perform direct DMA reads from user-space memory buffers, generating asynchronous completion notifications on the kernel error queue.
-- **Zero-Copy Engine Stats**: Live atomic telemetry (`zc_send_calls`, `zc_bytes_sent`, `fallback_send_calls`, `registered_buffer_hits`) monitoring zero-copy data paths.
+- **Linux `SO_ZEROCOPY` & `send_zc` (`MSG_ZEROCOPY`)**: Bypasses kernel skb socket buffer allocations by allowing network interface cards (NICs) to perform direct DMA reads from user-space memory buffers.
 
-### 13. SIMD Hardware Acceleration for Vector Search (AVX2 + FMA)
-Rudis features AVX2 + FMA SIMD optimizations for high-throughput vector queries:
-- **16-Lane Unrolled Float32 Dot Product & $L_2$ Distance**: Processes 16 single-precision floats per loop cycle utilizing `_mm256_fmadd_ps` fused multiply-add, achieving single-cycle accumulation with horizontal vector sums.
-- **SIMD Asymmetric SQ8 Distance Scoring**: Directly loads 8-bit unsigned integer quantized codes into `__m128i`, unpacks them into 32-bit integer vectors with `_mm256_cvtepu8_epi32`, converts them to `f32` vectors via `_mm256_cvtepi32_ps`, and multiply-accumulates with query float vectors using FMA.
-- **$O(1)$ Cosine Norm Calculation**: Quantized vectors precompute and store their sum of squared quantized values ($\sum d_i^2$) on ingest. Using algebraic expansion ($\text{norm\_b}^2 = D\min^2 + 2\min s \sum d_i + s^2 \sum d_i^2$), exact norms are resolved in $O(1)$ time during Cosine similarity scoring without vector scans.
-- **Runtime CPU Feature Detection**: Seamlessly switches between AVX2 hardware kernels and portable auto-vectorized fallbacks based on runtime CPU capabilities.
-
-### 14. Embedded RedisJSON Engine (RFC 8259 & JSONPath Query / Mutation Engine)
-Rudis provides native JSON document storage and deep manipulation with full RedisJSON specification parity:
-- **Hierarchical JSONPath Processing**: Full recursive selector parsing for root (`$`), property accesses (`.user`, `['name']`), wildcard fields (`.*`), array indices (`[0]`), array wildcards (`[*]`), and slice ranges (`[start:end]`).
-- **In-Place Atomic Mutations**: Modifies sub-trees in memory without re-serializing entire documents. Supports atomic integer/float increments (`JSON.NUMINCRBY`), multiplications (`JSON.NUMMULTBY`), string appends (`JSON.STRAPPEND`), and boolean toggles (`JSON.TOGGLE`).
-- **Comprehensive Command Suite**:
-  - `JSON.SET <key> <path> <json> [NX|XX]`: Store or update JSON documents with conditional existence flags.
-  - `JSON.GET <key> [path ...]`: Retrieve documents or sub-paths formatted as JSON.
-  - `JSON.DEL <key> [path]`: Atomically delete documents or sub-path keys.
-  - `JSON.TYPE <key> [path]`: Report JSON type (`object`, `array`, `string`, `integer`, `number`, `boolean`, `null`).
-  - `JSON.ARRAPPEND <key> <path> <val ...>`, `JSON.ARRLEN`, `JSON.ARRPOP`: Native array operations.
-  - `JSON.OBJKEYS <key> [path]`, `JSON.OBJLEN <key> [path]`: Object key introspection.
-  - `JSON.CLEAR <key> [path]`: Clear array or object containers in place.
-  - `JSON.MGET <key ...> <path>`: Multi-key scatter-gather JSONPath queries.
-
-### 15. Geospatial Engine (52-Bit Geohash & Haversine Distance)
-Rudis provides full Redis geospatial specification parity backed by Sorted Sets (`ZSet`):
-- **52-Bit Integer Geohash Bit-Interleaving**: Coordinates $(lon, lat)$ are normalized and interleaved into 52-bit integer scores, supporting precision up to sub-meter scales.
-- **Haversine Great-Circle Distance**: Computes accurate spherical distances across the Earth ($R = 6372.797$ km) with native conversions for meters (`m`), kilometers (`km`), miles (`mi`), and feet (`ft`).
-- **Base32 Geohash Encoding**: 11-character alphanumeric geohash strings compatible with standard Redis client tooling.
-- **Commands**:
-  - `GEOADD <key> [NX|XX|CH] <lon> <lat> <member> [...]`: Add or update geospatial coordinates stored as 52-bit geohash scores.
-  - `GEODIST <key> <m1> <m2> [unit]`: Return geodesic distance between two members.
-  - `GEOPOS <key> <member ...>`: Return coordinates $(lon, lat)$ for members, or nil for non-existent items.
-  - `GEOHASH <key> <member ...>`: Return 11-character Base32 geohash strings.
-  - `GEORADIUS <key> <lon> <lat> <radius> <unit> [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT n] [ASC|DESC]`: Query items within spherical radius.
-  - `GEORADIUSBYMEMBER <key> <member> <radius> <unit> [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT n] [ASC|DESC]`: Radius query centered on existing member.
-  - `GEOSEARCH <key> [FROMMEMBER m | FROMLONLAT lon lat] [BYRADIUS r u | BYBOX w h u] [ASC|DESC] [COUNT n] [WITHCOORD] [WITHDIST] [WITHHASH]`: Modern Redis 6.2+ multi-criterion geospatial search.
-
-### 16. Probabilistic Data Structures Engine (RedisBloom Parity)
-Rudis incorporates an enterprise-grade probabilistic engine for sub-millisecond membership testing, frequency tracking, and heavy-hitter analysis:
-- **Bloom Filter (`BF.*`)**: Optimal bit array sizing ($m = -n\ln p / (\ln 2)^2$, $k = (m/n)\ln 2$) with Kirsch-Mitzenmacher double-hashing ($h_1 + i \cdot h_2$). Commands: `BF.RESERVE`, `BF.ADD`, `BF.MADD`, `BF.EXISTS`, `BF.MEXISTS`, `BF.INFO`.
-- **Cuckoo Filter (`CF.*`)**: 4-slot bucket table with 16-bit fingerprints and alternate-index XOR hashing. Supports item deletions and cuckoo displacement kicks (up to 500 kicks). Commands: `CF.RESERVE`, `CF.ADD`, `CF.ADDNX`, `CF.EXISTS`, `CF.DEL`, `CF.INFO`.
-- **Count-Min Sketch (`CMS.*`)**: Sub-linear frequency tracking table $(\text{width}, \text{depth})$ parameterized by dimensions or error tolerance ($\epsilon, \delta$). Minimum point queries avoid over-counting. Commands: `CMS.INITBYDIM`, `CMS.INITBYPROB`, `CMS.INCRBY`, `CMS.QUERY`, `CMS.INFO`.
-- **Top-K Heavy Hitters (`TOPK.*`)**: Space-Saving algorithm maintaining exact top-$k$ frequent elements in streaming workloads with constant-time updates and min-element replacement. Commands: `TOPK.RESERVE`, `TOPK.ADD`, `TOPK.QUERY`, `TOPK.LIST`, `TOPK.INFO`.
-
-### 17. Product Quantization (PQ) & Asymmetric Distance Computation (ADC)
-Rudis extends its HNSW vector engine with Product Quantization (PQ) and Asymmetric Distance Computation (ADC) for ultra-compact vector indexing:
-- **Sub-Vector Codebook Quantization**: Decomposes $D$-dimensional embeddings into $M$ sub-vectors of dimension $D/M$. Each sub-space maps to 256 orthogonal and pseudo-randomly distributed centroids, compressing vectors into $M$ 8-bit byte codes (**up to 96.9% memory reduction**).
-- **Asymmetric Distance Computation (ADC)**: When querying, an $M \times 256$ distance lookup table between query sub-vectors and centroids is computed once. HNSW graph traversals resolve vector distance in $O(M)$ lookups without unpacking codes.
-- **Two-Stage Retrieval & Exact Rerank**: Supports candidate pool expansion followed by exact Float32 reranking for maximum precision.
-- **Commands**: `VADD <index> <key> <coords...> PQ [TIERED]`, `VQUERY <index> <k> <coords...> [RERANK]`.
-
-### 18. Redis Cluster Bus Protocol & Consensus-Based Automated Failover
-Rudis includes full Redis Cluster bus protocol implementation, dynamic multi-node introspection, and consensus-driven failover:
-- **Dedicated Cluster Bus Port (`port + 10000`)**: Independent gossip networking thread handling bidirectional peer heartbeats, transitive topology dissemination, and consensus voting without latency impact on client data planes.
-- **Modern Topology Introspection**:
-  - `CLUSTER SLOTS`: Dynamic multi-node slot mappings across all cluster shards with automatic single-node fallback for legacy clients.
-  - `CLUSTER SHARDS`: Redis 7 / Valkey specification reporting nested `slots` arrays and `nodes` attribute maps (`id`, `port`, `ip`, `endpoint`, `role`, `replication-offset`, `health`).
-  - `CLUSTER LINKS`: Active peer bus link telemetry monitoring connection direction (`to`/`from`), remote node ID, creation timestamp, event flags (`r`/`w`), and memory buffer allocations.
-- **Slot Mutation Commands**:
-  - `CLUSTER ADDSLOTS`, `CLUSTER DELSLOTS`, `CLUSTER ADDSLOTSRANGE`, `CLUSTER DELSLOTSRANGE`: Dynamic runtime slot repartitioning with range compaction and bounds validation.
-- **Dynamic Request Routing (`-MOVED` Redirection)**:
-  - Automatically redirects client commands with `-MOVED <slot> <target_ip>:<target_port>` when queried for keys belonging to peer masters, complementing live migration redirection (`-ASK` and `ASKING`).
-- **Raft-Like Consensus Automated Failover**:
-  - Replicas continuously track master heartbeats and detect failures via gossip timeout flags (`fail?` / `fail`).
-  - Initiates candidate elections by incrementing `current_epoch` and broadcasting `FAILOVER_AUTH_REQUEST <replica_id> <epoch> <master_id>`.
-  - Active cluster masters vote at most once per epoch with `FAILOVER_AUTH_ACK`.
-  - Upon achieving majority quorum, the candidate promotes to master, inherits slot ranges, broadcasts `FAILOVER_ANNOUNCE`, and seamlessly transitions replication roles.
-
-### 19. RediSearch Full-Text Search, BM25 Relevance Scoring & Hybrid Vector Retrieval
-Rudis provides native secondary indexing and full-text search with RediSearch specification parity:
-- **Inverted Index & Text Tokenization**: Real-time tokenization, stop-word elimination, suffix stemming, and prefix indexing (`term*`).
-- **Okapi BM25 Ranking**: Industry-standard $k_1 = 1.2, b = 0.75$ document scoring with document length normalization and inverse document frequency (IDF).
-- **Multi-Type Schema Support**:
-  - `TEXT`: Weighted, sortable, stemmable text fields.
-  - `NUMERIC`: Range queries (`@price:[min max]`) and sorting (`SORTBY`).
-  - `TAG`: Exact multi-tag filters (`@category:{electronics | books}`) with custom separators.
-  - `VECTOR`: Integrated HNSW indexing for hybrid search.
-- **Hybrid Search & Reciprocal Rank Fusion (RRF)**: Merges text BM25 ranking and vector cosine similarity using rank-based fusion ($RRF(d) = \sum \frac{1}{60 + \text{rank}(d)}$).
-- **Automatic Lifecycle Hooks**: Transparently indexes documents upon `HSET`, `HMSET`, or `JSON.SET`, and removes postings upon `DEL`.
-- **Commands**: `FT.CREATE`, `FT.SEARCH`, `FT.INFO`, `FT.DROPINDEX`, `FT.EXPLAIN`, `FT.ADD`.
-
-### 20. AF_XDP (eXpress Data Path) Kernel Bypass & eBPF Wire-Speed Ingress Filter
-Rudis incorporates an advanced Linux kernel-bypass networking subsystem powered by AF_XDP and eBPF:
-- **Zero-Copy AF_XDP (XSK) Architecture**: Direct packet delivery from network interface cards (NICs) into pre-allocated userspace memory (UMEM) rings, bypassing Linux sk_buff overhead and conntrack tables.
-- **eBPF Wire-Speed Packet Filter**: Evaluates CIDR block/pass rules at driver/NIC speed (`XDP_DROP`, `XDP_PASS`, `XDP_REDIRECT`), dropping flood traffic before socket or memory allocations.
-- **Per-IP Token Bucket Rate Limiting**: Built-in algorithmic rate limiter throttling malicious flood sources at L2/L3.
-- **Multi-Mode Operation**: Driver mode (native hardware offload), SKB mode (generic Linux XDP), and userspace simulated bypass mode.
-- **Commands**: `XDP.INFO`, `XDP.RULE ADD/DEL/LIST`, `XDP.STATS`, `XDP.PACKET` (packet diagnostics).
-
-### 21. Dragonfly Compatibility Suite (`DFLYCLUSTER`, `STICK`, `DELEX`, & Dual-Protocol Memcached Gateway)
-Rudis provides complete feature parity with Dragonfly's unique non-Redis extensions:
-- **DFLYCLUSTER Suite**: Dragonfly native cluster control plane commands:
-  - `DFLYCLUSTER MYID`: Queries unique node identifier.
-  - `DFLYCLUSTER CONFIG <json>`: Dynamically configures node roles and hash slot ownership via JSON configuration payload.
-  - `DFLYCLUSTER GETSLOTINFO SLOTS slot1 [slot2 ...]`: Returns granular metadata, key counts, and memory consumption per slot.
-  - `DFLYCLUSTER FLUSHSLOTS start end [start end ...]`: Atomically and efficiently flushes all keys belonging to specific slot ranges across shards.
-  - `DFLYCLUSTER SLOT-MIGRATION-STATUS`: Inspects real-time slot migration states and progress.
-- **DFLYMIGRATE Suite**: Dragonfly slot migration orchestration (`DFLYMIGRATE INIT`, `DFLYMIGRATE FLOW`, `DFLYMIGRATE ACK`).
-- **Cache Eviction Protection (`STICK`, `UNSTICK`, `STICKY`)**: Dragonfly's proprietary cache key pinning mechanism to prevent critical keys from ever being evicted or offloaded to NVMe tiering during memory pressure.
-- **Conditional Deletion (`DELEX`)**: Dragonfly's atomic conditional deletion command based on value comparisons (`IFEQ`, `IFNE`, `IFGT`, `IFLT`).
-- **Dual-Protocol Memcached Gateway**: Unified server supporting the standard text-based Memcached protocol (`set`, `add`, `replace`, `get`, `delete`, `incr`, `decr`, `stats`, `version`, `quit`), sharing database 0 with standard Redis clients with zero operational overhead.
+### 8. Dragonfly Compatibility Suite
+- **Cluster Control Plane**: Full support for Dragonfly's cluster management commands (`DFLYCLUSTER MYID`, `CONFIG`, `GETSLOTINFO`, `FLUSHSLOTS`, `SLOT-MIGRATION-STATUS`) and migration orchestration (`DFLYMIGRATE INIT`, `FLOW`, `ACK`).
+- **Cache Eviction Protection (`STICK`, `UNSTICK`, `STICKY`)**: Pins hot keys in DRAM, preventing them from being evicted or offloaded to NVMe tiering during memory pressure.
+- **Conditional Deletion (`DELEX`)**: Atomic conditional deletions based on value equality or numerical comparisons (`IFEQ`, `IFNE`, `IFGT`, `IFLT`).
+- **Dual-Protocol Memcached Gateway**: Unified server supporting the standard text-based Memcached protocol (`set`, `add`, `replace`, `get`, `delete`, `incr`, `decr`, `stats`, `version`, `quit`), sharing database 0 with standard Redis clients with zero overhead.
 
 ---
 
@@ -306,7 +599,6 @@ Detailed write-batching benchmark document: [docs/benchmarks/write_batching.md](
 
 Detailed baseline benchmark document: [docs/benchmarks/baseline.md](docs/benchmarks/baseline.md)
 
-
 | Server Threads | Throughput (Ops/sec) | Bandwidth (MB/s) | Avg Latency (ms) | p50 (ms) | p99 (ms) |
 | :---: | :---: | :---: | :---: | :---: | :---: |
 | **1** | 60,487.24 | 63.26 | 52.87 | 53.50 | 80.90 |
@@ -327,31 +619,38 @@ rudis/
 │   └── benchmarks/
 │       ├── baseline.md        # Detailed 1-32 thread baseline results
 │       ├── tiered_storage.md  # NVMe tiered storage benchmark vs Dragonfly
-│       └── vector_search.md   # HNSW vector search and SQ8 quantization benchmark
+│       ├── vector_search.md   # HNSW vector search and SQ8 quantization benchmark
+│       └── write_batching.md  # High-depth write-batching benchmark
 ├── src/
-│   ├── main.rs         # CLI argument parsing, thread spawning, mesh setup
-│   ├── lib.rs          # Library root exporting modules
-│   ├── allocator.rs    # jemalloc profiling and memory statistics
+│   ├── main.rs          # CLI argument parsing, thread pinning, mesh setup
+│   ├── lib.rs           # Library root exporting modules
+│   ├── acl.rs           # Access Control List (ACL) engine and user rules
+│   ├── allocator.rs     # jemalloc profiling and memory statistics
+│   ├── aof.rs           # Append-Only File (AOF) persistence and rewrite engine
+│   ├── block.rs         # Blocking commands manager (BLPOP, BRPOP, BLMOVE, XREAD BLOCK)
 │   ├── bin/
 │   │   └── vector_bench.rs # Standalone vector benchmark suite
-│   ├── cluster.rs      # Redis Cluster bus protocol (port + 10000), gossip, consensus voting
-│   ├── connection.rs   # TCP connection handler, RESP3 push, and command dispatcher
-│   ├── crdt.rs         # Active-Active multi-region CRDT engine (HLC, LWW, OR-Set, PN-Counter)
-│   ├── geo.rs          # 52-bit geohash encoding, Haversine distance, and geospatial queries
-│   ├── json.rs         # RFC 8259 RedisJSON engine with deep JSONPath navigation and mutations
-│   ├── probabilistic.rs# Bloom, Cuckoo, Count-Min Sketch, and Top-K probabilistic structures
-│   ├── resp.rs         # RESP2/RESP3 & inline frame parser and serializer
-│   ├── router.rs       # CRC16 key partitioner and cross-core message dispatcher
-│   ├── scripting.rs    # Lua scripting and Redis 7 Function engine
-│   ├── search.rs       # RediSearch full-text engine, BM25 scoring, inverted index, RRF
-│   ├── shard.rs        # Thread-local in-memory key-value database and message types
-│   ├── tiering.rs      # NVMe tiered storage, io_uring Direct I/O, zero-copy snapshots
-│   ├── tls.rs          # Hardware-accelerated Linux Kernel TLS (kTLS) and rustls integration
-│   ├── vector.rs       # HNSW vector search engine, AVX2 SIMD acceleration, SQ8 quantization
-│   ├── xdp.rs          # AF_XDP kernel bypass, eBPF wire-speed packet filter, UMEM rings
-│   └── zerocopy.rs     # SO_ZEROCOPY and io_uring fixed registered buffer pool
+│   ├── cluster.rs       # Redis Cluster bus (port + 10000), gossip, consensus failover, Dragonfly cluster
+│   ├── connection.rs    # TCP connection handler, RESP3 push, command batching, Memcached parser
+│   ├── crdt.rs          # Active-Active multi-region CRDT engine (HLC, LWW, OR-Set, PN-Counter)
+│   ├── geo.rs           # 52-bit geohash encoding, Haversine distance, and geospatial queries
+│   ├── json.rs          # RFC 8259 RedisJSON engine with deep JSONPath navigation and mutations
+│   ├── probabilistic.rs # Bloom, Cuckoo, Count-Min Sketch, and Top-K probabilistic structures
+│   ├── pubsub.rs        # Pub/Sub hub, channel and pattern dispatching
+│   ├── replication.rs   # Master-replica replication hub, PSYNC, and replication offset tracking
+│   ├── resp.rs          # RESP2/RESP3 & inline frame parser and serializer
+│   ├── router.rs        # CRC16 key partitioner and cross-core message dispatcher
+│   ├── scripting.rs     # Lua scripting and Redis 7 Function engine
+│   ├── search.rs        # RediSearch full-text engine, BM25 scoring, inverted index, RRF
+│   ├── server.rs        # Shared server context, background tasks, and signal handling
+│   ├── shard.rs         # Thread-local in-memory key-value database and message types
+│   ├── table.rs         # Data structures (String, Hash, List, Set, SortedSet, Stream)
+│   ├── tiering.rs       # NVMe tiered storage, io_uring Direct I/O, zero-copy snapshots
+│   ├── tls.rs           # Hardware-accelerated Linux Kernel TLS (kTLS) and rustls integration
+│   ├── vector.rs        # HNSW vector search engine, AVX2 SIMD acceleration, SQ8 & PQ quantization
+│   ├── xdp.rs           # AF_XDP kernel bypass, eBPF wire-speed packet filter, UMEM rings
+│   └── zerocopy.rs      # SO_ZEROCOPY and io_uring fixed registered buffer pool
 └── tests/
     ├── test_cross_thread.rs # Validates cross-core eventfd waker with Monoio
-    └── test_server_e2e.rs   # Multi-shard end-to-end integration tests
+    └── test_server_e2e.rs   # 47 comprehensive end-to-end integration tests
 ```
-
