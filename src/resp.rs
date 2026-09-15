@@ -640,6 +640,7 @@ pub enum Command {
         vector: Vec<f32>,
         metric: Option<crate::vector::VectorMetric>,
         quantize: bool,
+        pq: bool,
         tiered: bool,
     },
     Vquery {
@@ -767,6 +768,140 @@ pub enum Command {
         keys: Vec<Bytes>,
         path: String,
     },
+    // GEOSPATIAL COMMANDS
+    Geoadd {
+        key: Bytes,
+        items: Vec<(f64, f64, Bytes)>,
+        nx: bool,
+        xx: bool,
+        ch: bool,
+    },
+    Geodist {
+        key: Bytes,
+        m1: Bytes,
+        m2: Bytes,
+        unit: Option<crate::geo::GeoUnit>,
+    },
+    Geopos {
+        key: Bytes,
+        members: Vec<Bytes>,
+    },
+    Geohash {
+        key: Bytes,
+        members: Vec<Bytes>,
+    },
+    Georadius {
+        key: Bytes,
+        lon: f64,
+        lat: f64,
+        radius: f64,
+        unit: crate::geo::GeoUnit,
+        withcoord: bool,
+        withdist: bool,
+        withhash: bool,
+        count: Option<usize>,
+        asc: Option<bool>,
+    },
+    Georadiusbymember {
+        key: Bytes,
+        member: Bytes,
+        radius: f64,
+        unit: crate::geo::GeoUnit,
+        withcoord: bool,
+        withdist: bool,
+        withhash: bool,
+        count: Option<usize>,
+        asc: Option<bool>,
+    },
+    Geosearch {
+        key: Bytes,
+        from_member: Option<Bytes>,
+        from_lonlat: Option<(f64, f64)>,
+        by_radius: Option<(f64, crate::geo::GeoUnit)>,
+        by_box: Option<(f64, f64, crate::geo::GeoUnit)>,
+        asc: Option<bool>,
+        count: Option<usize>,
+        withcoord: bool,
+        withdist: bool,
+        withhash: bool,
+    },
+    // PROBABILISTIC COMMANDS
+    BfReserve {
+        key: Bytes,
+        error_rate: f64,
+        capacity: usize,
+    },
+    BfAdd {
+        key: Bytes,
+        item: Bytes,
+    },
+    BfMadd {
+        key: Bytes,
+        items: Vec<Bytes>,
+    },
+    BfExists {
+        key: Bytes,
+        item: Bytes,
+    },
+    BfMexists {
+        key: Bytes,
+        items: Vec<Bytes>,
+    },
+    BfInfo(Bytes),
+    CfReserve {
+        key: Bytes,
+        capacity: usize,
+    },
+    CfAdd {
+        key: Bytes,
+        item: Bytes,
+    },
+    CfAddnx {
+        key: Bytes,
+        item: Bytes,
+    },
+    CfExists {
+        key: Bytes,
+        item: Bytes,
+    },
+    CfDel {
+        key: Bytes,
+        item: Bytes,
+    },
+    CfInfo(Bytes),
+    CmsInitbydim {
+        key: Bytes,
+        width: usize,
+        depth: usize,
+    },
+    CmsInitbyprob {
+        key: Bytes,
+        error: f64,
+        probability: f64,
+    },
+    CmsIncrby {
+        key: Bytes,
+        pairs: Vec<(Bytes, u64)>,
+    },
+    CmsQuery {
+        key: Bytes,
+        items: Vec<Bytes>,
+    },
+    CmsInfo(Bytes),
+    TopkReserve {
+        key: Bytes,
+        topk: usize,
+    },
+    TopkAdd {
+        key: Bytes,
+        items: Vec<Bytes>,
+    },
+    TopkQuery {
+        key: Bytes,
+        items: Vec<Bytes>,
+    },
+    TopkList(Bytes),
+    TopkInfo(Bytes),
     Unknown(String),
 }
 
@@ -3956,11 +4091,14 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let key = args[2].clone();
             let mut vector = Vec::with_capacity(args.len() - 3);
             let mut quantize = false;
+            let mut pq = false;
             let mut tiered = false;
             for a in &args[3..] {
                 let s = String::from_utf8_lossy(a).to_uppercase();
                 if s == "QUANTIZE" || s == "SQ8" {
                     quantize = true;
+                } else if s == "PQ" {
+                    pq = true;
                 } else if s == "TIERED" {
                     tiered = true;
                 } else {
@@ -3974,6 +4112,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 vector,
                 metric: None,
                 quantize,
+                pq,
                 tiered,
             }))
         }
@@ -4332,6 +4471,413 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let path = String::from_utf8_lossy(args.last().unwrap()).to_string();
             let keys = args[1..args.len() - 1].to_vec();
             Ok(Some(Command::JsonMget { keys, path }))
+        }
+        "GEOADD" => {
+            if args.len() < 5 {
+                return Err("wrong number of arguments for 'geoadd' command".to_string());
+            }
+            let key = args[1].clone();
+            let mut nx = false;
+            let mut xx = false;
+            let mut ch = false;
+            let mut idx = 2;
+            while idx < args.len() {
+                let opt = String::from_utf8_lossy(&args[idx]).to_uppercase();
+                if opt == "NX" {
+                    nx = true;
+                    idx += 1;
+                } else if opt == "XX" {
+                    xx = true;
+                    idx += 1;
+                } else if opt == "CH" {
+                    ch = true;
+                    idx += 1;
+                } else {
+                    break;
+                }
+            }
+            if (args.len() - idx) % 3 != 0 || idx == args.len() {
+                return Err("syntax error".to_string());
+            }
+            let mut items = Vec::new();
+            while idx < args.len() {
+                let lon: f64 = std::str::from_utf8(&args[idx])
+                    .map_err(|_| "value is not a valid float")?
+                    .parse()
+                    .map_err(|_| "value is not a valid float")?;
+                let lat: f64 = std::str::from_utf8(&args[idx + 1])
+                    .map_err(|_| "value is not a valid float")?
+                    .parse()
+                    .map_err(|_| "value is not a valid float")?;
+                let member = args[idx + 2].clone();
+                items.push((lon, lat, member));
+                idx += 3;
+            }
+            Ok(Some(Command::Geoadd { key, items, nx, xx, ch }))
+        }
+        "GEODIST" => {
+            if args.len() < 4 || args.len() > 5 {
+                return Err("wrong number of arguments for 'geodist' command".to_string());
+            }
+            let key = args[1].clone();
+            let m1 = args[2].clone();
+            let m2 = args[3].clone();
+            let unit = if args.len() == 5 {
+                Some(crate::geo::GeoUnit::parse(&String::from_utf8_lossy(&args[4]))?)
+            } else {
+                None
+            };
+            Ok(Some(Command::Geodist { key, m1, m2, unit }))
+        }
+        "GEOPOS" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'geopos' command".to_string());
+            }
+            let key = args[1].clone();
+            let members = args[2..].to_vec();
+            Ok(Some(Command::Geopos { key, members }))
+        }
+        "GEOHASH" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'geohash' command".to_string());
+            }
+            let key = args[1].clone();
+            let members = args[2..].to_vec();
+            Ok(Some(Command::Geohash { key, members }))
+        }
+        "GEORADIUS" => {
+            if args.len() < 6 {
+                return Err("wrong number of arguments for 'georadius' command".to_string());
+            }
+            let key = args[1].clone();
+            let lon: f64 = std::str::from_utf8(&args[2])
+                .map_err(|_| "value is not a valid float")?
+                .parse()
+                .map_err(|_| "value is not a valid float")?;
+            let lat: f64 = std::str::from_utf8(&args[3])
+                .map_err(|_| "value is not a valid float")?
+                .parse()
+                .map_err(|_| "value is not a valid float")?;
+            let radius: f64 = std::str::from_utf8(&args[4])
+                .map_err(|_| "value is not a valid float")?
+                .parse()
+                .map_err(|_| "value is not a valid float")?;
+            let unit = crate::geo::GeoUnit::parse(&String::from_utf8_lossy(&args[5]))?;
+            let mut withcoord = false;
+            let mut withdist = false;
+            let mut withhash = false;
+            let mut count = None;
+            let mut asc = None;
+            let mut idx = 6;
+            while idx < args.len() {
+                let opt = String::from_utf8_lossy(&args[idx]).to_uppercase();
+                match opt.as_str() {
+                    "WITHCOORD" => withcoord = true,
+                    "WITHDIST" => withdist = true,
+                    "WITHHASH" => withhash = true,
+                    "ASC" => asc = Some(true),
+                    "DESC" => asc = Some(false),
+                    "COUNT" => {
+                        if idx + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        idx += 1;
+                        let c: usize = std::str::from_utf8(&args[idx])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        count = Some(c);
+                    }
+                    _ => {}
+                }
+                idx += 1;
+            }
+            Ok(Some(Command::Georadius {
+                key, lon, lat, radius, unit, withcoord, withdist, withhash, count, asc,
+            }))
+        }
+        "GEORADIUSBYMEMBER" => {
+            if args.len() < 5 {
+                return Err("wrong number of arguments for 'georadiusbymember' command".to_string());
+            }
+            let key = args[1].clone();
+            let member = args[2].clone();
+            let radius: f64 = std::str::from_utf8(&args[3])
+                .map_err(|_| "value is not a valid float")?
+                .parse()
+                .map_err(|_| "value is not a valid float")?;
+            let unit = crate::geo::GeoUnit::parse(&String::from_utf8_lossy(&args[4]))?;
+            let mut withcoord = false;
+            let mut withdist = false;
+            let mut withhash = false;
+            let mut count = None;
+            let mut asc = None;
+            let mut idx = 5;
+            while idx < args.len() {
+                let opt = String::from_utf8_lossy(&args[idx]).to_uppercase();
+                match opt.as_str() {
+                    "WITHCOORD" => withcoord = true,
+                    "WITHDIST" => withdist = true,
+                    "WITHHASH" => withhash = true,
+                    "ASC" => asc = Some(true),
+                    "DESC" => asc = Some(false),
+                    "COUNT" => {
+                        if idx + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        idx += 1;
+                        let c: usize = std::str::from_utf8(&args[idx])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        count = Some(c);
+                    }
+                    _ => {}
+                }
+                idx += 1;
+            }
+            Ok(Some(Command::Georadiusbymember {
+                key, member, radius, unit, withcoord, withdist, withhash, count, asc,
+            }))
+        }
+        "GEOSEARCH" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'geosearch' command".to_string());
+            }
+            let key = args[1].clone();
+            let mut from_member = None;
+            let mut from_lonlat = None;
+            let mut by_radius = None;
+            let mut by_box = None;
+            let mut asc = None;
+            let mut count = None;
+            let mut withcoord = false;
+            let mut withdist = false;
+            let mut withhash = false;
+            let mut idx = 2;
+            while idx < args.len() {
+                let opt = String::from_utf8_lossy(&args[idx]).to_uppercase();
+                match opt.as_str() {
+                    "FROMMEMBER" => {
+                        if idx + 1 >= args.len() { return Err("syntax error".to_string()); }
+                        idx += 1;
+                        from_member = Some(args[idx].clone());
+                    }
+                    "FROMLONLAT" => {
+                        if idx + 2 >= args.len() { return Err("syntax error".to_string()); }
+                        let lon: f64 = std::str::from_utf8(&args[idx + 1])
+                            .map_err(|_| "value is not a valid float")?
+                            .parse().map_err(|_| "value is not a valid float")?;
+                        let lat: f64 = std::str::from_utf8(&args[idx + 2])
+                            .map_err(|_| "value is not a valid float")?
+                            .parse().map_err(|_| "value is not a valid float")?;
+                        idx += 2;
+                        from_lonlat = Some((lon, lat));
+                    }
+                    "BYRADIUS" => {
+                        if idx + 2 >= args.len() { return Err("syntax error".to_string()); }
+                        let rad: f64 = std::str::from_utf8(&args[idx + 1])
+                            .map_err(|_| "value is not a valid float")?
+                            .parse().map_err(|_| "value is not a valid float")?;
+                        let u = crate::geo::GeoUnit::parse(&String::from_utf8_lossy(&args[idx + 2]))?;
+                        idx += 2;
+                        by_radius = Some((rad, u));
+                    }
+                    "BYBOX" => {
+                        if idx + 3 >= args.len() { return Err("syntax error".to_string()); }
+                        let w: f64 = std::str::from_utf8(&args[idx + 1])
+                            .map_err(|_| "value is not a valid float")?
+                            .parse().map_err(|_| "value is not a valid float")?;
+                        let h: f64 = std::str::from_utf8(&args[idx + 2])
+                            .map_err(|_| "value is not a valid float")?
+                            .parse().map_err(|_| "value is not a valid float")?;
+                        let u = crate::geo::GeoUnit::parse(&String::from_utf8_lossy(&args[idx + 3]))?;
+                        idx += 3;
+                        by_box = Some((w, h, u));
+                    }
+                    "ASC" => asc = Some(true),
+                    "DESC" => asc = Some(false),
+                    "COUNT" => {
+                        if idx + 1 >= args.len() { return Err("syntax error".to_string()); }
+                        idx += 1;
+                        let c: usize = std::str::from_utf8(&args[idx])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse().map_err(|_| "value is not an integer or out of range")?;
+                        count = Some(c);
+                    }
+                    "WITHCOORD" => withcoord = true,
+                    "WITHDIST" => withdist = true,
+                    "WITHHASH" => withhash = true,
+                    _ => {}
+                }
+                idx += 1;
+            }
+            Ok(Some(Command::Geosearch {
+                key, from_member, from_lonlat, by_radius, by_box, asc, count, withcoord, withdist, withhash,
+            }))
+        }
+        "BF.RESERVE" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'bf.reserve' command".to_string());
+            }
+            let key = args[1].clone();
+            let error_rate: f64 = std::str::from_utf8(&args[2])
+                .map_err(|_| "not a valid float")?.parse().map_err(|_| "not a valid float")?;
+            let capacity: usize = std::str::from_utf8(&args[3])
+                .map_err(|_| "not an integer")?.parse().map_err(|_| "not an integer")?;
+            Ok(Some(Command::BfReserve { key, error_rate, capacity }))
+        }
+        "BF.ADD" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'bf.add' command".to_string());
+            }
+            Ok(Some(Command::BfAdd { key: args[1].clone(), item: args[2].clone() }))
+        }
+        "BF.MADD" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'bf.madd' command".to_string());
+            }
+            Ok(Some(Command::BfMadd { key: args[1].clone(), items: args[2..].to_vec() }))
+        }
+        "BF.EXISTS" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'bf.exists' command".to_string());
+            }
+            Ok(Some(Command::BfExists { key: args[1].clone(), item: args[2].clone() }))
+        }
+        "BF.MEXISTS" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'bf.mexists' command".to_string());
+            }
+            Ok(Some(Command::BfMexists { key: args[1].clone(), items: args[2..].to_vec() }))
+        }
+        "BF.INFO" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'bf.info' command".to_string());
+            }
+            Ok(Some(Command::BfInfo(args[1].clone())))
+        }
+        "CF.RESERVE" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'cf.reserve' command".to_string());
+            }
+            let key = args[1].clone();
+            let capacity: usize = std::str::from_utf8(&args[2])
+                .map_err(|_| "not an integer")?.parse().map_err(|_| "not an integer")?;
+            Ok(Some(Command::CfReserve { key, capacity }))
+        }
+        "CF.ADD" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'cf.add' command".to_string());
+            }
+            Ok(Some(Command::CfAdd { key: args[1].clone(), item: args[2].clone() }))
+        }
+        "CF.ADDNX" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'cf.addnx' command".to_string());
+            }
+            Ok(Some(Command::CfAddnx { key: args[1].clone(), item: args[2].clone() }))
+        }
+        "CF.EXISTS" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'cf.exists' command".to_string());
+            }
+            Ok(Some(Command::CfExists { key: args[1].clone(), item: args[2].clone() }))
+        }
+        "CF.DEL" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'cf.del' command".to_string());
+            }
+            Ok(Some(Command::CfDel { key: args[1].clone(), item: args[2].clone() }))
+        }
+        "CF.INFO" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'cf.info' command".to_string());
+            }
+            Ok(Some(Command::CfInfo(args[1].clone())))
+        }
+        "CMS.INITBYDIM" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'cms.initbydim' command".to_string());
+            }
+            let key = args[1].clone();
+            let width: usize = std::str::from_utf8(&args[2])
+                .map_err(|_| "not an integer")?.parse().map_err(|_| "not an integer")?;
+            let depth: usize = std::str::from_utf8(&args[3])
+                .map_err(|_| "not an integer")?.parse().map_err(|_| "not an integer")?;
+            Ok(Some(Command::CmsInitbydim { key, width, depth }))
+        }
+        "CMS.INITBYPROB" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'cms.initbyprob' command".to_string());
+            }
+            let key = args[1].clone();
+            let error: f64 = std::str::from_utf8(&args[2])
+                .map_err(|_| "not a valid float")?.parse().map_err(|_| "not a valid float")?;
+            let probability: f64 = std::str::from_utf8(&args[3])
+                .map_err(|_| "not a valid float")?.parse().map_err(|_| "not a valid float")?;
+            Ok(Some(Command::CmsInitbyprob { key, error, probability }))
+        }
+        "CMS.INCRBY" => {
+            if args.len() < 4 || (args.len() - 2) % 2 != 0 {
+                return Err("wrong number of arguments for 'cms.incrby' command".to_string());
+            }
+            let key = args[1].clone();
+            let mut pairs = Vec::new();
+            let mut i = 2;
+            while i < args.len() {
+                let item = args[i].clone();
+                let inc: u64 = std::str::from_utf8(&args[i + 1])
+                    .map_err(|_| "not an integer")?.parse().map_err(|_| "not an integer")?;
+                pairs.push((item, inc));
+                i += 2;
+            }
+            Ok(Some(Command::CmsIncrby { key, pairs }))
+        }
+        "CMS.QUERY" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'cms.query' command".to_string());
+            }
+            Ok(Some(Command::CmsQuery { key: args[1].clone(), items: args[2..].to_vec() }))
+        }
+        "CMS.INFO" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'cms.info' command".to_string());
+            }
+            Ok(Some(Command::CmsInfo(args[1].clone())))
+        }
+        "TOPK.RESERVE" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'topk.reserve' command".to_string());
+            }
+            let key = args[1].clone();
+            let topk: usize = std::str::from_utf8(&args[2])
+                .map_err(|_| "not an integer")?.parse().map_err(|_| "not an integer")?;
+            Ok(Some(Command::TopkReserve { key, topk }))
+        }
+        "TOPK.ADD" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'topk.add' command".to_string());
+            }
+            Ok(Some(Command::TopkAdd { key: args[1].clone(), items: args[2..].to_vec() }))
+        }
+        "TOPK.QUERY" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'topk.query' command".to_string());
+            }
+            Ok(Some(Command::TopkQuery { key: args[1].clone(), items: args[2..].to_vec() }))
+        }
+        "TOPK.LIST" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'topk.list' command".to_string());
+            }
+            Ok(Some(Command::TopkList(args[1].clone())))
+        }
+        "TOPK.INFO" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'topk.info' command".to_string());
+            }
+            Ok(Some(Command::TopkInfo(args[1].clone())))
         }
         _ => Ok(Some(Command::Unknown(cmd_name))),
 

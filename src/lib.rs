@@ -19,6 +19,8 @@ pub mod tls;
 pub mod vector;
 pub mod zerocopy;
 pub mod json;
+pub mod geo;
+pub mod probabilistic;
 
 
 #[global_allocator]

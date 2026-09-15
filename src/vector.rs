@@ -410,6 +410,116 @@ impl QuantizedVector {
     }
 }
 
+/// Product Quantization (PQ) with Asymmetric Distance Computation (ADC).
+/// Decomposes D-dimensional vectors into M sub-vectors of dimension (D/M),
+/// compressing vectors by up to 96.9% (e.g. 128-dim Float32 512 bytes -> 16 bytes).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PQVector {
+    pub codes: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProductQuantizer {
+    pub dim: usize,
+    pub m: usize,
+    pub d_sub: usize,
+    pub codebooks: Vec<Vec<Vec<f32>>>,
+}
+
+impl ProductQuantizer {
+    pub fn new(dim: usize, m: usize) -> Self {
+        let m = m.max(1);
+        let d_sub = (dim / m).max(1);
+        let mut codebooks = Vec::with_capacity(m);
+        for sub in 0..m {
+            let mut centroids = Vec::with_capacity(256);
+            for c in 0..256 {
+                let mut centroid = vec![0.0f32; d_sub];
+                if c == 0 {
+                    // Zero vector
+                } else if c <= d_sub {
+                    // Positive basis vector
+                    centroid[c - 1] = 1.0;
+                } else if c <= 2 * d_sub {
+                    // Negative basis vector
+                    centroid[c - d_sub - 1] = -1.0;
+                } else {
+                    for i in 0..d_sub {
+                        let mut h = (c as u64).wrapping_mul(0x9E3779B97F4A7C15)
+                            ^ ((sub + 1) as u64).wrapping_mul(0xC6A4A7935BD1E995)
+                            ^ ((i + 1) as u64).wrapping_mul(0x517CC1B727220A95);
+                        h = (h ^ (h >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                        h = (h ^ (h >> 27)).wrapping_mul(0x94D049BB133111EB);
+                        h ^= h >> 31;
+                        centroid[i] = ((h & 0xFFFF) as f32 / 32767.5) - 1.0;
+                    }
+                }
+                centroids.push(centroid);
+            }
+            codebooks.push(centroids);
+        }
+        Self { dim, m, d_sub, codebooks }
+    }
+
+    pub fn encode(&self, v: &[f32]) -> PQVector {
+        let mut codes = Vec::with_capacity(self.m);
+        for m in 0..self.m {
+            let start = m * self.d_sub;
+            let end = (start + self.d_sub).min(v.len());
+            let sub_v = &v[start..end];
+            let mut best_c = 0u8;
+            let mut best_dist = f32::INFINITY;
+            for (c, centroid) in self.codebooks[m].iter().enumerate() {
+                let mut dist = 0.0f32;
+                for (i, &x) in sub_v.iter().enumerate() {
+                    let diff = x - centroid[i];
+                    dist += diff * diff;
+                }
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_c = c as u8;
+                }
+            }
+            codes.push(best_c);
+        }
+        PQVector { codes }
+    }
+
+    pub fn compute_distance_table(&self, query: &[f32]) -> Vec<[f32; 256]> {
+        let mut table = vec![[0.0f32; 256]; self.m];
+        for m in 0..self.m {
+            let start = m * self.d_sub;
+            let end = (start + self.d_sub).min(query.len());
+            let sub_q = &query[start..end];
+            for c in 0..256 {
+                let centroid = &self.codebooks[m][c];
+                let mut sq = 0.0f32;
+                for (i, &q) in sub_q.iter().enumerate() {
+                    let diff = q - centroid[i];
+                    sq += diff * diff;
+                }
+                table[m][c] = sq;
+            }
+        }
+        table
+    }
+
+    #[inline]
+    pub fn compute_distance_adc(&self, table: &[[f32; 256]], pq: &PQVector) -> f32 {
+        let mut sum = 0.0f32;
+        for (m, &c) in pq.codes.iter().enumerate() {
+            if m < table.len() {
+                sum += table[m][c as usize];
+            }
+        }
+        sum
+    }
+
+    pub fn compute_distance_with_vec(&self, query: &[f32], pq: &PQVector) -> f32 {
+        let table = self.compute_distance_table(query);
+        self.compute_distance_adc(&table, pq)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct HnswNode {
@@ -417,6 +527,7 @@ pub struct HnswNode {
     pub key: Bytes,
     pub vector: Vec<f32>,
     pub quantized: Option<QuantizedVector>,
+    pub pq: Option<PQVector>,
     pub is_tiered: bool,
     /// Neighbors at each layer [0..layer]
     pub neighbors: Vec<Vec<usize>>,
@@ -478,6 +589,7 @@ pub struct HnswIndex {
     pub max_layer: usize,
     pub nodes: Vec<Option<HnswNode>>,
     pub key_to_id: HashMap<Bytes, usize>,
+    pub pq_quantizer: Option<ProductQuantizer>,
     rng_state: u64,
 }
 
@@ -499,8 +611,13 @@ impl HnswIndex {
             max_layer: 0,
             nodes: Vec::new(),
             key_to_id: HashMap::new(),
+            pq_quantizer: None,
             rng_state: 0x853c49e6748fea9b,
         }
+    }
+
+    pub fn enable_pq(&mut self, m: usize) {
+        self.pq_quantizer = Some(ProductQuantizer::new(self.dim, m));
     }
 
     fn next_random_f64(&mut self) -> f64 {
@@ -532,6 +649,11 @@ impl HnswIndex {
 
     #[inline]
     pub fn dist_to_node(&self, query: &[f32], node: &HnswNode) -> f32 {
+        if let Some(pq) = &node.pq {
+            if let Some(quantizer) = &self.pq_quantizer {
+                return quantizer.compute_distance_with_vec(query, pq);
+            }
+        }
         if let Some(quant) = &node.quantized {
             quant.compute_distance(query, self.metric)
         } else {
@@ -552,6 +674,18 @@ impl HnswIndex {
         quantize: bool,
         tiered: bool,
     ) -> Result<(), &'static str> {
+        self.add_quantized_ext(key, vector, quantize, false, tiered)
+    }
+
+    /// Adds or updates a vector with flexible quantization (SQ8 or PQ) and tiered storage.
+    pub fn add_quantized_ext(
+        &mut self,
+        key: Bytes,
+        vector: Vec<f32>,
+        quantize_sq8: bool,
+        quantize_pq: bool,
+        tiered: bool,
+    ) -> Result<(), &'static str> {
         if vector.len() != self.dim {
             return Err("vector dimension mismatch");
         }
@@ -564,8 +698,18 @@ impl HnswIndex {
         let target_level = self.random_level();
         let new_id = self.nodes.len();
 
-        let quantized = if quantize || tiered {
+        let quantized = if quantize_sq8 || (tiered && !quantize_pq) {
             Some(QuantizedVector::quantize(&vector))
+        } else {
+            None
+        };
+
+        let pq = if quantize_pq {
+            if self.pq_quantizer.is_none() {
+                let m = (self.dim / 8).max(1).min(16);
+                self.pq_quantizer = Some(ProductQuantizer::new(self.dim, m));
+            }
+            self.pq_quantizer.as_ref().map(|q| q.encode(&vector))
         } else {
             None
         };
@@ -575,6 +719,7 @@ impl HnswIndex {
             key: key.clone(),
             vector: vector.clone(),
             quantized,
+            pq,
             is_tiered: tiered,
             neighbors: vec![Vec::new(); target_level + 1],
         };
@@ -889,5 +1034,32 @@ mod tests {
 
         let res_rerank = index.search_tiered(&query, 1, true);
         assert_eq!(res_rerank[0].0, Bytes::from("k1"));
+    }
+
+    #[test]
+    fn test_pq_quantization_and_adc() {
+        let dim = 16;
+        let m = 4;
+        let pq = ProductQuantizer::new(dim, m);
+        let v1 = vec![0.5; dim];
+        let v2 = vec![-0.5; dim];
+
+        let code1 = pq.encode(&v1);
+        let code2 = pq.encode(&v2);
+        assert_eq!(code1.codes.len(), m);
+        assert_eq!(code2.codes.len(), m);
+
+        let query = vec![0.48; dim];
+        let d1 = pq.compute_distance_with_vec(&query, &code1);
+        let d2 = pq.compute_distance_with_vec(&query, &code2);
+        assert!(d1 < d2, "v1 should be much closer to query than v2: d1={}, d2={}", d1, d2);
+
+        let mut index = HnswIndex::new("pq_idx".to_string(), dim, VectorMetric::L2);
+        index.add_quantized_ext(Bytes::from("doc_pos"), v1, false, true, false).unwrap();
+        index.add_quantized_ext(Bytes::from("doc_neg"), v2, false, true, false).unwrap();
+
+        let res = index.search(&query, 1);
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].0, Bytes::from("doc_pos"));
     }
 }

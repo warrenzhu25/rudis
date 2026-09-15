@@ -3462,6 +3462,157 @@ fn test_zero_copy_network_engine_e2e() {
     assert_eq!(stats.zc_send_calls.load(Ordering::Relaxed), 1);
 }
 
+#[test]
+fn test_geospatial_engine_e2e() {
+    let port = 16580;
+    let _server = start_test_server(port, 2);
+    std::thread::sleep(Duration::from_millis(50));
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. GEOADD
+    assert_eq!(send_and_read(&mut stream, b"GEOADD sicily 13.361389 38.115556 Palermo\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut stream, b"GEOADD sicily 15.087269 37.502669 Catania\r\n"), ":1\r\n");
+
+    // 2. GEODIST
+    let dist_resp = send_and_read(&mut stream, b"GEODIST sicily Palermo Catania km\r\n");
+    assert!(dist_resp.starts_with("$"));
+    assert!(dist_resp.contains("166.2"));
+
+    let dist_m = send_and_read(&mut stream, b"GEODIST sicily Palermo Catania m\r\n");
+    assert!(dist_m.contains("16627"));
+
+    // 3. GEOPOS
+    let pos_resp = send_and_read(&mut stream, b"GEOPOS sicily Palermo NonExistent\r\n");
+    assert!(pos_resp.starts_with("*2\r\n"));
+    assert!(pos_resp.contains("13.36"));
+    assert!(pos_resp.contains("38.11"));
+    assert!(pos_resp.contains("*-1\r\n"));
+
+    // 4. GEOHASH
+    let hash_resp = send_and_read(&mut stream, b"GEOHASH sicily Palermo Catania\r\n");
+    assert!(hash_resp.starts_with("*2\r\n"));
+    assert!(hash_resp.contains("$11\r\ntc1q585vb58"));
+    assert!(hash_resp.contains("$11\r\ntc26yj70z7h"));
+
+    // 5. GEORADIUS with WITHDIST and WITHCOORD
+    let rad_resp = send_and_read(&mut stream, b"GEORADIUS sicily 15 37 200 km WITHDIST WITHCOORD\r\n");
+    assert!(rad_resp.starts_with("*2\r\n"));
+    assert!(rad_resp.contains("Palermo"));
+    assert!(rad_resp.contains("Catania"));
+
+    // 6. GEORADIUSBYMEMBER
+    let rad_member = send_and_read(&mut stream, b"GEORADIUSBYMEMBER sicily Palermo 100 km WITHDIST\r\n");
+    assert!(rad_member.contains("Palermo"));
+    assert!(!rad_member.contains("Catania")); // Catania is > 166km away
+
+    // 7. GEOSEARCH FROMLONLAT BYRADIUS
+    let search_resp = send_and_read(&mut stream, b"GEOSEARCH sicily FROMLONLAT 15 37 BYRADIUS 200 km ASC WITHDIST\r\n");
+    let pos_catania = search_resp.find("Catania").unwrap();
+    let pos_palermo = search_resp.find("Palermo").unwrap();
+    assert!(pos_catania < pos_palermo); // ASC order: Catania closer to (15, 37) than Palermo
+
+    // 8. GEOSEARCH FROMMEMBER BYBOX
+    let box_resp = send_and_read(&mut stream, b"GEOSEARCH sicily FROMMEMBER Palermo BYBOX 400 400 km\r\n");
+    assert!(box_resp.contains("Palermo"));
+    assert!(box_resp.contains("Catania"));
+}
+
+#[test]
+fn test_probabilistic_data_structures_e2e() {
+    let port = 16590;
+    let _server = start_test_server(port, 2);
+    std::thread::sleep(Duration::from_millis(50));
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Bloom Filter (BF.*)
+    assert_eq!(send_and_read(&mut stream, b"BF.RESERVE mybf 0.01 1000\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut stream, b"BF.RESERVE mybf 0.01 1000\r\n"), "-ERR item exists\r\n");
+    assert_eq!(send_and_read(&mut stream, b"BF.ADD mybf apple\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut stream, b"BF.ADD mybf apple\r\n"), ":0\r\n");
+    assert_eq!(send_and_read(&mut stream, b"BF.EXISTS mybf apple\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut stream, b"BF.EXISTS mybf orange\r\n"), ":0\r\n");
+    assert_eq!(send_and_read(&mut stream, b"BF.MADD mybf banana grape\r\n"), "*2\r\n:1\r\n:1\r\n");
+    assert_eq!(send_and_read(&mut stream, b"BF.MEXISTS mybf apple banana melon\r\n"), "*3\r\n:1\r\n:1\r\n:0\r\n");
+    let info = send_and_read(&mut stream, b"BF.INFO mybf\r\n");
+    assert!(info.contains("Capacity"));
+    assert!(info.contains("1000"));
+
+    // 2. Cuckoo Filter (CF.*)
+    assert_eq!(send_and_read(&mut stream, b"CF.RESERVE mycf 1000\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut stream, b"CF.RESERVE mycf 1000\r\n"), "-ERR item exists\r\n");
+    assert_eq!(send_and_read(&mut stream, b"CF.ADD mycf foo\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut stream, b"CF.ADDNX mycf foo\r\n"), ":0\r\n");
+    assert_eq!(send_and_read(&mut stream, b"CF.ADDNX mycf bar\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut stream, b"CF.EXISTS mycf foo\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut stream, b"CF.DEL mycf foo\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut stream, b"CF.EXISTS mycf foo\r\n"), ":0\r\n");
+    let cf_info = send_and_read(&mut stream, b"CF.INFO mycf\r\n");
+    assert!(cf_info.contains("Number of buckets"));
+
+    // 3. Count-Min Sketch (CMS.*)
+    assert_eq!(send_and_read(&mut stream, b"CMS.INITBYDIM mycms 200 5\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut stream, b"CMS.INCRBY mycms item1 42 item2 17\r\n"), "*2\r\n:42\r\n:17\r\n");
+    assert_eq!(send_and_read(&mut stream, b"CMS.QUERY mycms item1 item2 item3\r\n"), "*3\r\n:42\r\n:17\r\n:0\r\n");
+    let cms_info = send_and_read(&mut stream, b"CMS.INFO mycms\r\n");
+    assert!(cms_info.contains("width"));
+    assert!(cms_info.contains("depth"));
+
+    // 4. Top-K (TOPK.*)
+    assert_eq!(send_and_read(&mut stream, b"TOPK.RESERVE mytopk 3\r\n"), "+OK\r\n");
+    let add_res = send_and_read(&mut stream, b"TOPK.ADD mytopk alpha alpha alpha beta beta gamma\r\n");
+    assert!(add_res.starts_with("*6\r\n"));
+    assert_eq!(send_and_read(&mut stream, b"TOPK.QUERY mytopk alpha beta gamma delta\r\n"), "*4\r\n:1\r\n:1\r\n:1\r\n:0\r\n");
+    let topk_list = send_and_read(&mut stream, b"TOPK.LIST mytopk\r\n");
+    assert!(topk_list.contains("alpha"));
+    assert!(topk_list.contains("beta"));
+    assert!(topk_list.contains("gamma"));
+    let topk_info = send_and_read(&mut stream, b"TOPK.INFO mytopk\r\n");
+    assert!(topk_info.contains("k"));
+}
+
+#[test]
+fn test_product_quantization_adc_e2e() {
+    let port = 16600;
+    let _server = start_test_server(port, 2);
+    std::thread::sleep(Duration::from_millis(50));
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Add vectors with PQ option
+    assert_eq!(
+        send_and_read(&mut stream, b"VADD pq_idx doc1 1.0 0.0 0.0 0.0 PQ\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"VADD pq_idx doc2 0.0 1.0 0.0 0.0 PQ\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"VADD pq_idx doc3 0.9 0.1 0.0 0.0 PQ\r\n"),
+        "+OK\r\n"
+    );
+
+    // 2. Query top-2 nearest neighbors using Asymmetric Distance Computation (ADC)
+    let resp = send_and_read(&mut stream, b"VQUERY pq_idx 2 1.0 0.0 0.0 0.0\r\n");
+    assert!(resp.starts_with("*4\r\n"));
+    assert!(resp.contains("doc1"));
+    assert!(resp.contains("doc3"));
+
+    // 3. Query with exact Float32 RERANK
+    let resp_rerank = send_and_read(&mut stream, b"VQUERY pq_idx 2 1.0 0.0 0.0 0.0 RERANK\r\n");
+    assert!(resp_rerank.starts_with("*4\r\n"));
+    assert!(resp_rerank.contains("doc1"));
+    assert!(resp_rerank.contains("doc3"));
+
+    // First result must be doc1
+    let pos_doc1 = resp_rerank.find("doc1").unwrap();
+    let pos_doc3 = resp_rerank.find("doc3").unwrap();
+    assert!(pos_doc1 < pos_doc3);
+}
+
+
 
 
 

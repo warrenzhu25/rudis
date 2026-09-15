@@ -957,7 +957,36 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::JsonObjKeys { key, .. }
         | Command::JsonObjLen { key, .. }
         | Command::JsonToggle { key, .. }
-        | Command::JsonClear { key, .. } => Some(key),
+        | Command::JsonClear { key, .. }
+        | Command::Geoadd { key, .. }
+        | Command::Geodist { key, .. }
+        | Command::Geopos { key, .. }
+        | Command::Geohash { key, .. }
+        | Command::Georadius { key, .. }
+        | Command::Georadiusbymember { key, .. }
+        | Command::Geosearch { key, .. }
+        | Command::BfReserve { key, .. }
+        | Command::BfAdd { key, .. }
+        | Command::BfMadd { key, .. }
+        | Command::BfExists { key, .. }
+        | Command::BfMexists { key, .. }
+        | Command::BfInfo(key)
+        | Command::CfReserve { key, .. }
+        | Command::CfAdd { key, .. }
+        | Command::CfAddnx { key, .. }
+        | Command::CfExists { key, .. }
+        | Command::CfDel { key, .. }
+        | Command::CfInfo(key)
+        | Command::CmsInitbydim { key, .. }
+        | Command::CmsInitbyprob { key, .. }
+        | Command::CmsIncrby { key, .. }
+        | Command::CmsQuery { key, .. }
+        | Command::CmsInfo(key)
+        | Command::TopkReserve { key, .. }
+        | Command::TopkAdd { key, .. }
+        | Command::TopkQuery { key, .. }
+        | Command::TopkList(key)
+        | Command::TopkInfo(key) => Some(key),
 
         Command::Smove { source, .. }
         | Command::Lmove { source, .. }
@@ -1090,7 +1119,36 @@ pub fn cmd_keys<'a>(cmd: &'a Command) -> Vec<&'a [u8]> {
         | Command::JsonObjKeys { key, .. }
         | Command::JsonObjLen { key, .. }
         | Command::JsonToggle { key, .. }
-        | Command::JsonClear { key, .. } => vec![key.as_ref()],
+        | Command::JsonClear { key, .. }
+        | Command::Geoadd { key, .. }
+        | Command::Geodist { key, .. }
+        | Command::Geopos { key, .. }
+        | Command::Geohash { key, .. }
+        | Command::Georadius { key, .. }
+        | Command::Georadiusbymember { key, .. }
+        | Command::Geosearch { key, .. }
+        | Command::BfReserve { key, .. }
+        | Command::BfAdd { key, .. }
+        | Command::BfMadd { key, .. }
+        | Command::BfExists { key, .. }
+        | Command::BfMexists { key, .. }
+        | Command::BfInfo(key)
+        | Command::CfReserve { key, .. }
+        | Command::CfAdd { key, .. }
+        | Command::CfAddnx { key, .. }
+        | Command::CfExists { key, .. }
+        | Command::CfDel { key, .. }
+        | Command::CfInfo(key)
+        | Command::CmsInitbydim { key, .. }
+        | Command::CmsInitbyprob { key, .. }
+        | Command::CmsIncrby { key, .. }
+        | Command::CmsQuery { key, .. }
+        | Command::CmsInfo(key)
+        | Command::TopkReserve { key, .. }
+        | Command::TopkAdd { key, .. }
+        | Command::TopkQuery { key, .. }
+        | Command::TopkList(key)
+        | Command::TopkInfo(key) => vec![key.as_ref()],
 
 
         Command::Smove { source, destination, .. }
@@ -1645,6 +1703,35 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         | Command::JsonToggle { .. }
         | Command::JsonClear { .. }
         | Command::JsonMget { .. } => "JSON",
+        Command::Geoadd { .. }
+        | Command::Geodist { .. }
+        | Command::Geopos { .. }
+        | Command::Geohash { .. }
+        | Command::Georadius { .. }
+        | Command::Georadiusbymember { .. }
+        | Command::Geosearch { .. } => "GEO",
+        Command::BfReserve { .. }
+        | Command::BfAdd { .. }
+        | Command::BfMadd { .. }
+        | Command::BfExists { .. }
+        | Command::BfMexists { .. }
+        | Command::BfInfo(_) => "BF",
+        Command::CfReserve { .. }
+        | Command::CfAdd { .. }
+        | Command::CfAddnx { .. }
+        | Command::CfExists { .. }
+        | Command::CfDel { .. }
+        | Command::CfInfo(_) => "CF",
+        Command::CmsInitbydim { .. }
+        | Command::CmsInitbyprob { .. }
+        | Command::CmsIncrby { .. }
+        | Command::CmsQuery { .. }
+        | Command::CmsInfo(_) => "CMS",
+        Command::TopkReserve { .. }
+        | Command::TopkAdd { .. }
+        | Command::TopkQuery { .. }
+        | Command::TopkList(_)
+        | Command::TopkInfo(_) => "TOPK",
         Command::Unknown(_) => "UNKNOWN",
     }
 }
@@ -2528,7 +2615,36 @@ async fn execute_command(
         | Command::JsonObjKeys { .. }
         | Command::JsonObjLen { .. }
         | Command::JsonToggle { .. }
-        | Command::JsonClear { .. } => {
+        | Command::JsonClear { .. }
+        | Command::Geoadd { .. }
+        | Command::Geodist { .. }
+        | Command::Geopos { .. }
+        | Command::Geohash { .. }
+        | Command::Georadius { .. }
+        | Command::Georadiusbymember { .. }
+        | Command::Geosearch { .. }
+        | Command::BfReserve { .. }
+        | Command::BfAdd { .. }
+        | Command::BfMadd { .. }
+        | Command::BfExists { .. }
+        | Command::BfMexists { .. }
+        | Command::BfInfo(_)
+        | Command::CfReserve { .. }
+        | Command::CfAdd { .. }
+        | Command::CfAddnx { .. }
+        | Command::CfExists { .. }
+        | Command::CfDel { .. }
+        | Command::CfInfo(_)
+        | Command::CmsInitbydim { .. }
+        | Command::CmsInitbyprob { .. }
+        | Command::CmsIncrby { .. }
+        | Command::CmsQuery { .. }
+        | Command::CmsInfo(_)
+        | Command::TopkReserve { .. }
+        | Command::TopkAdd { .. }
+        | Command::TopkQuery { .. }
+        | Command::TopkList(_)
+        | Command::TopkInfo(_) => {
             if let Some(target) = target_shard_of_cmd(&cmd, router.num_shards) {
                 if target == router.shard_id {
                     execute_local_command(
@@ -3882,8 +3998,8 @@ async fn execute_command(
             out.extend_from_slice(b"+OK\r\n");
             false
         }
-        Command::Vadd { index, key, vector, metric, quantize, tiered } => {
-            match router.local_db.borrow_mut().vadd(&index, key.clone(), vector, metric, quantize, tiered) {
+        Command::Vadd { index, key, vector, metric, quantize, pq, tiered } => {
+            match router.local_db.borrow_mut().vadd(&index, key.clone(), vector, metric, quantize, pq, tiered) {
                 Ok(()) => {
                     notify_key_invalidation(router.port, key.as_ref(), client_id);
                     out.extend_from_slice(b"+OK\r\n");
@@ -4195,7 +4311,36 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::JsonObjKeys { key, .. }
         | Command::JsonObjLen { key, .. }
         | Command::JsonToggle { key, .. }
-        | Command::JsonClear { key, .. } => Some(target_shard(key, num_shards)),
+        | Command::JsonClear { key, .. }
+        | Command::Geoadd { key, .. }
+        | Command::Geodist { key, .. }
+        | Command::Geopos { key, .. }
+        | Command::Geohash { key, .. }
+        | Command::Georadius { key, .. }
+        | Command::Georadiusbymember { key, .. }
+        | Command::Geosearch { key, .. }
+        | Command::BfReserve { key, .. }
+        | Command::BfAdd { key, .. }
+        | Command::BfMadd { key, .. }
+        | Command::BfExists { key, .. }
+        | Command::BfMexists { key, .. }
+        | Command::BfInfo(key)
+        | Command::CfReserve { key, .. }
+        | Command::CfAdd { key, .. }
+        | Command::CfAddnx { key, .. }
+        | Command::CfExists { key, .. }
+        | Command::CfDel { key, .. }
+        | Command::CfInfo(key)
+        | Command::CmsInitbydim { key, .. }
+        | Command::CmsInitbyprob { key, .. }
+        | Command::CmsIncrby { key, .. }
+        | Command::CmsQuery { key, .. }
+        | Command::CmsInfo(key)
+        | Command::TopkReserve { key, .. }
+        | Command::TopkAdd { key, .. }
+        | Command::TopkQuery { key, .. }
+        | Command::TopkList(key)
+        | Command::TopkInfo(key) => Some(target_shard(key, num_shards)),
         Command::Smove { source, destination, .. } => {
             let s1 = target_shard(source, num_shards);
             let s2 = target_shard(destination, num_shards);
@@ -6674,6 +6819,531 @@ pub fn execute_local_command(
         Command::JsonClear { key, path } => {
             let cleared = db.json_store.json_clear(key, path.as_deref());
             write_resp_integer(out, cleared as i64);
+            false
+        }
+        // GEOSPATIAL COMMANDS
+        Command::Geoadd { key, items, nx, xx, ch } => {
+            let mut elements = Vec::with_capacity(items.len());
+            for (lon, lat, member) in items {
+                match crate::geo::encode_geohash(*lon, *lat) {
+                    Ok(hash) => {
+                        elements.push((hash as f64, member.clone()));
+                    }
+                    Err(e) => {
+                        out.extend_from_slice(format!("-{}\r\n", e).as_bytes());
+                        return false;
+                    }
+                }
+            }
+            let flags = crate::table::ZAddFlags {
+                nx: *nx,
+                xx: *xx,
+                ch: *ch,
+                gt: false,
+                lt: false,
+                incr: false,
+            };
+            match db.zadd(key.clone(), elements, flags) {
+                Ok((added, _)) => {
+                    record_change!(cmd);
+                    write_resp_integer(out, added as i64);
+                }
+                Err(err) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", err).as_bytes());
+                }
+            }
+            false
+        }
+        Command::Geodist { key, m1, m2, unit } => {
+            let s1 = db.zscore(key, m1);
+            let s2 = db.zscore(key, m2);
+            match (s1, s2) {
+                (Ok(Some(sc1)), Ok(Some(sc2))) => {
+                    let (lon1, lat1) = crate::geo::decode_geohash(sc1 as u64);
+                    let (lon2, lat2) = crate::geo::decode_geohash(sc2 as u64);
+                    let mut dist = crate::geo::haversine_distance(lon1, lat1, lon2, lat2);
+                    if let Some(u) = unit {
+                        dist = u.from_meters(dist);
+                    }
+                    let s = format!("{:.4}", dist);
+                    write_resp_bulk(out, s.as_bytes());
+                }
+                _ => {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+            }
+            false
+        }
+        Command::Geopos { key, members } => {
+            out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
+            for m in members {
+                match db.zscore(key, m) {
+                    Ok(Some(score)) => {
+                        let (lon, lat) = crate::geo::decode_geohash(score as u64);
+                        out.extend_from_slice(b"*2\r\n");
+                        let lon_str = format!("{:.6}", lon);
+                        let lat_str = format!("{:.6}", lat);
+                        write_resp_bulk(out, lon_str.as_bytes());
+                        write_resp_bulk(out, lat_str.as_bytes());
+                    }
+                    _ => {
+                        out.extend_from_slice(b"*-1\r\n");
+                    }
+                }
+            }
+            false
+        }
+        Command::Geohash { key, members } => {
+            out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
+            for m in members {
+                match db.zscore(key, m) {
+                    Ok(Some(score)) => {
+                        let b32 = crate::geo::geohash_to_base32(score as u64);
+                        write_resp_bulk(out, b32.as_bytes());
+                    }
+                    _ => {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+            }
+            false
+        }
+        Command::Georadius { key, lon, lat, radius, unit, withcoord, withdist, withhash, count, asc } => {
+            let radius_meters = unit.to_meters(*radius);
+            let mut results = Vec::new();
+            let z_opts = crate::table::ZRangeOpts { start: 0, stop: -1, min_score: f64::NEG_INFINITY, min_inc: true, max_score: f64::INFINITY, max_inc: true, by_score: false, rev: false, with_scores: true, offset: 0, count: None };
+            if let Ok(pairs) = db.zrange(key, &z_opts) {
+                for (member, score) in pairs {
+                    let (m_lon, m_lat) = crate::geo::decode_geohash(score as u64);
+                    let dist = crate::geo::haversine_distance(*lon, *lat, m_lon, m_lat);
+                    if dist <= radius_meters {
+                        results.push(crate::geo::GeoItemResult {
+                            member,
+                            dist: if *withdist { Some(unit.from_meters(dist)) } else { None },
+                            hash: if *withhash { Some(score as u64) } else { None },
+                            coord: if *withcoord { Some((m_lon, m_lat)) } else { None },
+                        });
+                    }
+                }
+            }
+            if let Some(is_asc) = asc {
+                if *is_asc {
+                    results.sort_by(|a, b| a.dist.unwrap_or(0.0).partial_cmp(&b.dist.unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+                } else {
+                    results.sort_by(|a, b| b.dist.unwrap_or(0.0).partial_cmp(&a.dist.unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+                }
+            }
+            if let Some(c) = count {
+                results.truncate(*c);
+            }
+            let has_options = *withcoord || *withdist || *withhash;
+            crate::geo::format_geo_results(out, &results, has_options);
+            false
+        }
+        Command::Georadiusbymember { key, member, radius, unit, withcoord, withdist, withhash, count, asc } => {
+            match db.zscore(key, member) {
+                Ok(Some(score)) => {
+                    let (center_lon, center_lat) = crate::geo::decode_geohash(score as u64);
+                    let radius_meters = unit.to_meters(*radius);
+                    let mut results = Vec::new();
+                    let z_opts = crate::table::ZRangeOpts { start: 0, stop: -1, min_score: f64::NEG_INFINITY, min_inc: true, max_score: f64::INFINITY, max_inc: true, by_score: false, rev: false, with_scores: true, offset: 0, count: None };
+                    if let Ok(pairs) = db.zrange(key, &z_opts) {
+                        for (m, sc) in pairs {
+                            let (m_lon, m_lat) = crate::geo::decode_geohash(sc as u64);
+                            let dist = crate::geo::haversine_distance(center_lon, center_lat, m_lon, m_lat);
+                            if dist <= radius_meters {
+                                results.push(crate::geo::GeoItemResult {
+                                    member: m,
+                                    dist: if *withdist { Some(unit.from_meters(dist)) } else { None },
+                                    hash: if *withhash { Some(sc as u64) } else { None },
+                                    coord: if *withcoord { Some((m_lon, m_lat)) } else { None },
+                                });
+                            }
+                        }
+                    }
+                    if let Some(is_asc) = asc {
+                        if *is_asc {
+                            results.sort_by(|a, b| a.dist.unwrap_or(0.0).partial_cmp(&b.dist.unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+                        } else {
+                            results.sort_by(|a, b| b.dist.unwrap_or(0.0).partial_cmp(&a.dist.unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+                        }
+                    }
+                    if let Some(c) = count {
+                        results.truncate(*c);
+                    }
+                    let has_options = *withcoord || *withdist || *withhash;
+                    crate::geo::format_geo_results(out, &results, has_options);
+                }
+                _ => {
+                    out.extend_from_slice(b"-ERR could not decode requested zset member\r\n");
+                }
+            }
+            false
+        }
+        Command::Geosearch { key, from_member, from_lonlat, by_radius, by_box, asc, count, withcoord, withdist, withhash } => {
+            let center_opt = if let Some((lon, lat)) = from_lonlat {
+                Some((*lon, *lat))
+            } else if let Some(m) = from_member {
+                match db.zscore(key, m) {
+                    Ok(Some(score)) => Some(crate::geo::decode_geohash(score as u64)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            let (center_lon, center_lat) = match center_opt {
+                Some(c) => c,
+                None => {
+                    out.extend_from_slice(b"-ERR could not determine search origin\r\n");
+                    return false;
+                }
+            };
+
+            let mut results = Vec::new();
+            let z_opts = crate::table::ZRangeOpts { start: 0, stop: -1, min_score: f64::NEG_INFINITY, min_inc: true, max_score: f64::INFINITY, max_inc: true, by_score: false, rev: false, with_scores: true, offset: 0, count: None };
+            if let Ok(pairs) = db.zrange(key, &z_opts) {
+                for (member, score) in pairs {
+                    let (m_lon, m_lat) = crate::geo::decode_geohash(score as u64);
+                    let dist_m = crate::geo::haversine_distance(center_lon, center_lat, m_lon, m_lat);
+
+                    let inside = if let Some((rad, u)) = by_radius {
+                        dist_m <= u.to_meters(*rad)
+                    } else if let Some((w, h, u)) = by_box {
+                        let w_m = u.to_meters(*w) / 2.0;
+                        let h_m = u.to_meters(*h) / 2.0;
+                        let dlat_m = (m_lat - center_lat).abs() * 111_320.0;
+                        let dlon_m = (m_lon - center_lon).abs() * 111_320.0 * (center_lat.to_radians().cos());
+                        dlat_m <= h_m && dlon_m <= w_m
+                    } else {
+                        true
+                    };
+
+                    if inside {
+                        let dist_unit = by_radius.map(|(_, u)| u).or_else(|| by_box.map(|(_, _, u)| u)).unwrap_or(crate::geo::GeoUnit::Meters);
+                        results.push(crate::geo::GeoItemResult {
+                            member,
+                            dist: if *withdist { Some(dist_unit.from_meters(dist_m)) } else { None },
+                            hash: if *withhash { Some(score as u64) } else { None },
+                            coord: if *withcoord { Some((m_lon, m_lat)) } else { None },
+                        });
+                    }
+                }
+            }
+
+            if let Some(is_asc) = asc {
+                if *is_asc {
+                    results.sort_by(|a, b| a.dist.unwrap_or(0.0).partial_cmp(&b.dist.unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+                } else {
+                    results.sort_by(|a, b| b.dist.unwrap_or(0.0).partial_cmp(&a.dist.unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+                }
+            }
+            if let Some(c) = count {
+                results.truncate(*c);
+            }
+            let has_options = *withcoord || *withdist || *withhash;
+            crate::geo::format_geo_results(out, &results, has_options);
+            false
+        }
+        // PROBABILISTIC COMMANDS
+        Command::BfReserve { key, error_rate, capacity } => {
+            if db.probabilistic_store.bloom_filters.contains_key(key) {
+                out.extend_from_slice(b"-ERR item exists\r\n");
+            } else {
+                db.probabilistic_store.bloom_filters.insert(
+                    key.clone(),
+                    crate::probabilistic::BloomFilter::new(*capacity, *error_rate),
+                );
+                record_change!(cmd);
+                out.extend_from_slice(b"+OK\r\n");
+            }
+            false
+        }
+        Command::BfAdd { key, item } => {
+            let bf = db.probabilistic_store.bloom_filters.entry(key.clone()).or_insert_with(|| {
+                crate::probabilistic::BloomFilter::new(1000, 0.01)
+            });
+            let added = bf.add(item);
+            if added {
+                record_change!(cmd);
+                out.extend_from_slice(b":1\r\n");
+            } else {
+                out.extend_from_slice(b":0\r\n");
+            }
+            false
+        }
+        Command::BfMadd { key, items } => {
+            let bf = db.probabilistic_store.bloom_filters.entry(key.clone()).or_insert_with(|| {
+                crate::probabilistic::BloomFilter::new(1000, 0.01)
+            });
+            out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+            let mut any_added = false;
+            for it in items {
+                let added = bf.add(it);
+                if added {
+                    any_added = true;
+                    out.extend_from_slice(b":1\r\n");
+                } else {
+                    out.extend_from_slice(b":0\r\n");
+                }
+            }
+            if any_added {
+                record_change!(cmd);
+            }
+            false
+        }
+        Command::BfExists { key, item } => {
+            if let Some(bf) = db.probabilistic_store.bloom_filters.get(key) {
+                if bf.contains(item) {
+                    out.extend_from_slice(b":1\r\n");
+                } else {
+                    out.extend_from_slice(b":0\r\n");
+                }
+            } else {
+                out.extend_from_slice(b":0\r\n");
+            }
+            false
+        }
+        Command::BfMexists { key, items } => {
+            out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+            if let Some(bf) = db.probabilistic_store.bloom_filters.get(key) {
+                for it in items {
+                    if bf.contains(it) {
+                        out.extend_from_slice(b":1\r\n");
+                    } else {
+                        out.extend_from_slice(b":0\r\n");
+                    }
+                }
+            } else {
+                for _ in items {
+                    out.extend_from_slice(b":0\r\n");
+                }
+            }
+            false
+        }
+        Command::BfInfo(key) => {
+            if let Some(bf) = db.probabilistic_store.bloom_filters.get(key) {
+                out.extend_from_slice(b"*8\r\n");
+                write_resp_bulk(out, b"Capacity");
+                write_resp_integer(out, bf.capacity as i64);
+                write_resp_bulk(out, b"Size");
+                write_resp_integer(out, (bf.bits.len() * 8) as i64);
+                write_resp_bulk(out, b"Number of filters");
+                write_resp_integer(out, 1);
+                write_resp_bulk(out, b"Number of items inserted");
+                write_resp_integer(out, bf.count as i64);
+            } else {
+                out.extend_from_slice(b"-ERR not found\r\n");
+            }
+            false
+        }
+        Command::CfReserve { key, capacity } => {
+            if db.probabilistic_store.cuckoo_filters.contains_key(key) {
+                out.extend_from_slice(b"-ERR item exists\r\n");
+            } else {
+                db.probabilistic_store.cuckoo_filters.insert(
+                    key.clone(),
+                    crate::probabilistic::CuckooFilter::new(*capacity),
+                );
+                record_change!(cmd);
+                out.extend_from_slice(b"+OK\r\n");
+            }
+            false
+        }
+        Command::CfAdd { key, item } => {
+            let cf = db.probabilistic_store.cuckoo_filters.entry(key.clone()).or_insert_with(|| {
+                crate::probabilistic::CuckooFilter::new(1000)
+            });
+            match cf.add(item) {
+                Ok(_) => {
+                    record_change!(cmd);
+                    out.extend_from_slice(b":1\r\n");
+                }
+                Err(e) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes());
+                }
+            }
+            false
+        }
+        Command::CfAddnx { key, item } => {
+            let cf = db.probabilistic_store.cuckoo_filters.entry(key.clone()).or_insert_with(|| {
+                crate::probabilistic::CuckooFilter::new(1000)
+            });
+            if cf.contains(item) {
+                out.extend_from_slice(b":0\r\n");
+            } else {
+                match cf.add(item) {
+                    Ok(_) => {
+                        record_change!(cmd);
+                        out.extend_from_slice(b":1\r\n");
+                    }
+                    Err(e) => {
+                        out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::CfExists { key, item } => {
+            if let Some(cf) = db.probabilistic_store.cuckoo_filters.get(key) {
+                if cf.contains(item) {
+                    out.extend_from_slice(b":1\r\n");
+                } else {
+                    out.extend_from_slice(b":0\r\n");
+                }
+            } else {
+                out.extend_from_slice(b":0\r\n");
+            }
+            false
+        }
+        Command::CfDel { key, item } => {
+            if let Some(cf) = db.probabilistic_store.cuckoo_filters.get_mut(key) {
+                if cf.delete(item) {
+                    record_change!(cmd);
+                    out.extend_from_slice(b":1\r\n");
+                } else {
+                    out.extend_from_slice(b":0\r\n");
+                }
+            } else {
+                out.extend_from_slice(b":0\r\n");
+            }
+            false
+        }
+        Command::CfInfo(key) => {
+            if let Some(cf) = db.probabilistic_store.cuckoo_filters.get(key) {
+                out.extend_from_slice(b"*6\r\n");
+                write_resp_bulk(out, b"Size");
+                write_resp_integer(out, (cf.num_buckets * 4 * 2) as i64);
+                write_resp_bulk(out, b"Number of buckets");
+                write_resp_integer(out, cf.num_buckets as i64);
+                write_resp_bulk(out, b"Number of items inserted");
+                write_resp_integer(out, cf.count as i64);
+            } else {
+                out.extend_from_slice(b"-ERR not found\r\n");
+            }
+            false
+        }
+        Command::CmsInitbydim { key, width, depth } => {
+            db.probabilistic_store.cms_sketches.insert(
+                key.clone(),
+                crate::probabilistic::CountMinSketch::new(*width, *depth),
+            );
+            record_change!(cmd);
+            out.extend_from_slice(b"+OK\r\n");
+            false
+        }
+        Command::CmsInitbyprob { key, error, probability } => {
+            db.probabilistic_store.cms_sketches.insert(
+                key.clone(),
+                crate::probabilistic::CountMinSketch::from_prob(*error, *probability),
+            );
+            record_change!(cmd);
+            out.extend_from_slice(b"+OK\r\n");
+            false
+        }
+        Command::CmsIncrby { key, pairs } => {
+            let cms = db.probabilistic_store.cms_sketches.entry(key.clone()).or_insert_with(|| {
+                crate::probabilistic::CountMinSketch::new(2000, 5)
+            });
+            out.extend_from_slice(format!("*{}\r\n", pairs.len()).as_bytes());
+            for (item, delta) in pairs {
+                let count = cms.incr_by(item, *delta);
+                write_resp_integer(out, count as i64);
+            }
+            record_change!(cmd);
+            false
+        }
+        Command::CmsQuery { key, items } => {
+            out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+            if let Some(cms) = db.probabilistic_store.cms_sketches.get(key) {
+                for it in items {
+                    let count = cms.query(it);
+                    write_resp_integer(out, count as i64);
+                }
+            } else {
+                for _ in items {
+                    write_resp_integer(out, 0);
+                }
+            }
+            false
+        }
+        Command::CmsInfo(key) => {
+            if let Some(cms) = db.probabilistic_store.cms_sketches.get(key) {
+                out.extend_from_slice(b"*6\r\n");
+                write_resp_bulk(out, b"width");
+                write_resp_integer(out, cms.width as i64);
+                write_resp_bulk(out, b"depth");
+                write_resp_integer(out, cms.depth as i64);
+                write_resp_bulk(out, b"count");
+                write_resp_integer(out, cms.total_count as i64);
+            } else {
+                out.extend_from_slice(b"-ERR not found\r\n");
+            }
+            false
+        }
+        Command::TopkReserve { key, topk } => {
+            db.probabilistic_store.topk_trackers.insert(
+                key.clone(),
+                crate::probabilistic::TopK::new(*topk),
+            );
+            record_change!(cmd);
+            out.extend_from_slice(b"+OK\r\n");
+            false
+        }
+        Command::TopkAdd { key, items } => {
+            let tk = db.probabilistic_store.topk_trackers.entry(key.clone()).or_insert_with(|| {
+                crate::probabilistic::TopK::new(50)
+            });
+            out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+            for it in items {
+                if let Some(evicted) = tk.add(it.clone(), 1) {
+                    write_resp_bulk(out, &evicted);
+                } else {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+            }
+            record_change!(cmd);
+            false
+        }
+        Command::TopkQuery { key, items } => {
+            out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+            if let Some(tk) = db.probabilistic_store.topk_trackers.get(key) {
+                for it in items {
+                    if tk.query(it) {
+                        out.extend_from_slice(b":1\r\n");
+                    } else {
+                        out.extend_from_slice(b":0\r\n");
+                    }
+                }
+            } else {
+                for _ in items {
+                    out.extend_from_slice(b":0\r\n");
+                }
+            }
+            false
+        }
+        Command::TopkList(key) => {
+            if let Some(tk) = db.probabilistic_store.topk_trackers.get(key) {
+                let items = tk.list();
+                out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+                for (item, _) in items {
+                    write_resp_bulk(out, &item);
+                }
+            } else {
+                out.extend_from_slice(b"*0\r\n");
+            }
+            false
+        }
+        Command::TopkInfo(key) => {
+            if let Some(tk) = db.probabilistic_store.topk_trackers.get(key) {
+                out.extend_from_slice(b"*4\r\n");
+                write_resp_bulk(out, b"k");
+                write_resp_integer(out, tk.k as i64);
+                write_resp_bulk(out, b"width");
+                write_resp_integer(out, tk.items.len() as i64);
+            } else {
+                out.extend_from_slice(b"-ERR not found\r\n");
+            }
             false
         }
         Command::Quit => {

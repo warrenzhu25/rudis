@@ -237,6 +237,7 @@ pub struct ShardDb {
     pub vector_indexes: std::collections::HashMap<String, crate::vector::HnswIndex>,
     pub crdt_store: crate::crdt::CrdtStore,
     pub json_store: crate::json::JsonStore,
+    pub probabilistic_store: crate::probabilistic::ProbabilisticStore,
 }
 
 impl ShardDb {
@@ -248,6 +249,7 @@ impl ShardDb {
             vector_indexes: std::collections::HashMap::new(),
             crdt_store: crate::crdt::CrdtStore::new(port),
             json_store: crate::json::JsonStore::new(),
+            probabilistic_store: crate::probabilistic::ProbabilisticStore::new(),
         }
     }
 
@@ -1134,6 +1136,7 @@ impl ShardDb {
         vector: Vec<f32>,
         metric: Option<crate::vector::VectorMetric>,
         quantize: bool,
+        pq: bool,
         tiered: bool,
     ) -> Result<(), &'static str> {
         let dim = vector.len();
@@ -1144,7 +1147,7 @@ impl ShardDb {
                 metric.unwrap_or(crate::vector::VectorMetric::Cosine),
             )
         });
-        idx.add_quantized(key, vector, quantize, tiered)
+        idx.add_quantized_ext(key, vector, quantize, pq, tiered)
     }
 
     pub fn vquery(&self, index_name: &str, query: &[f32], k: usize, rerank: bool) -> Vec<(Bytes, f32)> {

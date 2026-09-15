@@ -163,6 +163,34 @@ Rudis provides native JSON document storage and deep manipulation with full Redi
   - `JSON.CLEAR <key> [path]`: Clear array or object containers in place.
   - `JSON.MGET <key ...> <path>`: Multi-key scatter-gather JSONPath queries.
 
+### 15. Geospatial Engine (52-Bit Geohash & Haversine Distance)
+Rudis provides full Redis geospatial specification parity backed by Sorted Sets (`ZSet`):
+- **52-Bit Integer Geohash Bit-Interleaving**: Coordinates $(lon, lat)$ are normalized and interleaved into 52-bit integer scores, supporting precision up to sub-meter scales.
+- **Haversine Great-Circle Distance**: Computes accurate spherical distances across the Earth ($R = 6372.797$ km) with native conversions for meters (`m`), kilometers (`km`), miles (`mi`), and feet (`ft`).
+- **Base32 Geohash Encoding**: 11-character alphanumeric geohash strings compatible with standard Redis client tooling.
+- **Commands**:
+  - `GEOADD <key> [NX|XX|CH] <lon> <lat> <member> [...]`: Add or update geospatial coordinates stored as 52-bit geohash scores.
+  - `GEODIST <key> <m1> <m2> [unit]`: Return geodesic distance between two members.
+  - `GEOPOS <key> <member ...>`: Return coordinates $(lon, lat)$ for members, or nil for non-existent items.
+  - `GEOHASH <key> <member ...>`: Return 11-character Base32 geohash strings.
+  - `GEORADIUS <key> <lon> <lat> <radius> <unit> [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT n] [ASC|DESC]`: Query items within spherical radius.
+  - `GEORADIUSBYMEMBER <key> <member> <radius> <unit> [WITHCOORD] [WITHDIST] [WITHHASH] [COUNT n] [ASC|DESC]`: Radius query centered on existing member.
+  - `GEOSEARCH <key> [FROMMEMBER m | FROMLONLAT lon lat] [BYRADIUS r u | BYBOX w h u] [ASC|DESC] [COUNT n] [WITHCOORD] [WITHDIST] [WITHHASH]`: Modern Redis 6.2+ multi-criterion geospatial search.
+
+### 16. Probabilistic Data Structures Engine (RedisBloom Parity)
+Rudis incorporates an enterprise-grade probabilistic engine for sub-millisecond membership testing, frequency tracking, and heavy-hitter analysis:
+- **Bloom Filter (`BF.*`)**: Optimal bit array sizing ($m = -n\ln p / (\ln 2)^2$, $k = (m/n)\ln 2$) with Kirsch-Mitzenmacher double-hashing ($h_1 + i \cdot h_2$). Commands: `BF.RESERVE`, `BF.ADD`, `BF.MADD`, `BF.EXISTS`, `BF.MEXISTS`, `BF.INFO`.
+- **Cuckoo Filter (`CF.*`)**: 4-slot bucket table with 16-bit fingerprints and alternate-index XOR hashing. Supports item deletions and cuckoo displacement kicks (up to 500 kicks). Commands: `CF.RESERVE`, `CF.ADD`, `CF.ADDNX`, `CF.EXISTS`, `CF.DEL`, `CF.INFO`.
+- **Count-Min Sketch (`CMS.*`)**: Sub-linear frequency tracking table $(\text{width}, \text{depth})$ parameterized by dimensions or error tolerance ($\epsilon, \delta$). Minimum point queries avoid over-counting. Commands: `CMS.INITBYDIM`, `CMS.INITBYPROB`, `CMS.INCRBY`, `CMS.QUERY`, `CMS.INFO`.
+- **Top-K Heavy Hitters (`TOPK.*`)**: Space-Saving algorithm maintaining exact top-$k$ frequent elements in streaming workloads with constant-time updates and min-element replacement. Commands: `TOPK.RESERVE`, `TOPK.ADD`, `TOPK.QUERY`, `TOPK.LIST`, `TOPK.INFO`.
+
+### 17. Product Quantization (PQ) & Asymmetric Distance Computation (ADC)
+Rudis extends its HNSW vector engine with Product Quantization (PQ) and Asymmetric Distance Computation (ADC) for ultra-compact vector indexing:
+- **Sub-Vector Codebook Quantization**: Decomposes $D$-dimensional embeddings into $M$ sub-vectors of dimension $D/M$. Each sub-space maps to 256 orthogonal and pseudo-randomly distributed centroids, compressing vectors into $M$ 8-bit byte codes (**up to 96.9% memory reduction**).
+- **Asymmetric Distance Computation (ADC)**: When querying, an $M \times 256$ distance lookup table between query sub-vectors and centroids is computed once. HNSW graph traversals resolve vector distance in $O(M)$ lookups without unpacking codes.
+- **Two-Stage Retrieval & Exact Rerank**: Supports candidate pool expansion followed by exact Float32 reranking for maximum precision.
+- **Commands**: `VADD <index> <key> <coords...> PQ [TIERED]`, `VQUERY <index> <k> <coords...> [RERANK]`.
+
 ---
 
 ## Testing
@@ -257,7 +285,9 @@ rudis/
 │   │   └── vector_bench.rs # Standalone vector benchmark suite
 │   ├── connection.rs   # TCP connection handler, RESP3 push, and command dispatcher
 │   ├── crdt.rs         # Active-Active multi-region CRDT engine (HLC, LWW, OR-Set, PN-Counter)
+│   ├── geo.rs          # 52-bit geohash encoding, Haversine distance, and geospatial queries
 │   ├── json.rs         # RFC 8259 RedisJSON engine with deep JSONPath navigation and mutations
+│   ├── probabilistic.rs# Bloom, Cuckoo, Count-Min Sketch, and Top-K probabilistic structures
 │   ├── resp.rs         # RESP2/RESP3 & inline frame parser and serializer
 │   ├── router.rs       # CRC16 key partitioner and cross-core message dispatcher
 │   ├── scripting.rs    # Lua scripting and Redis 7 Function engine
