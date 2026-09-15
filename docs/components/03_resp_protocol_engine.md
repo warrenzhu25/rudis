@@ -1,190 +1,333 @@
-# Component 03: RESP Protocol Engine & Serialization (`src/resp.rs`)
-
-> ⚠️ **Unverified against the real source.** This document's §5 "Serialization Primitives"
-> (`write_resp_bulk`, `write_resp_integer`, etc.) and its `read_integer` helper (§4.1) do not
-> exist in `src/resp.rs` (spot-checked) — replies are hand-formatted inline in `connection.rs`
-> instead. Treat this file's specifics as unverified. See
-> [`docs/designs/components.md`](../designs/components.md#part-5-resp-parsing-engine)
-> (Part 5) for a version checked against the actual code (note: it predates newer command
-> additions, so re-verify the `Command` enum's current variant list before relying on it).
+# Component 03: RESP Protocol Engine & Command Parser (`src/resp.rs`)
 
 ## 1. Architectural Purpose & Scope
 
-`src/resp.rs` is Rudis's wire protocol parser and serializer. It decodes raw TCP byte streams into strongly-typed `Command` enum variants and serializes execution results into Redis Serialization Protocol (**RESP2** and **RESP3**) wire formats.
+`src/resp.rs` is Rudis's wire-format decoder. It turns raw bytes read off a TCP socket into
+a single, strongly-typed `Command` enum value, one command at a time, and nothing else — it
+does **not** serialize replies. Reply formatting (RESP2 bulk strings, integers, arrays, and
+RESP3 maps/booleans where applicable) is hand-written directly into the output buffer in
+`src/connection.rs`, not in this file. There is no `write_resp_*`/serialization module here.
 
-It handles framing, length validation, argument tokenization, sub-command extraction, and error string generation matching official Redis specifications.
+The file is large (~7,500 lines) almost entirely because of the size of the `Command` enum
+and its parser (`build_command`), which now covers well over 200 distinct top-level command
+names spanning strings, hashes, lists, sets, sorted sets, streams, bitmaps, HyperLogLog,
+pub/sub, transactions, cluster/gossip, ACL, scripting, vector search, geospatial, probabilistic
+structures, RDB serialization, tiered-storage control commands, and a Memcached text-protocol
+gateway — not because the core parsing algorithm itself grew complex. That algorithm (the
+two-pass zero-copy RESP array parser) is unchanged from the original implementation.
 
 ---
 
 ## 2. Key Invariants & Concurrency Constraints
 
-1. **Zero-Copy Byte Slicing**: Bulk string payloads are extracted as reference-counted `bytes::Bytes` or borrowed byte slices (`&[u8]`). Payload data is never copied into temporary intermediate buffers during parsing.
-2. **Strict Redis Error Message Parity**: Errors conform precisely to official Redis wording (e.g., `"syntax error"`, `"value is not an integer or out of range"`, `"ERR no such key"`, `"at least 1 input key is needed for '...' command"`).
-3. **Dual Protocol Support**: Supports both RESP2 (legacy arrays, integers, bulk strings) and RESP3 (maps, sets, doubles, booleans, nulls, and push notifications).
-4. **Dual Gateway Support**: Transparently parses inline commands (`PING\r\n`, `SET k v\r\n`) and Memcached ASCII text commands.
+1. **Zero-Copy RESP Array Parsing**: Bulk string arguments inside a `*N\r\n...` frame are
+   extracted via `BytesMut::split_to(len).freeze()` — a reference-count bump on the
+   underlying buffer, never a byte-for-byte copy.
+2. **All-or-Nothing Frame Consumption**: A partially buffered command (still waiting on more
+   bytes from the socket) leaves the input buffer completely untouched (`Ok(None)`); a
+   complete command is parsed and fully consumed in one call. There's no partial-consumption
+   state to track between calls.
+3. **Three Independent Input Grammars, One Entry Point**: `parse_command` recognizes RESP
+   arrays (`*...`), plain space-separated inline text (`GET foo\r\n`), and Memcached's ASCII
+   storage-command grammar (`set key flags exptime bytes\r\n<data>\r\n`) — dispatched purely
+   by the first byte of the buffer, or by trial-parsing for the Memcached case (see §4.1).
+4. **No RESP3 wire-format parsing in this file.** `HELLO` is recognized and parsed as a
+   `Command` (so a client can request protocol v3), but nothing in `resp.rs` parses RESP3
+   input types (maps `%`, sets `~`, doubles `,`, booleans `#`, nulls `_`, pushes `>`) — every
+   incoming command is still a flat array of `$`-prefixed bulk strings. RESP3 is purely an
+   *output*-side concern implemented in `connection.rs` (a per-client `is_resp3` flag and a
+   thread-local `CURRENT_CLIENT_RESP3` cell gate which reply format gets written).
 
 ---
 
-## 3. Protocol Framing & Data Structures
+## 3. Command Surface & Data Structures
 
-### 3.1 RESP Framing Specification
+### 3.1 What `parse_command` actually recognizes
 
-```
-Type               Prefix   Example Wire Format             Parsed Rust Type
-────────────────────────────────────────────────────────────────────────────────
-Simple String      '+'      +OK\r\n                         &str
-Error              '-'      -ERR unknown command\r\n        &str
-Integer            ':'      :1000\r\n                       i64
-Bulk String        '$'      $5\r\nhello\r\n                 Bytes
-Null Bulk String   '$'      $-1\r\n                         Option<Bytes>
-Array              '*'      *2\r\n$3\r\nfoo\r\n$3\r\nbar    Vec<Bytes>
-RESP3 Null         '_'      _\r\n                           ()
-RESP3 Boolean      '#'      #t\r\n / #f\r\n                 bool
-RESP3 Double       ','      ,3.14159\r\n                    f64
-RESP3 Map          '%'      %1\r\n+key\r\n+val\r\n          HashMap<Bytes, Bytes>
-RESP3 Set          '~'      ~2\r\n$1\r\na\r\n$1\r\nb\r\n    HashSet<Bytes>
-RESP3 Push         '>'      >2\r\n+invalidate\r\n$1\r\nk\r\n Vec<Bytes>
+```text
+First byte        Grammar                                   Handler
+──────────────────────────────────────────────────────────────────────────────
+'*'               RESP array: *N\r\n($len\r\ndata\r\n){N}    parse_resp_array
+otherwise         Try Memcached "set/add/replace key         parse_memcached_storage_command
+                  flags exptime bytes [noreply]\r\n<data>\r\n"
+otherwise         Space/tab-separated inline text             parse_inline_command
 ```
 
-### 3.2 The Command Enum AST
+There is no separate frame type for simple strings (`+`), errors (`-`), or integers (`:`) on
+the *input* side — those are reply-only prefixes written by `connection.rs`, never parsed
+here, because a client never sends a command framed that way.
+
+### 3.2 The `Command` enum: real shape, real category breakdown
 
 ```rust
+#[derive(Debug, PartialEq, Clone)]
 pub enum Command {
-    // Strings
+    Auth { username: Option<String>, password: String },
+    Acl(AclSubcommand),
     Get(Bytes),
-    Set { key: Bytes, val: Bytes, ex: Option<Duration>, nx: bool, xx: bool, get: bool },
+    Getex { key: Bytes, expire_in: Option<Duration>, persist: bool },
+    Set {
+        key: Bytes,
+        value: Bytes,
+        expire_in: Option<Duration>,
+        condition: SetCondition,   // None | Nx | Xx | Ifeq(Bytes) | Ifne(Bytes) | Ifdeq(Bytes) | Ifdne(Bytes)
+        get: bool,
+        keepttl: bool,
+        past_expired: bool,
+    },
     Mget(Vec<Bytes>),
     Mset(Vec<(Bytes, Bytes)>),
-    Incr(Bytes),
-    Decr(Bytes),
-    IncrBy(Bytes, i64),
-    // Hashes
-    Hget { key: Bytes, field: Bytes },
-    Hset { key: Bytes, pairs: Vec<(Bytes, Bytes)> },
-    Hgetall(Bytes),
-    // Lists
-    Lpush { key: Bytes, elements: Vec<Bytes> },
-    Rpush { key: Bytes, elements: Vec<Bytes> },
-    Lpop { key: Bytes, count: Option<usize> },
-    Rpop { key: Bytes, count: Option<usize> },
-    // Sorted Sets
-    Zadd { key: Bytes, items: Vec<(f64, Bytes)>, flags: ZAddFlags },
-    Zrange { key: Bytes, opts: ZRangeOpts },
-    Zscore { key: Bytes, member: Bytes },
-    // Full-Text & Vector Search
-    FtCreate { index: Bytes, schema: SearchSchema },
-    FtSearch { index: Bytes, query: SearchQuery },
-    // Cluster & Replication
-    ClusterNodes,
-    ClusterSlots,
-    Psync { repl_id: String, offset: i64 },
-    // ... 274+ defined commands
+    // ... hundreds more variants, grouped by the file's own section comments:
+    // LIST, SET, ZSET, GENERIC & DATABASE, EXTENDED STRING, LUA SCRIPTING,
+    // TIERED STORAGE, CONFIG, PUBSUB, KEYSPACE INSPECTION, TRANSACTIONS,
+    // BITMAP, HYPERLOGLOG, RDB SERIALIZATION, STREAM, VALKEY EXTENDED,
+    // VECTOR, CRDT MULTI-REGION, REDIS 7 FUNCTIONS, REDISJSON, GEOSPATIAL,
+    // PROBABILISTIC, FT.* (full-text search), XDP.* (AF_XDP/eBPF control),
+    // Dragonfly native extensions, and a Memcached Protocol block:
+    MemcachedSet { key: Bytes, flags: u32, exptime: u32, bytes: usize, noreply: bool, data: Bytes },
+    MemcachedGet { keys: Vec<Bytes> },
+    MemcachedDelete { key: Bytes, noreply: bool },
+    MemcachedIncr { key: Bytes, value: u64, noreply: bool },
+    MemcachedStats,
+    Unknown(String),
 }
 ```
+
+Note the derive is `PartialEq, Clone` — **not `Eq`** — because several variants (`Zadd`,
+`Zincrby`, score-range queries, `Set`'s `past_expired` semantics, etc.) carry `f64` fields,
+and `f64` has no total order (`NaN != NaN`), so `Eq` can't be derived. This is a real
+constraint of the type, not an oversight.
+
+The enum's category list above comes directly from the file's own `// SECTION NAME` comments
+(`grep -n "^    // [A-Z]" src/resp.rs`), which is the fastest way to get an up-to-date map of
+what's supported without reading all ~1,000 lines of variant declarations.
 
 ---
 
 ## 4. Parsing Algorithms & Code Logic
 
-### 4.1 Zero-Copy Frame Detection (`parse_command`)
+### 4.1 `parse_command`: three grammars, tried in a fixed order
 
 ```rust
-pub fn parse_command(input: &[u8]) -> Option<(Command, usize)> {
-    if input.is_empty() { return None; }
-
-    match input[0] {
-        b'*' => parse_resp_array(input),
-        b'+' | b'-' | b':' | b'$' => None, // Not valid command roots
-        _ => parse_inline_command(input),  // Text command (e.g. PING, QUIT)
-    }
-}
-
-fn parse_resp_array(input: &[u8]) -> Option<(Command, usize)> {
-    let mut cursor = 1;
-    // 1. Read array length
-    let (count, bytes_consumed) = read_integer(&input[cursor..])?;
-    cursor += bytes_consumed;
-
-    let mut args = Vec::with_capacity(count as usize);
-
-    // 2. Read each argument bulk string
-    for _ in 0..count {
-        if cursor >= input.len() || input[cursor] != b'$' { return None; }
-        cursor += 1;
-        let (len, len_bytes) = read_integer(&input[cursor..])?;
-        cursor += len_bytes;
-
-        let end = cursor + len as usize;
-        if end + 2 > input.len() { return None; } // Incomplete frame
-
-        // Zero-copy reference slice
-        let arg = Bytes::copy_from_slice(&input[cursor..end]);
-        args.push(arg);
-        cursor = end + 2; // Skip trailing \r\n
+pub fn parse_command(buf: &mut BytesMut) -> Result<Option<Command>, String> {
+    if buf.is_empty() {
+        return Ok(None);
     }
 
-    // 3. Dispatch to command-specific AST generator
-    let cmd = build_command(args)?;
-    Some((cmd, cursor))
+    if buf[0] == b'*' {
+        parse_resp_array(buf)
+    } else {
+        match parse_memcached_storage_command(buf)? {
+            Some(Some(cmd)) => Ok(Some(cmd)),
+            Some(None) => Ok(None),
+            None => parse_inline_command(buf),
+        }
+    }
 }
 ```
 
-### 4.2 Strict Input Validation Examples
-
-#### Sorted Set Key Validation (`ZUNION`, `ZINTER`, `ZDIFF`)
-Redis commands that accept a variable number of keys strictly validate that `numkeys >= 1`:
+`parse_memcached_storage_command` returns a triple-layered result deliberately: `Ok(None)`
+means "this isn't a memcached storage command at all, try inline parsing next";
+`Ok(Some(None))` means "it *is* one, but the data block hasn't fully arrived yet — wait for
+more bytes, don't fall through to inline parsing"; `Ok(Some(Some(cmd)))` is a complete parse.
+That extra `Option` layer exists specifically to prevent a partially-received memcached
+`set key 0 0 1024\r\n<...only 200 bytes so far...>` from being misinterpreted as inline text.
 
 ```rust
-"ZUNIONSTORE" | "ZINTERSTORE" => {
-    let numkeys: i64 = std::str::from_utf8(&args[2])
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-
-    if numkeys <= 0 {
-        return Err(format!("at least 1 input key is needed for '{}' command", cmd_name.to_lowercase()));
+fn parse_memcached_storage_command(buf: &mut BytesMut) -> Result<Option<Option<Command>>, String> {
+    let newline_pos = match find_crlf(buf) { Some(pos) => pos, None => return Ok(None) };
+    let line = &buf[..newline_pos];
+    let first_space = match line.iter().position(|&b| b == b' ' || b == b'\t') {
+        Some(p) => p, None => return Ok(None),
+    };
+    let first_word = &line[..first_space];
+    let is_set = first_word.eq_ignore_ascii_case(b"set");
+    let is_add = first_word.eq_ignore_ascii_case(b"add");
+    let is_replace = first_word.eq_ignore_ascii_case(b"replace");
+    if !is_set && !is_add && !is_replace {
+        return Ok(None);
     }
-    let numkeys = numkeys as usize;
-    if args.len() < 3 + numkeys {
-        return Err("syntax error".to_string());
+    // ... parse key/flags/exptime/bytes/noreply from the header line ...
+    let total_len = newline_pos + 2 + bytes_len + 2;
+    if buf.len() < total_len {
+        return Ok(Some(None)); // header parsed, but data block hasn't fully arrived
     }
-    // Parse keys, weights, and aggregate options...
+    if &buf[newline_pos + 2 + bytes_len .. total_len] != b"\r\n" {
+        return Err("CLIENT_ERROR bad data chunk".to_string());
+    }
+    // ... build Command::MemcachedSet/Add/Replace, buf.advance(total_len) ...
 }
 ```
+
+### 4.2 `parse_resp_array`: unchanged two-pass zero-copy scan
+
+This is verbatim the same algorithm as the original design: scan the whole frame for
+completeness first, without mutating `buf`, then — only once the entire frame is known to be
+present — make a second pass that actually consumes bytes and slices out zero-copy `Bytes`
+arguments.
+
+```rust
+fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
+    let newline_pos = match find_crlf(buf) { Some(pos) => pos, None => return Ok(None) };
+    let line = &buf[1..newline_pos];
+    let num_args: usize = match std::str::from_utf8(line).ok().and_then(|s| s.parse().ok()) {
+        Some(n) => n,
+        None => return Err("Invalid array length in RESP frame".to_string()),
+    };
+
+    // Pass 1: prove the whole frame is present without consuming anything.
+    let mut scan_cursor = newline_pos + 2;
+    for _ in 0..num_args {
+        if scan_cursor >= buf.len() { return Ok(None); }
+        if buf[scan_cursor] != b'$' {
+            return Err("Expected bulk string in command array".to_string());
+        }
+        let next_crlf = match find_crlf_at(buf, scan_cursor) { Some(p) => p, None => return Ok(None) };
+        let arg_len: usize = std::str::from_utf8(&buf[scan_cursor + 1..next_crlf])
+            .ok().and_then(|s| s.parse().ok())
+            .ok_or_else(|| "Invalid bulk string length".to_string())?;
+        let data_end = next_crlf + 2 + arg_len;
+        if data_end + 2 > buf.len() { return Ok(None); }
+        if &buf[data_end..data_end + 2] != b"\r\n" {
+            return Err("Expected CRLF after bulk string data".to_string());
+        }
+        scan_cursor = data_end + 2;
+    }
+
+    // Pass 2: frame confirmed complete — now actually consume and zero-copy slice.
+    buf.advance(newline_pos + 2);
+    let mut args = Vec::with_capacity(num_args);
+    for _ in 0..num_args {
+        let header_crlf = find_crlf(buf).unwrap();
+        let arg_len: usize = std::str::from_utf8(&buf[1..header_crlf]).unwrap().parse().unwrap();
+        buf.advance(header_crlf + 2);
+        let data = buf.split_to(arg_len).freeze(); // zero-copy
+        buf.advance(2);
+        args.push(data);
+    }
+    build_command(args)
+}
+```
+
+`parse_inline_command` is also unchanged: it splits on spaces/tabs and builds each argument
+with `Bytes::copy_from_slice` — a real copy, not zero-copy, because this path only serves
+interactive/debugging clients (`redis-cli`, `nc`), never the benchmarked pipelined workload.
+
+### 4.3 `build_command`: one shared constructor, ~5,500 lines, dispatched by uppercased name
+
+```rust
+pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
+    if args.is_empty() { return Ok(None); }
+    let cmd_name = String::from_utf8_lossy(&args[0]).to_uppercase();
+    match cmd_name.as_str() {
+        "GET" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'get' command".to_string());
+            }
+            if args.len() == 2 {
+                Ok(Some(Command::Get(args[1].clone())))
+            } else {
+                // "get k1 k2 k3" is not valid Redis GET arity — treat it as a
+                // Memcached multi-key get instead of rejecting it outright.
+                Ok(Some(Command::MemcachedGet { keys: args[1..].to_vec() }))
+            }
+        }
+        // ...
+        _ => Ok(Some(Command::Unknown(cmd_name))),
+    }
+}
+```
+
+This `GET`/`MemcachedGet` disambiguation-by-arity is a good example of how the Redis and
+Memcached surfaces share one dispatch table without a protocol-mode flag: since real Redis
+`GET` is strictly single-key, any extra arguments unambiguously mean the memcached dialect
+was intended instead. `DEL`/`DELETE` similarly resolve to `Command::Del` or
+`Command::MemcachedDelete` depending on which spelling arrived.
+
+Options are parsed with the same index-walking `while i < args.len()` loop over uppercased
+option tokens the original design used for `SET ... EX ...`, now carrying more flags. `SET`
+itself has grown Dragonfly-style conditional variants beyond plain `NX`/`XX`:
+
+```rust
+"IFEQ" => {
+    if condition != SetCondition::None || i + 1 >= args.len() { return Err("syntax error".to_string()); }
+    condition = SetCondition::Ifeq(args[i + 1].clone()); // set only if current value == this
+    i += 2;
+}
+```
+
+### 4.4 `HELLO`: parsed here, acted on in `connection.rs`
+
+```rust
+"HELLO" => {
+    let mut proto = None;
+    // first arg, if a bare integer, is the requested protocol version
+    if let Ok(p) = String::from_utf8_lossy(&args[1]).parse::<u8>() { proto = Some(p); ... }
+    // then AUTH user pass / SETNAME name in any order
+    Ok(Some(Command::Hello { proto, auth, setname }))
+}
+```
+
+`resp.rs` only produces the `Command::Hello { proto, .. }` value. It's `connection.rs` that
+inspects `proto` and flips the client's `is_resp3` flag and the `CURRENT_CLIENT_RESP3`
+thread-local, which is what actually changes reply formatting afterward.
+
+### 4.5 `parse_redis_f64`: libc `strtod` as a fallback for exact Redis float parsing
+
+Sorted-set scores need to accept exactly the float literals real Redis accepts (`inf`,
+`+inf`, `-inf`, `infinity`, values Rust's `f64::from_str` is stricter about). Rather than
+reimplementing C's `strtod` parsing rules by hand, this file falls back to the real libc
+function via FFI when Rust's own parser doesn't accept the input:
+
+```rust
+pub fn parse_redis_f64(s: &str) -> Option<f64> {
+    if let Ok(v) = s.parse::<f64>() { /* fast path */ return Some(v); }
+    if let Ok(c_str) = std::ffi::CString::new(s) {
+        unsafe {
+            let mut end: *mut libc::c_char = std::ptr::null_mut();
+            let val = libc::strtod(c_str.as_ptr(), &mut end);
+            if !end.is_null() && *end == 0 && end != c_str.as_ptr() as *mut libc::c_char {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+```
+
+`parse_score_bound` builds on this to handle `ZRANGEBYSCORE`-style `(exclusive` prefixes on
+top of the same float grammar.
+
+### 4.6 `find_crlf`/`find_crlf_at`: still a plain windowed scan
+
+Unchanged from the original design — a `.windows(2).position(|w| w == b"\r\n")` scan. It's
+only ever used to find the end of small protocol headers (array lengths, bulk-string length
+prefixes), never to scan payload data, so there's no SIMD opportunity being left on the table
+here (see the storage engine's SIMD control-byte matching in Part 1 of
+`docs/designs/components.md` for where that technique actually applies, on 16-byte groups).
 
 ---
 
-## 5. Serialization Primitives
+## 5. Cross-Component Interactions
 
-`src/resp.rs` provides fast inlined serialization helpers that write directly into `out: &mut Vec<u8>`:
-
-```rust
-#[inline]
-pub fn write_resp_bulk(out: &mut Vec<u8>, data: &[u8]) {
-    out.extend_from_slice(format!("${}\r\n", data.len()).as_bytes());
-    out.extend_from_slice(data);
-    out.extend_from_slice(b"\r\n");
-}
-
-#[inline]
-pub fn write_resp_integer(out: &mut Vec<u8>, val: i64) {
-    out.extend_from_slice(format!(":{}\r\n", val).as_bytes());
-}
-
-#[inline]
-pub fn write_resp_simple_string(out: &mut Vec<u8>, s: &str) {
-    out.extend_from_slice(format!("+{}\r\n", s).as_bytes());
-}
-
-#[inline]
-pub fn write_resp_err(out: &mut Vec<u8>, err: &str) {
-    out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
-}
-```
+- **`src/connection.rs`**: The sole consumer of `parse_command`. All reply serialization
+  (RESP2 and RESP3) happens there, not in this file.
+- **`src/table.rs`**: Several `Command` variant fields carry types defined in `table.rs`
+  directly (e.g. `Zadd`'s `flags: crate::table::ZAddFlags`, `Zrange`'s
+  `opts: crate::table::ZRangeOpts`, stream commands' `crate::table::StreamId`), so this file
+  and the storage engine share vocabulary rather than each redefining it.
+- **`src/block.rs`**: `ClientSubcommand::Unblock` carries a `crate::block::ClientUnblockType`
+  defined in the blocking-operations module.
 
 ---
 
 ## 6. Performance Characteristics
 
-- **Zero Memory Allocation on Parsing**: By borrowing slices directly from network buffers, memory throughput is bound only by CPU cache bandwidth.
-- **Fast Integer Parsing**: `read_integer` uses branchless ASCII byte arithmetic (`val = val * 10 + (b - b'0') as i64`) rather than slow standard library string conversions.
+- **Zero-copy on the hot (RESP array) path**: every bulk-string argument is a `Bytes` slice
+  sharing the original read buffer's allocation, not a fresh heap copy.
+- **The inline and Memcached paths copy**: both exist for compatibility/interactive use, not
+  throughput, and neither is on the benchmarked pipeline path.
+- **`build_command`'s dispatch is a single string match, not a lookup table**: with 200+ arms,
+  this is a large `match` the compiler is left to optimize (typically into some mix of
+  length-bucketed comparisons/jump tables); no bespoke perfect-hash or trie dispatch was
+  built for it.
