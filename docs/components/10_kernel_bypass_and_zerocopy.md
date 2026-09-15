@@ -2,155 +2,279 @@
 
 ## 1. Architectural Purpose & Scope
 
-The **Kernel Bypass & Zero-Copy Networking** subsystem optimizes packet transmission and reception at the lowest layer of the Linux kernel. It consists of two engines:
-1. **AF_XDP (XSK) eBPF Driver (`src/xdp.rs`)**: Bypasses the entire Linux kernel networking stack, streaming raw Ethernet frames directly between the Network Interface Card (NIC) and userspace memory.
-2. **Zero-Copy TCP Engine (`src/zerocopy.rs`)**: Utilizes Linux's `MSG_ZEROCOPY` interface and pre-registered DMA buffer pools to transmit large bulk replies without copying data between userspace and kernel buffers.
+This component is two independent, mostly-unconnected pieces of code, neither of which does
+what its name and the previous version of this document claimed:
+
+1. **`src/xdp.rs`**: **Not real AF_XDP/eBPF kernel bypass.** There is no `aya`/`libbpf`/`xsk`
+   dependency in `Cargo.toml`, no `bpf()` syscall, no raw socket, no UMEM ring buffers, and no
+   attachment of any program to a NIC driver. What actually exists is a pure-userspace
+   `XdpEngine`: a CIDR-based allow/drop/redirect rule table plus a per-source-IP token-bucket
+   rate limiter, driven entirely by a Redis command (`XDP.PACKET <payload>`) that lets a client
+   hand it a raw byte buffer to run through the simulated pipeline. It never touches real
+   inbound network traffic.
+2. **`src/zerocopy.rs`**: **Real Linux zero-copy syscalls, but entirely disconnected from the
+   live request path.** `SO_ZEROCOPY`/`MSG_ZEROCOPY` usage here is genuine and correctly
+   implemented (real `libc` FFI, real `ENOBUFS` fallback handling), and there's a real
+   page-aligned `RegisteredBufferPool` with `io_uring`-crate-compatible `iovec`s. But grepping
+   the entire codebase shows **zero call sites** for any of it outside this file's own unit
+   tests — `server.rs`/`connection.rs`/`main.rs` never construct a `ZeroCopyEngine` or call
+   `send_zc`. The actual connection path (`connection.rs`, via `monoio`'s `io_uring` driver)
+   never uses this code.
 
 ---
 
 ## 2. Key Invariants & Concurrency Constraints
 
-1. **Direct Memory Access (DMA) Safety**: All UMEM and registered zero-copy buffers are 4KB page-aligned and memory-pinned to prevent OS page faults during hardware DMA transfers.
-2. **Lock-Free Ring Buffers**: AF_XDP uses four single-producer single-consumer lock-free circular queues: **Fill Ring**, **Rx Ring**, **Tx Ring**, and **Completion Ring**.
-3. **Hardware-Rate DDoS Mitigation**: Token-bucket rate limiting operates directly within the XDP hook; malicious traffic is dropped via `XDP_DROP` before consuming kernel CPU cycles.
-4. **Fallback Resilience**: If AF_XDP or `MSG_ZEROCOPY` are unavailable due to kernel capabilities or missing permissions, Rudis transparently falls back to standard `io_uring` TCP sockets.
+1. **`XdpEngine` is a single global, not per-shard**: `get_xdp_engine()` returns a clone of an
+   `Arc<XdpEngine>` behind a process-wide `static GLOBAL_XDP_ENGINE: LazyLock<Arc<XdpEngine>>`
+   — every shard thread that calls `XDP.*` commands shares the exact same instance, coordinated
+   via `RwLock<Vec<XdpRule>>` and `RwLock<HashMap<u32, TokenBucket>>` (a real, if narrow,
+   exception to the shared-nothing model, similar in shape to `BlockHub` in Component 06).
+2. **`XdpMode` is cosmetic, not functional**: the global engine picks `XdpMode::Skb` if
+   `/sys/class/net` exists on the host, else `XdpMode::Simulated` — this only changes what
+   `XDP.INFO` reports as a string; it does not change `process_packet`'s behavior or attach
+   anything to a real interface in either mode.
+3. **`RegisteredBufferPool` owns raw allocated memory directly** (`alloc_zeroed`/`dealloc` via
+   `std::alloc`, not a `Vec`), page-aligned via `Layout::from_size_align(total_size, PAGE_SIZE)`,
+   with a manual `unsafe impl Send + Sync` — correct in isolation, but again: nothing in the
+   codebase actually constructs one outside its own test.
+4. **`ZeroCopyEngine::send_zc` degrades gracefully**: only applies `MSG_ZEROCOPY` for payloads
+   `>= PAGE_SIZE` (4KB, per a comment citing page-locking overhead for smaller sends), and on
+   `ENOBUFS` (kernel zero-copy completion queue full) or general zero-copy failure, retries once
+   with a plain blocking `send()` — this fallback logic is real and correct, it's just never
+   invoked by anything.
 
 ---
 
-## 3. Component Architecture & Ring Topologies
+## 3. Component Architecture
 
 ```
-+─────────────────────────────────────────────────────────────────────────────+
-|                         AF_XDP KERNEL BYPASS (xdp.rs)                       |
-|                                                                             |
-|      Physical NIC (Intel 100GbE / Mellanox ConnectX-6)                      |
-|             │                                                               |
-|             ▼ (XDP_DRV Hook)                                                |
-|      [ eBPF Driver Filter: Token Bucket Rate Limiter ] ──► Drop DDoS (XDP_DROP)
-|             │ (XDP_REDIRECT)                                                |
-|             ▼                                                               |
-|      [ Rx Ring Buffer ] ─────────────────────┐                              |
-|                                              │ DMA into UMEM                |
-|                                              ▼                              |
-|                          [ Userspace UMEM Buffer Pool ]                     |
-|                               (4KB Aligned Pages)                           |
-+──────────────────────────────────────┬──────────────────────────────────────+
-                                       │
-                                       ▼
-+─────────────────────────────────────────────────────────────────────────────+
-|                          MSG_ZEROCOPY TCP (zerocopy.rs)                     |
-|                                                                             |
-|      Large Bulk Response (MGET / RDB / HGETALL)                             |
-|             │                                                               |
-|             ▼                                                               |
-|      libc::send(fd, buf, len, MSG_ZEROCOPY)                                 |
-|             │ (Zero CPU Copy: Kernel pins page and DMAs to NIC)             |
-|             ▼                                                               |
-|      Poll socket error queue (MSG_ERRQUEUE) for completion acknowledgment   |
-+─────────────────────────────────────────────────────────────────────────────+
+                    XDP.* Redis commands (client-issued, e.g. redis-cli)
+                                        │
+                                        ▼
+                     crate::xdp::get_xdp_engine()  (global Arc<XdpEngine>)
+                                        │
+                ┌───────────────────────┼───────────────────────┐
+                ▼                       ▼                       ▼
+        XDP.RULEADD/DEL/LIST    XDP.STATS / XDP.INFO      XDP.PACKET <bytes>
+       (CIDR allow/drop table)   (atomic counters)      (manually parses the
+                                                          given bytes as an
+                                                          Ethernet/IPv4 frame
+                                                          and runs the same
+                                                          filter+rate-limit
+                                                          pipeline used above)
+
+        src/zerocopy.rs: RegisteredBufferPool + ZeroCopyEngine
+        — fully implemented, fully unit-tested, ZERO callers anywhere
+          else in the codebase.
 ```
+
+### `XdpEngine` (`src/xdp.rs`) — the real struct
+
+```rust
+pub struct XdpEngine {
+    pub ifname: String,
+    pub mode: XdpMode,
+    pub frame_size: usize,          // 2048, cosmetic (reported by XDP.INFO only)
+    pub num_frames: usize,          // 4096, cosmetic
+    pub rules: RwLock<Vec<XdpRule>>,
+    pub next_rule_id: AtomicU32,
+    pub rate_limiters: RwLock<HashMap<u32, TokenBucket>>,  // keyed by source IPv4, as u32
+    pub default_rate_limit: f64,     // 100_000.0 tokens/sec
+    pub default_rate_capacity: f64,  // 50_000.0 burst capacity
+    pub rx_packets: AtomicU64,
+    pub rx_bytes: AtomicU64,
+    pub dropped_packets: AtomicU64,
+    pub redirected_packets: AtomicU64,
+    pub pass_packets: AtomicU64,
+    pub rate_limit_drops: AtomicU64,
+}
+```
+
+There is no `XdpSocket`, `XdpUmem`, `XdpRxRing`/`XdpTxRing`/`XdpFillRing`/`XdpCompRing`, and no
+`xsk_fd: RawFd` anywhere in the file — those were invented in the prior version of this
+document. The real per-rule type is:
+
+```rust
+pub struct XdpRule {
+    pub id: u32,
+    pub action: XdpAction,   // Pass | Drop | Redirect | Tx
+    pub cidr: String,
+    pub network: u32,        // pre-computed via parse_cidr for fast masking
+    pub netmask: u32,
+}
+```
+
+### `TokenBucket` (`src/xdp.rs`) — the real rate limiter, one instance per source IP
+
+```rust
+pub struct TokenBucket {
+    pub tokens: f64,
+    pub capacity: f64,
+    pub refill_rate: f64,   // tokens per second
+    pub last_update: Instant,
+}
+
+impl TokenBucket {
+    pub fn allow(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_update).as_secs_f64();
+        self.last_update = now;
+        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.capacity);
+        if self.tokens >= 1.0 { self.tokens -= 1.0; true } else { false }
+    }
+}
+```
+
+Standard continuous-refill token bucket, costing exactly 1 token per packet regardless of
+packet size (the prior doc's `TokenBucketLimiter::allow_packet(&mut self, packet_len: u64)`,
+which spent tokens proportional to byte length, does not exist — the real bucket is
+per-*packet*, not per-*byte*). Buckets are created lazily per source IP the first time that IP
+is seen (`rate_limiters.entry(ip).or_insert_with(...)`), never evicted — a real, if minor,
+unbounded-memory-growth characteristic worth knowing (one `TokenBucket` per distinct source IP
+ever seen, for the lifetime of the process).
+
+### `src/zerocopy.rs` — the real (but unused) types
+
+```rust
+pub struct RegisteredBufferPool {
+    ptr: *mut u8,
+    layout: Layout,
+    slot_size: usize,
+    slot_count: usize,
+    free_slots: Vec<usize>,
+    iovecs: Vec<libc::iovec>,
+    stats: Arc<ZeroCopyStats>,
+}
+
+pub struct ZeroCopyEngine {
+    stats: Arc<ZeroCopyStats>,
+}
+```
+
+Note these are **separate** structs — `ZeroCopyEngine` does not own a `buffer_pool` field the
+way the prior doc claimed; a caller would need to wire the two together manually (and no caller
+does).
 
 ---
 
 ## 4. Execution Algorithms & Code Logic
 
-### 4.1 AF_XDP Ring Management (`src/xdp.rs`)
+### 4.1 `XdpEngine::process_packet` — manual, CPU-side Ethernet/IPv4 parsing
 
 ```rust
-pub struct XdpSocket {
-    pub umem: Arc<XdpUmem>,
-    pub rx_ring: XdpRxRing,
-    pub tx_ring: XdpTxRing,
-    pub fill_ring: XdpFillRing,
-    pub comp_ring: XdpCompRing,
-    pub xsk_fd: RawFd,
+pub fn process_packet(&self, packet: &[u8]) -> XdpAction {
+    self.rx_packets.fetch_add(1, Ordering::Relaxed);
+    self.rx_bytes.fetch_add(packet.len() as u64, Ordering::Relaxed);
+    if packet.is_empty() {
+        self.dropped_packets.fetch_add(1, Ordering::Relaxed);
+        return XdpAction::Drop;
+    }
+    // Detects either a 14-byte Ethernet header (checking bytes[12..14] == 0x0800 for IPv4)
+    // followed by an IPv4 packet, OR a bare IPv4 packet (checking the top nibble of byte 0 == 4).
+    // Extracts source IP (bytes 12..16 of the IPv4 header) and, for TCP (protocol byte == 6),
+    // the destination port — computed but currently unused (`let _ = payload_offset;`).
+    ...
+    if let Some(ip) = src_ip {
+        // 1. Linear scan of CIDR rules (first match wins: Drop/Pass/Redirect/Tx)
+        // 2. Per-source-IP TokenBucket rate limit (lazily created)
+    }
+    // 3. Anything not matched by a rule or rate-limited is unconditionally Redirect'd
+    //    (the doc comment says "Redis port 6379 or cluster bus", but the code does not
+    //    actually inspect the destination port to decide this — it's an unconditional default)
+    self.redirected_packets.fetch_add(1, Ordering::Relaxed);
+    XdpAction::Redirect
 }
+```
 
-pub struct TokenBucketLimiter {
-    pub rate_per_sec: u64,
-    pub capacity: u64,
-    pub current_tokens: u64,
-    pub last_refill: Instant,
+The byte-offset parsing itself is real and reasonably careful (bounds-checked slice access,
+handles both frame shapes), but it operates on whatever byte slice was handed to it — there is
+no code anywhere that reads this slice from an actual NIC, a raw socket, or an XDP program.
+
+### 4.2 The only caller: `Command::XdpPacket` in `connection.rs`
+
+```rust
+Command::XdpPacket(payload) => {
+    let action = crate::xdp::get_xdp_engine().process_packet(&payload);
+    let s = format!("+{}\r\n", action);
+    out.extend_from_slice(s.as_bytes());
+    false
 }
+```
 
-impl TokenBucketLimiter {
-    pub fn allow_packet(&mut self, packet_len: u64) -> bool {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-        let new_tokens = (elapsed * self.rate_per_sec as f64) as u64;
+`payload` is a `Bytes` argument taken directly from the client's `XDP.PACKET` command — a
+Redis client can construct an arbitrary byte string and ask the server to run it through the
+simulated filter/rate-limit pipeline and report back `+PASS`, `+DROP`, `+REDIRECT`, or `+TX`.
+This confirms the design: it's a **testable simulation of what an XDP filter's logic would do**,
+reachable as an ordinary command, not a hook into real packet ingress. The companion commands
+(`XDP.INFO`, `XDP.RULEADD`, `XDP.RULEDEL`, `XDP.RULELIST`, `XDP.STATS`) manage the same global
+rule table and read back the same atomic counters — all of it is only ever exercised by
+whatever a client explicitly sends to `XDP.PACKET`, never by this server's own real 6379
+listener traffic.
 
-        self.current_tokens = (self.current_tokens + new_tokens).min(self.capacity);
-        self.last_refill = now;
+### 4.3 `ZeroCopyEngine::send_zc` — real syscall usage, verified unreachable
 
-        if self.current_tokens >= packet_len {
-            self.current_tokens -= packet_len;
-            true // Allow packet into Rx Ring
-        } else {
-            false // XDP_DROP
+```rust
+pub fn send_zc(&self, fd: RawFd, data: &[u8]) -> io::Result<usize> {
+    if data.is_empty() { return Ok(0); }
+    let flags = if data.len() >= PAGE_SIZE {
+        libc::MSG_NOSIGNAL | MSG_ZEROCOPY
+    } else {
+        libc::MSG_NOSIGNAL
+    };
+    let ret = unsafe { libc::send(fd, data.as_ptr() as *const libc::c_void, data.len(), flags) };
+    if ret >= 0 {
+        // record zc_send_calls / zc_bytes_sent, return Ok(sent)
+    } else {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ENOBUFS) || flags & MSG_ZEROCOPY != 0 {
+            // fall back to a plain blocking libc::send with just MSG_NOSIGNAL
         }
+        Err(err)
     }
 }
 ```
 
-### 4.2 Linux TCP Zero-Copy Engine (`src/zerocopy.rs`)
+This is correct, idiomatic use of Linux's real zero-copy send path (including the documented
+requirement to poll `MSG_ERRQUEUE` for completion notifications in a full implementation — which
+this code does *not* do; there is no `MSG_ERRQUEUE`/`recvmsg` polling anywhere in the file, so
+even if this were wired up, the caller would have no way to know when the kernel has actually
+finished the zero-copy DMA and it's safe to reuse/free the source buffer). `fd: RawFd` is a raw
+file descriptor — but `connection.rs`'s actual sockets are `monoio::net::TcpStream` objects
+whose file descriptors aren't exposed or passed to this function anywhere. There is no
+integration point today.
 
-```rust
-pub struct ZeroCopyEngine {
-    pub buffer_pool: RegisteredBufferPool,
-    pub stats: Arc<ZeroCopyStats>,
-}
-
-impl ZeroCopyEngine {
-    pub fn enable_so_zerocopy(fd: RawFd) -> std::io::Result<()> {
-        let one: libc::c_int = 1;
-        let ret = unsafe {
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_ZEROCOPY,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&one) as libc::socklen_t,
-            )
-        };
-        if ret != 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    pub fn send_zc(&self, fd: RawFd, payload: &[u8]) -> std::io::Result<usize> {
-        let flags = libc::MSG_ZEROCOPY | libc::MSG_NOSIGNAL;
-        let sent = unsafe {
-            libc::send(
-                fd,
-                payload.as_ptr() as *const libc::c_void,
-                payload.len(),
-                flags,
-            )
-        };
-
-        if sent < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            self.stats.zc_bytes_sent.fetch_add(sent as u64, Ordering::Relaxed);
-            Ok(sent as usize)
-        }
-    }
-}
-```
+`build_io_uring_send_zc` similarly constructs a real `io_uring::opcode::SendZc` entry using the
+`io-uring` crate (a genuine dependency in `Cargo.toml`, used elsewhere for direct-I/O tiering —
+see Component 07), but nothing ever calls it or submits the resulting entry to a ring.
 
 ---
 
 ## 5. Cross-Component Interactions
 
-- **`src/server.rs`**: When kernel bypass is enabled, shard threads poll the AF_XDP Rx ring directly rather than standard TCP sockets.
-- **`src/connection.rs`**: When returning responses larger than 4 KB, the connection handler calls `send_zc` to bypass CPU memory copies.
+- **`src/connection.rs`**: the only real integration point — six `Xdp*` `Command` variants
+  (`XdpInfo`, `XdpRuleAdd`, `XdpRuleDel`, `XdpRuleList`, `XdpStats`, `XdpPacket`) are dispatched
+  here, each just forwarding to `crate::xdp::get_xdp_engine()`. **Not connected**: the real
+  `handle_connection`/accept-loop path in `server.rs` (Component 01) always uses `monoio`'s
+  `SO_REUSEPORT` `TcpListener`, regardless of `XdpEngine`'s state.
+- **`src/resp.rs`**: parses the six `XDP.*` command names/arguments into the `Command` enum
+  variants above (including mapping `"DROP"`/`"PASS"`/`"REDIRECT"`/`"TX"` strings to
+  `XdpAction`).
+- **`src/zerocopy.rs`**: no cross-component interactions to document — verified zero callers
+  outside its own `#[cfg(test)]` module.
 
 ---
 
 ## 6. Performance Characteristics
 
-- **Zero CPU Cache Invalidation on Network Ingress**: Frames are DMA'd directly into userspace UMEM without touching the kernel's `sk_buff` structures.
-- **DDoS Immunity**: Hardware line-rate packet drops (up to **28 Million packets/sec per 100GbE port**).
-- **Line-Rate Bulk Transfers**: `MSG_ZEROCOPY` saturates 100GbE network interfaces with less than $5\%$ CPU utilization.
+- **No measured network-layer performance benefit exists from either file.** `xdp.rs`'s cost is
+  whatever it costs to run `process_packet` once per `XDP.PACKET` command a client explicitly
+  sends — i.e., it's exercised at whatever rate a test or admin script chooses to call it, not
+  at line rate against real traffic. `zerocopy.rs` is entirely inert in the running server.
+- **The token-bucket rate limiter and CIDR rule table are real, correct, O(1)-per-packet
+  (rules are a linear scan, but the rule list is expected to be small) userspace logic** — useful
+  as a testable filter-policy engine, just not connected to anything that would make it a DDoS
+  defense in practice.
+- Any performance claims in the previous version of this document (100GbE line-rate, "28 million
+  packets/sec", "&lt;5% CPU utilization" for `MSG_ZEROCOPY`) were invented and have been removed;
+  none of it has ever been benchmarked because none of it runs on the real request path.

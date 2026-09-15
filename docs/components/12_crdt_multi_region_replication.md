@@ -1,200 +1,256 @@
-# Component 12: Active-Active Multi-Region CRDT Engine (`src/crdt.rs`)
+# Component 12: CRDT Data Types & Manual Multi-Region Sync (`src/crdt.rs`)
 
 ## 1. Architectural Purpose & Scope
 
-`src/crdt.rs` implements Rudis's active-active multi-region replication engine. Built for geo-distributed deployments spanning continents, it eliminates cross-datacenter write latency by allowing clients to write locally to any region. Concurrent mutations converge automatically and deterministically into identical states using **Conflict-Free Replicated Data Types (CRDTs)** synchronized by **Hybrid Logical Clocks (HLC)**.
+`src/crdt.rs` (645 lines) implements a small, self-contained library of three
+**Conflict-Free Replicated Data Types (CRDTs)** — a Last-Write-Wins Register, an
+Observed-Remove Set, and a Positive-Negative Counter — each ordered by a **Hybrid Logical
+Clock (HLC)**, plus a binary export/import format for merging one instance's CRDT state
+into another's.
+
+**What this is not**: there is no automatic cross-region network replication. There is no
+peer/region configuration anywhere in `main.rs`, no background sync task, and no wiring
+into `src/replication.rs` (which handles the unrelated primary/replica `PSYNC` stream).
+`CRDT.MERGE` takes its payload as a plain command argument (`Command::CrdtMerge(Bytes)`),
+which means getting CRDT state from one Rudis instance to another is entirely
+operator/client-driven: read it out with `CRDT.DUMP`, transport those bytes yourself
+(script, sidecar, whatever), and feed them into the target instance with `CRDT.MERGE
+<payload>`. The "multi-region" framing in this file's doc comments describes the
+data types' *convergence properties*, not a built network protocol.
+
+**A second, more important scope note, verified directly in `connection.rs`**: every
+`Command::Crdt*` handler calls `router.local_db.borrow_mut().crdt_*(...)` directly —
+never `router.get`/`router.set` or any `target_shard_of_cmd`-based routing. This means a
+`CRDT.SET foo bar` issued over a connection pinned to shard 2 mutates *shard 2's own*
+`CrdtStore`, completely independent of whichever shard would own `foo` under the normal
+CRC16 key-slot scheme, and independent of any other shard's `CrdtStore` for the same key
+name. There is no cross-shard merge either — `CRDT.MERGE` only merges into the connection's
+local shard. In effect, `CrdtStore` is a per-shard-local CRDT toolkit, not a per-key,
+whole-node (let alone whole-cluster or whole-region) store.
 
 ---
 
 ## 2. Key Invariants & Concurrency Constraints
 
-1. **Local Write Latency ($< 1$ ms)**: Writes complete immediately against the local datacenter; synchronization across regions occurs asynchronously via delta streams.
-2. **Deterministic Convergence**: State merge functions are mathematically **associative**, **commutative**, and **idempotent**:
-   $$\text{merge}(A, B) = \text{merge}(B, A)$$
-   $$\text{merge}(\text{merge}(A, B), C) = \text{merge}(A, \text{merge}(B, C))$$
-   $$\text{merge}(A, A) = A$$
-3. **Causal Monotonicity via HLC**: Overcomes physical clock drift across datacenters by combining physical UNIX epoch timestamps with logical event counters.
-4. **Add-Wins Semantics for Sets**: Concurrent additions and removals of the same element resolve in favor of the addition (OR-Set).
+1. **Deterministic Convergence (real, and tested)**: `LwwRegister::merge`, `OrSet::merge`,
+   and `PnCounter::merge` are each commutative/idempotent by construction (see §4) — the
+   file's own `#[cfg(test)]` module (`test_lww_register_convergence`,
+   `test_pn_counter_convergence`, `test_orset_add_wins`) exercises exactly this.
+2. **HLC via lock-free CAS, not a mutex**: `HybridLogicalClock` stores
+   `latest_physical_ms: AtomicU64` / `latest_logical: AtomicU32` and advances them with a
+   compare-exchange retry loop (§4.1) — real lock-free code, not a fabrication.
+3. **Add-Wins semantics for `OrSet`**: a concurrent add and remove of the same element
+   resolve in favor of the add, because `remove` only tombstones the specific add-tags
+   (`HlcTimestamp`s) it has *observed so far* — a later add carries a fresh tag the remove
+   never saw, so it survives merge. Verified by `test_orset_add_wins`.
+4. **No consensus, because there's no network layer to reach consensus over**: with sync
+   entirely manual (§1), there's no Paxos/Raft and also no automatic conflict detection —
+   whoever runs `CRDT.MERGE` decides when and with what payload merging happens.
 
 ---
 
 ## 3. Component Architecture & Data Structures
 
 ```
-  Client (US-East)                         Client (EU-West)
-         │                                        │
-         ▼ (Write locally)                        ▼ (Write locally)
- [ Update HLC: 100.1 ]                    [ Update HLC: 102.1 ]
- [ Local RudisTable ]                     [ Local RudisTable ]
-         │                                        │
-         └───────────── Asynchronous WAN ─────────┘
-                              │
-                              ▼
-                Conflict Resolution via HLC:
-             102.1 > 100.1 ──► EU-West Wins!
-             Both Datacenters Converge to Same State!
+   Any client, on shard 2's connection          Any client, on shard 5's connection
+                  │                                            │
+        CRDT.SET foo bar                              CRDT.SET foo baz
+                  │                                            │
+   router.local_db (shard 2 only)              router.local_db (shard 5 only)
+   CrdtStore.registers["foo"]                   CrdtStore.registers["foo"]
+   = LwwRegister{baz? no: "bar", ts}            = LwwRegister{"baz", ts}
+                  │                                            │
+                  └──── independent stores; only merged ───────┘
+                        if an operator runs CRDT.DUMP on one
+                        and CRDT.MERGE <payload> on the other
 ```
 
-### Core Data Structures
+### Real data structures (verbatim from `src/crdt.rs`)
 
 ```rust
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct HybridLogicalClock {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HlcTimestamp {
     pub physical_ms: u64,
-    pub logical_counter: u32,
+    pub logical: u32,
     pub node_id: u16,
 }
+// Ord: physical_ms, then logical, then node_id (lexicographic tuple compare)
 
-// 1. Last-Write-Wins Register
-pub struct LwwRegister<T> {
-    pub value: T,
-    pub clock: HybridLogicalClock,
+pub struct HybridLogicalClock {
+    pub node_id: u16,
+    latest_physical_ms: AtomicU64,
+    latest_logical: AtomicU32,
 }
 
-// 2. Positive-Negative Counter
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LwwRegister {
+    pub value: Bytes,
+    pub timestamp: HlcTimestamp,
+    pub tombstone: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OrSet {
+    pub elements: HashMap<Bytes, HashSet<HlcTimestamp>>,
+    pub tombstones: HashSet<HlcTimestamp>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PnCounter {
-    pub increments: HashMap<u16, u64>, // NodeId -> Positive Counts
-    pub decrements: HashMap<u16, u64>, // NodeId -> Negative Counts
+    pub p: HashMap<u16, i64>,  // per-node positive contributions
+    pub n: HashMap<u16, i64>,  // per-node negative contributions
 }
 
-// 3. Observed-Remove Set (Add-Wins)
-pub struct OrSet<T: Hash + Eq + Clone> {
-    // Element -> Set of active addition UUIDs with clocks
-    pub elements: HashMap<T, HashMap<Uuid, HybridLogicalClock>>,
-    // Set of tombstone UUIDs that have been removed
-    pub tombstones: HashMap<Uuid, HybridLogicalClock>,
+pub struct CrdtStore {
+    pub clock: HybridLogicalClock,
+    pub registers: HashMap<Bytes, LwwRegister>,
+    pub sets: HashMap<Bytes, OrSet>,
+    pub counters: HashMap<Bytes, PnCounter>,
 }
 ```
+
+Note the real shapes differ from what an earlier, unverified draft of this document
+claimed: `LwwRegister`/`OrSet` are concretely `Bytes`-keyed (not generic `<T>`), `OrSet`
+tracks per-element `HashSet<HlcTimestamp>` tags directly (no separate UUID type), and
+`PnCounter`'s fields are named `p`/`n` (not `increments`/`decrements`) and store signed
+`i64` per-node deltas rather than only-positive `u64` add/remove counts.
 
 ---
 
 ## 4. Execution Algorithms & Code Logic
 
-### 4.1 Hybrid Logical Clock Updates
-
-An HLC updates on local events and when receiving remote messages:
+### 4.1 HLC generation and remote-update (real CAS loops)
 
 ```rust
-impl HybridLogicalClock {
-    pub fn update_with_remote(&mut self, remote: &HybridLogicalClock) {
-        let physical_now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-
-        let max_physical = self.physical_ms.max(remote.physical_ms).max(physical_now);
-
-        if max_physical == self.physical_ms && max_physical == remote.physical_ms {
-            self.logical_counter = self.logical_counter.max(remote.logical_counter) + 1;
-        } else if max_physical == self.physical_ms {
-            self.logical_counter += 1;
-        } else if max_physical == remote.physical_ms {
-            self.logical_counter = remote.logical_counter + 1;
-        } else {
-            self.logical_counter = 0;
-        }
-
-        self.physical_ms = max_physical;
-    }
-}
-```
-
-### 4.2 LWW-Register Merge Logic
-
-```rust
-impl<T: Clone> LwwRegister<T> {
-    pub fn merge(&mut self, remote: LwwRegister<T>) {
-        if remote.clock > self.clock {
-            self.value = remote.value;
-            self.clock = remote.clock;
+pub fn now(&self) -> HlcTimestamp {
+    let phys_now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
+    loop {
+        let cur_phys = self.latest_physical_ms.load(AtomicOrdering::Acquire);
+        let cur_log = self.latest_logical.load(AtomicOrdering::Acquire);
+        let (next_phys, next_log) = if phys_now > cur_phys { (phys_now, 0) } else { (cur_phys, cur_log + 1) };
+        if self.latest_physical_ms.compare_exchange(cur_phys, next_phys, AtomicOrdering::Release, AtomicOrdering::Relaxed).is_ok() {
+            self.latest_logical.store(next_log, AtomicOrdering::Release);
+            return HlcTimestamp::new(next_phys, next_log, self.node_id);
         }
     }
 }
 ```
 
-### 4.3 PN-Counter Merge Logic
+`update(&self, remote: &HlcTimestamp)` is the same CAS-retry shape, but seeds `max_phys`
+from `phys_now.max(cur_phys).max(remote.physical_ms)` — this is the standard HLC rule
+(physical clock never goes backward; logical counter only increments when physical time
+doesn't advance) and is called from `merge_sync_payload` (§4.3) every time a remote
+timestamp is observed, so the local clock is always causally ahead of anything it has
+merged in.
 
-Each node independently increments its own entry in `increments` and `decrements`. Merging computes the element-wise maximum across all node vectors:
+### 4.2 Merge logic for each type (all real, all as originally documented)
 
 ```rust
-impl PnCounter {
-    pub fn merge(&mut self, remote: &PnCounter) {
-        for (&node, &remote_val) in &remote.increments {
-            let local_val = self.increments.entry(node).or_default();
-            *local_val = (*local_val).max(remote_val);
-        }
-        for (&node, &remote_val) in &remote.decrements {
-            let local_val = self.decrements.entry(node).or_default();
-            *local_val = (*local_val).max(remote_val);
-        }
-    }
+// LwwRegister: later HLC timestamp wins outright
+pub fn merge(&mut self, other: &LwwRegister) -> bool {
+    if other.timestamp > self.timestamp {
+        self.value = other.value.clone();
+        self.timestamp = other.timestamp;
+        self.tombstone = other.tombstone;
+        true
+    } else { false }
+}
 
-    pub fn value(&self) -> i64 {
-        let pos: u64 = self.increments.values().sum();
-        let neg: u64 = self.decrements.values().sum();
-        pos as i64 - neg as i64
+// PnCounter: per-node component-wise max (each node's own counter only grows)
+pub fn merge(&mut self, other: &PnCounter) {
+    for (&node_id, &val) in &other.p { let e = self.p.entry(node_id).or_default(); *e = (*e).max(val); }
+    for (&node_id, &val) in &other.n { let e = self.n.entry(node_id).or_default(); *e = (*e).max(val); }
+}
+pub fn value(&self) -> i64 { self.p.values().sum::<i64>() - self.n.values().sum::<i64>() }
+
+// OrSet: union tags, union tombstones, then drop any tag that's now tombstoned
+pub fn merge(&mut self, other: &OrSet) {
+    for ts in &other.tombstones { self.tombstones.insert(*ts); }
+    for (elem, other_tags) in &other.elements {
+        let my_tags = self.elements.entry(elem.clone()).or_default();
+        for tag in other_tags { my_tags.insert(*tag); }
     }
+    self.elements.retain(|_, tags| { tags.retain(|tag| !self.tombstones.contains(tag)); !tags.is_empty() });
 }
 ```
 
-### 4.4 Add-Wins Observed-Remove Set (OR-Set)
+### 4.3 The manual sync format: `export_sync_payload` / `merge_sync_payload`
+
+`CrdtStore::export_sync_payload` serializes the *entire* local store into one flat
+`Vec<u8>` using a hand-rolled binary format (one byte tag per item — `1`=register,
+`2`=counter, `3`=set — followed by little-endian length-prefixed fields, no compression,
+no framing beyond simple concatenation):
 
 ```rust
-impl<T: Hash + Eq + Clone> OrSet<T> {
-    pub fn add(&mut self, element: T, clock: HybridLogicalClock) -> Uuid {
-        let tag = Uuid::new_v4();
-        self.elements
-            .entry(element)
-            .or_default()
-            .insert(tag, clock);
-        tag
+pub fn export_sync_payload(&self) -> Vec<u8> {
+    let mut buf = Vec::new();
+    for (k, r) in &self.registers {
+        buf.push(1u8);
+        buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
+        buf.extend_from_slice(k);
+        buf.extend_from_slice(&(r.value.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&r.value);
+        buf.extend_from_slice(&r.timestamp.physical_ms.to_le_bytes());
+        buf.extend_from_slice(&r.timestamp.logical.to_le_bytes());
+        buf.extend_from_slice(&r.timestamp.node_id.to_le_bytes());
+        buf.push(if r.tombstone { 1 } else { 0 });
     }
-
-    pub fn remove(&mut self, element: &T, clock: HybridLogicalClock) {
-        if let Some(tags) = self.elements.remove(element) {
-            for (tag, _) in tags {
-                self.tombstones.insert(tag, clock);
-            }
-        }
-    }
-
-    pub fn merge(&mut self, remote: OrSet<T>) {
-        // 1. Merge tombstones (keeping newest clock for each tag)
-        for (tag, r_clock) in remote.tombstones {
-            let l_clock = self.tombstones.entry(tag).or_insert(r_clock);
-            if r_clock > *l_clock { *l_clock = r_clock; }
-        }
-
-        // 2. Merge elements (preserving tags not marked in tombstones)
-        for (elem, r_tags) in remote.elements {
-            let l_tags = self.elements.entry(elem).or_default();
-            for (tag, clock) in r_tags {
-                if !self.tombstones.contains_key(&tag) {
-                    l_tags.entry(tag).or_insert(clock);
-                }
-            }
-        }
-
-        // 3. Purge any elements whose tags are now in tombstones
-        self.elements.retain(|_, tags| {
-            tags.retain(|tag, _| !self.tombstones.contains_key(tag));
-            !tags.is_empty()
-        });
-    }
+    // ...counters (type 2), then sets (type 3), same length-prefixed shape
+    buf
 }
 ```
+
+`merge_sync_payload(&mut self, data: &[u8])` walks that same format byte-by-byte,
+reconstructs each `LwwRegister`/`PnCounter`/`OrSet`, calls `self.clock.update(&ts)` for
+every timestamp it decodes (so the local clock catches up to whatever it just merged),
+and merges each reconstructed value into the matching local map via the real `merge()`
+methods from §4.2 — falling through to `Err(format!("Unknown CRDT item type: {}",
+item_type))` for anything but `1`/`2`/`3`. This whole export→transport→merge cycle is
+what a caller (script, sidecar, whatever "region sync" job exists outside this repo)
+would run periodically; nothing inside Rudis itself schedules or triggers it.
+
+### 4.4 Tombstone GC
+
+```rust
+pub fn gc_tombstones(&mut self, ttl_ms: u64) -> (usize, usize) {
+    let cutoff = now_ms.saturating_sub(ttl_ms);
+    self.registers.retain(|_, reg| !reg.tombstone || reg.timestamp.physical_ms >= cutoff);
+    // + OrSet::prune_tombstones(cutoff) per set
+}
+```
+Exposed as `CRDT.GC [ttl_ms]` (default handled at the command layer, not shown here).
+Only prunes registers/set-tombstones by age; there's no automatic scheduled GC task
+anywhere in `server.rs` — it's an on-demand command.
 
 ---
 
 ## 5. Cross-Component Interactions
 
-- **`src/replication.rs`**: Transmits CRDT delta packets between peer regional clusters.
-- **`src/table.rs`**: Stores CRDT data types directly as `RudisValue` representations.
-- **`src/connection.rs`**: Exposes CRDT-specific Redis commands (`CRDT.GET`, `CRDT.SET`, `CRDT.INCR`).
+- **`src/shard.rs`**: `ShardDb.crdt_store: CrdtStore` plus thin `#[inline]` wrappers
+  (`crdt_set`, `crdt_get`, `crdt_del`, `crdt_incrby`, `crdt_sadd`, `crdt_smembers`,
+  `crdt_srem`, `crdt_dump`, `crdt_merge`, `crdt_gc`) that just forward to the store.
+- **`src/resp.rs`**: parses `CRDT.SET|GET|DEL|INCRBY|SADD|SMEMBERS|SREM|DUMP|MERGE|GC`
+  into the matching `Command::Crdt*` variants (`CrdtMerge(Bytes)` carries the raw sync
+  payload as a normal bulk-string argument).
+- **`src/connection.rs`**: every `Command::Crdt*` arm calls `router.local_db.borrow_mut()`
+  directly — **no cross-shard routing at all** (see §1's second scope note). `CrdtSet`/
+  `CrdtDel`/`CrdtIncrby`/`CrdtSadd`/`CrdtSrem` also call `notify_key_invalidation` (RESP3
+  client-side-caching) the same way ordinary mutating commands do.
+- **`src/replication.rs`**: no interaction. Primary/replica `PSYNC` streaming is a
+  separate mechanism and does not carry CRDT state.
+- **`src/table.rs`**: no interaction. CRDT values are **not** stored as `RudisValue`
+  variants — they live entirely in `CrdtStore`'s own maps, a parallel store next to
+  `RudisTable`, not inside it.
 
 ---
 
 ## 6. Performance Characteristics
 
-- **Zero Consensus Overhead**: Requires no Paxos or Raft voting rounds. Writes complete in $< 1$ ms locally.
-- **Minimal Delta Footprint**: Delta synchronization sends only updated tags and values rather than entire datasets.
+- **Lock-free clock advancement**: `HybridLogicalClock::now`/`update` use CAS retry loops,
+  not a mutex — cheap even under contention from multiple connections on the same shard.
+- **Export is O(total CRDT state size) and single-threaded**: `export_sync_payload` builds
+  one `Vec<u8>` for the *entire* store in one call; there's no incremental/delta export —
+  every `CRDT.DUMP` re-serializes everything currently held.
+- **No network cost inside Rudis**: since sync is manual (§1), there's no WAN traffic,
+  retry logic, or delta-batching to account for here at all — that cost (if any) lives
+  entirely in whatever external process actually transports the dump/merge payloads.

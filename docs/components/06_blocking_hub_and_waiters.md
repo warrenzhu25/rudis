@@ -2,246 +2,348 @@
 
 ## 1. Architectural Purpose & Scope
 
-`src/block.rs` implements Rudis's asynchronous waiter registration and notification engine (**`BlockHub`**). It powers Redis blocking commands—including `BLPOP`, `BRPOP`, `BLMOVE`, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP`, and `BLMPOP`—allowing clients to wait for elements to appear in lists or sorted sets across shards without ever stalling or sleeping reactor threads.
-
----
+`src/block.rs` implements Rudis's waiter registration and wakeup engine (**`BlockHub`**). It
+powers the blocking list/zset/stream commands — `BLPOP`, `BRPOP`, `BLMOVE`, `BRPOPLPOP`-style
+moves, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP`, and `XREAD ... BLOCK` — plus `CLIENT UNBLOCK` and the
+blocked-flag reported by `CLIENT LIST`/`CLIENT INFO`. Unlike the rest of Rudis, `BlockHub` is
+**not** thread-local: it is one process-wide, mutex-guarded structure per listening port, shared
+by every shard thread serving that port.
 
 ## 2. Key Invariants & Concurrency Constraints
 
-1. **Non-Blocking Reactor Execution**: Reactor threads must never sleep or block. When a client blocks, its socket read loop yields execution, and an asynchronous waiter future is registered.
-2. **Cross-Shard Awareness**: A client connected to Shard A waiting on Key K can be satisfied by a write operation (`LPUSH`, `ZADD`) executed on Shard B.
-3. **Duplicate Waiter Suppression**: When a client waits on multiple keys (e.g., `BLPOP k1 k2 0`), only the first available key satisfies the request; subsequent notifications for the other keys in the same transaction or batch are ignored.
-4. **Immediate Clean-Up on Timeout or Disconnect**: When a blocked client times out or disconnects, its waiter registration is cleanly purged from `BlockHub` via RAII drop guards.
+1. **The one deliberate exception to "zero locks."** `BlockHub` lives behind a real
+   `std::sync::Mutex`, reachable from any shard via `get_block_hub_for_port(port)`:
+   ```rust
+   pub static PORT_BLOCK_HUBS: LazyLock<Mutex<HashMap<u16, Arc<Mutex<BlockHub>>>>> =
+       LazyLock::new(|| Mutex::new(HashMap::new()));
+
+   pub fn get_block_hub_for_port(port: u16) -> Arc<Mutex<BlockHub>> {
+       let mut map = PORT_BLOCK_HUBS.lock().unwrap();
+       map.entry(port)
+           .or_insert_with(|| Arc::new(Mutex::new(BlockHub::new(port))))
+           .clone()
+   }
+   ```
+   Every caller does `get_block_hub_for_port(port).lock().unwrap()` around a short, synchronous
+   critical section (register a waiter, or walk a key's waiter queue and pop values). This one
+   `Mutex` is the price paid for cross-shard wakeups: a client blocked on shard A must be
+   wakeable by a write executed on shard B, which the thread-local `Rc<RefCell<ShardDb>>` model
+   can't do on its own.
+2. **Reactor threads never sleep on a plain timer.** A blocked command doesn't `sleep()` the
+   whole event loop — it registers a waiter (a `flume::Sender`), yields by `.await`ing a
+   polling helper (`wait_for_blocked_result`, §4.2) that also has to actively watch for client
+   disconnect, since a channel receive alone can't detect a dead TCP socket (see §4.2).
+3. **FIFO fairness per key.** Waiter queues are `VecDeque`, and `notify_*` always
+   `pop_front()`s — the client that has been waiting longest on a key is served first.
+4. **Guaranteed cleanup via RAII.** `BlockedClientGuard`'s `Drop` impl calls
+   `hub.unregister_blocked_client(client_id)` unconditionally, so a waiter registration can
+   never outlive the `.await` that registered it — whether it resolved by pop, by timeout, by
+   `CLIENT UNBLOCK`, or by the connection task itself being dropped.
+5. **Transaction-aware deferral, not `CLIENT PAUSE`.** `BlockHub::pause()`/`resume()` exist —
+   but they're wired to `MULTI`/`EXEC`, not to Redis's `CLIENT PAUSE` command (which is a
+   complete no-op stub in Rudis, see §4.4).
 
 ---
 
 ## 3. Component Architecture & Data Structures
 
 ```
-  Client issues BLPOP k1 0 (k1 is empty)
-                     │
-                     ▼
-             Register Waiter
-  ┌────────────────────────────────────────┐
-  │ Waiter                                 │
-  │ ├── client_id: u64                     │
-  │ ├── keys: [k1]                         │
-  │ ├── target_type: List                  │
-  │ └── sender: oneshot::Sender<PopResult> │
-  └──────────────────┬─────────────────────┘
-                     │
-                     ▼
-           Store in Shard BlockHub
-  list_waiters: HashMap<"k1", [Waiter1, Waiter2]>
-                     │
-                     ▼ (Client yields; event loop processes other sockets)
-                     ...
-                     ▲ (Another client writes LPUSH k1 "val" on any shard)
-                     │
-         Shard Router Broadcasts:
-     ShardMessage::NotifyList { key: "k1" }
-                     │
-                     ▼
-           BlockHub::notify_list
-     ├── Matches Waiter1 for "k1"
-     ├── Pops item from k1
-     └── Sends result via oneshot::Sender
-                     │
-                     ▼
-       Waiter1 wakes up, writes RESP,
-       and resumes read loop!
+   BLPOP k1 k2 0 (both empty)                    LPUSH k1 "v"  (any shard)
+            │                                              │
+            ▼                                              ▼
+  hub.register_blocked_client(cid, tx)          notify_list_or_defer(db, "k1")
+  hub.register_list_waiter(cid,"k1",Pop,1,tx)             │
+  hub.register_list_waiter(cid,"k2",Pop,1,tx)     paused? ──yes──▶ add_pending_notify("k1")
+            │                                              │no
+            ▼                                              ▼
+  wait_for_blocked_result(&rx, timeout, fd)        hub.notify_list(&mut table, "k1")
+   (polls rx every ≤20ms; also polls the fd         │ pop_front waiter for "k1"
+    for POLLHUP/POLLRDHUP/EOF to detect a            │ table.lpop("k1", 1)  ◀── pop happens
+    client that vanished without closing            │ inside the notify call, under the
+    cleanly — a channel recv alone can't see         │ same Mutex-held critical section
+    that)                                            ▼ tx.send(Popped(key, vals))
+            │                                  remove_waiters_for_client(cid)
+            ▼                                  (drops the still-registered "k2" waiter too)
+  BlockedClientGuard::drop → unregister
 ```
 
-### Core Waiter Data Structures
+### Real waiter/result types (`src/block.rs`)
 
 ```rust
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum WaiterType {
-    List,
-    ZSet,
+pub enum WaiterOp {
+    Pop { pop_type: ListPopType, count: usize },
+    Move { where_from: ListPopType, where_to: ListPopType, destination: Bytes },
 }
 
-pub struct Waiter {
+pub struct ListWaiter {
     pub client_id: u64,
-    pub port: u16,
-    pub keys: Vec<Bytes>,
-    pub target_type: WaiterType,
-    pub is_min: bool,            // For ZSet pop direction
-    pub count: usize,            // For MPOP variants
-    pub sender: oneshot::Sender<BlockedPopResult>,
+    pub key: Bytes,
+    pub op: WaiterOp,
+    pub sender: Sender<BlockedListResult>,   // flume::Sender, not oneshot
 }
 
-pub enum BlockedPopResult {
-    List { key: Bytes, element: Bytes },
-    ZSet { key: Bytes, member: Bytes, score: f64 },
-    MultiList { key: Bytes, elements: Vec<Bytes> },
-    MultiZSet { key: Bytes, items: Vec<(Bytes, f64)> },
-    Timeout,
+pub struct ZSetWaiter {
+    pub client_id: u64,
+    pub key: Bytes,
+    pub pop_type: ZSetPopType,   // Min | Max
+    pub count: usize,
+    pub is_zmpop: bool,
+    pub sender: Sender<BlockedZSetResult>,
+}
+
+pub struct StreamWaiter {
+    pub key: Bytes,
+    pub sender: Sender<()>,   // pure wakeup, no payload — reader re-polls the stream itself
+}
+
+pub enum BlockedListResult {
+    Popped(Bytes, Vec<Bytes>),
+    Unblocked(ClientUnblockType),   // Timeout | Error | WrongType
 }
 
 pub struct BlockHub {
-    pub list_waiters: HashMap<Bytes, Vec<Waiter>>,
-    pub zset_waiters: HashMap<Bytes, Vec<Waiter>>,
+    pub port: u16,
+    list_waiters: HashMap<Bytes, VecDeque<ListWaiter>>,
+    zset_waiters: HashMap<Bytes, VecDeque<ZSetWaiter>>,
+    stream_waiters: HashMap<Bytes, Vec<StreamWaiter>>,
+    blocked_clients: HashMap<u64, Sender<BlockedListResult>>,      // for CLIENT UNBLOCK / CLIENT LIST's "b" flag
+    blocked_zset_clients: HashMap<u64, Sender<BlockedZSetResult>>,
+    paused_count: usize,          // MULTI/EXEC deferral, see §4.4 — NOT CLIENT PAUSE
+    pending_notifies: Vec<Bytes>,
 }
 ```
+
+There is no unified `Waiter`/`WaiterType`/`BlockedPopResult` type — list, zset, and stream
+waiters are three separate types with three separate queues and three separate result enums,
+and channels are `flume::Sender`, not `oneshot::Sender`.
 
 ---
 
 ## 4. Execution Algorithms & Code Logic
 
-### 4.1 Client Blocking & Registration Flow
-
-When `BLPOP` or `BZPOPMIN` finds all keys empty, it registers in `BlockHub`:
+### 4.1 Registering a blocked client (`BLPOP`, in `src/connection.rs`)
 
 ```rust
-pub async fn handle_blocking_list_pop(
-    client_id: u64,
-    port: u16,
-    keys: Vec<Bytes>,
-    timeout: Duration,
-    hub: &mut BlockHub,
-) -> Option<(Bytes, Bytes)> {
-    let (tx, rx) = oneshot::channel();
-    let waiter = Waiter {
-        client_id,
-        port,
-        keys: keys.clone(),
-        target_type: WaiterType::List,
-        is_min: true,
-        count: 1,
-        sender: tx,
-    };
-
-    // Register waiter for all specified keys
+let _guard = BlockedClientGuard { port: router.port, client_id };
+let (tx, rx) = flume::bounded(1);
+{
+    let hub_arc = crate::block::get_block_hub_for_port(router.port);
+    let mut hub = hub_arc.lock().unwrap();
+    hub.register_blocked_client(client_id, tx.clone());
     for k in &keys {
-        hub.list_waiters.entry(k.clone()).or_default().push(waiter.clone());
+        hub.register_list_waiter(client_id, k.clone(), crate::block::ListPopType::Left, 1, tx.clone());
     }
+}
+let raw_fd = client_registry.borrow().get(&client_id).map(|c| c.raw_fd);
+let (recv_res, client_disconnected) = wait_for_blocked_result(&rx, timeout, raw_fd).await;
+```
 
-    // Await notification or timeout asynchronously
-    if timeout.is_zero() {
-        // Block indefinitely until awakened
-        match rx.await {
-            Ok(BlockedPopResult::List { key, element }) => Some((key, element)),
-            _ => None,
+One waiter is registered per key in the `BLPOP` argument list, all sharing the same `tx` clone
+— whichever key is satisfied first sends on that shared channel, and `remove_waiters_for_client`
+(called from inside `notify_list`) then strips the *other* now-stale waiters for that client from
+every other key's queue. `BlockedClientGuard` is held across the whole `.await`, so if the
+future is ever dropped early (client disconnect, etc.) its `Drop` impl still unregisters.
+
+### 4.2 `wait_for_blocked_result`: polling, not a pure channel await
+
+```rust
+pub async fn wait_for_blocked_result<T>(
+    rx: &flume::Receiver<T>,
+    timeout_secs: f64,
+    raw_fd: Option<std::os::unix::io::RawFd>,
+) -> (Option<T>, bool) {
+    let deadline = ...;
+    loop {
+        let check_dur = /* min(remaining time, 20ms) */;
+        match monoio::time::timeout(check_dur, rx.recv_async()).await {
+            Ok(Ok(res)) => return (Some(res), false),
+            Ok(Err(_)) => return (None, false),
+            Err(_) => {
+                if let Some(fd) = raw_fd {
+                    if is_fd_closed(fd) { return (None, true); }
+                }
+                if /* deadline passed */ { return (None, false); }
+            }
         }
+    }
+}
+```
+
+This is **not** a single `select! { rx.await, sleep(timeout).await }` as one might assume — it
+loops, re-`await`ing the channel with a cap of 20ms per iteration, and on every timeout tick
+also calls `is_fd_closed(raw_fd)`:
+
+```rust
+pub fn is_fd_closed(fd: RawFd) -> bool {
+    let mut pollfd = libc::pollfd { fd, events: POLLIN|POLLRDHUP|POLLHUP|POLLERR, revents: 0 };
+    let ret = unsafe { libc::poll(&mut pollfd, 1, 0) };
+    // POLLRDHUP/POLLHUP/POLLERR ⇒ closed; POLLIN + a 0-byte MSG_PEEK recv ⇒ closed
+    ...
+}
+```
+
+The reason: while a client is blocked on `BLPOP`, its connection task isn't in its normal
+read loop — it's parked on `rx.recv_async()` — so a client that disappears (network drop,
+process killed) without a clean FIN would otherwise leave its waiter (and the task itself)
+registered forever. Polling the raw fd every ≤20ms via `libc::poll` + a non-consuming
+`MSG_PEEK` recv is how Rudis detects that case without a dedicated epoll registration for
+blocked sockets.
+
+### 4.3 Waking waiters: the pop happens *inside* `notify_list`/`notify_zset`, under the lock
+
+```rust
+pub fn notify_list(&mut self, table: &mut crate::table::RudisTable, key: &Bytes) {
+    crate::connection::touch_watched_key(self.port, key.as_ref());
+    if table.is_key_expired(key.as_ref()) { return; }
+    if let Some(waiters) = self.list_waiters.get_mut(key) {
+        while let Some(waiter) = waiters.pop_front() {
+            if waiter.sender.is_disconnected() { continue; }
+            match waiter.op {
+                WaiterOp::Pop { pop_type, count } => {
+                    let popped = match pop_type {
+                        ListPopType::Left => table.lpop(key.as_ref(), count).ok(),
+                        ListPopType::Right => table.rpop(key.as_ref(), count).ok(),
+                    };
+                    if let Some(vals) = popped {
+                        if !vals.is_empty() {
+                            let _ = waiter.sender.send(BlockedListResult::Popped(key.clone(), vals));
+                            satisfied_clients.push(waiter.client_id);
+                            if !table.exists(key.as_ref()) { break; }
+                        } else {
+                            waiters.push_front(waiter);   // put it back, nothing to give it
+                            break;
+                        }
+                    } else { waiters.push_front(waiter); break; }
+                }
+                WaiterOp::Move { where_from, where_to, ref destination } => { /* see below */ }
+            }
+        }
+    }
+    for cid in satisfied_clients { self.remove_waiters_for_client(cid); }
+}
+```
+
+Contrary to a design where the *writer* (e.g. `LPUSH`) hands the pushed value directly to the
+waiter, Rudis instead re-derives the popped value by calling `table.lpop`/`table.rpop` **from
+inside `notify_list` itself**, while the caller (`notify_list_or_defer`, in `connection.rs`)
+still holds the `BlockHub` mutex *and* the caller's own `ShardDb` borrow. This makes "pick a
+waiter" and "remove the value from the list" atomic with respect to each other by construction
+— there's no window where two different code paths could both believe they popped the same
+element. `touch_watched_key` is called unconditionally at the top, meaning a blocking-wakeup
+write also correctly invalidates any `WATCH` on that key (ties into the `MULTI`/`WATCH`
+machinery documented in Component 02).
+
+`WaiterOp::Move` (backing `BLMOVE`/`BRPOPLPUSH`-style commands) pops from the source list and
+pushes onto the destination list in the same critical section, then **recursively calls**
+`self.notify_list(table, destination)` — so if some *other* client is separately blocked on the
+destination key, a single `LPUSH`-triggered wakeup can cascade into a second wakeup for a
+completely different blocked client, still inside one lock acquisition.
+
+`notify_zset` is structurally identical (`zpopmin`/`zpopmax` instead of `lpop`/`rpop`), except it
+also explicitly skips a waiter if `satisfied_clients` already contains its `client_id` — a
+duplicate-suppression check the list path doesn't need in the same spot because
+`remove_waiters_for_client` is applied immediately afterward per satisfied client.
+
+`notify_stream` (backing `XREAD ... BLOCK`) is much simpler — it's a pure wakeup, no data
+handoff:
+```rust
+pub fn notify_stream(&mut self, key: &Bytes) {
+    if let Some(waiters) = self.stream_waiters.remove(key) {
+        for waiter in waiters { let _ = waiter.sender.send(()); }
+    }
+}
+```
+The blocked `XREAD` task is responsible for re-reading the stream itself once woken.
+
+### 4.4 `pause()`/`resume()`: deferred notification across `MULTI`/`EXEC` — not `CLIENT PAUSE`
+
+```rust
+// connection.rs, around EXEC:
+let hub_arc = crate::block::get_block_hub_for_port(router.port);
+hub_arc.lock().unwrap().pause();
+IN_TX.set(true);
+for q_cmd in queued { execute_command(q_cmd, ...).await; }
+IN_TX.set(false);
+if use_vll { router.release_tx_locks(&sorted_shards, tx_id).await; }
+let pending = hub_arc.lock().unwrap().resume();
+for k in pending { /* re-dispatch a real notify for each deferred key, possibly cross-shard */ }
+```
+
+Every list/zset write goes through `notify_list_or_defer`/`notify_zset_or_defer` rather than
+calling `notify_list`/`notify_zset` directly:
+```rust
+pub fn notify_list_or_defer(db: &mut ShardDb, key: &Bytes) {
+    touch_watched_key(db.port, key.as_ref());
+    let mut hub = get_block_hub_for_port(db.port).lock().unwrap();
+    if hub.is_paused() {
+        hub.add_pending_notify(key.clone());
     } else {
-        // Block with timeout
-        monoio::select! {
-            res = rx => {
-                match res {
-                    Ok(BlockedPopResult::List { key, element }) => Some((key, element)),
-                    _ => None,
-                }
-            }
-            _ = monoio::time::sleep(timeout) => {
-                None // Timed out, return null
-            }
-        }
+        hub.notify_list(&mut db.table, key);
     }
 }
 ```
+So while an `EXEC` is running, every write inside the transaction just records its key in
+`pending_notifies` instead of immediately waking any blocked client; only after the whole
+transaction (and, for cross-shard transactions, the VLL lock release) completes does `resume()`
+drain `pending_notifies` and fire real wakeups for each touched key. This means a blocked client
+can never observe a partially-applied transaction as if it were a completed write.
 
-### 4.2 Waiter Notification Flow (`notify_list` and `notify_zset`)
+**This machinery is unrelated to Redis's `CLIENT PAUSE`/`CLIENT UNPAUSE`.** Those are parsed
+into real `Command::Client(ClientSubcommand::Pause(timeout))`/`Unpause` variants, but the
+handler for both (and for `CLIENT NO-TOUCH`) is:
+```rust
+ClientSubcommand::Pause(_) | ClientSubcommand::Unpause | ClientSubcommand::NoTouch(_) => {
+    out.extend_from_slice(b"+OK\r\n");
+}
+```
+— an unconditional `+OK` with no effect. `CLIENT PAUSE` does not actually pause anything in
+Rudis today.
 
-When a write command (`LPUSH`, `RPUSH`, `ZADD`) mutates a key, `BlockHub` is notified immediately:
+### 4.5 `CLIENT UNBLOCK` and the `CLIENT LIST`/`INFO` blocked flag
 
 ```rust
-impl BlockHub {
-    pub fn notify_list(
-        &mut self,
-        table: &mut RudisTable,
-        key: &Bytes,
-    ) {
-        let waiters = match self.list_waiters.remove(key) {
-            Some(w) => w,
-            None => return,
-        };
-
-        let mut satisfied_clients = HashSet::new();
-
-        for waiter in waiters {
-            // Duplicate waiter check
-            if satisfied_clients.contains(&waiter.client_id) {
-                continue;
-            }
-
-            // Pop item from list
-            if let Some(RudisValue::List(list)) = table.get_mut(key) {
-                if let Some(elem) = list.pop_left() {
-                    let res = BlockedPopResult::List {
-                        key: key.clone(),
-                        element: elem,
-                    };
-                    if waiter.sender.send(res).is_ok() {
-                        satisfied_clients.insert(waiter.client_id);
-                    }
-                } else {
-                    // List is empty again; re-register remaining waiters
-                    self.list_waiters.entry(key.clone()).or_default().push(waiter);
-                    break;
-                }
-            }
-        }
-    }
-}
+let unblocked = hub.unblock_client(target_id, unblock_type);   // CLIENT UNBLOCK <id> [TIMEOUT|ERROR]
+...
+let is_blocked = get_block_hub_for_port(router.port).lock().unwrap().is_blocked(c.id);
+let flags = if is_blocked { "b" } else { "N" };   // surfaced in CLIENT INFO/LIST
 ```
-
-### 4.3 Multi-Key ZSet Pop (`notify_zset`)
-
-For `BZPOPMIN`, `BZPOPMAX`, and `BZMPOP`, the notification logic respects pop counts and order:
-
-```rust
-impl BlockHub {
-    pub fn notify_zset(
-        &mut self,
-        table: &mut RudisTable,
-        key: &Bytes,
-    ) {
-        let waiters = match self.zset_waiters.remove(key) {
-            Some(w) => w,
-            None => return,
-        };
-
-        let mut satisfied_clients = HashSet::new();
-
-        for waiter in waiters {
-            if satisfied_clients.contains(&waiter.client_id) {
-                continue;
-            }
-
-            if let Some(RudisValue::ZSet(zset)) = table.get_mut(key) {
-                let popped = if waiter.is_min {
-                    zset.pop_min(waiter.count)
-                } else {
-                    zset.pop_max(waiter.count)
-                };
-
-                if !popped.is_empty() {
-                    let res = BlockedPopResult::MultiZSet {
-                        key: key.clone(),
-                        items: popped,
-                    };
-                    if waiter.sender.send(res).is_ok() {
-                        satisfied_clients.insert(waiter.client_id);
-                    }
-                }
-            }
-        }
-    }
-}
-```
+`unblock_client` looks the target client up in `blocked_clients`/`blocked_zset_clients`, sends a
+`BlockedListResult::Unblocked(unblock_type)` / `BlockedZSetResult::Unblocked(unblock_type)` on
+its channel (waking `wait_for_blocked_result` immediately), and strips its now-dead waiters from
+every key queue it was registered under.
 
 ---
 
 ## 5. Cross-Component Interactions
 
-- **`src/server.rs`**: Invokes `hub.notify_list` and `hub.notify_zset` upon receiving `ShardMessage::NotifyList` from peer shards.
-- **`src/connection.rs`**: Invokes `handle_blocking_list_pop` and `handle_bzpop` when parsing blocking commands.
-- **`src/router.rs`**: Dispatches notification broadcasts across the shard channel mesh whenever a list or zset mutation occurs.
+- **`src/server.rs`**: the cross-shard receiver's `ShardMessage::NotifyList { keys }` handler
+  locks the port's hub once and, for every key in the batch, calls **both** `hub.notify_list`
+  and `hub.notify_zset` unconditionally (the sender doesn't track the target's value type, so
+  it just tries both — a miss on the wrong map is a cheap no-op `HashMap` lookup).
+- **`src/connection.rs`**: registers waiters for `BLPOP`/`BRPOP`/`BLMOVE`/`BZPOPMIN`/
+  `BZPOPMAX`/`BZMPOP`/`XREAD BLOCK`; drives `wait_for_blocked_result`; owns
+  `BlockedClientGuard`, `notify_list_or_defer`/`notify_zset_or_defer`, and the `MULTI`/`EXEC`
+  pause/resume sequencing; calls `touch_watched_key` (Component 02's `WATCH` machinery) from
+  inside every notify.
+- **`src/table.rs`** (Component 05): `notify_list`/`notify_zset` call directly into
+  `RudisTable::lpop`/`rpop`/`zpopmin`/`zpopmax`/`is_key_expired`/`exists` — `BlockHub` mutates
+  the storage engine itself rather than being handed already-popped values.
+- **`src/router.rs`** (Component 04): local writes broadcast `ShardMessage::NotifyList` to every
+  *other* shard so a blocked client on shard A can be woken by a write on shard B.
 
 ---
 
 ## 6. Performance Characteristics
 
-- **Zero Polling Overhead**: Waiters consume zero CPU while sleeping. Waking up a client is an $O(1)$ channel signal.
-- **High Concurrency**: Supports tens of thousands of concurrently blocked clients with minimal RAM overhead (~128 bytes per registered waiter).
+- **Not zero-overhead while blocked**: unlike a pure channel-based design, each blocked client
+  costs a wakeup-and-poll cycle at most every 20ms (`wait_for_blocked_result`'s cap) purely to
+  detect disconnection via `libc::poll`, in addition to being woken immediately (no polling
+  delay) whenever a real `notify_list`/`notify_zset`/`notify_stream` fires.
+- **One global mutex per port, held briefly**: every register/notify/unblock operation takes
+  `PORT_BLOCK_HUBS`'s per-port `Mutex<BlockHub>` for a short, synchronous, non-`.await`-ing
+  critical section (no lock is ever held across an `.await` point) — contention scales with how
+  many shards are simultaneously registering or notifying blocking waiters, not with the number
+  of ordinary (non-blocking) commands, which never touch this lock at all.
+- **Transaction-batched wakeups**: the `pause`/`resume` mechanism (§4.4) turns what could be up
+  to one wakeup attempt per write inside a large `MULTI`/`EXEC` into a single deferred batch
+  processed once, after the transaction (and any cross-shard lock release) fully completes.

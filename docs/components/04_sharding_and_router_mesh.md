@@ -282,12 +282,13 @@ several remote shards pays for that many serialized round-trips instead of a par
 fan-out. This is exactly the gap the original, accurate `docs/designs/components.md`
 Part 4 §6 identified — it has not been fixed.
 
-### 4.4 Live slot migration machinery exists but is not wired into routing (verified gap)
+### 4.4 `Router::check_slot_redirection` is dead, but the redirect feature itself is live — via a separate, duplicate implementation in `connection.rs` (correction to an earlier draft of this section)
 
 `Router` has real infrastructure for Redis Cluster-style live slot migration:
 `slot_owners: Rc<RefCell<Vec<usize>>>` (a per-slot ownership override, seeded from the
 static `slot_to_shard` mapping but mutable via `set_slot_owner`), `slot_states` (tracking
-`Migrating`/`Importing`/`Moved` per slot), and:
+`Migrating`/`Importing`/`Moved` per slot), and a helper method with the same shape as the
+logic below:
 
 ```rust
 pub fn check_slot_redirection(&self, slot: u16, key_exists: bool, asking: bool) -> Result<(), String> {
@@ -301,19 +302,48 @@ pub fn check_slot_redirection(&self, slot: u16, key_exists: bool, asking: bool) 
 }
 ```
 
-However, grepping the whole codebase for call sites shows `check_slot_redirection` is
-**never called anywhere** (not in `connection.rs`, not elsewhere in `router.rs` itself),
-and of the 17 call sites that compute a target shard for a key, only **one**
-(`expiretime`, via `self.target_shard(&key)` which does consult `slot_owners`) uses the
-dynamic, migration-aware path — the other 16 (`get`, `set`, `del`, `exists`, `incr_by`,
-`expire`, `persist`, `ttl`, `stick`, `unstick`, `is_sticky`, `delex`, the tiering ops,
-`dump_key`, ...) all call the static free function `target_shard(key, num_shards)`,
-which has no knowledge of `slot_owners` at all. In other words: **the live-migration
-state machine (`SlotState`, `set_slot_owner`, `check_slot_redirection`) is built, and
-`cluster_addslots`/`cluster_addslotsrange` do call `set_slot_state`, but ordinary command
-routing does not consult it and no `-MOVED`/`-ASK` redirect is ever actually sent from
-the normal command path.** Treat live slot migration as unfinished/dead code until this
-is wired up, not as a working feature.
+Grepping the whole codebase confirms this specific method, `check_slot_redirection`, is
+**never called anywhere** — that part of an earlier draft of this section was right. But
+an earlier draft went one step further and concluded the whole *feature* was dead, which
+is wrong: `connection.rs::execute_command` inlines the identical `SlotState` match
+directly (not via this helper) at the top of its per-command dispatch, gated on
+`cmd_primary_key(&cmd)`:
+
+```rust
+if let Some(key) = cmd_primary_key(&cmd) {
+    let slot = key_slot(key);
+    let state = router.slot_states.borrow()[slot as usize].clone();
+    match state {
+        SlotState::Moved(target) => { out.extend_from_slice(format!("-MOVED {} {}\r\n", slot, target).as_bytes()); return false; }
+        SlotState::Importing(source) => if !is_asking {
+            out.extend_from_slice(format!("-MOVED {} {}\r\n", slot, source).as_bytes()); return false;
+        },
+        SlotState::Migrating(target) => {
+            let key_exists = router.exists(key.clone()).await;
+            if !key_exists { out.extend_from_slice(format!("-ASK {} {}\r\n", slot, target).as_bytes()); return false; }
+        }
+        SlotState::Stable => {
+            // additionally cross-checks live cluster-bus gossip ownership (Component 11's
+            // ClusterHub::my_slots) and emits -MOVED to the gossiped owner if this shard's
+            // own slot_states says Stable but the gossip table disagrees
+        }
+    }
+}
+```
+
+So real `-MOVED`/`-ASK` redirects genuinely are sent from the normal command path — for
+commands that go through `execute_command`. The caveat that *does* still hold: this check
+lives only in `execute_command`, the single-command/non-squashed-fallback path (see
+Component 02 §4/§10) — grepping `slot_states` usage confirms the pipelined
+`execute_commands_squashed` fast path never checks it. **A pipelined batch of commands
+hitting a migrating/moved slot silently executes against the wrong data instead of
+redirecting**, while the same commands sent unpipelined (or as part of a
+squash-defeating pipeline) redirect correctly. This is the real, narrower gap — not "live
+migration is entirely unwired," which was the earlier draft's overstatement. As for
+`slot_owners` (a separate field from `slot_states`, used only by `Router::target_shard`,
+the dynamic method): that part of the original finding still holds — 16 of 17
+key-routing call sites use the static `target_shard()` free function instead, so
+`slot_owners` itself remains effectively unconsulted outside of `expiretime`.
 
 ### 4.5 Cross-shard `SCAN` cursor encoding
 

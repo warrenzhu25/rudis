@@ -2,211 +2,281 @@
 
 ## 1. Architectural Purpose & Scope
 
-`src/tiering.rs` is Rudis's embedded NVMe SSD data tiering engine. Inspired by Dragonfly's production architecture, it enables transparently scaling dataset sizes $2\times$ to $5\times$ beyond physical memory limits. Hot keys and active working sets remain in DRAM, while cold and infrequently accessed values are offloaded to high-speed NVMe storage.
+`src/tiering.rs` implements Rudis's per-shard NVMe/disk offload engine. Each shard owns one
+private tiered-storage file (`tier_shard_{id}.db` under a configured directory) and one
+`ShardTierManager` that packs small values into 4KB pages (`SmallBins`), writes larger values
+as their own aligned blocks, and lets `RudisTable` (`src/table.rs`) replace a hot in-RAM value
+with a small pointer (`TieredPointer`) once it has been written to disk. Orchestration (when to
+spill, when to reload, the auto-tiering trigger) lives in `src/router.rs`, not here — this file
+is the disk I/O and page-packing layer underneath it.
 
 ---
 
 ## 2. Key Invariants & Concurrency Constraints
 
-1. **Thread-per-Core Direct I/O**: Each shard owns a dedicated NVMe storage file (`shard-{id}.tier`) opened with `O_DIRECT`. Each core drives its own file descriptor via `io_uring` without cross-core locks.
-2. **Page-Cache Bypass (`O_DIRECT`)**: Linux page caching is completely bypassed. This eliminates double-caching (data in RAM twice) and prevents OS writeback latency spikes.
-3. **Three-State Value Lifecycle**: Values transition through `Hot` (RAM), `Staged/Cooled` (RAM write buffer), and `Cold` (SSD, referenced by a 16-byte `RudisExternalPtr`).
-4. **Hole Punching for Zero-Rewrite Deletions**: Deleting or updating cold keys invokes `fallocate(FALLOC_FL_PUNCH_HOLE)`, deallocating physical SSD blocks immediately without rewriting storage segments.
+1. **Thread-local, `Rc`-based, not `Arc`/`Mutex`**: `ShardTierManager` holds `file: Rc<monoio::fs::File>` and uses `RefCell`/`Cell` internally — it is only ever used by the one shard that owns it, consistent with the rest of the shared-nothing architecture. Cross-shard tiering requests go through `ShardMessage::Tier*` variants (Component 04), not by sharing a `ShardTierManager` across threads.
+2. **`O_DIRECT` is opt-in and falls back automatically.** `ShardTierManager::open` only attempts `O_DIRECT` if the `RUDIS_DIRECT_IO` environment variable is set to something other than `"0"`; if the `O_DIRECT` open call fails (common on filesystems/kernels that don't support it), it silently retries with a normal buffered open. There is no page-cache-bypass guarantee unless that env var is set *and* the underlying filesystem actually supports it.
+3. **Global, per-port shared statistics behind a lock.** `TieringStats` (23 atomic counters) is stored in a process-wide `static TIER_STATS: RwLock<Option<HashMap<u16, Arc<TieringStats>>>>`, one entry per listening port, shared by every shard on that port. This is a real (small, read-mostly) synchronization point outside the shared-nothing data path, used purely for reporting (`INFO`-style stats), not for coordinating storage itself.
+4. **Read coalescing, not hole punching, is the concurrency-sensitive part.** `OpManager::read_page_coalesced` ensures that if two in-flight reads target the same 4KB page, only one physical `read_exact_at` happens; the second caller waits on a `flume::bounded(1)` channel fed by the first.
+5. **Write backpressure via a byte counter, not a queue depth.** `OpManager::check_write_backpressure` returns `true` once `pending_stash_bytes` (tracked via `AtomicUsize`, incremented in `start_pending_stash`/decremented in `finish_pending_stash`/`cancel_pending_stash`) exceeds a hardcoded 16MB; `ShardTierManager::stash_record` refuses new stashes (`io::ErrorKind::WouldBlock`) while over that limit.
 
 ---
 
 ## 3. Component Architecture & Data Structures
 
 ```
-                      Hot Tier (DRAM)
-     RudisTable Entry: "user:123" -> RudisValue::String("payload")
-                             │
-                             ▼ (Memory Pressure > High Watermark)
-                   Stage in SmallBins
-     [ 4KB Aligned Buffer: Record 1 | Record 2 | Record 3 ]
-                             │
-                             ▼ (Flush via io_uring O_DIRECT)
-                      Cold Tier (NVMe)
-     Write Page to shard-0.tier at Offset 0x008000
-                             │
-                             ▼
-     Replace in DRAM: "user:123" -> RudisValue::External(RudisExternalPtr)
-                             │
-            ┌────────────────┴────────────────┐
-            ▼                                 ▼
-       Client Read                       Client Delete
-  Read 4KB from 0x008000           libc::fallocate(PUNCH_HOLE)
-  Unpack & Promote to Hot          Zero SSD Space Leaked!
+                  Hot (RudisValue::String/Int/List/Set/ZSet/...)
+                                   │
+                 Router::cool_local  (stash to disk, KEEP ram copy)
+                                   ▼
+     RudisValue::Cooled { ptr: TieredPointer, val: Box<RudisValue> }
+                                   │
+                 Router::spill_local / decommit_local (drop ram copy)
+                                   ▼
+                  RudisValue::Tiered(TieredPointer)     (ram: 4 bytes + tag)
+                                   │
+                 Router::load_local / stream_cold_read_local
+                                   ▼
+     RudisValue::Cooled { ptr, val }   <-- reload lands back in Cooled,
+                                           NOT plain Hot (see §4.3)
 ```
 
-### Core Data Structures
+### Core real data structures
 
 ```rust
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RudisExternalPtr {
-    pub page_id: u32,       // Index into 4KB page or segment
-    pub offset_in_page: u16,// Byte offset within page
-    pub length: u16,        // Length of payload
+pub const PAGE_SIZE: usize = 4096;
+pub const SMALL_VALUE_LIMIT: usize = 2048;   // records below this go into a SmallBin page
+pub const TIER_MAGIC: &[u8; 4] = b"TIER";
+
+pub struct TieredPointer {          // src/table.rs — 4+8+4+1 = 17 bytes, held inline in RudisValue
+    pub file_id: u32,
+    pub offset: u64,
+    pub length: u32,
+    pub value_type: u8,
 }
 
-pub struct SmallBins {
-    pub active_page: Vec<u8>,
-    pub active_page_id: u32,
-    pub current_offset: usize,
-}
-
-pub struct TieredStorage {
-    pub file_fd: RawFd,
+pub struct ShardTierManager {
     pub shard_id: usize,
-    pub small_bins: SmallBins,
-    pub max_memory_bytes: usize,
-    pub used_memory_bytes: usize,
-    pub high_watermark_ratio: f64, // e.g., 0.85
-    pub low_watermark_ratio: f64,  // e.g., 0.70
+    pub port: u16,
+    pub file: Rc<monoio::fs::File>,
+    pub current_offset: Cell<u64>,      // next unused, page-aligned disk offset
+    pub path: PathBuf,
+    pub stats: Arc<TieringStats>,
+    pub op_manager: Rc<OpManager>,
+    pub small_bins: RefCell<SmallBinsManager>,
+    pub is_direct_io: bool,
+}
+
+pub struct ActiveBin {                  // the one in-progress 4KB page being packed
+    pub page_index: u64,
+    pub buffer: Vec<u8>,
+    pub items: Vec<SmallBinItem>,
+}
+
+pub struct SmallBinsManager {
+    pub active_bin: Option<ActiveBin>,
+    pub page_active_counts: HashMap<u64, usize>,  // live-record count per written page
+    pub dead_pages: Vec<u64>,                     // pages whose count hit 0 -> GC candidates
+}
+
+pub struct OpManager {
+    pub in_flight_reads: RefCell<HashMap<u64, Vec<flume::Sender<Result<Rc<Vec<u8>>, String>>>>>,
+    pub pending_stashes: RefCell<HashSet<Bytes>>,
+    pub pending_stash_bytes: AtomicUsize,
 }
 ```
+
+`TieringStats` has 23 fields (`tiered_keys`, `cooled_keys`, `disk_reads`, `disk_writes`,
+`dead_bytes`, `ram_saved_bytes`, `coalesced_reads`, `gc_reclaimed_bytes`,
+`offload_threshold_pct` (default 60), `upload_threshold_pct` (default 80), ...) — all
+`AtomicU64`, updated from `router.rs`'s tiering methods (Component 04) and read by whatever
+reports tiering stats (`INFO`-style output, not shown in this file).
 
 ---
 
 ## 4. Execution Algorithms & Code Logic
 
-### 4.1 Eviction Under Memory Pressure
-
-When `used_memory` exceeds the high watermark, Rudis scans the table and offloads cold values:
+### 4.1 Opening the tier file and recovering the write cursor
 
 ```rust
-impl TieredStorage {
-    pub fn check_memory_pressure(&mut self, table: &mut RudisTable) {
-        let max = self.max_memory_bytes;
-        let high = (max as f64 * self.high_watermark_ratio) as usize;
-        let low = (max as f64 * self.low_watermark_ratio) as usize;
-
-        let current = self.get_allocated_memory();
-        if current < high { return; }
-
-        let bytes_to_reclaim = current - low;
-        let mut reclaimed = 0;
-
-        // Iterate through entries and offload candidates
-        for (_key, entry) in table.entries.iter_mut() {
-            if reclaimed >= bytes_to_reclaim { break; }
-
-            if let RudisValue::String(ref s) = entry.val {
-                if s.len() >= 32 { // Minimum threshold for tiering benefit
-                    let ptr = self.offload_to_ssd(s.as_ref());
-                    reclaimed += s.len();
-                    entry.val = RudisValue::External(ptr);
-                }
-            }
+pub async fn open(shard_id: usize, port: u16, dir: &Path) -> io::Result<Self> {
+    let direct_io_enabled = std::env::var("RUDIS_DIRECT_IO").map(|v| v != "0").unwrap_or(false);
+    let (file, is_direct) = if direct_io_enabled {
+        let mut opts = monoio::fs::OpenOptions::new();
+        opts.read(true).write(true).create(true);
+        opts.custom_flags(libc::O_DIRECT);
+        match opts.open(&path).await {
+            Ok(f) => (f, true),
+            Err(_) => { /* fall back to a normal buffered open */ }
         }
+    } else { /* normal buffered open */ };
+
+    let raw_len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    let current_offset = (raw_len + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64 * PAGE_SIZE as u64;
+    ...
+}
+```
+
+On restart, the write cursor resumes from the file's current length, rounded up to the next
+4KB boundary — so a shard restarted mid-page never overwrites a partially-written page, it
+just leaves a small gap and starts a fresh page.
+
+### 4.2 Stashing a value: SmallBins packing vs. standalone aligned block
+
+`stash_record` (called by `Router::spill_local`/`cool_local`, Component 04) branches purely on
+size:
+
+```rust
+pub async fn stash_record(&self, key: &Bytes, val_payload: &[u8], val_type: u8) -> io::Result<TieredPointer> {
+    if self.op_manager.check_write_backpressure() {
+        return Err(io::Error::new(io::ErrorKind::WouldBlock, "write backpressure: stash buffer full"));
+    }
+    let record = encode_tiered_record(key, val_payload, val_type);
+    ...
+    if record_len < SMALL_VALUE_LIMIT {
+        // pack into (or start a new) ActiveBin page; flush it once it can't fit
+        // one more ~64-byte record (`should_flush = !ab.can_fit(64)`)
+    } else {
+        // flush whatever SmallBin is open, then write this record as its own
+        // record_len-rounded-up-to-4KB standalone block at current_offset
     }
 }
 ```
 
-### 4.2 `SmallBins` Page Packing
+Records under 2KB (`SMALL_VALUE_LIMIT`) get packed multiple-to-a-page into the shard's single
+`ActiveBin`; a page is flushed to disk (`flush_active_bin`, one `write_all_at` per page) either
+when a new record won't fit or when it's nearly full (heuristically, when there's no room left
+for one more minimal ~64-byte record). Records at or above 2KB skip bin-packing entirely,
+flush whatever bin is currently open first (so nothing gets reordered on disk relative to the
+in-memory `current_offset` cursor), then get written as their own page-aligned block.
 
-Writing small values directly to disk causes massive write amplification. `SmallBins` coalesces values into 4 KB direct I/O pages:
+### 4.3 The on-disk record format (CRC64-checked, not just a length prefix)
 
 ```rust
-impl TieredStorage {
-    pub fn offload_to_ssd(&mut self, data: &[u8]) -> RudisExternalPtr {
-        let len = data.len();
-
-        // Check if data fits in the currently active 4KB SmallBins page
-        if self.small_bins.current_offset + len + 2 > 4096 {
-            self.flush_active_page();
-        }
-
-        let offset = self.small_bins.current_offset;
-        let page_id = self.small_bins.active_page_id;
-
-        // Write length prefix and payload into page
-        self.small_bins.active_page[offset..offset + 2]
-            .copy_from_slice(&(len as u16).to_le_bytes());
-        self.small_bins.active_page[offset + 2..offset + 2 + len]
-            .copy_from_slice(data);
-
-        self.small_bins.current_offset += len + 2;
-
-        RudisExternalPtr {
-            page_id,
-            offset_in_page: offset as u16,
-            length: len as u16,
-        }
-    }
-
-    fn flush_active_page(&mut self) {
-        let offset = (self.small_bins.active_page_id as u64) * 4096;
-        // Direct I/O write via Linux pwrite
-        unsafe {
-            libc::pwrite(
-                self.file_fd,
-                self.small_bins.active_page.as_ptr() as *const libc::c_void,
-                4096,
-                offset as libc::off_t,
-            );
-        }
-        self.small_bins.active_page_id += 1;
-        self.small_bins.current_offset = 0;
-        self.small_bins.active_page.fill(0);
-    }
+pub fn encode_tiered_record(key: &[u8], val_payload: &[u8], val_type: u8) -> Vec<u8> {
+    // TIER_MAGIC(4) | value_type(1) | key_len(4) | val_len(4) | crc64(8) | key | val_payload
 }
 ```
 
-### 4.3 Transparent Read Promotion
+`decode_tiered_record` verifies the magic bytes, the `value_type` byte matches what the caller
+expected, and recomputes a CRC64 (`crate::table::crc64`) over `key + val_payload` before
+trusting the bytes — a corrupt or torn write is detected and surfaced as an `io::Error`
+(`"crc mismatch on tiered read"`) rather than silently returning garbage.
 
-When a client accesses an external value via `GET`, it is fetched from NVMe and restored into DRAM:
+### 4.4 Reading a record back: page-read coalescing, and where the RAM copy lands
 
 ```rust
-impl TieredStorage {
-    pub fn read_from_ssd(&self, ptr: RudisExternalPtr) -> Bytes {
-        let mut page_buf = vec![0u8; 4096];
-        let offset = (ptr.page_id as u64) * 4096;
-
-        unsafe {
-            libc::pread(
-                self.file_fd,
-                page_buf.as_mut_ptr() as *mut libc::c_void,
-                4096,
-                offset as libc::off_t,
-            );
-        }
-
-        let start = ptr.offset_in_page as usize + 2;
-        let end = start + ptr.length as usize;
-        Bytes::copy_from_slice(&page_buf[start..end])
+pub async fn read_tiered_record(...) -> io::Result<(Bytes, Vec<u8>)> {
+    let offset_in_page = (ptr.offset % PAGE_SIZE as u64) as usize;
+    if offset_in_page + len <= PAGE_SIZE {
+        // check the still-open ActiveBin first — the record may not be flushed yet
+        // otherwise: op_manager.read_page_coalesced(file, page_start, stats).await
+    } else {
+        // record spans/exceeds a page (a standalone large block) — direct read_exact_at
     }
+    decode_tiered_record(&data, ptr.value_type)
 }
 ```
 
-### 4.4 Hole Punching on Deletion (`fallocate`)
+`read_page_coalesced` (§2.4) means N concurrent readers of the same still-warm 4KB page cause
+exactly one `read_exact_at` syscall; everyone else gets a clone of the same `Rc<Vec<u8>>`.
+
+Critically — and unlike the original design's simple "promote back to hot" description —
+`Router::load_local` (which calls this) does **not** turn a `RudisValue::Tiered(ptr)` back into
+a plain hot value. It calls `RudisTable::restore_tiered_value`, which sets the slot to
+`RudisValue::Cooled { ptr, val: Box::new(decoded_val) }` — i.e. a `Tiered` read always lands as
+`Cooled` (RAM-resident *and* still disk-backed), never straight back to a bare `String`/`List`/
+etc. Something has to explicitly `decommit` a `Cooled` entry (or it has to be spilled again) to
+either free the RAM copy (back to `Tiered`) or fully rejoin the "hot" set — there is no direct
+`Cooled → Hot` transition in the code; `Cooled` behaves as a permanent write-through cache
+layer once a key has ever been tiered.
+
+### 4.5 Garbage collection: dead-page tracking + `fallocate` hole punching
 
 ```rust
-pub fn delete_external_record(file_fd: RawFd, page_id: u32) {
-    let offset = (page_id as u64) * 4096;
-    unsafe {
-        libc::fallocate(
-            file_fd,
-            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-            offset as libc::off_t,
-            4096,
-        );
+pub fn on_key_deleted(&self, ptr: TieredPointer) {
+    if (ptr.length as usize) < SMALL_VALUE_LIMIT {
+        // decrement that page's live-record count; if it hits 0, queue the page in dead_pages
+    } else {
+        // large standalone block: punch the hole immediately, no waiting
     }
 }
+
+pub fn run_gc(&self) -> usize {
+    let dead = std::mem::take(&mut self.small_bins.borrow_mut().dead_pages);
+    for page_idx in &dead {
+        Self::punch_hole(&self.file, page_idx * PAGE_SIZE as u64, PAGE_SIZE as u64, &self.stats);
+    }
+    dead.len() * PAGE_SIZE
+}
 ```
+
+Because SmallBins pack multiple keys per 4KB page, a single deleted key can't reclaim its page
+immediately — `SmallBinsManager` tracks a live-record count per page and only queues the page
+for `fallocate(FALLOC_FL_PUNCH_HOLE)` once every record on it has been deleted. Standalone
+large-value blocks (≥2KB) are punched immediately on delete since they aren't shared with
+anything else. `run_gc` is invoked periodically from `src/server.rs`'s 2-second GC task
+(Component 01).
+
+### 4.6 Snapshotting: reflink-first, `copy_file_range` fallback
+
+```rust
+pub fn snapshot_file(src_path: &Path, dst_path: &Path) -> io::Result<bool> {
+    // Try FICLONE (0x40049409) ioctl first — an instant CoW reflink on filesystems
+    // that support it (btrfs, XFS with reflink, some overlay setups).
+    // On failure, fall back to looping libc::copy_file_range in 16MB chunks,
+    // and if THAT fails too, fall back again to std::fs::copy.
+}
+```
+
+`ShardTierManager::snapshot` flushes the active bin and `sync_all`s the file first, then calls
+`snapshot_file`, then writes a small plain-text manifest (`version`/`shard_id`/`file_size`/
+`is_reflink`/`current_offset`) next to the backup — three fallback tiers for the actual copy,
+in order of cost: reflink (instant, metadata-only) → `copy_file_range` (in-kernel copy, no
+userspace round-trip) → a plain buffered `std::fs::copy`.
 
 ---
 
 ## 5. Cross-Component Interactions
 
-- **`src/table.rs`**: Stores `RudisValue::External(ptr)` when keys are evicted.
-- **`src/connection.rs`**: Detects `RudisValue::External` during reads, calls `read_from_ssd`, and promotes values back to `RudisValue::String`.
-- **`src/server.rs`**: Periodically checks `tier.check_memory_pressure()` in the maintenance timer loop.
+- **`src/table.rs`** (Component 05): owns the `RudisValue::Tiered`/`RudisValue::Cooled`
+  variants and the state-transition methods this file's callers use
+  (`set_tiered_pointer`, `set_cooled_pointer`, `restore_tiered_value`, `get_value_for_spill`,
+  `decommit_all_cooled`, `get_hot_keys_for_spill`, `is_tiered`, `is_cooled`); also owns
+  `serialize_val_payload`/`deserialize_val_payload`, the value-encoding format this file's
+  records carry as their payload.
+- **`src/router.rs`** (Component 04): the actual orchestration layer —
+  `spill_local`/`cool_local`/`load_local`/`stream_cold_read_local`/`decommit_local`/
+  `check_auto_tier` decide *when* to call into this file's `ShardTierManager`, using the real
+  `offload_threshold_pct`/`upload_threshold_pct` from `TieringStats` and `get_hot_keys_for_spill`
+  to pick candidates.
+- **`src/shard.rs`**: `ShardDb.tier_manager: Option<Rc<ShardTierManager>>` — one manager
+  instance per shard, created during shard startup (Component 01 §4.1 step 7).
+- **`src/connection.rs`** (Component 02): a `GET` on a key whose value is
+  `RudisValue::Tiered`/`Cooled` falls through to `stream_cold_read_local`/`load_local` rather
+  than being served directly from the table.
+- **`src/main.rs`** / **`src/server.rs`**: `RUDIS_DIRECT_IO` is read as a process environment
+  variable, not a CLI flag; `--maxmemory`/`--tiered-offload-threshold`/
+  `--tiered-upload-threshold` (Component 01) feed `set_max_memory`/`set_offload_threshold_pct`/
+  `set_upload_threshold_pct` in this file.
 
 ---
 
 ## 6. Performance Characteristics
 
-- **Zero DRAM Waste**: Cold items take up exactly 16 bytes of metadata in memory.
-- **Sub-30µs Read Latency**: NVMe SSD 4 KB direct I/O reads complete in 15–30 microseconds.
-- **Zero Space Leaks**: Kernel-level hole punching frees physical flash blocks immediately upon deletion without full compaction rewrites.
+- **`O_DIRECT` is conditional, not guaranteed** (§2.2) — actual page-cache-bypass behavior
+  depends on `RUDIS_DIRECT_IO` being set and the filesystem/kernel actually honoring the flag;
+  silently falls back to normal buffered I/O otherwise.
+- **Read coalescing collapses concurrent hot-page reads** to one physical read plus N
+  in-memory channel deliveries, avoiding redundant disk I/O when several keys on the same
+  4KB SmallBin page are accessed close together.
+- **Write backpressure is a simple byte-budget gate** (16MB of in-flight stash data), not a
+  queue-depth or per-key limit — a burst of large concurrent spills can hit it and get
+  `WouldBlock` back to the caller.
+- **GC reclaims whole 4KB pages, not individual records** — a page with even one surviving
+  record can't be punched; deletion-heavy small-value workloads can accumulate dead-but-unfreed
+  bytes (`dead_bytes` stat) until every record sharing a page happens to be deleted.
+- **Snapshotting cost depends entirely on filesystem reflink support** — instant on
+  btrfs/XFS-with-reflink, an in-kernel `copy_file_range` loop otherwise (still avoiding a
+  full userspace read+write round trip), and only falls all the way back to `std::fs::copy`
+  if both kernel-assisted paths are unavailable.

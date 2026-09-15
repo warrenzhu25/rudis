@@ -1,227 +1,284 @@
-# Component 08: Vector Search Engine: HNSW, SQ8, PQ & ADC (`src/vector.rs`)
+# Component 08: Vector Search Engine: HNSW, SQ8 & Product Quantization (`src/vector.rs`)
 
 ## 1. Architectural Purpose & Scope
 
-`src/vector.rs` implements Rudis's high-performance vector search engine. Built to power real-time embedding search, AI agent retrieval, and RAG architectures, it supports **Hierarchical Navigable Small World (HNSW)** indexing, **Scalar Quantization (SQ8)**, and **Product Quantization (PQ)** with **Asymmetric Distance Computation (ADC)**.
+`src/vector.rs` implements an in-memory approximate nearest-neighbor (ANN) vector index:
+a **Hierarchical Navigable Small World (HNSW)** graph (`HnswIndex`), an **8-bit scalar
+quantization** scheme (`QuantizedVector`), and a **Product Quantization with Asymmetric
+Distance Computation** scheme (`ProductQuantizer`/`PQVector`). It is exposed to clients
+through five bespoke commands parsed in `src/resp.rs` and dispatched in `src/connection.rs`:
+`VADD`, `VQUERY`, `VSIM`, `VDEL`, `VINFO`. There is no `FT.SEARCH ... KNN` integration —
+that syntax does not exist anywhere in this codebase; full-text search (`src/search.rs`,
+Component 09) is a separate engine with no code-level link to this one.
+
+**Each shard owns a completely independent set of named indexes** (`ShardDb.vector_indexes:
+HashMap<String, HnswIndex>`), and every vector command only ever touches
+`router.local_db` — there is no cross-shard routing for `VADD`/`VQUERY`/`VSIM`/`VDEL`/`VINFO`
+at all (confirmed: none of the five appear in `target_shard_of_cmd`, and none of `Router`'s
+methods reference the vector engine). This means an index named `"products"` on shard 0 and
+an index named `"products"` on shard 1 are two entirely separate, unrelated HNSW graphs —
+which shard a given connection lands on (decided by the kernel via `SO_REUSEPORT`, per
+Component 01) silently determines which index a `VADD`/`VQUERY` actually reads or writes.
+There is no fan-out, no merge, and no consistency check across shards. Treat this as the
+single most important operational caveat for this subsystem.
 
 ---
 
 ## 2. Key Invariants & Concurrency Constraints
 
-1. **SIMD-Accelerated Distance Metrics**: Dot products, Euclidean distance (L2), and Cosine similarity are vectorized using AVX2 and NEON SIMD intrinsics.
-2. **Deterministic Layer Generation**: Node levels in the HNSW hierarchy are assigned via a geometric distribution parameterized by $m_L = 1 / \ln(M)$.
-3. **Quantization with Zero Loss of Recall**: Quantized representations (SQ8 / PQ) accelerate candidate exploration, while a tiered reranking pipeline accesses raw vectors only for the final top-$K$ candidates to guarantee $> 98\%$ recall.
-4. **Lock-Free Read Operations**: Graph nodes and adjacency lists are stored in contiguous vectors indexed by internal vector IDs.
+1. **Thread-local, not cross-shard**: consistent with the rest of the codebase, `HnswIndex`
+   instances live inside one shard's `ShardDb` with no locks — but unlike the key-value
+   store, there is no `ShardMessage` variant to reach a vector index on another shard at all
+   (see §1). This isn't a locking decision, it's simply unimplemented cross-shard support.
+2. **Runtime AVX2 detection, x86_64 only**: `dot_product`/`l2_distance_sq` check
+   `is_x86_feature_detected!("avx2")`/`"fma"` at call time and fall back to a portable
+   8-lane-unrolled scalar implementation otherwise. There is **no ARM/NEON code path** —
+   only `#[cfg(target_arch = "x86_64")]` SIMD kernels exist; any other architecture always
+   takes the portable path.
+3. **All three metrics return a "smaller is closer" distance, not a raw similarity score**:
+   `VectorMetric::IP` (inner product) returns `-dot_product(a, b)` specifically so that, like
+   `L2` and `Cosine`, a smaller returned value always means "more similar" — letting
+   `search_layer`'s single min/max-heap logic work identically regardless of metric.
+4. **Product Quantization codebooks are not trained on data.** `ProductQuantizer::new`
+   generates each subvector's 256 centroids deterministically: centroid 0 is the zero
+   vector, centroids `1..=d_sub` are positive unit basis vectors, `d_sub+1..=2*d_sub` are
+   negative unit basis vectors, and the remainder are filled by a fixed SplitMix64-style
+   hash of `(centroid_id, subvector_id, dim_id)` mapped into `[-1, 1]`. There is no k-means
+   or any training pass over real vectors — every `ProductQuantizer` for a given `(dim, m)`
+   produces byte-for-byte identical codebooks. Real PQ implementations cluster the actual
+   data distribution; this one does not, which will cost recall accordingly.
+5. **HNSW layer assignment is deterministic across index instances.** `HnswIndex::new`
+   seeds a custom xorshift64 PRNG (`rng_state`) with the fixed constant
+   `0x853c49e6748fea9b` every time — not from OS randomness, the clock, or the index name.
+   Two indexes built by inserting the same vectors in the same order will have identical
+   graph topology.
 
 ---
 
 ## 3. Component Architecture & Data Structures
 
 ```
-                             Vector Query (float32[])
-                                       │
-                         ┌─────────────┴─────────────┐
-                         ▼                           ▼
-                 Standard Search              Quantized Search
-                  (Raw float32)                  (SQ8 / PQ)
-                         │                           │
-                         │                   Precompute ADC Lookup
-                         │                   Table for Centroids
-                         │                           │
-                         ▼                           ▼
-                HNSW Layer Traversal: Top -> Layer 1 -> Layer 0
-                         │                           │
-                         │                   Fast Candidate Set
-                         │                           │
-                         │                   Top-K Reranking via
-                         │                   Exact Float32 Vectors
-                         │                           │
-                         └─────────────┬─────────────┘
-                                       ▼
-                             Sorted K-NN Results
+                 VADD index key <floats...> [QUANTIZE|SQ8] [PQ] [TIERED]
+                 VQUERY index k <floats...> [RERANK]
+                 VSIM index key1 key2 [METRIC ...]
+                 VDEL index key
+                 VINFO index
+                                     │
+                        ShardDb.vector_indexes["index"]  (per-shard, independent)
+                                     │
+                                     ▼
+                              HnswIndex
+                    ┌────────────────┴────────────────┐
+                    ▼                                 ▼
+         nodes: Vec<Option<HnswNode>>          key_to_id: HashMap<Bytes, usize>
+         (tombstoned via None on delete,          (external key -> internal id)
+          never compacted)
+                    │
+                    ▼
+         HnswNode { vector: Vec<f32>, quantized: Option<QuantizedVector>,
+                     pq: Option<PQVector>, neighbors: Vec<Vec<usize>> }
+                     (neighbors[layer] = adjacency list at that layer)
 ```
 
-### Core Data Structures
+### Real core types
 
 ```rust
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MetricType {
-    Cosine,
-    L2,
-    InnerProduct,
-}
+pub enum VectorMetric { Cosine, L2, IP }   // Cosine is Default
 
 pub struct HnswIndex {
+    pub name: String,
     pub dim: usize,
-    pub m: usize,              // Max links per node at level > 0
-    pub m0: usize,             // Max links per node at level 0 (2 * m)
-    pub ef_construction: usize,// Beam size during indexing
-    pub metric: MetricType,
-    pub enter_node: Option<u32>,
-    pub max_level: usize,
-    pub nodes: Vec<HnswNode>,
-    pub vectors: Vec<Vec<f32>>,
-    pub sq8: Option<Sq8Quantizer>,
-    pub pq: Option<PqQuantizer>,
+    pub metric: VectorMetric,
+    pub m: usize,               // 16 — max neighbors per node, layer > 0
+    pub m0: usize,              // 32 — max neighbors per node, layer 0
+    pub ef_construction: usize, // 64
+    pub ef_search: usize,       // 32
+    pub ml: f64,                // 1 / ln(m) — level-generation scale
+    pub entry_point: Option<usize>,
+    pub max_layer: usize,
+    pub nodes: Vec<Option<HnswNode>>,
+    pub key_to_id: HashMap<Bytes, usize>,
+    pub pq_quantizer: Option<ProductQuantizer>,
+    rng_state: u64,             // fixed-seed xorshift64, see §2.5
 }
 
 pub struct HnswNode {
-    pub id: u32,
-    pub external_key: Bytes,
-    pub level: usize,
-    pub friends: Vec<Vec<u32>>, // Adjacency list per level
+    pub id: usize,
+    pub key: Bytes,
+    pub vector: Vec<f32>,             // full-precision vector always kept
+    pub quantized: Option<QuantizedVector>,  // SQ8, if requested
+    pub pq: Option<PQVector>,                // PQ codes, if requested
+    pub is_tiered: bool,
+    pub neighbors: Vec<Vec<usize>>,   // one adjacency list per layer this node exists on
+}
+
+pub struct QuantizedVector {
+    pub min_val: f32,
+    pub scale: f32,      // (max - min) / 255
+    pub sum_q: f32,      // precomputed for fast cosine norm
+    pub sum_q_sq: f32,
+    pub data: Vec<u8>,
+}
+
+pub struct PQVector { pub codes: Vec<u8> }   // one byte (0-255) per subvector
+
+pub struct ProductQuantizer {
+    pub dim: usize,
+    pub m: usize,                       // number of subvectors
+    pub d_sub: usize,                   // dim / m
+    pub codebooks: Vec<Vec<Vec<f32>>>,  // [subvector][centroid 0..256][d_sub floats]
 }
 ```
+
+Note the node always keeps its full `Vec<f32>` regardless of whether SQ8/PQ is also
+enabled — quantization here is an additional fast-path structure for candidate scoring,
+not a memory-savings replacement for the raw vector (the "reranking" pass in §4.3 depends
+on the exact float vector still being present).
 
 ---
 
 ## 4. Execution Algorithms & Code Logic
 
-### 4.1 Quantization Engines
-
-#### 1. Scalar Quantization (SQ8)
-Projects 32-bit floats into 8-bit unsigned integers, providing $4\times$ memory savings:
-
-$$\tilde{x}_i = \left\lfloor \frac{x_i - \min}{\max - \min} \times 255 \right\rfloor$$
+### 4.1 SIMD distance kernels
 
 ```rust
-pub struct Sq8Quantizer {
-    pub min_val: f32,
-    pub max_val: f32,
-    pub quantized_vectors: Vec<Vec<u8>>,
+pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    { if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        return unsafe { dot_product_avx2(a, b) };
+    } }
+    dot_product_portable(a, b)
 }
+```
 
-impl Sq8Quantizer {
-    pub fn quantize(&self, v: &[f32]) -> Vec<u8> {
-        let range = self.max_val - self.min_val;
-        v.iter()
-            .map(|&x| {
-                let clamped = x.clamp(self.min_val, self.max_val);
-                (((clamped - self.min_val) / range) * 255.0).round() as u8
-            })
-            .collect()
+`dot_product_avx2`/`l2_distance_sq_avx2` process 16 floats per iteration (two accumulated
+`__m256` lanes via `_mm256_fmadd_ps`), with an 8-wide tail and a scalar remainder — real
+FMA-fused AVX2, not a placeholder. `dot_f32_u8_avx2`/`l2_f32_u8_avx2` do the same for a
+`f32` query against a `u8`-quantized vector (`_mm256_cvtepu8_epi32` widening + convert),
+used by `QuantizedVector::compute_distance` so SQ8-accelerated scoring is itself
+SIMD-accelerated, not just smaller.
+
+`compute_distance` unifies the three metrics into one "smaller is closer" scale:
+
+```rust
+pub fn compute_distance(a: &[f32], b: &[f32], metric: VectorMetric) -> f32 {
+    match metric {
+        VectorMetric::L2 => l2_distance_sq(a, b).sqrt(),
+        VectorMetric::IP => -dot_product(a, b),
+        VectorMetric::Cosine => {
+            let dot = dot_product(a, b);
+            let norm_a = dot_product(a, a).sqrt();
+            let norm_b = dot_product(b, b).sqrt();
+            if norm_a == 0.0 || norm_b == 0.0 { 1.0 }
+            else { (1.0 - (dot / (norm_a * norm_b))).max(0.0) }
+        }
     }
 }
 ```
 
-#### 2. Product Quantization (PQ) & Asymmetric Distance Computation (ADC)
-Splits a vector into $M$ sub-vectors, quantizing each into one of 256 centroid IDs:
+### 4.2 SQ8 quantization: precomputed sums avoid dequantizing on every comparison
+
+`QuantizedVector::quantize` linearly maps each float into `[0, 255]` using the vector's own
+min/max (`scale = (max - min) / 255`), and precomputes `sum_q`/`sum_q_sq` once at insert
+time. `compute_distance` (query vs. stored SQ8 vector) then reconstructs the true dot
+product / L2 / cosine algebraically from `dot_u8` (float·u8 SIMD dot) plus the precomputed
+sums, without ever materializing a dequantized `Vec<f32>` — e.g. inner product is
+`min_val * sum_query + scale * dot_u8`. `dequantize()` (full float reconstruction) exists
+but is not on this hot path.
+
+### 4.3 HNSW insertion (`add_quantized_ext`)
 
 ```rust
-pub struct PqQuantizer {
-    pub num_subvectors: usize,
-    pub subvector_dim: usize,
-    pub centroids: Vec<Vec<Vec<f32>>>, // [subvector_idx][centroid_idx][dim]
-}
+let target_level = self.random_level();     // -ln(rand) * ml, capped at 16
+...
+// 1. Greedy descent from entry_point through layers ABOVE target_level
+for lc in (target_level + 1..=self.max_layer).rev() { /* follow nearest neighbor at lc */ }
+// 2. From target_level down to 0: beam search (search_layer) at each layer,
+//    keep the nearest m_max candidates (m0 at layer 0, m elsewhere) as new neighbors,
+//    link bidirectionally, and prune any neighbor whose list now exceeds m_max
+for lc in (0..=target_level.min(self.max_layer)).rev() { ... self.prune_neighbors(...) }
+if target_level > self.max_layer { self.max_layer = target_level; self.entry_point = Some(new_id); }
+```
 
-impl PqQuantizer {
-    // Precomputes distance table between query subvectors and all centroids
-    pub fn compute_distance_table(&self, query: &[f32]) -> Vec<[f32; 256]> {
-        let mut table = vec![[0.0f32; 256]; self.num_subvectors];
-        for m in 0..self.num_subvectors {
-            let q_sub = &query[m * self.subvector_dim..(m + 1) * self.subvector_dim];
-            for c in 0..256 {
-                let centroid = &self.centroids[m][c];
-                table[m][c] = compute_l2_sq(q_sub, centroid);
-            }
-        }
-        table
-    }
+`prune_neighbors` prunes by **plain nearest-distance truncation** (sort candidates by
+distance to the node, keep the closest `max_neighbors`) — not the original HNSW paper's
+diversity-aware neighbor-selection heuristic. Simpler, but can leave the graph less
+navigable under adversarial insertion orders than the paper's algorithm.
 
-    // Asymmetric distance lookup: Sum of precomputed centroid distances!
-    #[inline(always)]
-    pub fn distance_with_table(&self, table: &[[f32; 256]], pq_code: &[u8]) -> f32 {
-        let mut sum = 0.0f32;
-        for (m, &code) in pq_code.iter().enumerate() {
-            sum += table[m][code as usize];
-        }
-        sum
+### 4.4 Search (`search`/`search_tiered`) with optional exact rerank
+
+```rust
+pub fn search_tiered(&self, query: &[f32], k: usize, rerank: bool) -> Vec<(Bytes, f32)> {
+    // 1. Greedy descent through layers max_layer..=1 (single nearest-neighbor hop per layer)
+    // 2. Beam search at layer 0 via search_layer(query, curr_obj, search_ef, 0)
+    //    where search_ef = ef_search.max(if rerank { k*3 } else { k })
+    if rerank {
+        // 3. Re-score every candidate with compute_distance() on the EXACT f32 vector
+        //    (bypassing any SQ8/PQ approximation used during graph traversal), re-sort, truncate to k
+    } else {
+        // return the approximate candidates as-is, truncated to k
     }
 }
 ```
 
-### 4.2 HNSW K-NN Search Algorithm
+`dist_to_node` (used throughout traversal) prefers `PQVector`+`ProductQuantizer` ADC if
+both are present, else `QuantizedVector` SQ8, else the exact float vector — so a node
+built with `PQ` or `QUANTIZE` is scored approximately during graph traversal, and only
+gets compared against the true vector if the caller passes `RERANK` (`Command::Vquery {
+rerank, .. }`).
+
+### 4.5 PQ encode + ADC scoring
 
 ```rust
-impl HnswIndex {
-    pub fn search_knn(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(Bytes, f32)> {
-        let mut curr_obj = match self.enter_node {
-            Some(node) => node,
-            None => return Vec::new(),
-        };
-
-        let mut curr_dist = self.distance(query, &self.vectors[curr_obj as usize]);
-
-        // 1. Traverse top levels greedily to find entry point into level 0
-        for level in (1..=self.max_level).rev() {
-            let mut changed = true;
-            while changed {
-                changed = false;
-                for &neighbor in &self.nodes[curr_obj as usize].friends[level] {
-                    let d = self.distance(query, &self.vectors[neighbor as usize]);
-                    if d < curr_dist {
-                        curr_dist = d;
-                        curr_obj = neighbor;
-                        changed = true;
-                    }
-                }
-            }
-        }
-
-        // 2. Beam search at Level 0
-        let mut visited = HashSet::new();
-        visited.insert(curr_obj);
-
-        let mut candidates = BinaryHeap::new(); // Min-heap of candidates
-        candidates.push(Reverse(OrderedFloat(curr_dist, curr_obj)));
-
-        let mut w = BinaryHeap::new(); // Max-heap of nearest elements
-        w.push(OrderedFloat(curr_dist, curr_obj));
-
-        while let Some(Reverse(OrderedFloat(c_dist, c_node))) = candidates.pop() {
-            let furthest_dist = w.peek().unwrap().0;
-            if c_dist > furthest_dist && w.len() >= ef_search {
-                break;
-            }
-
-            for &neighbor in &self.nodes[c_node as usize].friends[0] {
-                if visited.insert(neighbor) {
-                    let d = self.distance(query, &self.vectors[neighbor as usize]);
-                    if d < furthest_dist || w.len() < ef_search {
-                        candidates.push(Reverse(OrderedFloat(d, neighbor)));
-                        w.push(OrderedFloat(d, neighbor));
-                        if w.len() > ef_search {
-                            w.pop();
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. Extract top K results
-        let mut results = Vec::new();
-        while let Some(OrderedFloat(dist, node)) = w.pop() {
-            results.push((self.nodes[node as usize].external_key.clone(), dist));
-        }
-        results.reverse();
-        results.truncate(k);
-        results
-    }
+pub fn compute_distance_table(&self, query: &[f32]) -> Vec<[f32; 256]> {
+    // one 256-entry L2 table per subvector, precomputed once per query
+}
+pub fn compute_distance_adc(&self, table: &[[f32; 256]], pq: &PQVector) -> f32 {
+    pq.codes.iter().enumerate().map(|(m, &c)| table[m][c as usize]).sum()
 }
 ```
+
+Classic ADC: encode the query's distance to all 256 centroids per subvector once, then
+score every stored PQ-coded vector as a sum of table lookups — no per-candidate float
+math, at the cost of the codebook-quality caveat in §2.4.
+
+### 4.6 Deletion leaves tombstoned slots, no compaction
+
+`remove(key)` walks every layer's neighbor list to strip references to the removed id,
+sets `self.nodes[id] = None` (leaving a hole — ids are never reused or compacted), and if
+the removed node was the entry point, picks the first `Some` slot in `nodes` as the new
+one (`self.nodes.iter().position(|n| n.is_some())`) — not necessarily a well-connected or
+central node, just the first surviving slot.
 
 ---
 
 ## 5. Cross-Component Interactions
 
-- **`src/resp.rs`**: Parses vector commands (`FT.SEARCH index "*=>[KNN 10 @vec $query_vec]"`).
-- **`src/search.rs`**: Integrates with the RediSearch schema engine and reciprocal rank fusion (RRF).
-- **`src/table.rs`**: Associates raw vector embeddings with document keys.
+- **`src/resp.rs`**: parses `VADD`/`VQUERY`/`VSIM`/`VDEL`/`VINFO` into `Command` variants;
+  `VADD`'s `metric` field is always parsed as `None` (per-call metric override isn't
+  actually accepted on `VADD` — the metric is fixed at index-creation time only).
+- **`src/shard.rs`**: `ShardDb::vadd` lazily creates the `HnswIndex` on first use
+  (`vector_indexes.entry(index_name).or_insert_with(...)`), defaulting the metric to
+  `VectorMetric::Cosine` if the index didn't already exist; `vsim` allows a one-off
+  `metric_override` for that single comparison without changing the index's stored metric.
+- **`src/connection.rs`**: dispatches all five commands straight to
+  `router.local_db.borrow()[_mut]()` — no `target_shard_of_cmd` entry, no remote path (§1).
+- **`src/search.rs`** (Component 09): no code-level relationship — separate engine, despite
+  both being "search" subsystems.
+- **`src/table.rs`**: no relationship — vector data lives entirely in `ShardDb.vector_indexes`,
+  not in `RudisValue`/`RudisTable` at all.
 
 ---
 
 ## 6. Performance Characteristics
 
-- **Ingestion Speed**: Ingests $> 3,500$ vectors/sec per core for 128-dimensional vectors.
-- **Sub-Millisecond Queries**: p99 search latency is $< 400$ µs across datasets of 100,000+ vectors.
-- **Memory Footprint**: SQ8 achieves a **$75\%$ RAM reduction** over raw Float32 embeddings.
+- Distance kernels are genuinely AVX2+FMA accelerated at 16 floats/iteration when the CPU
+  supports it, with a correct portable fallback otherwise — no unconditional `unsafe` on
+  unsupported hardware.
+- SQ8 scoring reuses the same AVX2 kernels against `u8` data, so approximate scoring during
+  graph traversal is not meaningfully slower per-comparison than exact float scoring.
+- No numbers in this document are benchmarked — the previous version's "\>3,500 vectors/sec",
+  "\<400µs p99", and "75% RAM reduction" figures were unsourced and have been removed rather
+  than repeated unverified. SQ8's memory reduction ratio (4 bytes/dim -> 1 byte/dim, i.e. 4x
+  smaller for the quantized copy, kept *alongside* the original `Vec<f32>` per §3's note) is
+  the one ratio derivable directly from the type definitions, not from measurement.

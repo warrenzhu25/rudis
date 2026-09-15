@@ -2,158 +2,289 @@
 
 ## 1. Architectural Purpose & Scope
 
-`src/cluster.rs` implements full compatibility with the **Redis Cluster Specification**. It manages distributed multi-node clusters across 16,384 virtual hash slots, orchestrates node discovery via the **Cluster Bus Gossip Protocol** (listening on Port + 10000), executes automated failover consensus, and handles dynamic slot migration with `MOVED` and `ASK` client redirections.
+`src/cluster.rs` implements a simplified Redis Cluster control plane: per-node slot
+ownership tracked as `(start, end)` ranges (not a real Redis Cluster deployment's
+16,384-bit bitmask), a plain-text line-oriented gossip protocol between nodes on
+`port + 10000`, unilateral (non-consensus) failure detection based on ping/pong
+staleness, and a real majority-vote replica election for failover. It is a single
+process-wide singleton per listening port (`get_cluster_hub(port)`), and only the
+shard-0 worker thread ever starts the cluster-bus listener for that port
+(`start_cluster_bus`, called from `run_shard_worker` — see Component 01).
 
 ---
 
 ## 2. Key Invariants & Concurrency Constraints
 
-1. **16,384 Hash Slots**: Keys map deterministically to slots via `crc16(hash_tag(key)) % 16384`. Each node owns a specific subset of slots represented as a 2048-byte bitmask.
-2. **Dedicated Cluster Bus**: Inter-node communication operates over a separate TCP port (`client_port + 10000`) using binary gossip frames rather than text RESP.
-3. **Consensus via Configuration Epochs**: Changes to topology (failovers, slot transfers) are timestamped with strictly increasing `currentEpoch` and `configEpoch` numbers to ensure convergence without split-brain anomalies.
-4. **Redirection Semantics**:
-   - `MOVED <slot> <target_ip>:<port>`: The slot is owned permanently by another node.
-   - `ASK <slot> <target_ip>:<port>`: The slot is currently migrating; clients send `ASKING` to the target node prior to executing single commands.
+1. **One `ClusterHub` per port, shared via a global registry**: `CLUSTER_HUBS:
+   LazyLock<RwLock<HashMap<u16, Arc<ClusterHub>>>>`. `get_cluster_hub(port)`
+   lazily creates and caches one `Arc<ClusterHub>` per port — this is process-wide
+   shared, mutex/rwlock-guarded state, not thread-local (a deliberate, narrow
+   exception to the shared-nothing model, same category as `BlockHub` in
+   Component 06).
+2. **Plain-text wire protocol, not binary framing**: every cluster-bus message
+   (`MEET`, `PING`, `FAIL`, `FAILOVER`, `FAILOVER_AUTH_REQUEST`,
+   `FAILOVER_ANNOUNCE`) is a `\r\n`-terminated space-separated ASCII line, parsed
+   with `split_whitespace()`. There is no binary struct, no magic-byte signature,
+   no `#[repr(C, packed)]` header of any kind.
+3. **Synchronous blocking I/O on dedicated OS threads, not `io_uring`/`monoio`**:
+   the cluster bus listener runs on its own `std::thread`, using plain
+   `std::net::TcpStream`/`TcpListener` with short (200-500ms) read/write
+   timeouts — completely separate from the rest of Rudis's async, io_uring-based
+   networking. Each inbound connection also gets its own `std::thread::spawn`.
+4. **Unilateral failure detection, not quorum-based**: a peer is marked `"fail?"`
+   after 5s of silence and `"fail"` after 10s, decided independently by each node
+   from its own `pong_recv` timestamps. The `pfail_reports: HashMap<String,
+   HashSet<String>>` field that `cluster_nodes()` reads to check "has anyone else
+   reported this node as failing" is **never written to** anywhere in the file
+   except being cleared on `CLUSTER RESET` — there is no real distributed PFAIL→FAIL
+   consensus, despite the data structure existing for it.
+5. **Replica election *is* a real majority vote**: `start_election` does send
+   `FAILOVER_AUTH_REQUEST` to every known master and only promotes itself after
+   collecting `>= (total_masters / 2) + 1` `FAILOVER_AUTH_ACK` replies, gated by
+   `last_vote_epoch` (one vote per epoch per master) — this part matches the
+   Architectural Purpose's claim, unlike the failure-detection consensus.
 
 ---
 
 ## 3. Component Architecture & Data Structures
 
 ```
-     Client Connection ──► GET user:100 (Slot 7560)
-                                │
-                                ▼
-                       Local Node owns Slot 7560?
-                     ┌──────────┴──────────┐
-                     ▼                     ▼
-                   Yes                     No
-                    │                      │
-          Execute Locally                  Is Slot 7560 Migrating?
-                                         ┌─────────┴─────────┐
-                                         ▼                   ▼
-                                        Yes                  No
-                                         │                   │
-                                   Return -ASK         Return -MOVED
-                                  target:6380         target:6381
+   CLUSTER MEET ip port          Client Connection ── CLUSTER SETSLOT / GET / SET
+          │                              │
+          ▼                              ▼
+   ClusterHub::cluster_meet    connection.rs: read router.slot_states[slot]
+   (connects to peer's cport,      (Migrating/Importing/Moved/Stable)
+    exchanges MEET/PONG)                 │
+          │                    Stable ──► also checks ClusterHub.my_slots /
+          ▼                              .nodes for a DIFFERENT node owning
+   nodes: HashMap<id, ClusterNodeInfo>    this slot ── -MOVED if so
+          │
+          ▼
+   cluster_bus_tick() every 500ms: PING every known peer,
+   embed full node table as a ";"-joined gossip blob in the PING line,
+   update pong_recv / flags from the PONG reply or its absence
 ```
 
-### Cluster State Structures
+### Real data structures (`src/cluster.rs`)
 
 ```rust
-pub const CLUSTER_SLOTS: usize = 16384;
-
 #[derive(Clone, Debug)]
-pub struct ClusterNode {
-    pub name: String, // 40-character hex node ID
+pub struct ClusterNodeInfo {
+    pub id: String,
     pub ip: String,
     pub port: u16,
-    pub cport: u16,   // Cluster bus port (port + 10000)
-    pub flags: NodeFlags,
+    pub cport: u16,
+    pub flags: String, // "myself,master", "master", "slave", "fail?", "fail"
+    pub master_id: String,
+    pub ping_sent: u64,
+    pub pong_recv: u64,
     pub config_epoch: u64,
-    pub slots: [u8; 2048], // 16,384 bits (1 bit per slot)
-    pub master_id: Option<String>,
+    pub link_state: String, // "connected", "disconnected"
+    pub slots: Vec<(u16, u16)>,
 }
 
-pub struct ClusterState {
-    pub myself: ClusterNode,
-    pub current_epoch: u64,
-    pub nodes: HashMap<String, ClusterNode>,
-    pub slots: [Option<String>; CLUSTER_SLOTS], // Slot -> Node ID
-    pub migrating_slots: HashMap<u16, String>,  // Slot -> Destination Node ID
-    pub importing_slots: HashMap<u16, String>,  // Slot -> Source Node ID
+pub struct ClusterHub {
+    pub port: u16,
+    pub cport: u16,
+    pub my_id: RwLock<String>,
+    pub current_epoch: AtomicU64,
+    pub config_epoch: AtomicU64,
+    pub last_vote_epoch: AtomicU64,
+    pub election_in_progress: AtomicBool,
+    pub role: RwLock<String>,          // "master" or "slave"
+    pub master_id: RwLock<String>,     // "-" or an id
+    pub nodes: RwLock<HashMap<String, ClusterNodeInfo>>,
+    pub my_slots: RwLock<Vec<(u16, u16)>>,
+    pub pfail_reports: RwLock<HashMap<String, HashSet<String>>>, // dead — see §2.4
+    pub bus_running: AtomicBool,
+    pub cancel_bus: RwLock<Option<flume::Sender<()>>>,
+    pub active_migration: RwLock<Option<ActiveMigration>>,
 }
 ```
+
+`slots`/`my_slots` are `Vec<(u16, u16)>` range lists, kept normalized by
+`compact_slots` (sorts, then merges adjacent/overlapping ranges) — there is no
+16,384-bit bitmask anywhere in this file. Node IDs are **not** the real Redis
+40-hex-char SHA1-derived ID; `generate_node_id` builds a 40-hex-char string from
+two `fxhash::hash64` calls over the port and the current time-in-nanoseconds
+(`format!("{:016x}{:016x}{:08x}", h1, h2, port)`), which happens to be the same
+length but is not cryptographically meaningful.
+
+`ActiveMigration` backs the Dragonfly-style (`DFLYCLUSTER`) migration status
+commands (`dfly_migrate_init`/`dfly_migrate_flow`/`dfly_migrate_ack`/
+`dfly_slot_migration_status`) — these are simple state bookkeeping (a state
+string, a counter incremented by whatever `flow_id` value is passed in) rather
+than any real data-transfer protocol; no keys are actually copied between nodes
+by this code.
 
 ---
 
 ## 4. Execution Algorithms & Code Logic
 
-### 4.1 Slot Calculation & Redirection Check
+### 4.1 `CLUSTER MEET`: a synchronous one-shot handshake
 
 ```rust
-impl ClusterState {
-    pub fn check_slot_ownership(&self, key: &[u8]) -> SlotRouting {
-        let slot = key_to_cluster_slot(key);
+pub fn cluster_meet(&self, ip: &str, port: u16) -> Result<(), String> {
+    // ...pre-insert a temp node entry so it's visible immediately...
+    let addr = format!("{}:{}", ip, port + 10000);
+    if let Ok(mut stream) = TcpStream::connect_timeout(&addr.parse()?, Duration::from_millis(300)) {
+        let meet_frame = format!("MEET 127.0.0.1 {} {} {} {}\r\n", self.port, self.my_id(), my_epoch, slots_repr);
+        stream.write_all(meet_frame.as_bytes())?;
+        // read the "+PONG <id> <epoch> <role> <slots>" reply, replace the temp entry with the real one
+    }
+    Ok(())
+}
+```
 
-        if let Some(target_node_id) = self.migrating_slots.get(&slot) {
-            let target_node = &self.nodes[target_node_id];
-            return SlotRouting::Ask {
-                slot,
-                ip: target_node.ip.clone(),
-                port: target_node.port,
-            };
+This blocks the calling connection task's thread for up to ~300ms (connect) plus
+another ~300ms (read) in the worst case — it's a direct synchronous socket call
+made from inside `CLUSTER MEET`'s command handler in `connection.rs`, not
+dispatched to a background task.
+
+### 4.2 The gossip tick — `cluster_bus_tick`, called every 500ms from the bus thread
+
+```rust
+if last_tick.elapsed() >= Duration::from_millis(500) {
+    last_tick = std::time::Instant::now();
+    cluster_bus_tick(&hub_clone);
+}
+```
+
+For every known peer, it opens a fresh `TcpStream`, sends:
+
+```rust
+let ping_msg = format!("PING {} {} {} {} GOSSIP {}\r\n",
+    hub.my_id(), my_epoch, role, slots_repr, gossip_payload);
+```
+
+where `gossip_payload` is the *entire* known node table serialized as
+`id,ip,port,cport,flags,epoch;id,ip,port,cport,flags,epoch;...` — every tick
+re-sends full state to every peer (no incremental/random-sample gossip despite
+what the old doc claimed). A successful `+PONG id epoch role slots` reply updates
+that peer's `pong_recv`/`slots`/`config_epoch`/`flags`; a failed connection or
+timeout instead re-evaluates that peer's failure state from elapsed silence
+(`> 5000ms` → `"fail?"`, `> 10000ms` → `"fail"`). After processing all peers, it
+checks whether the *local* node is a replica whose recorded master is `"fail"`,
+and if so spawns `start_election` on a fresh `std::thread` (guarded by
+`election_in_progress` so only one election runs at a time).
+
+### 4.3 Receiving a message — `handle_cluster_bus_conn`, one thread per inbound connection
+
+A single `match` on the first whitespace-separated token handles `MEET`, `PING`
+(also parses the embedded `GOSSIP <payload>` section — this is how third-party
+nodes are learned about transitively, without ever calling `CLUSTER MEET` on
+them directly), `FAIL`, `FAILOVER`, `FAILOVER_AUTH_REQUEST`, and
+`FAILOVER_ANNOUNCE`. Every branch replies inline on the same blocking stream
+(`+PONG ...`, `+OK\r\n`, or `+FAILOVER_AUTH_ACK id epoch\r\n` /
+`-ERR vote rejected\r\n` for the vote request).
+
+### 4.4 Replica election — the one place with a real quorum
+
+```rust
+pub fn start_election(&self) {
+    let req_epoch = self.current_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+    let masters = /* every known peer whose flags contain "master" and not "fail" */;
+    let mut votes = 1; // self
+    for (ip, cport) in &masters {
+        // connect, send "FAILOVER_AUTH_REQUEST <id> <epoch> <master_id>", count a "+FAILOVER_AUTH_ACK" reply
+    }
+    let majority = (masters.len() + 1) / 2 + 1;
+    if votes >= majority {
+        // become master, inherit the old master's slots, broadcast FAILOVER_ANNOUNCE
+    }
+}
+```
+
+A voter (`FAILOVER_AUTH_REQUEST` handler, §4.3) only grants a vote if it is
+itself a master, the requested epoch is newer than its `last_vote_epoch`, and it
+believes the claimed old master is already `"fail"` — this is the one piece of
+this file that is genuinely a distributed-consensus mechanism, not just local
+bookkeeping. `cluster_failover FORCE` (manual failover via `CLUSTER FAILOVER`)
+skips the vote entirely and just claims mastership + broadcasts `FAILOVER`
+unconditionally.
+
+### 4.5 How this actually reaches `-MOVED`/`-ASK` on the command path — corrects a claim in Component 04
+
+Component 04's doc states cluster slot-migration/redirection is "dead code" because
+the standalone helper `Router::check_slot_redirection` has no call sites. That is
+true for that specific function, but the underlying mechanism it would have
+implemented **is** live — just inlined directly in `connection.rs` instead of
+calling out to that helper:
+
+```rust
+if let Some(key) = cmd_primary_key(&cmd) {
+    let slot = key_slot(key);
+    let state = router.slot_states.borrow()[slot as usize].clone();
+    match state {
+        SlotState::Moved(target) => { /* -MOVED slot target, always */ }
+        SlotState::Importing(source) => { if !is_asking { /* -MOVED slot source */ } }
+        SlotState::Migrating(target) => {
+            if !router.exists(key.clone()).await { /* -ASK slot target */ }
         }
-
-        match &self.slots[slot as usize] {
-            Some(node_id) if node_id == &self.myself.name => {
-                SlotRouting::Local
-            }
-            Some(node_id) => {
-                let target_node = &self.nodes[node_id];
-                SlotRouting::Moved {
-                    slot,
-                    ip: target_node.ip.clone(),
-                    port: target_node.port,
+        SlotState::Stable => {
+            // even in the common case, check this file's ClusterHub for a
+            // DIFFERENT node (not shard) owning this slot, and -MOVED to it:
+            let hub = crate::cluster::get_cluster_hub(router.port);
+            if !hub.my_slots.read().unwrap().iter().any(|&(s,e)| slot>=s && slot<=e) {
+                if let Some(peer) = hub.nodes.read().unwrap().values()
+                    .find(|n| n.flags.contains("master") && !n.flags.contains("fail")
+                              && n.slots.iter().any(|&(s,e)| slot>=s && slot<=e)) {
+                    out.extend_from_slice(format!("-MOVED {} {}:{}\r\n", slot, peer.ip, peer.port).as_bytes());
+                    return false;
                 }
             }
-            None => SlotRouting::Unassigned(slot),
         }
     }
 }
 ```
 
-### 4.2 The Binary Gossip Frame
-
-Nodes exchange binary `ClusterMsg` packets every 100ms containing their state and a randomized sample of peer states:
-
-```rust
-#[repr(C, packed)]
-pub struct ClusterMsgHeader {
-    pub sig: [u8; 4],        // "RCmb" (Redis Cluster Message Bus)
-    pub totlen: u32,
-    pub ver: u16,
-    pub port: u16,
-    pub msg_type: u16,       // PING (0), PONG (1), MEET (2), FAIL (3)
-    pub count: u16,          // Number of gossip entries appended
-    pub current_epoch: u64,
-    pub config_epoch: u64,
-    pub sender: [u8; 40],    // Node ID
-    pub myslots: [u8; 2048], // Slot bitmask
-}
-
-#[repr(C, packed)]
-pub struct ClusterMsgGossip {
-    pub nodename: [u8; 40],
-    pub ping_sent: u32,
-    pub pong_received: u32,
-    pub ip: [u8; 46],
-    pub port: u16,
-    pub cport: u16,
-    pub flags: u16,
-}
-```
-
-### 4.3 Failover Consensus & Election
-
-1. **PFAIL (Possible Failure)**: If a node does not reply to PING packets within `cluster-node-timeout`, it is marked as `PFAIL`.
-2. **FAIL Broadcast**: If a majority of masters report a node as `PFAIL` within the gossip window, the state transitions to `FAIL` and a `FAIL` message is broadcast to the cluster.
-3. **Replica Election**:
-   - Replicas wait an offset: `delay = 500ms + random_delay + rank * 1000ms`.
-   - The replica increments `currentEpoch` and broadcasts `FAILOVER_AUTH_REQUEST`.
-   - Masters vote once per epoch (`FAILOVER_AUTH_ACK`).
-   - Upon receiving a strict majority of master votes, the replica promotes itself to Master and broadcasts a `PONG` with updated slot bitmasks.
+This runs on **every command that has a primary key**, for every connection —
+`router.slot_states` (set via `CLUSTER SETSLOT`, see `router.rs::set_slot_state`,
+which broadcasts a `ShardMessage::SetSlotState` to every local shard) and this
+file's `ClusterHub.my_slots`/`.nodes` (populated by gossip/`MEET`) are both
+genuinely consulted, and a real `-MOVED`/`-ASK` is genuinely written to the
+client. `router.slot_owners` (a *separate*, per-shard-local ownership-override
+vector — see Component 04) is a different piece of machinery not used by this
+path at all; don't conflate the two.
 
 ---
 
 ## 5. Cross-Component Interactions
 
-- **`src/connection.rs`**: Evaluates `check_slot_ownership` before executing commands, returning `-MOVED` or `-ASK` when necessary.
-- **`src/router.rs`**: In cluster mode, internal routing uses the cluster slot rather than pure XXH3 hashing.
-- **`src/server.rs`**: Binds the cluster bus listener on `port + 10000`.
+- **`src/connection.rs`**: reads `router.slot_states` and `get_cluster_hub(port)`
+  directly on every keyed command (§4.5) to decide `-MOVED`/`-ASK`; also the
+  entire `CLUSTER *` subcommand family (`MEET`, `NODES`, `INFO`, `ADDSLOTS`,
+  `ADDSLOTSRANGE`, `DELSLOTS`, `DELSLOTSRANGE`, `SETSLOT`, `FAILOVER`,
+  `REPLICATE`, `RESET`, `SLOTS`, `SHARDS`, `LINKS`, `FORGET`) is dispatched from
+  `connection.rs` through thin `Router::cluster_*` passthrough methods straight
+  into this file's `ClusterHub` methods.
+- **`src/router.rs`**: `Router::set_slot_state`/`slot_states` is a *different*
+  slot-state mechanism than this file's `my_slots`/gossip table — see §4.5's
+  correction. They coexist and are both real, but they're not the same system.
+- **`src/replication.rs`**: `cluster_failover`/`start_election` both call
+  `crate::replication::get_replication_hub(self.port).make_master()` when this
+  node wins/executes a failover, so cluster-level role changes propagate into
+  the replication subsystem.
+- **`src/server.rs`** (Component 01): calls `start_cluster_bus(port)` exactly
+  once, only from the `shard_id == 0` worker thread.
 
 ---
 
 ## 6. Performance Characteristics
 
-- **Zero-Allocation Routing**: Inlined 2048-byte bitmask operations determine slot ownership in a single CPU cycle (`slots[slot / 8] & (1 << (slot % 8))`).
-- **Rapid Convergence**: Gossip propagation completes across a 100-node cluster in less than 2 seconds.
+- **Not zero-allocation, not io_uring-based**: every gossip tick and every
+  `CLUSTER MEET`/`FAILOVER` opens a brand-new blocking `TcpStream` per peer
+  (connect + write + read, each with its own 200-500ms timeout) on a plain OS
+  thread — the opposite of the rest of Rudis's zero-copy/`monoio` design.
+  Acceptable for a control-plane path that runs a few times a second, not
+  something to model the data-path invariants on.
+- **Full-state gossip, not incremental**: `cluster_bus_tick` re-sends the entire
+  known node table to every peer on every 500ms tick — bandwidth is O(peers²)
+  per tick, not the randomized-sample gossip real Redis Cluster uses. Fine at
+  small cluster sizes (a handful of nodes), not validated or designed for
+  hundreds of nodes despite what an earlier draft of this doc claimed about
+  "100-node cluster convergence."
+- **Failure detection is local and synchronous, not a distributed vote** (§2.4)
+  — a node can mark a peer `"fail"` purely from its own missed-PONG timer, with
+  no corroboration from other nodes, unlike the real replica-election step which
+  does require a genuine majority.
