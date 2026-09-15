@@ -647,6 +647,10 @@ impl Router {
                     key,
                     value,
                     expire_in,
+                    condition: crate::resp::SetCondition::None,
+                    get: false,
+                    keepttl: false,
+                    past_expired: false,
                 }) {
                     aof.borrow_mut().append(&bytes);
                 }
@@ -974,12 +978,14 @@ impl Router {
         if target == self.shard_id {
             let mut db = self.local_db.borrow_mut();
             let should_del = match condition {
-                None => true,
+                None => db.exists(&key),
                 Some((op, expected)) => {
                     if let Some(val) = db.get(&key) {
                         match op.to_uppercase().as_str() {
                             "IFEQ" => val == expected,
                             "IFNE" => val != expected,
+                            "IFDEQ" => crate::table::compute_digest(&val) == String::from_utf8_lossy(&expected),
+                            "IFDNE" => crate::table::compute_digest(&val) != String::from_utf8_lossy(&expected),
                             "IFGT" => val > expected,
                             "IFLT" => val < expected,
                             _ => false,
@@ -1012,27 +1018,38 @@ impl Router {
     pub async fn client_list(
         &self,
         local_registry: &RefCell<hashbrown::HashMap<u64, crate::connection::ClientInfo>>,
+        filter_ids: &[u64],
     ) -> String {
         let mut out = String::new();
         let now = std::time::Instant::now();
         for client in local_registry.borrow().values() {
+            if !filter_ids.is_empty() && !filter_ids.contains(&client.id) {
+                continue;
+            }
             let age = now.duration_since(client.connected_at).as_secs();
             let idle = now.duration_since(client.last_active).as_secs();
+            let is_blocked = crate::block::get_block_hub_for_port(self.port).lock().unwrap().is_blocked(client.id);
+            let flags = if is_blocked { "b" } else { "N" };
             out.push_str(&format!(
-                "id={} addr={} name={} age={} idle={} cmd={}\n",
+                "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=20448 argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem=0 omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name= lib-ver= io-thread=0 tot-net-in=0 tot-net-out=0 tot-cmds=0 read-events=0 avg-pipeline-len-sum=0 avg-pipeline-len-cnt=0\n",
                 client.id,
                 client.addr,
+                self.port,
                 client.name.as_deref().unwrap_or(""),
                 age,
                 idle,
-                client.last_cmd
+                flags,
+                client.last_cmd.to_lowercase()
             ));
         }
 
         for (shard_id, sender) in self.senders.iter().enumerate() {
             if shard_id != self.shard_id {
                 let (tx, rx) = flume::bounded(1);
-                let msg = ShardMessage::ClientList { responder: tx };
+                let msg = ShardMessage::ClientList {
+                    filter_ids: filter_ids.to_vec(),
+                    responder: tx,
+                };
                 if sender.send(msg).is_ok() {
                     if let Ok(peer_list) = rx.recv_async().await {
                         out.push_str(&peer_list);
@@ -1044,10 +1061,12 @@ impl Router {
     }
 
     pub async fn execute_remote(&self, target: usize, cmd: Command) -> Vec<u8> {
+        let is_resp3 = crate::connection::CURRENT_CLIENT_RESP3.get();
         let (tx, rx) = flume::bounded(1);
         let msg = ShardMessage::Batch {
             items: vec![(0, cmd)],
             responder: tx,
+            is_resp3,
         };
         if self.senders[target].send(msg).is_ok() {
             if let Ok(mut res) = rx.recv_async().await {

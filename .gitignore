@@ -2,3 +2,5 @@
 /benchmark_logs
 *.rdb
 *.tmp.*
+__pycache__/
+*.pyc

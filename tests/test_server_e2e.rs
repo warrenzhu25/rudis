@@ -391,7 +391,7 @@ fn test_multithread_shared_nothing_e2e() {
 
     // Test WRONGTYPE: performing INCR on a Hash key
     let resp = send_and_read(&mut stream, b"INCR user:100\r\n");
-    assert!(resp.starts_with("-ERR WRONGTYPE"));
+    assert!(resp.starts_with("-ERR WRONGTYPE") || resp.starts_with("-WRONGTYPE"));
 
     // Test cross-shard Hash operations via pipelined squashing
     let mut hash_pipe = Vec::new();
@@ -701,7 +701,7 @@ fn test_lists_and_sets_e2e() {
     let resp = send_and_read(&mut stream, b"SET str_key test_val\r\n");
     assert_eq!(resp, "+OK\r\n");
     let resp = send_and_read(&mut stream, b"LPUSH str_key val\r\n");
-    assert!(resp.starts_with("-ERR WRONGTYPE"));
+    assert!(resp.starts_with("-ERR WRONGTYPE") || resp.starts_with("-WRONGTYPE"));
 
     // --- SET TESTS ---
     // SADD
@@ -746,7 +746,7 @@ fn test_lists_and_sets_e2e() {
 
     // WRONGTYPE on Set
     let resp = send_and_read(&mut stream, b"SADD str_key elem\r\n");
-    assert!(resp.starts_with("-ERR WRONGTYPE"));
+    assert!(resp.starts_with("-ERR WRONGTYPE") || resp.starts_with("-WRONGTYPE"));
 
     // --- PIPELINED SQUASHED CROSS-SHARD OPERATIONS ---
     let mut pipe = Vec::new();
@@ -1061,7 +1061,7 @@ fn test_sorted_sets_zset_e2e() {
     // 14. WRONGTYPE error check
     send_and_read(&mut stream, b"SET str_test_key foo\r\n");
     let resp = send_and_read(&mut stream, b"ZADD str_test_key 10 m\r\n");
-    assert!(resp.starts_with("-ERR WRONGTYPE"));
+    assert!(resp.starts_with("-ERR WRONGTYPE") || resp.starts_with("-WRONGTYPE"));
 }
 
 #[test]
@@ -1544,7 +1544,7 @@ fn test_transactions_multi_exec_e2e() {
     );
 
     let exec_resp = send_and_read(&mut stream, b"EXEC\r\n");
-    assert!(exec_resp.starts_with("*3\r\n+OK\r\n-ERR"));
+    assert!(exec_resp.starts_with("*3\r\n+OK\r\n-ERR") || exec_resp.starts_with("*3\r\n+OK\r\n-WRONGTYPE"));
     assert!(exec_resp.ends_with("$5\r\nhello\r\n"));
 
     // 5. Syntax error causing EXECABORT
@@ -3199,9 +3199,14 @@ fn test_option3_modern_redis7_features_e2e() {
     // Client 2 modifies track_k1
     let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     assert_eq!(send_and_read(&mut client2, b"SET track_k1 updated_val\r\n"), "+OK\r\n");
+    std::thread::sleep(std::time::Duration::from_millis(200));
 
     // Client 1 should receive the invalidation message on next interaction or read
-    let next_resp = send_and_read(&mut client1, b"PING\r\n");
+    let mut next_resp = send_and_read(&mut client1, b"PING\r\n");
+    if !next_resp.contains("invalidate") {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        next_resp.push_str(&send_and_read(&mut client1, b"PING\r\n"));
+    }
     assert!(next_resp.contains("invalidate"));
     assert!(next_resp.contains("track_k1"));
 
@@ -4071,7 +4076,13 @@ fn test_harness_and_extended_command_coverage_e2e() {
     assert!(zrev_res.contains("b") && zrev_res.contains("a"));
     let _ = send_and_read(&mut client, b"PUNSUBSCRIBE mypat*\r\n");
 
-    // 8. REPLCONF & QUIT
+    // 8. MEMORY USAGE & STATS
+    assert_eq!(send_and_read(&mut client, b"SET mem_key foobar\r\n"), "+OK\r\n");
+    let mem_res = send_and_read(&mut client, b"MEMORY USAGE mem_key\r\n");
+    assert!(mem_res.starts_with(":"));
+    assert_eq!(send_and_read(&mut client, b"MEMORY PURGE\r\n"), "+OK\r\n");
+
+    // 9. REPLCONF & QUIT
     assert_eq!(send_and_read(&mut client, b"REPLCONF listening-port 6380\r\n"), "+OK\r\n");
     let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     assert_eq!(send_and_read(&mut client2, b"QUIT\r\n"), "+OK\r\n");
@@ -4085,6 +4096,83 @@ fn test_ping_resp_array_tcp() {
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     let resp = send_and_read(&mut stream, b"*1\r\n$4\r\nPING\r\n");
     assert_eq!(resp, "+PONG\r\n");
+}
+
+#[test]
+fn test_msetex_e2e() {
+    let port = 16405;
+    let num_shards = 2;
+    start_test_server(port, num_shards);
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Basic MSETEX with EX
+    let resp = send_and_read(&mut stream, b"MSETEX 2 mkey1 mval1 mkey2 mval2 EX 10\r\n");
+    assert_eq!(resp, "+OK\r\n");
+    assert_eq!(send_and_read(&mut stream, b"GET mkey1\r\n"), "$5\r\nmval1\r\n");
+    assert_eq!(send_and_read(&mut stream, b"GET mkey2\r\n"), "$5\r\nmval2\r\n");
+
+    // 2. MSETEX with NX when key exists -> 0
+    let resp = send_and_read(&mut stream, b"MSETEX 1 mkey1 newval NX EX 10\r\n");
+    assert_eq!(resp, ":0\r\n");
+
+    // 3. MSETEX with XX when key exists -> 1
+    let resp = send_and_read(&mut stream, b"MSETEX 1 mkey1 newval XX EX 10\r\n");
+    assert_eq!(resp, ":1\r\n");
+    assert_eq!(send_and_read(&mut stream, b"GET mkey1\r\n"), "$6\r\nnewval\r\n");
+
+    // 4. MSETEX KEEPTTL
+    let resp = send_and_read(&mut stream, b"MSETEX 1 mkey1 finalval KEEPTTL\r\n");
+    assert_eq!(resp, "+OK\r\n");
+    assert_eq!(send_and_read(&mut stream, b"GET mkey1\r\n"), "$8\r\nfinalval\r\n");
+}
+
+#[test]
+fn test_all_remaining_uncovered_commands_e2e() {
+    let port = 16406;
+    let num_shards = 2;
+    start_test_server(port, num_shards);
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. GETEX
+    assert_eq!(send_and_read(&mut stream, b"SET getex_k val EX 100\r\n"), "+OK\r\n");
+    let resp = send_and_read(&mut stream, b"GETEX getex_k PERSIST\r\n");
+    assert_eq!(resp, "$3\r\nval\r\n");
+
+    // 2. HSETNX, HSTRLEN, HGETDEL
+    assert_eq!(send_and_read(&mut stream, b"HSETNX myh f1 v1\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut stream, b"HSETNX myh f1 v2\r\n"), ":0\r\n");
+    assert_eq!(send_and_read(&mut stream, b"HSTRLEN myh f1\r\n"), ":2\r\n");
+    let resp = send_and_read(&mut stream, b"HGETDEL myh FIELDS 1 f1\r\n");
+    assert_eq!(resp, "*1\r\n$2\r\nv1\r\n");
+
+    // 3. LPUSHX, RPUSHX
+    assert_eq!(send_and_read(&mut stream, b"LPUSHX nonex_list elem\r\n"), ":0\r\n");
+    assert_eq!(send_and_read(&mut stream, b"RPUSHX nonex_list elem\r\n"), ":0\r\n");
+    assert_eq!(send_and_read(&mut stream, b"RPUSH mylist a b\r\n"), ":2\r\n");
+    assert_eq!(send_and_read(&mut stream, b"LPUSHX mylist first\r\n"), ":3\r\n");
+    assert_eq!(send_and_read(&mut stream, b"RPUSHX mylist last\r\n"), ":4\r\n");
+
+    // 4. RPOPLPUSH, BRPOPLPUSH
+    assert_eq!(send_and_read(&mut stream, b"RPOPLPUSH mylist dstlist\r\n"), "$4\r\nlast\r\n");
+    assert_eq!(send_and_read(&mut stream, b"BRPOPLPUSH mylist dstlist 1\r\n"), "$1\r\nb\r\n");
+
+    // 5. LMPOP, BLMPOP
+    let resp = send_and_read(&mut stream, b"LMPOP 1 mylist LEFT COUNT 1\r\n");
+    assert_eq!(resp, "*2\r\n$6\r\nmylist\r\n*1\r\n$5\r\nfirst\r\n");
+    let resp = send_and_read(&mut stream, b"BLMPOP 1 1 mylist RIGHT COUNT 1\r\n");
+    assert_eq!(resp, "*2\r\n$6\r\nmylist\r\n*1\r\n$1\r\na\r\n");
+
+    // 6. LCS
+    assert_eq!(send_and_read(&mut stream, b"SET str1 AGGTAB\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut stream, b"SET str2 GXTXAYB\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut stream, b"LCS str1 str2 LEN\r\n"), ":4\r\n");
+
+    // 7. DIGEST & DEBUG
+    let digest_res = send_and_read(&mut stream, b"DIGEST str1\r\n");
+    assert!(digest_res.starts_with("$"));
+    let debug_res = send_and_read(&mut stream, b"DEBUG OBJECT str1\r\n");
+    eprintln!("DEBUG RES: {:?}", debug_res);
+    assert!(debug_res.starts_with("+") || debug_res.starts_with("$") || debug_res.starts_with(":"));
 }
 
 

@@ -98,6 +98,7 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             key,
             value,
             expire_in,
+            ..
         } => {
             if let Some(dur) = expire_in {
                 let ms = dur.as_millis().max(1);
@@ -127,6 +128,43 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                 buf.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
                 buf.extend_from_slice(v);
                 buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
+        Command::Msetex { pairs, condition, expiry } => {
+            let mut num_args = 2 + pairs.len() * 2;
+            if *condition != crate::resp::MsetexCondition::None {
+                num_args += 1;
+            }
+            match expiry {
+                crate::resp::MsetexExpiry::None => {}
+                crate::resp::MsetexExpiry::KeepTtl => num_args += 1,
+                crate::resp::MsetexExpiry::ExpireIn(_) => num_args += 2,
+            }
+            buf.extend_from_slice(format!("*{}\r\n$6\r\nMSETEX\r\n", num_args).as_bytes());
+            let numkeys_str = pairs.len().to_string();
+            buf.extend_from_slice(format!("${}\r\n{}\r\n", numkeys_str.len(), numkeys_str).as_bytes());
+            for (k, v) in pairs {
+                buf.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                buf.extend_from_slice(k);
+                buf.extend_from_slice(b"\r\n");
+                buf.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
+                buf.extend_from_slice(v);
+                buf.extend_from_slice(b"\r\n");
+            }
+            match condition {
+                crate::resp::MsetexCondition::Nx => buf.extend_from_slice(b"$2\r\nNX\r\n"),
+                crate::resp::MsetexCondition::Xx => buf.extend_from_slice(b"$2\r\nXX\r\n"),
+                crate::resp::MsetexCondition::None => {}
+            }
+            match expiry {
+                crate::resp::MsetexExpiry::KeepTtl => buf.extend_from_slice(b"$7\r\nKEEPTTL\r\n"),
+                crate::resp::MsetexExpiry::ExpireIn(d) => {
+                    buf.extend_from_slice(b"$2\r\nPX\r\n");
+                    let ms_str = d.as_millis().to_string();
+                    buf.extend_from_slice(format!("${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes());
+                }
+                crate::resp::MsetexExpiry::None => {}
             }
             Some(buf)
         }
@@ -181,7 +219,21 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             Some(buf)
         }
-        Command::Hdel { key, fields } => {
+        Command::Hsetnx { key, field, value } => {
+            buf.extend_from_slice(
+                format!("*4\r\n$6\r\nHSETNX\r\n${}\r\n", key.len()).as_bytes(),
+            );
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(b"\r\n");
+            buf.extend_from_slice(format!("${}\r\n", field.len()).as_bytes());
+            buf.extend_from_slice(field);
+            buf.extend_from_slice(b"\r\n");
+            buf.extend_from_slice(format!("${}\r\n", value.len()).as_bytes());
+            buf.extend_from_slice(value);
+            buf.extend_from_slice(b"\r\n");
+            Some(buf)
+        }
+        Command::Hdel { key, fields } | Command::Hgetdel { key, fields } => {
             buf.extend_from_slice(
                 format!("*{}\r\n$4\r\nHDEL\r\n${}\r\n", 2 + fields.len(), key.len()).as_bytes(),
             );
@@ -766,6 +818,29 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n${}\r\n", off_s.len(), off_s, value.len()).as_bytes());
             buf.extend_from_slice(value);
             buf.extend_from_slice(b"\r\n");
+            Some(buf)
+        }
+        Command::Sort { key, desc, alpha, store: Some(dest), limit } => {
+            let mut args: Vec<Vec<u8>> = vec![b"SORT".to_vec(), key.to_vec()];
+            if let Some((offset, count)) = limit {
+                args.push(b"LIMIT".to_vec());
+                args.push(offset.to_string().into_bytes());
+                args.push(count.to_string().into_bytes());
+            }
+            if *desc {
+                args.push(b"DESC".to_vec());
+            }
+            if *alpha {
+                args.push(b"ALPHA".to_vec());
+            }
+            args.push(b"STORE".to_vec());
+            args.push(dest.to_vec());
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend_from_slice(&a);
+                buf.extend_from_slice(b"\r\n");
+            }
             Some(buf)
         }
         _ => None,

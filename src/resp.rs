@@ -1,5 +1,5 @@
 use bytes::{Buf, Bytes, BytesMut};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum SetSlotSubcommand {
@@ -61,6 +61,39 @@ pub enum DflyMigrateSubcommand {
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
+pub enum SetCondition {
+    None,
+    Nx,
+    Xx,
+    Ifeq(Bytes),
+    Ifne(Bytes),
+    Ifdeq(Bytes),
+    Ifdne(Bytes),
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum MsetexCondition {
+    None,
+    Nx,
+    Xx,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum MsetexExpiry {
+    None,
+    KeepTtl,
+    ExpireIn(Duration),
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum MemorySubcommand {
+    Usage { key: Bytes },
+    Stats,
+    Purge,
+    Doctor,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum TierSubcommand {
     Spill(Bytes),
     Load(Bytes),
@@ -75,7 +108,8 @@ pub enum TierSubcommand {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ClientSubcommand {
-    List,
+    List(Vec<u64>),
+    Info,
     SetName(String),
     GetName,
     Id,
@@ -86,6 +120,13 @@ pub enum ClientSubcommand {
         prefixes: Vec<Bytes>,
     },
     Caching(bool),
+    Unblock {
+        client_id: u64,
+        unblock_type: crate::block::ClientUnblockType,
+    },
+    Pause(u64),
+    Unpause,
+    NoTouch(bool),
 }
 
 
@@ -120,9 +161,27 @@ pub enum Command {
         key: Bytes,
         value: Bytes,
         expire_in: Option<Duration>,
+        condition: SetCondition,
+        get: bool,
+        keepttl: bool,
+        past_expired: bool,
     },
     Mget(Vec<Bytes>),
     Mset(Vec<(Bytes, Bytes)>),
+    Msetex {
+        pairs: Vec<(Bytes, Bytes)>,
+        condition: MsetexCondition,
+        expiry: MsetexExpiry,
+    },
+    Lcs {
+        key1: Bytes,
+        key2: Bytes,
+        len_only: bool,
+        idx: bool,
+        min_match_len: usize,
+        with_match_len: bool,
+    },
+    Digest(Bytes),
     Del(Vec<Bytes>),
     Exists(Vec<Bytes>),
     IncrBy(Bytes, i64),
@@ -145,6 +204,11 @@ pub enum Command {
     Hset {
         key: Bytes,
         fields: Vec<(Bytes, Bytes)>,
+    },
+    Hsetnx {
+        key: Bytes,
+        field: Bytes,
+        value: Bytes,
     },
     Hmset {
         key: Bytes,
@@ -170,12 +234,28 @@ pub enum Command {
     Hgetall(Bytes),
     Hkeys(Bytes),
     Hvals(Bytes),
+    Hstrlen {
+        key: Bytes,
+        field: Bytes,
+    },
+    Hgetdel {
+        key: Bytes,
+        fields: Vec<Bytes>,
+    },
     // LIST COMMANDS
     Lpush {
         key: Bytes,
         values: Vec<Bytes>,
     },
     Rpush {
+        key: Bytes,
+        values: Vec<Bytes>,
+    },
+    Lpushx {
+        key: Bytes,
+        values: Vec<Bytes>,
+    },
+    Rpushx {
         key: Bytes,
         values: Vec<Bytes>,
     },
@@ -239,6 +319,18 @@ pub enum Command {
         destination: Bytes,
         keys: Vec<Bytes>,
     },
+    Sintercard {
+        keys: Vec<Bytes>,
+        limit: usize,
+    },
+    Sunioncard {
+        keys: Vec<Bytes>,
+        limit: usize,
+    },
+    Sdiffcard {
+        keys: Vec<Bytes>,
+        limit: usize,
+    },
     // ZSET COMMANDS
     Zadd {
         key: Bytes,
@@ -257,10 +349,12 @@ pub enum Command {
     Zrank {
         key: Bytes,
         member: Bytes,
+        with_score: bool,
     },
     Zrevrank {
         key: Bytes,
         member: Bytes,
+        with_score: bool,
     },
     Zcount {
         key: Bytes,
@@ -278,12 +372,36 @@ pub enum Command {
         key: Bytes,
         opts: crate::table::ZRangeOpts,
     },
+    Zrangestore {
+        dst: Bytes,
+        src: Bytes,
+        opts: crate::table::ZRangeOpts,
+    },
     Zpopmin {
         key: Bytes,
-        count: usize,
+        count: Option<usize>,
     },
     Zpopmax {
         key: Bytes,
+        count: Option<usize>,
+    },
+    Bzpopmin {
+        keys: Vec<Bytes>,
+        timeout: f64,
+    },
+    Bzpopmax {
+        keys: Vec<Bytes>,
+        timeout: f64,
+    },
+    Zmpop {
+        keys: Vec<Bytes>,
+        is_min: bool,
+        count: usize,
+    },
+    Bzmpop {
+        timeout: f64,
+        keys: Vec<Bytes>,
+        is_min: bool,
         count: usize,
     },
     Zunionstore {
@@ -318,12 +436,16 @@ pub enum Command {
         aggregate: crate::table::Aggregate,
         with_scores: bool,
     },
+    Zintercard {
+        keys: Vec<Bytes>,
+        limit: usize,
+    },
     // GENERIC & DATABASE COMMANDS
     Type(Bytes),
     Dbsize,
     Select(u32),
     Slowlog(Bytes),
-    Debug,
+    Debug(Vec<Bytes>),
     Flushdb,
     Flushall,
     Touch(Vec<Bytes>),
@@ -409,6 +531,8 @@ pub enum Command {
     Multi,
     Exec,
     Discard,
+    Watch(Vec<Bytes>),
+    Unwatch,
     // BITMAP COMMANDS
     Setbit {
         key: Bytes,
@@ -434,6 +558,13 @@ pub enum Command {
         op: String,
         destkey: Bytes,
         srckeys: Vec<Bytes>,
+    },
+    Sort {
+        key: Bytes,
+        desc: bool,
+        alpha: bool,
+        store: Option<Bytes>,
+        limit: Option<(i64, i64)>,
     },
     // HYPERLOGLOG COMMANDS
     Pfadd {
@@ -658,6 +789,17 @@ pub enum Command {
         where_from: crate::table::ListDirection,
         where_to: crate::table::ListDirection,
         timeout: f64,
+    },
+    Lmpop {
+        keys: Vec<Bytes>,
+        where_from: crate::table::ListDirection,
+        count: usize,
+    },
+    Blmpop {
+        timeout: f64,
+        keys: Vec<Bytes>,
+        where_from: crate::table::ListDirection,
+        count: usize,
     },
     Incrbyfloat {
         key: Bytes,
@@ -1035,6 +1177,7 @@ pub enum Command {
     MemcachedStats,
     MemcachedVersion,
     MemcachedQuit,
+    Memory(MemorySubcommand),
     Unknown(String),
 }
 
@@ -1347,34 +1490,158 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'set'/'put' command".to_string());
             }
             let mut expire_in = None;
+            let mut condition = SetCondition::None;
+            let mut get = false;
+            let mut keepttl = false;
+            let mut past_expired = false;
+            let mut has_expiry = false;
+
             let mut i = 3;
             while i < args.len() {
                 let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
                 match opt.as_str() {
-                    "EX" => {
-                        if i + 1 >= args.len() {
+                    "NX" => {
+                        if condition != SetCondition::None {
                             return Err("syntax error".to_string());
                         }
-                        let secs: u64 = std::str::from_utf8(&args[i + 1])
-                            .ok()
-                            .and_then(|s| s.parse().ok())
-                            .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-                        expire_in = Some(Duration::from_secs(secs));
+                        condition = SetCondition::Nx;
+                        i += 1;
+                    }
+                    "XX" => {
+                        if condition != SetCondition::None {
+                            return Err("syntax error".to_string());
+                        }
+                        condition = SetCondition::Xx;
+                        i += 1;
+                    }
+                    "IFEQ" => {
+                        if condition != SetCondition::None || i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        condition = SetCondition::Ifeq(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "IFNE" => {
+                        if condition != SetCondition::None || i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        condition = SetCondition::Ifne(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "IFDEQ" => {
+                        if condition != SetCondition::None || i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        condition = SetCondition::Ifdeq(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "IFDNE" => {
+                        if condition != SetCondition::None || i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        condition = SetCondition::Ifdne(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "GET" => {
+                        get = true;
+                        i += 1;
+                    }
+                    "KEEPTTL" => {
+                        if has_expiry || keepttl {
+                            return Err("syntax error".to_string());
+                        }
+                        keepttl = true;
+                        i += 1;
+                    }
+                    "EX" => {
+                        if has_expiry || keepttl || i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let secs_str = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        let secs: i64 = secs_str
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        if secs <= 0 || secs > (i64::MAX / 1000) {
+                            return Err("invalid expire time in 'set' command".to_string());
+                        }
+                        expire_in = Some(Duration::from_secs(secs as u64));
+                        has_expiry = true;
                         i += 2;
                     }
                     "PX" => {
-                        if i + 1 >= args.len() {
+                        if has_expiry || keepttl || i + 1 >= args.len() {
                             return Err("syntax error".to_string());
                         }
-                        let ms: u64 = std::str::from_utf8(&args[i + 1])
-                            .ok()
-                            .and_then(|s| s.parse().ok())
-                            .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-                        expire_in = Some(Duration::from_millis(ms));
+                        let ms_str = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        let ms: i64 = ms_str
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        if ms <= 0 {
+                            return Err("invalid expire time in 'set' command".to_string());
+                        }
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64;
+                        if ms.checked_add(now_ms).is_none() {
+                            return Err("invalid expire time in 'set' command".to_string());
+                        }
+                        expire_in = Some(Duration::from_millis(ms as u64));
+                        has_expiry = true;
+                        i += 2;
+                    }
+                    "EXAT" => {
+                        if has_expiry || keepttl || i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let ts_str = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        let ts: i64 = ts_str
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        if ts <= 0 || ts > (i64::MAX / 1000) {
+                            return Err("invalid expire time in 'set' command".to_string());
+                        }
+                        let now_sec = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64;
+                        if ts > now_sec {
+                            expire_in = Some(Duration::from_secs((ts - now_sec) as u64));
+                        } else {
+                            past_expired = true;
+                        }
+                        has_expiry = true;
+                        i += 2;
+                    }
+                    "PXAT" => {
+                        if has_expiry || keepttl || i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let ts_str = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        let ts: i128 = ts_str
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        if ts <= 0 || ts > (i64::MAX as i128) {
+                            return Err("invalid expire time in 'set' command".to_string());
+                        }
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i128;
+                        if ts > now_ms {
+                            expire_in = Some(Duration::from_millis((ts - now_ms) as u64));
+                        } else {
+                            past_expired = true;
+                        }
+                        has_expiry = true;
                         i += 2;
                     }
                     _ => {
-                        i += 1;
+                        return Err("syntax error".to_string());
                     }
                 }
             }
@@ -1382,6 +1649,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 key: args[1].clone(),
                 value: args[2].clone(),
                 expire_in,
+                condition,
+                get,
+                keepttl,
+                past_expired,
             }))
         }
         "MGET" => {
@@ -1401,6 +1672,179 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 i += 2;
             }
             Ok(Some(Command::Mset(pairs)))
+        }
+        "MSETEX" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'msetex' command".to_string());
+            }
+            let numkeys_str = std::str::from_utf8(&args[1]).map_err(|_| "invalid numkeys value".to_string())?;
+            let numkeys: i64 = numkeys_str.parse().map_err(|_| "invalid numkeys value".to_string())?;
+            if numkeys < 0 || numkeys > i32::MAX as i64 {
+                return Err("invalid numkeys value".to_string());
+            }
+            let numkeys = numkeys as usize;
+
+            let mut pairs = Vec::with_capacity(numkeys);
+            let mut condition = MsetexCondition::None;
+            let mut expiry = MsetexExpiry::None;
+            let mut idx = 2;
+            let mut keys_found = 0;
+
+            while idx < args.len() {
+                let opt = std::str::from_utf8(&args[idx]).unwrap_or("").to_uppercase();
+                match opt.as_str() {
+                    "NX" => {
+                        if condition != MsetexCondition::None {
+                            return Err("syntax error".to_string());
+                        }
+                        condition = MsetexCondition::Nx;
+                        idx += 1;
+                    }
+                    "XX" => {
+                        if condition != MsetexCondition::None {
+                            return Err("syntax error".to_string());
+                        }
+                        condition = MsetexCondition::Xx;
+                        idx += 1;
+                    }
+                    "KEEPTTL" => {
+                        if expiry != MsetexExpiry::None {
+                            return Err("syntax error".to_string());
+                        }
+                        expiry = MsetexExpiry::KeepTtl;
+                        idx += 1;
+                    }
+                    "EX" => {
+                        if expiry != MsetexExpiry::None || idx + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let sec_str = std::str::from_utf8(&args[idx + 1]).map_err(|_| "syntax error".to_string())?;
+                        let sec: u64 = sec_str.parse().map_err(|_| "syntax error".to_string())?;
+                        expiry = MsetexExpiry::ExpireIn(Duration::from_secs(sec));
+                        idx += 2;
+                    }
+                    "PX" => {
+                        if expiry != MsetexExpiry::None || idx + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let ms_str = std::str::from_utf8(&args[idx + 1]).map_err(|_| "syntax error".to_string())?;
+                        let ms: u64 = ms_str.parse().map_err(|_| "syntax error".to_string())?;
+                        expiry = MsetexExpiry::ExpireIn(Duration::from_millis(ms));
+                        idx += 2;
+                    }
+                    "EXAT" => {
+                        if expiry != MsetexExpiry::None || idx + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let ts_str = std::str::from_utf8(&args[idx + 1]).map_err(|_| "syntax error".to_string())?;
+                        let ts: u64 = ts_str.parse().map_err(|_| "syntax error".to_string())?;
+                        let now_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+                        let dur = if ts > now_epoch {
+                            Duration::from_secs(ts - now_epoch)
+                        } else {
+                            Duration::from_millis(1)
+                        };
+                        expiry = MsetexExpiry::ExpireIn(dur);
+                        idx += 2;
+                    }
+                    "PXAT" => {
+                        if expiry != MsetexExpiry::None || idx + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let ts_str = std::str::from_utf8(&args[idx + 1]).map_err(|_| "syntax error".to_string())?;
+                        let ts: u128 = ts_str.parse().map_err(|_| "syntax error".to_string())?;
+                        let now_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+                        let dur = if ts > now_epoch {
+                            Duration::from_millis((ts - now_epoch) as u64)
+                        } else {
+                            Duration::from_millis(1)
+                        };
+                        expiry = MsetexExpiry::ExpireIn(dur);
+                        idx += 2;
+                    }
+                    _ => {
+                        if keys_found < numkeys {
+                            if idx + 1 >= args.len() {
+                                return Err("wrong number of key-value pairs".to_string());
+                            }
+                            pairs.push((args[idx].clone(), args[idx + 1].clone()));
+                            keys_found += 1;
+                            idx += 2;
+                        } else {
+                            return Err("syntax error".to_string());
+                        }
+                    }
+                }
+            }
+
+            if keys_found != numkeys {
+                return Err("wrong number of key-value pairs".to_string());
+            }
+
+            Ok(Some(Command::Msetex {
+                pairs,
+                condition,
+                expiry,
+            }))
+        }
+        "LCS" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'lcs' command".to_string());
+            }
+            let key1 = args[1].clone();
+            let key2 = args[2].clone();
+            let mut len_only = false;
+            let mut idx = false;
+            let mut min_match_len = 0;
+            let mut with_match_len = false;
+
+            let mut i = 3;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "LEN" => {
+                        len_only = true;
+                        i += 1;
+                    }
+                    "IDX" => {
+                        idx = true;
+                        i += 1;
+                    }
+                    "WITHMATCHLEN" => {
+                        with_match_len = true;
+                        i += 1;
+                    }
+                    "MINMATCHLEN" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let m_str = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        let m: i64 = m_str
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        if m < 0 {
+                            return Err("value is not an integer or out of range".to_string());
+                        }
+                        min_match_len = m as usize;
+                        i += 2;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+
+            if len_only && idx {
+                return Err("If you want both the length and indexes, please just use IDX.".to_string());
+            }
+
+            Ok(Some(Command::Lcs {
+                key1,
+                key2,
+                len_only,
+                idx,
+                min_match_len,
+                with_match_len,
+            }))
         }
         "DEL" | "DELETE" => {
             if args.len() < 2 {
@@ -1840,7 +2284,30 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
             match sub.as_str() {
-                "LIST" => Ok(Some(Command::Client(ClientSubcommand::List))),
+                "LIST" => {
+                    let mut ids = Vec::new();
+                    let mut i = 2;
+                    while i < args.len() {
+                        let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                        if opt == "ID" {
+                            i += 1;
+                            while i < args.len() {
+                                if let Ok(id) = std::str::from_utf8(&args[i]).unwrap_or("").parse::<u64>() {
+                                    ids.push(id);
+                                    i += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                        } else if opt == "TYPE" {
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    Ok(Some(Command::Client(ClientSubcommand::List(ids))))
+                }
+                "INFO" => Ok(Some(Command::Client(ClientSubcommand::Info))),
                 "SETNAME" => {
                     if args.len() < 3 {
                         return Err(
@@ -1898,6 +2365,47 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     let flag = state == "YES";
                     Ok(Some(Command::Client(ClientSubcommand::Caching(flag))))
                 }
+                "UNBLOCK" => {
+                    if args.len() < 3 || args.len() > 4 {
+                        return Err("wrong number of arguments for 'client unblock' command".to_string());
+                    }
+                    let client_id: u64 = std::str::from_utf8(&args[2])
+                        .map_err(|_| "value is not an integer or out of range".to_string())?
+                        .parse()
+                        .map_err(|_| "value is not an integer or out of range".to_string())?;
+                    let unblock_type = if args.len() == 4 {
+                        let opt = String::from_utf8_lossy(&args[3]).to_uppercase();
+                        match opt.as_str() {
+                            "TIMEOUT" => crate::block::ClientUnblockType::Timeout,
+                            "ERROR" => crate::block::ClientUnblockType::Error,
+                            _ => return Err("syntax error".to_string()),
+                        }
+                    } else {
+                        crate::block::ClientUnblockType::Timeout
+                    };
+                    Ok(Some(Command::Client(ClientSubcommand::Unblock { client_id, unblock_type })))
+                }
+                "PAUSE" => {
+                    if args.len() < 3 {
+                        return Err("wrong number of arguments for 'client pause' command".to_string());
+                    }
+                    let timeout: u64 = std::str::from_utf8(&args[2])
+                        .map_err(|_| "value is not an integer or out of range".to_string())?
+                        .parse()
+                        .map_err(|_| "value is not an integer or out of range".to_string())?;
+                    Ok(Some(Command::Client(ClientSubcommand::Pause(timeout))))
+                }
+                "UNPAUSE" => {
+                    Ok(Some(Command::Client(ClientSubcommand::Unpause)))
+                }
+                "NO-TOUCH" => {
+                    if args.len() < 3 {
+                        return Err("wrong number of arguments for 'client no-touch' command".to_string());
+                    }
+                    let opt = String::from_utf8_lossy(&args[2]).to_uppercase();
+                    let enabled = opt == "ON" || opt == "YES" || opt == "1";
+                    Ok(Some(Command::Client(ClientSubcommand::NoTouch(enabled))))
+                }
                 _ => Ok(Some(Command::Unknown(format!("CLIENT {}", sub)))),
             }
         }
@@ -1914,6 +2422,16 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 i += 2;
             }
             Ok(Some(Command::Hset { key, fields }))
+        }
+        "HSETNX" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'hsetnx' command".to_string());
+            }
+            Ok(Some(Command::Hsetnx {
+                key: args[1].clone(),
+                field: args[2].clone(),
+                value: args[3].clone(),
+            }))
         }
         "HMSET" => {
             if args.len() < 4 || (args.len() - 2) % 2 != 0 {
@@ -1988,6 +2506,36 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             Ok(Some(Command::Hvals(args[1].clone())))
         }
+        "HSTRLEN" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'hstrlen' command".to_string());
+            }
+            Ok(Some(Command::Hstrlen {
+                key: args[1].clone(),
+                field: args[2].clone(),
+            }))
+        }
+        "HGETDEL" => {
+            if args.len() < 5 {
+                return Err("wrong number of arguments for 'hgetdel' command".to_string());
+            }
+            if !args[2].eq_ignore_ascii_case(b"FIELDS") {
+                return Err("ERR argument FIELDS is missing or invalid".to_string());
+            }
+            let s = std::str::from_utf8(&args[3]).map_err(|_| "ERR Number of fields must be a positive integer".to_string())?;
+            let numfields = s.parse::<i64>().map_err(|_| "ERR Number of fields must be a positive integer".to_string())?;
+            if numfields <= 0 {
+                return Err("ERR Number of fields must be a positive integer".to_string());
+            }
+            let fields = args[4..].to_vec();
+            if fields.len() != numfields as usize {
+                return Err("ERR numfields parameter must match the number of arguments".to_string());
+            }
+            Ok(Some(Command::Hgetdel {
+                key: args[1].clone(),
+                fields,
+            }))
+        }
         "LPUSH" => {
             if args.len() < 3 {
                 return Err("wrong number of arguments for 'lpush' command".to_string());
@@ -2006,8 +2554,26 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 values: args[2..].to_vec(),
             }))
         }
+        "LPUSHX" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'lpushx' command".to_string());
+            }
+            Ok(Some(Command::Lpushx {
+                key: args[1].clone(),
+                values: args[2..].to_vec(),
+            }))
+        }
+        "RPUSHX" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'rpushx' command".to_string());
+            }
+            Ok(Some(Command::Rpushx {
+                key: args[1].clone(),
+                values: args[2..].to_vec(),
+            }))
+        }
         "LPOP" => {
-            if args.len() < 2 {
+            if args.len() < 2 || args.len() > 3 {
                 return Err("wrong number of arguments for 'lpop' command".to_string());
             }
             let count = if args.len() > 2 {
@@ -2025,7 +2591,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }))
         }
         "RPOP" => {
-            if args.len() < 2 {
+            if args.len() < 2 || args.len() > 3 {
                 return Err("wrong number of arguments for 'rpop' command".to_string());
             }
             let count = if args.len() > 2 {
@@ -2083,10 +2649,27 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() < 3 {
                 return Err("wrong number of arguments for 'blpop' command".to_string());
             }
-            let timeout: f64 = std::str::from_utf8(args.last().unwrap())
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| "timeout is not a float or out of range".to_string())?;
+            let s = std::str::from_utf8(args.last().unwrap())
+                .map_err(|_| "timeout is not a float or out of range".to_string())?;
+            let timeout: f64 = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                match u128::from_str_radix(hex, 16) {
+                    Ok(v) => {
+                        if v > (i64::MAX / 1000) as u128 {
+                            return Err("timeout is out of range".to_string());
+                        }
+                        v as f64
+                    }
+                    Err(_) => return Err("timeout is out of range".to_string()),
+                }
+            } else {
+                s.parse::<f64>().map_err(|_| "timeout is not a float or out of range".to_string())?
+            };
+            if timeout < 0.0 || timeout.is_nan() {
+                return Err("timeout is negative".to_string());
+            }
+            if timeout > (i64::MAX / 1000) as f64 {
+                return Err("timeout is out of range".to_string());
+            }
             let keys = args[1..args.len() - 1].to_vec();
             Ok(Some(Command::Blpop { keys, timeout }))
         }
@@ -2094,12 +2677,132 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() < 3 {
                 return Err("wrong number of arguments for 'brpop' command".to_string());
             }
-            let timeout: f64 = std::str::from_utf8(args.last().unwrap())
+            let s = std::str::from_utf8(args.last().unwrap())
+                .map_err(|_| "timeout is not a float or out of range".to_string())?;
+            let timeout: f64 = if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                match u128::from_str_radix(hex, 16) {
+                    Ok(v) => {
+                        if v > (i64::MAX / 1000) as u128 {
+                            return Err("timeout is out of range".to_string());
+                        }
+                        v as f64
+                    }
+                    Err(_) => return Err("timeout is out of range".to_string()),
+                }
+            } else {
+                s.parse::<f64>().map_err(|_| "timeout is not a float or out of range".to_string())?
+            };
+            if timeout < 0.0 || timeout.is_nan() {
+                return Err("timeout is negative".to_string());
+            }
+            if timeout > (i64::MAX / 1000) as f64 {
+                return Err("timeout is out of range".to_string());
+            }
+            let keys = args[1..args.len() - 1].to_vec();
+            Ok(Some(Command::Brpop { keys, timeout }))
+        }
+        "LMPOP" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'lmpop' command".to_string());
+            }
+            let numkeys: i64 = std::str::from_utf8(&args[1])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "numkeys should be greater than 0".to_string())?;
+            if numkeys <= 0 {
+                return Err("numkeys should be greater than 0".to_string());
+            }
+            let numkeys = numkeys as usize;
+            if args.len() < 2 + numkeys + 1 {
+                return Err("syntax error".to_string());
+            }
+            let keys = args[2..2 + numkeys].to_vec();
+            let dir_str = String::from_utf8_lossy(&args[2 + numkeys]).to_uppercase();
+            let where_from = match dir_str.as_str() {
+                "LEFT" => crate::table::ListDirection::Left,
+                "RIGHT" => crate::table::ListDirection::Right,
+                _ => return Err("syntax error".to_string()),
+            };
+            let mut count = 1;
+            let idx = 2 + numkeys + 1;
+            if idx < args.len() {
+                if idx + 2 != args.len() {
+                    return Err("syntax error".to_string());
+                }
+                if !String::from_utf8_lossy(&args[idx]).eq_ignore_ascii_case("COUNT") {
+                    return Err("syntax error".to_string());
+                }
+                let c: i64 = std::str::from_utf8(&args[idx + 1])
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| "count should be greater than 0".to_string())?;
+                if c <= 0 {
+                    return Err("count should be greater than 0".to_string());
+                }
+                count = c as usize;
+            }
+            Ok(Some(Command::Lmpop {
+                keys,
+                where_from,
+                count,
+            }))
+        }
+        "BLMPOP" => {
+            if args.len() < 5 {
+                return Err("wrong number of arguments for 'blmpop' command".to_string());
+            }
+            let timeout: f64 = std::str::from_utf8(&args[1])
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| "timeout is not a float or out of range".to_string())?;
-            let keys = args[1..args.len() - 1].to_vec();
-            Ok(Some(Command::Brpop { keys, timeout }))
+            if timeout < 0.0 || timeout.is_nan() {
+                return Err("timeout is negative".to_string());
+            }
+            if timeout > (i64::MAX / 1000) as f64 {
+                return Err("timeout is out of range".to_string());
+            }
+            let numkeys: i64 = std::str::from_utf8(&args[2])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "numkeys should be greater than 0".to_string())?;
+            if numkeys <= 0 {
+                return Err("numkeys should be greater than 0".to_string());
+            }
+            let numkeys = numkeys as usize;
+            if args.len() < 3 + numkeys + 1 {
+                return Err("syntax error".to_string());
+            }
+            let keys = args[3..3 + numkeys].to_vec();
+            let dir_str = String::from_utf8_lossy(&args[3 + numkeys]).to_uppercase();
+            let where_from = match dir_str.as_str() {
+                "LEFT" => crate::table::ListDirection::Left,
+                "RIGHT" => crate::table::ListDirection::Right,
+                _ => return Err("syntax error".to_string()),
+            };
+            let mut count = 1;
+            let idx = 3 + numkeys + 1;
+            if idx < args.len() {
+                if idx + 2 != args.len() {
+                    return Err("syntax error".to_string());
+                }
+                if !String::from_utf8_lossy(&args[idx]).eq_ignore_ascii_case("COUNT") {
+                    return Err("syntax error".to_string());
+                }
+                let c: i64 = std::str::from_utf8(&args[idx + 1])
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| "count should be greater than 0".to_string())?;
+                if c <= 0 {
+                    return Err("count should be greater than 0".to_string());
+                }
+                count = c as usize;
+            }
+            Ok(Some(Command::Blmpop {
+                timeout,
+                keys,
+                where_from,
+                count,
+            }))
         }
         "SADD" => {
             if args.len() < 3 {
@@ -2203,6 +2906,51 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 keys: args[2..].to_vec(),
             }))
         }
+        "SINTERCARD" | "SUNIONCARD" | "SDIFFCARD" => {
+            if args.len() < 3 {
+                return Err(format!("wrong number of arguments for '{}' command", cmd_name.to_lowercase()));
+            }
+            let numkeys: i64 = std::str::from_utf8(&args[1])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "numkeys must be greater than 0".to_string())?;
+            if numkeys <= 0 {
+                return Err("numkeys must be greater than 0".to_string());
+            }
+            let numkeys = numkeys as usize;
+            if args.len() < 2 + numkeys {
+                return Err("Number of keys can't be greater than number of args".to_string());
+            }
+            let keys = args[2..2 + numkeys].to_vec();
+            let mut limit = 0;
+            let mut i = 2 + numkeys;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                if opt == "LIMIT" {
+                    if i + 1 >= args.len() {
+                        return Err("syntax error".to_string());
+                    }
+                    let lim: i64 = std::str::from_utf8(&args[i + 1])
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| "LIMIT can't be negative".to_string())?;
+                    if lim < 0 {
+                        return Err("LIMIT can't be negative".to_string());
+                    }
+                    limit = lim as usize;
+                    i += 2;
+                } else if cmd_name == "SUNIONCARD" && opt == "APPROX" {
+                    i += 1;
+                } else {
+                    return Err("syntax error".to_string());
+                }
+            }
+            match cmd_name.as_str() {
+                "SINTERCARD" => Ok(Some(Command::Sintercard { keys, limit })),
+                "SUNIONCARD" => Ok(Some(Command::Sunioncard { keys, limit })),
+                _ => Ok(Some(Command::Sdiffcard { keys, limit })),
+            }
+        }
         "ZADD" => {
             if args.len() < 4 {
                 return Err("wrong number of arguments for 'zadd' command".to_string());
@@ -2260,12 +3008,8 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             while j < remaining.len() {
                 let score_str =
                     std::str::from_utf8(&remaining[j]).map_err(|_| "value is not a valid float")?;
-                let score: f64 = score_str
-                    .parse()
-                    .map_err(|_| "value is not a valid float")?;
-                if score.is_nan() {
-                    return Err("value is not a valid float".to_string());
-                }
+                let score = parse_redis_f64(score_str)
+                    .ok_or_else(|| "value is not a valid float".to_string())?;
                 let member = remaining[j + 1].clone();
                 elements.push((score, member));
                 j += 2;
@@ -2301,21 +3045,39 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::Zcard(args[1].clone())))
         }
         "ZRANK" => {
-            if args.len() != 3 {
+            if args.len() != 3 && args.len() != 4 {
                 return Err("wrong number of arguments for 'zrank' command".to_string());
             }
+            let with_score = if args.len() == 4 {
+                if !args[3].eq_ignore_ascii_case(b"WITHSCORE") {
+                    return Err("syntax error".to_string());
+                }
+                true
+            } else {
+                false
+            };
             Ok(Some(Command::Zrank {
                 key: args[1].clone(),
                 member: args[2].clone(),
+                with_score,
             }))
         }
         "ZREVRANK" => {
-            if args.len() != 3 {
+            if args.len() != 3 && args.len() != 4 {
                 return Err("wrong number of arguments for 'zrevrank' command".to_string());
             }
+            let with_score = if args.len() == 4 {
+                if !args[3].eq_ignore_ascii_case(b"WITHSCORE") {
+                    return Err("syntax error".to_string());
+                }
+                true
+            } else {
+                false
+            };
             Ok(Some(Command::Zrevrank {
                 key: args[1].clone(),
                 member: args[2].clone(),
+                with_score,
             }))
         }
         "ZCOUNT" => {
@@ -2338,12 +3100,8 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             let delta_str =
                 std::str::from_utf8(&args[2]).map_err(|_| "value is not a valid float")?;
-            let delta: f64 = delta_str
-                .parse()
-                .map_err(|_| "value is not a valid float")?;
-            if delta.is_nan() {
-                return Err("value is not a valid float".to_string());
-            }
+            let delta = parse_redis_f64(delta_str)
+                .ok_or_else(|| "value is not a valid float".to_string())?;
             Ok(Some(Command::Zincrby {
                 key: args[1].clone(),
                 delta,
@@ -2355,8 +3113,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'zrange' command".to_string());
             }
             let mut by_score = false;
+            let mut by_lex = false;
             let mut rev = false;
             let mut with_scores = false;
+            let mut has_limit = false;
             let mut offset = 0;
             let mut count = None;
 
@@ -2368,6 +3128,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         by_score = true;
                         i += 1;
                     }
+                    "BYLEX" => {
+                        by_lex = true;
+                        i += 1;
+                    }
                     "REV" => {
                         rev = true;
                         i += 1;
@@ -2377,6 +3141,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         i += 1;
                     }
                     "LIMIT" => {
+                        has_limit = true;
                         if i + 2 >= args.len() {
                             return Err("syntax error".to_string());
                         }
@@ -2384,9 +3149,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             .map_err(|_| "value is not an integer or out of range")?;
                         let cnt_str = std::str::from_utf8(&args[i + 2])
                             .map_err(|_| "value is not an integer or out of range")?;
-                        offset = off_str
-                            .parse::<usize>()
+                        let off: i64 = off_str
+                            .parse()
                             .map_err(|_| "value is not an integer or out of range")?;
+                        offset = if off < 0 { usize::MAX } else { off as usize };
                         let c = cnt_str
                             .parse::<i64>()
                             .map_err(|_| "value is not an integer or out of range")?;
@@ -2399,10 +3165,40 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
             }
 
-            let (start, stop, min_score, min_inc, max_score, max_inc) = if by_score {
-                let (min, min_i) = parse_score_bound(&args[2])?;
-                let (max, max_i) = parse_score_bound(&args[3])?;
-                (0, 0, min, min_i, max, max_i)
+            if by_score && by_lex {
+                return Err("syntax error".to_string());
+            }
+            if has_limit && !by_score && !by_lex {
+                return Err("syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX".to_string());
+            }
+            if with_scores && by_lex {
+                return Err("syntax error, WITHSCORES not supported in combination with BYLEX".to_string());
+            }
+
+            let mut opts = crate::table::ZRangeOpts {
+                by_score,
+                by_lex,
+                rev,
+                with_scores,
+                offset,
+                count,
+                ..Default::default()
+            };
+
+            if by_score {
+                let (min_idx, max_idx) = if rev { (3, 2) } else { (2, 3) };
+                let (min, min_i) = parse_score_bound(&args[min_idx])?;
+                let (max, max_i) = parse_score_bound(&args[max_idx])?;
+                opts.min_score = min;
+                opts.min_inc = min_i;
+                opts.max_score = max;
+                opts.max_inc = max_i;
+            } else if by_lex {
+                let (min_idx, max_idx) = if rev { (3, 2) } else { (2, 3) };
+                let min = crate::table::parse_lex_bound(&args[min_idx]).map_err(|e| e.to_string())?;
+                let max = crate::table::parse_lex_bound(&args[max_idx]).map_err(|e| e.to_string())?;
+                opts.min_lex = min;
+                opts.max_lex = max;
             } else {
                 let start: i64 = std::str::from_utf8(&args[2])
                     .map_err(|_| "value is not an integer or out of range")?
@@ -2412,24 +3208,13 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     .map_err(|_| "value is not an integer or out of range")?
                     .parse()
                     .map_err(|_| "value is not an integer or out of range")?;
-                (start, stop, 0.0, true, 0.0, true)
-            };
+                opts.start = start;
+                opts.stop = stop;
+            }
 
             Ok(Some(Command::Zrange {
                 key: args[1].clone(),
-                opts: crate::table::ZRangeOpts {
-                    start,
-                    stop,
-                    min_score,
-                    min_inc,
-                    max_score,
-                    max_inc,
-                    by_score,
-                    rev,
-                    with_scores,
-                    offset,
-                    count,
-                },
+                opts,
             }))
         }
         "ZREVRANGE" => {
@@ -2459,15 +3244,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 opts: crate::table::ZRangeOpts {
                     start,
                     stop,
-                    min_score: 0.0,
-                    min_inc: true,
-                    max_score: 0.0,
-                    max_inc: true,
-                    by_score: false,
                     rev: true,
                     with_scores,
-                    offset: 0,
-                    count: None,
+                    ..Default::default()
                 },
             }))
         }
@@ -2492,10 +3271,11 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         if i + 2 >= args.len() {
                             return Err("syntax error".to_string());
                         }
-                        offset = std::str::from_utf8(&args[i + 1])
+                        let off: i64 = std::str::from_utf8(&args[i + 1])
                             .map_err(|_| "value is not an integer or out of range")?
                             .parse()
                             .map_err(|_| "value is not an integer or out of range")?;
+                        offset = if off < 0 { usize::MAX } else { off as usize };
                         let c: i64 = std::str::from_utf8(&args[i + 2])
                             .map_err(|_| "value is not an integer or out of range")?
                             .parse()
@@ -2509,8 +3289,6 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::Zrange {
                 key: args[1].clone(),
                 opts: crate::table::ZRangeOpts {
-                    start: 0,
-                    stop: 0,
                     min_score: min,
                     min_inc,
                     max_score: max,
@@ -2520,6 +3298,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     with_scores,
                     offset,
                     count,
+                    ..Default::default()
                 },
             }))
         }
@@ -2544,10 +3323,11 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         if i + 2 >= args.len() {
                             return Err("syntax error".to_string());
                         }
-                        offset = std::str::from_utf8(&args[i + 1])
+                        let off: i64 = std::str::from_utf8(&args[i + 1])
                             .map_err(|_| "value is not an integer or out of range")?
                             .parse()
                             .map_err(|_| "value is not an integer or out of range")?;
+                        offset = if off < 0 { usize::MAX } else { off as usize };
                         let c: i64 = std::str::from_utf8(&args[i + 2])
                             .map_err(|_| "value is not an integer or out of range")?
                             .parse()
@@ -2561,8 +3341,6 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::Zrange {
                 key: args[1].clone(),
                 opts: crate::table::ZRangeOpts {
-                    start: 0,
-                    stop: 0,
                     min_score: min,
                     min_inc,
                     max_score: max,
@@ -2572,42 +3350,327 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     with_scores,
                     offset,
                     count,
+                    ..Default::default()
                 },
             }))
         }
-        "ZPOPMIN" => {
-            if args.len() < 2 {
-                return Err("wrong number of arguments for 'zpopmin' command".to_string());
+        "ZRANGEBYLEX" => {
+            if args.len() != 4 && args.len() != 7 {
+                return Err("wrong number of arguments for 'zrangebylex' command".to_string());
             }
-            let count = if args.len() > 2 {
-                std::str::from_utf8(&args[2])
+            let min = crate::table::parse_lex_bound(&args[2]).map_err(|e| e.to_string())?;
+            let max = crate::table::parse_lex_bound(&args[3]).map_err(|e| e.to_string())?;
+            let mut offset = 0;
+            let mut count = None;
+            if args.len() == 7 {
+                let opt = String::from_utf8_lossy(&args[4]).to_uppercase();
+                if opt != "LIMIT" {
+                    return Err("syntax error".to_string());
+                }
+                let off: i64 = std::str::from_utf8(&args[5])
                     .map_err(|_| "value is not an integer or out of range")?
-                    .parse::<usize>()
+                    .parse()
+                    .map_err(|_| "value is not an integer or out of range")?;
+                offset = if off < 0 { usize::MAX } else { off as usize };
+                let c: i64 = std::str::from_utf8(&args[6])
                     .map_err(|_| "value is not an integer or out of range")?
-            } else {
-                1
-            };
-            Ok(Some(Command::Zpopmin {
+                    .parse()
+                    .map_err(|_| "value is not an integer or out of range")?;
+                count = if c < 0 { None } else { Some(c as usize) };
+            }
+            Ok(Some(Command::Zrange {
                 key: args[1].clone(),
-                count,
+                opts: crate::table::ZRangeOpts {
+                    by_lex: true,
+                    min_lex: min,
+                    max_lex: max,
+                    offset,
+                    count,
+                    ..Default::default()
+                },
             }))
         }
-        "ZPOPMAX" => {
+        "ZREVRANGEBYLEX" => {
+            if args.len() != 4 && args.len() != 7 {
+                return Err("wrong number of arguments for 'zrevrangebylex' command".to_string());
+            }
+            let max = crate::table::parse_lex_bound(&args[2]).map_err(|e| e.to_string())?;
+            let min = crate::table::parse_lex_bound(&args[3]).map_err(|e| e.to_string())?;
+            let mut offset = 0;
+            let mut count = None;
+            if args.len() == 7 {
+                let opt = String::from_utf8_lossy(&args[4]).to_uppercase();
+                if opt != "LIMIT" {
+                    return Err("syntax error".to_string());
+                }
+                let off: i64 = std::str::from_utf8(&args[5])
+                    .map_err(|_| "value is not an integer or out of range")?
+                    .parse()
+                    .map_err(|_| "value is not an integer or out of range")?;
+                offset = if off < 0 { usize::MAX } else { off as usize };
+                let c: i64 = std::str::from_utf8(&args[6])
+                    .map_err(|_| "value is not an integer or out of range")?
+                    .parse()
+                    .map_err(|_| "value is not an integer or out of range")?;
+                count = if c < 0 { None } else { Some(c as usize) };
+            }
+            Ok(Some(Command::Zrange {
+                key: args[1].clone(),
+                opts: crate::table::ZRangeOpts {
+                    by_lex: true,
+                    min_lex: min,
+                    max_lex: max,
+                    rev: true,
+                    offset,
+                    count,
+                    ..Default::default()
+                },
+            }))
+        }
+        "ZRANGESTORE" => {
+            if args.len() < 5 {
+                return Err("wrong number of arguments for 'zrangestore' command".to_string());
+            }
+            let mut by_score = false;
+            let mut by_lex = false;
+            let mut rev = false;
+            let mut has_limit = false;
+            let mut offset = 0;
+            let mut count = None;
+
+            let mut i = 5;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "BYSCORE" => {
+                        by_score = true;
+                        i += 1;
+                    }
+                    "BYLEX" => {
+                        by_lex = true;
+                        i += 1;
+                    }
+                    "REV" => {
+                        rev = true;
+                        i += 1;
+                    }
+                    "LIMIT" => {
+                        has_limit = true;
+                        if i + 2 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let off: i64 = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        offset = if off < 0 { usize::MAX } else { off as usize };
+                        let c: i64 = std::str::from_utf8(&args[i + 2])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        count = if c < 0 { None } else { Some(c as usize) };
+                        i += 3;
+                    }
+                    _ => {
+                        return Err("syntax error".to_string());
+                    }
+                }
+            }
+
+            if by_score && by_lex {
+                return Err("syntax error".to_string());
+            }
+            if has_limit && !by_score && !by_lex {
+                return Err("syntax error".to_string());
+            }
+
+            let mut opts = crate::table::ZRangeOpts {
+                by_score,
+                by_lex,
+                rev,
+                with_scores: false,
+                offset,
+                count,
+                ..Default::default()
+            };
+
+            if by_score {
+                let (min_idx, max_idx) = if rev { (4, 3) } else { (3, 4) };
+                let (min, min_i) = parse_score_bound(&args[min_idx])?;
+                let (max, max_i) = parse_score_bound(&args[max_idx])?;
+                opts.min_score = min;
+                opts.min_inc = min_i;
+                opts.max_score = max;
+                opts.max_inc = max_i;
+            } else if by_lex {
+                let (min_idx, max_idx) = if rev { (4, 3) } else { (3, 4) };
+                let min = crate::table::parse_lex_bound(&args[min_idx]).map_err(|e| e.to_string())?;
+                let max = crate::table::parse_lex_bound(&args[max_idx]).map_err(|e| e.to_string())?;
+                opts.min_lex = min;
+                opts.max_lex = max;
+            } else {
+                let start: i64 = std::str::from_utf8(&args[3])
+                    .map_err(|_| "value is not an integer or out of range")?
+                    .parse()
+                    .map_err(|_| "value is not an integer or out of range")?;
+                let stop: i64 = std::str::from_utf8(&args[4])
+                    .map_err(|_| "value is not an integer or out of range")?
+                    .parse()
+                    .map_err(|_| "value is not an integer or out of range")?;
+                opts.start = start;
+                opts.stop = stop;
+            }
+
+            Ok(Some(Command::Zrangestore {
+                dst: args[1].clone(),
+                src: args[2].clone(),
+                opts,
+            }))
+        }
+        "ZPOPMIN" | "ZPOPMAX" => {
+            let is_min = cmd_name == "ZPOPMIN";
             if args.len() < 2 {
-                return Err("wrong number of arguments for 'zpopmax' command".to_string());
+                return Err(format!("wrong number of arguments for '{}' command", cmd_name.to_lowercase()));
             }
             let count = if args.len() > 2 {
-                std::str::from_utf8(&args[2])
+                let val = std::str::from_utf8(&args[2])
                     .map_err(|_| "value is not an integer or out of range")?
-                    .parse::<usize>()
-                    .map_err(|_| "value is not an integer or out of range")?
+                    .parse::<i64>()
+                    .map_err(|_| "value is not an integer or out of range")?;
+                if val < 0 {
+                    return Err("value is out of range, must be positive".to_string());
+                }
+                Some(val as usize)
             } else {
-                1
+                None
             };
-            Ok(Some(Command::Zpopmax {
-                key: args[1].clone(),
-                count,
-            }))
+            if is_min {
+                Ok(Some(Command::Zpopmin {
+                    key: args[1].clone(),
+                    count,
+                }))
+            } else {
+                Ok(Some(Command::Zpopmax {
+                    key: args[1].clone(),
+                    count,
+                }))
+            }
+        }
+        "BZPOPMIN" | "BZPOPMAX" => {
+            let is_min = cmd_name == "BZPOPMIN";
+            if args.len() < 3 {
+                return Err(format!("wrong number of arguments for '{}' command", cmd_name.to_lowercase()));
+            }
+            let timeout: f64 = std::str::from_utf8(&args[args.len() - 1])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "timeout is not a float or out of range".to_string())?;
+            if timeout < 0.0 || timeout.is_nan() {
+                return Err("timeout is negative".to_string());
+            }
+            if timeout > (i64::MAX / 1000) as f64 {
+                return Err("timeout is out of range".to_string());
+            }
+            let keys = args[1..args.len() - 1].to_vec();
+            if is_min {
+                Ok(Some(Command::Bzpopmin { keys, timeout }))
+            } else {
+                Ok(Some(Command::Bzpopmax { keys, timeout }))
+            }
+        }
+        "ZMPOP" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'zmpop' command".to_string());
+            }
+            let numkeys: i64 = std::str::from_utf8(&args[1])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "numkeys should be greater than 0".to_string())?;
+            if numkeys <= 0 {
+                return Err("numkeys should be greater than 0".to_string());
+            }
+            let numkeys = numkeys as usize;
+            if args.len() < 2 + numkeys + 1 {
+                return Err("syntax error".to_string());
+            }
+            let keys = args[2..2 + numkeys].to_vec();
+            let where_str = String::from_utf8_lossy(&args[2 + numkeys]).to_uppercase();
+            let is_min = match where_str.as_str() {
+                "MIN" => true,
+                "MAX" => false,
+                _ => return Err("syntax error".to_string()),
+            };
+            let mut count = 1;
+            let idx = 2 + numkeys + 1;
+            if idx < args.len() {
+                if idx + 2 != args.len() {
+                    return Err("syntax error".to_string());
+                }
+                if !String::from_utf8_lossy(&args[idx]).eq_ignore_ascii_case("COUNT") {
+                    return Err("syntax error".to_string());
+                }
+                let c: i64 = std::str::from_utf8(&args[idx + 1])
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| "count should be greater than 0".to_string())?;
+                if c <= 0 {
+                    return Err("count should be greater than 0".to_string());
+                }
+                count = c as usize;
+            }
+            Ok(Some(Command::Zmpop { keys, is_min, count }))
+        }
+        "BZMPOP" => {
+            if args.len() < 5 {
+                return Err("wrong number of arguments for 'bzmpop' command".to_string());
+            }
+            let timeout: f64 = std::str::from_utf8(&args[1])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "timeout is not a float or out of range".to_string())?;
+            if timeout < 0.0 || timeout.is_nan() {
+                return Err("timeout is negative".to_string());
+            }
+            if timeout > (i64::MAX / 1000) as f64 {
+                return Err("timeout is out of range".to_string());
+            }
+            let numkeys: i64 = std::str::from_utf8(&args[2])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "numkeys should be greater than 0".to_string())?;
+            if numkeys <= 0 {
+                return Err("numkeys should be greater than 0".to_string());
+            }
+            let numkeys = numkeys as usize;
+            if args.len() < 3 + numkeys + 1 {
+                return Err("syntax error".to_string());
+            }
+            let keys = args[3..3 + numkeys].to_vec();
+            let where_str = String::from_utf8_lossy(&args[3 + numkeys]).to_uppercase();
+            let is_min = match where_str.as_str() {
+                "MIN" => true,
+                "MAX" => false,
+                _ => return Err("syntax error".to_string()),
+            };
+            let mut count = 1;
+            let idx = 3 + numkeys + 1;
+            if idx < args.len() {
+                if idx + 2 != args.len() {
+                    return Err("syntax error".to_string());
+                }
+                if !String::from_utf8_lossy(&args[idx]).eq_ignore_ascii_case("COUNT") {
+                    return Err("syntax error".to_string());
+                }
+                let c: i64 = std::str::from_utf8(&args[idx + 1])
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| "count should be greater than 0".to_string())?;
+                if c <= 0 {
+                    return Err("count should be greater than 0".to_string());
+                }
+                count = c as usize;
+            }
+            Ok(Some(Command::Bzmpop { timeout, keys, is_min, count }))
         }
         "ZUNIONSTORE" | "ZINTERSTORE" => {
             let is_union = cmd_name == "ZUNIONSTORE";
@@ -2615,11 +3678,15 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err(format!("wrong number of arguments for '{}' command", cmd_name.to_lowercase()));
             }
             let destination = args[1].clone();
-            let numkeys: usize = std::str::from_utf8(&args[2])
+            let numkeys: i64 = std::str::from_utf8(&args[2])
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-            if numkeys == 0 || args.len() < 3 + numkeys {
+            if numkeys <= 0 {
+                return Err(format!("at least 1 input key is needed for '{}' command", cmd_name.to_lowercase()));
+            }
+            let numkeys = numkeys as usize;
+            if args.len() < 3 + numkeys {
                 return Err("syntax error".to_string());
             }
             let keys = args[3..3 + numkeys].to_vec();
@@ -2636,7 +3703,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         }
                         let w: f64 = std::str::from_utf8(&args[i])
                             .ok()
-                            .and_then(|s| s.parse().ok())
+                            .and_then(parse_redis_f64)
                             .ok_or_else(|| "weight value is not a float".to_string())?;
                         weights.push(w);
                         i += 1;
@@ -2650,6 +3717,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         "SUM" => crate::table::Aggregate::Sum,
                         "MIN" => crate::table::Aggregate::Min,
                         "MAX" => crate::table::Aggregate::Max,
+                        "COUNT" => crate::table::Aggregate::Count,
                         _ => return Err("syntax error".to_string()),
                     };
                     i += 2;
@@ -2668,11 +3736,15 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'zdiffstore' command".to_string());
             }
             let destination = args[1].clone();
-            let numkeys: usize = std::str::from_utf8(&args[2])
+            let numkeys: i64 = std::str::from_utf8(&args[2])
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-            if numkeys == 0 || args.len() != 3 + numkeys {
+            if numkeys <= 0 {
+                return Err("at least 1 input key is needed for 'zdiffstore' command".to_string());
+            }
+            let numkeys = numkeys as usize;
+            if args.len() != 3 + numkeys {
                 return Err("syntax error".to_string());
             }
             let keys = args[3..3 + numkeys].to_vec();
@@ -2682,11 +3754,15 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() < 3 {
                 return Err("wrong number of arguments for 'zdiff' command".to_string());
             }
-            let numkeys: usize = std::str::from_utf8(&args[1])
+            let numkeys: i64 = std::str::from_utf8(&args[1])
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-            if numkeys == 0 || args.len() < 2 + numkeys {
+            if numkeys <= 0 {
+                return Err("at least 1 input key is needed for 'zdiff' command".to_string());
+            }
+            let numkeys = numkeys as usize;
+            if args.len() < 2 + numkeys {
                 return Err("syntax error".to_string());
             }
             let keys = args[2..2 + numkeys].to_vec();
@@ -2706,11 +3782,15 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() < 3 {
                 return Err(format!("wrong number of arguments for '{}' command", cmd_name.to_lowercase()));
             }
-            let numkeys: usize = std::str::from_utf8(&args[1])
+            let numkeys: i64 = std::str::from_utf8(&args[1])
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-            if numkeys == 0 || args.len() < 2 + numkeys {
+            if numkeys <= 0 {
+                return Err(format!("at least 1 input key is needed for '{}' command", cmd_name.to_lowercase()));
+            }
+            let numkeys = numkeys as usize;
+            if args.len() < 2 + numkeys {
                 return Err("syntax error".to_string());
             }
             let keys = args[2..2 + numkeys].to_vec();
@@ -2728,7 +3808,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         }
                         let w: f64 = std::str::from_utf8(&args[i])
                             .ok()
-                            .and_then(|s| s.parse().ok())
+                            .and_then(parse_redis_f64)
                             .ok_or_else(|| "weight value is not a float".to_string())?;
                         weights.push(w);
                         i += 1;
@@ -2742,6 +3822,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         "SUM" => crate::table::Aggregate::Sum,
                         "MIN" => crate::table::Aggregate::Min,
                         "MAX" => crate::table::Aggregate::Max,
+                        "COUNT" => crate::table::Aggregate::Count,
                         _ => return Err("syntax error".to_string()),
                     };
                     i += 2;
@@ -2757,6 +3838,45 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             } else {
                 Ok(Some(Command::Zinter { keys, weights, aggregate, with_scores }))
             }
+        }
+        "ZINTERCARD" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'zintercard' command".to_string());
+            }
+            let numkeys: i64 = std::str::from_utf8(&args[1])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            if numkeys <= 0 {
+                return Err("at least 1 input key is needed for 'zintercard' command".to_string());
+            }
+            let numkeys = numkeys as usize;
+            if args.len() < 2 + numkeys {
+                return Err("Number of keys can't be greater than number of args".to_string());
+            }
+            let keys = args[2..2 + numkeys].to_vec();
+            let mut limit = 0;
+            let mut i = 2 + numkeys;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                if opt == "LIMIT" {
+                    if i + 1 >= args.len() {
+                        return Err("syntax error".to_string());
+                    }
+                    let lim: i64 = std::str::from_utf8(&args[i + 1])
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| "LIMIT can't be negative".to_string())?;
+                    if lim < 0 {
+                        return Err("LIMIT can't be negative".to_string());
+                    }
+                    limit = lim as usize;
+                    i += 2;
+                } else {
+                    return Err("syntax error".to_string());
+                }
+            }
+            Ok(Some(Command::Zintercard { keys, limit }))
         }
         "TYPE" => {
             if args.len() != 2 {
@@ -2788,7 +3908,31 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             };
             Ok(Some(Command::Slowlog(sub)))
         }
-        "DEBUG" => Ok(Some(Command::Debug)),
+        "DEBUG" => Ok(Some(Command::Debug(args[1..].to_vec()))),
+        "DIGEST" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'digest' command".to_string());
+            }
+            Ok(Some(Command::Digest(args[1].clone())))
+        }
+        "MEMORY" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'memory' command".to_string());
+            }
+            let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
+            match sub.as_str() {
+                "USAGE" => {
+                    if args.len() < 3 {
+                        return Err("wrong number of arguments for 'memory|usage' command".to_string());
+                    }
+                    Ok(Some(Command::Memory(MemorySubcommand::Usage { key: args[2].clone() })))
+                }
+                "STATS" => Ok(Some(Command::Memory(MemorySubcommand::Stats))),
+                "PURGE" => Ok(Some(Command::Memory(MemorySubcommand::Purge))),
+                "DOCTOR" => Ok(Some(Command::Memory(MemorySubcommand::Doctor))),
+                _ => Err(format!("unknown subcommand '{}' for 'memory'", sub)),
+            }
+        }
         "EXPIREAT" => {
             if args.len() != 3 {
                 return Err("wrong number of arguments for 'expireat' command".to_string());
@@ -2876,6 +4020,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 key: args[1].clone(),
                 value: args[3].clone(),
                 expire_in: Some(Duration::from_secs(secs)),
+                condition: SetCondition::None,
+                get: false,
+                keepttl: false,
+                past_expired: false,
             }))
         }
         "PSETEX" => {
@@ -2890,6 +4038,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 key: args[1].clone(),
                 value: args[3].clone(),
                 expire_in: Some(Duration::from_millis(ms)),
+                condition: SetCondition::None,
+                get: false,
+                keepttl: false,
+                past_expired: false,
             }))
         }
         "GETSET" => {
@@ -3190,14 +4342,19 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::Sticky(args[1].clone())))
         }
         "DELEX" => {
-            if args.len() < 2 {
+            if args.len() != 2 && args.len() != 4 {
                 return Err("wrong number of arguments for 'delex' command".to_string());
             }
             let key = args[1].clone();
-            let condition = if args.len() >= 4 {
+            let condition = if args.len() == 4 {
                 let op = String::from_utf8_lossy(&args[2]).to_uppercase();
-                let expected = args[3].clone();
-                Some((op, expected))
+                match op.as_str() {
+                    "IFEQ" | "IFNE" | "IFDEQ" | "IFDNE" | "IFGT" | "IFLT" => {
+                        let expected = args[3].clone();
+                        Some((op, expected))
+                    }
+                    _ => return Err("Invalid condition for 'delex' command".to_string()),
+                }
             } else {
                 None
             };
@@ -3367,14 +4524,30 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             Ok(Some(Command::Discard))
         }
+        "WATCH" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'watch' command".to_string());
+            }
+            Ok(Some(Command::Watch(args[1..].to_vec())))
+        }
+        "UNWATCH" => {
+            if args.len() != 1 {
+                return Err("wrong number of arguments for 'unwatch' command".to_string());
+            }
+            Ok(Some(Command::Unwatch))
+        }
         "SETBIT" => {
             if args.len() != 4 {
                 return Err("wrong number of arguments for 'setbit' command".to_string());
             }
-            let offset: usize = std::str::from_utf8(&args[2])
+            let offset_raw: u64 = std::str::from_utf8(&args[2])
                 .map_err(|_| "bit offset is not an integer or out of range")?
                 .parse()
                 .map_err(|_| "bit offset is not an integer or out of range")?;
+            if offset_raw >= (1u64 << 32) {
+                return Err("bit offset is not an integer or out of range".to_string());
+            }
+            let offset = offset_raw as usize;
             let val_str = std::str::from_utf8(&args[3])
                 .map_err(|_| "bit is not an integer or out of range")?;
             let value: u8 = val_str
@@ -4060,12 +5233,12 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() != 4 {
                 return Err("wrong number of arguments for 'hincrbyfloat' command".to_string());
             }
-            let increment: f64 = std::str::from_utf8(&args[3])
-                .map_err(|_| "value is not a valid float".to_string())?
-                .parse()
+            let s = std::str::from_utf8(&args[3])
                 .map_err(|_| "value is not a valid float".to_string())?;
+            let increment: f64 = parse_redis_f64(s)
+                .ok_or_else(|| "value is not a valid float".to_string())?;
             if increment.is_nan() || increment.is_infinite() {
-                return Err("value is not a valid float".to_string());
+                return Err("value is NaN or Infinity".to_string());
             }
             Ok(Some(Command::Hincrbyfloat {
                 key: args[1].clone(),
@@ -4082,6 +5255,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     .map_err(|_| "value is not an integer or out of range".to_string())?
                     .parse()
                     .map_err(|_| "value is not an integer or out of range".to_string())?;
+                if c == i64::MIN {
+                    return Err("value is out of range".to_string());
+                }
                 Some(c)
             } else {
                 None
@@ -4090,6 +5266,11 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() == 4 {
                 if String::from_utf8_lossy(&args[3]).eq_ignore_ascii_case("WITHVALUES") {
                     with_values = true;
+                    if let Some(c) = count {
+                        if c.checked_mul(2).is_none() {
+                            return Err("value is out of range".to_string());
+                        }
+                    }
                 } else {
                     return Err("syntax error".to_string());
                 }
@@ -4160,6 +5341,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     .map_err(|_| "value is not an integer or out of range".to_string())?
                     .parse()
                     .map_err(|_| "value is not an integer or out of range".to_string())?;
+                if c == i64::MIN {
+                    return Err("value is out of range".to_string());
+                }
                 Some(c)
             } else {
                 None
@@ -4239,6 +5423,9 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     .map_err(|_| "value is not an integer or out of range".to_string())?
                     .parse()
                     .map_err(|_| "value is not an integer or out of range".to_string())?;
+                if c == i64::MIN {
+                    return Err("value is out of range".to_string());
+                }
                 Some(c)
             } else {
                 None
@@ -4247,6 +5434,11 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() == 4 {
                 if String::from_utf8_lossy(&args[3]).eq_ignore_ascii_case("WITHSCORES") {
                     with_scores = true;
+                    if let Some(c) = count {
+                        if c.checked_mul(2).is_none() {
+                            return Err("value is out of range".to_string());
+                        }
+                    }
                 } else {
                     return Err("syntax error".to_string());
                 }
@@ -4420,8 +5612,11 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             .map_err(|_| "value is not an integer or out of range".to_string())?
                             .parse()
                             .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        if r == i64::MIN {
+                            return Err("value is out of range".to_string());
+                        }
                         if r == 0 {
-                            return Err("RANK can't be zero: use 1 to start from the first match, use -1 from the last".to_string());
+                            return Err("RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list".to_string());
                         }
                         rank = Some(r);
                         i += 2;
@@ -4519,8 +5714,11 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 .map_err(|_| "timeout is not a float or out of range".to_string())?
                 .parse()
                 .map_err(|_| "timeout is not a float or out of range".to_string())?;
-            if timeout < 0.0 {
+            if timeout < 0.0 || timeout.is_nan() {
                 return Err("timeout is negative".to_string());
+            }
+            if timeout > (i64::MAX / 1000) as f64 {
+                return Err("timeout is out of range".to_string());
             }
             Ok(Some(Command::Blmove {
                 source: args[1].clone(),
@@ -4530,16 +5728,98 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 timeout,
             }))
         }
+        "SORT" | "SORT_RO" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'sort' command".to_string());
+            }
+            let key = args[1].clone();
+            let mut desc = false;
+            let mut alpha = false;
+            let mut store = None;
+            let mut limit = None;
+            let mut i = 2;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "ASC" => { desc = false; i += 1; }
+                    "DESC" => { desc = true; i += 1; }
+                    "ALPHA" => { alpha = true; i += 1; }
+                    "STORE" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        store = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "LIMIT" => {
+                        if i + 2 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let offset: i64 = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        let count: i64 = std::str::from_utf8(&args[i + 2])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        limit = Some((offset, count));
+                        i += 3;
+                    }
+                    _ => { i += 1; }
+                }
+            }
+            Ok(Some(Command::Sort {
+                key,
+                desc,
+                alpha,
+                store,
+                limit,
+            }))
+        }
+        "RPOPLPUSH" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'rpoplpush' command".to_string());
+            }
+            Ok(Some(Command::Lmove {
+                source: args[1].clone(),
+                destination: args[2].clone(),
+                where_from: crate::table::ListDirection::Right,
+                where_to: crate::table::ListDirection::Left,
+            }))
+        }
+        "BRPOPLPUSH" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'brpoplpush' command".to_string());
+            }
+            let timeout: f64 = std::str::from_utf8(&args[3])
+                .map_err(|_| "timeout is not a float or out of range".to_string())?
+                .parse()
+                .map_err(|_| "timeout is not a float or out of range".to_string())?;
+            if timeout < 0.0 || timeout.is_nan() {
+                return Err("timeout is negative".to_string());
+            }
+            if timeout > (i64::MAX / 1000) as f64 {
+                return Err("timeout is out of range".to_string());
+            }
+            Ok(Some(Command::Blmove {
+                source: args[1].clone(),
+                destination: args[2].clone(),
+                where_from: crate::table::ListDirection::Right,
+                where_to: crate::table::ListDirection::Left,
+                timeout,
+            }))
+        }
         "INCRBYFLOAT" => {
             if args.len() != 3 {
                 return Err("wrong number of arguments for 'incrbyfloat' command".to_string());
             }
-            let increment: f64 = std::str::from_utf8(&args[2])
-                .map_err(|_| "value is not a valid float".to_string())?
-                .parse()
+            let s = std::str::from_utf8(&args[2])
                 .map_err(|_| "value is not a valid float".to_string())?;
+            let increment: f64 = parse_redis_f64(s)
+                .ok_or_else(|| "value is not a valid float".to_string())?;
             if increment.is_nan() || increment.is_infinite() {
-                return Err("value is not a valid float".to_string());
+                return Err("value is NaN or Infinity".to_string());
             }
             Ok(Some(Command::Incrbyfloat {
                 key: args[1].clone(),
@@ -4560,9 +5840,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 value: args[3].clone(),
             }))
         }
-        "GETRANGE" => {
+        "GETRANGE" | "SUBSTR" => {
             if args.len() != 4 {
-                return Err("wrong number of arguments for 'getrange' command".to_string());
+                let name = if cmd_name == "SUBSTR" { "substr" } else { "getrange" };
+                return Err(format!("wrong number of arguments for '{}' command", name));
             }
             let start: i64 = std::str::from_utf8(&args[2])
                 .map_err(|_| "value is not an integer or out of range".to_string())?
@@ -5649,6 +6930,49 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
     }
 }
 
+pub fn parse_redis_f64(s: &str) -> Option<f64> {
+    if s.is_empty() || s.starts_with(char::is_whitespace) || s.ends_with(char::is_whitespace) {
+        return None;
+    }
+    if s.eq_ignore_ascii_case("nan")
+        || s.eq_ignore_ascii_case("+nan")
+        || s.eq_ignore_ascii_case("-nan")
+    {
+        return None;
+    }
+    let is_literal_inf = s.eq_ignore_ascii_case("inf")
+        || s.eq_ignore_ascii_case("+inf")
+        || s.eq_ignore_ascii_case("-inf")
+        || s.eq_ignore_ascii_case("infinity")
+        || s.eq_ignore_ascii_case("+infinity")
+        || s.eq_ignore_ascii_case("-infinity");
+
+    if let Ok(v) = s.parse::<f64>() {
+        if !v.is_nan() {
+            if v.is_infinite() && !is_literal_inf {
+                return None;
+            }
+            return Some(v);
+        }
+        return None;
+    }
+    if let Ok(c_str) = std::ffi::CString::new(s) {
+        unsafe {
+            let mut end: *mut libc::c_char = std::ptr::null_mut();
+            let val = libc::strtod(c_str.as_ptr(), &mut end);
+            if !end.is_null() && *end == 0 && end != c_str.as_ptr() as *mut libc::c_char {
+                if !val.is_nan() {
+                    if val.is_infinite() && !is_literal_inf {
+                        return None;
+                    }
+                    return Some(val);
+                }
+            }
+        }
+    }
+    None
+}
+
 pub fn parse_score_bound(arg: &[u8]) -> Result<(f64, bool), String> {
     if arg.is_empty() {
         return Err("min or max not specified".to_string());
@@ -5664,12 +6988,7 @@ pub fn parse_score_bound(arg: &[u8]) -> Result<(f64, bool), String> {
     } else if s.eq_ignore_ascii_case("+inf") || s.eq_ignore_ascii_case("inf") {
         Ok((f64::INFINITY, inc))
     } else {
-        let val: f64 = s
-            .parse()
-            .map_err(|_| "value is not a valid float".to_string())?;
-        if val.is_nan() {
-            return Err("value is not a valid float".to_string());
-        }
+        let val = parse_redis_f64(s).ok_or_else(|| "value is not a valid float".to_string())?;
         Ok((val, inc))
     }
 }
@@ -5710,6 +7029,10 @@ mod tests {
                 key: Bytes::from_static(b"mykey"),
                 value: Bytes::from_static(b"myvalue"),
                 expire_in: None,
+                condition: SetCondition::None,
+                get: false,
+                keepttl: false,
+                past_expired: false,
             }
         );
         assert!(buf.is_empty());
@@ -5722,6 +7045,10 @@ mod tests {
                 key: Bytes::from_static(b"k"),
                 value: Bytes::from_static(b"v"),
                 expire_in: None,
+                condition: SetCondition::None,
+                get: false,
+                keepttl: false,
+                past_expired: false,
             }
         );
         assert!(buf.is_empty());
@@ -5736,6 +7063,10 @@ mod tests {
                 key: Bytes::from_static(b"k"),
                 value: Bytes::from_static(b"v"),
                 expire_in: Some(Duration::from_secs(10)),
+                condition: SetCondition::None,
+                get: false,
+                keepttl: false,
+                past_expired: false,
             }
         );
     }
@@ -5754,6 +7085,10 @@ mod tests {
                 key: Bytes::from_static(b"foo"),
                 value: Bytes::from_static(b"bar"),
                 expire_in: None,
+                condition: SetCondition::None,
+                get: false,
+                keepttl: false,
+                past_expired: false,
             }
         );
 

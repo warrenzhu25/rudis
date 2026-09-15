@@ -13,7 +13,7 @@ from collections import defaultdict
 
 CATEGORIES = {
     "Strings & Basic Keyspace": [
-        "GET", "SET", "PUT", "MGET", "MSET", "SETNX", "MSETNX", "GETSET",
+        "GET", "SET", "PUT", "MGET", "MSET", "MSETEX", "SETNX", "MSETNX", "GETSET",
         "GETDEL", "APPEND", "STRLEN", "SETRANGE", "GETRANGE", "INCR", "DECR",
         "INCRBY", "DECRBY", "INCRBYFLOAT", "DEL", "EXISTS", "SETEX", "PSETEX"
     ],
@@ -68,7 +68,7 @@ CATEGORIES = {
         "KEYS", "SCAN", "RANDOMKEY", "TYPE", "EXPIRE", "PEXPIRE", "EXPIREAT",
         "PEXPIREAT", "EXPIRETIME", "PEXPIRETIME", "PERSIST", "TTL", "PTTL",
         "TOUCH", "RENAME", "RENAMENX", "DUMP", "RESTORE", "INFO", "COMMAND",
-        "CONFIG", "HELLO", "CLIENT", "QUIT"
+        "CONFIG", "HELLO", "CLIENT", "QUIT", "MEMORY"
     ],
     "Persistence & Replication": [
         "SAVE", "BGSAVE", "LASTSAVE", "REPLICAOF", "PSYNC", "REPLCONF", "ROLE"

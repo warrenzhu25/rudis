@@ -249,6 +249,10 @@ pub fn run_shard_worker(
                                     key,
                                     value,
                                     expire_in,
+                                    condition: crate::resp::SetCondition::None,
+                                    get: false,
+                                    keepttl: false,
+                                    past_expired: false,
                                 })
                             {
                                 aof.borrow_mut().append(&bytes);
@@ -346,26 +350,33 @@ pub fn run_shard_worker(
                         let keys = cross_shard_db.borrow_mut().get_keys_in_slot(slot, count);
                         let _ = responder.send(keys);
                     }
-                    ShardMessage::ClientList { responder } => {
+                    ShardMessage::ClientList { filter_ids, responder } => {
                         let mut out = String::new();
                         let reg = cross_shard_clients.borrow();
                         let now = std::time::Instant::now();
                         for client in reg.values() {
+                            if !filter_ids.is_empty() && !filter_ids.contains(&client.id) {
+                                continue;
+                            }
                             let age = now.duration_since(client.connected_at).as_secs();
                             let idle = now.duration_since(client.last_active).as_secs();
+                            let is_blocked = crate::block::get_block_hub_for_port(port).lock().unwrap().is_blocked(client.id);
+                            let flags = if is_blocked { "b" } else { "N" };
                             out.push_str(&format!(
-                                "id={} addr={} name={} age={} idle={} cmd={}\n",
+                                "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=20448 argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem=0 omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name= lib-ver= io-thread=0 tot-net-in=0 tot-net-out=0 tot-cmds=0 read-events=0 avg-pipeline-len-sum=0 avg-pipeline-len-cnt=0\n",
                                 client.id,
                                 client.addr,
+                                port,
                                 client.name.as_deref().unwrap_or(""),
                                 age,
                                 idle,
-                                client.last_cmd
+                                flags,
+                                client.last_cmd.to_lowercase()
                             ));
                         }
                         let _ = responder.send(out);
                     }
-                    ShardMessage::Batch { items, responder } => {
+                    ShardMessage::Batch { items, responder, is_resp3 } => {
                         let r = cross_shard_router.clone();
                         let aof_ref = cross_shard_aof.clone();
                         let needs_async = items.iter().any(|(_, cmd)| {
@@ -379,6 +390,7 @@ pub fn run_shard_worker(
 
                         if needs_async {
                             monoio::spawn(async move {
+                                crate::connection::CURRENT_CLIENT_RESP3.set(is_resp3);
                                 let mut results = Vec::with_capacity(items.len());
                                 let mut temp_buf = Vec::with_capacity(128);
                                 let mut has_writes = false;
@@ -412,6 +424,7 @@ pub fn run_shard_worker(
                                 let _ = responder.send(results);
                             });
                         } else {
+                            crate::connection::CURRENT_CLIENT_RESP3.set(is_resp3);
                             let mut db = cross_shard_db.borrow_mut();
                             let mut results = Vec::with_capacity(items.len());
                             let aof_ref = cross_shard_aof.as_deref();
@@ -571,6 +584,15 @@ pub fn run_shard_worker(
                         let aof_ref = cross_shard_aof.as_deref();
                         execute_local_command(&cmd, &mut db, &mut dummy_out, aof_ref);
                         let _ = responder.send(());
+                    }
+                    ShardMessage::NotifyList { keys } => {
+                        let mut db = cross_shard_db.borrow_mut();
+                        let hub_arc = crate::block::get_block_hub_for_port(db.port);
+                        let mut hub = hub_arc.lock().unwrap();
+                        for k in keys {
+                            hub.notify_list(&mut db.table, &k);
+                            hub.notify_zset(&mut db.table, &k);
+                        }
                     }
                     ShardMessage::TierSpill { key, responder } => {
                         let r = cross_shard_router.clone();

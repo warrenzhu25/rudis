@@ -110,11 +110,16 @@ pub enum ShardMessage {
         responder: flume::Sender<Vec<Bytes>>,
     },
     ClientList {
+        filter_ids: Vec<u64>,
         responder: flume::Sender<String>,
     },
     Batch {
         items: Vec<(usize, Command)>,
         responder: flume::Sender<Vec<(usize, CompactResp)>>,
+        is_resp3: bool,
+    },
+    NotifyList {
+        keys: Vec<Bytes>,
     },
     SetSlotState {
         slot: u16,
@@ -312,6 +317,27 @@ impl ShardDb {
     }
 
     #[inline]
+    pub fn set_extended(&mut self, key: Bytes, value: Bytes, expire_in: Option<Duration>, keepttl: bool) {
+        if let Some(tm) = &self.tier_manager {
+            tm.op_manager.cancel_pending_stash(&key);
+        }
+        if let Some(ptr) = self.table.is_tiered(&key) {
+            if let Some(tm) = &self.tier_manager {
+                tm.on_key_deleted(ptr);
+                tm.stats.tiered_keys.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                tm.stats.total_deletes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        } else if let Some(ptr) = self.table.is_cooled(&key) {
+            if let Some(tm) = &self.tier_manager {
+                tm.on_key_deleted(ptr);
+                tm.stats.cooled_keys.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                tm.stats.total_deletes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        self.table.set_extended(key, value, expire_in, keepttl);
+    }
+
+    #[inline]
     pub fn del(&mut self, key: &[u8]) -> bool {
         if let Some(tm) = &self.tier_manager {
             tm.op_manager.cancel_pending_stash(key);
@@ -399,6 +425,11 @@ impl ShardDb {
     }
 
     #[inline]
+    pub fn hsetnx(&mut self, key: Bytes, field: Bytes, value: Bytes) -> Result<usize, &'static str> {
+        self.table.hsetnx(key, field, value)
+    }
+
+    #[inline]
     pub fn hget(&mut self, key: &[u8], field: &[u8]) -> Result<Option<Bytes>, &'static str> {
         self.table.hget(key, field)
     }
@@ -443,6 +474,21 @@ impl ShardDb {
     }
 
     #[inline]
+    pub fn hstrlen(&mut self, key: &[u8], field: &[u8]) -> Result<usize, &'static str> {
+        self.table.hstrlen(key, field)
+    }
+
+    #[inline]
+    pub fn hgetdel(&mut self, key: &[u8], fields: &[Bytes]) -> Result<(Vec<Option<Bytes>>, Vec<Bytes>), &'static str> {
+        self.table.hgetdel(key, fields)
+    }
+
+    #[inline]
+    pub fn object_encoding(&mut self, key: &[u8]) -> Option<&'static str> {
+        self.table.object_encoding(key)
+    }
+
+    #[inline]
     pub fn hincrby(&mut self, key: Bytes, field: Bytes, delta: i64) -> Result<i64, &'static str> {
         self.table.hincrby(key, field, delta)
     }
@@ -482,6 +528,16 @@ impl ShardDb {
     #[inline]
     pub fn rpush(&mut self, key: Bytes, values: Vec<Bytes>) -> Result<usize, &'static str> {
         self.table.rpush(key, values)
+    }
+
+    #[inline]
+    pub fn lpushx(&mut self, key: Bytes, values: Vec<Bytes>) -> Result<usize, &'static str> {
+        self.table.lpushx(key, values)
+    }
+
+    #[inline]
+    pub fn rpushx(&mut self, key: Bytes, values: Vec<Bytes>) -> Result<usize, &'static str> {
+        self.table.rpushx(key, values)
     }
 
     #[inline]
@@ -625,6 +681,21 @@ impl ShardDb {
     }
 
     #[inline]
+    pub fn sintercard(&mut self, keys: &[Bytes], limit: usize) -> Result<usize, &'static str> {
+        self.table.sintercard(keys, limit)
+    }
+
+    #[inline]
+    pub fn sunioncard(&mut self, keys: &[Bytes], limit: usize) -> Result<usize, &'static str> {
+        self.table.sunioncard(keys, limit)
+    }
+
+    #[inline]
+    pub fn sdiffcard(&mut self, keys: &[Bytes], limit: usize) -> Result<usize, &'static str> {
+        self.table.sdiffcard(keys, limit)
+    }
+
+    #[inline]
     pub fn smismember(&mut self, key: &[u8], members: &[Bytes]) -> Result<Vec<bool>, &'static str> {
         self.table.smismember(key, members)
     }
@@ -635,7 +706,7 @@ impl ShardDb {
     }
 
     #[inline]
-    pub fn smove(&mut self, source: &[u8], destination: Bytes, member: Bytes) -> Result<bool, &'static str> {
+    pub fn smove(&mut self, source: &[u8], destination: Bytes, member: Bytes) -> Result<crate::table::SmoveResult, &'static str> {
         self.table.smove(source, destination, member)
     }
 
@@ -681,8 +752,9 @@ impl ShardDb {
         key: &[u8],
         member: &[u8],
         rev: bool,
-    ) -> Result<Option<usize>, &'static str> {
-        self.table.zrank(key, member, rev)
+        with_score: bool,
+    ) -> Result<Option<(usize, Option<f64>)>, &'static str> {
+        self.table.zrank(key, member, rev, with_score)
     }
 
     #[inline]
@@ -709,6 +781,16 @@ impl ShardDb {
         opts: &crate::table::ZRangeOpts,
     ) -> Result<Vec<(Bytes, f64)>, &'static str> {
         self.table.zrange(key, opts)
+    }
+
+    #[inline]
+    pub fn zrangestore(
+        &mut self,
+        dst: &[u8],
+        src: &[u8],
+        opts: &crate::table::ZRangeOpts,
+    ) -> Result<usize, &'static str> {
+        self.table.zrangestore(dst, src, opts)
     }
 
     #[inline]
@@ -762,6 +844,11 @@ impl ShardDb {
         with_scores: bool,
     ) -> Result<Vec<(Bytes, f64)>, &'static str> {
         self.table.zinter(keys, weights, agg, with_scores)
+    }
+
+    #[inline]
+    pub fn zintercard(&mut self, keys: &[Bytes], limit: usize) -> Result<usize, &'static str> {
+        self.table.zintercard(keys, limit)
     }
 
     #[inline]

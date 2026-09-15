@@ -50,7 +50,7 @@ pub fn format_memory_info(used_mem: usize, max_mem: u64, cooled_keys: u64, tiere
         maxmemory:{}\r\n\
         maxmemory_human:{}\r\n\
         mem_fragmentation_ratio:{:.2}\r\n\
-        mem_allocator:jemalloc\r\n\
+        mem_allocator:libc\r\n\
         allocator_allocated:{}\r\n\
         allocator_active:{}\r\n\
         allocator_resident:{}\r\n\
