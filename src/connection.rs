@@ -770,6 +770,26 @@ pub async fn handle_connection(
             Ok(n) => {
                 buf.extend_from_slice(&read_buf[..n]);
 
+                // Drain any additional bytes waiting in kernel TCP socket buffer
+                loop {
+                    let drain_n = unsafe {
+                        libc::recv(
+                            raw_fd,
+                            read_buf.as_mut_ptr() as *mut libc::c_void,
+                            read_buf.len(),
+                            libc::MSG_DONTWAIT,
+                        )
+                    };
+                    if drain_n > 0 {
+                        buf.extend_from_slice(&read_buf[..drain_n as usize]);
+                        if (drain_n as usize) < read_buf.len() {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
                 // 1. Parse all complete commands currently in the buffer
                 let mut commands = Vec::new();
                 let mut should_quit = false;
@@ -779,7 +799,19 @@ pub async fn handle_connection(
                             commands.push(cmd);
                         }
                         Ok(None) => {
-                            // Incomplete frame, need more data
+                            // Incomplete frame: check if remaining bytes just arrived in kernel buffer
+                            let drain_n = unsafe {
+                                libc::recv(
+                                    raw_fd,
+                                    read_buf.as_mut_ptr() as *mut libc::c_void,
+                                    read_buf.len(),
+                                    libc::MSG_DONTWAIT,
+                                )
+                            };
+                            if drain_n > 0 {
+                                buf.extend_from_slice(&read_buf[..drain_n as usize]);
+                                continue;
+                            }
                             break;
                         }
                         Err(err) => {
@@ -12046,5 +12078,24 @@ mod tests {
         unwatch_keys(port, cid);
         assert!(!is_watch_tainted(port, cid));
     }
+
+    #[test]
+    fn test_fragmented_frame_parsing_and_buffer_growth() {
+        let mut buf = BytesMut::new();
+        // Feed partial command
+        buf.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$4\r\nkey1");
+        assert!(matches!(parse_command(&mut buf), Ok(None)));
+        assert_eq!(buf.len(), 21);
+
+        // Feed remainder of command plus a complete second command
+        buf.extend_from_slice(b"\r\n$4\r\nval1\r\n*2\r\n$3\r\nGET\r\n$4\r\nkey1\r\n");
+        let cmd1 = parse_command(&mut buf).unwrap().unwrap();
+        assert!(matches!(cmd1, Command::Set { .. }));
+
+        let cmd2 = parse_command(&mut buf).unwrap().unwrap();
+        assert!(matches!(cmd2, Command::Get(_)));
+        assert!(buf.is_empty());
+    }
 }
+
 

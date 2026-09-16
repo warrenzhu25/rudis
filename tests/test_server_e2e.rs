@@ -6253,6 +6253,65 @@ fn test_replication_atomic_bypass_and_slave_gate_e2e() {
     );
 }
 
+#[test]
+fn test_fragmented_socket_frame_draining_e2e() {
+    let port = 16440;
+    start_test_server(port, 4);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // Prepare 32 pipelined 1KB SET commands
+    let val_1kb = "V".repeat(1024);
+    let mut payload = Vec::new();
+    for i in 0..32 {
+        let cmd = format!(
+            "*3\r\n$3\r\nSET\r\n${}\r\nfrag_k_{}\r\n${}\r\n{}\r\n",
+            format!("frag_k_{}", i).len(),
+            i,
+            val_1kb.len(),
+            val_1kb
+        );
+        payload.extend_from_slice(cmd.as_bytes());
+    }
+
+    // Transmit in fragmented chunks of 512 bytes with tiny delays
+    let chunk_size = 512;
+    for chunk in payload.chunks(chunk_size) {
+        client.write_all(chunk).unwrap();
+        thread::sleep(Duration::from_micros(200));
+    }
+
+    // Read all 32 +OK\r\n responses (160 bytes total)
+    let mut responses = Vec::new();
+    let mut temp = [0u8; 1024];
+    while responses.len() < 32 * 5 {
+        let n = client.read(&mut temp).unwrap();
+        if n == 0 { break; }
+        responses.extend_from_slice(&temp[..n]);
+    }
+
+    let resp_str = String::from_utf8_lossy(&responses);
+    assert_eq!(responses.len(), 32 * 5);
+    assert_eq!(resp_str.matches("+OK\r\n").count(), 32);
+
+    // Verify all keys were correctly stored
+    let expected_get_len = 7 + 1024 + 2; // $1024\r\n<1024 bytes>\r\n
+    for i in 0..32 {
+        let get_cmd = format!("GET frag_k_{}\r\n", i);
+        client.write_all(get_cmd.as_bytes()).unwrap();
+        let mut get_resp = Vec::new();
+        let mut temp = [0u8; 2048];
+        while get_resp.len() < expected_get_len {
+            let n = client.read(&mut temp).unwrap();
+            if n == 0 { break; }
+            get_resp.extend_from_slice(&temp[..n]);
+        }
+        let resp_str = String::from_utf8_lossy(&get_resp);
+        assert!(resp_str.contains(&val_1kb));
+    }
+}
+
+
 
 
 
