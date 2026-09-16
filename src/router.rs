@@ -72,6 +72,7 @@ pub struct Router {
     pub is_auto_tiering: Rc<Cell<bool>>,
     pub mget_channel_pool: Rc<RefCell<Vec<Vec<MgetChannel>>>>,
     pub mset_channel_pool: Rc<RefCell<Vec<Vec<MsetChannel>>>>,
+    pub set_channel_pool: Rc<RefCell<Vec<MsetChannel>>>,
 }
 
 impl Router {
@@ -109,6 +110,7 @@ impl Router {
             is_auto_tiering: Rc::new(Cell::new(false)),
             mget_channel_pool: Rc::new(RefCell::new(Vec::new())),
             mset_channel_pool: Rc::new(RefCell::new(Vec::new())),
+            set_channel_pool: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -736,16 +738,21 @@ impl Router {
                 }
             }
         } else {
-            let (tx, rx) = flume::bounded(1);
+            let (tx, rx) = self
+                .set_channel_pool
+                .borrow_mut()
+                .pop()
+                .unwrap_or_else(|| flume::bounded(1));
             let msg = ShardMessage::Set {
                 key,
                 value,
                 expire_in,
-                responder: tx,
+                responder: tx.clone(),
             };
             if self.senders[target].send(msg).is_ok() {
                 let _ = rx.recv_async().await;
             }
+            self.set_channel_pool.borrow_mut().push((tx, rx));
         }
     }
 

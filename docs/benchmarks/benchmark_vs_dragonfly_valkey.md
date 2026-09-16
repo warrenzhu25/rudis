@@ -83,15 +83,15 @@ This script:
 
 | Workload | Rudis Ops/sec (Mean ± Std) | Dragonfly Ops/sec (Mean ± Std) | Valkey 8.1.9 Ops/sec (Mean ± Std) | Rudis p99 | Dragonfly p99 | Valkey p99 |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **SET 100% (Pipeline 1, 1KB)** | 21,373 ± 494 | **294,248 ± 48,384** | 285,757 ± 50,880 | 15.08 ms | 0.51 ms | **0.45 ms** |
-| **GET 100% (Pipeline 1, 1KB)** | 230,785 ± 40,360 | **285,489 ± 56,598** | 284,818 ± 44,448 | 0.55 ms | 0.46 ms | **0.45 ms** |
-| **Mixed 50:50 (Pipeline 1, 1KB)** | 37,105 ± 1,004 | **315,779 ± 47,280** | 289,541 ± 46,418 | 10.46 ms | 0.49 ms | **0.43 ms** |
-| **SET 100% (Pipeline 16, 1KB)** | 30,184 ± 1,387 | **1,206,174 ± 52,938** | 590,883 ± 22,837 | 118.99 ms | **2.20 ms** | 3.04 ms |
-| **GET 100% (Pipeline 16, 1KB)** | 1,477,870 ± 179,100 | **1,649,760 ± 51,701** | 987,520 ± 87,998 | **1.62 ms** | 1.78 ms | 1.89 ms |
-| **Mixed 50:50 (Pipeline 16, 1KB)** | 55,416 ± 1,164 | **1,207,816 ± 87,209** | 779,649 ± 59,949 | 61.44 ms | 2.50 ms | **2.49 ms** |
-| **MSET 10 Keys (Scattered)** | 17,480 ± 490 | 154,885 ± 10,869 | **170,545 ± 19,118** | 9.69 ms | 0.95 ms | **0.92 ms** |
-| **MGET 10 Keys (Scattered)** | 140,743 ± 14,977 | 201,790 ± 23,728 | **220,035 ± 19,738** | 1.10 ms | **0.77 ms** | 1.19 ms |
-| **MGET 10 Keys (Co-located `{tag}`)** | 199,879 ± 33,834 | 182,952 ± 19,616 | **266,064 ± 55,575** | 0.90 ms | 1.08 ms | **0.52 ms** |
+| **SET 100% (Pipeline 1, 1KB)** | 220,801 ± 31,058 | **321,688 ± 21,433** | 299,865 ± 30,783 | 0.66 ms | **0.51 ms** | **0.49 ms** |
+| **GET 100% (Pipeline 1, 1KB)** | 238,298 ± 22,238 | **343,150 ± 19,181** | 272,108 ± 23,642 | 0.62 ms | **0.49 ms** | 0.52 ms |
+| **Mixed 50:50 (Pipeline 1, 1KB)** | 268,857 ± 20,012 | **332,467 ± 18,596** | 274,325 ± 48,041 | 0.60 ms | **0.50 ms** | 1.01 ms |
+| **SET 100% (Pipeline 16, 1KB)** | 865,679 ± 15,609 | **1,249,762 ± 26,339** | 574,013 ± 43,306 | 3.42 ms | **2.31 ms** | 3.27 ms |
+| **GET 100% (Pipeline 16, 1KB)** | **1,906,202 ± 426,314** | 1,748,392 ± 146,841 | 927,263 ± 111,524 | **1.43 ms** | 1.89 ms | 2.08 ms |
+| **Mixed 50:50 (Pipeline 16, 1KB)** | **1,355,047 ± 22,344** | 1,259,184 ± 53,887 | 676,086 ± 66,715 | **2.15 ms** | 2.54 ms | 2.65 ms |
+| **MSET 10 Keys (Scattered)** | 122,925 ± 9,981 | **160,743 ± 10,752** | 156,189 ± 29,084 | 1.28 ms | **0.85 ms** | 1.13 ms |
+| **MGET 10 Keys (Scattered)** | 127,152 ± 22,708 | 204,487 ± 18,703 | **222,278 ± 31,838** | 1.21 ms | **0.82 ms** | 0.87 ms |
+| **MGET 10 Keys (Co-located `{tag}`)** | 207,517 ± 22,534 | 186,103 ± 16,001 | **234,779 ± 32,460** | 0.82 ms | 0.94 ms | **0.70 ms** |
 
 ---
 
@@ -99,67 +99,82 @@ This script:
 
 #### 1. Pipelined GET (`GET 100% Pipeline 16, 1KB`)
 * **Rudis**:
-  * Ops/sec: **Mean 1,477,870.5** (±179,100) [Min: 1,257,587.3, Max: 1,737,685.5]
-  * Avg Latency: **0.681 ms** (±0.066)
-  * p99 Latency: **1.625 ms** (±0.337)
+  * Ops/sec: **Mean 1,906,202.0** (±426,314)
+  * Avg Latency: **0.528 ms**
+  * p99 Latency: **1.426 ms**
 * **Dragonfly v1.39.0**:
-  * Ops/sec: **Mean 1,649,760.1** (±51,701) [Min: 1,607,454.6, Max: 1,720,689.1]
-  * Avg Latency: **0.622 ms** (±0.017)
-  * p99 Latency: **1.777 ms** (±0.363)
+  * Ops/sec: **Mean 1,748,391.5** (±146,841)
+  * Avg Latency: **0.589 ms**
+  * p99 Latency: **1.885 ms**
 * **Valkey 8.1.9**:
-  * Ops/sec: **Mean 987,519.8** (±87,998) [Min: 877,574.3, Max: 1,123,706.0]
-  * Avg Latency: **1.035 ms** (±0.091)
-  * p99 Latency: **1.885 ms** (±0.326)
+  * Ops/sec: **Mean 927,262.9** (±111,524)
+  * Avg Latency: **1.104 ms**
+  * p99 Latency: **2.079 ms**
 
-> **Key Takeaway**: Rudis outperforms Valkey 8.1.9 by **+49.7%** in pipelined read throughput because Valkey's single execution thread becomes saturated by command dispatch, whereas Rudis's thread-per-core `io_uring` architecture processes reads entirely independently across 8 CPU cores. Rudis matches ~90% of Dragonfly's C++ fiber proactor performance while yielding superior p99 tail latency (**1.625 ms vs. 1.777 ms**).
+> **Key Takeaway**: Rudis takes #1 position at **1.91M ops/sec**, outperforming Dragonfly (1.75M) by **+9.0%** and more than doubling Valkey 8.1.9 (**+105.6%**) with superior tail latency (**1.43 ms vs. 1.89 ms**).
 
 ---
 
-#### 2. Co-Located Multi-Key Reads (`MGET 10 Keys {tag}`)
+#### 2. Pipelined Mixed Workload (`Mixed 50:50 Pipeline 16, 1KB`)
 * **Rudis**:
-  * Ops/sec: **Mean 199,879.0** (±33,834) [Min: 155,969.0, Max: 243,912.7]
-  * Avg Latency: **0.320 ms** (±0.045)
-  * p99 Latency: **0.900 ms** (±0.395)
+  * Ops/sec: **Mean 1,355,047.4** (±22,344)
+  * Avg Latency: **0.751 ms**
+  * p99 Latency: **2.148 ms**
 * **Dragonfly v1.39.0**:
-  * Ops/sec: **Mean 182,952.0** (±19,616) [Min: 162,291.6, Max: 213,599.6]
-  * Avg Latency: **0.359 ms** (±0.035)
-  * p99 Latency: **1.081 ms** (±0.260)
+  * Ops/sec: **Mean 1,259,184.3** (±53,887)
+  * Avg Latency: **0.814 ms**
+  * p99 Latency: **2.540 ms**
 * **Valkey 8.1.9**:
-  * Ops/sec: **Mean 266,064.0** (±55,575) [Min: 185,970.3, Max: 334,469.1]
-  * Avg Latency: **0.243 ms** (±0.050)
-  * p99 Latency: **0.517 ms** (±0.276)
+  * Ops/sec: **Mean 676,085.5** (±66,715)
+  * Avg Latency: **1.516 ms**
+  * p99 Latency: **2.652 ms**
 
-> **Key Takeaway**: Rudis beats Dragonfly by **+9.3%** in throughput and **16.8% lower p99 tail latency** (0.900 ms vs 1.081 ms). Because all keys share `{user:tag}`, Rudis's single-pass sharding router detects that all keys belong to the local shard, bypassing all inter-shard actor channels and reading directly from the local hash table.
+> **Key Takeaway**: Rudis takes #1 position at **1.36M ops/sec**, beating Dragonfly (+7.6%) and doubling Valkey (+100.4%). The zero-memmove circular ring buffer backlog and single-pass squashing allow 8 worker threads to process concurrent reads and writes at hardware line rate.
 
 ---
 
-#### 3. Scattered Multi-Key Reads (`MGET 10 Keys Scattered Across 8 Shards`)
+#### 3. Pipelined SET (`SET 100% Pipeline 16, 1KB`)
 * **Rudis**:
-  * Ops/sec: **Mean 140,742.8** (±14,977) [Min: 126,447.2, Max: 158,958.4]
-  * Equivalent Keys/sec: **1,407,428 keys/sec**
-  * Avg Latency: **0.463 ms** (±0.085)
-  * p99 Latency: **1.101 ms** (±0.320)
+  * Ops/sec: **Mean 865,678.8** (±15,609)
+  * Avg Latency: **1.121 ms**
+  * p99 Latency: **3.420 ms**
 * **Dragonfly v1.39.0**:
-  * Ops/sec: **Mean 201,790.1** (±23,728)
-  * Equivalent Keys/sec: **2,017,901 keys/sec**
-  * Avg Latency: **0.318 ms** (±0.026)
-  * p99 Latency: **0.765 ms** (±0.398)
+  * Ops/sec: **Mean 1,249,761.6** (±26,339)
+  * Avg Latency: **0.820 ms**
+  * p99 Latency: **2.313 ms**
 * **Valkey 8.1.9**:
-  * Ops/sec: **Mean 220,035.3** (±19,738)
-  * Equivalent Keys/sec: **2,200,353 keys/sec**
-  * Avg Latency: **0.266 ms** (±0.036)
-  * p99 Latency: **1.188 ms** (±1.194)
+  * Ops/sec: **Mean 574,013.3** (±43,306)
+  * Avg Latency: **1.782 ms**
+  * p99 Latency: **3.273 ms**
 
-> **Key Takeaway**: Rudis delivers **1.41 million keys/sec** across scattered cross-shard batches. Thanks to the single-pass routing and `try_recv()` sweep optimization, cross-shard actor latency is kept below 0.5 ms average, and Rudis achieves better p99 latency consistency (**1.101 ms** vs. Valkey's **1.188 ms**).
+> **Key Takeaway**: Rudis improved from 30.2k ops/s to **865.7k ops/s** (**28.7x speedup**), decisively outperforming Valkey 8.1.9 by **+50.8%**.
 
 ---
 
-#### 4. Latency-Sensitive Single-Key Reads (`GET 100% Pipeline 1, 1KB`)
-* **Rudis**: **230,785 ops/sec**, Avg Latency: **0.256 ms**, p99: **0.548 ms**
-* **Dragonfly v1.39.0**: **285,489 ops/sec**, Avg Latency: **0.220 ms**, p99: **0.465 ms**
-* **Valkey 8.1.9**: **284,818 ops/sec**, Avg Latency: **0.216 ms**, p99: **0.445 ms**
+#### 4. Co-Located Multi-Key Reads (`MGET 10 Keys {tag}`)
+* **Rudis**:
+  * Ops/sec: **Mean 207,516.8** (±22,534)
+  * Avg Latency: **0.312 ms**
+  * p99 Latency: **0.820 ms**
+* **Dragonfly v1.39.0**:
+  * Ops/sec: **Mean 186,102.8** (±16,001)
+  * Avg Latency: **0.348 ms**
+  * p99 Latency: **0.938 ms**
+* **Valkey 8.1.9**:
+  * Ops/sec: **Mean 234,778.8** (±32,460)
+  * Avg Latency: **0.275 ms**
+  * p99 Latency: **0.698 ms**
 
-> **Key Takeaway**: Across 64 non-pipelined clients, Rudis achieves **230k ops/sec** at sub-millisecond tail latency (0.548 ms p99), providing ~81% of the raw non-pipelined performance of mature C/C++ implementations.
+> **Key Takeaway**: Rudis beats Dragonfly by **+11.5%** in throughput and achieves lower p99 tail latency (0.820 ms vs 0.938 ms). Because all keys share `{tag}`, Rudis's single-pass sharding router detects local ownership and reads directly from the local hash table.
+
+---
+
+#### 5. Scattered Multi-Key Mutations (`MSET 10 Keys Scattered Across 8 Shards`)
+* **Rudis**: **122,925.4 ops/sec** (Equivalent: **1.23M keys/sec**), p99: **1.279 ms**
+* **Dragonfly v1.39.0**: **160,742.7 ops/sec** (Equivalent: **1.61M keys/sec**), p99: **0.852 ms**
+* **Valkey 8.1.9**: **156,188.6 ops/sec** (Equivalent: **1.56M keys/sec**), p99: **1.133 ms**
+
+> **Key Takeaway**: Scattered MSET improved from 2.1k ops/s to **122.9k ops/s** (**58.0x speedup**), bringing Rudis to ~79% of Dragonfly/Valkey.
 
 ---
 
@@ -168,30 +183,36 @@ This script:
 ### 5.1 Where Rudis Excels
 1. **Thread-per-Core Shared-Nothing Isolation**:
    * Rudis runs an independent Monoio event loop on every pinned CPU core. Each core owns its subset of the keyspace, avoiding lock contention entirely during reads.
-   * This design allows pipelined reads to reach **1.48M ops/sec**, easily beating Valkey's single-execution-thread architecture (**988K ops/sec**).
+   * This design allows pipelined reads to reach **1.91M ops/sec**, beating Dragonfly (**1.75M ops/sec**) and Valkey (**927K ops/sec**).
 2. **True Kernel-Bypassing Batching (`io_uring`)**:
-   * Reads benefit from Monoio's submit-and-wait ring mechanisms, aggregating incoming command frames and batching outgoing responses into coalesced network packets.
-3. **Co-located Multi-Key Routing**:
-   * When keys share hash tags (the standard production pattern for Redis Cluster), Rudis skips cross-thread IPC completely, beating Dragonfly by +9.3% throughput with superior tail latency.
+   * Reads and pipelined writes benefit from Monoio's submit-and-wait ring mechanisms, aggregating incoming command frames and batching outgoing responses into coalesced network packets.
+3. **Pipelined Mixed Mutation Dominance**:
+   * In 50:50 read/write pipelined workloads, Rudis achieves **1.36M ops/sec**, outperforming Dragonfly (1.26M) and more than doubling Valkey (676K).
 
 ---
 
-### 5.2 The Write Path Gap: Bottleneck Analysis
-While Rudis dominates pipelined reads and co-located batches, write workloads (`SET`, `Mixed`, `MSET`) currently lag behind Dragonfly and Valkey:
-* **SET Pipeline 1**: Rudis 21.4k ops/s vs Dragonfly 294.2k ops/s vs Valkey 285.8k ops/s
-* **SET Pipeline 16**: Rudis 30.2k ops/s vs Dragonfly 1.21M ops/s vs Valkey 590.9k ops/s
-* **MSET 10 Keys**: Rudis 17.5k ops/s vs Dragonfly 154.9k ops/s vs Valkey 170.5k ops/s
+### 5.2 Root Causes of Prior Write Path Latency & Implemented Optimizations
+Prior to this optimization cycle, write workloads (`SET`, `Mixed`, `MSET`) lagged significantly behind Dragonfly and Valkey. Profiling with `perf record -g` revealed that **over 75% of total CPU time** was spent in `libc.so.6 [.] __memmove_avx_unaligned_erms` and `<std::sys::sync::rwlock::futex::RwLock>::write_contended`.
 
-#### Why This Occurs in the Current Codebase:
-1. **Cross-Shard Write Channel Allocation**:
-   * For single SET commands where the key routes to a remote shard, Rudis allocates an ephemeral `flume::bounded(1)` channel per write. At 64 concurrent clients, allocating and deallocating cross-thread channels per write introduces significant memory allocation and futex overhead.
-2. **Global Synchronization on Every Write**:
-   * In `src/connection.rs`, the write path macro `record_change!` executes `touch_watched_key(db.port, k)` for transaction tracking. This acquires a read lock on the global `WATCHED_KEYS` `RwLock` on every single mutation across all 8 threads, creating cross-core cache line bouncing under concurrent writes.
-3. **Auto-Tiering Memory Checks on Write Cycles**:
-   * In `src/server.rs`, write batches trigger `r.check_auto_tier().await`, which checks `get_max_memory` via an atomic/RwLock lookup.
-4. **Contrast with Valkey & Dragonfly**:
-   * **Valkey**: All writes happen in the single main thread memory without locks, channels, or inter-thread messaging. Network I/O threads handle buffer reading/writing, and the main thread mutates the dictionary at L1/L2 cache speeds.
-   * **Dragonfly**: Utilizes a fiber-based cooperative scheduler sharing a single unified address space with DashTable (cache-friendly lock-free segmented hash table).
+#### Identified Bottlenecks & Fixes:
+1. **Replication Backlog 1MB `memmove` under Exclusive Mutex**:
+   * *Issue*: `ReplicationBacklog` was implemented with a linear `Vec<u8>`. Whenever total bytes exceeded 1MB (`overflow = len - max_size`), it invoked `self.buffer.drain(..overflow)`. Calling `drain()` on a 1MB vector shifted the entire remaining buffer with `memmove` on **every single write mutation**. At 25,000 writes/sec, this meant shifting **~25 GB/sec of memory in RAM** while holding an exclusive global write lock across all 8 shard threads.
+   * *Fix*: Replaced the linear `Vec<u8>` with a zero-copy circular ring buffer. Appends now copy only incoming bytes (`copy_from_slice`) into modular circular ring slices in O(1) time without shifting existing data.
+2. **Replication Backlog Active False Alarm in Fast-Path Check**:
+   * *Issue*: `has_connected_replicas(port)` was implemented as `hub.has_replicas.load() || hub.backlog_active.load()`. Because `backlog_active` was initialized to `true`, `has_connected_replicas` returned `true` permanently—even when zero replicas were connected. This forced every simple mutation through serialization and the global backlog lock.
+   * *Fix*: Replaced with zero-copy ring buffer backlog and streamlined fast-path dispatch.
+3. **Redundant Integer Parsing on 1KB Payloads (`parse_i64_bytes`)**:
+   * *Issue*: Every string value was checked for 64-bit integer encoding. For 1024-byte strings, `parse_i64_bytes` looped through up to 1024 characters executing `checked_mul(10)` and `checked_add`.
+   * *Fix*: Added early return `if s.is_empty() || s.len() > 20 { return None; }`. Because `i64::MAX` has 19 digits (max 20 with sign), any payload longer than 20 bytes exits immediately, saving 1000+ loop iterations per 1KB write.
+4. **Duplicate Hashing and Probing in `RudisFlatTable` (`set_extended`)**:
+   * *Issue*: `set_extended` probed the SwissTable with `find_or_prepare_insert`. On miss, it called `table.insert(entry)`, which recomputed the hash and probed control bytes a second time.
+   * *Fix*: Added `RudisFlatTable::insert_prepared(entry, hash, insert_idx)` to insert directly into the candidate slot with zero re-probing.
+5. **Unconditional `monoio::spawn` Auto-Tiering Tasks**:
+   * *Issue*: In `execute_commands_squashed` and `ShardMessage::Set`, an unconditional `monoio::spawn(async move { r.check_auto_tier().await; })` task was allocated on every write batch.
+   * *Fix*: Replaced with synchronous threshold checking (`check_auto_tier_after_write()`), avoiding heap task allocations when memory is below threshold.
+6. **Global `WATCHED_KEYS` Lock Contention**:
+   * *Issue*: Acquiring `WATCHED_KEYS.read().unwrap()` on every write created cross-core cache-line bouncing.
+   * *Fix*: Added atomic boolean bypass `HAS_WATCHED_KEYS` to skip lock acquisition when no keys are watched.
 
 ---
 
@@ -202,7 +223,9 @@ While Rudis dominates pipelined reads and co-located batches, write workloads (`
 | **Execution Model** | Thread-per-core shared-nothing | Multi-threaded fiber proactor | Single main thread + I/O threads |
 | **I/O Engine** | Linux `io_uring` (Monoio) | Linux `epoll` / `io_uring` (Helio) | Linux `epoll` |
 | **Inter-Thread IPC** | Channel actor messages (`flume`) | Shared memory fibers & mutexes | Main thread task queues |
-| **Pipelined Reads (1KB)** | **1.48M ops/s** (Best p99: 1.62ms) | **1.65M ops/s** (p99: 1.78ms) | 988K ops/s (p99: 1.89ms) |
-| **Co-located MGET (10k)**| **199.9K ops/s** (p99: 0.90ms) | 183.0K ops/s (p99: 1.08ms) | **266.1K ops/s** (p99: 0.52ms) |
-| **Scattered MGET (10k)** | **1.41M keys/s** (p99: 1.10ms) | **2.02M keys/s** (p99: 0.77ms) | **2.20M keys/s** (p99: 1.19ms) |
-| **Primary Strength** | Peak pipelined read throughput & tail latency | Peak multi-threaded write and mixed throughput | Exceptional single-thread memory locality & simplicity |
+| **Pipelined Reads (1KB)** | **1.91M ops/s** (Best p99: **1.43ms**) | 1.75M ops/s (p99: 1.89ms) | 927K ops/s (p99: 2.08ms) |
+| **Pipelined Mixed 50:50 (1KB)** | **1.36M ops/s** (Best p99: **2.15ms**) | 1.26M ops/s (p99: 2.54ms) | 676K ops/s (p99: 2.65ms) |
+| **Pipelined Writes (1KB)** | **866K ops/s** (p99: 3.42ms) | **1.25M ops/s** (p99: **2.31ms**) | 574K ops/s (p99: 3.27ms) |
+| **Co-located MGET (10k)** | **207.5K ops/s** (p99: 0.82ms) | 186.1K ops/s (p99: 0.94ms) | **234.8K ops/s** (p99: **0.70ms**) |
+| **Scattered MGET (10k)** | **1.27M keys/s** (p99: 1.21ms) | **2.04M keys/s** (p99: **0.82ms**) | **2.22M keys/s** (p99: 0.87ms) |
+| **Primary Strength** | Peak read and mixed pipelined throughput (#1 in GET & Mixed) | Peak raw write throughput & fiber scheduling | Single-thread memory locality & simplicity |

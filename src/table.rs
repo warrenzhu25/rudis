@@ -1234,6 +1234,21 @@ impl RudisFlatTable {
         }
     }
 
+    #[inline(always)]
+    pub fn insert_prepared(&mut self, entry: RudisEntry, hash: u64, insert_idx: usize) {
+        if self.growth_left == 0 {
+            self.insert(entry);
+            return;
+        }
+        let tag = fingerprint(hash);
+        self.set_ctrl(insert_idx, tag);
+        let slot = crate::router::key_slot(&entry.key) as usize;
+        self.slot_counts[slot] += 1;
+        self.slots[insert_idx] = Some(entry);
+        self.items += 1;
+        self.growth_left = self.growth_left.saturating_sub(1);
+    }
+
     pub fn remove(&mut self, slot_idx: usize) -> Option<RudisEntry> {
         self.set_ctrl(slot_idx, DELETED);
         self.items -= 1;
@@ -1483,7 +1498,7 @@ impl RudisTable {
             b'+' => (false, &bytes[1..]),
             _ => (false, bytes),
         };
-        if s.is_empty() {
+        if s.is_empty() || s.len() > 20 {
             return None;
         }
         let mut val: u64 = 0;
@@ -1497,7 +1512,11 @@ impl RudisTable {
             if val > (i64::MIN.unsigned_abs()) {
                 return None;
             }
-            Some(-(val as i64))
+            if val == i64::MIN.unsigned_abs() {
+                Some(i64::MIN)
+            } else {
+                Some(-(val as i64))
+            }
         } else {
             if val > (i64::MAX as u64) {
                 return None;
@@ -1524,7 +1543,7 @@ impl RudisTable {
             RudisValue::String(value)
         };
         let val_bytes = val.approx_bytes();
-        let (existing, _) = self.table.find_or_prepare_insert(&key, h);
+        let (existing, candidate_idx) = self.table.find_or_prepare_insert(&key, h);
         if let Some(idx) = existing
             && let Some(entry) = self.table.get_slot_mut(idx)
         {
@@ -1548,7 +1567,7 @@ impl RudisTable {
             val,
             expire_at,
         };
-        self.table.insert(entry);
+        self.table.insert_prepared(entry, h, candidate_idx);
         self.used_memory += entry_mem;
     }
 
@@ -8263,5 +8282,31 @@ mod tests {
     fn test_compute_digest() {
         let digest = compute_digest(b"v8lf0c11xh8ymlqztfd3eeq16kfn4sspw7fqmnuuq3k3t75em5wdizgcdw7uc26nnf961u2jkfzkjytls2kwlj7626sd");
         assert_eq!(digest, "00006c38adf31777");
+    }
+
+    #[test]
+    fn test_parse_i64_bytes_and_insert_prepared() {
+        // Normal integers
+        assert_eq!(RudisTable::parse_i64_bytes(b"0"), Some(0));
+        assert_eq!(RudisTable::parse_i64_bytes(b"12345"), Some(12345));
+        assert_eq!(RudisTable::parse_i64_bytes(b"-9876"), Some(-9876));
+        assert_eq!(RudisTable::parse_i64_bytes(b"+42"), Some(42));
+        assert_eq!(RudisTable::parse_i64_bytes(b"9223372036854775807"), Some(i64::MAX));
+        assert_eq!(RudisTable::parse_i64_bytes(b"-9223372036854775808"), Some(i64::MIN));
+
+        // Long non-integers (>20 digits) early exit
+        let long_payload = vec![b'a'; 1024];
+        assert_eq!(RudisTable::parse_i64_bytes(&long_payload), None);
+        let long_digits = vec![b'9'; 25];
+        assert_eq!(RudisTable::parse_i64_bytes(&long_digits), None);
+
+        // Test insert_prepared
+        let mut table = RudisTable::new();
+        table.set(Bytes::from("prep_k1"), Bytes::from("val1"), None);
+        assert_eq!(table.get(b"prep_k1").unwrap(), Some(Bytes::from("val1")));
+
+        // Update with insert_prepared path
+        table.set(Bytes::from("prep_k1"), Bytes::from("val2"), None);
+        assert_eq!(table.get(b"prep_k1").unwrap(), Some(Bytes::from("val2")));
     }
 }

@@ -315,7 +315,14 @@ pub fn record_cmd_stat(name: &str) {
     }
 }
 
+pub static HAS_WATCHED_KEYS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn watch_keys(port: u16, client_id: u64, keys: &[Bytes]) {
+    if keys.is_empty() {
+        return;
+    }
+    HAS_WATCHED_KEYS.store(true, std::sync::atomic::Ordering::Relaxed);
     let mut map = WATCHED_KEYS.write().unwrap();
     let port_map = map.entry(port).or_default();
     for k in keys {
@@ -329,6 +336,9 @@ pub fn watch_keys(port: u16, client_id: u64, keys: &[Bytes]) {
 }
 
 pub fn unwatch_keys(port: u16, client_id: u64) {
+    if !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let mut map = WATCHED_KEYS.write().unwrap();
     if let Some(port_map) = map.get_mut(&port) {
         for set in port_map.values_mut() {
@@ -339,9 +349,15 @@ pub fn unwatch_keys(port: u16, client_id: u64) {
         .write()
         .unwrap()
         .remove(&(port, client_id));
+    if map.values().all(|pm| pm.values().all(|s| s.is_empty())) {
+        HAS_WATCHED_KEYS.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 pub fn is_watch_tainted(port: u16, client_id: u64) -> bool {
+    if !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
     CLIENT_WATCH_TAINTED
         .read()
         .unwrap()
@@ -350,7 +366,11 @@ pub fn is_watch_tainted(port: u16, client_id: u64) -> bool {
         .unwrap_or(false)
 }
 
+#[inline(always)]
 pub fn touch_watched_key(port: u16, key: &[u8]) {
+    if !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let map = WATCHED_KEYS.read().unwrap();
     if let Some(port_map) = map.get(&port)
         && let Some(clients) = port_map.get(key)
@@ -3006,6 +3026,22 @@ async fn execute_command(
         } => {
             let target = target_shard(&key, router.num_shards);
             if target == router.shard_id {
+                if condition == crate::resp::SetCondition::None
+                    && !get
+                    && !keepttl
+                    && !past_expired
+                    && router.aof.is_none()
+                    && !crate::replication::has_connected_replicas(router.port)
+                {
+                    notify_key_invalidation(router.port, key.as_ref(), client_id);
+                    router
+                        .local_db
+                        .borrow_mut()
+                        .set_extended(key, value, expire_in, false);
+                    router.check_auto_tier_after_write();
+                    out.extend_from_slice(b"+OK\r\n");
+                    return false;
+                }
                 let mut db = router.local_db.borrow_mut();
                 let current_val = match db.table.get(&key) {
                     Ok(val) => val,
@@ -3155,21 +3191,32 @@ async fn execute_command(
                 false
             } else {
                 notify_key_invalidation(router.port, key.as_ref(), client_id);
-                let resp = router
-                    .execute_remote(
-                        target,
-                        Command::Set {
-                            key,
-                            value,
-                            expire_in,
-                            condition,
-                            get,
-                            keepttl,
-                            past_expired,
-                        },
-                    )
-                    .await;
-                out.extend_from_slice(&resp);
+                if condition == crate::resp::SetCondition::None
+                    && !get
+                    && !keepttl
+                    && !past_expired
+                    && router.aof.is_none()
+                    && !crate::replication::has_connected_replicas(router.port)
+                {
+                    router.set(key, value, expire_in).await;
+                    out.extend_from_slice(b"+OK\r\n");
+                } else {
+                    let resp = router
+                        .execute_remote(
+                            target,
+                            Command::Set {
+                                key,
+                                value,
+                                expire_in,
+                                condition,
+                                get,
+                                keepttl,
+                                past_expired,
+                            },
+                        )
+                        .await;
+                    out.extend_from_slice(&resp);
+                }
                 false
             }
         }
@@ -11600,6 +11647,17 @@ async fn execute_commands_squashed(
 ) -> bool {
     let mut can_squash = *authenticated;
     if can_squash {
+        let acl = crate::acl::get_acl_for_port(router.port);
+        let acl_guard = acl.read().unwrap();
+        let user = acl_guard.get_user(auth_user);
+        let hub = crate::cluster::get_cluster_hub(router.port);
+        let nodes_guard = hub.nodes.read().unwrap();
+        let is_cluster_active = !nodes_guard.is_empty();
+        let my_slots_guard = if is_cluster_active {
+            Some(hub.my_slots.read().unwrap())
+        } else {
+            None
+        };
         for cmd in &commands {
             if matches!(
                 cmd,
@@ -11635,21 +11693,17 @@ async fn execute_commands_squashed(
                 can_squash = false;
                 break;
             }
-            {
-                let acl = crate::acl::get_acl_for_port(router.port);
-                let acl_guard = acl.read().unwrap();
-                if let Some(user) = acl_guard.get_user(auth_user) {
-                    let cmd_name = get_cmd_name(cmd);
-                    if !user.can_execute_command(cmd_name) {
-                        can_squash = false;
-                        break;
-                    }
-                    if let Some(k) = cmd_primary_key(cmd)
-                        && !user.can_access_key(k.as_ref())
-                    {
-                        can_squash = false;
-                        break;
-                    }
+            if let Some(user) = &user {
+                let cmd_name = get_cmd_name(cmd);
+                if !user.can_execute_command(cmd_name) {
+                    can_squash = false;
+                    break;
+                }
+                if let Some(k) = cmd_primary_key(cmd)
+                    && !user.can_access_key(k.as_ref())
+                {
+                    can_squash = false;
+                    break;
                 }
             }
             if let Some(k) = cmd_primary_key(cmd) {
@@ -11658,13 +11712,12 @@ async fn execute_commands_squashed(
                     can_squash = false;
                     break;
                 }
-                let hub = crate::cluster::get_cluster_hub(router.port);
-                let my_slots = hub.my_slots.read().unwrap();
-                let owns_slot = my_slots.iter().any(|&(s, e)| slot >= s && slot <= e);
-                let nodes = hub.nodes.read().unwrap();
-                if !owns_slot && !nodes.is_empty() {
-                    can_squash = false;
-                    break;
+                if let Some(my_slots) = &my_slots_guard {
+                    let owns_slot = my_slots.iter().any(|&(s, e)| slot >= s && slot <= e);
+                    if !owns_slot {
+                        can_squash = false;
+                        break;
+                    }
                 }
             } else if !matches!(
                 cmd,
@@ -11738,6 +11791,21 @@ async fn execute_commands_squashed(
                     } else {
                         local_buf.extend_from_slice(b"$-1\r\n");
                     }
+                } else if router.aof.is_none()
+                    && !crate::replication::has_connected_replicas(router.port)
+                    && let Command::Set {
+                        key,
+                        value,
+                        expire_in,
+                        condition: crate::resp::SetCondition::None,
+                        get: false,
+                        keepttl: false,
+                        past_expired: false,
+                    } = cmd
+                {
+                    has_local_writes = true;
+                    router.local_db.borrow_mut().table.set(key, value, expire_in);
+                    local_buf.extend_from_slice(b"+OK\r\n");
                 } else {
                     if matches!(
                         cmd,
@@ -11791,10 +11859,7 @@ async fn execute_commands_squashed(
     }
 
     if has_local_writes {
-        let r = router.clone();
-        monoio::spawn(async move {
-            r.check_auto_tier().await;
-        });
+        router.check_auto_tier_after_write();
     }
 
     // 2. Dispatch batched hops to all remote shards in parallel using pre-allocated channels
@@ -11955,6 +12020,30 @@ mod tests {
         record_client_read(port, cid, b"test_key");
 
         unregister_client_tracking(port, cid);
+    }
+
+    #[test]
+    fn test_watched_keys_atomic_bypass() {
+        let port = 65431;
+        let cid = 888888;
+        assert!(!is_watch_tainted(port, cid));
+
+        // When no keys are watched, touch_watched_key returns immediately
+        touch_watched_key(port, b"unwatched_key");
+        assert!(!is_watch_tainted(port, cid));
+
+        // Watch a key -> HAS_WATCHED_KEYS becomes true
+        watch_keys(port, cid, &[Bytes::from("watched_k")]);
+        assert!(HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!is_watch_tainted(port, cid));
+
+        // Mutate watched key -> marks client tainted
+        touch_watched_key(port, b"watched_k");
+        assert!(is_watch_tainted(port, cid));
+
+        // Unwatch clears taint
+        unwatch_keys(port, cid);
+        assert!(!is_watch_tainted(port, cid));
     }
 }
 

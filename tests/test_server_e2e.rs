@@ -6127,6 +6127,70 @@ fn test_mget_fast_harvest_try_recv_sweep_e2e() {
     assert_eq!(resp, "*4\r\n$4\r\nval0\r\n$4\r\nval1\r\n$4\r\nval2\r\n$4\r\nval3\r\n");
 }
 
+#[test]
+fn test_pipelined_fast_path_set_and_scattered_mset_e2e() {
+    let port = 16707;
+    start_test_server(port, 4);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("Failed to connect client");
+    client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+
+    // 1. Pipelined fast-path SET with 1KB payloads (16 commands in single write)
+    let val_1kb = vec![b'v'; 1024];
+    let val_1kb_str = std::str::from_utf8(&val_1kb).unwrap();
+    let mut pipeline_req = Vec::new();
+    for i in 0..16 {
+        pipeline_req.extend_from_slice(
+            format!("*3\r\n$3\r\nSET\r\n${}\r\nfast_k_{}\r\n$1024\r\n{}\r\n", 7 + i.to_string().len(), i, val_1kb_str).as_bytes()
+        );
+    }
+    client.write_all(&pipeline_req).unwrap();
+
+    let mut resp_buf = vec![0u8; 16 * 5];
+    client.read_exact(&mut resp_buf).unwrap();
+    let expected_ok = "+OK\r\n".repeat(16);
+    assert_eq!(std::str::from_utf8(&resp_buf).unwrap(), expected_ok);
+
+    // 2. Verify values via pipelined GET
+    let mut pipeline_get = Vec::new();
+    for i in 0..16 {
+        pipeline_get.extend_from_slice(format!("GET fast_k_{}\r\n", i).as_bytes());
+    }
+    client.write_all(&pipeline_get).unwrap();
+
+    let mut get_resp = Vec::new();
+    let mut temp = [0u8; 4096];
+    let expected_get_len = 16 * (7 + 1024 + 2); // $1024\r\n<1024 bytes>\r\n per key
+    while get_resp.len() < expected_get_len {
+        let n = client.read(&mut temp).unwrap();
+        if n == 0 { break; }
+        get_resp.extend_from_slice(&temp[..n]);
+    }
+    let get_resp_str = String::from_utf8_lossy(&get_resp);
+    for i in 0..16 {
+        assert!(get_resp_str.contains(val_1kb_str), "Missing 1KB payload for fast_k_{}", i);
+    }
+
+    // 3. Multi-key scattered MSET across shards
+    let mut mset_cmd = "MSET".to_string();
+    for i in 0..10 {
+        mset_cmd.push_str(&format!(" scatt_k_{} scatt_v_{}", i, i));
+    }
+    mset_cmd.push_str("\r\n");
+    assert_eq!(send_and_read(&mut client, mset_cmd.as_bytes()), "+OK\r\n");
+
+    // 4. Verify scattered keys with MGET
+    let mut mget_cmd = "MGET".to_string();
+    for i in 0..10 {
+        mget_cmd.push_str(&format!(" scatt_k_{}", i));
+    }
+    mget_cmd.push_str("\r\n");
+    let mget_resp = send_and_read(&mut client, mget_cmd.as_bytes());
+    for i in 0..10 {
+        assert!(mget_resp.contains(&format!("scatt_v_{}", i)));
+    }
+}
+
 
 
 

@@ -28,6 +28,8 @@ pub struct ConnectedReplica {
 
 pub struct ReplicationBacklog {
     pub buffer: Vec<u8>,
+    pub write_idx: usize,
+    pub len: usize,
     pub max_size: usize,
     pub first_byte_offset: u64,
 }
@@ -35,27 +37,54 @@ pub struct ReplicationBacklog {
 impl ReplicationBacklog {
     pub fn new(max_size: usize) -> Self {
         Self {
-            buffer: Vec::with_capacity(max_size),
+            buffer: vec![0u8; max_size],
+            write_idx: 0,
+            len: 0,
             max_size,
             first_byte_offset: 1,
         }
     }
 
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub fn append(&mut self, data: &[u8], current_master_offset: u64) {
-        self.buffer.extend_from_slice(data);
-        if self.buffer.len() > self.max_size {
-            let overflow = self.buffer.len() - self.max_size;
-            self.buffer.drain(..overflow);
-            self.first_byte_offset =
-                current_master_offset.saturating_sub(self.buffer.len() as u64) + 1;
+        let n = data.len();
+        if n == 0 {
+            return;
         }
+        if n >= self.max_size {
+            let slice = &data[n - self.max_size..];
+            self.buffer[..self.max_size].copy_from_slice(slice);
+            self.write_idx = 0;
+            self.len = self.max_size;
+            self.first_byte_offset = current_master_offset.saturating_sub(self.max_size as u64) + 1;
+            return;
+        }
+
+        let first_chunk = (self.max_size - self.write_idx).min(n);
+        self.buffer[self.write_idx..self.write_idx + first_chunk].copy_from_slice(&data[..first_chunk]);
+        let second_chunk = n - first_chunk;
+        if second_chunk > 0 {
+            self.buffer[..second_chunk].copy_from_slice(&data[first_chunk..]);
+        }
+        self.write_idx = (self.write_idx + n) % self.max_size;
+        self.len = (self.len + n).min(self.max_size);
+        self.first_byte_offset = current_master_offset.saturating_sub(self.len as u64) + 1;
     }
 
     pub fn can_partial_sync(&self, target_offset: u64, current_master_offset: u64) -> bool {
         if target_offset > current_master_offset + 1 {
             return false;
         }
-        if self.buffer.is_empty() {
+        if self.len == 0 {
             return target_offset == current_master_offset + 1;
         }
         target_offset >= self.first_byte_offset
@@ -68,12 +97,19 @@ impl ReplicationBacklog {
         if target_offset == current_master_offset + 1 {
             return Some(Vec::new());
         }
-        let start_idx = (target_offset.saturating_sub(self.first_byte_offset)) as usize;
-        if start_idx <= self.buffer.len() {
-            Some(self.buffer[start_idx..].to_vec())
-        } else {
-            None
+        let diff_len = (current_master_offset + 1 - target_offset) as usize;
+        if diff_len > self.len {
+            return None;
         }
+        let mut out = vec![0u8; diff_len];
+        let read_start = (self.write_idx + self.max_size - diff_len) % self.max_size;
+        let first_chunk = (self.max_size - read_start).min(diff_len);
+        out[..first_chunk].copy_from_slice(&self.buffer[read_start..read_start + first_chunk]);
+        let second_chunk = diff_len - first_chunk;
+        if second_chunk > 0 {
+            out[first_chunk..].copy_from_slice(&self.buffer[..second_chunk]);
+        }
+        Some(out)
     }
 }
 
@@ -387,7 +423,7 @@ impl ReplicationHub {
                     second_offset,
                     backlog.max_size,
                     backlog.first_byte_offset,
-                    backlog.buffer.len()
+                    backlog.len()
                 )
             }
             ReplicationRole::Slave {
@@ -727,7 +763,7 @@ mod tests {
 
         // Append 10 bytes: "0123456789"
         backlog.append(b"0123456789", 10);
-        assert_eq!(backlog.buffer.len(), 10);
+        assert_eq!(backlog.len(), 10);
         assert_eq!(backlog.first_byte_offset, 1);
         assert!(backlog.can_partial_sync(1, 10));
         assert!(backlog.can_partial_sync(6, 10));
@@ -743,7 +779,7 @@ mod tests {
 
         // Overflow backlog (max_size is 20, append 15 bytes -> total 25 bytes, drain 5)
         backlog.append(b"abcdefghijklmno", 25);
-        assert_eq!(backlog.buffer.len(), 20);
+        assert_eq!(backlog.len(), 20);
         // first_byte_offset = 25 - 20 + 1 = 6
         assert_eq!(backlog.first_byte_offset, 6);
         // target < 6 cannot partial sync

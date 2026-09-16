@@ -289,10 +289,7 @@ pub fn run_shard_worker(
                             {
                                 aof.borrow_mut().append(&bytes);
                             }
-                        let r = cross_shard_router.clone();
-                        monoio::spawn(async move {
-                            r.check_auto_tier().await;
-                        });
+                        cross_shard_router.check_auto_tier_after_write();
                         let _ = responder.send(());
                     }
                     ShardMessage::Del { key, responder } => {
@@ -433,6 +430,21 @@ pub fn run_shard_worker(
                                         } else {
                                             temp_buf.extend_from_slice(b"$-1\r\n");
                                         }
+                                    } else if aof_ref.is_none()
+                                        && !crate::replication::has_connected_replicas(r.port)
+                                        && let Command::Set {
+                                            key,
+                                            value,
+                                            expire_in,
+                                            condition: crate::resp::SetCondition::None,
+                                            get: false,
+                                            keepttl: false,
+                                            past_expired: false,
+                                        } = cmd
+                                    {
+                                        has_writes = true;
+                                        r.local_db.borrow_mut().table.set(key, value, expire_in);
+                                        temp_buf.extend_from_slice(b"+OK\r\n");
                                     } else {
                                         if matches!(cmd, Command::Set { .. } | Command::Del(_) | Command::IncrBy { .. }) {
                                             has_writes = true;
@@ -443,7 +455,7 @@ pub fn run_shard_worker(
                                     results.push((idx, crate::shard::CompactResp::from_slice(&temp_buf)));
                                 }
                                 if has_writes {
-                                    r.check_auto_tier().await;
+                                    r.check_auto_tier_after_write();
                                 }
                                 let _ = responder.send(results);
                             });
@@ -456,10 +468,34 @@ pub fn run_shard_worker(
                             let mut has_writes = false;
                             for (idx, cmd) in items {
                                 temp_buf.clear();
-                                if matches!(cmd, Command::Set { .. } | Command::Del(_) | Command::IncrBy { .. }) {
+                                if let Command::Get(ref key) = cmd {
+                                    let val = db.get(key);
+                                    if let Some(v) = val {
+                                        crate::connection::write_resp_bulk(&mut temp_buf, &v);
+                                    } else {
+                                        temp_buf.extend_from_slice(b"$-1\r\n");
+                                    }
+                                } else if aof_ref.is_none()
+                                    && !crate::replication::has_connected_replicas(cross_shard_router.port)
+                                    && let Command::Set {
+                                        key,
+                                        value,
+                                        expire_in,
+                                        condition: crate::resp::SetCondition::None,
+                                        get: false,
+                                        keepttl: false,
+                                        past_expired: false,
+                                    } = cmd
+                                {
                                     has_writes = true;
+                                    db.table.set(key, value, expire_in);
+                                    temp_buf.extend_from_slice(b"+OK\r\n");
+                                } else {
+                                    if matches!(cmd, Command::Set { .. } | Command::Del(_) | Command::IncrBy { .. }) {
+                                        has_writes = true;
+                                    }
+                                    let _ = execute_local_command(&cmd, &mut db, &mut temp_buf, aof_ref);
                                 }
-                                let _ = execute_local_command(&cmd, &mut db, &mut temp_buf, aof_ref);
                                 results.push((idx, crate::shard::CompactResp::from_slice(&temp_buf)));
                             }
                             drop(db);
