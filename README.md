@@ -37,7 +37,7 @@ A ultra-high-performance, **multi-threaded**, **shared-nothing** Redis-compatibl
 
 > **Contributor Learning Guides**:
 > - [**Rudis Internals & Architecture Guide**](docs/rudis_internals_guide.md): Exhaustive, self-contained walkthrough of the engine, data structures, and lock-free routing.
-> - [**Component Architecture Documentation**](docs/components.md): Dedicated, deep-dive specifications for all 15 individual subsystems (`RudisTable`, `BlockHub`, Tiering, Vector, Search, XDP, CRDTs, etc.), in one file.
+> - [**Component Architecture Documentation**](docs/components.md): Dedicated, deep-dive specifications for all 19 individual subsystems (`RudisTable`, `BlockHub`, Tiering, Vector, Search, XDP, CRDTs, JSON, Geo, Probabilistic structures, Pub/Sub, etc.), in one file.
 
 ---
 
@@ -667,7 +667,7 @@ rudis/
 ├── Cargo.toml
 ├── docs/
 │   ├── rudis_internals_guide.md # Comprehensive internal architecture & contributor learning guide
-│   ├── components/            # Detailed documentation for all 15 core subsystems
+│   ├── components.md          # Detailed documentation for all 19 core subsystems
 │   └── benchmarks/
 │       ├── README.md          # Benchmark index and directory catalog
 │       ├── comprehensive_performance_guide.md # Master performance whitepaper

@@ -16,10 +16,11 @@ See `agent.md`'s "Core Architectural Invariants" for the non-negotiable rules th
 modules exist to satisfy, and `docs/benchmarks/` for the performance numbers referenced
 throughout.
 
-> **Relationship to `docs/components.md`**: that single file covers 15 subsystems (Components
-> 01-15), including 10 (blocking ops, tiering, vector search, RediSearch, kernel bypass,
-> cluster gossip, CRDT replication, Lua scripting, persistence, security/TLS) this doc doesn't
-> touch at all. Its Components 01-05 cover the same five subsystems as the five parts below and
+> **Relationship to `docs/components.md`**: that single file covers 19 subsystems (Components
+> 01-19), including 14 (blocking ops, tiering, vector search, RediSearch, kernel bypass,
+> cluster gossip, CRDT replication, Lua scripting, persistence, security/TLS, JSON, geospatial,
+> probabilistic structures, pub/sub) this doc doesn't touch at all. Its Components 01-05 cover
+> the same five subsystems as the five parts below and
 > have since been rewritten and verified against the current source (they previously didn't
 > match — see that file's own intro for history); the two doc sets should now agree, but this
 > doc still predates several major additions to `RudisValue` (`Int`, `SmallHash`, `List`,

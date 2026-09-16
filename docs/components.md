@@ -1,12 +1,12 @@
 # Rudis Component Architecture Documentation
 
-This is the single reference for how every core module of `rudis` works — 15 subsystems,
-each a deep-dive against the **real, current source**, not an idealized description. It
-merges what used to be 15 separate files (`docs/components/01_*.md` ... `15_*.md`) into one
-document so the whole system can be read start to finish or jumped into by component number.
-Cross-references between components (e.g. "see Component 04 §7") still work exactly as
-written — every component keeps its original number, just as a `##` section in this file
-instead of its own file.
+This is the single reference for how every core module of `rudis` works — 19 subsystems,
+each a deep-dive against the **real, current source**, not an idealized description. Components
+01-15 merge what used to be 15 separate files (`docs/components/01_*.md` ... `15_*.md`) into
+one document; Components 16-19 (JSON, Geospatial, Probabilistic structures, Pub/Sub) were
+written directly here to close the remaining gap in module coverage. Cross-references between
+components (e.g. "see Component 04 §7") work exactly as written — every component keeps its
+own number as a `##` section in this file.
 
 > ℹ️ **All 15 sections were rewritten and verified against the real source** (each claim,
 > struct, and code excerpt checked against the actual `src/` file it documents — see each
@@ -51,6 +51,10 @@ instead of its own file.
 | **13** | **Lua Scripting & Redis 7 Functions Engine** | `src/scripting.rs` | A fresh `mlua::Lua` VM per call (no persistent interpreter or bytecode cache), SHA1-cached script/library *source text*, real `redis.call`/`redis.pcall` via the normal command-execution path. `FCALL`'s AOF-bypass bug is now fixed. |
 | **14** | **Persistence & Replication Engines** | `src/replication.rs`, `src/aof.rs` | Still no AOF rewrite/compaction — the file grows forever. Partial `PSYNC` resync (`+CONTINUE`) is now real on the master side, but Rudis's own replica always sends `PSYNC ? -1`, so a Rudis-to-Rudis pair never actually exercises it. A real custom RDB binary format with a CRC64 trailer. |
 | **15** | **Security, Memory Allocator & TLS** | `src/acl.rs`, `src/allocator.rs`, `src/tls.rs` | ACL now hashes passwords (SHA1 with a hardcoded global salt — weak, and the plaintext is *still also* stored) and genuinely enforces per-command/per-key permissions. TLS is now wired to a `--tls-port` listener, but has a **critical live bug**: its kTLS fast-path marks itself active without ever installing kernel key material, so it silently sends all "encrypted" traffic in cleartext. |
+| **16** | **JSON Document Store & JSONPath Engine** | `src/json.rs` | A real, hand-written JSONPath subset (no recursive descent, no filter expressions) over `serde_json::Value`. Single-key commands genuinely route per-shard, unlike Vector (08); `JSON.MGET` is still sequential per-key, unlike the already-fixed `MGET`/`MSET`. Not included in RDB persistence. |
+| **17** | **Geospatial Commands** | `src/geo.rs` | Owns zero storage — every `GEO*` command is a thin layer over `ZADD`/`ZSCORE`/`ZRANGE` (Component 05), matching real Redis's own architecture. `GEORADIUS`/`GEORADIUSBYMEMBER`/`GEOSEARCH` are three independent O(N) full-set brute-force scans, not geohash-neighborhood-pruned. |
+| **18** | **Probabilistic Data Structures** | `src/probabilistic.rs` | Real Bloom filter, Cuckoo filter (with real eviction and deletion), Count-Min Sketch, and Space-Saving Top-K — all textbook-correct implementations sharing one FNV-1a-based double-hash scheme. Routes per-key like Components 16/17. Not included in RDB persistence. |
+| **19** | **Pub/Sub Messaging Hub** | `src/pubsub.rs` | Genuinely per-shard (not a global-lock exception like `BlockHub`), with real parallel cross-shard fan-out for `PUBLISH`/`PUBSUB *`. Verified gap: every delivered message is hard-coded RESP2 array framing — RESP3-negotiated subscribers never get the RESP3 push type. |
 
 ---
 
@@ -5411,6 +5415,831 @@ is just never set to `true` by a bare `TCP_ULP` success, and the code always tak
 - **High — replace the fixed-salt SHA1 scheme with a real per-user-salted slow hash (§2.3).** `hash_password` uses one hardcoded global salt (`"rudis_acl_salt_v1:"`) shared across every user and every Rudis instance, with a fast general-purpose hash (SHA1) that has no work-factor resistance to offline brute force. A per-user random salt plus Argon2id (or at minimum bcrypt/scrypt/PBKDF2 with a real iteration count) closes both weaknesses — the fixed-salt SHA1 hash is barely better than plaintext against a determined offline attacker.
 - **Medium — extend `ACL SETUSER` to support command categories and pub/sub channel patterns (§4.2).** `+@read`/`-@write`-style category tokens and `&channel:*` pub/sub ACL rules are still silently accepted and ignored, exactly as before this update — only bare per-command and per-key-prefix rules are real. Either implement categories/channels or make `ACL SETUSER` reject unrecognized rule tokens with an error, so a deployment can't believe it applied a restriction that was silently dropped.
 - **Low — expose jemalloc heap-profiling/dump capability, not just aggregate stats (§4.3)**, if deep memory-leak/fragmentation debugging in production ever becomes a need — `tikv-jemalloc-ctl` supports profiling hooks beyond the stats-only reads currently used. Unchanged by this update.
+
+---
+---
+
+## Component 16: JSON Document Store & JSONPath Engine (`src/json.rs`)
+
+### 1. Architectural Purpose & Scope
+
+`src/json.rs` implements a RedisJSON-compatible document store: a hand-written JSONPath
+parser/evaluator operating directly on `serde_json::Value` trees, plus `JsonStore`, the
+per-shard map of key → JSON document that backs `JSON.SET`/`GET`/`DEL`/`TYPE`/`NUMINCRBY`/
+`STRAPPEND`/`STRLEN`/`ARRAPPEND`/`ARRLEN`/`ARRPOP`/`OBJKEYS`/`OBJLEN`/`TOGGLE`/`CLEAR`/`MGET`.
+Unlike `src/vector.rs` (Component 08) and unlike `src/crdt.rs` before its fix (Component 12),
+single-key JSON commands are **genuinely routed per-key across shards** — verified directly
+in `connection.rs`: every `Command::Json*` variant (except `JsonMget`, see §4.5) appears in
+the same `target_shard_of_cmd`/local-vs-`execute_remote` dispatch arm as ordinary string/hash/
+list commands, so a `JSON.SET`/`GET` on a given key always lands on the one shard that key
+actually hashes to, regardless of which shard's connection issued it.
+
+---
+
+### 2. Key Invariants & Concurrency Constraints
+
+1. **A real, but partial, JSONPath implementation.** `parse_json_path` hand-parses `$`, bare
+   `.field` traversal, `[idx]` (including negative indices), `[*]` wildcards, `[start:end]`
+   slices (including negative/omitted bounds), and `["quoted"]`/`['quoted']` field names. There
+   is **no recursive descent (`$..field`) and no filter-expression syntax (`?(@.price < 10)`)**
+   — both real RedisJSON/JSONPath features. A path using either silently fails to match
+   anything (parses as a literal field name containing those characters) rather than erroring.
+2. **Whole-document storage, no incremental structure.** `JsonStore.docs: HashMap<Bytes,
+   Value>` stores one complete `serde_json::Value` tree per key. A `JSON.SET`/`NUMINCRBY`/etc.
+   on a deeply nested path still has to parse the target's own sub-value in place (via
+   `query_json_path_mut`, no full-document re-parse), but `JSON.GET` always calls
+   `serde_json::to_string` fresh on whatever subtree matched — there's no cached serialized
+   form, and a `JSON.GET key $` on a huge document re-serializes the entire thing every call.
+3. **`query_json_path`/`query_json_path_mut` are structurally identical, hand-duplicated for
+   `&`/`&mut`.** Every match arm in the immutable traversal (§4.2) has a corresponding
+   `_mut` arm doing the identical navigation logic against `.get`/`.get_mut`,
+   `.values()`/`.values_mut()`, `&arr[i]`/`&mut arr[i]`. This is a real, verified
+   duplication (not a design choice with a stated rationale) — a bugfix to one traversal
+   rule (e.g. how negative slice bounds clamp) has to be applied to both copies by hand.
+4. **Auto-vivification on `SET`, not on read.** `set_json_path` creates intermediate
+   `Object`/`Array` containers as needed when writing to a path whose parents don't exist yet
+   (§4.3) — real Redis JSON has the same behavior. `NX`/`XX` are checked once, up front,
+   against whether the *target* path already resolves to something, before any mutation.
+
+---
+
+### 3. Component Architecture & Data Structures
+
+```
+JSON.SET doc:1 $.user.name "\"Alice\""
+              │
+              ▼
+   parse_json_path("$.user.name") -> [Root, Field("user"), Field("name")]
+              │
+              ▼
+   set_json_path: walk parent segments (Root, Field("user")),
+   auto-vivifying an empty Object at "user" if it doesn't exist yet,
+   then insert "name" -> Value::String("Alice") into that object
+              │
+              ▼
+   JsonStore.docs[doc:1] = { "user": { "name": "Alice" } }
+```
+
+### Real data structures (verbatim from `src/json.rs`)
+
+```rust
+pub enum PathSegment {
+    Root,
+    Field(String),
+    Index(isize),
+    Wildcard,
+    Slice { start: Option<isize>, end: Option<isize> },
+}
+
+pub struct JsonStore {
+    docs: HashMap<Bytes, Value>,   // Value = serde_json::Value
+}
+```
+
+There is no bespoke JSON representation — every stored document is a plain `serde_json::Value`
+(the same enum `Value::{Null, Bool, Number, String, Array, Object}` any `serde_json` consumer
+would use), not a Redis-specific compact encoding.
+
+---
+
+### 4. Execution Algorithms & Code Logic
+
+#### 4.1 `parse_json_path`: character-by-character, no grammar/lexer library
+
+The parser is a single hand-rolled `while let Some(&ch) = chars.peek()` loop over a
+`Peekable<Chars>` iterator, branching on `.`, `*`, `[`, or "anything else starts a bare field
+name" — no `nom`/`pest`/regex dependency. Bracket contents (`[...]`) are further classified by
+trying, in order: `*` (wildcard), a quoted string, a `:`-containing slice, a parseable integer
+(index), then falling back to an unquoted field name. This ordering matters: `[0:2]` is
+recognized as a slice before the parser ever tries to parse it as an integer.
+
+#### 4.2 `query_json_path` / `query_json_path_mut`: breadth-first accumulation per segment
+
+Both functions maintain a `Vec` of "current matches" and, for each `PathSegment` in turn,
+build a new `Vec` of every match's children that satisfy that segment — so `$.items[*].id`
+naturally fans out to multiple simultaneous matches (one per array element) by the time it
+reaches the final `Field("id")` segment. A `Slice`'s `start`/`end` are each independently
+clamped: negative values count from the end (`len + s`), values are `.max(0)`/`.min(len)`
+bounded, and `s_idx < e_idx` is required for anything to be included — an empty or
+backward-ordered slice range simply matches nothing rather than erroring.
+
+#### 4.3 `set_json_path`: parent traversal with auto-vivification, then a final insert
+
+```rust
+for seg in parent_segments {
+    match seg {
+        PathSegment::Field(name) => {
+            if !curr.is_object() { *curr = Value::Object(serde_json::Map::new()); }
+            let map = curr.as_object_mut().unwrap();
+            if !map.contains_key(name) { map.insert(name.clone(), Value::Object(...)); }
+            curr = map.get_mut(name).unwrap();
+        }
+        PathSegment::Index(idx) => {
+            if !curr.is_array() { *curr = Value::Array(Vec::new()); }
+            let arr = curr.as_array_mut().unwrap();
+            while arr.len() <= actual_idx { arr.push(Value::Null); }
+            curr = &mut arr[actual_idx];
+        }
+        _ => return Err("ERR wildcards not supported as parent path for SET"),
+    }
+}
+```
+
+If an intermediate path element exists but is the *wrong type* (e.g. `$.user.name` where
+`user` is currently a string, not an object), it's silently **overwritten** with a fresh empty
+container (`*curr = Value::Object(...)`) rather than erroring — a real, permissive behavior
+worth knowing: `JSON.SET` can silently destroy a differently-typed intermediate value on the
+way to setting a deep path. Setting through a `Wildcard`/`Slice` parent segment is the one
+case that does return a real error (`"ERR wildcards not supported as parent path for SET"`).
+
+#### 4.4 `delete_json_path`: wildcard deletes clear whole containers
+
+A `Field`/`Index` last-segment delete removes one entry; a `Wildcard` last segment instead
+clears the entire matched `Object`/`Array` in place (`map.clear()`/`arr.clear()`) and counts
+every removed entry — so `JSON.DEL key $.items[*]` empties the `items` array (leaving an empty
+array behind, not removing the array itself) rather than deleting each element one at a time.
+
+#### 4.5 `JSON.MGET`: sequential per-key, not fanned out — the same gap `MGET`/`MSET` had before their fix
+
+```rust
+Command::JsonMget { keys, path } => {
+    for k in keys {
+        let single_cmd = Command::JsonGet { key: k.clone(), paths: vec![path.clone()] };
+        if let Some(target) = target_shard_of_cmd(&single_cmd, router.num_shards) {
+            if target == router.shard_id { /* local execute_local_command */ }
+            else { let res = router.execute_remote(target, single_cmd).await; /* ... */ }
+        } else { out.extend_from_slice(b"$-1\r\n"); }
+    }
+}
+```
+
+Each key in a `JSON.MGET` is routed and awaited **one at a time** — exactly the shape
+`MGET`/`MSET` had before the fix documented in Component 02 §4.6/Component 04 §4.3. Unlike
+plain `MGET`, `JsonMget` was never given the bucket-by-shard-then-fan-out treatment; a
+`JSON.MGET` spanning several remote shards still pays one serialized round-trip per key.
+
+---
+
+### 5. Cross-Component Interactions
+
+- **`src/connection.rs`** (Component 02): dispatches every single-key `Command::Json*` through
+  the shared `target_shard_of_cmd`/local-vs-`execute_remote` fork (§1); `JsonMget` is a
+  standalone arm with its own sequential per-key loop (§4.5).
+- **`src/search.rs`** (Component 09): `JSON.SET` on the root path (`$`) triggers
+  `index_document_hook` for auto-indexing after a successful write, flattening top-level
+  scalar fields into the search engine's document representation — nested objects/arrays are
+  stringified, not recursively flattened (already documented in Component 09 §5).
+- **`src/table.rs`** (Component 05): no relationship — JSON documents live entirely in
+  `ShardDb.json_store: JsonStore`, a separate per-shard map alongside `RudisTable`, never as a
+  `RudisValue` variant.
+- **RDB persistence: no relationship, verified.** Grepping `table.rs`/`router.rs`'s RDB
+  save/restore chunk logic for any reference to `json_store` finds none — `JsonStore` is not
+  included in `save_rdb_chunk`/`load_rdb`, so JSON documents do **not** survive a restart via
+  RDB. This is the same gap Component 08 §7 flagged for vector indexes.
+
+---
+
+### 6. Performance Characteristics
+
+- **`JSON.GET` cost scales with matched-subtree size, not query specificity** — every call
+  does a fresh `serde_json::to_string` of whatever `query_json_path` returned, with no
+  memoization; repeatedly reading the same small field from a large sibling-heavy document is
+  cheap, but repeatedly reading `$` on a large document is not.
+- **Path traversal is O(document breadth) per segment, not indexed** — `Field` lookups on an
+  `Object` are O(1) (backed by `serde_json`'s own map), but `Wildcard`/`Slice` segments
+  necessarily visit every child at that level; there's no precomputed path index.
+- **`JSON.MGET`'s sequential fan-out (§4.5) is the single biggest addressable cost** on
+  multi-key JSON reads spread across shards — see Future Improvements.
+
+---
+
+### 7. Future Improvements
+
+- **Medium — give `JSON.MGET` the same bucket-and-fan-out treatment `MGET`/`MSET` already got (§4.5).** The building blocks are identical to Component 02/04's fix: bucket the requested keys by target shard, dispatch one batched request per remote shard, await all in parallel, reassemble in original order. Until then, `JSON.MGET` is the one JSON command that doesn't benefit from the cross-shard parallelism the rest of this subsystem already has.
+- **Medium — include `JsonStore` in RDB save/restore (§5).** A shared gap with vector indexes (Component 08) and, before its own fix, CRDT state (Component 12) — any of these auxiliary per-shard stores silently losing all data on restart is a real durability surprise for a feature that otherwise looks fully persistent (ordinary keys in the same process do survive a restart).
+- **Low — deduplicate `query_json_path`/`query_json_path_mut` (§2.3)**, e.g. via a macro or a trait abstracting over `&`/`&mut` child access, to remove the risk of the two traversal implementations drifting apart on a future bugfix.
+- **Low — extend JSONPath coverage** (recursive descent `$..field`, filter expressions `?(@.price < N)`) if closer RedisJSON/JSONPath-spec compatibility becomes a goal (§2.1) — the current subset covers the common cases (field access, indexing, wildcards, slices) but silently no-ops on anything more advanced rather than erroring, which could surprise a client library that assumes full JSONPath support.
+
+---
+---
+
+## Component 17: Geospatial Commands (`src/geo.rs`)
+
+### 1. Architectural Purpose & Scope
+
+`src/geo.rs` is pure math and reply-formatting — it owns **no storage of its own**. Every
+`GEOADD`/`GEODIST`/`GEOPOS`/`GEOHASH`/`GEORADIUS`/`GEORADIUSBYMEMBER`/`GEOSEARCH` command is
+implemented directly in `src/connection.rs` on top of the existing sorted-set (`RudisZSet`,
+Component 05) API — `GEOADD` is a `ZADD` whose "score" is a 52-bit interleaved geohash encoding
+of (longitude, latitude), and every other geo command decodes that score back into
+coordinates. This is architecturally identical to how real Redis implements its own `GEO*`
+command family as a thin layer over `ZSET`, and it means `ZRANGE`/`ZSCORE`/any other ZSET
+command works unmodified against a "geo set" key too — a real compatibility feature and a real
+footgun (an arbitrary `ZADD` against a geo key can insert a member with a score that isn't a
+valid geohash at all, and nothing rejects it).
+
+---
+
+### 2. Key Invariants & Concurrency Constraints
+
+1. **Encoding is 52-bit interleaved (26 bits longitude + 26 bits latitude), matching real
+   Redis's internal encoding** — not the 5-bit-alphabet, 11-character textual geohash;
+   that (`geohash_to_base32`) is only computed on demand for the `GEOHASH` command's text
+   output, never used as the stored representation.
+2. **Latitude is clamped to the real Web Mercator-projectable range**
+   (`GEO_LAT_MIN`/`MAX` = ±85.05112878°, not ±90°) — this matches real Redis's own
+   documented limitation exactly (values interleave cleanly only within this range); a
+   `GEOADD` outside it is rejected with `"ERR invalid latitude"`.
+3. **Distance is Haversine (great-circle on a sphere), not an ellipsoidal (Vincenty) model** —
+   using `EARTH_RADIUS_METERS = 6372797.560856`, the same constant real Redis's own Haversine
+   implementation uses. This is an approximation (Earth isn't a perfect sphere) but is exactly
+   what real Redis does too, so behavior matches rather than diverges.
+4. **Geo commands route per-key across shards exactly like ordinary ZSET commands** (verified:
+   `Geoadd`/`Geodist`/`Geopos`/`Geosearch`/etc. all appear in the same `target_shard_of_cmd`
+   dispatch arm as other keyed commands, Component 02 §4.5) — there is no geo-specific routing
+   concern; a "geo set" is routed by the same CRC16 key-slot mechanism as any other key.
+
+---
+
+### 3. Component Architecture & Data Structures
+
+```
+GEOADD geo:cities -122.4194 37.7749 "San Francisco"
+              │
+              ▼
+   encode_geohash(-122.4194, 37.7749) -> u64 (52-bit interleaved)
+              │
+              ▼
+   db.zadd("geo:cities", [(hash as f64, "San Francisco")], flags)
+              │
+              ▼
+   RudisZSet (Component 05) — "San Francisco" -> score = hash as f64
+
+GEODIST geo:cities "San Francisco" "Oakland" km
+              │
+              ▼
+   db.zscore() twice -> decode_geohash() twice -> haversine_distance() -> GeoUnit::from_meters()
+```
+
+### Real supporting types (`src/geo.rs`)
+
+```rust
+pub enum GeoUnit { Meters, Kilometers, Miles, Feet }   // to_meters/from_meters conversion factors:
+                                                         // km=1000, mi=1609.344, ft=0.3048 — match real Redis
+
+pub struct GeoItemResult {
+    pub member: Bytes,
+    pub dist: Option<f64>,
+    pub hash: Option<u64>,
+    pub coord: Option<(f64, f64)>,
+}
+```
+
+`GeoItemResult` + `format_geo_results` unify the reply-formatting for every command that can
+return `WITHCOORD`/`WITHDIST`/`WITHHASH` options (`GEORADIUS`, `GEORADIUSBYMEMBER`,
+`GEOSEARCH`) — one shared formatter rather than three separately hand-written reply encoders.
+
+---
+
+### 4. Execution Algorithms & Code Logic
+
+#### 4.1 `encode_geohash`/`decode_geohash`: bit interleaving, not a lookup table
+
+```rust
+for i in 0..26 {
+    let bit_x = (x >> i) & 1;
+    let bit_y = (y >> i) & 1;
+    hash |= bit_x << (2 * i);
+    hash |= bit_y << (2 * i + 1);
+}
+```
+
+Longitude and latitude are each linearly normalized into a 26-bit integer, then their bits are
+interleaved (x at even positions, y at odd) into one 52-bit value — the standard Z-order/Morton
+encoding real geohashing uses, decoded by the exact inverse bit-extraction in `decode_geohash`.
+Because this is lossy quantization (26 bits per axis over the real coordinate range), a
+decode-then-re-encode round trip returns a coordinate close to, but not bit-identical to, the
+original input — `decode_geohash` returns the *center* of the encoded cell
+(`(x + 0.5) / max_val`), which is why the round-trip test in this file asserts closeness
+(`< 1e-5`) rather than exact equality.
+
+#### 4.2 `GEOADD`'s real implementation: encode, then delegate entirely to `ZADD`
+
+```rust
+for (lon, lat, member) in items {
+    match crate::geo::encode_geohash(*lon, *lat) {
+        Ok(hash) => elements.push((hash as f64, member.clone())),
+        Err(e) => { out.extend_from_slice(...); return false; }
+    }
+}
+let flags = crate::table::ZAddFlags { nx: *nx, xx: *xx, ch: *ch, gt: false, lt: false, incr: false };
+match db.zadd(key.clone(), elements, flags) { ... }
+```
+
+`NX`/`XX`/`CH` flags pass straight through to the underlying `ZADD` semantics (Component 05) —
+`GEOADD` adds no geo-specific conflict handling of its own beyond the encoding step.
+
+#### 4.3 `GEODIST`: two `zscore` lookups, decode, Haversine, unit conversion
+
+Straightforward: `db.zscore(key, m1)`/`db.zscore(key, m2)` fetch the two raw geohash scores,
+`decode_geohash` turns each back into coordinates, `haversine_distance` computes meters, and
+the requested `GeoUnit` (default meters) converts the final figure — a member with no score
+(never added, or added via a non-geo `ZADD` with a score that happens to decode to garbage
+coordinates) returns `$-1\r\n` only if the `zscore` lookup itself misses, not if the decoded
+"coordinates" are nonsensical.
+
+#### 4.4 `GEORADIUS`/`GEORADIUSBYMEMBER`/`GEOSEARCH`: three independent, near-identical brute-force scans
+
+All three commands share the exact same shape, implemented as three separate, hand-duplicated
+blocks (not a shared helper function):
+
+```rust
+let z_opts = crate::table::ZRangeOpts { start: 0, stop: -1, with_scores: true, ..Default::default() };
+if let Ok(pairs) = db.zrange(key, &z_opts) {
+    for (member, score) in pairs {
+        let (m_lon, m_lat) = crate::geo::decode_geohash(score as u64);
+        let dist = crate::geo::haversine_distance(center_lon, center_lat, m_lon, m_lat);
+        if dist <= radius_meters { /* collect into results */ }
+    }
+}
+```
+
+**This is a full O(N) scan of every member in the geo set for every search**, decoding and
+computing Haversine distance against each one, regardless of the search radius or how many
+members actually match. Real Redis's own `GEORADIUS`/`GEOSEARCH` implementation instead uses
+the sorted-by-geohash structure of the underlying skiplist to narrow the scan to a small
+neighborhood of 52-bit-geohash-adjacent score ranges (the "9 neighboring geohash cells"
+technique) before doing exact distance filtering — this implementation does none of that
+narrowing; it always decodes and distance-checks the entire set. `GEOSEARCH`'s `BY BOX` variant
+additionally approximates a box as `dlat_m = Δlat° × 111,320` /
+`dlon_m = Δlon° × 111,320 × cos(center_lat)` — a flat-Earth-locally approximation, not exact
+geodesic box math, reasonable at the box sizes these commands are typically used for but not
+precise at very large box dimensions.
+
+---
+
+### 5. Cross-Component Interactions
+
+- **`src/table.rs`** (Component 05): every geo command is built entirely on `RudisTable`'s
+  `zadd`/`zscore`/`zrange` — there is no geo-specific storage anywhere; a "geo set" *is* a
+  `RudisZSet`.
+- **`src/connection.rs`** (Component 02): owns every `Command::Geo*` match arm (`geo.rs` itself
+  contains no command dispatch, only the math/formatting helpers those arms call); routes all
+  of them through the standard `target_shard_of_cmd` keyed-command path (§2.4).
+- **`src/resp.rs`** (Component 03): parses `GEOADD`/`GEODIST`/etc.'s arguments (including unit
+  strings `m`/`km`/`mi`/`ft` and `BYRADIUS`/`BYBOX`/`ASC`/`DESC`/`WITHCOORD`/`WITHDIST`/
+  `WITHHASH` option flags) into the `Command::Geo*` variants this file's helpers consume.
+
+---
+
+### 6. Performance Characteristics
+
+- **`GEOADD`/`GEODIST`/`GEOPOS` are O(1)-ish**, bounded by the underlying `ZADD`/`ZSCORE` cost
+  (Component 05) plus a fixed amount of bit-interleaving/Haversine math — no scan involved.
+- **`GEORADIUS`/`GEORADIUSBYMEMBER`/`GEOSEARCH` are all O(N) in the size of the geo set**
+  (§4.4), not O(matches) or O(log N + matches) the way a geohash-neighborhood-aware
+  implementation would be — a large geo set with a small-radius search still decodes and
+  distance-checks every member.
+- **No caching of decoded coordinates** — every scan re-runs `decode_geohash` (cheap bit
+  extraction) per member per call; not a measurable cost relative to the Haversine
+  trigonometry, which dominates.
+
+---
+
+### 7. Future Improvements
+
+- **Medium — narrow `GEORADIUS`/`GEORADIUSBYMEMBER`/`GEOSEARCH`'s scan using geohash-neighborhood pruning instead of a full O(N) scan (§4.4).** Since scores are already geohash-ordered when read via a range on the sorted structure, computing the target radius/box's covering geohash cell(s) and querying only score ranges near them (real Redis's approach) would turn this into roughly O(log N + matches) instead of O(N) — the highest-value fix here for any geo set large enough to matter.
+- **Low — factor `GEORADIUS`/`GEORADIUSBYMEMBER`/`GEOSEARCH`'s shared scan-and-filter logic into one helper (§4.4).** Three independently hand-written copies of the same loop is a real duplication-drift risk — a bugfix or the geohash-neighborhood optimization above would otherwise need to be applied three times.
+- **Low — replace the `BY BOX` flat-Earth approximation with exact geodesic box math** (§4.4) if very large box searches (spanning enough latitude/longitude to make the flat approximation's error non-negligible) become a real use case — not a concern at typical city-scale search radii.
+- **Low — reject non-geo `ZADD`s against a key already used as a geo set, or document the compatibility footgun explicitly (§1)** — since a geo set is just a `ZSET`, nothing stops an ordinary `ZADD member not-a-geohash-score` from corrupting later `GEODIST`/`GEOPOS`/`GEOSEARCH` calls against that key with silently-nonsensical decoded coordinates.
+
+---
+---
+
+## Component 18: Probabilistic Data Structures (`src/probabilistic.rs`)
+
+### 1. Architectural Purpose & Scope
+
+`src/probabilistic.rs` implements four independent approximate-membership/frequency data
+structures — a **Bloom Filter**, a **Cuckoo Filter**, a **Count-Min Sketch**, and a **Top-K
+frequency tracker** (Space-Saving algorithm) — exposed via RedisBloom-compatible commands
+(`BF.*`, `CF.*`, `CMS.*`, `TOPK.*`). Each structure type has its own per-key map inside
+`ProbabilisticStore`, which lives in `ShardDb` alongside `vector_indexes`/`crdt_store`/
+`json_store`. Like `src/json.rs` (Component 16) and `src/geo.rs` (Component 17) and unlike
+`src/vector.rs` (Component 08), every single-key command here is genuinely routed per-key
+across shards — confirmed directly in `connection.rs`: `BfAdd`/`CfAdd`/`CmsIncrby`/`TopkAdd`/
+etc. all appear in the same `target_shard_of_cmd`/local-vs-`execute_remote` dispatch arm as
+ordinary keyed commands.
+
+---
+
+### 2. Key Invariants & Concurrency Constraints
+
+1. **A single custom hash function underlies all four structures.** `fnv1a_hash` (a
+   seeded 64-bit FNV-1a) and `double_hash` (two independent FNV-1a calls with different fixed
+   seeds, used for Kirsch-Mitzenmacher double-hashing) are shared by the Bloom filter, Cuckoo
+   filter, and Count-Min Sketch — there is no per-structure hash family, and no cryptographic
+   hash anywhere in this file (not a concern for these structures' intended use, unlike an
+   auth-adjacent context).
+2. **Bloom filter sizing follows the standard formulas, computed once at creation.**
+   `BloomFilter::new(capacity, error_rate)` derives bit-array size via
+   $m = \lceil -n \ln(p) / (\ln 2)^2 \rceil$ and hash count via $k = \text{round}((m/n)\ln 2)$,
+   clamped to `[1, 30]` hashes — real, textbook Bloom filter parameter derivation, not
+   hardcoded constants.
+3. **The Cuckoo filter is a real, complete implementation including eviction ("cuckoo
+   kicks").** `add` tries both candidate buckets first, and only falls back to the
+   randomized-kick relocation loop (`MAX_KICKS = 500`) if both are full — a genuine cuckoo
+   hashing insert, not a simplified always-fails-when-full variant. `delete` is also real
+   (removes a matching fingerprint from either candidate bucket), which is one of the
+   Cuckoo filter's actual advantages over a Bloom filter (Bloom filters can't support
+   deletion at all without a counting variant, which isn't implemented here).
+4. **The Top-K tracker is a real Space-Saving algorithm, not an exact top-K.** Once at
+   capacity, `TopK::add` evicts the *minimum-count* tracked item and gives the new item that
+   evicted item's count plus the increment — the standard Space-Saving guarantee (every
+   tracked count is an overestimate, bounded by the true frequency of whatever was evicted
+   last), not an exact frequency count.
+5. **No structure ever shrinks or is auto-resized.** A Bloom/Cuckoo filter's bit array or
+   bucket count is fixed at creation time (`BF.RESERVE`/`CF.RESERVE`'s capacity argument); a
+   Count-Min Sketch's width/depth are likewise fixed at `CMS.INITBYDIM`/`INITBYPROB` time.
+   There is no `BF.INSERT ... EXPANSION` auto-scaling behavior — once a filter created with a
+   given capacity is over-inserted, its false-positive rate silently degrades rather than the
+   structure growing.
+
+---
+
+### 3. Component Architecture & Data Structures
+
+```
+BF.RESERVE myfilter 0.01 1000        CF.ADD mycuckoo item
+        │                                     │
+        ▼                                     ▼
+BloomFilter::new(1000, 0.01)          CuckooFilter::add("item")
+  m,k derived from formula                    │
+        │                          fingerprint(item) -> u16
+        ▼                          indices(item, fp) -> (i1, i2)
+ProbabilisticStore                  try buckets[i1]/[i2], else
+  .bloom_filters["myfilter"]        cuckoo-kick up to 500 times
+```
+
+### Real data structures (verbatim from `src/probabilistic.rs`)
+
+```rust
+pub struct BloomFilter { pub capacity: usize, pub error_rate: f64, pub num_bits: usize,
+                          pub num_hashes: usize, pub count: usize, pub bits: Vec<u64> }
+
+pub struct CuckooFilter { pub capacity: usize, pub num_buckets: usize, pub count: usize,
+                           pub buckets: Vec<[u16; 4]> }   // BUCKET_SIZE = 4
+
+pub struct CountMinSketch { pub width: usize, pub depth: usize, pub total_count: u64,
+                             pub table: Vec<Vec<u64>> }
+
+pub struct TopK { pub k: usize, pub items: HashMap<Bytes, u64> }   // Space-Saving
+
+pub struct ProbabilisticStore {
+    pub bloom_filters: HashMap<Bytes, BloomFilter>,
+    pub cuckoo_filters: HashMap<Bytes, CuckooFilter>,
+    pub cms_sketches: HashMap<Bytes, CountMinSketch>,
+    pub topk_trackers: HashMap<Bytes, TopK>,
+}
+```
+
+Each structure type gets its own separate `HashMap` inside `ProbabilisticStore` — a key used
+for a Bloom filter and a key of the same name used for a Cuckoo filter would be two completely
+independent entries (in different maps), not a naming collision, since the command layer
+(`connection.rs`) dispatches to the right map by command family (`BF.*` vs `CF.*` vs...), not
+by inspecting what's already stored under that key.
+
+---
+
+### 4. Execution Algorithms & Code Logic
+
+#### 4.1 Bloom filter: bit array indexed by `h1 + i*h2 mod num_bits`
+
+```rust
+pub fn add(&mut self, item: &[u8]) -> bool {
+    let (h1, h2) = double_hash(item);
+    let mut was_present = true;
+    for i in 0..self.num_hashes {
+        let bit = (h1.wrapping_add((i as u64).wrapping_mul(h2)) as usize) % self.num_bits;
+        if !self.get_bit(bit) { was_present = false; self.set_bit(bit); }
+    }
+    if !was_present { self.count += 1; true } else { false }
+}
+```
+
+The classic Kirsch-Mitzenmacher trick: instead of computing `num_hashes` independent hash
+functions, only two real hashes (`h1`, `h2`) are computed, and the `i`-th "hash" is derived
+cheaply as `h1 + i*h2` — mathematically indistinguishable from independent hashing for Bloom
+filter purposes, and far cheaper than running up to 30 real hash functions per `add`/`contains`
+call. `add`'s return value (and the `count` increment) reflect whether the item was *probably
+already present* (all bits already set) before this call — a real, if approximate,
+already-seen signal, not just "operation succeeded."
+
+#### 4.2 Cuckoo filter: two candidate buckets via XOR, eviction via random kicks
+
+```rust
+fn indices(&self, item: &[u8], fp: u16) -> (usize, usize) {
+    let h = fnv1a_hash(item, SEED) as usize;
+    let i1 = h % self.num_buckets;
+    let i2 = (i1 ^ fnv1a_hash(&fp.to_le_bytes(), OTHER_SEED) as usize) % self.num_buckets;
+    (i1, i2)
+}
+```
+
+This is the standard partial-key cuckoo hashing trick: `i2` is derived from `i1` XORed with a
+hash of the *fingerprint itself* (`alt_index`, §below), which is what makes `alt_index(alt_index(i,
+fp), fp) == i` — applying the same XOR twice cancels out — so an item's alternate bucket can
+always be recomputed from its current bucket and fingerprint alone, without needing to
+re-hash the original item during a kick chain. The kick loop swaps a random existing
+fingerprint out of a full bucket, relocates it to its own alternate bucket, and repeats up to
+`MAX_KICKS = 500` times before giving up with `Err("ERR Cuckoo filter is full")` — real
+cuckoo-hashing eviction, not a stub.
+
+#### 4.3 Count-Min Sketch: `depth` independent hash rows, `min` across them as the estimate
+
+```rust
+pub fn incr_by(&mut self, item: &[u8], delta: u64) -> u64 {
+    let (h1, h2) = double_hash(item);
+    let mut min_val = u64::MAX;
+    for r in 0..self.depth {
+        let col = (h1.wrapping_add((r as u64).wrapping_mul(h2)) as usize) % self.width;
+        self.table[r][col] = self.table[r][col].saturating_add(delta);
+        min_val = min_val.min(self.table[r][col]);
+    }
+    self.total_count = self.total_count.saturating_add(delta);
+    min_val
+}
+```
+
+Same Kirsch-Mitzenmacher double-hash reuse as the Bloom filter (§4.1) to derive `depth`
+independent-enough row hashes from two real hash computations. Taking the **minimum** across
+rows after incrementing is the standard Count-Min Sketch estimator: any single row can only
+*overestimate* a true count (due to hash collisions with other items sharing that row's
+column), so the minimum across independent rows is the tightest available overestimate.
+`CMS.INITBYPROB`'s width/depth derivation (`from_prob`) uses the textbook formulas
+$w = \lceil e/\epsilon \rceil$, $d = \lceil \ln(1/(1-\delta)) \rceil$.
+
+#### 4.4 Top-K: Space-Saving eviction of the current minimum
+
+```rust
+pub fn add(&mut self, item: Bytes, increment: u64) -> Option<Bytes> {
+    if let Some(count) = self.items.get_mut(&item) { *count += increment; return None; }
+    if self.items.len() < self.k { self.items.insert(item, increment); return None; }
+    // find (Bytes, u64) with minimum count, evict it, insert new item with min_val + increment
+}
+```
+
+Finding the minimum-count tracked item is a **linear scan over all `k` tracked items** on
+every eviction (`for (k, &v) in &self.items { if v < min_val { ... } }`) — fine for the small
+`k` values `TOPK.RESERVE` is realistically used with, but not the heap-based O(log k) eviction
+a larger-scale Space-Saving implementation would use.
+
+---
+
+### 5. Cross-Component Interactions
+
+- **`src/connection.rs`** (Component 02): dispatches every `BF.*`/`CF.*`/`CMS.*`/`TOPK.*`
+  command through the shared `target_shard_of_cmd`/local-vs-`execute_remote` fork (§1),
+  identical in shape to how `Json*`/`Geo*` commands are routed (Components 16/17).
+- **`src/resp.rs`** (Component 03): parses each command family's arguments (e.g.
+  `BF.RESERVE`'s error-rate/capacity, `CMS.INITBYPROB`'s error/confidence, `TOPK.RESERVE`'s
+  `k`) into the matching `Command::Bf*`/`Cf*`/`Cms*`/`Topk*` variants.
+- **`src/table.rs`**: no relationship — none of these four structures are `RudisValue`
+  variants; they live entirely in `ShardDb.probabilistic_store`, a separate per-shard map.
+- **RDB persistence: no relationship, verified** — same gap as `JsonStore` (Component 16 §5)
+  and vector indexes (Component 08 §7): none of `bloom_filters`/`cuckoo_filters`/
+  `cms_sketches`/`topk_trackers` are referenced anywhere in the RDB save/restore chunk logic,
+  so all four structure types are lost on restart.
+
+---
+
+### 6. Performance Characteristics
+
+- **Bloom/Cuckoo `add`/`contains` are O(num_hashes) / O(1)** respectively — a Bloom filter
+  check costs up to 30 bit-array probes (bounded, per §2.2's clamp), a Cuckoo filter check is
+  two fixed-size (4-slot) bucket scans regardless of fill level.
+- **Cuckoo insertion degrades under high load factor** — the `MAX_KICKS = 500` eviction chain
+  only triggers once both candidate buckets are full, and a filter approaching its rated
+  capacity will trigger it increasingly often before either succeeding or returning
+  `"ERR Cuckoo filter is full"` — a real, expected cuckoo-hashing characteristic, not a bug.
+- **Count-Min Sketch `incr_by`/`query` are O(depth)**, independent of how many distinct items
+  have been tracked — the whole point of a fixed-size sketch over an exact per-item counter map.
+- **Top-K's eviction is O(k) per new distinct item once at capacity** (§4.4) — negligible at
+  small `k`, would matter if `TOPK.RESERVE` were ever used with a very large `k`.
+
+---
+
+### 7. Future Improvements
+
+- **Medium — include these four structures in RDB save/restore (§5)** — the same cross-cutting durability gap already flagged for `JsonStore` (Component 16) and vector indexes (Component 08): a restart silently discards all Bloom/Cuckoo/CMS/Top-K state with no warning.
+- **Low — replace Top-K's O(k) linear-scan eviction with a min-heap for O(log k) (§4.4)** — only matters if `TOPK.RESERVE` is used with a large `k`; negligible at the small-k values this structure is typically used for.
+- **Low — support counting Bloom filters or scalable/auto-expanding variants** (§2.5) if `BF.INSERT ... EXPANSION`-style auto-growth or deletion-capable Bloom semantics become a compatibility target — today, over-inserting a fixed-capacity Bloom filter just silently raises its real false-positive rate above the configured target with no signal to the caller.
+- **Low — document the false-positive-rate implications of Cuckoo filter fingerprint collisions explicitly** (§4.2) — `contains` can return a false positive if two different items hash to the same 16-bit fingerprint in the same bucket, same as any Cuckoo filter design; not a bug, but worth stating plainly given the structure's "no false negatives" framing can otherwise be read as "always exact."
+
+---
+---
+
+## Component 19: Pub/Sub Messaging Hub (`src/pubsub.rs`)
+
+### 1. Architectural Purpose & Scope
+
+`src/pubsub.rs` implements `PubSubHub`, the per-shard channel/pattern subscription registry
+backing `SUBSCRIBE`/`UNSUBSCRIBE`/`PSUBSCRIBE`/`PUNSUBSCRIBE`/`PUBLISH`/`PUBSUB CHANNELS`/
+`NUMSUB`/`NUMPAT`. Like `BlockHub` (Component 06), a client that issues `SUBSCRIBE` hands its
+connection off to a dedicated, permanent mode-switch loop (`run_pubsub_loop` in
+`connection.rs`) that never returns to ordinary command processing for the lifetime of that
+TCP connection. Unlike `BlockHub`, `PubSubHub` is genuinely **per-shard** (one instance per
+shard, owned by `Router.pubsub`, not a process-wide `Arc<Mutex<_>>`) — cross-shard delivery
+(a publisher on shard A reaching a subscriber connected via shard B) is handled by `Router::
+publish` fanning the message out to every other shard's own `PubSubHub`, not by sharing one
+hub across shards.
+
+---
+
+### 2. Key Invariants & Concurrency Constraints
+
+1. **Genuinely per-shard, not a `BlockHub`/`ACL`/search-registry-style global exception.**
+   `Router.pubsub: Rc<RefCell<PubSubHub>>` — a plain `Rc`/`RefCell`, exactly like `ShardDb`
+   itself, with no `Arc`/`Mutex` anywhere. A subscriber's registration (`channels`,
+   `patterns`, `clients`, `client_channels`, `client_patterns`) only ever exists in the
+   `PubSubHub` of the one shard that accepted that subscriber's connection.
+2. **Cross-shard delivery is a real, parallel fan-out — send-then-await, matching the
+   squashed-pipeline pattern.** `Router::publish` (Component 04) delivers to local
+   subscribers immediately, then dispatches one `ShardMessage::Publish` to every *other*
+   shard (all sends issued before any await), and sums each shard's returned delivery count —
+   the same "dispatch all, then await all" shape used throughout the codebase for
+   parallelism (Components 02/04).
+3. **A hand-written glob matcher, not a regex or a crate.** `glob_match` implements `*`/`?`
+   wildcard matching via an explicit backtracking scan (tracking the last `*` position and
+   resuming from there on a mismatch) rather than compiling a regex or pulling in a glob
+   crate — used both for `PSUBSCRIBE` pattern matching against published channels and for
+   `PUBSUB CHANNELS <pattern>`'s filtering.
+4. **No RESP3 push-type framing anywhere in this file — verified.** Every delivered message
+   (`message`/`pmessage`) and every subscribe/unsubscribe confirmation is hard-coded RESP2
+   array framing (`*3\r\n$7\r\nmessage\r\n...`); grepping this file for `is_resp3`/`resp3`
+   finds zero matches. A RESP3-negotiated client (Component 02's `CURRENT_CLIENT_RESP3`
+   machinery) still receives ordinary array-type frames for pub/sub messages instead of the
+   RESP3 push type (`>3\r\n...`) real Redis sends once a client has opted into RESP3 — see §7.
+5. **A subscriber count of zero triggers cleanup, not a lingering empty entry.** Every
+   `unsubscribe`/`punsubscribe`/`unsubscribe_all`/`punsubscribe_all` path removes the
+   channel/pattern's `HashSet` entirely once it's empty (not left as an empty set), and
+   removes the client's `flume::Sender` from `clients` once its last subscription anywhere
+   drops to zero (`total_subscriptions(client_id) == 0`) — no unbounded growth from
+   subscribe/unsubscribe churn.
+
+---
+
+### 3. Component Architecture & Data Structures
+
+```
+Client A (shard 0)              Client B (shard 2)
+   SUBSCRIBE news                  PUBLISH news "hello"
+        │                                  │
+        ▼                                  ▼
+shard 0's PubSubHub              shard 2's Router::publish
+  .channels["news"] = {A}                  │
+  .clients[A] = write_tx_A          1. shard 2's own PubSubHub.publish("news", "hello")
+                                        (0 local subscribers on shard 2 itself)
+                                     2. ShardMessage::Publish sent to every OTHER shard,
+                                        including shard 0, in parallel
+                                     3. shard 0's PubSubHub.publish("news", "hello") finds A,
+                                        sends the RESP frame on write_tx_A
+                                     4. shard 0's dedicated pubsub writer task (run_pubsub_loop,
+                                        Component 02) drains write_tx_A and writes the socket
+```
+
+### Real data structures (verbatim from `src/pubsub.rs`)
+
+```rust
+pub struct PubSubHub {
+    pub channels: HashMap<Bytes, HashSet<u64>>,          // channel -> subscriber client IDs
+    pub patterns: HashMap<Bytes, HashSet<u64>>,          // pattern -> subscriber client IDs
+    pub clients: HashMap<u64, flume::Sender<Vec<u8>>>,   // client ID -> its delivery channel
+    pub client_channels: HashMap<u64, HashSet<Bytes>>,   // reverse index: client -> its channels
+    pub client_patterns: HashMap<u64, HashSet<Bytes>>,   // reverse index: client -> its patterns
+}
+```
+
+Two reverse indices (`client_channels`/`client_patterns`) exist purely so
+`unsubscribe_all`/`punsubscribe_all`/`total_subscriptions`/connection-drop cleanup don't have
+to scan every channel/pattern in the hub looking for a given client — a real, deliberate
+O(subscriptions for this client) design instead of O(all channels/patterns).
+
+---
+
+### 4. Execution Algorithms & Code Logic
+
+#### 4.1 `glob_match`: backtracking `*`/`?` matcher
+
+```rust
+pub fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
+    let (mut p, mut t, mut star_p, mut match_t) = (0, 0, None, 0);
+    while t < text.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == text[t]) { p += 1; t += 1; }
+        else if p < pattern.len() && pattern[p] == b'*' { star_p = Some(p); p += 1; match_t = t; }
+        else if let Some(sp) = star_p { p = sp + 1; match_t += 1; t = match_t; }
+        else { return false; }
+    }
+    while p < pattern.len() && pattern[p] == b'*' { p += 1; }
+    p == pattern.len()
+}
+```
+
+This is the standard greedy-with-backtracking wildcard algorithm: on a literal mismatch, if a
+`*` was seen earlier, the matcher "backtracks" by advancing `match_t` (trying to let the `*`
+consume one more character of `text`) and resuming pattern matching from just after that `*` —
+rather than a recursive/exponential-worst-case naive implementation. `?` matches exactly one
+character; there's no character-class (`[abc]`) support, matching real Redis's own
+`PSUBSCRIBE` glob semantics (which also lack character classes... actually real Redis glob
+*does* support `[...]` classes — this implementation's `?`/`*`-only subset is narrower than
+real Redis's pattern language, worth knowing if a client relies on bracket-class patterns).
+
+#### 4.2 `publish`: two independent passes, direct channels then pattern channels
+
+```rust
+pub fn publish(&self, channel: &[u8], message: &[u8]) -> usize {
+    let mut count = 0;
+    // 1. Direct channel subscribers — one frame built once, cloned per subscriber
+    if let Some(subscribers) = self.channels.get(channel) {
+        let frame = /* build "*3\r\n$7\r\nmessage\r\n$<len>\r\n<channel>\r\n$<len>\r\n<message>\r\n" once */;
+        for client_id in subscribers {
+            if let Some(tx) = self.clients.get(client_id) && tx.send(frame.clone()).is_ok() { count += 1; }
+        }
+    }
+    // 2. Pattern subscribers — iterate EVERY registered pattern, glob-match against this channel
+    for (pattern, subscribers) in &self.patterns {
+        if glob_match(pattern, channel) { /* build "*4\r\n$8\r\npmessage\r\n..." once, send to each */ }
+    }
+    count
+}
+```
+
+Direct-channel delivery is O(subscribers to this exact channel); pattern delivery is
+**O(total registered patterns)**, since every pattern has to be glob-matched against the
+published channel name — there's no pattern index (e.g. a trie or prefix grouping) to narrow
+the set of patterns actually worth checking. `send(frame.clone())` is a `flume` channel send
+(non-blocking, delivers to the subscriber's dedicated writer task — Component 02's
+`run_pubsub_loop`); a `count` increment happens only if the send actually succeeds, so a
+subscriber whose connection has already dropped (channel disconnected) doesn't count as
+delivered even though it's still technically registered until the next cleanup path runs.
+
+#### 4.3 Cleanup: `remove_client` is the single exit-path hook
+
+```rust
+pub fn remove_client(&mut self, client_id: u64) {
+    self.unsubscribe_all(client_id);
+    self.punsubscribe_all(client_id);
+}
+```
+
+Called when a pub/sub-mode connection's loop exits (disconnect, `QUIT`, or a hard error) —
+tears down every channel and pattern subscription for that client in one call, relying on
+`unsubscribe_all`/`punsubscribe_all`'s own per-entry cleanup (§2.5) to leave no dangling
+`HashSet`/`clients` entries behind.
+
+---
+
+### 5. Cross-Component Interactions
+
+- **`src/connection.rs`** (Component 02): `run_pubsub_loop` is the sole caller of
+  `subscribe`/`unsubscribe`/`psubscribe`/`punsubscribe`/`remove_client` — a permanent
+  mode-switch entered on `SUBSCRIBE`/`PSUBSCRIBE`, with its own split reader/writer tasks (a
+  dedicated `flume::unbounded` channel feeds a background writer task that drains published
+  messages onto the socket, independent of the loop that reads new `SUBSCRIBE`/`UNSUBSCRIBE`/
+  `PING`/`QUIT` commands from the client).
+- **`src/router.rs`** (Component 04): `Router::publish`/`pubsub_channels`/`pubsub_numsub`/
+  `pubsub_numpat` are the only entry points that reach across shards — each publishes/queries
+  the local `PubSubHub` first, then fans out to every other shard's `ShardMessage::Publish`/
+  equivalent and merges results (§2.2).
+- **`src/shard.rs`** (Component 04): `ShardMessage::Publish { channel, message, responder }`
+  is the wire message a remote shard's `PubSubHub.publish` call is delivered through.
+- **`src/table.rs`**: no relationship — pub/sub state is entirely separate from `RudisTable`;
+  a channel name is never a Redis key and never interacts with expiration/eviction.
+
+---
+
+### 6. Performance Characteristics
+
+- **Direct-channel publish is O(subscribers to that channel)** — no overhead from unrelated
+  channels or patterns.
+- **Pattern publish is O(total registered patterns) per publish**, not O(matching patterns)
+  (§4.2) — a deployment with many distinct active `PSUBSCRIBE` patterns pays a glob-match per
+  pattern on every single `PUBLISH`, regardless of how many (if any) actually match.
+- **Cross-shard fan-out cost is O(num_shards) per `PUBLISH`, done in parallel** (§2.2) — every
+  publish touches every other shard's `PubSubHub` once via a `flume` message, dispatched
+  concurrently rather than sequentially, matching the codebase's general cross-shard fan-out
+  pattern.
+- **One frame is built once and cloned per subscriber**, not re-serialized per recipient —
+  the `Vec<u8>` frame construction cost is paid once regardless of subscriber count.
+
+---
+
+### 7. Future Improvements
+
+- **Medium — send RESP3 push-type frames (`>`) to RESP3-negotiated subscribers instead of always RESP2 arrays (§2.4).** This is a real, verified protocol-compliance gap: a client that sent `HELLO 3` and is tracked as `is_resp3` elsewhere in the codebase (Component 02) still receives plain `*3\r\n...`/`*4\r\n...` array frames for `message`/`pmessage` delivery here, not the RESP3 push type real Redis switches to. Since one frame is currently built once and cloned to every subscriber (§4.2, a real performance benefit), fixing this requires either building two frame variants up front (RESP2 and RESP3) and picking per-subscriber based on a tracked protocol flag, or moving per-subscriber protocol awareness into `PubSubHub` itself (currently it has none).
+- **Medium — index patterns to avoid an O(total patterns) scan per publish (§4.2/§6).** A simple first step: group patterns by their literal (non-wildcard) prefix so a publish only glob-matches against patterns whose prefix could plausibly match the channel, rather than every registered pattern unconditionally.
+- **Low — add character-class (`[abc]`/`[a-z]`) support to `glob_match` (§4.1)** if closer compatibility with real Redis's full glob pattern language (which does support bracket classes) becomes a goal — today `?`/`*` are the only wildcard forms recognized.
+- **Low — consider whether `PubSubHub` being per-shard (rather than a single process-wide hub like `BlockHub`) has any subtle ordering implications worth documenting** — e.g. two publishes to the same channel from different shards in quick succession have no cross-shard ordering guarantee relative to each other, only FIFO delivery within whichever shard's `flume` channel a given subscriber is registered on.
 
 ---
 ---
