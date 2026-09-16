@@ -37,7 +37,7 @@ A ultra-high-performance, **multi-threaded**, **shared-nothing** Redis-compatibl
 
 > **Contributor Learning Guides**:
 > - [**Rudis Internals & Architecture Guide**](docs/rudis_internals_guide.md): Exhaustive, self-contained walkthrough of the engine, data structures, and lock-free routing.
-> - [**Component Architecture Documentation**](docs/components/README.md): Dedicated, deep-dive specifications for all 15 individual subsystems (`RudisTable`, `BlockHub`, Tiering, Vector, Search, XDP, CRDTs, etc.).
+> - [**Component Architecture Documentation**](docs/components.md): Dedicated, deep-dive specifications for all 15 individual subsystems (`RudisTable`, `BlockHub`, Tiering, Vector, Search, XDP, CRDTs, etc.), in one file.
 
 ---
 

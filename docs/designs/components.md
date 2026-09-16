@@ -16,16 +16,16 @@ See `agent.md`'s "Core Architectural Invariants" for the non-negotiable rules th
 modules exist to satisfy, and `docs/benchmarks/` for the performance numbers referenced
 throughout.
 
-> **Relationship to `docs/components/`**: that directory covers 15 subsystems, including
-> 10 (blocking ops, tiering, vector search, RediSearch, kernel bypass, cluster gossip, CRDT
-> replication, Lua scripting, persistence, security/TLS) this doc doesn't touch at all. Its
-> files 01-05 cover the same five subsystems as the five parts below and have since been
-> rewritten and verified against the current source (they previously didn't match — see that
-> directory's README for history); the two doc sets should now agree, but this doc still
-> predates several major additions to `RudisValue` (`Int`, `SmallHash`, `List`, `Set`, `ZSet`,
-> `Stream`, `Tiered`/`Cooled` for NVMe tiering) that `docs/components/05` documents and this
-> one doesn't — Part 1 here documents the underlying SIMD table engine accurately, but not
-> those newer value types' own internals.
+> **Relationship to `docs/components.md`**: that single file covers 15 subsystems (Components
+> 01-15), including 10 (blocking ops, tiering, vector search, RediSearch, kernel bypass,
+> cluster gossip, CRDT replication, Lua scripting, persistence, security/TLS) this doc doesn't
+> touch at all. Its Components 01-05 cover the same five subsystems as the five parts below and
+> have since been rewritten and verified against the current source (they previously didn't
+> match — see that file's own intro for history); the two doc sets should now agree, but this
+> doc still predates several major additions to `RudisValue` (`Int`, `SmallHash`, `List`,
+> `Set`, `ZSet`, `Stream`, `Tiered`/`Cooled` for NVMe tiering) that `docs/components.md`'s
+> Component 05 documents and this one doesn't — Part 1 here documents the underlying SIMD
+> table engine accurately, but not those newer value types' own internals.
 
 **Contents**
 - Part 1: Storage Engine (`RudisTable`) — `src/table.rs`, `src/shard.rs`
