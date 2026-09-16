@@ -1184,6 +1184,21 @@ pub async fn handle_connection(
                                 break;
                             }
                         }
+                    } else if commands.len() == 1 {
+                        let quit = execute_command(
+                            commands.pop().unwrap(),
+                            &router,
+                            client_id,
+                            &client_registry,
+                            &mut out_buf,
+                            &mut asking,
+                            &mut authenticated,
+                            &mut auth_user,
+                        )
+                        .await;
+                        if quit {
+                            should_quit = true;
+                        }
                     } else {
                         let quit = execute_commands_squashed(
                             &mut commands,
@@ -2914,7 +2929,10 @@ async fn execute_command(
         return false;
     }
 
-    if *authenticated {
+    if *authenticated
+        && (crate::acl::HAS_CUSTOM_ACL.load(std::sync::atomic::Ordering::Relaxed)
+            || auth_user != "default")
+    {
         let acl = crate::acl::get_acl_for_port(router.port);
         let acl_guard = acl.read().unwrap();
         if let Some(user) = acl_guard.get_user(auth_user) {
@@ -2970,22 +2988,24 @@ async fn execute_command(
                 }
             }
             crate::shard::SlotState::Stable => {
-                let hub = crate::cluster::get_cluster_hub(router.port);
-                let my_slots = hub.my_slots.read().unwrap();
-                let owns_slot = my_slots.iter().any(|&(s, e)| slot >= s && slot <= e);
-                if !owns_slot {
-                    let nodes = hub.nodes.read().unwrap();
-                    if !nodes.is_empty()
-                        && let Some(peer) = nodes.values().find(|n| {
-                            n.flags.contains("master")
-                                && !n.flags.contains("fail")
-                                && n.slots.iter().any(|&(s, e)| slot >= s && slot <= e)
-                        })
-                    {
-                        out.extend_from_slice(
-                            format!("-MOVED {} {}:{}\r\n", slot, peer.ip, peer.port).as_bytes(),
-                        );
-                        return false;
+                if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
+                    let hub = crate::cluster::get_cluster_hub(router.port);
+                    let my_slots = hub.my_slots.read().unwrap();
+                    let owns_slot = my_slots.iter().any(|&(s, e)| slot >= s && slot <= e);
+                    if !owns_slot {
+                        let nodes = hub.nodes.read().unwrap();
+                        if !nodes.is_empty()
+                            && let Some(peer) = nodes.values().find(|n| {
+                                n.flags.contains("master")
+                                    && !n.flags.contains("fail")
+                                    && n.slots.iter().any(|&(s, e)| slot >= s && slot <= e)
+                            })
+                        {
+                            out.extend_from_slice(
+                                format!("-MOVED {} {}:{}\r\n", slot, peer.ip, peer.port).as_bytes(),
+                            );
+                            return false;
+                        }
                     }
                 }
             }
@@ -11857,7 +11877,14 @@ async fn execute_commands_squashed(
             } else {
                 remote_batches[target].push((idx, cmd));
             }
-        } else if matches!(cmd, Command::Mget(_) | Command::Mset(_)) {
+        } else if !matches!(
+            cmd,
+            Command::Ping(_)
+                | Command::CommandDocs
+                | Command::Quit
+                | Command::Time
+                | Command::Echo(_)
+        ) {
             local_buf.clear();
             if execute_command(
                 cmd,
@@ -12094,6 +12121,76 @@ mod tests {
         assert!(matches!(cmd2, Command::Get(_)));
         assert!(buf.is_empty());
     }
+
+    #[test]
+    fn test_pipeline1_execute_command_lockless_bypass() {
+        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let (tx, _rx) = flume::unbounded();
+            let db = Rc::new(RefCell::new(ShardDb::new(9993)));
+            let router = Router::new(
+                0,
+                1,
+                9993,
+                db,
+                vec![tx],
+                None,
+                Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+                std::env::temp_dir(),
+            );
+            let client_registry = RefCell::new(hashbrown::HashMap::new());
+            let mut out = Vec::new();
+            let mut asking = false;
+            let mut authenticated = true;
+            let mut auth_user = String::from("default");
+
+            // Execute SET
+            let set_cmd = Command::Set {
+                key: Bytes::from("pipe1_k"),
+                value: Bytes::from("pipe1_v"),
+                expire_in: None,
+                condition: crate::resp::SetCondition::None,
+                get: false,
+                keepttl: false,
+                past_expired: false,
+            };
+            let quit = execute_command(
+                set_cmd,
+                &router,
+                1,
+                &client_registry,
+                &mut out,
+                &mut asking,
+                &mut authenticated,
+                &mut auth_user,
+            )
+            .await;
+            assert!(!quit);
+            assert_eq!(out, b"+OK\r\n");
+
+            // Execute GET
+            out.clear();
+            let get_cmd = Command::Get(Bytes::from("pipe1_k"));
+            let quit = execute_command(
+                get_cmd,
+                &router,
+                1,
+                &client_registry,
+                &mut out,
+                &mut asking,
+                &mut authenticated,
+                &mut auth_user,
+            )
+            .await;
+            assert!(!quit);
+            assert_eq!(out, b"$7\r\npipe1_v\r\n");
+        });
+    }
 }
+
 
 

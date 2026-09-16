@@ -6405,6 +6405,31 @@ fn test_reactive_mget_mset_and_command_drain_e2e() {
     }
 }
 
+#[test]
+fn test_pipeline1_fast_path_and_multi_key_routing_e2e() {
+    let port = 16472;
+    start_test_server(port, 4);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Pipeline 1 single-command requests
+    let resp = send_and_read(&mut client, b"SET single_k single_v\r\n");
+    assert_eq!(resp, "+OK\r\n");
+
+    let resp = send_and_read(&mut client, b"GET single_k\r\n");
+    assert_eq!(resp, "$8\r\nsingle_v\r\n");
+
+    // 2. Multi-key TOUCH across shards
+    let _ = send_and_read(&mut client, b"SET touch_k1 v1\r\n");
+    let _ = send_and_read(&mut client, b"SET touch_k2 v2\r\n");
+    let resp = send_and_read(&mut client, b"TOUCH touch_k1 touch_k2 touch_missing\r\n");
+    assert_eq!(resp, ":2\r\n");
+
+    // 3. Multi-key DEL across shards
+    let resp = send_and_read(&mut client, b"DEL touch_k1 touch_k2 touch_missing\r\n");
+    assert_eq!(resp, ":2\r\n");
+}
+
+
 
 
 
