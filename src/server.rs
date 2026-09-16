@@ -467,6 +467,78 @@ pub fn run_shard_worker(
                             let _ = responder.send(results);
                         }
                     }
+                    ShardMessage::Mget { keys, responder } => {
+                        let r = cross_shard_router.clone();
+                        let db_ref = cross_shard_db.clone();
+                        let needs_async = keys.iter().any(|(_, key)| {
+                            db_ref.borrow_mut().get(key).is_none()
+                                && db_ref.borrow_mut().table.is_tiered(key).is_some()
+                        });
+                        if needs_async {
+                            monoio::spawn(async move {
+                                let mut results = Vec::with_capacity(keys.len());
+                                for (idx, key) in keys {
+                                    let val = r.local_db.borrow_mut().get(&key);
+                                    if let Some(v) = val {
+                                        results.push((idx, Some(v)));
+                                    } else if r.local_db.borrow_mut().table.is_tiered(&key).is_some() {
+                                        let max_mem = crate::tiering::get_max_memory(r.port);
+                                        let offload_pct = crate::tiering::get_offload_threshold_pct(r.port);
+                                        let is_constrained = if max_mem > 0 {
+                                            let used = r.local_db.borrow().table.used_memory;
+                                            let shard_threshold = (max_mem / r.num_shards.max(1) as u64) as usize;
+                                            used >= (shard_threshold * offload_pct as usize) / 100
+                                        } else {
+                                            false
+                                        };
+                                        if is_constrained {
+                                            let val = r.stream_cold_read_local(&key).await;
+                                            if val.is_some() {
+                                                let stats = crate::tiering::get_tier_stats(r.port);
+                                                stats.streaming_reads.fetch_add(1, Ordering::Relaxed);
+                                                stats.ram_misses.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                            results.push((idx, val));
+                                        } else {
+                                            r.ensure_loaded(&key).await;
+                                            let val = r.local_db.borrow_mut().get(&key);
+                                            results.push((idx, val));
+                                        }
+                                    } else {
+                                        results.push((idx, None));
+                                    }
+                                }
+                                let _ = responder.send(results);
+                            });
+                        } else {
+                            let mut db = cross_shard_db.borrow_mut();
+                            let mut results = Vec::with_capacity(keys.len());
+                            for (idx, key) in keys {
+                                let val = db.get(&key);
+                                results.push((idx, val));
+                            }
+                            let _ = responder.send(results);
+                        }
+                    }
+                    ShardMessage::Mset { pairs, responder } => {
+                        {
+                            let mut db = cross_shard_db.borrow_mut();
+                            for (k, v) in &pairs {
+                                db.set(k.clone(), v.clone(), None);
+                            }
+                        }
+                        if let Some(aof) = &cross_shard_aof
+                            && let Some(bytes) =
+                                crate::aof::command_to_resp(&crate::resp::Command::Mset(pairs))
+                            {
+                                aof.borrow_mut().append(&bytes);
+                            }
+                        let r = cross_shard_router.clone();
+                        monoio::spawn(async move {
+                            r.check_auto_tier().await;
+                        });
+                        let _ = responder.send(());
+                    }
                     ShardMessage::SetSlotState { slot, state } => {
                         cross_shard_slot_states.borrow_mut()[slot as usize] = state;
                     }

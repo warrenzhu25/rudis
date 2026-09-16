@@ -736,6 +736,156 @@ impl Router {
         }
     }
 
+    pub async fn mget(&self, keys: Vec<Bytes>) -> Vec<Option<Bytes>> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+
+        let total_keys = keys.len();
+        let mut results: Vec<Option<Bytes>> = vec![None; total_keys];
+        let mut local_batch: Vec<(usize, Bytes)> = Vec::new();
+        let mut remote_batches: Vec<Vec<(usize, Bytes)>> = vec![Vec::new(); self.num_shards];
+
+        for (idx, key) in keys.into_iter().enumerate() {
+            let target = self.target_shard(&key);
+            if target == self.shard_id {
+                local_batch.push((idx, key));
+            } else {
+                remote_batches[target].push((idx, key));
+            }
+        }
+
+        // 1. Process local batch
+        for (idx, key) in local_batch {
+            let val = self.local_db.borrow_mut().get(&key);
+            if let Some(v) = val {
+                let stats = crate::tiering::get_tier_stats(self.port);
+                stats.ram_hits.fetch_add(1, Ordering::Relaxed);
+                results[idx] = Some(v);
+            } else if self.local_db.borrow_mut().table.is_tiered(&key).is_some() {
+                let max_mem = crate::tiering::get_max_memory(self.port);
+                let offload_pct = crate::tiering::get_offload_threshold_pct(self.port);
+                let is_constrained = if max_mem > 0 {
+                    let used_mem = self.local_db.borrow().table.used_memory;
+                    let shard_threshold = (max_mem / self.num_shards.max(1) as u64) as usize;
+                    used_mem >= (shard_threshold * offload_pct as usize) / 100
+                } else {
+                    false
+                };
+                if is_constrained {
+                    if let Some(val) = self.stream_cold_read_local(&key).await {
+                        let stats = crate::tiering::get_tier_stats(self.port);
+                        stats.streaming_reads.fetch_add(1, Ordering::Relaxed);
+                        stats.ram_misses.fetch_add(1, Ordering::Relaxed);
+                        results[idx] = Some(val);
+                    }
+                } else {
+                    self.load_local(&key).await;
+                    results[idx] = self.local_db.borrow_mut().get(&key);
+                }
+            } else {
+                results[idx] = None;
+            }
+        }
+
+        // 2. Dispatch remote batches concurrently
+        let mut pending = Vec::new();
+        for (target_shard, items) in remote_batches.into_iter().enumerate() {
+            if !items.is_empty() {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::Mget {
+                    keys: items,
+                    responder: tx,
+                };
+                if self.senders[target_shard].send(msg).is_ok() {
+                    pending.push(rx);
+                }
+            }
+        }
+
+        // 3. Await all remote shard responses
+        for rx in pending {
+            if let Ok(shard_results) = rx.recv_async().await {
+                for (idx, val) in shard_results {
+                    results[idx] = val;
+                }
+            }
+        }
+
+        results
+    }
+
+    pub async fn mset(&self, pairs: Vec<(Bytes, Bytes)>) {
+        if pairs.is_empty() {
+            return;
+        }
+
+        let mut local_batch: Vec<(Bytes, Bytes)> = Vec::new();
+        let mut remote_batches: Vec<Vec<(Bytes, Bytes)>> = vec![Vec::new(); self.num_shards];
+
+        for (k, v) in pairs {
+            let target = self.target_shard(&k);
+            if target == self.shard_id {
+                local_batch.push((k, v));
+            } else {
+                remote_batches[target].push((k, v));
+            }
+        }
+
+        // 1. Process local batch
+        if !local_batch.is_empty() {
+            {
+                let mut db = self.local_db.borrow_mut();
+                for (k, v) in &local_batch {
+                    db.set(k.clone(), v.clone(), None);
+                }
+            }
+            if let Some(aof) = &self.aof
+                && let Some(bytes) =
+                    crate::aof::command_to_resp(&crate::resp::Command::Mset(local_batch))
+                {
+                    aof.borrow_mut().append(&bytes);
+                }
+            let max_mem = crate::tiering::get_max_memory(self.port);
+            if max_mem > 0 {
+                let used = self.local_db.borrow().table.used_memory;
+                let shard_max_mem = (max_mem / self.num_shards.max(1) as u64) as usize;
+                if used > shard_max_mem && !self.is_auto_tiering.get() {
+                    let decommitted = self.decommit_local(None);
+                    let used_after = self.local_db.borrow().table.used_memory;
+                    if (decommitted == 0 || used_after > shard_max_mem)
+                        && !self.is_auto_tiering.get()
+                    {
+                        let r = self.clone();
+                        monoio::spawn(async move {
+                            r.check_auto_tier().await;
+                        });
+                    }
+                }
+            }
+        }
+
+        // 2. Dispatch remote batches concurrently
+        let mut pending = Vec::new();
+        for (target_shard, items) in remote_batches.into_iter().enumerate() {
+            if !items.is_empty() {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::Mset {
+                    pairs: items,
+                    responder: tx,
+                };
+                if self.senders[target_shard].send(msg).is_ok() {
+                    pending.push(rx);
+                }
+            }
+        }
+
+        // 3. Await all completions
+        for rx in pending {
+            let _ = rx.recv_async().await;
+        }
+    }
+
     pub async fn del(&self, key: Bytes) -> bool {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
@@ -1683,3 +1833,111 @@ impl Router {
         crate::cluster::get_cluster_hub(self.port).cluster_delslotsrange(ranges)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_router_mget_mset_fanout() {
+        let num_shards = 2;
+        let mut senders = Vec::new();
+        let mut receivers = Vec::new();
+        for _ in 0..num_shards {
+            let (tx, rx) = flume::unbounded::<ShardMessage>();
+            senders.push(tx);
+            receivers.push(rx);
+        }
+
+        let db0 = Rc::new(RefCell::new(ShardDb::new(9999)));
+
+        let router = Router::new(
+            0,
+            num_shards,
+            9999,
+            db0.clone(),
+            senders.clone(),
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+
+        let mut k_shard0 = Bytes::from("k0");
+        let mut k_shard1 = Bytes::from("k1");
+        for i in 0..1000 {
+            let candidate = Bytes::from(format!("key_{}", i));
+            if target_shard(&candidate, num_shards) == 0 && k_shard0 == "k0" {
+                k_shard0 = candidate.clone();
+            }
+            if target_shard(&candidate, num_shards) == 1 && k_shard1 == "k1" {
+                k_shard1 = candidate;
+            }
+        }
+        assert_eq!(target_shard(&k_shard0, num_shards), 0);
+        assert_eq!(target_shard(&k_shard1, num_shards), 1);
+
+        let rx1 = receivers.remove(1);
+        let k_shard1_verify = k_shard1.clone();
+        let (done_tx, done_rx) = flume::bounded(1);
+        let h = std::thread::spawn(move || {
+            let mut db = ShardDb::new(9999);
+            while let Ok(msg) = rx1.recv() {
+                match msg {
+                    ShardMessage::Mset { pairs, responder } => {
+                        for (k, v) in pairs {
+                            db.set(k, v, None);
+                        }
+                        let _ = responder.send(());
+                    }
+                    ShardMessage::Mget { keys, responder } => {
+                        let mut results = Vec::new();
+                        for (idx, k) in keys {
+                            let val = db.get(&k);
+                            results.push((idx, val));
+                        }
+                        let _ = responder.send(results);
+                    }
+                    _ => break,
+                }
+            }
+            let _ = done_tx.send(db.get(&k_shard1_verify));
+        });
+
+        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async move {
+            // MSET across both shards simultaneously
+            let pairs = vec![
+                (k_shard0.clone(), Bytes::from("val0")),
+                (k_shard1.clone(), Bytes::from("val1")),
+            ];
+            router.mset(pairs).await;
+
+            // Shard 0 local_db should have k_shard0
+            assert_eq!(db0.borrow_mut().get(&k_shard0), Some(Bytes::from("val0")));
+
+            // MGET across both shards including nonexistent and duplicate keys
+            let missing_key = Bytes::from("missing_key_xyz");
+            let keys = vec![
+                k_shard1.clone(),
+                missing_key.clone(),
+                k_shard0.clone(),
+                k_shard1.clone(),
+            ];
+            let values = router.mget(keys).await;
+            assert_eq!(values.len(), 4);
+            assert_eq!(values[0], Some(Bytes::from("val1")));
+            assert_eq!(values[1], None);
+            assert_eq!(values[2], Some(Bytes::from("val0")));
+            assert_eq!(values[3], Some(Bytes::from("val1")));
+        });
+
+        drop(senders);
+        let _ = h.join();
+        assert_eq!(done_rx.recv().unwrap(), Some(Bytes::from("val1")));
+    }
+}
+

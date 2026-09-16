@@ -118,6 +118,14 @@ pub enum ShardMessage {
         responder: flume::Sender<Vec<(usize, CompactResp)>>,
         is_resp3: bool,
     },
+    Mget {
+        keys: Vec<(usize, Bytes)>,
+        responder: flume::Sender<Vec<(usize, Option<Bytes>)>>,
+    },
+    Mset {
+        pairs: Vec<(Bytes, Bytes)>,
+        responder: flume::Sender<()>,
+    },
     NotifyList {
         keys: Vec<Bytes>,
     },

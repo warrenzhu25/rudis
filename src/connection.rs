@@ -3146,9 +3146,10 @@ async fn execute_command(
             for key in &keys {
                 record_client_read(router.port, client_id, key.as_ref());
             }
-            out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
-            for key in keys {
-                match router.get(key).await {
+            let values = router.mget(keys).await;
+            out.extend_from_slice(format!("*{}\r\n", values.len()).as_bytes());
+            for val in values {
+                match val {
                     Some(v) => {
                         out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
                         out.extend_from_slice(&v);
@@ -3167,10 +3168,10 @@ async fn execute_command(
             {
                 crate::replication::propagate_bytes(router.port, &bytes);
             }
-            for (key, val) in pairs {
+            for (key, _) in &pairs {
                 notify_key_invalidation(router.port, key.as_ref(), client_id);
-                router.set(key, val, None).await;
             }
+            router.mset(pairs).await;
             out.extend_from_slice(b"+OK\r\n");
             false
         }
@@ -7395,6 +7396,22 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         }
         Command::Touch(keys) | Command::Del(keys) | Command::Exists(keys) if keys.len() == 1 => {
             Some(target_shard(&keys[0], num_shards))
+        }
+        Command::Mget(keys)
+            if !keys.is_empty()
+                && keys
+                    .iter()
+                    .all(|k| target_shard(k, num_shards) == target_shard(&keys[0], num_shards)) =>
+        {
+            Some(target_shard(&keys[0], num_shards))
+        }
+        Command::Mset(pairs)
+            if !pairs.is_empty()
+                && pairs
+                    .iter()
+                    .all(|(k, _)| target_shard(k, num_shards) == target_shard(&pairs[0].0, num_shards)) =>
+        {
+            Some(target_shard(&pairs[0].0, num_shards))
         }
         Command::Xread { keys, .. } | Command::Xreadgroup { keys, .. }
             if !keys.is_empty()
@@ -11722,6 +11739,23 @@ async fn execute_commands_squashed(
             } else {
                 remote_batches[target].push((idx, cmd));
             }
+        } else if matches!(cmd, Command::Mget(_) | Command::Mset(_)) {
+            local_buf.clear();
+            if execute_command(
+                cmd,
+                router,
+                client_id,
+                client_registry,
+                &mut local_buf,
+                asking,
+                authenticated,
+                auth_user,
+            )
+            .await
+            {
+                should_close = true;
+            }
+            responses[idx] = CompactResp::from_slice(&local_buf);
         } else {
             // Non-sharded simple commands (PING, QUIT, COMMAND DOCS) run locally
             local_buf.clear();
@@ -11832,6 +11866,44 @@ mod tests {
         assert_eq!(extract_hash_tag(tagged1), b"user:123");
         assert_eq!(extract_hash_tag(tagged2), b"user:123");
         assert_eq!(key_slot(tagged1), key_slot(tagged2));
+    }
+
+    #[test]
+    fn test_target_shard_of_cmd_mget_mset() {
+        let num_shards = 4;
+        let k1 = Bytes::from("{user:123}:a");
+        let k2 = Bytes::from("{user:123}:b");
+        let expected_shard = target_shard(&k1, num_shards);
+        assert_eq!(target_shard(&k2, num_shards), expected_shard);
+
+        // Co-located MGET
+        let mget_colocated = Command::Mget(vec![k1.clone(), k2.clone()]);
+        assert_eq!(target_shard_of_cmd(&mget_colocated, num_shards), Some(expected_shard));
+
+        // Co-located MSET
+        let mset_colocated = Command::Mset(vec![
+            (k1.clone(), Bytes::from("val1")),
+            (k2.clone(), Bytes::from("val2")),
+        ]);
+        assert_eq!(target_shard_of_cmd(&mset_colocated, num_shards), Some(expected_shard));
+
+        // Non-colocated MGET
+        let mut diff_key = Bytes::from("different_key");
+        for i in 0..1000 {
+            let candidate = Bytes::from(format!("k_{}", i));
+            if target_shard(&candidate, num_shards) != expected_shard {
+                diff_key = candidate;
+                break;
+            }
+        }
+        let mget_cross = Command::Mget(vec![k1.clone(), diff_key.clone()]);
+        assert_eq!(target_shard_of_cmd(&mget_cross, num_shards), None);
+
+        let mset_cross = Command::Mset(vec![
+            (k1, Bytes::from("val1")),
+            (diff_key, Bytes::from("val2")),
+        ]);
+        assert_eq!(target_shard_of_cmd(&mset_cross, num_shards), None);
     }
 }
 

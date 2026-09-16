@@ -5817,6 +5817,85 @@ fn test_tls_port_listener_e2e() {
     assert_eq!(&buf[..n], b"$9\r\nplain_val\r\n");
 }
 
+#[test]
+fn test_cross_shard_mget_mset_fanout_e2e() {
+    let port = 16700;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("Failed to connect client");
+    client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+
+    // 1. Find 4 keys that each map to shard 0, 1, 2, 3
+    let mut shard_keys: [String; 4] = Default::default();
+    let mut found = 0;
+    for i in 0..10000 {
+        let key = format!("k_{}", i);
+        let s = target_shard(key.as_bytes(), num_shards);
+        if shard_keys[s].is_empty() {
+            shard_keys[s] = key;
+            found += 1;
+            if found == 4 {
+                break;
+            }
+        }
+    }
+    assert_eq!(found, 4);
+
+    let k0 = &shard_keys[0];
+    let k1 = &shard_keys[1];
+    let k2 = &shard_keys[2];
+    let k3 = &shard_keys[3];
+
+    // 2. Parallel cross-shard MSET fanning out to all 4 shards
+    let mset_cmd = format!("MSET {} v0 {} v1 {} v2 {} v3\r\n", k0, k1, k2, k3);
+    assert_eq!(send_and_read(&mut client, mset_cmd.as_bytes()), "+OK\r\n");
+
+    // 3. Verify via individual GET commands that keys actually reside on each shard
+    assert_eq!(
+        send_and_read(&mut client, format!("GET {}\r\n", k0).as_bytes()),
+        "$2\r\nv0\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, format!("GET {}\r\n", k1).as_bytes()),
+        "$2\r\nv1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, format!("GET {}\r\n", k2).as_bytes()),
+        "$2\r\nv2\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, format!("GET {}\r\n", k3).as_bytes()),
+        "$2\r\nv3\r\n"
+    );
+
+    // 4. Parallel cross-shard MGET reading across all 4 shards with missing & duplicate keys
+    let mget_cmd = format!(
+        "MGET {} {} non_existent_key_xyz {} {} {}\r\n",
+        k3, k0, k2, k1, k0
+    );
+    let expected = "*6\r\n$2\r\nv3\r\n$2\r\nv0\r\n$-1\r\n$2\r\nv2\r\n$2\r\nv1\r\n$2\r\nv0\r\n";
+    assert_eq!(send_and_read(&mut client, mget_cmd.as_bytes()), expected);
+
+    // 5. Co-located hash-tag keys (single-shard bypass path)
+    let mset_tagged = "MSET {user:99}:name Alice {user:99}:city Seattle {user:99}:role Admin\r\n";
+    assert_eq!(send_and_read(&mut client, mset_tagged.as_bytes()), "+OK\r\n");
+
+    let mget_tagged = "MGET {user:99}:city {user:99}:name {user:99}:missing {user:99}:role\r\n";
+    let expected_tagged = "*4\r\n$7\r\nSeattle\r\n$5\r\nAlice\r\n$-1\r\n$5\r\nAdmin\r\n";
+    assert_eq!(send_and_read(&mut client, mget_tagged.as_bytes()), expected_tagged);
+
+    // 6. Pipelined MSET + MGET in a single network buffer
+    let pipeline = format!(
+        "MSET {} new_v0 {} new_v2\r\nMGET {} {} {}\r\n",
+        k0, k2, k0, k1, k2
+    );
+    let pipeline_resp = send_and_read(&mut client, pipeline.as_bytes());
+    let expected_pipeline = "+OK\r\n*3\r\n$6\r\nnew_v0\r\n$2\r\nv1\r\n$6\r\nnew_v2\r\n";
+    assert_eq!(pipeline_resp, expected_pipeline);
+}
+
 
 
 
