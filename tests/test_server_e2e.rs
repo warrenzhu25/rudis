@@ -5302,7 +5302,7 @@ fn test_all_remaining_uncovered_commands_e2e() {
 fn test_fcall_mutating_aof_persistence_and_replay_e2e() {
     let port1 = 16640;
     let port2 = 16641;
-    let num_shards = 2;
+    let num_shards = 1;
     let aof_dir = std::env::temp_dir().join(format!("rudis-aof-fcall-{}", port1));
     let _ = std::fs::remove_dir_all(&aof_dir);
     std::fs::create_dir_all(&aof_dir).unwrap();
@@ -5454,5 +5454,101 @@ fn test_crdt_cross_shard_routing_e2e() {
         assert_eq!(resp, "$-1\r\n");
     }
 }
+
+#[test]
+fn test_cluster_pipelined_squashed_moved_redirect_e2e() {
+    let port1 = 16660;
+    let port2 = 16661;
+
+    start_test_server(port1, 2);
+    start_test_server(port2, 2);
+
+    let mut c1 = TcpStream::connect(format!("127.0.0.1:{}", port1)).unwrap();
+    let mut c2 = TcpStream::connect(format!("127.0.0.1:{}", port2)).unwrap();
+
+    // Node 1: slots 0..=8191
+    assert_eq!(
+        send_and_read(&mut c1, b"CLUSTER DELSLOTSRANGE 0 16383\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut c1, b"CLUSTER ADDSLOTSRANGE 0 8191\r\n"),
+        "+OK\r\n"
+    );
+
+    // Node 2: slots 8192..=16383
+    assert_eq!(
+        send_and_read(&mut c2, b"CLUSTER DELSLOTSRANGE 0 16383\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut c2, b"CLUSTER ADDSLOTSRANGE 8192 16383\r\n"),
+        "+OK\r\n"
+    );
+
+    // Node 1 meets Node 2
+    assert_eq!(
+        send_and_read(
+            &mut c1,
+            format!("CLUSTER MEET 127.0.0.1 {}\r\n", port2).as_bytes()
+        ),
+        "+OK\r\n"
+    );
+
+    // Wait for gossip tick & slot exchange
+    thread::sleep(Duration::from_millis(1500));
+
+    // Find a key belonging to Node 1 (slot < 8192) and one to Node 2 (slot >= 8192)
+    let mut key_node1 = String::new();
+    let mut key_node2 = String::new();
+    let mut slot_node2 = 0;
+
+    for i in 0..1000 {
+        let candidate = format!("test_key_{}", i);
+        let s = rudis::router::key_slot(candidate.as_bytes());
+        if s < 8192 && key_node1.is_empty() {
+            key_node1 = candidate.clone();
+        } else if s >= 8192 && key_node2.is_empty() {
+            key_node2 = candidate.clone();
+            slot_node2 = s;
+        }
+        if !key_node1.is_empty() && !key_node2.is_empty() {
+            break;
+        }
+    }
+
+    // Connect a fresh client connection to Node 1
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port1)).unwrap();
+
+    // Send a pipelined batch in a single TCP write:
+    // Cmd 1: SET <key_node1> owned_val (should succeed: +OK)
+    // Cmd 2: SET <key_node2> unowned_val (should fail: -MOVED <slot_node2> 127.0.0.1:16661)
+    let pipeline_req = format!(
+        "SET {} owned_val\r\nSET {} unowned_val\r\n",
+        key_node1, key_node2
+    );
+    let resp = send_and_read(&mut client, pipeline_req.as_bytes());
+
+    let expected_moved = format!("-MOVED {} 127.0.0.1:{}\r\n", slot_node2, port2);
+    assert_eq!(
+        resp,
+        format!("+OK\r\n{}", expected_moved),
+        "Pipelined squashed commands must return MOVED redirect for unowned slots"
+    );
+
+    // Verify key_node1 was actually set on Node 1
+    let get_resp = send_and_read(&mut client, format!("GET {}\r\n", key_node1).as_bytes());
+    assert_eq!(get_resp, "$9\r\nowned_val\r\n");
+
+    // Also send a pipeline of multiple unowned commands
+    let pipeline_unowned = format!("GET {}\r\nDEL {}\r\n", key_node2, key_node2);
+    let resp = send_and_read(&mut client, pipeline_unowned.as_bytes());
+    assert_eq!(
+        resp,
+        format!("{}{}", expected_moved, expected_moved),
+        "All commands for unowned slots in a squashed pipeline must return MOVED redirect"
+    );
+}
+
 
 

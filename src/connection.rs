@@ -6431,29 +6431,70 @@ async fn execute_command(
             false
         }
         Command::CrdtDump => {
-            let payload = router.local_db.borrow().crdt_dump();
+            let mut payload = router.local_db.borrow().crdt_dump();
+            for sid in 0..router.num_shards {
+                if sid != router.shard_id {
+                    let res = router.execute_remote(sid, Command::CrdtDump).await;
+                    if let Some(first_nl) = res.iter().position(|&b| b == b'\n')
+                        && res.len() > first_nl + 2
+                    {
+                        let chunk = &res[first_nl + 1..res.len() - 2];
+                        payload.extend_from_slice(chunk);
+                    }
+                }
+            }
             write_resp_bulk(out, &payload);
             false
         }
         Command::CrdtMerge(payload) => {
-            match router.local_db.borrow_mut().crdt_merge(&payload) {
-                Ok(count) => {
-                    write_resp_integer(out, count as i64);
-                }
+            let mut total_merged = match router.local_db.borrow_mut().crdt_merge(&payload) {
+                Ok(count) => count,
                 Err(e) => {
                     let err_resp = format!("-ERR {}\r\n", e);
                     out.extend_from_slice(err_resp.as_bytes());
+                    return false;
+                }
+            };
+            for sid in 0..router.num_shards {
+                if sid != router.shard_id {
+                    let res = router
+                        .execute_remote(sid, Command::CrdtMerge(payload.clone()))
+                        .await;
+                    if let Ok(s) = std::str::from_utf8(&res)
+                        && let Some(num_str) =
+                            s.strip_prefix(':').and_then(|x| x.split("\r\n").next())
+                        && let Ok(n) = num_str.parse::<usize>()
+                    {
+                        total_merged += n;
+                    }
                 }
             }
+            write_resp_integer(out, total_merged as i64);
             false
         }
         Command::CrdtGc(ttl_ms) => {
-            let (regs, set_tombstones) = router.local_db.borrow_mut().crdt_gc(ttl_ms);
+            let (mut total_regs, mut total_sets) = router.local_db.borrow_mut().crdt_gc(ttl_ms);
+            for sid in 0..router.num_shards {
+                if sid != router.shard_id {
+                    let res = router.execute_remote(sid, Command::CrdtGc(ttl_ms)).await;
+                    if let Ok(s) = std::str::from_utf8(&res) {
+                        let parts: Vec<&str> = s.split("\r\n").collect();
+                        if parts.len() >= 6 {
+                            if let Ok(r) = parts[3].trim_start_matches(':').parse::<usize>() {
+                                total_regs += r;
+                            }
+                            if let Ok(st) = parts[5].trim_start_matches(':').parse::<usize>() {
+                                total_sets += st;
+                            }
+                        }
+                    }
+                }
+            }
             out.extend_from_slice(b"*4\r\n");
             write_resp_bulk(out, b"registers_pruned");
-            write_resp_integer(out, regs as i64);
+            write_resp_integer(out, total_regs as i64);
             write_resp_bulk(out, b"set_tombstones_pruned");
-            write_resp_integer(out, set_tombstones as i64);
+            write_resp_integer(out, total_sets as i64);
             false
         }
         Command::FunctionLoad { replace, code } => {
@@ -11319,6 +11360,33 @@ pub fn execute_local_command(
             }
             false
         }
+        Command::CrdtDump => {
+            let payload = db.crdt_dump();
+            write_resp_bulk(out, &payload);
+            false
+        }
+        Command::CrdtMerge(payload) => {
+            match db.crdt_merge(payload) {
+                Ok(count) => {
+                    record_change!(cmd);
+                    write_resp_integer(out, count as i64);
+                }
+                Err(e) => {
+                    let err_resp = format!("-ERR {}\r\n", e);
+                    out.extend_from_slice(err_resp.as_bytes());
+                }
+            }
+            false
+        }
+        Command::CrdtGc(ttl_ms) => {
+            let (regs, set_tombstones) = db.crdt_gc(*ttl_ms);
+            out.extend_from_slice(b"*4\r\n");
+            write_resp_bulk(out, b"registers_pruned");
+            write_resp_integer(out, regs as i64);
+            write_resp_bulk(out, b"set_tombstones_pruned");
+            write_resp_integer(out, set_tombstones as i64);
+            false
+        }
         Command::Quit => {
             out.extend_from_slice(b"+OK\r\n");
             true
@@ -11576,6 +11644,22 @@ mod tests {
             assert_eq!(cmd_primary_key(cmd), Some(&k));
             assert_eq!(target_shard_of_cmd(cmd, num_shards), Some(expected_shard));
         }
+    }
+
+    #[test]
+    fn test_cluster_key_slot_and_tag_extraction() {
+        use crate::router::{extract_hash_tag, key_slot};
+
+        let key1 = b"user1000";
+        let slot1 = key_slot(key1);
+        assert!(slot1 < 16384);
+
+        // Keys with identical hash tags must hash to identical cluster slots
+        let tagged1 = b"{user:123}:profile";
+        let tagged2 = b"{user:123}:settings";
+        assert_eq!(extract_hash_tag(tagged1), b"user:123");
+        assert_eq!(extract_hash_tag(tagged2), b"user:123");
+        assert_eq!(key_slot(tagged1), key_slot(tagged2));
     }
 }
 
