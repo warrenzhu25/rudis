@@ -165,4 +165,180 @@ impl TlsSession {
 
         Ok(())
     }
+
+    /// Asynchronously performs TLS handshake using monoio TcpStream
+    pub async fn handshake_monoio(
+        &mut self,
+        stream: &mut monoio::net::TcpStream,
+    ) -> io::Result<()> {
+        use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
+
+        let mut read_buf = vec![0u8; 4096];
+        while self.conn.is_handshaking() {
+            while self.conn.wants_write() {
+                let mut out = Vec::new();
+                self.conn.write_tls(&mut out)?;
+                if !out.is_empty() {
+                    let (res, _) = stream.write_all(out).await;
+                    res?;
+                }
+            }
+            if self.conn.wants_read() {
+                let (res, returned) = stream.read(read_buf).await;
+                read_buf = returned;
+                let n = res?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "TLS handshake EOF",
+                    ));
+                }
+                let mut slice = &read_buf[..n];
+                self.conn.read_tls(&mut slice)?;
+                self.conn.process_new_packets().map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("TLS error: {}", e))
+                })?;
+            }
+        }
+        while self.conn.wants_write() {
+            let mut out = Vec::new();
+            self.conn.write_tls(&mut out)?;
+            if !out.is_empty() {
+                let (res, _) = stream.write_all(out).await;
+                res?;
+            }
+        }
+
+        let raw_fd = stream.as_raw_fd();
+        if enable_ktls(raw_fd).is_ok() {
+            self.is_ktls_active = true;
+        }
+
+        Ok(())
+    }
+
+    /// Asynchronously reads decrypted plaintext from TLS session
+    pub async fn read_plaintext(
+        &mut self,
+        stream: &mut monoio::net::TcpStream,
+        read_buf: &mut Vec<u8>,
+        plaintext_out: &mut [u8],
+    ) -> io::Result<usize> {
+        use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
+
+        if self.is_ktls_active {
+            let (res, returned) = stream.read(std::mem::take(read_buf)).await;
+            *read_buf = returned;
+            let n = res?;
+            if n > 0 {
+                let to_copy = n.min(plaintext_out.len());
+                plaintext_out[..to_copy].copy_from_slice(&read_buf[..to_copy]);
+                Ok(to_copy)
+            } else {
+                Ok(0)
+            }
+        } else {
+            // First check if rustls reader already has decrypted data available
+            match self.conn.reader().read(plaintext_out) {
+                Ok(n) if n > 0 => return Ok(n),
+                Err(e) if e.kind() != io::ErrorKind::WouldBlock => return Err(e),
+                _ => {}
+            }
+
+            // Otherwise read more encrypted TLS frames from the wire
+            loop {
+                let (res, returned) = stream.read(std::mem::take(read_buf)).await;
+                *read_buf = returned;
+                let n = res?;
+                if n == 0 {
+                    return Ok(0);
+                }
+                let mut slice = &read_buf[..n];
+                self.conn.read_tls(&mut slice)?;
+                self.conn.process_new_packets().map_err(|e| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("TLS error: {}", e))
+                })?;
+
+                while self.conn.wants_write() {
+                    let mut out = Vec::new();
+                    self.conn.write_tls(&mut out)?;
+                    if !out.is_empty() {
+                        let (res, _) = stream.write_all(out).await;
+                        res?;
+                    }
+                }
+
+                match self.conn.reader().read(plaintext_out) {
+                    Ok(n) if n > 0 => return Ok(n),
+                    Err(e) if e.kind() != io::ErrorKind::WouldBlock => return Err(e),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Asynchronously writes plaintext into TLS session and flushes encrypted frames
+    pub async fn write_plaintext(
+        &mut self,
+        stream: &mut monoio::net::TcpStream,
+        plaintext: &[u8],
+    ) -> io::Result<()> {
+        use monoio::io::AsyncWriteRentExt;
+
+        if self.is_ktls_active {
+            let (res, _) = stream.write_all(plaintext.to_vec()).await;
+            res?;
+        } else {
+            self.conn.writer().write_all(plaintext)?;
+            while self.conn.wants_write() {
+                let mut out = Vec::new();
+                self.conn.write_tls(&mut out)?;
+                if !out.is_empty() {
+                    let (res, _) = stream.write_all(out).await;
+                    res?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Configuration for running a TLS listener on worker shards.
+#[derive(Clone)]
+pub struct TlsWorkerConfig {
+    pub tls_port: u16,
+    pub server_config: Arc<ServerConfig>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tls_cert_generation_and_config() {
+        let (cert_der, key_der) = generate_self_signed_cert(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .expect("Failed to generate test self-signed cert");
+        assert!(!cert_der.is_empty());
+        assert!(!key_der.is_empty());
+
+        let config = create_server_config(&cert_der, &key_der)
+            .expect("Failed to create ServerConfig");
+        let session = TlsSession::new(config);
+        assert!(session.is_ok());
+    }
+
+    #[test]
+    fn test_tls_worker_config() {
+        let (cert_der, key_der) = generate_self_signed_cert(vec!["localhost".to_string()])
+            .expect("generate cert failed");
+        let server_config = create_server_config(&cert_der, &key_der).unwrap();
+        let worker_cfg = TlsWorkerConfig {
+            tls_port: 16379,
+            server_config,
+        };
+        assert_eq!(worker_cfg.tls_port, 16379);
+    }
 }

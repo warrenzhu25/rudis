@@ -17,6 +17,7 @@ pub fn run_shard_worker(
     rx: flume::Receiver<ShardMessage>,
     core_id: Option<core_affinity::CoreId>,
     aof_config: crate::aof::AofConfig,
+    tls_config: Option<crate::tls::TlsWorkerConfig>,
 ) {
     if let Some(core) = core_id {
         core_affinity::set_for_current(core);
@@ -51,6 +52,34 @@ pub fn run_shard_worker(
 
         let listener = monoio::net::TcpListener::from_std(socket.into())
             .expect("Failed to convert socket into Monoio TcpListener");
+
+        let tls_listener = if let Some(ref tls_cfg) = tls_config {
+            let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+                .expect("Failed to create TLS socket");
+            socket
+                .set_reuse_port(true)
+                .expect("Failed to set SO_REUSEPORT on TLS socket");
+            socket
+                .set_reuse_address(true)
+                .expect("Failed to set SO_REUSEADDR on TLS socket");
+            socket
+                .set_nonblocking(true)
+                .expect("Failed to set non-blocking on TLS socket");
+            let _ = socket.set_recv_buffer_size(512 * 1024);
+            let _ = socket.set_send_buffer_size(512 * 1024);
+
+            let addr: SocketAddr = format!("0.0.0.0:{}", tls_cfg.tls_port)
+                .parse()
+                .expect("Invalid TLS address");
+            socket.bind(&addr.into()).expect("Failed to bind TLS socket");
+            socket.listen(4096).expect("Failed to listen on TLS socket");
+
+            let listener = monoio::net::TcpListener::from_std(socket.into())
+                .expect("Failed to convert TLS socket into Monoio TcpListener");
+            Some(listener)
+        } else {
+            None
+        };
 
         // 2. Pure thread-local Shard DB (no Mutex, no Arc)
         let local_db = Rc::new(RefCell::new(ShardDb::new(port)));
@@ -701,6 +730,54 @@ pub fn run_shard_worker(
             "[Shard {}/{}] Worker started and listening on {} via io_uring",
             shard_id, num_shards, addr
         );
+
+        // 4.9 Spawn TLS Accept loop if enabled
+        if let Some(tls_listener) = tls_listener
+            && let Some(tls_cfg) = tls_config
+        {
+            let r = router.clone();
+            let reg = client_registry.clone();
+            monoio::spawn(async move {
+                let mut next_tls_client_id: u64 = ((shard_id as u64) << 48) | 0x8000_0000_0000;
+                loop {
+                    match tls_listener.accept().await {
+                        Ok((mut stream, client_addr)) => {
+                            let _ = stream.set_nodelay(true);
+                            let client_id = next_tls_client_id;
+                            next_tls_client_id += 1;
+                            let router_clone = r.clone();
+                            let reg_clone = reg.clone();
+                            let s_cfg = tls_cfg.server_config.clone();
+                            monoio::spawn(async move {
+                                let mut session = match crate::tls::TlsSession::new(s_cfg) {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        eprintln!("[Shard {}] Failed to create TlsSession: {}", shard_id, e);
+                                        return;
+                                    }
+                                };
+                                if let Err(e) = session.handshake_monoio(&mut stream).await {
+                                    eprintln!("[Shard {}] TLS handshake error: {}", shard_id, e);
+                                    return;
+                                }
+                                crate::connection::handle_tls_connection(
+                                    stream,
+                                    session,
+                                    client_addr,
+                                    client_id,
+                                    reg_clone,
+                                    router_clone,
+                                )
+                                .await;
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("[Shard {}] TLS accept error: {}", shard_id, e);
+                        }
+                    }
+                }
+            });
+        }
 
         // 5. Accept loop
         let mut next_client_id: u64 = ((shard_id as u64) << 48) + 1;

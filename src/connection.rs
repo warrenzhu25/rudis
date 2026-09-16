@@ -525,6 +525,118 @@ pub static HASH_MAX_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 pub static ALLOW_ACCESS_EXPIRED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+pub async fn handle_tls_connection(
+    mut stream: TcpStream,
+    mut session: crate::tls::TlsSession,
+    client_addr: SocketAddr,
+    client_id: u64,
+    client_registry: Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
+    router: Rc<Router>,
+) {
+    let raw_fd = stream.as_raw_fd();
+    let now = Instant::now();
+    client_registry.borrow_mut().insert(
+        client_id,
+        ClientInfo {
+            id: client_id,
+            addr: client_addr,
+            name: None,
+            connected_at: now,
+            last_active: now,
+            last_cmd: "NONE".to_string(),
+            is_resp3: false,
+            track_tx: None,
+            raw_fd,
+        },
+    );
+
+    struct TlsClientCleanup {
+        port: u16,
+        client_id: u64,
+        registry: Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
+    }
+    impl Drop for TlsClientCleanup {
+        fn drop(&mut self) {
+            self.registry.borrow_mut().remove(&self.client_id);
+            unregister_client_tracking(self.port, self.client_id);
+            let hub_arc = crate::block::get_block_hub_for_port(self.port);
+            let mut hub = hub_arc.lock().unwrap();
+            hub.unregister_blocked_client(self.client_id);
+        }
+    }
+    let _cleanup = TlsClientCleanup {
+        port: router.port,
+        client_id,
+        registry: client_registry.clone(),
+    };
+
+    let mut buf = BytesMut::with_capacity(131072);
+    let mut read_buf = vec![0u8; READ_BUFFER_SIZE];
+    let mut temp_plain = vec![0u8; READ_BUFFER_SIZE];
+    let mut out_buf = Vec::with_capacity(65536);
+
+    let mut asking = false;
+    let mut authenticated = !crate::acl::get_acl_for_port(router.port)
+        .read()
+        .unwrap()
+        .is_auth_required_for_default();
+    let mut auth_user = "default".to_string();
+
+    loop {
+        let n = match session
+            .read_plaintext(&mut stream, &mut read_buf, &mut temp_plain)
+            .await
+        {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => break,
+        };
+
+        buf.extend_from_slice(&temp_plain[..n]);
+
+        let mut should_quit = false;
+        while !buf.is_empty() {
+            match parse_command(&mut buf) {
+                Ok(Some(cmd)) => {
+                    if execute_command(
+                        cmd,
+                        &router,
+                        client_id,
+                        &client_registry,
+                        &mut out_buf,
+                        &mut asking,
+                        &mut authenticated,
+                        &mut auth_user,
+                    )
+                    .await
+                    {
+                        should_quit = true;
+                    }
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    write_resp_err(&mut out_buf, &err);
+                }
+            }
+        }
+
+        if !out_buf.is_empty() {
+            let write_chunk = std::mem::take(&mut out_buf);
+            if session
+                .write_plaintext(&mut stream, &write_chunk)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+
+        if should_quit {
+            break;
+        }
+    }
+}
+
 pub async fn handle_connection(
     mut stream: TcpStream,
     client_addr: SocketAddr,

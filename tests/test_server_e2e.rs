@@ -35,6 +35,7 @@ fn start_test_server_with_aof(port: u16, num_shards: usize, aof_config: rudis::a
                     rx,
                     None,
                     shard_aof_config,
+                    None,
                 );
             })
             .expect("Failed to spawn test shard");
@@ -42,6 +43,65 @@ fn start_test_server_with_aof(port: u16, num_shards: usize, aof_config: rudis::a
 
     // Give server threads time to bind and listen
     thread::sleep(Duration::from_millis(200));
+}
+
+fn start_test_server_with_tls(
+    port: u16,
+    tls_port: u16,
+    num_shards: usize,
+) -> (Vec<u8>, Vec<u8>) {
+    let (cert_der, key_der) = rudis::tls::generate_self_signed_cert(vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+    ])
+    .expect("Failed to generate test self-signed cert");
+
+    let server_config = rudis::tls::create_server_config(&cert_der, &key_der)
+        .expect("Failed to build rustls ServerConfig");
+
+    let tls_config = rudis::tls::TlsWorkerConfig {
+        tls_port,
+        server_config,
+    };
+
+    let aof_config = rudis::aof::AofConfig {
+        enabled: false,
+        dir: std::env::temp_dir(),
+        fsync_every_sec: false,
+    };
+
+    let mut senders = Vec::with_capacity(num_shards);
+    let mut receivers = Vec::with_capacity(num_shards);
+
+    for _ in 0..num_shards {
+        let (tx, rx) = flume::unbounded::<ShardMessage>();
+        senders.push(tx);
+        receivers.push(rx);
+    }
+
+    for (shard_id, rx) in receivers.into_iter().enumerate() {
+        let shard_senders = senders.clone();
+        let shard_aof_config = aof_config.clone();
+        let shard_tls_config = Some(tls_config.clone());
+        thread::Builder::new()
+            .name(format!("test-tls-shard-{}", shard_id))
+            .spawn(move || {
+                run_shard_worker(
+                    shard_id,
+                    num_shards,
+                    port,
+                    shard_senders,
+                    rx,
+                    None,
+                    shard_aof_config,
+                    shard_tls_config,
+                );
+            })
+            .expect("Failed to spawn test shard");
+    }
+
+    thread::sleep(Duration::from_millis(200));
+    (cert_der, key_der)
 }
 
 fn send_and_read(stream: &mut TcpStream, cmd: &[u8]) -> String {
@@ -5692,6 +5752,69 @@ fn test_psync_partial_resync_continue_e2e() {
         "Expected +FULLRESYNC on invalid replid, got: {}",
         bad_resp
     );
+}
+
+#[test]
+fn test_tls_port_listener_e2e() {
+    let port = 16690;
+    let tls_port = 16691;
+    let (cert_der, _key_der) = start_test_server_with_tls(port, tls_port, 2);
+
+    // 1. Build a client rustls config trusting the server's self-signed cert
+    let mut root_store = rustls::RootCertStore::empty();
+    root_store
+        .add(rustls::pki_types::CertificateDer::from(cert_der))
+        .expect("Failed to add cert to root store");
+    let client_config = std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth(),
+    );
+
+    // 2. Connect to TLS port and perform TLS handshake
+    let server_name = "localhost".try_into().unwrap();
+    let conn = rustls::ClientConnection::new(client_config, server_name)
+        .expect("Failed to create ClientConnection");
+    let sock = TcpStream::connect(format!("127.0.0.1:{}", tls_port))
+        .expect("Failed to connect TCP socket to TLS port");
+    sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut tls_client = rustls::StreamOwned::new(conn, sock);
+
+    // 3. Send PING over TLS
+    tls_client.write_all(b"PING\r\n").unwrap();
+    let mut buf = [0u8; 512];
+    let n = tls_client.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"+PONG\r\n");
+
+    // 4. Send SET command over TLS
+    tls_client
+        .write_all(b"SET secure_key encrypted_value_99\r\n")
+        .unwrap();
+    let n = tls_client.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"+OK\r\n");
+
+    // 5. Send GET command over TLS
+    tls_client.write_all(b"GET secure_key\r\n").unwrap();
+    let n = tls_client.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"$18\r\nencrypted_value_99\r\n");
+
+    // 6. Connect to plain TCP port and verify shared database state
+    let mut plain_client = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("Failed to connect plain client");
+    assert_eq!(
+        send_and_read(&mut plain_client, b"GET secure_key\r\n"),
+        "$18\r\nencrypted_value_99\r\n"
+    );
+
+    // 7. Mutate via plain TCP port and read back via TLS client
+    assert_eq!(
+        send_and_read(&mut plain_client, b"SET plain_key plain_val\r\n"),
+        "+OK\r\n"
+    );
+
+    tls_client.write_all(b"GET plain_key\r\n").unwrap();
+    let n = tls_client.read(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"$9\r\nplain_val\r\n");
 }
 
 
