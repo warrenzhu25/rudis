@@ -6012,6 +6012,45 @@ fn test_mget_mset_8shard_preallocated_fanout_e2e() {
     assert!(resp.ends_with("$-1\r\n"));
 }
 
+#[test]
+fn test_mget_mset_pooled_channels_high_churn_e2e() {
+    let port = 16704;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("Failed to connect client");
+    client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+
+    // Find 4 keys on 4 shards
+    let mut keys = Vec::new();
+    for i in 0..1000 {
+        let key = format!("pool_k_{}", i);
+        if keys.len() < 4 {
+            keys.push(key);
+        }
+    }
+
+    // High churn loop exercising channel reuse across 50 iterations
+    for iter in 0..50 {
+        let set_cmd = format!(
+            "MSET {} v_{}_0 {} v_{}_1 {} v_{}_2 {} v_{}_3\r\n",
+            keys[0], iter, keys[1], iter, keys[2], iter, keys[3], iter
+        );
+        assert_eq!(send_and_read(&mut client, set_cmd.as_bytes()), "+OK\r\n");
+
+        let get_cmd = format!(
+            "MGET {} {} {} {}\r\n",
+            keys[0], keys[1], keys[2], keys[3]
+        );
+        let resp = send_and_read(&mut client, get_cmd.as_bytes());
+        assert!(resp.contains(&format!("v_{}_0", iter)));
+        assert!(resp.contains(&format!("v_{}_1", iter)));
+        assert!(resp.contains(&format!("v_{}_2", iter)));
+        assert!(resp.contains(&format!("v_{}_3", iter)));
+    }
+}
+
 
 
 

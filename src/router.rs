@@ -44,6 +44,12 @@ pub fn target_shard(key: &[u8], num_shards: usize) -> usize {
 
 use std::sync::atomic::Ordering;
 
+pub type MgetChannel = (
+    flume::Sender<Vec<(usize, Option<Bytes>)>>,
+    flume::Receiver<Vec<(usize, Option<Bytes>)>>,
+);
+pub type MsetChannel = (flume::Sender<()>, flume::Receiver<()>);
+
 /// The router handles dispatching operations.
 /// If the key belongs to the current shard, it directly touches `local_db` without locking.
 /// If the key belongs to a peer shard, it routes the message across cores via the mesh.
@@ -64,6 +70,8 @@ pub struct Router {
     pub last_save_time: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub db_dir: std::path::PathBuf,
     pub is_auto_tiering: Rc<Cell<bool>>,
+    pub mget_channel_pool: Rc<RefCell<Vec<Vec<MgetChannel>>>>,
+    pub mset_channel_pool: Rc<RefCell<Vec<Vec<MsetChannel>>>>,
 }
 
 impl Router {
@@ -99,6 +107,8 @@ impl Router {
             last_save_time: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             db_dir,
             is_auto_tiering: Rc::new(Cell::new(false)),
+            mget_channel_pool: Rc::new(RefCell::new(Vec::new())),
+            mset_channel_pool: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -760,6 +770,34 @@ impl Router {
         }
     }
 
+    #[inline(always)]
+    pub fn acquire_mget_channels(&self) -> Vec<MgetChannel> {
+        if let Some(channels) = self.mget_channel_pool.borrow_mut().pop() {
+            channels
+        } else {
+            (0..self.num_shards).map(|_| flume::bounded(1)).collect()
+        }
+    }
+
+    #[inline(always)]
+    pub fn release_mget_channels(&self, channels: Vec<MgetChannel>) {
+        self.mget_channel_pool.borrow_mut().push(channels);
+    }
+
+    #[inline(always)]
+    pub fn acquire_mset_channels(&self) -> Vec<MsetChannel> {
+        if let Some(channels) = self.mset_channel_pool.borrow_mut().pop() {
+            channels
+        } else {
+            (0..self.num_shards).map(|_| flume::bounded(1)).collect()
+        }
+    }
+
+    #[inline(always)]
+    pub fn release_mset_channels(&self, channels: Vec<MsetChannel>) {
+        self.mset_channel_pool.borrow_mut().push(channels);
+    }
+
     pub async fn mget(&self, keys: Vec<Bytes>) -> Vec<Option<Bytes>> {
         if keys.is_empty() {
             return Vec::new();
@@ -817,14 +855,15 @@ impl Router {
             }
         }
 
-        // 4. Dispatch remote batches concurrently
+        // 4. Dispatch remote batches concurrently with pooled channels
+        let channel_set = self.acquire_mget_channels();
         let mut pending = Vec::new();
         for (target_shard, items) in remote_batches.into_iter().enumerate() {
             if !items.is_empty() {
-                let (tx, rx) = flume::bounded(1);
+                let (tx, rx) = &channel_set[target_shard];
                 let msg = ShardMessage::Mget {
                     keys: items,
-                    responder: tx,
+                    responder: tx.clone(),
                 };
                 if self.senders[target_shard].send(msg).is_ok() {
                     pending.push(rx);
@@ -840,6 +879,8 @@ impl Router {
                 }
             }
         }
+
+        self.release_mget_channels(channel_set);
 
         results
     }
@@ -937,13 +978,14 @@ impl Router {
             self.check_auto_tier_after_write();
         }
 
+        let channel_set = self.acquire_mset_channels();
         let mut pending = Vec::new();
         for (target_shard, items) in remote_batches.into_iter().enumerate() {
             if !items.is_empty() {
-                let (tx, rx) = flume::bounded(1);
+                let (tx, rx) = &channel_set[target_shard];
                 let msg = ShardMessage::Mset {
                     pairs: items,
-                    responder: tx,
+                    responder: tx.clone(),
                 };
                 if self.senders[target_shard].send(msg).is_ok() {
                     pending.push(rx);
@@ -954,6 +996,8 @@ impl Router {
         for rx in pending {
             let _ = rx.recv_async().await;
         }
+
+        self.release_mset_channels(channel_set);
     }
 
     pub async fn del(&self, key: Bytes) -> bool {
@@ -2048,6 +2092,41 @@ mod tests {
             assert_eq!(values[1], None);
             assert_eq!(values[2], Some(Bytes::from("val2")));
         });
+    }
+
+    #[test]
+    fn test_channel_pool_acquire_and_release() {
+        let db0 = Rc::new(RefCell::new(ShardDb::new(9999)));
+        let (tx, _rx) = flume::unbounded();
+        let router = Router::new(
+            0,
+            4,
+            9999,
+            db0.clone(),
+            vec![tx.clone(), tx.clone(), tx.clone(), tx],
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+
+        assert_eq!(router.mget_channel_pool.borrow().len(), 0);
+        assert_eq!(router.mset_channel_pool.borrow().len(), 0);
+
+        let ch1 = router.acquire_mget_channels();
+        assert_eq!(ch1.len(), 4);
+        assert_eq!(router.mget_channel_pool.borrow().len(), 0);
+
+        router.release_mget_channels(ch1);
+        assert_eq!(router.mget_channel_pool.borrow().len(), 1);
+
+        let ch2 = router.acquire_mget_channels();
+        assert_eq!(ch2.len(), 4);
+        assert_eq!(router.mget_channel_pool.borrow().len(), 0);
+
+        let mch1 = router.acquire_mset_channels();
+        assert_eq!(mch1.len(), 4);
+        router.release_mset_channels(mch1);
+        assert_eq!(router.mset_channel_pool.borrow().len(), 1);
     }
 }
 
