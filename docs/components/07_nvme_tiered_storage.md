@@ -280,3 +280,12 @@ userspace round-trip) → a plain buffered `std::fs::copy`.
   btrfs/XFS-with-reflink, an in-kernel `copy_file_range` loop otherwise (still avoiding a
   full userspace read+write round trip), and only falls all the way back to `std::fs::copy`
   if both kernel-assisted paths are unavailable.
+
+---
+
+## 7. Future Improvements
+
+- **Medium — add a `Cooled → Hot` transition (§4.4).** Today `Cooled` is a one-way permanent write-through layer: once a key has ever been tiered, every future read/write pays the bookkeeping overhead of maintaining a `TieredPointer` alongside the RAM value, even if the key becomes consistently hot again. A simple heuristic (e.g. N consecutive accesses without a re-spill, or a periodic sweep during low memory pressure) that fully promotes a long-stable `Cooled` entry back to a bare hot value — freeing the disk pointer and its GC bookkeeping — would avoid permanently taxing keys that were only cold briefly.
+- **Medium — support partial-page compaction, not just whole-page GC (§4.5).** `run_gc` can only reclaim a 4KB `SmallBins` page once every record on it has been deleted; a page with one long-lived survivor among many deleted neighbors stays fully allocated indefinitely. A periodic "read the survivors, repack into a fresh page, punch the old one" compaction pass (amortized, background, rate-limited like the existing 2s GC task) would bound worst-case `dead_bytes` growth under delete-heavy small-value workloads.
+- **Low — surface `O_DIRECT` fallback as a visible event, not just a silent retry (§4.1/§2.2).** An operator who sets `RUDIS_DIRECT_IO=1` expecting page-cache bypass has no way to discover the open silently fell back to buffered I/O (e.g. an unsupported filesystem) short of instrumenting the syscalls themselves. A one-time log line or a `TieringStats` flag would make this observable.
+- **Low — make the 16MB write-backpressure threshold and the 2KB SmallBins cutoff configurable** (§2.5/§4.2) rather than hardcoded constants, so tiering behavior can be tuned per deployment (fast NVMe vs. slower SSD, high-value-count vs. large-value-heavy workloads) without a rebuild.

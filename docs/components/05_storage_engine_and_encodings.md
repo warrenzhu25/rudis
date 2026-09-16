@@ -392,3 +392,13 @@ before.
   `RudisValue::approx_bytes()` (a fixed per-variant heuristic, e.g. `+16`/`+32` bytes of
   assumed overhead per element) plus a flat `+64` bytes per entry, not a precise allocator
   measurement.
+
+---
+
+## 8. Future Improvements
+
+- **High — implement the original segmented/incremental resize design (§4's Phase 2, still not started).** `RudisFlatTable::resize` is still a monolithic doubling rehash of the *entire* table (§7) — the exact tail-latency spike the original design document (§1) was written to eliminate. This remains the single highest-value structural change to this file if p99.9 write latency at large key counts ever becomes a measured problem.
+- **Medium — restore an efficient cluster-slot key index (§6's "real regression").** Replacing `slot_to_keys: HashMap<u16, HashSet<Bytes>>` with a count-only `slot_counts` array traded away O(keys-in-slot) `CLUSTER COUNTKEYSINSLOT`/`GETKEYSINSLOT` for O(table capacity) on any non-empty slot. A middle ground — e.g. a small per-slot `Vec<usize>` of slot indices, sized only for slots actually in use, rather than a full `HashSet<Bytes>` clone of every key — could recover most of the lookup speed without paying the original design's full per-insert cloning cost.
+- **Medium — give `ZSet`/`ZRANK` a real O(log n) rank operation.** `rank()` is a linear scan even in the `Full` representation because `BTreeSet` has no built-in indexable-rank support (§4.4). An order-statistics structure (a `BTreeMap` augmented with subtree sizes, or a hand-rolled indexable skiplist closer to the original design's roadmap framing) would make `ZRANK`/`ZREVRANK`/`ZRANGEBYSCORE`-with-rank genuinely sub-linear, which matters more as sorted sets grow past the 64-element small-form threshold.
+- **Low — make `Set`/`ZSet`'s small-form promotion thresholds runtime-configurable**, consistent with `Hash`'s already-configurable `HASH_MAX_ENTRIES`/`HASH_MAX_VALUE` (§4.2) — currently `SMALL_SET_LIMIT`/`SMALL_ZSET_LIMIT` are compile-time constants (§4.3/§4.4), an inconsistency with no apparent reason beyond historical accident.
+- **Low — track `used_memory` per-`RudisValue`-variant more precisely for the variants tiering decisions care about most** (`String`/`Hash`/`List`/`Set`/`ZSet`, the types actually eligible for spill) rather than one flat heuristic (§7) — doesn't need to be exact, but a closer estimate would make `src/tiering.rs`'s offload/upload threshold decisions (Component 07) more accurate without needing real allocator introspection.

@@ -331,3 +331,12 @@ here (see the storage engine's SIMD control-byte matching in Part 1 of
   this is a large `match` the compiler is left to optimize (typically into some mix of
   length-bucketed comparisons/jump tables); no bespoke perfect-hash or trie dispatch was
   built for it.
+
+---
+
+## 7. Future Improvements
+
+- **High — enforce a maximum bulk-string/array length (§8's "No maximum frame/argument size enforcement").** `parse_resp_array` trusts `arg_len` straight off the wire with no upper bound, so a client claiming a multi-gigabyte bulk string makes the server attempt to buffer that much data before giving up. A `proto-max-bulk-len`-equivalent check (reject the frame early if the declared length exceeds a configurable cap) is a small, high-value change given this is the very first thing untrusted input touches.
+- **Medium — split `build_command`'s ~5,500-line single match into per-family functions** (strings, hashes, lists, sets, zsets, streams, cluster/ACL, scripting, vector/search, tiering, Memcached, ...), dispatched from a smaller top-level match on a coarse prefix or category lookup. Purely a maintainability change (§6 already notes the compiler handles the current single match fine performance-wise) — the real motivation is that a 5,500-line function is a place bugs hide, not a place they're compiled away.
+- **Medium — reconcile the `GET`-vs-`MemcachedGet` and `DEL`-vs-`MemcachedDelete` arity-based disambiguation (§4.3) with a config flag.** Silently reinterpreting `GET k1 k2` as a Memcached multi-get is convenient for dual-protocol support but means a genuine Redis client typo (`GET` with accidentally-extra arguments) gets a different error message than real Redis would give, which could confuse debugging. Consider gating the Memcached-arity fallback behind an explicit "Memcached gateway enabled" flag so pure-Redis deployments get real Redis-compatible arity errors.
+- **Low — add RESP3 *input* parsing** (maps `%`, sets `~`, doubles `,`, booleans `#`, nulls `_`) if any planned feature needs a client to send a RESP3-typed argument rather than only receive RESP3-typed replies (§2.4) — not needed today since every real Redis command is still sent as a flat bulk-string array, but worth flagging as the one genuine protocol-completeness gap versus a full RESP3 implementation.

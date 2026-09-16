@@ -347,3 +347,12 @@ every key queue it was registered under.
 - **Transaction-batched wakeups**: the `pause`/`resume` mechanism (§4.4) turns what could be up
   to one wakeup attempt per write inside a large `MULTI`/`EXEC` into a single deferred batch
   processed once, after the transaction (and any cross-shard lock release) fully completes.
+
+---
+
+## 7. Future Improvements
+
+- **Medium — replace `wait_for_blocked_result`'s active ≤20ms polling with real readiness notification (§4.2).** Polling `libc::poll`/`MSG_PEEK` every tick to detect a vanished client works but costs a syscall per blocked client per tick even when nothing has happened; since `monoio`'s `io_uring` driver already knows how to wait on fd readiness/hangup without polling, registering an explicit disconnect-watch operation on the ring (if `monoio` exposes one) would remove this cost and also lower worst-case disconnect-detection latency below the current 20ms cap.
+- **Medium — implement real `CLIENT PAUSE`/`CLIENT UNPAUSE` semantics (§4.4).** They're currently a no-op `+OK` stub, distinct from the real (but differently-purposed) `pause`/`resume` used internally for `MULTI`/`EXEC` deferral. Since that internal mechanism already exists and does almost the right thing (defer notifications, replay after), extending it to also gate new-command acceptance for `CLIENT PAUSE`'s actual contract (pause all commands, or just writes, for a duration) is a smaller lift than building the feature from scratch.
+- **Low — bound `pending_notifies`' growth during a very large `MULTI`/`EXEC`.** Every write inside a paused transaction appends to `pending_notifies` (§4.4) with no cap; a transaction touching an unusually large number of distinct keys could accumulate an unbounded `Vec` before `resume()` drains it. Unlikely to matter in practice (transaction size is bounded by client behavior), but worth a sanity cap if very large scripted transactions become common.
+- **Low — consider giving `notify_zset`'s duplicate-suppression check (§4.3) and `notify_list`'s equivalent logic a shared helper** rather than two structurally-identical-but-separately-implemented sweeps, purely to reduce the chance the two drift apart if one gets a bugfix the other doesn't.

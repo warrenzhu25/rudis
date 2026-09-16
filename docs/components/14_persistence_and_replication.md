@@ -342,3 +342,12 @@ state currently is at request time.
   for the first time.
 - **Replication fan-out itself is cheap per write**: `propagate` is an `O(num_replicas)`
   loop of non-blocking `flume` sends per mutating command, independent of dataset size.
+
+---
+
+## 7. Future Improvements
+
+- **High — implement AOF rewrite/compaction (§4.1).** An AOF-enabled node that runs for a long time under sustained writes has an ever-growing file and an ever-growing restart replay cost, with no relief mechanism (no `BGREWRITEAOF` equivalent exists at all). Since `RudisTable` already has a working RDB chunk format (Component 05) used for full resync, the natural implementation is: periodically (or on an explicit `BGREWRITEAOF`-equivalent command) snapshot the current dataset to a fresh AOF-equivalent-from-RDB, atomically swap it in for the old growing file, and discard the old one — reusing existing RDB serialization rather than building new compaction logic from scratch.
+- **High — implement partial resynchronization using the backlog that already exists (§2.3/§4.3).** `ReplicationBacklog` is already maintained on every `propagate` call but never read back — the infrastructure for a real `+CONTINUE` partial-resync path is half-built. Finishing it (have the master check whether a reconnecting replica's requested offset still falls within the retained backlog window, and if so replay just that slice instead of a full RDB transfer) would make brief network blips cheap to recover from instead of paying a full-dataset re-transfer every time, which matters a lot more as dataset size grows.
+- **Low — derive `replid` from something closer to Redis's real generation scheme**, or at least document that the current `fxhash`-over-port-and-timestamp approach (§3) is a real, working, but not cryptographically-derived identifier — same category of note as Component 11's node-ID generation.
+- **Low — make the 1MB `ReplicationBacklog` size and the 50ms/~1s AOF flush/fsync cadence configurable** rather than hardcoded, once partial resync (above) makes the backlog size an operationally meaningful tuning knob rather than just an `INFO`-reporting detail.

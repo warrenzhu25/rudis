@@ -15,6 +15,13 @@ These documents are designed for contributors and system engineers who need to u
 > [`docs/designs/components.md`](../designs/components.md) also covers the same five subsystems
 > as 01-05 (independently written, also verified against real code) — the two should agree;
 > if they ever diverge, re-check both against the source rather than trusting either by default.
+>
+> Every file also ends with a **Future Improvements** section — concrete, prioritized (High/
+> Medium/Low) suggestions grounded in the real gaps, bugs, and dead code found while verifying
+> that file, not speculative wishlist items. The handful of cross-cutting items that show up in
+> more than one file (the `MGET`/`MSET` fan-out gap, the two competing slot-authority mechanisms,
+> the squashed-pipeline path skipping slot-migration redirection) are cross-referenced between
+> their respective files rather than duplicated in full.
 
 ---
 

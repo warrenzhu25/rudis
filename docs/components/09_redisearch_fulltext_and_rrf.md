@@ -269,3 +269,13 @@ that constructs both hit lists manually rather than through a real KNN search.
   frequency + `Vec<u32>` positions per entry) — no delta-encoding, no compression, and the
   tracked term `positions` are never actually read by anything (no phrase-query support uses
   them).
+
+---
+
+## 7. Future Improvements
+
+- **High — wire `PARAMS`-supplied vectors into `QueryAst::KnnVector` (§4.3).** This is a precise, verified dead-code gap, not a design choice: `SearchOptions.params` already carries the exact bytes `FT.SEARCH ... PARAMS n $param BLOB ...` supplies, but `parse_query`'s KNN branch never looks them up before building `query_vec: Vec::new()`. The fix is narrow and local — after parsing the query AST, walk it for `KnnVector` nodes and populate `query_vec` from `options.params` by name before calling `execute_search`. Until this lands, hybrid keyword+vector search is advertised syntax with no working vector half.
+- **Medium — either read `FieldType::Text.weight` in `bm25_score`, or remove it from `FT.CREATE`'s accepted syntax (§2.4).** Accepting and storing a per-field weight that scoring silently ignores is worse than not accepting it at all — a user who sets `WEIGHT 5.0` on a field reasonably expects it to matter. Implementing real per-field BM25F (per-field lengths and weighted term contributions) is the "correct" fix; dropping/erroring on `WEIGHT` until then is the honest one.
+- **Medium — shard or otherwise reduce contention on the global `SEARCH_INDICES` `RwLock` (§6).** Every `HSET`/`FT.SEARCH` across every shard takes this one process-wide lock, which is the same class of exception as `BlockHub` (Component 06) but on a much hotter path (every indexed write, not just blocking commands). A per-index `RwLock` (already partially true — `Arc<RwLock<InvertedIndex>>` per index — but the *registry* itself is one lock) or sharding indexes by name hash across a small pool of registries would reduce contention when many indexes are in active use concurrently.
+- **Low — either use the tracked term `positions` for real phrase-query support (`"exact phrase"` matching), or stop tracking them (§6).** Currently pure dead weight: computed and stored on every `Posting`, read by nothing.
+- **Low — replace `simple_stem`'s handful of suffix rules with a real Porter/Snowball stemmer (§2.3)** if search-quality on real English text becomes a priority — the current heuristic is a reasonable placeholder but will both over-stem and under-stem relative to a proper algorithm.

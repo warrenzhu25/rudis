@@ -254,3 +254,12 @@ anywhere in `server.rs` — it's an on-demand command.
 - **No network cost inside Rudis**: since sync is manual (§1), there's no WAN traffic,
   retry logic, or delta-batching to account for here at all — that cost (if any) lives
   entirely in whatever external process actually transports the dump/merge payloads.
+
+---
+
+## 7. Future Improvements
+
+- **High — route CRDT commands through the normal key-slot mechanism instead of always hitting `router.local_db` (§1's second scope note).** This is the most surprising real gap: a `CRDT.SET foo bar` on shard 2 and a `CRDT.GET foo` on shard 5 see completely independent state for the same key name, with no error or warning. Making `Command::Crdt*` route through `target_shard_of_cmd` like every other keyed command (Component 02/04) would make a given key's CRDT state consistent regardless of which shard's connection touches it — a straightforward fix since the routing infrastructure already exists, it's just not applied here.
+- **High — build (or explicitly scope out) real automatic multi-region sync.** As documented, "multi-region CRDT" today means "manually run `CRDT.DUMP` and `CRDT.MERGE` yourself" — the data types genuinely support real automatic sync (their merge functions are commutative/idempotent, exactly what's needed), but nothing schedules or transports the exchange. A minimal real version: a background task that periodically pushes `export_sync_payload()` to a configured list of peer addresses and merges whatever it receives back — turning this from a manual toolkit into an actual active-active feature matching its name.
+- **Medium — schedule `CRDT.GC` automatically (§4.4)** rather than leaving tombstone cleanup entirely on-demand — a long-running instance with many deletes/removes will accumulate tombstones indefinitely otherwise, growing `export_sync_payload`'s output and memory footprint for no ongoing benefit once tombstones are older than any plausible in-flight merge.
+- **Low — add incremental/delta export** so `CRDT.DUMP` doesn't have to re-serialize the entire store on every call (§6) — matters once the store holds enough registers/sets/counters that a full dump becomes a non-trivial cost per sync cycle.

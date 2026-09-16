@@ -288,3 +288,13 @@ path at all; don't conflate the two.
   — a node can mark a peer `"fail"` purely from its own missed-PONG timer, with
   no corroboration from other nodes, unlike the real replica-election step which
   does require a genuine majority.
+
+---
+
+## 7. Future Improvements
+
+- **High — wire up real PFAIL corroboration instead of unilateral failure marking (§2.4).** `pfail_reports` already exists as a field on `ClusterHub` and is read by `cluster_nodes()`, but nothing ever writes to it — a single node's missed-PONG timer alone flips a peer to `"fail"`. A transient network blip to just one node in the cluster can currently trigger a failover that a real quorum-based PFAIL→FAIL promotion would have prevented. Implementing this is mostly plumbing that's already half-built: when a node locally marks a peer `"fail?"`, gossip that opinion to other nodes (piggybacked on the existing PING gossip payload) and only escalate to `"fail"` once enough peers agree.
+- **High — unify with Component 04's `slot_owners` (see that doc's §7) rather than maintaining two independent slot-authority systems.** This file's `ClusterHub.my_slots`/`.nodes` is the one actually consulted by the real `-MOVED` redirect path (§4.5); `router.rs`'s `slot_owners` is a parallel, mostly-unread mechanism. Consolidating avoids a future bug where the two disagree.
+- **Medium — replace full-state gossip with incremental/randomized-sample gossip (§6)** if cluster sizes beyond a handful of nodes become a real target — the current O(peers²)-per-tick full node-table resend every 500ms is fine at small scale but won't hold up at real Redis Cluster-scale membership counts.
+- **Medium — extend the slot-state check (§4.5) to the pipelined squashed-command path** — see Component 02 §7's identical finding; this file's `ClusterHub` state is one of the two things that check needs to consult.
+- **Low — derive node IDs from something closer to Redis's real scheme**, or at minimum document clearly that `generate_node_id`'s two-`fxhash`-calls-over-port-and-time approach (§3) is not cryptographically meaningful — it's "good enough" for uniqueness within one test cluster but shouldn't be assumed collision-resistant across a long-running fleet the way real Redis's ID generation is designed to be.
