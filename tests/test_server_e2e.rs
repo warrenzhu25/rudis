@@ -5297,3 +5297,67 @@ fn test_all_remaining_uncovered_commands_e2e() {
     eprintln!("DEBUG RES: {:?}", debug_res);
     assert!(debug_res.starts_with("+") || debug_res.starts_with("$") || debug_res.starts_with(":"));
 }
+
+#[test]
+fn test_fcall_mutating_aof_persistence_and_replay_e2e() {
+    let port1 = 16640;
+    let port2 = 16641;
+    let num_shards = 2;
+    let aof_dir = std::env::temp_dir().join(format!("rudis-aof-fcall-{}", port1));
+    let _ = std::fs::remove_dir_all(&aof_dir);
+    std::fs::create_dir_all(&aof_dir).unwrap();
+
+    let aof_config1 = rudis::aof::AofConfig {
+        enabled: true,
+        dir: aof_dir.clone(),
+        fsync_every_sec: true,
+    };
+
+    // 1. Start Server 1 with AOF enabled
+    start_test_server_with_aof(port1, num_shards, aof_config1);
+
+    let mut stream1 = TcpStream::connect(format!("127.0.0.1:{}", port1))
+        .expect("Failed to connect to rudis server 1");
+
+    // Load function library
+    let func_code = "#!lua name=fcallpersistlib\nredis.register_function('fcall_persist_set', function(keys, args) return redis.call('SET', keys[1], args[1]) end)\n";
+    let load_cmd = format!(
+        "*3\r\n$8\r\nFUNCTION\r\n$4\r\nLOAD\r\n${}\r\n{}\r\n",
+        func_code.len(),
+        func_code
+    );
+    let load_resp = send_and_read(&mut stream1, load_cmd.as_bytes());
+    assert_eq!(load_resp, "$15\r\nfcallpersistlib\r\n");
+
+    // Execute FCALL which calls redis.call('SET', ...)
+    let fcall_cmd = "*5\r\n$5\r\nFCALL\r\n$17\r\nfcall_persist_set\r\n$1\r\n1\r\n$9\r\npersist_k\r\n$9\r\npersist_v\r\n";
+    let fcall_resp = send_and_read(&mut stream1, fcall_cmd.as_bytes());
+    assert_eq!(fcall_resp, "+OK\r\n");
+
+    // Verify key in Server 1
+    let get_resp = send_and_read(&mut stream1, b"GET persist_k\r\n");
+    assert_eq!(get_resp, "$9\r\npersist_v\r\n");
+
+    // Save to sync AOF to disk
+    let save_resp = send_and_read(&mut stream1, b"SAVE\r\n");
+    assert_eq!(save_resp, "+OK\r\n");
+
+    drop(stream1);
+    thread::sleep(Duration::from_millis(200));
+
+    // 2. Start Server 2 pointing to the same AOF directory
+    let aof_config2 = rudis::aof::AofConfig {
+        enabled: true,
+        dir: aof_dir.clone(),
+        fsync_every_sec: true,
+    };
+    start_test_server_with_aof(port2, num_shards, aof_config2);
+
+    let mut stream2 = TcpStream::connect(format!("127.0.0.1:{}", port2))
+        .expect("Failed to connect to rudis server 2");
+
+    // Verify key was restored via AOF replay
+    let replay_resp = send_and_read(&mut stream2, b"GET persist_k\r\n");
+    assert_eq!(replay_resp, "$9\r\npersist_v\r\n");
+}
+

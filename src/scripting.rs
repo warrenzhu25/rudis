@@ -608,3 +608,39 @@ pub fn delete_function(lib_name: &str) -> bool {
 pub fn flush_functions() {
     FUNCTION_LIBS.write().unwrap().clear();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::aof::AofWriter;
+    use crate::shard::ShardDb;
+
+    #[test]
+    fn test_fcall_with_aof_writer() {
+        let code = "#!lua name=testlib\nredis.register_function('test_set', function(keys, args) return redis.call('SET', keys[1], args[1]) end)";
+        let lib_name = load_function(code, true).expect("function load should succeed");
+        assert_eq!(lib_name, "testlib");
+
+        let db = Rc::new(RefCell::new(ShardDb::new(6379)));
+        let aof = RefCell::new(AofWriter::new_in_memory());
+
+        let res = call_function(
+            "test_set",
+            &[Bytes::from("test_key")],
+            &[Bytes::from("test_val")],
+            &db,
+            Some(&aof),
+        );
+        assert!(res.is_ok());
+        assert_eq!(
+            db.borrow_mut().get(b"test_key"),
+            Some(Bytes::from("test_val"))
+        );
+
+        let buf = aof.borrow().buffer().to_vec();
+        let aof_str = String::from_utf8_lossy(&buf);
+        assert!(aof_str.contains("SET"), "AOF buffer must contain SET command");
+        assert!(aof_str.contains("test_key"), "AOF buffer must contain test_key");
+        assert!(aof_str.contains("test_val"), "AOF buffer must contain test_val");
+    }
+}

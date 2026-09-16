@@ -47,6 +47,20 @@ impl AofWriter {
         })
     }
 
+    pub fn new_in_memory() -> Self {
+        Self {
+            buffer: Vec::with_capacity(65536),
+            file: None,
+            path: PathBuf::new(),
+            offset: 0,
+        }
+    }
+
+    #[inline]
+    pub fn buffer(&self) -> &[u8] {
+        &self.buffer
+    }
+
     #[inline]
     pub fn path(&self) -> &Path {
         &self.path
