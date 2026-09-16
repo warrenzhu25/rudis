@@ -4191,7 +4191,14 @@ async fn execute_command(
         | Command::TopkList(_)
         | Command::TopkInfo(_)
         | Command::Digest(_)
-        | Command::Delex { .. } => {
+        | Command::Delex { .. }
+        | Command::CrdtSet { .. }
+        | Command::CrdtGet(_)
+        | Command::CrdtDel(_)
+        | Command::CrdtIncrby { .. }
+        | Command::CrdtSadd { .. }
+        | Command::CrdtSmembers(_)
+        | Command::CrdtSrem { .. } => {
             if let Some(target) = target_shard_of_cmd(&cmd, router.num_shards) {
                 if target == router.shard_id {
                     execute_local_command(
@@ -6420,63 +6427,6 @@ async fn execute_command(
                 write_resp_integer(out, max_layer as i64);
             } else {
                 out.extend_from_slice(b"$-1\r\n");
-            }
-            false
-        }
-        Command::CrdtSet { key, val } => {
-            let ts = router.local_db.borrow_mut().crdt_set(key.clone(), val);
-            notify_key_invalidation(router.port, key.as_ref(), client_id);
-            let s = format!("+OK {}:{}:{}\r\n", ts.physical_ms, ts.logical, ts.node_id);
-            out.extend_from_slice(s.as_bytes());
-            false
-        }
-        Command::CrdtGet(key) => {
-            record_client_read(router.port, client_id, key.as_ref());
-            if let Some(val) = router.local_db.borrow().crdt_get(&key) {
-                write_resp_bulk(out, &val);
-            } else {
-                out.extend_from_slice(b"$-1\r\n");
-            }
-            false
-        }
-        Command::CrdtDel(key) => {
-            let removed = router.local_db.borrow_mut().crdt_del(&key);
-            if removed {
-                notify_key_invalidation(router.port, key.as_ref(), client_id);
-                write_resp_integer(out, 1);
-            } else {
-                write_resp_integer(out, 0);
-            }
-            false
-        }
-        Command::CrdtIncrby { key, delta } => {
-            let val = router.local_db.borrow_mut().crdt_incrby(key.clone(), delta);
-            notify_key_invalidation(router.port, key.as_ref(), client_id);
-            write_resp_integer(out, val);
-            false
-        }
-        Command::CrdtSadd { key, member } => {
-            let added = router.local_db.borrow_mut().crdt_sadd(key.clone(), member);
-            notify_key_invalidation(router.port, key.as_ref(), client_id);
-            write_resp_integer(out, if added { 1 } else { 0 });
-            false
-        }
-        Command::CrdtSmembers(key) => {
-            record_client_read(router.port, client_id, key.as_ref());
-            let members = router.local_db.borrow().crdt_smembers(&key);
-            out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
-            for m in members {
-                write_resp_bulk(out, &m);
-            }
-            false
-        }
-        Command::CrdtSrem { key, member } => {
-            let removed = router.local_db.borrow_mut().crdt_srem(&key, &member);
-            if removed {
-                notify_key_invalidation(router.port, key.as_ref(), client_id);
-                write_resp_integer(out, 1);
-            } else {
-                write_resp_integer(out, 0);
             }
             false
         }
@@ -11587,3 +11537,45 @@ async fn execute_commands_squashed(
 
     should_close
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resp::Command;
+    use bytes::Bytes;
+
+    #[test]
+    fn test_crdt_primary_key_and_target_shard() {
+        let num_shards = 4;
+        let k = Bytes::from("crdt:test:key");
+        let expected_shard = target_shard(&k, num_shards);
+
+        let cmds = vec![
+            Command::CrdtSet {
+                key: k.clone(),
+                val: Bytes::from("val"),
+            },
+            Command::CrdtGet(k.clone()),
+            Command::CrdtDel(k.clone()),
+            Command::CrdtIncrby {
+                key: k.clone(),
+                delta: 10,
+            },
+            Command::CrdtSadd {
+                key: k.clone(),
+                member: Bytes::from("m1"),
+            },
+            Command::CrdtSmembers(k.clone()),
+            Command::CrdtSrem {
+                key: k.clone(),
+                member: Bytes::from("m1"),
+            },
+        ];
+
+        for cmd in &cmds {
+            assert_eq!(cmd_primary_key(cmd), Some(&k));
+            assert_eq!(target_shard_of_cmd(cmd, num_shards), Some(expected_shard));
+        }
+    }
+}
+

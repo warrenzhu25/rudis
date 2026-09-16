@@ -5361,3 +5361,98 @@ fn test_fcall_mutating_aof_persistence_and_replay_e2e() {
     assert_eq!(replay_resp, "$9\r\npersist_v\r\n");
 }
 
+#[test]
+fn test_crdt_cross_shard_routing_e2e() {
+    let port = 16650;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut client1 = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("Failed to connect client 1");
+    let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("Failed to connect client 2");
+
+    // Identify keys mapping to distinct shards in a 4-shard cluster
+    let mut shard_keys = std::collections::HashMap::new();
+    let mut counter = 0;
+    while shard_keys.len() < num_shards {
+        let key_str = format!("crdt_key_{}", counter);
+        let shard = rudis::router::target_shard(key_str.as_bytes(), num_shards);
+        shard_keys.entry(shard).or_insert(key_str);
+        counter += 1;
+    }
+
+    for (shard, key) in &shard_keys {
+        // Write CRDT LWW register from Client 1
+        let val = format!("val_shard_{}", shard);
+        let resp = send_and_read(
+            &mut client1,
+            format!("CRDT.SET {} {}\r\n", key, val).as_bytes(),
+        );
+        assert!(resp.starts_with("+OK"));
+
+        // Read back from Client 2 (cross-shard pipeline/dispatch)
+        let resp = send_and_read(
+            &mut client2,
+            format!("CRDT.GET {}\r\n", key).as_bytes(),
+        );
+        assert_eq!(resp, format!("${}\r\n{}\r\n", val.len(), val));
+
+        // Test CRDT counter on this shard: increment by 42 from client1, then by 1 from client2
+        let counter_key = format!("{}:cnt", key);
+        let resp = send_and_read(
+            &mut client1,
+            format!("CRDT.INCRBY {} 42\r\n", counter_key).as_bytes(),
+        );
+        assert_eq!(resp, ":42\r\n");
+
+        // Verify and increment counter from Client 2 across shard boundary
+        let resp = send_and_read(
+            &mut client2,
+            format!("CRDT.INCRBY {} 1\r\n", counter_key).as_bytes(),
+        );
+        assert_eq!(resp, ":43\r\n");
+
+        // Test CRDT ORSet on this shard: SADD from Client 1, SMEMBERS from Client 2
+        let set_key = format!("{}:set", key);
+        let resp = send_and_read(
+            &mut client1,
+            format!("CRDT.SADD {} member_a\r\n", set_key).as_bytes(),
+        );
+        assert_eq!(resp, ":1\r\n");
+
+        let resp = send_and_read(
+            &mut client2,
+            format!("CRDT.SMEMBERS {}\r\n", set_key).as_bytes(),
+        );
+        assert_eq!(resp, "*1\r\n$8\r\nmember_a\r\n");
+
+        // Remove member from Client 2 and verify SMEMBERS empty from Client 1
+        let resp = send_and_read(
+            &mut client2,
+            format!("CRDT.SREM {} member_a\r\n", set_key).as_bytes(),
+        );
+        assert_eq!(resp, ":1\r\n");
+
+        let resp = send_and_read(
+            &mut client1,
+            format!("CRDT.SMEMBERS {}\r\n", set_key).as_bytes(),
+        );
+        assert_eq!(resp, "*0\r\n");
+
+        // Delete register from Client 2 and verify nil from Client 1
+        let resp = send_and_read(
+            &mut client2,
+            format!("CRDT.DEL {}\r\n", key).as_bytes(),
+        );
+        assert_eq!(resp, ":1\r\n");
+
+        let resp = send_and_read(
+            &mut client1,
+            format!("CRDT.GET {}\r\n", key).as_bytes(),
+        );
+        assert_eq!(resp, "$-1\r\n");
+    }
+}
+
+
