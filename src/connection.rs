@@ -2968,7 +2968,8 @@ async fn execute_command(
         }
     }
 
-    if crate::replication::get_replication_hub(router.port).is_slave()
+    if crate::replication::HAS_SLAVE_INSTANCE.load(std::sync::atomic::Ordering::Relaxed)
+        && crate::replication::get_replication_hub(router.port).is_slave()
         && crate::aof::command_to_resp(&cmd).is_some()
     {
         out.extend_from_slice(b"-READONLY You can't write against a read only replica.\r\n");

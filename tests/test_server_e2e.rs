@@ -6191,6 +6191,69 @@ fn test_pipelined_fast_path_set_and_scattered_mset_e2e() {
     }
 }
 
+#[test]
+fn test_replication_atomic_bypass_and_slave_gate_e2e() {
+    let master_port = 16430;
+    let replica_port = 16431;
+
+    start_test_server(master_port, 2);
+    start_test_server(replica_port, 2);
+
+    let mut master_client = TcpStream::connect(format!("127.0.0.1:{}", master_port)).unwrap();
+    let mut replica_client = TcpStream::connect(format!("127.0.0.1:{}", replica_port)).unwrap();
+
+    // 1. High-volume standalone writes before replica attaches (verifying atomic bypass)
+    for i in 0..50 {
+        let cmd = format!("SET bypass_k_{} val_{}\r\n", i, i);
+        assert_eq!(send_and_read(&mut master_client, cmd.as_bytes()), "+OK\r\n");
+    }
+
+    // 2. Attach replica
+    let rep_resp = send_and_read(
+        &mut replica_client,
+        format!("REPLICAOF 127.0.0.1 {}\r\n", master_port).as_bytes(),
+    );
+    assert_eq!(rep_resp, "+OK\r\n");
+    thread::sleep(Duration::from_millis(300));
+
+    // 3. Replica rejects direct writes with -READONLY
+    let write_rep = send_and_read(&mut replica_client, b"SET forbidden_k val\r\n");
+    assert!(
+        write_rep.contains("-READONLY"),
+        "Expected READONLY error on replica, got {}",
+        write_rep
+    );
+
+    // 4. Master write replicates to replica
+    assert_eq!(
+        send_and_read(&mut master_client, b"SET live_k live_v\r\n"),
+        "+OK\r\n"
+    );
+    thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        send_and_read(&mut replica_client, b"GET live_k\r\n"),
+        "$6\r\nlive_v\r\n"
+    );
+
+    // 5. Promote replica via REPLICAOF NO ONE
+    assert_eq!(
+        send_and_read(&mut replica_client, b"REPLICAOF NO ONE\r\n"),
+        "+OK\r\n"
+    );
+    thread::sleep(Duration::from_millis(100));
+
+    // Replica is now master and accepts direct writes
+    assert_eq!(
+        send_and_read(&mut replica_client, b"SET promoted_k ok\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut replica_client, b"GET promoted_k\r\n"),
+        "$2\r\nok\r\n"
+    );
+}
+
+
 
 
 

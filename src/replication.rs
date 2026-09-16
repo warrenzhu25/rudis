@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,6 +118,7 @@ pub struct ReplicationHub {
     pub role: RwLock<ReplicationRole>,
     pub master_replid: String,
     pub master_repl_offset: AtomicU64,
+    pub is_slave_atomic: std::sync::atomic::AtomicBool,
     pub has_replicas: std::sync::atomic::AtomicBool,
     pub backlog_active: std::sync::atomic::AtomicBool,
     pub backlog: RwLock<ReplicationBacklog>,
@@ -145,6 +146,7 @@ impl ReplicationHub {
             }),
             master_replid: replid,
             master_repl_offset: AtomicU64::new(0),
+            is_slave_atomic: std::sync::atomic::AtomicBool::new(false),
             has_replicas: std::sync::atomic::AtomicBool::new(false),
             backlog_active: std::sync::atomic::AtomicBool::new(true),
             backlog: RwLock::new(ReplicationBacklog::new(1024 * 1024)),
@@ -153,14 +155,14 @@ impl ReplicationHub {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn is_master(&self) -> bool {
-        matches!(*self.role.read().unwrap(), ReplicationRole::Master { .. })
+        !self.is_slave_atomic.load(Ordering::Relaxed)
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn is_slave(&self) -> bool {
-        matches!(*self.role.read().unwrap(), ReplicationRole::Slave { .. })
+        self.is_slave_atomic.load(Ordering::Relaxed)
     }
 
     pub fn make_master(&self) {
@@ -179,12 +181,18 @@ impl ReplicationHub {
             replid2: "0000000000000000000000000000000000000000".to_string(),
             second_offset: -1,
         };
+        self.is_slave_atomic.store(false, Ordering::Release);
     }
 
     pub fn stop_sync(&self) {
         if let Some(cancel) = self.cancel_sync.write().unwrap().take() {
             let _ = cancel.send(());
         }
+    }
+
+    pub fn activate_backlog(&self) {
+        self.backlog_active.store(true, Ordering::Release);
+        HAS_ACTIVE_REPLICATION.store(true, Ordering::Release);
     }
 
     pub fn register_replica(
@@ -201,6 +209,8 @@ impl ReplicationHub {
         });
         self.replicas.write().unwrap().insert(id, rep.clone());
         self.has_replicas.store(true, Ordering::Release);
+        self.backlog_active.store(true, Ordering::Release);
+        HAS_ACTIVE_REPLICATION.store(true, Ordering::Release);
         rep
     }
 
@@ -310,6 +320,9 @@ impl ReplicationHub {
 
     pub fn propagate(&self, bytes: &[u8]) {
         if !self.is_master() {
+            return;
+        }
+        if !self.backlog_active.load(Ordering::Relaxed) && !self.has_replicas.load(Ordering::Relaxed) {
             return;
         }
         if self.backlog_active.load(Ordering::Relaxed) {
@@ -460,18 +473,30 @@ impl ReplicationHub {
     }
 }
 
+pub static HAS_ACTIVE_REPLICATION: AtomicBool = AtomicBool::new(true);
+pub static HAS_SLAVE_INSTANCE: AtomicBool = AtomicBool::new(false);
+
 static REPLICATION_HUBS: LazyLock<RwLock<HashMap<u16, Arc<ReplicationHub>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 pub fn get_replication_hub(port: u16) -> Arc<ReplicationHub> {
+    {
+        let hubs = REPLICATION_HUBS.read().unwrap();
+        if let Some(hub) = hubs.get(&port) {
+            return hub.clone();
+        }
+    }
     let mut hubs = REPLICATION_HUBS.write().unwrap();
     hubs.entry(port)
         .or_insert_with(|| Arc::new(ReplicationHub::new(port)))
         .clone()
 }
 
-#[inline]
+#[inline(always)]
 pub fn has_connected_replicas(port: u16) -> bool {
+    if !HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) {
+        return false;
+    }
     let hubs = REPLICATION_HUBS.read().unwrap();
     if let Some(hub) = hubs.get(&port) {
         hub.has_replicas.load(Ordering::Relaxed) || hub.backlog_active.load(Ordering::Relaxed)
@@ -480,7 +505,11 @@ pub fn has_connected_replicas(port: u16) -> bool {
     }
 }
 
+#[inline(always)]
 pub fn propagate_bytes(port: u16, bytes: &[u8]) {
+    if !HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) {
+        return;
+    }
     let hub = get_replication_hub(port);
     hub.propagate(bytes);
 }
@@ -507,6 +536,8 @@ pub fn start_replica_sync(
     let hub = get_replication_hub(port);
     hub.stop_sync();
 
+    hub.is_slave_atomic.store(true, Ordering::Release);
+    HAS_SLAVE_INSTANCE.store(true, Ordering::Release);
     *hub.role.write().unwrap() = ReplicationRole::Slave {
         master_host: master_host.clone(),
         master_port,
@@ -839,4 +870,39 @@ mod tests {
             .try_partial_resync(4, tx.clone(), &replid, (current_offset + 10) as i64)
             .is_none());
     }
+
+    #[test]
+    fn test_replication_atomic_bypass_and_lock_elimination() {
+        let hub = ReplicationHub::new(19998);
+        assert!(hub.is_master());
+        assert!(!hub.is_slave());
+        assert!(!hub.has_replicas.load(Ordering::Relaxed));
+        assert!(hub.backlog_active.load(Ordering::Relaxed));
+
+        // When backlog is active, propagate records mutation and increments offset
+        hub.propagate(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+        assert!(hub.master_repl_offset.load(Ordering::Relaxed) > 0);
+
+        // Register replica attaches connected replica
+        let (tx, _rx) = flume::unbounded();
+        let rep = hub.register_replica(10, tx);
+        assert!(hub.has_replicas.load(Ordering::Relaxed));
+        assert!(hub.backlog_active.load(Ordering::Relaxed));
+        assert!(HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed));
+
+        // Now propagate mutates backlog and increments offset
+        hub.propagate(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+        assert!(hub.master_repl_offset.load(Ordering::Relaxed) > 0);
+
+        hub.unregister_replica(rep.id);
+        assert!(!hub.has_replicas.load(Ordering::Relaxed));
+
+        // Make master clears is_slave
+        hub.is_slave_atomic.store(true, Ordering::Release);
+        assert!(hub.is_slave());
+        hub.make_master();
+        assert!(hub.is_master());
+        assert!(!hub.is_slave());
+    }
 }
+
