@@ -122,9 +122,25 @@ pub enum ShardMessage {
         keys: Vec<(usize, Option<Bytes>)>,
         responder: flume::Sender<Vec<(usize, Option<Bytes>)>>,
     },
+    ScatterMget {
+        shard_id: usize,
+        keys: Vec<(usize, Bytes)>,
+        descriptor: std::sync::Arc<crate::mailbox::ScatterMgetDescriptor>,
+    },
     Mset {
         pairs: Vec<(Bytes, Bytes)>,
         responder: flume::Sender<Vec<(Bytes, Bytes)>>,
+    },
+    ScatterMset {
+        shard_id: usize,
+        pairs: Vec<(Bytes, Bytes)>,
+        descriptor: std::sync::Arc<crate::mailbox::ScatterMsetDescriptor>,
+    },
+    FastGet {
+        descriptor: std::sync::Arc<crate::mailbox::FastGetDescriptor>,
+    },
+    FastSet {
+        descriptor: std::sync::Arc<crate::mailbox::FastSetDescriptor>,
     },
     NotifyList {
         keys: Vec<Bytes>,

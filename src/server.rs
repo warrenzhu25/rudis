@@ -291,6 +291,62 @@ pub fn run_shard_worker(
                         cross_shard_router.check_auto_tier_after_write();
                         let _ = responder.send(());
                     }
+                    ShardMessage::FastGet { descriptor } => {
+                        let val = cross_shard_db.borrow_mut().get(&descriptor.key);
+                        if let Some(v) = val {
+                            descriptor.finish(Some(v));
+                        } else if cross_shard_db.borrow_mut().table.is_tiered(&descriptor.key).is_some() {
+                            let r = cross_shard_router.clone();
+                            monoio::spawn(async move {
+                                let max_mem = crate::tiering::get_max_memory(r.port);
+                                let offload_pct = crate::tiering::get_offload_threshold_pct(r.port);
+                                let is_constrained = if max_mem > 0 {
+                                    let used = r.local_db.borrow().table.used_memory;
+                                    let shard_threshold = (max_mem / r.num_shards.max(1) as u64) as usize;
+                                    used >= (shard_threshold * offload_pct as usize) / 100
+                                } else {
+                                    false
+                                };
+
+                                if is_constrained {
+                                    let val = r.stream_cold_read_local(&descriptor.key).await;
+                                    if val.is_some() {
+                                        let stats = crate::tiering::get_tier_stats(r.port);
+                                        stats.streaming_reads.fetch_add(1, Ordering::Relaxed);
+                                        stats.ram_misses.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    descriptor.finish(val);
+                                } else {
+                                    r.ensure_loaded(&descriptor.key).await;
+                                    let val = r.local_db.borrow_mut().get(&descriptor.key);
+                                    descriptor.finish(val);
+                                }
+                            });
+                        } else {
+                            descriptor.finish(None);
+                        }
+                    }
+                    ShardMessage::FastSet { descriptor } => {
+                        if let Some(aof) = &cross_shard_aof
+                            && let Some(bytes) =
+                                crate::aof::command_to_resp(&crate::resp::Command::Set {
+                                    key: descriptor.key.clone(),
+                                    value: descriptor.value.clone(),
+                                    expire_in: descriptor.expire_in,
+                                    condition: crate::resp::SetCondition::None,
+                                    get: false,
+                                    keepttl: false,
+                                    past_expired: false,
+                                })
+                        {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                        cross_shard_db
+                            .borrow_mut()
+                            .set(descriptor.key.clone(), descriptor.value.clone(), descriptor.expire_in);
+                        cross_shard_router.check_auto_tier_after_write();
+                        descriptor.finish();
+                    }
                     ShardMessage::Del { key, responder } => {
                         let deleted = cross_shard_db.borrow_mut().del(&key);
                         if deleted
@@ -585,6 +641,86 @@ pub fn run_shard_worker(
                         cross_shard_router.check_auto_tier_after_write();
                         pairs.clear();
                         let _ = responder.send(pairs);
+                    }
+                    ShardMessage::ScatterMget {
+                        shard_id,
+                        mut keys,
+                        descriptor,
+                    } => {
+                        let mut db = cross_shard_db.borrow_mut();
+                        let mut cold_keys = Vec::new();
+
+                        for (idx, key) in &keys {
+                            let val = db.get(key);
+                            if val.is_none() && db.table.is_tiered(key).is_some() {
+                                cold_keys.push((*idx, key.clone()));
+                            } else {
+                                descriptor.write_result(*idx, val);
+                            }
+                        }
+
+                        if !cold_keys.is_empty() {
+                            drop(db);
+                            let r = cross_shard_router.clone();
+                            monoio::spawn(async move {
+                                let max_mem = crate::tiering::get_max_memory(r.port);
+                                let offload_pct = crate::tiering::get_offload_threshold_pct(r.port);
+                                let is_constrained = if max_mem > 0 {
+                                    let used = r.local_db.borrow().table.used_memory;
+                                    let shard_threshold = (max_mem / r.num_shards.max(1) as u64) as usize;
+                                    used >= (shard_threshold * offload_pct as usize) / 100
+                                } else {
+                                    false
+                                };
+
+                                if is_constrained {
+                                    for (idx, key) in cold_keys {
+                                        let val = r.stream_cold_read_local(&key).await;
+                                        if val.is_some() {
+                                            let stats = crate::tiering::get_tier_stats(r.port);
+                                            stats.streaming_reads.fetch_add(1, Ordering::Relaxed);
+                                            stats.ram_misses.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        descriptor.write_result(idx, val);
+                                    }
+                                } else {
+                                    for (idx, key) in cold_keys {
+                                        r.ensure_loaded(&key).await;
+                                        let val = r.local_db.borrow_mut().get(&key);
+                                        descriptor.write_result(idx, val);
+                                    }
+                                }
+                                keys.clear();
+                                descriptor.recycle_keys(shard_id, keys);
+                                descriptor.finish_shard();
+                            });
+                        } else {
+                            keys.clear();
+                            descriptor.recycle_keys(shard_id, keys);
+                            descriptor.finish_shard();
+                        }
+                    }
+                    ShardMessage::ScatterMset {
+                        shard_id,
+                        mut pairs,
+                        descriptor,
+                    } => {
+                        if let Some(aof) = &cross_shard_aof
+                            && let Some(bytes) =
+                                crate::aof::command_to_resp(&crate::resp::Command::Mset(pairs.clone()))
+                        {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                        {
+                            let mut db = cross_shard_db.borrow_mut();
+                            for (k, v) in &pairs {
+                                db.set(k.clone(), v.clone(), None);
+                            }
+                        }
+                        cross_shard_router.check_auto_tier_after_write();
+                        pairs.clear();
+                        descriptor.recycle_pairs(shard_id, pairs);
+                        descriptor.finish_shard();
                     }
                     ShardMessage::SetSlotState { slot, state } => {
                         cross_shard_slot_states.borrow_mut()[slot as usize] = state;

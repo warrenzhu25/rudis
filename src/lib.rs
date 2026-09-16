@@ -10,6 +10,7 @@ pub mod connection;
 pub mod crdt;
 pub mod geo;
 pub mod json;
+pub mod mailbox;
 pub mod probabilistic;
 pub mod pubsub;
 pub mod replication;

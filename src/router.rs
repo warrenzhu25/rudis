@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::resp::Command;
@@ -78,8 +79,9 @@ pub struct Router {
     pub mset_channel_pool: Rc<RefCell<Vec<Vec<MsetChannel>>>>,
     pub set_channel_pool: Rc<RefCell<Vec<SetChannel>>>,
     pub get_channel_pool: Rc<RefCell<Vec<(flume::Sender<Option<Bytes>>, flume::Receiver<Option<Bytes>>)>>>,
+    pub notify_channel_pool: Rc<RefCell<Vec<(flume::Sender<()>, flume::Receiver<()>)>>>,
     pub remote_responder_pool: Rc<RefCell<Vec<crate::connection::ResponderChannel>>>,
-    pub mget_batch_pool: Rc<RefCell<Vec<Vec<Vec<(usize, Option<Bytes>)>>>>>,
+    pub mget_batch_pool: Rc<RefCell<Vec<Vec<Vec<(usize, Bytes)>>>>>,
     pub mset_batch_pool: Rc<RefCell<Vec<Vec<Vec<(Bytes, Bytes)>>>>>,
     pub tier_stats: std::sync::Arc<crate::tiering::TieringStats>,
 }
@@ -121,6 +123,7 @@ impl Router {
             mset_channel_pool: Rc::new(RefCell::new(Vec::new())),
             set_channel_pool: Rc::new(RefCell::new(Vec::new())),
             get_channel_pool: Rc::new(RefCell::new(Vec::new())),
+            notify_channel_pool: Rc::new(RefCell::new(Vec::new())),
             remote_responder_pool: Rc::new(RefCell::new(Vec::new())),
             mget_batch_pool: Rc::new(RefCell::new(Vec::new())),
             mset_batch_pool: Rc::new(RefCell::new(Vec::new())),
@@ -684,26 +687,24 @@ impl Router {
         if target == self.shard_id {
             self.get_local_direct(&key).await
         } else {
-            // Unified remote shard Get with pooled channel
-            let (tx, rx) = self
-                .get_channel_pool
-                .borrow_mut()
-                .pop()
-                .unwrap_or_else(|| flume::bounded(1));
-            let msg = ShardMessage::Get {
-                key,
-                responder: tx.clone(),
+            let (tx, rx) = self.acquire_notify_channel();
+            let desc = Arc::new(crate::mailbox::FastGetDescriptor::new(key, tx.clone()));
+            let msg = ShardMessage::FastGet {
+                descriptor: desc.clone(),
             };
             let res = if self.senders[target].send(msg).is_ok() {
-                if let Ok(val) = rx.try_recv() {
-                    val
-                } else {
-                    rx.recv_async().await.ok().flatten()
+                if !desc.done.load(Ordering::Acquire) {
+                    if let Ok(()) = rx.try_recv() {
+                        // fast completion
+                    } else {
+                        let _ = rx.recv_async().await;
+                    }
                 }
+                unsafe { (*desc.val.get()).take() }
             } else {
                 None
             };
-            self.get_channel_pool.borrow_mut().push((tx, rx));
+            self.release_notify_channel(tx, rx);
             res
         }
     }
@@ -764,23 +765,23 @@ impl Router {
                 }
             }
         } else {
-            let (tx, rx) = self
-                .set_channel_pool
-                .borrow_mut()
-                .pop()
-                .unwrap_or_else(|| flume::bounded(1));
-            let msg = ShardMessage::Set {
+            let (tx, rx) = self.acquire_notify_channel();
+            let desc = Arc::new(crate::mailbox::FastSetDescriptor::new(
                 key,
                 value,
                 expire_in,
-                responder: tx.clone(),
+                tx.clone(),
+            ));
+            let msg = ShardMessage::FastSet {
+                descriptor: desc.clone(),
             };
             if self.senders[target].send(msg).is_ok()
+                && !desc.done.load(Ordering::Acquire)
                 && rx.try_recv().is_err()
             {
                 let _ = rx.recv_async().await;
             }
-            self.set_channel_pool.borrow_mut().push((tx, rx));
+            self.release_notify_channel(tx, rx);
         }
     }
 
@@ -803,6 +804,20 @@ impl Router {
                 }
             }
         }
+    }
+
+    #[inline(always)]
+    pub fn acquire_notify_channel(&self) -> (flume::Sender<()>, flume::Receiver<()>) {
+        self.notify_channel_pool
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(|| flume::bounded(1))
+    }
+
+    #[inline(always)]
+    pub fn release_notify_channel(&self, tx: flume::Sender<()>, rx: flume::Receiver<()>) {
+        let _ = rx.try_recv();
+        self.notify_channel_pool.borrow_mut().push((tx, rx));
     }
 
     #[inline(always)]
@@ -839,11 +854,11 @@ impl Router {
         }
 
         let total_keys = keys.len();
-        let mut results: Vec<Option<Bytes>> = vec![None; total_keys];
 
         if self.num_shards <= 1 {
-            for (idx, key) in keys.into_iter().enumerate() {
-                results[idx] = self.get_local_direct(&key).await;
+            let mut results = Vec::with_capacity(total_keys);
+            for key in keys {
+                results.push(self.get_local_direct(&key).await);
             }
             return results;
         }
@@ -853,6 +868,7 @@ impl Router {
         });
         let mut local_keys = Vec::with_capacity(keys.len().min(16));
         let mut has_remote = false;
+        let mut num_remote_shards = 0;
 
         // Partition local keys and remote keys without holding RefCell borrow across await
         {
@@ -864,76 +880,67 @@ impl Router {
                     local_keys.push((idx, key));
                 } else {
                     has_remote = true;
-                    remote_batches[target].push((idx, Some(key)));
+                    if remote_batches[target].is_empty() {
+                        num_remote_shards += 1;
+                    }
+                    remote_batches[target].push((idx, key));
                 }
             }
         }
 
         // Fast path: all keys are local - 0 channel operations
         if !has_remote {
-            for (idx, key) in local_keys {
-                results[idx] = self.get_local_direct(&key).await;
+            let mut results = Vec::with_capacity(total_keys);
+            for (_, key) in local_keys {
+                results.push(self.get_local_direct(&key).await);
             }
             self.mget_batch_pool.borrow_mut().push(remote_batches);
             return results;
         }
 
-        // Dispatch remote batches concurrently with pooled channels FIRST
-        let channel_set = self.acquire_mget_channels();
-        let mut sent_mask: u64 = 0;
-        for target_shard in 0..self.num_shards {
-            let items = std::mem::take(&mut remote_batches[target_shard]);
+        let (notify_tx, notify_rx) = self.acquire_notify_channel();
+        let descriptor = Arc::new(crate::mailbox::ScatterMgetDescriptor::new(
+            total_keys,
+            self.num_shards,
+            num_remote_shards,
+            notify_tx.clone(),
+        ));
+
+        // Dispatch remote batches concurrently with direct scatter-gather shared memory
+        for (target_shard, batch) in remote_batches.iter_mut().enumerate().take(self.num_shards) {
+            let items = std::mem::take(batch);
             if !items.is_empty() {
-                let (tx, _) = &channel_set[target_shard];
-                let msg = ShardMessage::Mget {
+                let msg = ShardMessage::ScatterMget {
+                    shard_id: target_shard,
                     keys: items,
-                    responder: tx.clone(),
+                    descriptor: descriptor.clone(),
                 };
-                if self.senders[target_shard].send(msg).is_ok() && target_shard < 64 {
-                    sent_mask |= 1 << target_shard;
+                if self.senders[target_shard].send(msg).is_err() {
+                    descriptor.finish_shard();
                 }
             }
         }
 
         // Execute local keys CONCURRENTLY while remote shards process their batches
         for (idx, key) in local_keys {
-            results[idx] = self.get_local_direct(&key).await;
+            let val = self.get_local_direct(&key).await;
+            descriptor.write_result(idx, val);
         }
 
-        let mut pending_mask = sent_mask;
-        for (target_shard, (_, rx)) in channel_set.iter().enumerate() {
-            if target_shard < 64
-                && (pending_mask & (1 << target_shard)) != 0
-                && let Ok(mut shard_results) = rx.try_recv()
-            {
-                pending_mask &= !(1 << target_shard);
-                for (idx, val) in &mut shard_results {
-                    results[*idx] = val.take();
-                }
-                shard_results.clear();
-                remote_batches[target_shard] = shard_results;
+        // Wait for all remote shards to complete their writes
+        if descriptor.pending.load(Ordering::Acquire) != 0 {
+            if let Ok(()) = notify_rx.try_recv() {
+                // fast path
+            } else {
+                let _ = notify_rx.recv_async().await;
             }
         }
 
-        if pending_mask != 0 {
-            for (target_shard, (_, rx)) in channel_set.iter().enumerate() {
-                if target_shard < 64
-                    && (pending_mask & (1 << target_shard)) != 0
-                    && let Ok(mut shard_results) = rx.recv_async().await
-                {
-                    for (idx, val) in &mut shard_results {
-                        results[*idx] = val.take();
-                    }
-                    shard_results.clear();
-                    remote_batches[target_shard] = shard_results;
-                }
-            }
-        }
-        self.mget_batch_pool.borrow_mut().push(remote_batches);
+        let recycled = descriptor.take_recycled_keys();
+        self.mget_batch_pool.borrow_mut().push(recycled);
+        self.release_notify_channel(notify_tx, notify_rx);
 
-        self.release_mget_channels(channel_set);
-
-        results
+        descriptor.into_results()
     }
 
     pub async fn mset(&self, pairs: Vec<(Bytes, Bytes)>) {
@@ -951,9 +958,9 @@ impl Router {
             if let Some(aof) = &self.aof
                 && let Some(bytes) =
                     crate::aof::command_to_resp(&crate::resp::Command::Mset(pairs))
-                {
-                    aof.borrow_mut().append(&bytes);
-                }
+            {
+                aof.borrow_mut().append(&bytes);
+            }
             self.check_auto_tier_after_write();
             return;
         }
@@ -963,6 +970,7 @@ impl Router {
         });
         let mut local_batch = Vec::with_capacity(pairs.len().min(16));
         let mut has_remote = false;
+        let mut num_remote_shards = 0;
 
         {
             let owners = self.slot_owners.borrow();
@@ -973,6 +981,9 @@ impl Router {
                     local_batch.push((k, v));
                 } else {
                     has_remote = true;
+                    if remote_batches[target].is_empty() {
+                        num_remote_shards += 1;
+                    }
                     remote_batches[target].push((k, v));
                 }
             }
@@ -999,18 +1010,23 @@ impl Router {
             return;
         }
 
-        let channel_set = self.acquire_mset_channels();
-        let mut sent_mask: u64 = 0;
-        for target_shard in 0..self.num_shards {
-            let items = std::mem::take(&mut remote_batches[target_shard]);
+        let (notify_tx, notify_rx) = self.acquire_notify_channel();
+        let descriptor = Arc::new(crate::mailbox::ScatterMsetDescriptor::new(
+            self.num_shards,
+            num_remote_shards,
+            notify_tx.clone(),
+        ));
+
+        for (target_shard, batch) in remote_batches.iter_mut().enumerate().take(self.num_shards) {
+            let items = std::mem::take(batch);
             if !items.is_empty() {
-                let (tx, _) = &channel_set[target_shard];
-                let msg = ShardMessage::Mset {
+                let msg = ShardMessage::ScatterMset {
+                    shard_id: target_shard,
                     pairs: items,
-                    responder: tx.clone(),
+                    descriptor: descriptor.clone(),
                 };
-                if self.senders[target_shard].send(msg).is_ok() && target_shard < 64 {
-                    sent_mask |= 1 << target_shard;
+                if self.senders[target_shard].send(msg).is_err() {
+                    descriptor.finish_shard();
                 }
             }
         }
@@ -1032,32 +1048,17 @@ impl Router {
             self.check_auto_tier_after_write();
         }
 
-        let mut pending_mask = sent_mask;
-        for (target_shard, (_, rx)) in channel_set.iter().enumerate() {
-            if target_shard < 64
-                && (pending_mask & (1 << target_shard)) != 0
-                && let Ok(mut recycled_pairs) = rx.try_recv()
-            {
-                pending_mask &= !(1 << target_shard);
-                recycled_pairs.clear();
-                remote_batches[target_shard] = recycled_pairs;
+        if descriptor.pending.load(Ordering::Acquire) != 0 {
+            if let Ok(()) = notify_rx.try_recv() {
+                // fast path
+            } else {
+                let _ = notify_rx.recv_async().await;
             }
         }
 
-        if pending_mask != 0 {
-            for (target_shard, (_, rx)) in channel_set.iter().enumerate() {
-                if target_shard < 64
-                    && (pending_mask & (1 << target_shard)) != 0
-                    && let Ok(mut recycled_pairs) = rx.recv_async().await
-                {
-                    recycled_pairs.clear();
-                    remote_batches[target_shard] = recycled_pairs;
-                }
-            }
-        }
-        self.mset_batch_pool.borrow_mut().push(remote_batches);
-
-        self.release_mset_channels(channel_set);
+        let recycled = descriptor.take_recycled_pairs();
+        self.mset_batch_pool.borrow_mut().push(recycled);
+        self.release_notify_channel(notify_tx, notify_rx);
     }
 
     pub async fn del(&self, key: Bytes) -> bool {
@@ -2064,6 +2065,31 @@ mod tests {
             let mut db = ShardDb::new(9999);
             while let Ok(msg) = rx1.recv() {
                 match msg {
+                    ShardMessage::ScatterMset {
+                        shard_id,
+                        mut pairs,
+                        descriptor,
+                    } => {
+                        for (k, v) in &pairs {
+                            db.set(k.clone(), v.clone(), None);
+                        }
+                        pairs.clear();
+                        descriptor.recycle_pairs(shard_id, pairs);
+                        descriptor.finish_shard();
+                    }
+                    ShardMessage::ScatterMget {
+                        shard_id,
+                        mut keys,
+                        descriptor,
+                    } => {
+                        for (idx, key) in &keys {
+                            let val = db.get(key);
+                            descriptor.write_result(*idx, val);
+                        }
+                        keys.clear();
+                        descriptor.recycle_keys(shard_id, keys);
+                        descriptor.finish_shard();
+                    }
                     ShardMessage::Mset { pairs, responder } => {
                         for (k, v) in &pairs {
                             db.set(k.clone(), v.clone(), None);
@@ -2233,6 +2259,31 @@ mod tests {
             let mut remote_db = ShardDb::new(9999);
             while let Ok(msg) = rx1_clone.recv() {
                 match msg {
+                    ShardMessage::ScatterMset {
+                        shard_id,
+                        mut pairs,
+                        descriptor,
+                    } => {
+                        for (k, v) in &pairs {
+                            remote_db.set(k.clone(), v.clone(), None);
+                        }
+                        pairs.clear();
+                        descriptor.recycle_pairs(shard_id, pairs);
+                        descriptor.finish_shard();
+                    }
+                    ShardMessage::ScatterMget {
+                        shard_id,
+                        mut keys,
+                        descriptor,
+                    } => {
+                        for (idx, key) in &keys {
+                            let val = remote_db.get(key);
+                            descriptor.write_result(*idx, val);
+                        }
+                        keys.clear();
+                        descriptor.recycle_keys(shard_id, keys);
+                        descriptor.finish_shard();
+                    }
                     ShardMessage::Mset { pairs, responder } => {
                         for (k, v) in &pairs {
                             remote_db.set(k.clone(), v.clone(), None);
@@ -2316,6 +2367,19 @@ mod tests {
             remote_db.set(k1_remote, Bytes::from("remote_harvest_val"), None);
             while let Ok(msg) = rx1_clone.recv() {
                 match msg {
+                    ShardMessage::ScatterMget {
+                        shard_id,
+                        mut keys,
+                        descriptor,
+                    } => {
+                        for (idx, key) in &keys {
+                            let val = remote_db.get(key);
+                            descriptor.write_result(*idx, val);
+                        }
+                        keys.clear();
+                        descriptor.recycle_keys(shard_id, keys);
+                        descriptor.finish_shard();
+                    }
                     ShardMessage::Mget { mut keys, responder } => {
                         for item in &mut keys {
                             let val = remote_db.get(item.1.as_ref().unwrap());
@@ -2378,6 +2442,10 @@ mod tests {
             remote_db.set(k1_remote.clone(), Bytes::from("pool_val"), None);
             while let Ok(msg) = rx1_clone.recv() {
                 match msg {
+                    ShardMessage::FastGet { descriptor } => {
+                        let val = remote_db.get(&descriptor.key);
+                        descriptor.finish(val);
+                    }
                     ShardMessage::Get { key, responder } => {
                         let val = remote_db.get(&key);
                         let _ = responder.send(val);
@@ -2400,14 +2468,14 @@ mod tests {
             .unwrap();
 
         rt.block_on(async move {
-            assert_eq!(router.get_channel_pool.borrow().len(), 0);
+            assert_eq!(router.notify_channel_pool.borrow().len(), 0);
             let val1 = router.get(k1.clone()).await;
             assert_eq!(val1, Some(Bytes::from("pool_val")));
-            assert_eq!(router.get_channel_pool.borrow().len(), 1);
+            assert_eq!(router.notify_channel_pool.borrow().len(), 1);
 
             let val2 = router.get(k1.clone()).await;
             assert_eq!(val2, Some(Bytes::from("pool_val")));
-            assert_eq!(router.get_channel_pool.borrow().len(), 1);
+            assert_eq!(router.notify_channel_pool.borrow().len(), 1);
 
             assert_eq!(router.remote_responder_pool.borrow().len(), 0);
             let resp1 = router.execute_remote(1, Command::Ping(None)).await;
@@ -2459,6 +2527,31 @@ mod tests {
             let mut remote_db = ShardDb::new(9996);
             while let Ok(msg) = rx1_clone.recv() {
                 match msg {
+                    ShardMessage::ScatterMset {
+                        shard_id,
+                        mut pairs,
+                        descriptor,
+                    } => {
+                        for (k, v) in &pairs {
+                            remote_db.set(k.clone(), v.clone(), None);
+                        }
+                        pairs.clear();
+                        descriptor.recycle_pairs(shard_id, pairs);
+                        descriptor.finish_shard();
+                    }
+                    ShardMessage::ScatterMget {
+                        shard_id,
+                        mut keys,
+                        descriptor,
+                    } => {
+                        for (idx, key) in &keys {
+                            let val = remote_db.get(key);
+                            descriptor.write_result(*idx, val);
+                        }
+                        keys.clear();
+                        descriptor.recycle_keys(shard_id, keys);
+                        descriptor.finish_shard();
+                    }
                     ShardMessage::Mget { mut keys, responder } => {
                         for item in &mut keys {
                             let val = remote_db.get(item.1.as_ref().unwrap());
@@ -2545,6 +2638,31 @@ mod tests {
             let mut remote_db = ShardDb::new(9994);
             while let Ok(msg) = rx1_clone.recv() {
                 match msg {
+                    ShardMessage::ScatterMset {
+                        shard_id,
+                        mut pairs,
+                        descriptor,
+                    } => {
+                        for (k, v) in &pairs {
+                            remote_db.set(k.clone(), v.clone(), None);
+                        }
+                        pairs.clear();
+                        descriptor.recycle_pairs(shard_id, pairs);
+                        descriptor.finish_shard();
+                    }
+                    ShardMessage::ScatterMget {
+                        shard_id,
+                        mut keys,
+                        descriptor,
+                    } => {
+                        for (idx, key) in &keys {
+                            let val = remote_db.get(key);
+                            descriptor.write_result(*idx, val);
+                        }
+                        keys.clear();
+                        descriptor.recycle_keys(shard_id, keys);
+                        descriptor.finish_shard();
+                    }
                     ShardMessage::Mget { mut keys, responder } => {
                         for item in &mut keys {
                             let val = remote_db.get(item.1.as_ref().unwrap());
@@ -2620,6 +2738,31 @@ mod tests {
             let mut remote_db = ShardDb::new(9995);
             while let Ok(msg) = rx1_clone.recv() {
                 match msg {
+                    ShardMessage::ScatterMset {
+                        shard_id,
+                        mut pairs,
+                        descriptor,
+                    } => {
+                        for (k, v) in &pairs {
+                            remote_db.set(k.clone(), v.clone(), None);
+                        }
+                        pairs.clear();
+                        descriptor.recycle_pairs(shard_id, pairs);
+                        descriptor.finish_shard();
+                    }
+                    ShardMessage::ScatterMget {
+                        shard_id,
+                        mut keys,
+                        descriptor,
+                    } => {
+                        for (idx, key) in &keys {
+                            let val = remote_db.get(key);
+                            descriptor.write_result(*idx, val);
+                        }
+                        keys.clear();
+                        descriptor.recycle_keys(shard_id, keys);
+                        descriptor.finish_shard();
+                    }
                     ShardMessage::Mget { mut keys, responder } => {
                         for item in &mut keys {
                             let val = remote_db.get(item.1.as_ref().unwrap());

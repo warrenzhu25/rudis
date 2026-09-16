@@ -307,13 +307,16 @@ def compute_stats(values):
 def main():
     global ITERATIONS
     df_only = "--df-only" in sys.argv or "--dragonfly-only" in sys.argv
+    rudis_only = "--rudis-only" in sys.argv
     for i, arg in enumerate(sys.argv):
         if arg in ("-i", "--iterations") and i + 1 < len(sys.argv):
             ITERATIONS = int(sys.argv[i + 1])
 
     print("=" * 70)
     print(f"   AUTOMATED {ITERATIONS}-RUN COMPARATIVE BENCHMARK")
-    if df_only:
+    if rudis_only:
+        print("   Rudis Only")
+    elif df_only:
         print("   Rudis vs Dragonfly v1.39.0 (Valkey skipped)")
     else:
         print("   Rudis vs Dragonfly v1.39.0 vs Valkey 8.1.9")
@@ -326,7 +329,7 @@ def main():
     all_results = {}
     engines_to_run = {
         k: v for k, v in ENGINES.items()
-        if not (df_only and "Valkey" in k)
+        if not (df_only and "Valkey" in k) and not (rudis_only and "Rudis" not in k)
     }
 
     for engine_name, engine_info in engines_to_run.items():
