@@ -3023,7 +3023,21 @@ async fn execute_command(
     match cmd {
         Command::Get(key) => {
             record_client_read(router.port, client_id, key.as_ref());
-            let val = router.get(key).await;
+            let target = target_shard(&key, router.num_shards);
+            let val = if target == router.shard_id {
+                let local_val = router.local_db.borrow_mut().get(&key);
+                if let Some(v) = local_val {
+                    let stats = crate::tiering::get_tier_stats(router.port);
+                    stats.ram_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Some(v)
+                } else if router.local_db.borrow_mut().table.is_tiered(&key).is_none() {
+                    None
+                } else {
+                    router.get(key).await
+                }
+            } else {
+                router.get(key).await
+            };
             match val {
                 Some(v) => {
                     write_resp_bulk(out, &v);
@@ -3262,6 +3276,19 @@ async fn execute_command(
         Command::Mget(keys) => {
             for key in &keys {
                 record_client_read(router.port, client_id, key.as_ref());
+            }
+            let all_local = !keys.is_empty()
+                && keys.iter().all(|k| target_shard(k, router.num_shards) == router.shard_id);
+            if all_local {
+                write_resp_array_header(out, keys.len());
+                let mut db = router.local_db.borrow_mut();
+                for k in &keys {
+                    match db.get(k) {
+                        Some(v) => write_resp_bulk(out, &v),
+                        None => write_resp_null(out),
+                    }
+                }
+                return false;
             }
             let values = router.mget(keys).await;
             write_resp_array_header(out, values.len());
@@ -11937,8 +11964,18 @@ async fn execute_commands_squashed(
         }
     }
 
-    // 3. Await parallel responses from all remote shards
+    // 3. Await parallel responses from all remote shards with initial non-blocking sweep
+    let mut pending_remaining = Vec::with_capacity(pending.len());
     for rx in pending {
+        if let Ok(results) = rx.try_recv() {
+            for (idx, resp) in results {
+                responses[idx] = resp;
+            }
+        } else {
+            pending_remaining.push(rx);
+        }
+    }
+    for rx in pending_remaining {
         if let Ok(results) = rx.recv_async().await {
             for (idx, resp) in results {
                 responses[idx] = resp;
@@ -12188,6 +12225,102 @@ mod tests {
             .await;
             assert!(!quit);
             assert_eq!(out, b"$7\r\npipe1_v\r\n");
+        });
+    }
+
+    #[test]
+    fn test_execute_command_local_sync_fast_path_and_mget_colocated() {
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let (tx, _rx) = flume::unbounded();
+            let db = Rc::new(RefCell::new(ShardDb::new(9994)));
+            let router = Router::new(
+                0,
+                1,
+                9994,
+                db,
+                vec![tx],
+                None,
+                Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+                std::env::temp_dir(),
+            );
+            let client_registry = RefCell::new(hashbrown::HashMap::new());
+            let mut asking = false;
+            let mut authenticated = true;
+            let mut auth_user = String::from("default");
+            let mut out = Vec::new();
+
+            // Set a key
+            let set_cmd = Command::Set {
+                key: Bytes::from("local_k1"),
+                value: Bytes::from("local_v1"),
+                expire_in: None,
+                condition: crate::resp::SetCondition::None,
+                get: false,
+                keepttl: false,
+                past_expired: false,
+            };
+            execute_command(
+                set_cmd,
+                &router,
+                1,
+                &client_registry,
+                &mut out,
+                &mut asking,
+                &mut authenticated,
+                &mut auth_user,
+            )
+            .await;
+            assert_eq!(out, b"+OK\r\n");
+
+            // Local GET hit
+            out.clear();
+            execute_command(
+                Command::Get(Bytes::from("local_k1")),
+                &router,
+                1,
+                &client_registry,
+                &mut out,
+                &mut asking,
+                &mut authenticated,
+                &mut auth_user,
+            )
+            .await;
+            assert_eq!(out, b"$8\r\nlocal_v1\r\n");
+
+            // Local GET miss
+            out.clear();
+            execute_command(
+                Command::Get(Bytes::from("missing_k")),
+                &router,
+                1,
+                &client_registry,
+                &mut out,
+                &mut asking,
+                &mut authenticated,
+                &mut auth_user,
+            )
+            .await;
+            assert_eq!(out, b"$-1\r\n");
+
+            // Local co-located MGET
+            out.clear();
+            execute_command(
+                Command::Mget(vec![Bytes::from("local_k1"), Bytes::from("missing_k")]),
+                &router,
+                1,
+                &client_registry,
+                &mut out,
+                &mut asking,
+                &mut authenticated,
+                &mut auth_user,
+            )
+            .await;
+            assert_eq!(out, b"*2\r\n$8\r\nlocal_v1\r\n$-1\r\n");
         });
     }
 }

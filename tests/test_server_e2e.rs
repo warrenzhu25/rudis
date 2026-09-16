@@ -6485,6 +6485,54 @@ fn test_zero_alloc_command_dispatch_and_mixed_case_e2e() {
     assert_eq!(resp, "+OK\r\n+OK\r\n$2\r\nv1\r\n$2\r\nv2\r\n");
 }
 
+#[test]
+fn test_sync_local_fast_path_and_reactive_harvest_e2e() {
+    let port = 16473;
+    start_test_server(port, 4);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Single GET hit and miss (pipeline 1)
+    let resp = send_and_read(&mut client, b"GET not_exist\r\n");
+    assert_eq!(resp, "$-1\r\n");
+
+    let resp = send_and_read(&mut client, b"SET single_k single_v\r\n");
+    assert_eq!(resp, "+OK\r\n");
+
+    let resp = send_and_read(&mut client, b"GET single_k\r\n");
+    assert_eq!(resp, "$8\r\nsingle_v\r\n");
+
+    // 2. Co-located MGET with hash tags
+    let resp = send_and_read(&mut client, b"SET {user}:a va\r\n");
+    assert_eq!(resp, "+OK\r\n");
+    let resp = send_and_read(&mut client, b"SET {user}:b vb\r\n");
+    assert_eq!(resp, "+OK\r\n");
+    let resp = send_and_read(&mut client, b"MGET {user}:a {user}:b {user}:c\r\n");
+    assert_eq!(resp, "*3\r\n$2\r\nva\r\n$2\r\nvb\r\n$-1\r\n");
+
+    // 3. Multi-round scattered MSET and MGET triggering reactive harvest
+    for round in 0..5 {
+        let mut mset = String::from("MSET");
+        for i in 0..10 {
+            mset.push_str(&format!(" sc_k_{} val_{}_{}", i, round, i));
+        }
+        mset.push_str("\r\n");
+        let resp = send_and_read(&mut client, mset.as_bytes());
+        assert_eq!(resp, "+OK\r\n");
+
+        let mut mget = String::from("MGET");
+        for i in 0..10 {
+            mget.push_str(&format!(" sc_k_{}", i));
+        }
+        mget.push_str("\r\n");
+        let resp = send_and_read(&mut client, mget.as_bytes());
+        assert!(resp.starts_with("*10\r\n"));
+        for i in 0..10 {
+            assert!(resp.contains(&format!("val_{}_{}", round, i)));
+        }
+    }
+}
+
+
 
 
 

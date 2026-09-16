@@ -890,16 +890,33 @@ impl Router {
             }
         }
 
+        let mut pending_mask = sent_mask;
         for (target_shard, (_, rx)) in channel_set.iter().enumerate() {
             if target_shard < 64
-                && (sent_mask & (1 << target_shard)) != 0
-                && let Ok(mut shard_results) = rx.recv_async().await
+                && (pending_mask & (1 << target_shard)) != 0
+                && let Ok(mut shard_results) = rx.try_recv()
             {
+                pending_mask &= !(1 << target_shard);
                 for (idx, val) in &mut shard_results {
                     results[*idx] = val.take();
                 }
                 shard_results.clear();
                 remote_batches[target_shard] = shard_results;
+            }
+        }
+
+        if pending_mask != 0 {
+            for (target_shard, (_, rx)) in channel_set.iter().enumerate() {
+                if target_shard < 64
+                    && (pending_mask & (1 << target_shard)) != 0
+                    && let Ok(mut shard_results) = rx.recv_async().await
+                {
+                    for (idx, val) in &mut shard_results {
+                        results[*idx] = val.take();
+                    }
+                    shard_results.clear();
+                    remote_batches[target_shard] = shard_results;
+                }
             }
         }
         self.mget_batch_pool.borrow_mut().push(remote_batches);
@@ -989,13 +1006,27 @@ impl Router {
             }
         }
 
+        let mut pending_mask = sent_mask;
         for (target_shard, (_, rx)) in channel_set.iter().enumerate() {
             if target_shard < 64
-                && (sent_mask & (1 << target_shard)) != 0
-                && let Ok(mut recycled_pairs) = rx.recv_async().await
+                && (pending_mask & (1 << target_shard)) != 0
+                && let Ok(mut recycled_pairs) = rx.try_recv()
             {
+                pending_mask &= !(1 << target_shard);
                 recycled_pairs.clear();
                 remote_batches[target_shard] = recycled_pairs;
+            }
+        }
+
+        if pending_mask != 0 {
+            for (target_shard, (_, rx)) in channel_set.iter().enumerate() {
+                if target_shard < 64
+                    && (pending_mask & (1 << target_shard)) != 0
+                    && let Ok(mut recycled_pairs) = rx.recv_async().await
+                {
+                    recycled_pairs.clear();
+                    remote_batches[target_shard] = recycled_pairs;
+                }
             }
         }
         self.mset_batch_pool.borrow_mut().push(remote_batches);
