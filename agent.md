@@ -34,12 +34,16 @@ This document defines the mandatory operating guidelines, architectural invarian
 
 Every commit to `main` must strictly adhere to the following four rules:
 
-### Rule 1: All Tests Must Pass
+### Rule 1: All Tests Must Pass & Mandatory Dual-Test Coverage (Unit + Integration)
 * Every commit must pass the full test suite cleanly:
   ```bash
   source $HOME/.cargo/env && cargo test
   ```
-* Any new feature (commands, cluster migration, client management) **must** include corresponding tests in `tests/test_server_e2e.rs` or unit tests in `src/`.
+* **Mandatory Dual-Test Coverage (Unit + Integration Tests)**:
+  * Every change (bug fix, new feature, or architectural modification) **must** include both:
+    1. **Unit Test(s)** in `src/` (e.g., in module-level `#[cfg(test)] mod tests` blocks) testing the isolated logic, edge conditions, AST/protocol parsing, or internal state transitions.
+    2. **Integration Test(s)** in `tests/` (e.g., `tests/test_server_e2e.rs`) testing end-to-end client-server behavior over actual TCP sockets, command pipelines, clustering, or persistence replays.
+  * No change may be merged or committed with only one testing tier or without dedicated tests asserting the specific behavior.
 * No compiler warnings, dead code, or broken test assertions are permitted.
 
 ### Rule 2: Zero Benchmark Regression vs. Baseline
