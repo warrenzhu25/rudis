@@ -305,9 +305,18 @@ def compute_stats(values):
     }
 
 def main():
+    global ITERATIONS
+    df_only = "--df-only" in sys.argv or "--dragonfly-only" in sys.argv
+    for i, arg in enumerate(sys.argv):
+        if arg in ("-i", "--iterations") and i + 1 < len(sys.argv):
+            ITERATIONS = int(sys.argv[i + 1])
+
     print("=" * 70)
-    print("   AUTOMATED 5-RUN COMPARATIVE BENCHMARK")
-    print("   Rudis vs Dragonfly v1.39.0 vs Valkey 8.1.9")
+    print(f"   AUTOMATED {ITERATIONS}-RUN COMPARATIVE BENCHMARK")
+    if df_only:
+        print("   Rudis vs Dragonfly v1.39.0 (Valkey skipped)")
+    else:
+        print("   Rudis vs Dragonfly v1.39.0 vs Valkey 8.1.9")
     print("=" * 70)
 
     # Clean up any lingering dump files or processes
@@ -315,8 +324,12 @@ def main():
         os.remove("dump.rdb")
 
     all_results = {}
+    engines_to_run = {
+        k: v for k, v in ENGINES.items()
+        if not (df_only and "Valkey" in k)
+    }
 
-    for engine_name, engine_info in ENGINES.items():
+    for engine_name, engine_info in engines_to_run.items():
         print(f"\n>>>>>>>> Starting Engine: {engine_name} (Port {engine_info['port']}) <<<<<<<<")
         check_vm_load()
 
