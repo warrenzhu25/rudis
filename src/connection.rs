@@ -1507,7 +1507,14 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::TopkAdd { key, .. }
         | Command::TopkQuery { key, .. }
         | Command::TopkList(key)
-        | Command::TopkInfo(key) => Some(key),
+        | Command::TopkInfo(key)
+        | Command::CrdtSet { key, .. }
+        | Command::CrdtGet(key)
+        | Command::CrdtDel(key)
+        | Command::CrdtIncrby { key, .. }
+        | Command::CrdtSadd { key, .. }
+        | Command::CrdtSmembers(key)
+        | Command::CrdtSrem { key, .. } => Some(key),
 
         Command::Smove { source, .. }
         | Command::Lmove { source, .. }
@@ -6516,7 +6523,13 @@ async fn execute_command(
             keys,
             args,
         } => {
-            match crate::scripting::call_function(&function, &keys, &args, &router.local_db, None) {
+            match crate::scripting::call_function(
+                &function,
+                &keys,
+                &args,
+                &router.local_db,
+                router.aof.as_deref(),
+            ) {
                 Ok(res) => {
                     for k in &keys {
                         notify_key_invalidation(router.port, k.as_ref(), client_id);
@@ -7175,7 +7188,14 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::MemcachedReplace { key, .. }
         | Command::MemcachedDelete { key, .. }
         | Command::MemcachedIncr { key, .. }
-        | Command::MemcachedDecr { key, .. } => Some(target_shard(key, num_shards)),
+        | Command::MemcachedDecr { key, .. }
+        | Command::CrdtSet { key, .. }
+        | Command::CrdtGet(key)
+        | Command::CrdtDel(key)
+        | Command::CrdtIncrby { key, .. }
+        | Command::CrdtSadd { key, .. }
+        | Command::CrdtSmembers(key)
+        | Command::CrdtSrem { key, .. } => Some(target_shard(key, num_shards)),
         Command::Smove {
             source,
             destination,
@@ -11294,6 +11314,61 @@ pub fn execute_local_command(
             }
             false
         }
+        Command::CrdtSet { key, val } => {
+            let ts = db.crdt_set(key.clone(), val.clone());
+            record_change!(cmd);
+            let s = format!("+OK {}:{}:{}\r\n", ts.physical_ms, ts.logical, ts.node_id);
+            out.extend_from_slice(s.as_bytes());
+            false
+        }
+        Command::CrdtGet(key) => {
+            if let Some(v) = db.crdt_get(key) {
+                write_resp_bulk(out, &v);
+            } else {
+                out.extend_from_slice(b"$-1\r\n");
+            }
+            false
+        }
+        Command::CrdtDel(key) => {
+            let removed = db.crdt_del(key);
+            if removed {
+                record_change!(cmd);
+                write_resp_integer(out, 1);
+            } else {
+                write_resp_integer(out, 0);
+            }
+            false
+        }
+        Command::CrdtIncrby { key, delta } => {
+            let val = db.crdt_incrby(key.clone(), *delta);
+            record_change!(cmd);
+            write_resp_integer(out, val);
+            false
+        }
+        Command::CrdtSadd { key, member } => {
+            let added = db.crdt_sadd(key.clone(), member.clone());
+            record_change!(cmd);
+            write_resp_integer(out, if added { 1 } else { 0 });
+            false
+        }
+        Command::CrdtSmembers(key) => {
+            let members = db.crdt_smembers(key);
+            out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
+            for m in members {
+                write_resp_bulk(out, &m);
+            }
+            false
+        }
+        Command::CrdtSrem { key, member } => {
+            let removed = db.crdt_srem(key, member);
+            if removed {
+                record_change!(cmd);
+                write_resp_integer(out, 1);
+            } else {
+                write_resp_integer(out, 0);
+            }
+            false
+        }
         Command::Quit => {
             out.extend_from_slice(b"+OK\r\n");
             true
@@ -11354,6 +11429,14 @@ async fn execute_commands_squashed(
             if let Some(k) = cmd_primary_key(cmd) {
                 let slot = key_slot(k);
                 if router.slot_states.borrow()[slot as usize] != crate::shard::SlotState::Stable {
+                    can_squash = false;
+                    break;
+                }
+                let hub = crate::cluster::get_cluster_hub(router.port);
+                let my_slots = hub.my_slots.read().unwrap();
+                let owns_slot = my_slots.iter().any(|&(s, e)| slot >= s && slot <= e);
+                let nodes = hub.nodes.read().unwrap();
+                if !owns_slot && !nodes.is_empty() {
                     can_squash = false;
                     break;
                 }

@@ -4784,6 +4784,38 @@ fn test_redisearch_fulltext_and_hybrid_vector_e2e() {
     );
     assert!(search_json.contains("user:1"));
     assert!(search_json.contains("Alice Engineer"));
+
+    // 15. Vector Indexing and FT.SEARCH KNN with PARAMS
+    assert_eq!(
+        send_and_read(
+            &mut client,
+            b"FT.CREATE idx:vectors ON HASH PREFIX 1 vec: SCHEMA title TEXT embedding VECTOR FLAT 6 TYPE FLOAT32 DIM 3 DISTANCE_METRIC COSINE\r\n"
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"HSET vec:doc1 title First embedding 1.0,0.0,0.0\r\n"),
+        ":2\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"HSET vec:doc2 title Second embedding 0.0,1.0,0.0\r\n"),
+        ":2\r\n"
+    );
+
+    let mut q_vec_bytes = Vec::new();
+    for val in [1.0f32, 0.1f32, 0.0f32] {
+        q_vec_bytes.extend_from_slice(&val.to_le_bytes());
+    }
+
+    let mut search_vec_cmd = Vec::new();
+    search_vec_cmd.extend_from_slice(b"*7\r\n$9\r\nFT.SEARCH\r\n$11\r\nidx:vectors\r\n$27\r\n*=>[KNN 1 @embedding $blob]\r\n$6\r\nPARAMS\r\n$1\r\n2\r\n$4\r\nblob\r\n");
+    search_vec_cmd.extend_from_slice(format!("${}\r\n", q_vec_bytes.len()).as_bytes());
+    search_vec_cmd.extend_from_slice(&q_vec_bytes);
+    search_vec_cmd.extend_from_slice(b"\r\n");
+
+    let vec_search_res = send_and_read(&mut client, &search_vec_cmd);
+    assert!(vec_search_res.contains("vec:doc1"));
+    assert!(!vec_search_res.contains("vec:doc2"));
 }
 
 #[test]

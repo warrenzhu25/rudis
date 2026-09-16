@@ -278,6 +278,21 @@ pub fn tokenize_text(text: &str, stem: bool) -> Vec<String> {
     tokens
 }
 
+pub fn parse_vector_blob(bytes: &[u8]) -> Vec<f32> {
+    if bytes.len().is_multiple_of(4) && !bytes.is_empty() {
+        let (chunks, _) = bytes.as_chunks::<4>();
+        chunks
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
+            .collect()
+    } else {
+        String::from_utf8_lossy(bytes)
+            .split(|c: char| c == ',' || c.is_whitespace() || c == '[' || c == ']')
+            .filter_map(|s| s.trim().parse::<f32>().ok())
+            .collect()
+    }
+}
+
 impl InvertedIndex {
     pub fn new(schema: IndexSchema) -> Self {
         Self {
@@ -370,13 +385,25 @@ impl InvertedIndex {
             self.inverted.entry(term).or_default().push(posting);
         }
 
+        let mut vector_fields = vectors.unwrap_or_default();
+        for (field_name, field_val) in &fields {
+            if let Some(FieldType::Vector { .. }) = schema.fields.get(field_name)
+                && !vector_fields.contains_key(field_name)
+            {
+                let v = parse_vector_blob(field_val.as_bytes());
+                if !v.is_empty() {
+                    vector_fields.insert(field_name.clone(), v);
+                }
+            }
+        }
+
         let doc_meta = DocMeta {
             doc_id: doc_id.to_string(),
             doc_len,
             fields,
             numeric_fields,
             tag_fields,
-            vector_fields: vectors.unwrap_or_default(),
+            vector_fields,
         };
 
         self.docs.insert(doc_id.to_string(), doc_meta);
@@ -501,6 +528,7 @@ pub enum QueryAst {
         field: String,
         k: usize,
         query_vec: Vec<f32>,
+        param_name: String,
     },
     MatchAll,
 }
@@ -529,10 +557,15 @@ pub fn parse_query(q: &str) -> QueryAst {
                 .get(1)
                 .map(|s| s.trim_start_matches('@').to_string())
                 .unwrap_or_default();
+            let param_name = tokens
+                .get(2)
+                .map(|s| s.trim_start_matches('$').to_string())
+                .unwrap_or_default();
             let knn_ast = QueryAst::KnnVector {
                 field,
                 k,
-                query_vec: Vec::new(), // Populated via PARAMS
+                query_vec: Vec::new(),
+                param_name,
             };
             return QueryAst::And(vec![base_ast, knn_ast]);
         }
@@ -778,6 +811,7 @@ pub fn execute_search(
                         sub,
                         &SearchOptions {
                             limit: usize::MAX,
+                            params: opts.params.clone(),
                             ..Default::default()
                         },
                     );
@@ -807,6 +841,7 @@ pub fn execute_search(
                     sub,
                     &SearchOptions {
                         limit: usize::MAX,
+                        params: opts.params.clone(),
                         ..Default::default()
                     },
                 );
@@ -821,6 +856,7 @@ pub fn execute_search(
                 sub,
                 &SearchOptions {
                     limit: usize::MAX,
+                    params: opts.params.clone(),
                     ..Default::default()
                 },
             );
@@ -835,16 +871,34 @@ pub fn execute_search(
             field,
             k,
             query_vec,
+            param_name,
         } => {
+            let effective_vec = if !query_vec.is_empty() {
+                query_vec.clone()
+            } else if !param_name.is_empty() {
+                let raw_bytes = opts
+                    .params
+                    .get(param_name)
+                    .or_else(|| opts.params.get(&format!("${}", param_name)));
+                if let Some(bytes) = raw_bytes {
+                    parse_vector_blob(bytes)
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
             // Compute vector cosine distance against all docs having this vector field
             let mut vector_dists = Vec::new();
-            for (doc_id, doc) in &index.docs {
-                if let Some(doc_vec) = doc.vector_fields.get(field)
-                    && !query_vec.is_empty()
-                    && query_vec.len() == doc_vec.len()
-                {
-                    let sim = cosine_similarity(query_vec, doc_vec);
-                    vector_dists.push((doc_id.clone(), sim));
+            if !effective_vec.is_empty() {
+                for (doc_id, doc) in &index.docs {
+                    if let Some(doc_vec) = doc.vector_fields.get(field)
+                        && effective_vec.len() == doc_vec.len()
+                    {
+                        let sim = cosine_similarity(&effective_vec, doc_vec);
+                        vector_dists.push((doc_id.clone(), sim));
+                    }
                 }
             }
             vector_dists.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -1072,6 +1126,63 @@ mod tests {
         let fused = reciprocal_rank_fusion(&bm25_hits, &vec_hits, 60.0);
         // doc2 appears in both lists, so its combined RRF should be highest!
         assert_eq!(fused[0].doc_id, "doc2");
+    }
+
+    #[test]
+    fn test_knn_vector_search_with_params() {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "title".to_string(),
+            FieldType::Text {
+                weight: 1.0,
+                sortable: false,
+                nostem: false,
+            },
+        );
+        fields.insert(
+            "embedding".to_string(),
+            FieldType::Vector {
+                dim: 3,
+                distance_metric: "COSINE".to_string(),
+                algorithm: "FLAT".to_string(),
+            },
+        );
+        let schema = IndexSchema {
+            name: "test_vec_idx".to_string(),
+            on_type: "HASH".to_string(),
+            prefixes: vec!["doc:".to_string()],
+            fields,
+        };
+        let mut idx = InvertedIndex::new(schema);
+
+        let mut doc1 = HashMap::new();
+        doc1.insert("title".to_string(), "Doc 1".to_string());
+        doc1.insert("embedding".to_string(), "1.0, 0.0, 0.0".to_string());
+
+        let mut doc2 = HashMap::new();
+        doc2.insert("title".to_string(), "Doc 2".to_string());
+        doc2.insert("embedding".to_string(), "0.0, 1.0, 0.0".to_string());
+
+        idx.add_document("doc:1", doc1, None);
+        idx.add_document("doc:2", doc2, None);
+
+        let ast = parse_query("*=>[KNN 1 @embedding $q_vec]");
+        let mut params = HashMap::new();
+        // Query vector closest to doc:1 (1.0, 0.1, 0.0)
+        let q_bytes: Vec<u8> = vec![1.0f32, 0.1f32, 0.0f32]
+            .into_iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        params.insert("q_vec".to_string(), q_bytes);
+
+        let opts = SearchOptions {
+            limit: 10,
+            params,
+            ..Default::default()
+        };
+        let (total, hits) = execute_search(&idx, &ast, &opts);
+        assert_eq!(total, 1);
+        assert_eq!(hits[0].doc_id, "doc:1");
     }
 
     fn h2_clone(h: &SearchHit) -> SearchHit {
