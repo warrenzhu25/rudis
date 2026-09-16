@@ -366,6 +366,9 @@ static TRACKING_CLIENTS: std::sync::LazyLock<
     std::sync::RwLock<hashbrown::HashMap<(u16, u64), ClientTracker>>,
 > = std::sync::LazyLock::new(|| std::sync::RwLock::new(hashbrown::HashMap::new()));
 
+pub static HAS_TRACKING_CLIENTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn register_client_tracking(
     port: u16,
     client_id: u64,
@@ -387,14 +390,20 @@ pub fn register_client_tracking(
             is_resp3,
         },
     );
+    HAS_TRACKING_CLIENTS.store(!map.is_empty(), std::sync::atomic::Ordering::Release);
 }
 
 pub fn unregister_client_tracking(port: u16, client_id: u64) {
     let mut map = TRACKING_CLIENTS.write().unwrap();
     map.remove(&(port, client_id));
+    HAS_TRACKING_CLIENTS.store(!map.is_empty(), std::sync::atomic::Ordering::Release);
 }
 
+#[inline(always)]
 pub fn record_client_read(port: u16, client_id: u64, key: &[u8]) {
+    if !HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let mut map = TRACKING_CLIENTS.write().unwrap();
     if let Some(tracker) = map.get_mut(&(port, client_id))
         && !tracker.bcast
@@ -405,6 +414,9 @@ pub fn record_client_read(port: u16, client_id: u64, key: &[u8]) {
 
 pub fn notify_key_invalidation(port: u16, key: &[u8], sender_client_id: u64) {
     touch_watched_key(port, key);
+    if !HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let mut map = TRACKING_CLIENTS.write().unwrap();
     for tracker in map.values_mut() {
         if tracker.port != port {
@@ -11930,6 +11942,19 @@ mod tests {
         buf.clear();
         write_resp_array_header(&mut buf, 1024);
         assert_eq!(buf, b"*1024\r\n");
+    }
+
+    #[test]
+    fn test_tracking_clients_atomic_fast_path() {
+        let port = 65432;
+        let cid = 999999;
+        let (tx, _rx) = flume::unbounded();
+        register_client_tracking(port, cid, false, Vec::new(), tx, false);
+        assert!(HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed));
+
+        record_client_read(port, cid, b"test_key");
+
+        unregister_client_tracking(port, cid);
     }
 }
 

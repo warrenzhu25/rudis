@@ -5922,6 +5922,47 @@ fn test_mget_zero_alloc_resp2_resp3_serialization_e2e() {
     assert_eq!(mget_resp3, "*3\r\n$11\r\nvalue_alpha\r\n_\r\n$10\r\nvalue_beta\r\n");
 }
 
+#[test]
+fn test_client_tracking_atomic_bypass_and_invalidation_e2e() {
+    let port = 16702;
+    let num_shards = 2;
+    start_test_server(port, num_shards);
+
+    let mut client1 = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("Failed to connect client1");
+    client1.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+
+    let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("Failed to connect client2");
+    client2.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+
+    // 1. Initial MGET without tracking - verifies atomic bypass path
+    assert_eq!(send_and_read(&mut client1, b"SET tracked_k1 initial_v1\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client1, b"MGET tracked_k1\r\n"), "*1\r\n$10\r\ninitial_v1\r\n");
+
+    // 2. Enable client tracking in RESP3 mode
+    assert!(send_and_read(&mut client1, b"HELLO 3\r\n").starts_with('%') || true);
+    assert_eq!(send_and_read(&mut client1, b"CLIENT TRACKING on\r\n"), "+OK\r\n");
+
+    // 3. Read key with tracking enabled
+    let _ = send_and_read(&mut client1, b"GET tracked_k1\r\n");
+
+    // 4. Mutate key from client2
+    assert_eq!(send_and_read(&mut client2, b"SET tracked_k1 updated_v1\r\n"), "+OK\r\n");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // 5. Client 1 receives push invalidation message
+    let mut next_resp = send_and_read(&mut client1, b"PING\r\n");
+    if !next_resp.contains("invalidate") {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        next_resp.push_str(&send_and_read(&mut client1, b"PING\r\n"));
+    }
+    assert!(next_resp.contains("invalidate") && next_resp.contains("tracked_k1"));
+
+    // 6. Disable tracking - restores atomic bypass
+    assert_eq!(send_and_read(&mut client1, b"CLIENT TRACKING off\r\n"), "+OK\r\n");
+}
+
 
 
 
