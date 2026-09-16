@@ -5612,6 +5612,88 @@ fn test_acl_permissions_and_hashed_passwords_e2e() {
     assert!(resp.contains("-NOPERM this user has no permissions to access one of the keys"));
 }
 
+#[test]
+fn test_psync_partial_resync_continue_e2e() {
+    let port = 16680;
+    start_test_server(port, 2);
+
+    let mut master = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    master.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+
+    // 1. Query master replication info
+    let info = send_and_read(&mut master, b"INFO replication\r\n");
+    let mut replid = String::new();
+    for line in info.lines() {
+        if let Some(stripped) = line.strip_prefix("master_replid:") {
+            replid = stripped.trim().to_string();
+        }
+    }
+    assert!(!replid.is_empty(), "Failed to extract master_replid");
+
+    // 2. Pre-populate some keys and check offset
+    assert_eq!(send_and_read(&mut master, b"SET k1 v1\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut master, b"SET k2 v2\r\n"), "+OK\r\n");
+
+    let info2 = send_and_read(&mut master, b"INFO replication\r\n");
+    let mut offset1: i64 = 0;
+    for line in info2.lines() {
+        if let Some(stripped) = line.strip_prefix("master_repl_offset:") {
+            offset1 = stripped.trim().parse::<i64>().unwrap_or(0);
+        }
+    }
+    assert!(offset1 > 0, "Expected master_repl_offset > 0");
+
+    // 3. Mutate more keys after offset1
+    assert_eq!(send_and_read(&mut master, b"SET k3 v3\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut master, b"SET k4 v4\r\n"), "+OK\r\n");
+
+    // 4. Connect replica client requesting partial resync at offset1
+    let mut replica = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    replica.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+
+    let psync_cmd = format!("PSYNC {} {}\r\n", replid, offset1);
+    replica.write_all(psync_cmd.as_bytes()).unwrap();
+
+    // 5. Read response from master on replica connection
+    let mut buf = [0u8; 4096];
+    let n = replica.read(&mut buf).unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+
+    // Must start with +CONTINUE <replid>
+    assert!(
+        resp.starts_with(&format!("+CONTINUE {}", replid)),
+        "Expected +CONTINUE {}, got: {}",
+        replid,
+        resp
+    );
+
+    // Diff must contain k3 and k4 mutations
+    assert!(
+        resp.contains("k3") && resp.contains("v3"),
+        "Diff should contain k3/v3: {}",
+        resp
+    );
+    assert!(
+        resp.contains("k4") && resp.contains("v4"),
+        "Diff should contain k4/v4: {}",
+        resp
+    );
+
+    // 6. Test invalid replid triggers +FULLRESYNC
+    let mut bad_replica = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    bad_replica.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    bad_replica
+        .write_all(b"PSYNC 0000000000000000000000000000000000000000 0\r\n")
+        .unwrap();
+    let n = bad_replica.read(&mut buf).unwrap();
+    let bad_resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(
+        bad_resp.starts_with("+FULLRESYNC"),
+        "Expected +FULLRESYNC on invalid replid, got: {}",
+        bad_resp
+    );
+}
+
 
 
 

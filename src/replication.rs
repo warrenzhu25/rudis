@@ -50,6 +50,31 @@ impl ReplicationBacklog {
                 current_master_offset.saturating_sub(self.buffer.len() as u64) + 1;
         }
     }
+
+    pub fn can_partial_sync(&self, target_offset: u64, current_master_offset: u64) -> bool {
+        if target_offset > current_master_offset + 1 {
+            return false;
+        }
+        if self.buffer.is_empty() {
+            return target_offset == current_master_offset + 1;
+        }
+        target_offset >= self.first_byte_offset
+    }
+
+    pub fn get_diff(&self, target_offset: u64, current_master_offset: u64) -> Option<Vec<u8>> {
+        if !self.can_partial_sync(target_offset, current_master_offset) {
+            return None;
+        }
+        if target_offset == current_master_offset + 1 {
+            return Some(Vec::new());
+        }
+        let start_idx = (target_offset.saturating_sub(self.first_byte_offset)) as usize;
+        if start_idx <= self.buffer.len() {
+            Some(self.buffer[start_idx..].to_vec())
+        } else {
+            None
+        }
+    }
 }
 
 pub struct ReplicationHub {
@@ -58,6 +83,7 @@ pub struct ReplicationHub {
     pub master_replid: String,
     pub master_repl_offset: AtomicU64,
     pub has_replicas: std::sync::atomic::AtomicBool,
+    pub backlog_active: std::sync::atomic::AtomicBool,
     pub backlog: RwLock<ReplicationBacklog>,
     pub replicas: RwLock<HashMap<u64, Arc<ConnectedReplica>>>,
     pub cancel_sync: RwLock<Option<flume::Sender<()>>>,
@@ -84,6 +110,7 @@ impl ReplicationHub {
             master_replid: replid,
             master_repl_offset: AtomicU64::new(0),
             has_replicas: std::sync::atomic::AtomicBool::new(false),
+            backlog_active: std::sync::atomic::AtomicBool::new(true),
             backlog: RwLock::new(ReplicationBacklog::new(1024 * 1024)),
             replicas: RwLock::new(HashMap::new()),
             cancel_sync: RwLock::new(None),
@@ -166,15 +193,100 @@ impl ReplicationHub {
         }
     }
 
+    pub fn try_partial_resync(
+        &self,
+        client_id: u64,
+        sender: flume::Sender<Vec<u8>>,
+        req_replid: &str,
+        req_offset: i64,
+    ) -> Option<(String, Vec<u8>, Arc<ConnectedReplica>)> {
+        if req_offset < 0 {
+            return None;
+        }
+        let target_offset = (req_offset as u64) + 1;
+
+        let replid_matches = {
+            let role = self.role.read().unwrap();
+            match &*role {
+                ReplicationRole::Master {
+                    replid,
+                    replid2,
+                    second_offset,
+                } => {
+                    req_replid == replid
+                        || req_replid == self.master_replid
+                        || (!replid2.is_empty()
+                            && req_replid == replid2
+                            && *second_offset >= 0
+                            && req_offset <= *second_offset)
+                }
+                _ => false,
+            }
+        };
+
+        if !replid_matches {
+            return None;
+        }
+
+        let current_offset = self.master_repl_offset.load(Ordering::SeqCst);
+        let backlog = self.backlog.read().unwrap();
+        if !backlog.can_partial_sync(target_offset, current_offset) {
+            return None;
+        }
+
+        let diff = backlog.get_diff(target_offset, current_offset)?;
+        drop(backlog);
+
+        let rep = self.register_replica(client_id, sender);
+        Some((self.master_replid.clone(), diff, rep))
+    }
+
+    pub fn can_partial_resync(&self, req_replid: &str, req_offset: i64) -> bool {
+        if req_offset < 0 {
+            return false;
+        }
+        let target_offset = (req_offset as u64) + 1;
+        let role = self.role.read().unwrap();
+        let replid_matches = match &*role {
+            ReplicationRole::Master {
+                replid,
+                replid2,
+                second_offset,
+            } => {
+                if req_replid == replid || req_replid == self.master_replid {
+                    true
+                } else {
+                    !replid2.is_empty()
+                        && req_replid == replid2
+                        && *second_offset >= 0
+                        && req_offset <= *second_offset
+                }
+            }
+            _ => false,
+        };
+        if !replid_matches {
+            return false;
+        }
+        let current_offset = self.master_repl_offset.load(Ordering::SeqCst);
+        let backlog = self.backlog.read().unwrap();
+        backlog.can_partial_sync(target_offset, current_offset)
+    }
+
     pub fn propagate(&self, bytes: &[u8]) {
-        if !self.has_replicas.load(Ordering::Relaxed) || !self.is_master() {
+        if !self.is_master() {
             return;
         }
-        let new_offset = self
-            .master_repl_offset
-            .fetch_add(bytes.len() as u64, Ordering::SeqCst)
-            + bytes.len() as u64;
-        self.backlog.write().unwrap().append(bytes, new_offset);
+        if self.backlog_active.load(Ordering::Relaxed) {
+            let new_offset = self
+                .master_repl_offset
+                .fetch_add(bytes.len() as u64, Ordering::SeqCst)
+                + bytes.len() as u64;
+            self.backlog.write().unwrap().append(bytes, new_offset);
+        }
+
+        if !self.has_replicas.load(Ordering::Relaxed) {
+            return;
+        }
 
         let dead: Vec<u64> = {
             let reps = self.replicas.read().unwrap();
@@ -326,7 +438,7 @@ pub fn get_replication_hub(port: u16) -> Arc<ReplicationHub> {
 pub fn has_connected_replicas(port: u16) -> bool {
     let hubs = REPLICATION_HUBS.read().unwrap();
     if let Some(hub) = hubs.get(&port) {
-        hub.has_replicas.load(Ordering::Relaxed)
+        hub.has_replicas.load(Ordering::Relaxed) || hub.backlog_active.load(Ordering::Relaxed)
     } else {
         false
     }
@@ -462,48 +574,63 @@ async fn run_replica_worker(
 
     // 4. PSYNC ? -1
     let line = send_and_expect_line!(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n");
-    if !line.starts_with(b"+FULLRESYNC") {
+    let is_continue = line.starts_with(b"+CONTINUE");
+    if !line.starts_with(b"+FULLRESYNC") && !is_continue {
         return;
     }
 
-    let line_str = String::from_utf8_lossy(&line);
-    let parts: Vec<&str> = line_str.split_whitespace().collect();
-    let initial_offset: u64 = if parts.len() >= 3 {
-        parts[2].parse().unwrap_or(0)
+    let initial_offset: u64 = if is_continue {
+        let role = hub.role.read().unwrap();
+        if let ReplicationRole::Slave {
+            master_repl_offset, ..
+        } = *role
+        {
+            master_repl_offset
+        } else {
+            0
+        }
     } else {
-        0
+        let line_str = String::from_utf8_lossy(&line);
+        let parts: Vec<&str> = line_str.split_whitespace().collect();
+        if parts.len() >= 3 {
+            parts[2].parse().unwrap_or(0)
+        } else {
+            0
+        }
     };
 
-    // 5. Read RDB header: $<len>\r\n
-    let rdb_len: usize = loop {
-        if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
-            let line = buf.split_to(pos + 2);
-            if line.starts_with(b"$") {
-                let s = std::str::from_utf8(&line[1..line.len() - 2]).unwrap_or("0");
-                break s.parse().unwrap_or(0);
+    if !is_continue {
+        // 5. Read RDB header: $<len>\r\n
+        let rdb_len: usize = loop {
+            if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
+                let line = buf.split_to(pos + 2);
+                if line.starts_with(b"$") {
+                    let s = std::str::from_utf8(&line[1..line.len() - 2]).unwrap_or("0");
+                    break s.parse().unwrap_or(0);
+                }
+            }
+            let (res, returned) = stream.read(read_buf).await;
+            read_buf = returned;
+            match res {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&read_buf[..n]),
+            }
+        };
+
+        // 6. Read rdb_len bytes
+        while buf.len() < rdb_len {
+            let (res, returned) = stream.read(read_buf).await;
+            read_buf = returned;
+            match res {
+                Ok(0) | Err(_) => return,
+                Ok(n) => buf.extend_from_slice(&read_buf[..n]),
             }
         }
-        let (res, returned) = stream.read(read_buf).await;
-        read_buf = returned;
-        match res {
-            Ok(0) | Err(_) => return,
-            Ok(n) => buf.extend_from_slice(&read_buf[..n]),
-        }
-    };
+        let rdb_bytes = buf.split_to(rdb_len).freeze();
 
-    // 6. Read rdb_len bytes
-    while buf.len() < rdb_len {
-        let (res, returned) = stream.read(read_buf).await;
-        read_buf = returned;
-        match res {
-            Ok(0) | Err(_) => return,
-            Ok(n) => buf.extend_from_slice(&read_buf[..n]),
-        }
+        // 7. Restore RDB into router
+        router.restore_rdb_bytes(rdb_bytes).await;
     }
-    let rdb_bytes = buf.split_to(rdb_len).freeze();
-
-    // 7. Restore RDB into router
-    router.restore_rdb_bytes(rdb_bytes).await;
 
     // 8. Mark link_status up
     {
@@ -583,5 +710,97 @@ async fn run_replica_worker(
     } = *hub.role.write().unwrap()
     {
         *link_status = "down".to_string();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_backlog_append_and_diff() {
+        let mut backlog = ReplicationBacklog::new(20);
+        assert_eq!(backlog.first_byte_offset, 1);
+        assert!(backlog.can_partial_sync(1, 0));
+        assert!(!backlog.can_partial_sync(2, 0));
+        assert_eq!(backlog.get_diff(1, 0), Some(Vec::new()));
+
+        // Append 10 bytes: "0123456789"
+        backlog.append(b"0123456789", 10);
+        assert_eq!(backlog.buffer.len(), 10);
+        assert_eq!(backlog.first_byte_offset, 1);
+        assert!(backlog.can_partial_sync(1, 10));
+        assert!(backlog.can_partial_sync(6, 10));
+        assert!(backlog.can_partial_sync(11, 10));
+        assert!(!backlog.can_partial_sync(12, 10));
+
+        // Diff from offset 1 (target 1, index 0): all 10 bytes
+        assert_eq!(backlog.get_diff(1, 10), Some(b"0123456789".to_vec()));
+        // Diff from offset 6 (target 6, index 5): "56789"
+        assert_eq!(backlog.get_diff(6, 10), Some(b"56789".to_vec()));
+        // Diff from offset 11 (target 11, up-to-date): empty
+        assert_eq!(backlog.get_diff(11, 10), Some(Vec::new()));
+
+        // Overflow backlog (max_size is 20, append 15 bytes -> total 25 bytes, drain 5)
+        backlog.append(b"abcdefghijklmno", 25);
+        assert_eq!(backlog.buffer.len(), 20);
+        // first_byte_offset = 25 - 20 + 1 = 6
+        assert_eq!(backlog.first_byte_offset, 6);
+        // target < 6 cannot partial sync
+        assert!(!backlog.can_partial_sync(5, 25));
+        assert_eq!(backlog.get_diff(5, 25), None);
+        // target 6 can partial sync (index 0)
+        assert!(backlog.can_partial_sync(6, 25));
+        assert_eq!(backlog.get_diff(6, 25).unwrap().len(), 20);
+    }
+
+    #[test]
+    fn test_try_partial_resync() {
+        let hub = ReplicationHub::new(19999);
+        let (tx, _rx) = flume::unbounded();
+
+        // Initially offset is 0, empty backlog
+        let replid = hub.master_replid.clone();
+
+        // Unknown replid fails
+        assert!(hub
+            .try_partial_resync(1, tx.clone(), "unknown_replid", 0)
+            .is_none());
+
+        // Negative offset fails
+        assert!(hub.try_partial_resync(1, tx.clone(), &replid, -1).is_none());
+
+        // Offset 0 succeeds with empty diff
+        let res = hub.try_partial_resync(1, tx.clone(), &replid, 0);
+        assert!(res.is_some());
+        let (out_id, diff, rep) = res.unwrap();
+        assert_eq!(out_id, replid);
+        assert!(diff.is_empty());
+        assert_eq!(rep.id, 1);
+        hub.unregister_replica(1);
+
+        // Propagate mutation
+        hub.propagate(b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n");
+        let current_offset = hub.master_repl_offset.load(Ordering::SeqCst);
+        assert!(current_offset > 0);
+
+        // Can partial resync from offset 0 (wants diff from byte 1)
+        let res2 = hub.try_partial_resync(2, tx.clone(), &replid, 0);
+        assert!(res2.is_some());
+        let (_, diff2, _) = res2.unwrap();
+        assert_eq!(diff2, b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n");
+        hub.unregister_replica(2);
+
+        // Replay from current offset (up to date)
+        let res3 = hub.try_partial_resync(3, tx.clone(), &replid, current_offset as i64);
+        assert!(res3.is_some());
+        let (_, diff3, _) = res3.unwrap();
+        assert!(diff3.is_empty());
+        hub.unregister_replica(3);
+
+        // Offset beyond master fails
+        assert!(hub
+            .try_partial_resync(4, tx.clone(), &replid, (current_offset + 10) as i64)
+            .is_none());
     }
 }

@@ -1297,25 +1297,43 @@ async fn run_master_replica_stream(
     client_id: u64,
     _client_registry: Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
     router: Rc<Router>,
-    _psync_cmd: Command,
+    psync_cmd: Command,
 ) {
     let hub = crate::replication::get_replication_hub(router.port);
     let (mut reader, mut writer) = stream.into_split();
     let (write_tx, write_rx) = flume::unbounded::<Vec<u8>>();
 
-    let rdb = router.generate_full_rdb().await;
-    let _repl = hub.register_replica(client_id, write_tx.clone());
+    let (req_replid, req_offset) = match &psync_cmd {
+        Command::Psync { replid, offset } => (
+            std::str::from_utf8(replid).unwrap_or(""),
+            *offset,
+        ),
+        _ => ("", -1),
+    };
 
-    let replid = hub.master_replid.clone();
-    let offset = hub
-        .master_repl_offset
-        .load(std::sync::atomic::Ordering::SeqCst);
-    let mut initial_msg =
-        format!("+FULLRESYNC {} {}\r\n${}\r\n", replid, offset, rdb.len()).into_bytes();
-    initial_msg.extend_from_slice(&rdb);
-    if writer.write_all(initial_msg).await.0.is_err() {
-        hub.unregister_replica(client_id);
-        return;
+    let partial = hub.try_partial_resync(client_id, write_tx.clone(), req_replid, req_offset);
+    if let Some((replid, diff, _repl)) = partial {
+        let mut initial_msg = format!("+CONTINUE {}\r\n", replid).into_bytes();
+        initial_msg.extend_from_slice(&diff);
+        if writer.write_all(initial_msg).await.0.is_err() {
+            hub.unregister_replica(client_id);
+            return;
+        }
+    } else {
+        let rdb = router.generate_full_rdb().await;
+        let _repl = hub.register_replica(client_id, write_tx.clone());
+
+        let replid = hub.master_replid.clone();
+        let offset = hub
+            .master_repl_offset
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let mut initial_msg =
+            format!("+FULLRESYNC {} {}\r\n${}\r\n", replid, offset, rdb.len()).into_bytes();
+        initial_msg.extend_from_slice(&rdb);
+        if writer.write_all(initial_msg).await.0.is_err() {
+            hub.unregister_replica(client_id);
+            return;
+        }
     }
 
     let writer_hub = hub.clone();
