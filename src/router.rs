@@ -750,7 +750,7 @@ impl Router {
     }
 
     #[inline(always)]
-    fn check_auto_tier_after_write(&self) {
+    pub(crate) fn check_auto_tier_after_write(&self) {
         let max_mem = crate::tiering::get_max_memory(self.port);
         if max_mem > 0 {
             let used = self.local_db.borrow().table.used_memory;
@@ -813,67 +813,60 @@ impl Router {
             return results;
         }
 
-        // 1. Single pass to count keys per shard and track targets
-        let mut shard_counts = vec![0usize; self.num_shards];
-        let mut targets = Vec::with_capacity(total_keys);
+        let avg_cap = (keys.len() / self.num_shards.max(1)).max(4) + 4;
+        let mut remote_batches: Vec<Vec<(usize, Bytes)>> = (0..self.num_shards)
+            .map(|_| Vec::with_capacity(avg_cap))
+            .collect();
+        let mut local_keys = Vec::with_capacity(avg_cap);
         let mut has_remote = false;
 
-        for key in &keys {
-            let target = self.target_shard(key);
-            shard_counts[target] += 1;
-            if target != self.shard_id {
-                has_remote = true;
+        // Partition local keys and remote keys without holding RefCell borrow across await
+        {
+            let owners = self.slot_owners.borrow();
+            for (idx, key) in keys.into_iter().enumerate() {
+                let slot = key_slot(&key);
+                let target = owners[slot as usize];
+                if target == self.shard_id {
+                    local_keys.push((idx, key));
+                } else {
+                    has_remote = true;
+                    remote_batches[target].push((idx, key));
+                }
             }
-            targets.push(target);
         }
 
-        // Fast path: all keys are local (e.g. hash-tagged co-located) - 0 remote vector allocations
+        // Execute local keys
+        for (idx, key) in local_keys {
+            results[idx] = self.get_local_direct(&key).await;
+        }
+
+        // Fast path: all keys are local - 0 channel operations
         if !has_remote {
-            for (idx, key) in keys.into_iter().enumerate() {
-                results[idx] = self.get_local_direct(&key).await;
-            }
             return results;
         }
 
-        // 2. Pre-allocate remote batches with exact capacity needed - 0 reallocations
-        let mut remote_batches: Vec<Vec<(usize, Bytes)>> = (0..self.num_shards)
-            .map(|s| {
-                if s != self.shard_id && shard_counts[s] > 0 {
-                    Vec::with_capacity(shard_counts[s])
-                } else {
-                    Vec::new()
-                }
-            })
-            .collect();
-
-        // 3. Process keys: execute local keys immediately, bucket remote keys
-        for (idx, (key, target)) in keys.into_iter().zip(targets).enumerate() {
-            if target == self.shard_id {
-                results[idx] = self.get_local_direct(&key).await;
-            } else {
-                remote_batches[target].push((idx, key));
-            }
-        }
-
-        // 4. Dispatch remote batches concurrently with pooled channels
+        // Dispatch remote batches concurrently with pooled channels
         let channel_set = self.acquire_mget_channels();
-        let mut pending = Vec::new();
+        let mut sent_mask: u64 = 0;
         for (target_shard, items) in remote_batches.into_iter().enumerate() {
             if !items.is_empty() {
-                let (tx, rx) = &channel_set[target_shard];
+                let (tx, _) = &channel_set[target_shard];
                 let msg = ShardMessage::Mget {
                     keys: items,
                     responder: tx.clone(),
                 };
-                if self.senders[target_shard].send(msg).is_ok() {
-                    pending.push(rx);
+                if self.senders[target_shard].send(msg).is_ok() && target_shard < 64 {
+                    sent_mask |= 1 << target_shard;
                 }
             }
         }
 
-        // 5. Await all remote shard responses
-        for rx in pending {
-            if let Ok(shard_results) = rx.recv_async().await {
+        // Await all remote shard responses via bitmask (0 pending allocations)
+        for (target_shard, (_, rx)) in channel_set.iter().enumerate() {
+            if target_shard < 64
+                && (sent_mask & (1 << target_shard)) != 0
+                && let Ok(shard_results) = rx.recv_async().await
+            {
                 for (idx, val) in shard_results {
                     results[idx] = val;
                 }
@@ -907,58 +900,24 @@ impl Router {
             return;
         }
 
-        let mut shard_counts = vec![0usize; self.num_shards];
-        let mut targets = Vec::with_capacity(pairs.len());
+        let avg_cap = (pairs.len() / self.num_shards.max(1)).max(4) + 4;
+        let mut remote_batches: Vec<Vec<(Bytes, Bytes)>> = (0..self.num_shards)
+            .map(|_| Vec::with_capacity(avg_cap))
+            .collect();
+        let mut local_batch = Vec::with_capacity(avg_cap);
         let mut has_remote = false;
 
-        for (k, _) in &pairs {
-            let target = self.target_shard(k);
-            shard_counts[target] += 1;
-            if target != self.shard_id {
-                has_remote = true;
-            }
-            targets.push(target);
-        }
-
-        // Fast path: all pairs are local
-        if !has_remote {
-            {
-                let mut db = self.local_db.borrow_mut();
-                for (k, v) in &pairs {
-                    db.set(k.clone(), v.clone(), None);
-                }
-            }
-            if let Some(aof) = &self.aof
-                && let Some(bytes) =
-                    crate::aof::command_to_resp(&crate::resp::Command::Mset(pairs))
-                {
-                    aof.borrow_mut().append(&bytes);
-                }
-            self.check_auto_tier_after_write();
-            return;
-        }
-
-        // Pre-allocate batches with exact capacity
-        let mut remote_batches: Vec<Vec<(Bytes, Bytes)>> = (0..self.num_shards)
-            .map(|s| {
-                if s != self.shard_id && shard_counts[s] > 0 {
-                    Vec::with_capacity(shard_counts[s])
+        {
+            let owners = self.slot_owners.borrow();
+            for (k, v) in pairs {
+                let slot = key_slot(&k);
+                let target = owners[slot as usize];
+                if target == self.shard_id {
+                    local_batch.push((k, v));
                 } else {
-                    Vec::new()
+                    has_remote = true;
+                    remote_batches[target].push((k, v));
                 }
-            })
-            .collect();
-        let mut local_batch = if shard_counts[self.shard_id] > 0 {
-            Vec::with_capacity(shard_counts[self.shard_id])
-        } else {
-            Vec::new()
-        };
-
-        for ((k, v), target) in pairs.into_iter().zip(targets) {
-            if target == self.shard_id {
-                local_batch.push((k, v));
-            } else {
-                remote_batches[target].push((k, v));
             }
         }
 
@@ -978,23 +937,30 @@ impl Router {
             self.check_auto_tier_after_write();
         }
 
+        // Fast path: all pairs are local
+        if !has_remote {
+            return;
+        }
+
         let channel_set = self.acquire_mset_channels();
-        let mut pending = Vec::new();
+        let mut sent_mask: u64 = 0;
         for (target_shard, items) in remote_batches.into_iter().enumerate() {
             if !items.is_empty() {
-                let (tx, rx) = &channel_set[target_shard];
+                let (tx, _) = &channel_set[target_shard];
                 let msg = ShardMessage::Mset {
                     pairs: items,
                     responder: tx.clone(),
                 };
-                if self.senders[target_shard].send(msg).is_ok() {
-                    pending.push(rx);
+                if self.senders[target_shard].send(msg).is_ok() && target_shard < 64 {
+                    sent_mask |= 1 << target_shard;
                 }
             }
         }
 
-        for rx in pending {
-            let _ = rx.recv_async().await;
+        for (target_shard, (_, rx)) in channel_set.iter().enumerate() {
+            if target_shard < 64 && (sent_mask & (1 << target_shard)) != 0 {
+                let _ = rx.recv_async().await;
+            }
         }
 
         self.release_mset_channels(channel_set);
@@ -2127,6 +2093,88 @@ mod tests {
         assert_eq!(mch1.len(), 4);
         router.release_mset_channels(mch1);
         assert_eq!(router.mset_channel_pool.borrow().len(), 1);
+    }
+
+    #[test]
+    fn test_mget_single_pass_and_bitmask_fanout() {
+        let (tx0, _rx0) = flume::unbounded();
+        let (tx1, rx1) = flume::unbounded();
+        let db0 = Rc::new(RefCell::new(ShardDb::new(9999)));
+        let router = Router::new(
+            0,
+            2,
+            9999,
+            db0.clone(),
+            vec![tx0, tx1],
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+
+        let mut k_shard0 = None;
+        let mut k_shard1 = None;
+        for i in 0..1000 {
+            let k = Bytes::from(format!("key_{}", i));
+            let target = router.target_shard(&k);
+            if target == 0 && k_shard0.is_none() {
+                k_shard0 = Some(k);
+            } else if target == 1 && k_shard1.is_none() {
+                k_shard1 = Some(k);
+            }
+            if k_shard0.is_some() && k_shard1.is_some() {
+                break;
+            }
+        }
+        let k0 = k_shard0.unwrap();
+        let k1 = k_shard1.unwrap();
+
+        let rx1_clone = rx1.clone();
+        std::thread::spawn(move || {
+            let mut remote_db = ShardDb::new(9999);
+            while let Ok(msg) = rx1_clone.recv() {
+                match msg {
+                    ShardMessage::Mset { pairs, responder } => {
+                        for (k, v) in pairs {
+                            remote_db.set(k, v, None);
+                        }
+                        let _ = responder.send(());
+                    }
+                    ShardMessage::Mget { keys, responder } => {
+                        let mut res = Vec::new();
+                        for (idx, k) in keys {
+                            let val = remote_db.get(&k);
+                            res.push((idx, val));
+                        }
+                        let _ = responder.send(res);
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async move {
+            let pairs = vec![
+                (k0.clone(), Bytes::from("v0")),
+                (k1.clone(), Bytes::from("v1")),
+            ];
+            router.mset(pairs).await;
+
+            let keys = vec![
+                k0.clone(),
+                Bytes::from("nonexistent"),
+                k1.clone(),
+            ];
+            let values = router.mget(keys).await;
+            assert_eq!(values.len(), 3);
+            assert_eq!(values[0], Some(Bytes::from("v0")));
+            assert_eq!(values[1], None);
+            assert_eq!(values[2], Some(Bytes::from("v1")));
+        });
     }
 }
 

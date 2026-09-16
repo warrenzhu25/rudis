@@ -6051,6 +6051,57 @@ fn test_mget_mset_pooled_channels_high_churn_e2e() {
     }
 }
 
+#[test]
+fn test_mget_burst_draining_and_single_pass_fanout_e2e() {
+    let port = 16705;
+    start_test_server(port, 8);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("Failed to connect client");
+    client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+
+    // Form 16 keys across 8 shards (2 keys per shard)
+    let mut keys = Vec::new();
+    let mut shard_keys = vec![Vec::new(); 8];
+    for i in 0..1000 {
+        let key = format!("burst_k_{}", i);
+        let slot = rudis::router::key_slot(key.as_bytes());
+        let shard = rudis::router::slot_to_shard(slot, 8);
+        if shard_keys[shard].len() < 2 {
+            shard_keys[shard].push(key.clone());
+            keys.push(key);
+        }
+        if keys.len() == 16 {
+            break;
+        }
+    }
+    assert_eq!(keys.len(), 16);
+
+    // Interleaved MSET and MGET burst execution
+    for iter in 0..30 {
+        let mut mset_args = String::new();
+        for (idx, k) in keys.iter().enumerate() {
+            mset_args.push_str(&format!("{} v_{}_{} ", k, iter, idx));
+        }
+        let set_cmd = format!("MSET {}\r\n", mset_args.trim_end());
+        assert_eq!(send_and_read(&mut client, set_cmd.as_bytes()), "+OK\r\n");
+
+        let mget_args = keys.join(" ");
+        let get_cmd = format!("MGET {}\r\n", mget_args);
+        let resp = send_and_read(&mut client, get_cmd.as_bytes());
+        assert!(resp.starts_with("*16\r\n"));
+        for idx in 0..16 {
+            assert!(
+                resp.contains(&format!("v_{}_{}", iter, idx)),
+                "Iteration {} missing key index {} in resp: {}",
+                iter,
+                idx,
+                resp
+            );
+        }
+    }
+}
+
+
 
 
 
