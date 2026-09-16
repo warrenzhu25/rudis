@@ -6109,7 +6109,7 @@ fn test_mget_fast_harvest_try_recv_sweep_e2e() {
         .expect("Failed to connect client");
     client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
 
-    let keys = vec![
+    let keys = [
         "sweep_k_0".to_string(),
         "sweep_k_1".to_string(),
         "sweep_k_2".to_string(),
