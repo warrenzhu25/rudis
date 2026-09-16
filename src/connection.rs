@@ -497,6 +497,25 @@ pub fn write_resp_bulk(out: &mut Vec<u8>, val: &[u8]) {
     out.extend_from_slice(b"\r\n");
 }
 
+#[inline(always)]
+pub fn write_resp_array_header(out: &mut Vec<u8>, len: usize) {
+    out.push(b'*');
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    let mut uval = len;
+    if uval == 0 {
+        out.extend_from_slice(b"0\r\n");
+    } else {
+        while uval > 0 {
+            i -= 1;
+            buf[i] = b'0' + (uval % 10) as u8;
+            uval /= 10;
+        }
+        out.extend_from_slice(&buf[i..]);
+        out.extend_from_slice(b"\r\n");
+    }
+}
+
 #[inline]
 pub fn write_resp_err(out: &mut Vec<u8>, err: impl AsRef<str>) {
     let err = err.as_ref();
@@ -3147,17 +3166,11 @@ async fn execute_command(
                 record_client_read(router.port, client_id, key.as_ref());
             }
             let values = router.mget(keys).await;
-            out.extend_from_slice(format!("*{}\r\n", values.len()).as_bytes());
+            write_resp_array_header(out, values.len());
             for val in values {
                 match val {
-                    Some(v) => {
-                        out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                        out.extend_from_slice(&v);
-                        out.extend_from_slice(b"\r\n");
-                    }
-                    None => {
-                        out.extend_from_slice(b"$-1\r\n");
-                    }
+                    Some(v) => write_resp_bulk(out, &v),
+                    None => write_resp_null(out),
                 }
             }
             false
@@ -7514,17 +7527,11 @@ pub fn execute_local_command(
             false
         }
         Command::Mget(keys) => {
-            out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
+            write_resp_array_header(out, keys.len());
             for k in keys {
                 match db.get(k) {
-                    Some(v) => {
-                        out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                        out.extend_from_slice(&v);
-                        out.extend_from_slice(b"\r\n");
-                    }
-                    None => {
-                        out.extend_from_slice(b"$-1\r\n");
-                    }
+                    Some(v) => write_resp_bulk(out, &v),
+                    None => write_resp_null(out),
                 }
             }
             false
@@ -11904,6 +11911,25 @@ mod tests {
             (diff_key, Bytes::from("val2")),
         ]);
         assert_eq!(target_shard_of_cmd(&mset_cross, num_shards), None);
+    }
+
+    #[test]
+    fn test_write_resp_array_header() {
+        let mut buf = Vec::new();
+        write_resp_array_header(&mut buf, 0);
+        assert_eq!(buf, b"*0\r\n");
+
+        buf.clear();
+        write_resp_array_header(&mut buf, 5);
+        assert_eq!(buf, b"*5\r\n");
+
+        buf.clear();
+        write_resp_array_header(&mut buf, 50);
+        assert_eq!(buf, b"*50\r\n");
+
+        buf.clear();
+        write_resp_array_header(&mut buf, 1024);
+        assert_eq!(buf, b"*1024\r\n");
     }
 }
 

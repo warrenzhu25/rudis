@@ -5896,6 +5896,32 @@ fn test_cross_shard_mget_mset_fanout_e2e() {
     assert_eq!(pipeline_resp, expected_pipeline);
 }
 
+#[test]
+fn test_mget_zero_alloc_resp2_resp3_serialization_e2e() {
+    let port = 16701;
+    let num_shards = 2;
+    start_test_server(port, num_shards);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("Failed to connect client");
+    client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+
+    assert_eq!(send_and_read(&mut client, b"SET key_alpha value_alpha\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"SET key_beta value_beta\r\n"), "+OK\r\n");
+
+    // RESP2 test: missing key returns "$-1\r\n"
+    let mget_resp2 = send_and_read(&mut client, b"MGET key_alpha key_missing key_beta\r\n");
+    assert_eq!(mget_resp2, "*3\r\n$11\r\nvalue_alpha\r\n$-1\r\n$10\r\nvalue_beta\r\n");
+
+    // Switch to RESP3 via HELLO 3
+    let hello_resp = send_and_read(&mut client, b"HELLO 3\r\n");
+    assert!(hello_resp.starts_with('%') || hello_resp.starts_with('*'));
+
+    // RESP3 test: missing key returns "_\r\n" (null)
+    let mget_resp3 = send_and_read(&mut client, b"MGET key_alpha key_missing key_beta\r\n");
+    assert_eq!(mget_resp3, "*3\r\n$11\r\nvalue_alpha\r\n_\r\n$10\r\nvalue_beta\r\n");
+}
+
 
 
 
