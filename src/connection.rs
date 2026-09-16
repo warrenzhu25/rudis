@@ -29,7 +29,7 @@ pub struct ClientInfo {
     pub name: Option<String>,
     pub connected_at: Instant,
     pub last_active: Instant,
-    pub last_cmd: String,
+    pub last_cmd: &'static str,
     pub is_resp3: bool,
     pub track_tx: Option<flume::Sender<Vec<u8>>>,
     pub raw_fd: std::os::unix::io::RawFd,
@@ -624,7 +624,7 @@ pub async fn handle_tls_connection(
             name: None,
             connected_at: now,
             last_active: now,
-            last_cmd: "NONE".to_string(),
+            last_cmd: "NONE",
             is_resp3: false,
             track_tx: None,
             raw_fd,
@@ -736,7 +736,7 @@ pub async fn handle_connection(
             name: None,
             connected_at: now,
             last_active: now,
-            last_cmd: "NONE".to_string(),
+            last_cmd: "NONE",
             is_resp3: false,
             track_tx: Some(track_tx),
             raw_fd,
@@ -951,7 +951,7 @@ pub async fn handle_connection(
                                 && let Some(c) = client_registry.borrow_mut().get_mut(&client_id)
                             {
                                 c.last_active = Instant::now();
-                                c.last_cmd = get_cmd_name(&cmd).to_lowercase();
+                                c.last_cmd = get_cmd_name(&cmd);
                             }
                             if in_multi {
                                 match cmd {
@@ -1070,7 +1070,7 @@ pub async fn handle_connection(
                                                 client_registry.borrow_mut().get_mut(&client_id)
                                             {
                                                 c.last_active = Instant::now();
-                                                c.last_cmd = "exec".to_string();
+                                                c.last_cmd = "EXEC";
                                             }
 
                                             if use_vll {
@@ -1222,7 +1222,7 @@ pub async fn handle_connection(
                         let single_cmd = commands.pop().unwrap();
                         if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                             c.last_active = Instant::now();
-                            c.last_cmd = get_cmd_name(&single_cmd).to_lowercase();
+                            c.last_cmd = get_cmd_name(&single_cmd);
                         }
                         let quit = execute_command(
                             single_cmd,
@@ -1259,18 +1259,38 @@ pub async fn handle_connection(
                     }
                 }
 
-                // 4. Batch flush all accumulated responses in one io_uring write
+                // 4. Batch flush all accumulated responses: direct non-blocking send with io_uring fallback
                 if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
                     while let Ok(inval) = track_rx.try_recv() {
                         out_buf.extend_from_slice(&inval);
                     }
                 }
                 if !out_buf.is_empty() {
-                    let (write_res, returned_buf) = stream.write_all(out_buf).await;
-                    out_buf = returned_buf;
-                    out_buf.clear();
-                    if write_res.is_err() {
-                        break;
+                    let len = out_buf.len();
+                    let send_ret = unsafe {
+                        libc::send(
+                            raw_fd,
+                            out_buf.as_ptr() as *const libc::c_void,
+                            len,
+                            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                        )
+                    };
+                    if send_ret == len as isize {
+                        out_buf.clear();
+                    } else if send_ret > 0 {
+                        let rem = out_buf[send_ret as usize..].to_vec();
+                        out_buf.clear();
+                        let (write_res, _) = stream.write_all(rem).await;
+                        if write_res.is_err() {
+                            break;
+                        }
+                    } else {
+                        let (write_res, returned_buf) = stream.write_all(out_buf).await;
+                        out_buf = returned_buf;
+                        out_buf.clear();
+                        if write_res.is_err() {
+                            break;
+                        }
                     }
                 }
 
@@ -1323,7 +1343,7 @@ async fn run_pubsub_loop(
         };
         if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
             c.last_active = Instant::now();
-            c.last_cmd = cmd_name.to_string();
+            c.last_cmd = cmd_name;
         }
         match cmd {
             Command::Subscribe(channels) => {
@@ -11867,7 +11887,7 @@ async fn execute_commands_squashed(
         c.last_active = Instant::now();
         if let Some(last_cmd) = commands.last() {
             let cmd_name = get_cmd_name(last_cmd);
-            c.last_cmd = cmd_name.to_lowercase();
+            c.last_cmd = cmd_name;
         }
     }
     responses.clear();

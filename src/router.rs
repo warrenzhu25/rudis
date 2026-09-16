@@ -695,7 +695,11 @@ impl Router {
                 responder: tx.clone(),
             };
             let res = if self.senders[target].send(msg).is_ok() {
-                rx.recv_async().await.ok().flatten()
+                if let Ok(val) = rx.try_recv() {
+                    val
+                } else {
+                    rx.recv_async().await.ok().flatten()
+                }
             } else {
                 None
             };
@@ -726,13 +730,10 @@ impl Router {
     pub async fn set(&self, key: Bytes, value: Bytes, expire_in: Option<Duration>) {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
-            self.local_db
-                .borrow_mut()
-                .set(key.clone(), value.clone(), expire_in);
             if let Some(aof) = &self.aof
                 && let Some(bytes) = crate::aof::command_to_resp(&Command::Set {
-                    key,
-                    value,
+                    key: key.clone(),
+                    value: value.clone(),
                     expire_in,
                     condition: crate::resp::SetCondition::None,
                     get: false,
@@ -742,6 +743,9 @@ impl Router {
             {
                 aof.borrow_mut().append(&bytes);
             }
+            self.local_db
+                .borrow_mut()
+                .set(key, value, expire_in);
             let max_mem = crate::tiering::get_max_memory(self.port);
             if max_mem > 0 {
                 let used = self.local_db.borrow().table.used_memory;
@@ -771,7 +775,9 @@ impl Router {
                 expire_in,
                 responder: tx.clone(),
             };
-            if self.senders[target].send(msg).is_ok() {
+            if self.senders[target].send(msg).is_ok()
+                && rx.try_recv().is_err()
+            {
                 let _ = rx.recv_async().await;
             }
             self.set_channel_pool.borrow_mut().push((tx, rx));
@@ -863,18 +869,16 @@ impl Router {
             }
         }
 
-        // Execute local keys
-        for (idx, key) in local_keys {
-            results[idx] = self.get_local_direct(&key).await;
-        }
-
         // Fast path: all keys are local - 0 channel operations
         if !has_remote {
+            for (idx, key) in local_keys {
+                results[idx] = self.get_local_direct(&key).await;
+            }
             self.mget_batch_pool.borrow_mut().push(remote_batches);
             return results;
         }
 
-        // Dispatch remote batches concurrently with pooled channels
+        // Dispatch remote batches concurrently with pooled channels FIRST
         let channel_set = self.acquire_mget_channels();
         let mut sent_mask: u64 = 0;
         for target_shard in 0..self.num_shards {
@@ -889,6 +893,11 @@ impl Router {
                     sent_mask |= 1 << target_shard;
                 }
             }
+        }
+
+        // Execute local keys CONCURRENTLY while remote shards process their batches
+        for (idx, key) in local_keys {
+            results[idx] = self.get_local_direct(&key).await;
         }
 
         let mut pending_mask = sent_mask;
@@ -969,24 +978,23 @@ impl Router {
             }
         }
 
-        if !local_batch.is_empty() {
-            {
-                let mut db = self.local_db.borrow_mut();
-                for (k, v) in &local_batch {
-                    db.set(k.clone(), v.clone(), None);
-                }
-            }
-            if let Some(aof) = &self.aof
-                && let Some(bytes) =
-                    crate::aof::command_to_resp(&crate::resp::Command::Mset(local_batch))
+        // Fast path: all pairs are local
+        if !has_remote {
+            if !local_batch.is_empty() {
+                if let Some(aof) = &self.aof
+                    && let Some(bytes) =
+                        crate::aof::command_to_resp(&crate::resp::Command::Mset(local_batch.clone()))
                 {
                     aof.borrow_mut().append(&bytes);
                 }
-            self.check_auto_tier_after_write();
-        }
-
-        // Fast path: all pairs are local
-        if !has_remote {
+                {
+                    let mut db = self.local_db.borrow_mut();
+                    for (k, v) in local_batch {
+                        db.set(k, v, None);
+                    }
+                }
+                self.check_auto_tier_after_write();
+            }
             self.mset_batch_pool.borrow_mut().push(remote_batches);
             return;
         }
@@ -1005,6 +1013,23 @@ impl Router {
                     sent_mask |= 1 << target_shard;
                 }
             }
+        }
+
+        // Execute local batch CONCURRENTLY while remote shards process their batches
+        if !local_batch.is_empty() {
+            if let Some(aof) = &self.aof
+                && let Some(bytes) =
+                    crate::aof::command_to_resp(&crate::resp::Command::Mset(local_batch.clone()))
+            {
+                aof.borrow_mut().append(&bytes);
+            }
+            {
+                let mut db = self.local_db.borrow_mut();
+                for (k, v) in local_batch {
+                    db.set(k, v, None);
+                }
+            }
+            self.check_auto_tier_after_write();
         }
 
         let mut pending_mask = sent_mask;
