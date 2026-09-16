@@ -5963,6 +5963,55 @@ fn test_client_tracking_atomic_bypass_and_invalidation_e2e() {
     assert_eq!(send_and_read(&mut client1, b"CLIENT TRACKING off\r\n"), "+OK\r\n");
 }
 
+#[test]
+fn test_mget_mset_8shard_preallocated_fanout_e2e() {
+    let port = 16703;
+    let num_shards = 8;
+    start_test_server(port, num_shards);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("Failed to connect client");
+    client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+
+    // Find keys for all 8 shards
+    let mut shard_keys: [String; 8] = Default::default();
+    let mut found = 0;
+    for i in 0..20000 {
+        let key = format!("k8_{}", i);
+        let s = target_shard(key.as_bytes(), num_shards);
+        if shard_keys[s].is_empty() {
+            shard_keys[s] = key;
+            found += 1;
+            if found == 8 {
+                break;
+            }
+        }
+    }
+    assert_eq!(found, 8);
+
+    // MSET across all 8 shards
+    let mut mset_args = String::from("MSET");
+    for (i, k) in shard_keys.iter().enumerate() {
+        mset_args.push_str(&format!(" {} val_8_{}", k, i));
+    }
+    mset_args.push_str("\r\n");
+    assert_eq!(send_and_read(&mut client, mset_args.as_bytes()), "+OK\r\n");
+
+    // MGET reading all 8 shards in reverse order + nonexistent keys
+    let mut mget_args = String::from("MGET");
+    for k in shard_keys.iter().rev() {
+        mget_args.push_str(&format!(" {}", k));
+    }
+    mget_args.push_str(" missing_8_x\r\n");
+
+    let resp = send_and_read(&mut client, mget_args.as_bytes());
+    assert!(resp.starts_with("*9\r\n"));
+    for i in (0..8).rev() {
+        assert!(resp.contains(&format!("val_8_{}", i)));
+    }
+    assert!(resp.ends_with("$-1\r\n"));
+}
+
 
 
 

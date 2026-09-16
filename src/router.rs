@@ -621,40 +621,43 @@ impl Router {
         Ok((all_reflink, total_bytes, shard_count))
     }
 
+    #[inline(always)]
+    pub async fn get_local_direct(&self, key: &Bytes) -> Option<Bytes> {
+        let val = self.local_db.borrow_mut().get(key);
+        if let Some(v) = val {
+            let stats = crate::tiering::get_tier_stats(self.port);
+            stats.ram_hits.fetch_add(1, Ordering::Relaxed);
+            return Some(v);
+        }
+        if self.local_db.borrow_mut().table.is_tiered(key).is_some() {
+            let max_mem = crate::tiering::get_max_memory(self.port);
+            let offload_pct = crate::tiering::get_offload_threshold_pct(self.port);
+            let is_constrained = if max_mem > 0 {
+                let used_mem = self.local_db.borrow().table.used_memory;
+                let shard_threshold = (max_mem / self.num_shards.max(1) as u64) as usize;
+                used_mem >= (shard_threshold * offload_pct as usize) / 100
+            } else {
+                false
+            };
+            if is_constrained {
+                if let Some(val) = self.stream_cold_read_local(key).await {
+                    let stats = crate::tiering::get_tier_stats(self.port);
+                    stats.streaming_reads.fetch_add(1, Ordering::Relaxed);
+                    stats.ram_misses.fetch_add(1, Ordering::Relaxed);
+                    return Some(val);
+                }
+            } else {
+                self.load_local(key).await;
+                return self.local_db.borrow_mut().get(key);
+            }
+        }
+        None
+    }
+
     pub async fn get(&self, key: Bytes) -> Option<Bytes> {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
-            // 1. Fast DRAM path
-            let val = self.local_db.borrow_mut().get(&key);
-            if let Some(v) = val {
-                let stats = crate::tiering::get_tier_stats(self.port);
-                stats.ram_hits.fetch_add(1, Ordering::Relaxed);
-                return Some(v);
-            }
-            // 2. Cold tiered path
-            if self.local_db.borrow_mut().table.is_tiered(&key).is_some() {
-                let max_mem = crate::tiering::get_max_memory(self.port);
-                let offload_pct = crate::tiering::get_offload_threshold_pct(self.port);
-                let is_constrained = if max_mem > 0 {
-                    let used_mem = self.local_db.borrow().table.used_memory;
-                    let shard_threshold = (max_mem / self.num_shards.max(1) as u64) as usize;
-                    used_mem >= (shard_threshold * offload_pct as usize) / 100
-                } else {
-                    false
-                };
-                if is_constrained {
-                    if let Some(val) = self.stream_cold_read_local(&key).await {
-                        let stats = crate::tiering::get_tier_stats(self.port);
-                        stats.streaming_reads.fetch_add(1, Ordering::Relaxed);
-                        stats.ram_misses.fetch_add(1, Ordering::Relaxed);
-                        return Some(val);
-                    }
-                } else {
-                    self.load_local(&key).await;
-                    return self.local_db.borrow_mut().get(&key);
-                }
-            }
-            None
+            self.get_local_direct(&key).await
         } else {
             // Unified remote shard Get (handles DRAM and tiered in a single message)
             let (tx, rx) = flume::bounded(1);
@@ -736,6 +739,27 @@ impl Router {
         }
     }
 
+    #[inline(always)]
+    fn check_auto_tier_after_write(&self) {
+        let max_mem = crate::tiering::get_max_memory(self.port);
+        if max_mem > 0 {
+            let used = self.local_db.borrow().table.used_memory;
+            let shard_max_mem = (max_mem / self.num_shards.max(1) as u64) as usize;
+            if used > shard_max_mem && !self.is_auto_tiering.get() {
+                let decommitted = self.decommit_local(None);
+                let used_after = self.local_db.borrow().table.used_memory;
+                if (decommitted == 0 || used_after > shard_max_mem)
+                    && !self.is_auto_tiering.get()
+                {
+                    let r = self.clone();
+                    monoio::spawn(async move {
+                        r.check_auto_tier().await;
+                    });
+                }
+            }
+        }
+    }
+
     pub async fn mget(&self, keys: Vec<Bytes>) -> Vec<Option<Bytes>> {
         if keys.is_empty() {
             return Vec::new();
@@ -743,52 +767,57 @@ impl Router {
 
         let total_keys = keys.len();
         let mut results: Vec<Option<Bytes>> = vec![None; total_keys];
-        let mut local_batch: Vec<(usize, Bytes)> = Vec::new();
-        let mut remote_batches: Vec<Vec<(usize, Bytes)>> = vec![Vec::new(); self.num_shards];
 
-        for (idx, key) in keys.into_iter().enumerate() {
-            let target = self.target_shard(&key);
+        if self.num_shards <= 1 {
+            for (idx, key) in keys.into_iter().enumerate() {
+                results[idx] = self.get_local_direct(&key).await;
+            }
+            return results;
+        }
+
+        // 1. Single pass to count keys per shard and track targets
+        let mut shard_counts = vec![0usize; self.num_shards];
+        let mut targets = Vec::with_capacity(total_keys);
+        let mut has_remote = false;
+
+        for key in &keys {
+            let target = self.target_shard(key);
+            shard_counts[target] += 1;
+            if target != self.shard_id {
+                has_remote = true;
+            }
+            targets.push(target);
+        }
+
+        // Fast path: all keys are local (e.g. hash-tagged co-located) - 0 remote vector allocations
+        if !has_remote {
+            for (idx, key) in keys.into_iter().enumerate() {
+                results[idx] = self.get_local_direct(&key).await;
+            }
+            return results;
+        }
+
+        // 2. Pre-allocate remote batches with exact capacity needed - 0 reallocations
+        let mut remote_batches: Vec<Vec<(usize, Bytes)>> = (0..self.num_shards)
+            .map(|s| {
+                if s != self.shard_id && shard_counts[s] > 0 {
+                    Vec::with_capacity(shard_counts[s])
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+
+        // 3. Process keys: execute local keys immediately, bucket remote keys
+        for (idx, (key, target)) in keys.into_iter().zip(targets).enumerate() {
             if target == self.shard_id {
-                local_batch.push((idx, key));
+                results[idx] = self.get_local_direct(&key).await;
             } else {
                 remote_batches[target].push((idx, key));
             }
         }
 
-        // 1. Process local batch
-        for (idx, key) in local_batch {
-            let val = self.local_db.borrow_mut().get(&key);
-            if let Some(v) = val {
-                let stats = crate::tiering::get_tier_stats(self.port);
-                stats.ram_hits.fetch_add(1, Ordering::Relaxed);
-                results[idx] = Some(v);
-            } else if self.local_db.borrow_mut().table.is_tiered(&key).is_some() {
-                let max_mem = crate::tiering::get_max_memory(self.port);
-                let offload_pct = crate::tiering::get_offload_threshold_pct(self.port);
-                let is_constrained = if max_mem > 0 {
-                    let used_mem = self.local_db.borrow().table.used_memory;
-                    let shard_threshold = (max_mem / self.num_shards.max(1) as u64) as usize;
-                    used_mem >= (shard_threshold * offload_pct as usize) / 100
-                } else {
-                    false
-                };
-                if is_constrained {
-                    if let Some(val) = self.stream_cold_read_local(&key).await {
-                        let stats = crate::tiering::get_tier_stats(self.port);
-                        stats.streaming_reads.fetch_add(1, Ordering::Relaxed);
-                        stats.ram_misses.fetch_add(1, Ordering::Relaxed);
-                        results[idx] = Some(val);
-                    }
-                } else {
-                    self.load_local(&key).await;
-                    results[idx] = self.local_db.borrow_mut().get(&key);
-                }
-            } else {
-                results[idx] = None;
-            }
-        }
-
-        // 2. Dispatch remote batches concurrently
+        // 4. Dispatch remote batches concurrently
         let mut pending = Vec::new();
         for (target_shard, items) in remote_batches.into_iter().enumerate() {
             if !items.is_empty() {
@@ -803,7 +832,7 @@ impl Router {
             }
         }
 
-        // 3. Await all remote shard responses
+        // 5. Await all remote shard responses
         for rx in pending {
             if let Ok(shard_results) = rx.recv_async().await {
                 for (idx, val) in shard_results {
@@ -820,11 +849,71 @@ impl Router {
             return;
         }
 
-        let mut local_batch: Vec<(Bytes, Bytes)> = Vec::new();
-        let mut remote_batches: Vec<Vec<(Bytes, Bytes)>> = vec![Vec::new(); self.num_shards];
+        if self.num_shards <= 1 {
+            {
+                let mut db = self.local_db.borrow_mut();
+                for (k, v) in &pairs {
+                    db.set(k.clone(), v.clone(), None);
+                }
+            }
+            if let Some(aof) = &self.aof
+                && let Some(bytes) =
+                    crate::aof::command_to_resp(&crate::resp::Command::Mset(pairs))
+                {
+                    aof.borrow_mut().append(&bytes);
+                }
+            self.check_auto_tier_after_write();
+            return;
+        }
 
-        for (k, v) in pairs {
-            let target = self.target_shard(&k);
+        let mut shard_counts = vec![0usize; self.num_shards];
+        let mut targets = Vec::with_capacity(pairs.len());
+        let mut has_remote = false;
+
+        for (k, _) in &pairs {
+            let target = self.target_shard(k);
+            shard_counts[target] += 1;
+            if target != self.shard_id {
+                has_remote = true;
+            }
+            targets.push(target);
+        }
+
+        // Fast path: all pairs are local
+        if !has_remote {
+            {
+                let mut db = self.local_db.borrow_mut();
+                for (k, v) in &pairs {
+                    db.set(k.clone(), v.clone(), None);
+                }
+            }
+            if let Some(aof) = &self.aof
+                && let Some(bytes) =
+                    crate::aof::command_to_resp(&crate::resp::Command::Mset(pairs))
+                {
+                    aof.borrow_mut().append(&bytes);
+                }
+            self.check_auto_tier_after_write();
+            return;
+        }
+
+        // Pre-allocate batches with exact capacity
+        let mut remote_batches: Vec<Vec<(Bytes, Bytes)>> = (0..self.num_shards)
+            .map(|s| {
+                if s != self.shard_id && shard_counts[s] > 0 {
+                    Vec::with_capacity(shard_counts[s])
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+        let mut local_batch = if shard_counts[self.shard_id] > 0 {
+            Vec::with_capacity(shard_counts[self.shard_id])
+        } else {
+            Vec::new()
+        };
+
+        for ((k, v), target) in pairs.into_iter().zip(targets) {
             if target == self.shard_id {
                 local_batch.push((k, v));
             } else {
@@ -832,7 +921,6 @@ impl Router {
             }
         }
 
-        // 1. Process local batch
         if !local_batch.is_empty() {
             {
                 let mut db = self.local_db.borrow_mut();
@@ -846,26 +934,9 @@ impl Router {
                 {
                     aof.borrow_mut().append(&bytes);
                 }
-            let max_mem = crate::tiering::get_max_memory(self.port);
-            if max_mem > 0 {
-                let used = self.local_db.borrow().table.used_memory;
-                let shard_max_mem = (max_mem / self.num_shards.max(1) as u64) as usize;
-                if used > shard_max_mem && !self.is_auto_tiering.get() {
-                    let decommitted = self.decommit_local(None);
-                    let used_after = self.local_db.borrow().table.used_memory;
-                    if (decommitted == 0 || used_after > shard_max_mem)
-                        && !self.is_auto_tiering.get()
-                    {
-                        let r = self.clone();
-                        monoio::spawn(async move {
-                            r.check_auto_tier().await;
-                        });
-                    }
-                }
-            }
+            self.check_auto_tier_after_write();
         }
 
-        // 2. Dispatch remote batches concurrently
         let mut pending = Vec::new();
         for (target_shard, items) in remote_batches.into_iter().enumerate() {
             if !items.is_empty() {
@@ -880,7 +951,6 @@ impl Router {
             }
         }
 
-        // 3. Await all completions
         for rx in pending {
             let _ = rx.recv_async().await;
         }
@@ -1938,6 +2008,46 @@ mod tests {
         drop(senders);
         let _ = h.join();
         assert_eq!(done_rx.recv().unwrap(), Some(Bytes::from("val1")));
+    }
+
+    #[test]
+    fn test_router_mget_all_local_fast_path() {
+        let db0 = Rc::new(RefCell::new(ShardDb::new(9999)));
+        let (tx, _rx) = flume::unbounded();
+        let router = Router::new(
+            0,
+            1,
+            9999,
+            db0.clone(),
+            vec![tx],
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+
+        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async move {
+            let pairs = vec![
+                (Bytes::from("local_k1"), Bytes::from("val1")),
+                (Bytes::from("local_k2"), Bytes::from("val2")),
+            ];
+            router.mset(pairs).await;
+
+            let keys = vec![
+                Bytes::from("local_k1"),
+                Bytes::from("local_missing"),
+                Bytes::from("local_k2"),
+            ];
+            let values = router.mget(keys).await;
+            assert_eq!(values.len(), 3);
+            assert_eq!(values[0], Some(Bytes::from("val1")));
+            assert_eq!(values[1], None);
+            assert_eq!(values[2], Some(Bytes::from("val2")));
+        });
     }
 }
 
