@@ -73,6 +73,8 @@ pub struct Router {
     pub mget_channel_pool: Rc<RefCell<Vec<Vec<MgetChannel>>>>,
     pub mset_channel_pool: Rc<RefCell<Vec<Vec<MsetChannel>>>>,
     pub set_channel_pool: Rc<RefCell<Vec<MsetChannel>>>,
+    pub get_channel_pool: Rc<RefCell<Vec<(flume::Sender<Option<Bytes>>, flume::Receiver<Option<Bytes>>)>>>,
+    pub remote_responder_pool: Rc<RefCell<Vec<crate::connection::ResponderChannel>>>,
 }
 
 impl Router {
@@ -111,6 +113,8 @@ impl Router {
             mget_channel_pool: Rc::new(RefCell::new(Vec::new())),
             mset_channel_pool: Rc::new(RefCell::new(Vec::new())),
             set_channel_pool: Rc::new(RefCell::new(Vec::new())),
+            get_channel_pool: Rc::new(RefCell::new(Vec::new())),
+            remote_responder_pool: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -671,14 +675,23 @@ impl Router {
         if target == self.shard_id {
             self.get_local_direct(&key).await
         } else {
-            // Unified remote shard Get (handles DRAM and tiered in a single message)
-            let (tx, rx) = flume::bounded(1);
-            let msg = ShardMessage::Get { key, responder: tx };
-            if self.senders[target].send(msg).is_ok() {
+            // Unified remote shard Get with pooled channel
+            let (tx, rx) = self
+                .get_channel_pool
+                .borrow_mut()
+                .pop()
+                .unwrap_or_else(|| flume::bounded(1));
+            let msg = ShardMessage::Get {
+                key,
+                responder: tx.clone(),
+            };
+            let res = if self.senders[target].send(msg).is_ok() {
                 rx.recv_async().await.ok().flatten()
             } else {
                 None
-            }
+            };
+            self.get_channel_pool.borrow_mut().push((tx, rx));
+            res
         }
     }
 
@@ -1390,19 +1403,26 @@ impl Router {
 
     pub async fn execute_remote(&self, target: usize, cmd: Command) -> Vec<u8> {
         let is_resp3 = crate::connection::CURRENT_CLIENT_RESP3.get();
-        let (tx, rx) = flume::bounded(1);
+        let (tx, rx) = self
+            .remote_responder_pool
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(|| flume::bounded(1));
         let msg = ShardMessage::Batch {
             items: vec![(0, cmd)],
-            responder: tx,
+            responder: tx.clone(),
             is_resp3,
         };
-        if self.senders[target].send(msg).is_ok()
+        let res = if self.senders[target].send(msg).is_ok()
             && let Ok(mut res) = rx.recv_async().await
             && let Some((_, out)) = res.pop()
         {
-            return out.into_vec();
-        }
-        b"-ERR internal shard routing error\r\n".to_vec()
+            out.into_vec()
+        } else {
+            b"-ERR internal shard routing error\r\n".to_vec()
+        };
+        self.remote_responder_pool.borrow_mut().push((tx, rx));
+        res
     }
 
     pub async fn dbsize(&self) -> usize {
@@ -2289,6 +2309,83 @@ mod tests {
             assert_eq!(values.len(), 2);
             assert!(values[0].is_some());
             assert!(values[1].is_some());
+        });
+    }
+
+    #[test]
+    fn test_router_channel_pool_reuse() {
+        let (tx0, _rx0) = flume::unbounded();
+        let (tx1, rx1) = flume::unbounded();
+
+        let db0 = Rc::new(RefCell::new(ShardDb::new(9997)));
+        let senders = vec![tx0, tx1];
+        let router = Router::new(
+            0,
+            2,
+            9997,
+            db0.clone(),
+            senders,
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+
+        let mut k_shard1 = None;
+        for i in 0..1000 {
+            let k = Bytes::from(format!("key_pool_{}", i));
+            if target_shard(&k, 2) == 1 {
+                k_shard1 = Some(k);
+                break;
+            }
+        }
+        let k1 = k_shard1.unwrap();
+        let rx1_clone = rx1.clone();
+        let k1_remote = k1.clone();
+
+        std::thread::spawn(move || {
+            let mut remote_db = ShardDb::new(9997);
+            remote_db.set(k1_remote.clone(), Bytes::from("pool_val"), None);
+            while let Ok(msg) = rx1_clone.recv() {
+                match msg {
+                    ShardMessage::Get { key, responder } => {
+                        let val = remote_db.get(&key);
+                        let _ = responder.send(val);
+                    }
+                    ShardMessage::Batch { items, responder, .. } => {
+                        let mut res = Vec::new();
+                        for (idx, _cmd) in items {
+                            res.push((idx, crate::shard::CompactResp::from_slice(b"+PONG\r\n")));
+                        }
+                        let _ = responder.send(res);
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async move {
+            assert_eq!(router.get_channel_pool.borrow().len(), 0);
+            let val1 = router.get(k1.clone()).await;
+            assert_eq!(val1, Some(Bytes::from("pool_val")));
+            assert_eq!(router.get_channel_pool.borrow().len(), 1);
+
+            let val2 = router.get(k1.clone()).await;
+            assert_eq!(val2, Some(Bytes::from("pool_val")));
+            assert_eq!(router.get_channel_pool.borrow().len(), 1);
+
+            assert_eq!(router.remote_responder_pool.borrow().len(), 0);
+            let resp1 = router.execute_remote(1, Command::Ping(None)).await;
+            assert_eq!(resp1, b"+PONG\r\n");
+            assert_eq!(router.remote_responder_pool.borrow().len(), 1);
+
+            let resp2 = router.execute_remote(1, Command::Ping(None)).await;
+            assert_eq!(resp2, b"+PONG\r\n");
+            assert_eq!(router.remote_responder_pool.borrow().len(), 1);
         });
     }
 }

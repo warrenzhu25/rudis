@@ -1,5 +1,8 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
+
+pub static HAS_CUSTOM_ACL: AtomicBool = AtomicBool::new(false);
 
 pub static PORT_ACLS: LazyLock<Mutex<HashMap<u16, Arc<RwLock<AclManager>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -222,6 +225,7 @@ impl AclManager {
     }
 
     pub fn set_user(&mut self, username: &str, rules: &[String]) -> Result<(), String> {
+        HAS_CUSTOM_ACL.store(true, Ordering::Release);
         let user = self
             .users
             .entry(username.to_string())
@@ -308,6 +312,7 @@ impl AclManager {
     }
 
     pub fn del_user(&mut self, usernames: &[String]) -> usize {
+        HAS_CUSTOM_ACL.store(true, Ordering::Release);
         let mut count = 0;
         for u in usernames {
             if u != "default" && self.users.remove(u).is_some() {

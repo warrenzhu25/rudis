@@ -39,6 +39,7 @@ pub struct ClusterHub {
     pub election_in_progress: AtomicBool,
     pub role: RwLock<String>,      // "master" or "slave"
     pub master_id: RwLock<String>, // "-" or ID
+    pub has_nodes: AtomicBool,
     pub nodes: RwLock<HashMap<String, ClusterNodeInfo>>,
     pub my_slots: RwLock<Vec<(u16, u16)>>,
     pub pfail_reports: RwLock<HashMap<String, HashSet<String>>>,
@@ -47,10 +48,18 @@ pub struct ClusterHub {
     pub active_migration: RwLock<Option<ActiveMigration>>,
 }
 
+pub static HAS_ACTIVE_CLUSTER: AtomicBool = AtomicBool::new(false);
+
 static CLUSTER_HUBS: LazyLock<RwLock<HashMap<u16, Arc<ClusterHub>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 pub fn get_cluster_hub(port: u16) -> Arc<ClusterHub> {
+    {
+        let hubs = CLUSTER_HUBS.read().unwrap();
+        if let Some(hub) = hubs.get(&port) {
+            return hub.clone();
+        }
+    }
     let mut hubs = CLUSTER_HUBS.write().unwrap();
     if let Some(hub) = hubs.get(&port) {
         return hub.clone();
@@ -86,6 +95,7 @@ impl ClusterHub {
             election_in_progress: AtomicBool::new(false),
             role: RwLock::new("master".to_string()),
             master_id: RwLock::new("-".to_string()),
+            has_nodes: AtomicBool::new(false),
             nodes: RwLock::new(HashMap::new()),
             my_slots: RwLock::new(vec![(0, 16383)]),
             pfail_reports: RwLock::new(HashMap::new()),
@@ -230,6 +240,8 @@ impl ClusterHub {
                         slots: Vec::new(),
                     },
                 );
+                self.has_nodes.store(true, Ordering::Release);
+                HAS_ACTIVE_CLUSTER.store(true, Ordering::Release);
             }
         }
 

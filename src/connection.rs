@@ -746,6 +746,7 @@ pub async fn handle_connection(
     let mut remote_batches: Vec<Vec<(usize, Command)>> = (0..router.num_shards)
         .map(|_| Vec::with_capacity(64))
         .collect();
+    let mut squashed_responses = Vec::with_capacity(64);
 
     let mut asking = false;
     let mut in_multi = false;
@@ -1180,27 +1181,13 @@ pub async fn handle_connection(
                                 break;
                             }
                         }
-                    } else if commands.len() == 1 {
-                        let quit = execute_command(
-                            commands.pop().unwrap(),
-                            &router,
-                            client_id,
-                            &client_registry,
-                            &mut out_buf,
-                            &mut asking,
-                            &mut authenticated,
-                            &mut auth_user,
-                        )
-                        .await;
-                        if quit {
-                            should_quit = true;
-                        }
                     } else {
                         let quit = execute_commands_squashed(
                             commands,
                             &router,
                             &responders,
                             &mut remote_batches,
+                            &mut squashed_responses,
                             client_id,
                             &client_registry,
                             &mut out_buf,
@@ -3014,9 +3001,7 @@ async fn execute_command(
             let val = router.get(key).await;
             match val {
                 Some(v) => {
-                    out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                    out.extend_from_slice(&v);
-                    out.extend_from_slice(b"\r\n");
+                    write_resp_bulk(out, &v);
                 }
                 None => {
                     out.extend_from_slice(b"$-1\r\n");
@@ -3038,9 +3023,7 @@ async fn execute_command(
                     } else if let Some(exp) = expire_in {
                         let _ = router.expire(key, exp).await;
                     }
-                    out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                    out.extend_from_slice(&v);
-                    out.extend_from_slice(b"\r\n");
+                    write_resp_bulk(out, &v);
                 }
                 None => {
                     out.extend_from_slice(b"$-1\r\n");
@@ -3212,9 +3195,7 @@ async fn execute_command(
 
                 if get {
                     if let Some(v) = current_val {
-                        out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                        out.extend_from_slice(&v);
-                        out.extend_from_slice(b"\r\n");
+                        write_resp_bulk(out, &v);
                     } else {
                         out.extend_from_slice(b"$-1\r\n");
                     }
@@ -11671,6 +11652,7 @@ async fn execute_commands_squashed(
     router: &Router,
     responders: &[ResponderChannel],
     remote_batches: &mut [Vec<(usize, Command)>],
+    responses: &mut Vec<CompactResp>,
     client_id: u64,
     client_registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
     out: &mut Vec<u8>,
@@ -11680,17 +11662,27 @@ async fn execute_commands_squashed(
 ) -> bool {
     let mut can_squash = *authenticated;
     if can_squash {
-        let acl = crate::acl::get_acl_for_port(router.port);
-        let acl_guard = acl.read().unwrap();
-        let user = acl_guard.get_user(auth_user);
-        let hub = crate::cluster::get_cluster_hub(router.port);
-        let nodes_guard = hub.nodes.read().unwrap();
-        let is_cluster_active = !nodes_guard.is_empty();
-        let my_slots_guard = if is_cluster_active {
-            Some(hub.my_slots.read().unwrap())
+        let acl = if crate::acl::HAS_CUSTOM_ACL.load(std::sync::atomic::Ordering::Relaxed)
+            || auth_user != "default"
+        {
+            Some(crate::acl::get_acl_for_port(router.port))
         } else {
             None
         };
+        let acl_guard = acl.as_ref().map(|a| a.read().unwrap());
+        let user = acl_guard.as_ref().and_then(|g| g.get_user(auth_user));
+
+        let hub = if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
+            let h = crate::cluster::get_cluster_hub(router.port);
+            if !h.nodes.read().unwrap().is_empty() {
+                Some(h)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let my_slots_guard = hub.as_ref().map(|h| h.my_slots.read().unwrap());
         for cmd in &commands {
             if matches!(
                 cmd,
@@ -11797,7 +11789,8 @@ async fn execute_commands_squashed(
             c.last_cmd = cmd_name.to_lowercase();
         }
     }
-    let mut responses: Vec<CompactResp> = vec![CompactResp::empty(); n];
+    responses.clear();
+    responses.resize(n, CompactResp::empty());
     let mut local_buf = Vec::with_capacity(128);
     let mut should_close = false;
 
@@ -11922,7 +11915,7 @@ async fn execute_commands_squashed(
     }
 
     // 4. Append responses in exact FIFO pipeline order
-    for resp in &responses {
+    for resp in responses.iter() {
         out.extend_from_slice(resp.as_slice());
     }
 

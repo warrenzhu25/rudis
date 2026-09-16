@@ -6311,6 +6311,44 @@ fn test_fragmented_socket_frame_draining_e2e() {
     }
 }
 
+#[test]
+fn test_pipeline1_fast_path_and_acl_bypass_e2e() {
+    let port = 16450;
+    start_test_server(port, 4);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Pipeline 1 commands: individual GET and SET across different shards
+    for i in 0..50 {
+        let set_cmd = format!("SET p1_k_{} val_{}\r\n", i, i);
+        let resp = send_and_read(&mut client, set_cmd.as_bytes());
+        assert_eq!(resp, "+OK\r\n");
+
+        let get_cmd = format!("GET p1_k_{}\r\n", i);
+        let resp = send_and_read(&mut client, get_cmd.as_bytes());
+        let expected = format!("${}\r\nval_{}\r\n", format!("val_{}", i).len(), i);
+        assert_eq!(resp, expected);
+    }
+
+    // 2. SET with GET option (using write_resp_bulk fast path)
+    let resp = send_and_read(&mut client, b"SET p1_k_0 new_val GET\r\n");
+    assert_eq!(resp, "$5\r\nval_0\r\n");
+
+    let resp = send_and_read(&mut client, b"GET p1_k_0\r\n");
+    assert_eq!(resp, "$7\r\nnew_val\r\n");
+
+    // 3. Test ACL configuration and execution
+    let resp = send_and_read(&mut client, b"ACL SETUSER alice on >secretpass +@all ~*\r\n");
+    assert_eq!(resp, "+OK\r\n");
+
+    let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let resp = send_and_read(&mut client2, b"AUTH alice secretpass\r\n");
+    assert_eq!(resp, "+OK\r\n");
+
+    let resp = send_and_read(&mut client2, b"GET p1_k_0\r\n");
+    assert_eq!(resp, "$7\r\nnew_val\r\n");
+}
+
+
 
 
 
