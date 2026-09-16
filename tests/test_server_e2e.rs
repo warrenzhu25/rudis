@@ -6101,6 +6101,33 @@ fn test_mget_burst_draining_and_single_pass_fanout_e2e() {
     }
 }
 
+#[test]
+fn test_mget_fast_harvest_try_recv_sweep_e2e() {
+    let port = 16706;
+    start_test_server(port, 4);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("Failed to connect client");
+    client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+
+    let keys = vec![
+        "sweep_k_0".to_string(),
+        "sweep_k_1".to_string(),
+        "sweep_k_2".to_string(),
+        "sweep_k_3".to_string(),
+    ];
+
+    let set_cmd = format!(
+        "MSET {} val0 {} val1 {} val2 {} val3\r\n",
+        keys[0], keys[1], keys[2], keys[3]
+    );
+    assert_eq!(send_and_read(&mut client, set_cmd.as_bytes()), "+OK\r\n");
+
+    let get_cmd = format!("MGET {} {} {} {}\r\n", keys[0], keys[1], keys[2], keys[3]);
+    let resp = send_and_read(&mut client, get_cmd.as_bytes());
+    assert_eq!(resp, "*4\r\n$4\r\nval0\r\n$4\r\nval1\r\n$4\r\nval2\r\n$4\r\nval3\r\n");
+}
+
+
 
 
 
