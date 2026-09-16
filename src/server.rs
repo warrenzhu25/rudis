@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::cell::RefCell;
 use std::net::SocketAddr;
@@ -505,22 +504,20 @@ pub fn run_shard_worker(
                             let _ = responder.send(results);
                         }
                     }
-                    ShardMessage::Mget { keys, responder } => {
+                    ShardMessage::Mget { mut keys, responder } => {
                         let mut db = cross_shard_db.borrow_mut();
                         if db.tier_manager.is_none() {
-                            let results: Vec<(usize, Option<Bytes>)> = keys
-                                .into_iter()
-                                .map(|(idx, key)| {
-                                    let val = db.get(&key);
-                                    (idx, val)
-                                })
-                                .collect();
-                            let _ = responder.send(results);
+                            for item in &mut keys {
+                                let val = db.get(item.1.as_ref().unwrap());
+                                item.1 = val;
+                            }
+                            let _ = responder.send(keys);
                         } else {
                             let mut results = Vec::with_capacity(keys.len());
                             let mut async_item = None;
 
-                            for (i, (idx, key)) in keys.iter().enumerate() {
+                            for (i, (idx, key_opt)) in keys.iter().enumerate() {
+                                let key = key_opt.as_ref().unwrap();
                                 let val = db.get(key);
                                 if val.is_some() || db.table.is_tiered(key).is_none() {
                                     results.push((*idx, val));
@@ -534,7 +531,8 @@ pub fn run_shard_worker(
                                 drop(db);
                                 let r = cross_shard_router.clone();
                                 monoio::spawn(async move {
-                                    for (idx, key) in keys.into_iter().skip(start_idx) {
+                                    for (idx, key_opt) in keys.into_iter().skip(start_idx) {
+                                        let key = key_opt.unwrap();
                                         let val = r.local_db.borrow_mut().get(&key);
                                         if let Some(v) = val {
                                             results.push((idx, Some(v)));
@@ -572,21 +570,28 @@ pub fn run_shard_worker(
                             }
                         }
                     }
-                    ShardMessage::Mset { pairs, responder } => {
+                    ShardMessage::Mset { mut pairs, responder } => {
                         {
                             let mut db = cross_shard_db.borrow_mut();
-                            for (k, v) in &pairs {
-                                db.set(k.clone(), v.clone(), None);
+                            if cross_shard_aof.is_some() {
+                                for (k, v) in &pairs {
+                                    db.set(k.clone(), v.clone(), None);
+                                }
+                            } else {
+                                for (k, v) in pairs.drain(..) {
+                                    db.set(k, v, None);
+                                }
                             }
                         }
                         if let Some(aof) = &cross_shard_aof
                             && let Some(bytes) =
-                                crate::aof::command_to_resp(&crate::resp::Command::Mset(pairs))
+                                crate::aof::command_to_resp(&crate::resp::Command::Mset(pairs.clone()))
                             {
                                 aof.borrow_mut().append(&bytes);
                             }
                         cross_shard_router.check_auto_tier_after_write();
-                        let _ = responder.send(());
+                        pairs.clear();
+                        let _ = responder.send(pairs);
                     }
                     ShardMessage::SetSlotState { slot, state } => {
                         cross_shard_slot_states.borrow_mut()[slot as usize] = state;

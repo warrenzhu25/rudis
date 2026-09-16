@@ -6429,6 +6429,36 @@ fn test_pipeline1_fast_path_and_multi_key_routing_e2e() {
     assert_eq!(resp, ":2\r\n");
 }
 
+#[test]
+fn test_mget_mset_in_place_recycling_scattered_e2e() {
+    let port = 16471;
+    start_test_server(port, 4);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    for round in 0..10 {
+        // Multi-shard scattered MSET
+        let mut mset_cmd = String::from("MSET");
+        for i in 0..20 {
+            mset_cmd.push_str(&format!(" recyc_k_{} recyc_val_{}_{}", i, round, i));
+        }
+        mset_cmd.push_str("\r\n");
+        let set_resp = send_and_read(&mut client, mset_cmd.as_bytes());
+        assert_eq!(set_resp, "+OK\r\n");
+
+        // Multi-shard scattered MGET
+        let mut mget_cmd = String::from("MGET");
+        for i in 0..20 {
+            mget_cmd.push_str(&format!(" recyc_k_{}", i));
+        }
+        mget_cmd.push_str("\r\n");
+        let get_resp = send_and_read(&mut client, mget_cmd.as_bytes());
+        assert!(get_resp.starts_with("*20\r\n"));
+        for i in 0..20 {
+            assert!(get_resp.contains(&format!("recyc_val_{}_{}", round, i)));
+        }
+    }
+}
+
 
 
 

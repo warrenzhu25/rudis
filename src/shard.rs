@@ -119,12 +119,12 @@ pub enum ShardMessage {
         is_resp3: bool,
     },
     Mget {
-        keys: Vec<(usize, Bytes)>,
+        keys: Vec<(usize, Option<Bytes>)>,
         responder: flume::Sender<Vec<(usize, Option<Bytes>)>>,
     },
     Mset {
         pairs: Vec<(Bytes, Bytes)>,
-        responder: flume::Sender<()>,
+        responder: flume::Sender<Vec<(Bytes, Bytes)>>,
     },
     NotifyList {
         keys: Vec<Bytes>,

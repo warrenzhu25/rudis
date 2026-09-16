@@ -48,7 +48,11 @@ pub type MgetChannel = (
     flume::Sender<Vec<(usize, Option<Bytes>)>>,
     flume::Receiver<Vec<(usize, Option<Bytes>)>>,
 );
-pub type MsetChannel = (flume::Sender<()>, flume::Receiver<()>);
+pub type SetChannel = (flume::Sender<()>, flume::Receiver<()>);
+pub type MsetChannel = (
+    flume::Sender<Vec<(Bytes, Bytes)>>,
+    flume::Receiver<Vec<(Bytes, Bytes)>>,
+);
 
 /// The router handles dispatching operations.
 /// If the key belongs to the current shard, it directly touches `local_db` without locking.
@@ -72,10 +76,10 @@ pub struct Router {
     pub is_auto_tiering: Rc<Cell<bool>>,
     pub mget_channel_pool: Rc<RefCell<Vec<Vec<MgetChannel>>>>,
     pub mset_channel_pool: Rc<RefCell<Vec<Vec<MsetChannel>>>>,
-    pub set_channel_pool: Rc<RefCell<Vec<MsetChannel>>>,
+    pub set_channel_pool: Rc<RefCell<Vec<SetChannel>>>,
     pub get_channel_pool: Rc<RefCell<Vec<(flume::Sender<Option<Bytes>>, flume::Receiver<Option<Bytes>>)>>>,
     pub remote_responder_pool: Rc<RefCell<Vec<crate::connection::ResponderChannel>>>,
-    pub mget_batch_pool: Rc<RefCell<Vec<Vec<Vec<(usize, Bytes)>>>>>,
+    pub mget_batch_pool: Rc<RefCell<Vec<Vec<Vec<(usize, Option<Bytes>)>>>>>,
     pub mset_batch_pool: Rc<RefCell<Vec<Vec<Vec<(Bytes, Bytes)>>>>>,
 }
 
@@ -853,7 +857,7 @@ impl Router {
                     local_keys.push((idx, key));
                 } else {
                     has_remote = true;
-                    remote_batches[target].push((idx, key));
+                    remote_batches[target].push((idx, Some(key)));
                 }
             }
         }
@@ -885,18 +889,20 @@ impl Router {
                 }
             }
         }
-        self.mget_batch_pool.borrow_mut().push(remote_batches);
 
         for (target_shard, (_, rx)) in channel_set.iter().enumerate() {
             if target_shard < 64
                 && (sent_mask & (1 << target_shard)) != 0
-                && let Ok(shard_results) = rx.recv_async().await
+                && let Ok(mut shard_results) = rx.recv_async().await
             {
-                for (idx, val) in shard_results {
-                    results[idx] = val;
+                for (idx, val) in &mut shard_results {
+                    results[*idx] = val.take();
                 }
+                shard_results.clear();
+                remote_batches[target_shard] = shard_results;
             }
         }
+        self.mget_batch_pool.borrow_mut().push(remote_batches);
 
         self.release_mget_channels(channel_set);
 
@@ -982,13 +988,17 @@ impl Router {
                 }
             }
         }
-        self.mset_batch_pool.borrow_mut().push(remote_batches);
 
         for (target_shard, (_, rx)) in channel_set.iter().enumerate() {
-            if target_shard < 64 && (sent_mask & (1 << target_shard)) != 0 {
-                let _ = rx.recv_async().await;
+            if target_shard < 64
+                && (sent_mask & (1 << target_shard)) != 0
+                && let Ok(mut recycled_pairs) = rx.recv_async().await
+            {
+                recycled_pairs.clear();
+                remote_batches[target_shard] = recycled_pairs;
             }
         }
+        self.mset_batch_pool.borrow_mut().push(remote_batches);
 
         self.release_mset_channels(channel_set);
     }
@@ -1998,18 +2008,17 @@ mod tests {
             while let Ok(msg) = rx1.recv() {
                 match msg {
                     ShardMessage::Mset { pairs, responder } => {
-                        for (k, v) in pairs {
-                            db.set(k, v, None);
+                        for (k, v) in &pairs {
+                            db.set(k.clone(), v.clone(), None);
                         }
-                        let _ = responder.send(());
+                        let _ = responder.send(pairs);
                     }
-                    ShardMessage::Mget { keys, responder } => {
-                        let mut results = Vec::new();
-                        for (idx, k) in keys {
-                            let val = db.get(&k);
-                            results.push((idx, val));
+                    ShardMessage::Mget { mut keys, responder } => {
+                        for item in &mut keys {
+                            let val = db.get(item.1.as_ref().unwrap());
+                            item.1 = val;
                         }
-                        let _ = responder.send(results);
+                        let _ = responder.send(keys);
                     }
                     _ => break,
                 }
@@ -2168,18 +2177,17 @@ mod tests {
             while let Ok(msg) = rx1_clone.recv() {
                 match msg {
                     ShardMessage::Mset { pairs, responder } => {
-                        for (k, v) in pairs {
-                            remote_db.set(k, v, None);
+                        for (k, v) in &pairs {
+                            remote_db.set(k.clone(), v.clone(), None);
                         }
-                        let _ = responder.send(());
+                        let _ = responder.send(pairs);
                     }
-                    ShardMessage::Mget { keys, responder } => {
-                        let mut res = Vec::new();
-                        for (idx, k) in keys {
-                            let val = remote_db.get(&k);
-                            res.push((idx, val));
+                    ShardMessage::Mget { mut keys, responder } => {
+                        for item in &mut keys {
+                            let val = remote_db.get(item.1.as_ref().unwrap());
+                            item.1 = val;
                         }
-                        let _ = responder.send(res);
+                        let _ = responder.send(keys);
                     }
                     _ => break,
                 }
@@ -2251,13 +2259,12 @@ mod tests {
             remote_db.set(k1_remote, Bytes::from("remote_harvest_val"), None);
             while let Ok(msg) = rx1_clone.recv() {
                 match msg {
-                    ShardMessage::Mget { keys, responder } => {
-                        let mut res = Vec::new();
-                        for (idx, k) in keys {
-                            let val = remote_db.get(&k);
-                            res.push((idx, val));
+                    ShardMessage::Mget { mut keys, responder } => {
+                        for item in &mut keys {
+                            let val = remote_db.get(item.1.as_ref().unwrap());
+                            item.1 = val;
                         }
-                        let _ = responder.send(res);
+                        let _ = responder.send(keys);
                     }
                     _ => break,
                 }
@@ -2395,19 +2402,18 @@ mod tests {
             let mut remote_db = ShardDb::new(9996);
             while let Ok(msg) = rx1_clone.recv() {
                 match msg {
-                    ShardMessage::Mget { keys, responder } => {
-                        let mut res = Vec::new();
-                        for (idx, k) in keys {
-                            let val = remote_db.get(&k);
-                            res.push((idx, val));
+                    ShardMessage::Mget { mut keys, responder } => {
+                        for item in &mut keys {
+                            let val = remote_db.get(item.1.as_ref().unwrap());
+                            item.1 = val;
                         }
-                        let _ = responder.send(res);
+                        let _ = responder.send(keys);
                     }
                     ShardMessage::Mset { pairs, responder } => {
-                        for (k, v) in pairs {
-                            remote_db.set(k, v, None);
+                        for (k, v) in &pairs {
+                            remote_db.set(k.clone(), v.clone(), None);
                         }
-                        let _ = responder.send(());
+                        let _ = responder.send(pairs);
                     }
                     _ => break,
                 }
@@ -2438,6 +2444,83 @@ mod tests {
             let res2 = router.mget(vec![k0.clone(), k1.clone()]).await;
             assert_eq!(res2, vec![Some(Bytes::from("v0_new")), Some(Bytes::from("v1_new"))]);
             assert_eq!(router.mget_batch_pool.borrow().len(), 1);
+            assert!(router.mset_batch_pool.borrow()[0][1].capacity() > 0);
+            assert!(router.mget_batch_pool.borrow()[0][1].capacity() > 0);
+        });
+    }
+
+    #[test]
+    fn test_router_mget_mset_in_place_recycling_zero_alloc() {
+        let (tx0, _rx0) = flume::unbounded();
+        let (tx1, rx1) = flume::unbounded();
+
+        let db0 = Rc::new(RefCell::new(ShardDb::new(9994)));
+        let senders = vec![tx0, tx1];
+        let router = Router::new(
+            0,
+            2,
+            9994,
+            db0.clone(),
+            senders,
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+
+        let mut k_shard0 = None;
+        let mut k_shard1 = None;
+        for i in 0..1000 {
+            let k = Bytes::from(format!("zero_alloc_k_{}", i));
+            if target_shard(&k, 2) == 0 && k_shard0.is_none() {
+                k_shard0 = Some(k);
+            } else if target_shard(&k, 2) == 1 && k_shard1.is_none() {
+                k_shard1 = Some(k);
+            }
+            if k_shard0.is_some() && k_shard1.is_some() {
+                break;
+            }
+        }
+        let k0 = k_shard0.unwrap();
+        let k1 = k_shard1.unwrap();
+        let rx1_clone = rx1.clone();
+
+        std::thread::spawn(move || {
+            let mut remote_db = ShardDb::new(9994);
+            while let Ok(msg) = rx1_clone.recv() {
+                match msg {
+                    ShardMessage::Mget { mut keys, responder } => {
+                        for item in &mut keys {
+                            let val = remote_db.get(item.1.as_ref().unwrap());
+                            item.1 = val;
+                        }
+                        let _ = responder.send(keys);
+                    }
+                    ShardMessage::Mset { pairs, responder } => {
+                        for (k, v) in &pairs {
+                            remote_db.set(k.clone(), v.clone(), None);
+                        }
+                        let _ = responder.send(pairs);
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async move {
+            for round in 0..10 {
+                let v0 = Bytes::from(format!("val0_{}", round));
+                let v1 = Bytes::from(format!("val1_{}", round));
+                router.mset(vec![(k0.clone(), v0.clone()), (k1.clone(), v1.clone())]).await;
+                let res = router.mget(vec![k0.clone(), k1.clone()]).await;
+                assert_eq!(res, vec![Some(v0), Some(v1)]);
+                assert!(router.mset_batch_pool.borrow()[0][1].capacity() >= 1);
+                assert!(router.mget_batch_pool.borrow()[0][1].capacity() >= 1);
+            }
         });
     }
 
@@ -2480,19 +2563,18 @@ mod tests {
             let mut remote_db = ShardDb::new(9995);
             while let Ok(msg) = rx1_clone.recv() {
                 match msg {
-                    ShardMessage::Mget { keys, responder } => {
-                        let mut res = Vec::new();
-                        for (idx, k) in keys {
-                            let val = remote_db.get(&k);
-                            res.push((idx, val));
+                    ShardMessage::Mget { mut keys, responder } => {
+                        for item in &mut keys {
+                            let val = remote_db.get(item.1.as_ref().unwrap());
+                            item.1 = val;
                         }
-                        let _ = responder.send(res);
+                        let _ = responder.send(keys);
                     }
                     ShardMessage::Mset { pairs, responder } => {
-                        for (k, v) in pairs {
-                            remote_db.set(k, v, None);
+                        for (k, v) in &pairs {
+                            remote_db.set(k.clone(), v.clone(), None);
                         }
-                        let _ = responder.send(());
+                        let _ = responder.send(pairs);
                     }
                     _ => break,
                 }
