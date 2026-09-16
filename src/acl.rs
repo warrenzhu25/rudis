@@ -11,14 +11,33 @@ pub fn get_acl_for_port(port: u16) -> Arc<RwLock<AclManager>> {
         .clone()
 }
 
+pub fn hash_password(password: &str) -> String {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(b"rudis_acl_salt_v1:");
+    hasher.update(password.as_bytes());
+    let res = hasher.finalize();
+    let mut s = String::with_capacity(res.len() * 2 + 1);
+    s.push('#');
+    for b in res {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{:02x}", b);
+    }
+    s
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AclUser {
     pub name: String,
     pub enabled: bool,
     pub passwords: Vec<String>,
+    pub password_hashes: Vec<String>,
     pub nopass: bool,
     pub all_commands: bool,
+    pub allowed_commands: hashbrown::HashSet<String>,
+    pub disallowed_commands: hashbrown::HashSet<String>,
     pub all_keys: bool,
+    pub allowed_key_patterns: Vec<String>,
 }
 
 impl AclUser {
@@ -27,10 +46,47 @@ impl AclUser {
             name: "default".to_string(),
             enabled: true,
             passwords: Vec::new(),
+            password_hashes: Vec::new(),
             nopass: true,
             all_commands: true,
+            allowed_commands: hashbrown::HashSet::new(),
+            disallowed_commands: hashbrown::HashSet::new(),
             all_keys: true,
+            allowed_key_patterns: Vec::new(),
         }
+    }
+
+    pub fn can_execute_command(&self, cmd_name: &str) -> bool {
+        let name = cmd_name.to_lowercase();
+        if name == "ping" || name == "reset" || name == "quit" || name == "auth" || name == "hello"
+        {
+            return true;
+        }
+        if self.all_commands {
+            !self.disallowed_commands.contains(&name)
+        } else {
+            self.allowed_commands.contains(&name)
+        }
+    }
+
+    pub fn can_access_key(&self, key: &[u8]) -> bool {
+        if self.all_keys {
+            return true;
+        }
+        let key_str = String::from_utf8_lossy(key);
+        for pat in &self.allowed_key_patterns {
+            if pat == "*" {
+                return true;
+            }
+            if let Some(prefix) = pat.strip_suffix('*') {
+                if key_str.starts_with(prefix) {
+                    return true;
+                }
+            } else if key_str == *pat {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn flags(&self) -> Vec<String> {
@@ -65,14 +121,29 @@ impl AclUser {
             for p in &self.passwords {
                 parts.push(format!(">{}", p));
             }
+            for h in &self.password_hashes {
+                if !self.passwords.iter().any(|p| p == h) {
+                    parts.push(h.clone());
+                }
+            }
         }
         if self.all_commands {
             parts.push("+@all".to_string());
+            for d in &self.disallowed_commands {
+                parts.push(format!("-{}", d));
+            }
         } else {
             parts.push("-@all".to_string());
+            for a in &self.allowed_commands {
+                parts.push(format!("+{}", a));
+            }
         }
         if self.all_keys {
             parts.push("~*".to_string());
+        } else {
+            for pat in &self.allowed_key_patterns {
+                parts.push(format!("~{}", pat));
+            }
         }
         parts.push("&*".to_string());
         parts.join(" ")
@@ -106,7 +177,14 @@ impl AclManager {
             if !user.enabled {
                 return Err("WRONGPASS User is disabled");
             }
-            if user.nopass || user.passwords.iter().any(|p| p == password) {
+            let hashed = hash_password(password);
+            if user.nopass
+                || user.passwords.iter().any(|p| p == password)
+                || user
+                    .password_hashes
+                    .iter()
+                    .any(|h| h == &hashed || h == password)
+            {
                 Ok(user_name.to_string())
             } else {
                 Err("WRONGPASS invalid username-password pair or user is disabled.")
@@ -118,7 +196,7 @@ impl AclManager {
 
     pub fn is_auth_required_for_default(&self) -> bool {
         if let Some(user) = self.users.get("default") {
-            !user.nopass && !user.passwords.is_empty()
+            !user.nopass && (!user.passwords.is_empty() || !user.password_hashes.is_empty())
         } else {
             false
         }
@@ -151,9 +229,13 @@ impl AclManager {
                 name: username.to_string(),
                 enabled: false,
                 passwords: Vec::new(),
+                password_hashes: Vec::new(),
                 nopass: false,
                 all_commands: false,
+                allowed_commands: hashbrown::HashSet::new(),
+                disallowed_commands: hashbrown::HashSet::new(),
                 all_keys: false,
+                allowed_key_patterns: Vec::new(),
             });
 
         for rule in rules {
@@ -164,19 +246,62 @@ impl AclManager {
             } else if rule == "nopass" {
                 user.nopass = true;
                 user.passwords.clear();
+                user.password_hashes.clear();
+            } else if rule == "-nopass" {
+                user.nopass = false;
             } else if let Some(p) = rule.strip_prefix('>') {
                 user.nopass = false;
                 if !user.passwords.contains(&p.to_string()) {
                     user.passwords.push(p.to_string());
                 }
+                let h = hash_password(p);
+                if !user.password_hashes.contains(&h) {
+                    user.password_hashes.push(h);
+                }
+            } else if let Some(h) = rule.strip_prefix('#') {
+                user.nopass = false;
+                let full_hash = format!("#{}", h);
+                if !user.password_hashes.contains(&full_hash) {
+                    user.password_hashes.push(full_hash);
+                }
             } else if let Some(p) = rule.strip_prefix('<') {
                 user.passwords.retain(|pass| pass != p);
+                let h = hash_password(p);
+                user.password_hashes.retain(|pass| pass != &h && pass != p);
+            } else if let Some(h) = rule.strip_prefix('!') {
+                let full_hash = format!("#{}", h);
+                user.password_hashes.retain(|pass| pass != &full_hash && pass != h);
             } else if rule == "+@all" || rule == "+all" {
                 user.all_commands = true;
+                user.disallowed_commands.clear();
             } else if rule == "-@all" || rule == "-all" {
                 user.all_commands = false;
+                user.allowed_commands.clear();
+            } else if let Some(cmd) = rule.strip_prefix('+') {
+                let c = cmd.to_lowercase();
+                if user.all_commands {
+                    user.disallowed_commands.remove(&c);
+                } else {
+                    user.allowed_commands.insert(c);
+                }
+            } else if let Some(cmd) = rule.strip_prefix('-') {
+                let c = cmd.to_lowercase();
+                if user.all_commands {
+                    user.disallowed_commands.insert(c);
+                } else {
+                    user.allowed_commands.remove(&c);
+                }
             } else if rule == "~*" || rule == "allkeys" {
                 user.all_keys = true;
+                user.allowed_key_patterns.clear();
+            } else if rule == "resetkeys" {
+                user.all_keys = false;
+                user.allowed_key_patterns.clear();
+            } else if let Some(pat) = rule.strip_prefix('~') {
+                user.all_keys = false;
+                if !user.allowed_key_patterns.contains(&pat.to_string()) {
+                    user.allowed_key_patterns.push(pat.to_string());
+                }
             }
         }
         Ok(())
@@ -192,3 +317,82 @@ impl AclManager {
         count
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_acl_salted_password_hashing() {
+        let mut mgr = AclManager::new();
+        let pass = "super_secret_pw";
+        let expected_hash = hash_password(pass);
+        assert!(expected_hash.starts_with('#'));
+
+        // Set user with plaintext password: should auto-hash
+        mgr.set_user(
+            "alice",
+            &[
+                "on".to_string(),
+                format!(">{}", pass),
+                "+@all".to_string(),
+                "~*".to_string(),
+            ],
+        )
+        .unwrap();
+
+        let alice = mgr.get_user("alice").unwrap();
+        assert!(alice.password_hashes.contains(&expected_hash));
+
+        // Authenticate with plaintext password
+        assert_eq!(
+            mgr.check_auth(Some("alice"), pass),
+            Ok("alice".to_string())
+        );
+        assert!(mgr.check_auth(Some("alice"), "wrong_pw").is_err());
+
+        // Set user directly with precomputed hash
+        mgr.set_user(
+            "bob",
+            &[
+                "on".to_string(),
+                expected_hash.clone(),
+                "+@all".to_string(),
+                "~*".to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(mgr.check_auth(Some("bob"), pass), Ok("bob".to_string()));
+        assert!(mgr.check_auth(Some("bob"), "wrong_pw").is_err());
+    }
+
+    #[test]
+    fn test_acl_command_and_key_enforcement() {
+        let mut mgr = AclManager::new();
+        // User with restricted commands (-@all +get) and restricted keys (~user:*)
+        mgr.set_user(
+            "restricted",
+            &[
+                "on".to_string(),
+                "nopass".to_string(),
+                "-@all".to_string(),
+                "+get".to_string(),
+                "~user:*".to_string(),
+            ],
+        )
+        .unwrap();
+
+        let user = mgr.get_user("restricted").unwrap();
+        assert!(user.can_execute_command("get"));
+        assert!(user.can_execute_command("ping")); // Builtin allowed
+        assert!(!user.can_execute_command("set"));
+        assert!(!user.can_execute_command("del"));
+
+        assert!(user.can_access_key(b"user:12345"));
+        assert!(user.can_access_key(b"user:profile"));
+        assert!(!user.can_access_key(b"cache:12345"));
+        assert!(!user.can_access_key(b"admin:root"));
+    }
+}
+

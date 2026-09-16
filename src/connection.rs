@@ -2709,6 +2709,31 @@ async fn execute_command(
         return false;
     }
 
+    if *authenticated {
+        let acl = crate::acl::get_acl_for_port(router.port);
+        let acl_guard = acl.read().unwrap();
+        if let Some(user) = acl_guard.get_user(auth_user) {
+            if !user.can_execute_command(cmd_name) {
+                out.extend_from_slice(
+                    format!(
+                        "-NOPERM this user has no permissions to run the '{}' command\r\n",
+                        cmd_name.to_lowercase()
+                    )
+                    .as_bytes(),
+                );
+                return false;
+            }
+            if let Some(key) = cmd_primary_key(&cmd)
+                && !user.can_access_key(key.as_ref())
+            {
+                out.extend_from_slice(
+                    b"-NOPERM this user has no permissions to access one of the keys used as arguments\r\n",
+                );
+                return false;
+            }
+        }
+    }
+
     if let Command::Asking = cmd {
         *asking = true;
         out.extend_from_slice(b"+OK\r\n");
@@ -11443,6 +11468,23 @@ async fn execute_commands_squashed(
             ) {
                 can_squash = false;
                 break;
+            }
+            {
+                let acl = crate::acl::get_acl_for_port(router.port);
+                let acl_guard = acl.read().unwrap();
+                if let Some(user) = acl_guard.get_user(auth_user) {
+                    let cmd_name = get_cmd_name(cmd);
+                    if !user.can_execute_command(cmd_name) {
+                        can_squash = false;
+                        break;
+                    }
+                    if let Some(k) = cmd_primary_key(cmd)
+                        && !user.can_access_key(k.as_ref())
+                    {
+                        can_squash = false;
+                        break;
+                    }
+                }
             }
             if let Some(k) = cmd_primary_key(cmd) {
                 let slot = key_slot(k);

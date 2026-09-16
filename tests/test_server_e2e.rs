@@ -5550,5 +5550,68 @@ fn test_cluster_pipelined_squashed_moved_redirect_e2e() {
     );
 }
 
+#[test]
+fn test_acl_permissions_and_hashed_passwords_e2e() {
+    let port = 16670;
+    start_test_server(port, 2);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("Failed to connect admin client");
+
+    // 1. Create user 'carol' with restricted commands (-@all +get +ping) and restricted keys (~user:*)
+    let pass = "carol_secure_pass";
+    let hash = rudis::acl::hash_password(pass);
+    let setuser_cmd = format!("ACL SETUSER carol on {} -@all +get +acl ~user:*\r\n", hash);
+    assert_eq!(
+        send_and_read(&mut client, setuser_cmd.as_bytes()),
+        "+OK\r\n"
+    );
+
+    // Set a key as admin (default user)
+    assert_eq!(
+        send_and_read(&mut client, b"SET user:profile alice_data\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"SET secret:token secret_val\r\n"),
+        "+OK\r\n"
+    );
+
+    // 2. Connect as Carol and authenticate using plaintext password matching stored hash
+    let mut carol_client = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("Failed to connect carol client");
+    assert_eq!(
+        send_and_read(
+            &mut carol_client,
+            format!("AUTH carol {}\r\n", pass).as_bytes()
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut carol_client, b"ACL WHOAMI\r\n"),
+        "$5\r\ncarol\r\n"
+    );
+
+    // 3. Test allowed command on allowed key
+    let resp = send_and_read(&mut carol_client, b"GET user:profile\r\n");
+    assert_eq!(resp, "$10\r\nalice_data\r\n");
+
+    // 4. Test forbidden command on allowed key -> NOPERM command
+    let resp = send_and_read(&mut carol_client, b"SET user:profile new_data\r\n");
+    assert!(resp.starts_with("-NOPERM") && resp.contains("permissions to run the 'set' command"));
+
+    // 5. Test allowed command on forbidden key -> NOPERM key
+    let resp = send_and_read(&mut carol_client, b"GET secret:token\r\n");
+    assert!(resp.starts_with("-NOPERM") && resp.contains("permissions to access one of the keys"));
+
+    // 6. Test pipelined squashed commands enforcing ACL per command
+    let pipeline = b"GET user:profile\r\nSET user:profile hack\r\nGET secret:token\r\n";
+    let resp = send_and_read(&mut carol_client, pipeline);
+    assert!(resp.contains("$10\r\nalice_data\r\n"));
+    assert!(resp.contains("-NOPERM this user has no permissions to run the 'set' command"));
+    assert!(resp.contains("-NOPERM this user has no permissions to access one of the keys"));
+}
+
+
 
 
