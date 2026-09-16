@@ -49,14 +49,23 @@ Every commit to `main` must strictly adhere to the following four rules:
   * **16 Threads**: $\ge 2,630,000$ Ops/sec, $\le 1.2$ ms average latency, $\le 2.9$ ms p99 tail latency.
 * Before committing structural or networking changes, verify with the benchmark protocol (see Section 3).
 
-### Rule 3: Small, Granular, Atomic Commits
-* Each logical change must be a distinct, self-contained commit.
-* Use clear conventional commit prefixes:
-  * `feat:` new user-facing functionality or commands
-  * `perf:` performance optimizations
-  * `fix:` bug fixes
-  * `test:` test additions or improvements
-  * `docs:` benchmark records and documentation
+### Rule 3: Strict Atomicity — One Logical Change Per Commit
+* **Never bundle multiple distinct features or bug fixes into a single commit**:
+  * If a task resolves 4 bugs (e.g. `FCALL` AOF, KNN vector search, CRDT sharding, slot migration check), it **must** be committed as **4 distinct, sequential commits**, not 1 omnibus commit.
+  * Each commit must represent a single, cohesive, self-contained unit of work.
+* **Bisectability & Verification**:
+  * Every single commit in the git history must independently compile, pass `cargo clippy --all-targets -- -D warnings`, and pass all tests (`cargo test`).
+  * Never commit an intermediate broken state with the intention of fixing it in a subsequent commit.
+* **Atomic Scope & Commit Messages**:
+  * Use clear conventional commit headers with precise subsystem scopes:
+    * `fix(scripting): thread router AOF writer to call_function in FCALL`
+    * `fix(search): wire PARAMS vector blob into FT.SEARCH KnnVector and add_document`
+    * `fix(crdt): route keyed CRDT commands through target_shard and execute_local_command`
+    * `fix(cluster): enforce slot ownership check in execute_commands_squashed pipeline`
+    * `feat(scope):` new user-facing functionality or commands
+    * `perf(scope):` performance and memory optimizations
+    * `test(scope):` test additions or improvements
+    * `docs(scope):` documentation and benchmark records
 
 ### Rule 4: Every Commit Must Be Pushed Immediately
 * **Every commit created must be pushed immediately to `origin main`**:
