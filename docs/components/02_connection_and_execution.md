@@ -28,8 +28,10 @@ gateway). It is genuinely the busiest file in the codebase, not a thin dispatche
    commands touch more than one shard acquires a distributed "VLL" (very-lightweight-locking)
    lock across every touched shard before running the batch, and releases it after — see §4.2.
 4. **Squashing Is Gated on More Than Just Routability**: The pipeline-squashing fast path
-   (`execute_commands_squashed`) additionally requires the client to already be authenticated
-   and every key's cluster slot to be `Stable` (not mid-migration) — see §4.4.
+   (`execute_commands_squashed`) additionally requires the client to already be authenticated,
+   have real ACL permission for each command and its key, and (for keyed commands) that this
+   node's cluster-gossip table actually confirms ownership of the key's slot — not merely that
+   the slot's local `SlotState` is `Stable` — see §4.4.
 5. **Non-Blocking Cross-Shard Dispatch**: Remote-shard work is always sent as a
    `ShardMessage::Batch` over pre-allocated `flume` channels and awaited without blocking the
    reactor thread — other connections on the same core keep making progress.
@@ -237,25 +239,31 @@ sequentially (never squashed), each preceded by a flush of anything already queu
 task for seconds while waiting on `BlockHub`, and a client shouldn't see its earlier pipelined
 replies delayed by that wait.
 
-### 4.4 `execute_commands_squashed`: the squash gate has grown a lot
+### 4.4 `execute_commands_squashed`: the squash gate now enforces ACL and real cluster ownership, and `MGET`/`MSET` are squashable again
 
 The core squash-or-fallback mechanism is unchanged in shape (bucket local commands inline,
 bucket remote commands per target shard, dispatch one `ShardMessage::Batch` per shard,
-await all in parallel, reassemble in original order) but the eligibility check now also
-covers authentication and live cluster slot migration:
+await all in parallel, reassemble in original order), but the eligibility check has grown
+two real security/correctness gates beyond the original authentication-and-migration check:
 
 ```rust
 let mut can_squash = *authenticated;
 if can_squash {
     for cmd in &commands {
-        if matches!(cmd, Command::Blpop { .. } | ... | Command::Hello { .. } | Command::Reset
-            | Command::Auth { .. } | Command::Acl(_) | Command::Tier(_) | Command::ConfigGet(_)
-            | Command::ConfigSet(_, _) | Command::DflyCluster(_) | Command::DflyMigrate(_)
-            | Command::Stick(_) | Command::Unstick(_) | Command::MemcachedStats
-            | Command::MemcachedVersion | Command::MemcachedQuit | Command::Watch(_)
-            | Command::Unwatch) {
+        if matches!(cmd, Command::Blpop { .. } | ... | Command::Watch(_) | Command::Unwatch) {
             can_squash = false;
             break;
+        }
+        {
+            let acl = crate::acl::get_acl_for_port(router.port);
+            let acl_guard = acl.read().unwrap();
+            if let Some(user) = acl_guard.get_user(auth_user) {
+                let cmd_name = get_cmd_name(cmd);
+                if !user.can_execute_command(cmd_name) { can_squash = false; break; }
+                if let Some(k) = cmd_primary_key(cmd)
+                    && !user.can_access_key(k.as_ref())
+                { can_squash = false; break; }
+            }
         }
         if let Some(k) = cmd_primary_key(cmd) {
             let slot = key_slot(k);
@@ -263,8 +271,16 @@ if can_squash {
                 can_squash = false;   // don't squash while this key's slot is migrating
                 break;
             }
+            let hub = crate::cluster::get_cluster_hub(router.port);
+            let my_slots = hub.my_slots.read().unwrap();
+            let owns_slot = my_slots.iter().any(|&(s, e)| slot >= s && slot <= e);
+            let nodes = hub.nodes.read().unwrap();
+            if !owns_slot && !nodes.is_empty() {
+                can_squash = false;   // Stable locally, but cluster gossip says a peer node owns it
+                break;
+            }
         } else if !matches!(cmd, Command::Ping(_) | Command::CommandDocs | Command::Quit
-            | Command::Time | Command::Echo(_)) {
+            | Command::Time | Command::Echo(_) | Command::Mget(_) | Command::Mset(_)) {
             can_squash = false;
             break;
         }
@@ -272,11 +288,32 @@ if can_squash {
 }
 ```
 
-The all-or-nothing squash-defeat behavior documented for the original, smaller version of
-this file (one non-squashable command in a pipeline forces the whole pipeline to the
-sequential fallback) still holds — it just now has a longer exclusion list. `MGET`/`MSET`
-still fall through to `_ => None` in `target_shard_of_cmd` (see §4.5) and so are **never**
-eligible for squashing, unchanged from before.
+The `SlotState::Stable`-vs-not check alone was already present before this round of changes
+and already correctly deferred squashing during `Migrating`/`Importing`/`Moved` (an earlier
+version of this doc's Future Improvements section incorrectly flagged this as unfixed — it
+wasn't; see §7). What's genuinely new is the **ACL check** (a squashed batch containing a
+command the authenticated user can't run, or whose key they can't access, now correctly
+falls back to sequential execution so `execute_command`'s real `-NOPERM` rejection applies
+per-command — see §4.5) and the **cluster-gossip ownership check**: a slot can be locally
+`Stable` (no migration in progress) while a multi-node cluster's gossip table says a *different
+node* now owns it (e.g. after `CLUSTER SETSLOT ... NODE` on another node propagated via gossip)
+— that case now also defeats squashing so the sequential fallback's real `-MOVED` check
+(§4.5) fires, confirmed by `test_cluster_pipelined_squashed_moved_redirect_e2e` in
+`tests/test_server_e2e.rs`.
+
+**One narrow gap in this gate, verified**: for multi-key commands, `cmd_primary_key` returns
+only the *first* key (`keys.first()`/`pairs.first()`) — so a squash-eligibility check for an
+`MGET`/`MSET`/`SINTER`/etc. spanning several keys validates ACL/slot-state/ownership against
+only that first key, not every key in the command. A command whose first key is permitted and
+stable but whose second key is ACL-forbidden or mid-migration could still be judged
+squash-eligible on this check alone (see §4.6 for how that plays out for `MGET`/`MSET`
+specifically once inside the squash path).
+
+`MGET`/`MSET` are now explicitly allowed through the eligibility gate (added to the
+`Ping`/`CommandDocs`/... safe list above, since `target_shard_of_cmd` still returns `None`
+for them — they have no single target shard). The all-or-nothing squash-defeat behavior for
+everything *not* on this expanding safe/eligible list is otherwise unchanged: one ineligible
+command in a pipeline still forces the whole pipeline to the sequential fallback.
 
 Inside the squash path, `GET` gets a special inline case for transparent NVMe-tiered reads
 (the auto-tiering system can move cold values to disk):
@@ -314,6 +351,24 @@ if !*authenticated && !matches!(cmd, Command::Auth { .. } | Command::Hello { .. 
     out.extend_from_slice(b"-NOAUTH Authentication required.\r\n");
     return false;
 }
+
+if *authenticated {
+    let acl = crate::acl::get_acl_for_port(router.port);
+    let acl_guard = acl.read().unwrap();
+    if let Some(user) = acl_guard.get_user(auth_user) {
+        if !user.can_execute_command(cmd_name) {
+            out.extend_from_slice(format!(
+                "-NOPERM this user has no permissions to run the '{}' command\r\n",
+                cmd_name.to_lowercase()).as_bytes());
+            return false;
+        }
+        if let Some(key) = cmd_primary_key(&cmd) && !user.can_access_key(key.as_ref()) {
+            out.extend_from_slice(b"-NOPERM this user has no permissions to access one of the keys used as arguments\r\n");
+            return false;
+        }
+    }
+}
+
 if let Command::Asking = cmd { *asking = true; out.extend_from_slice(b"+OK\r\n"); return false; }
 let is_asking = *asking;
 *asking = false;
@@ -336,9 +391,11 @@ if crate::replication::get_replication_hub(router.port).is_slave()
 }
 ```
 
-This is a genuine, working implementation of the Redis Cluster live-migration protocol
-(`MOVED`/`ASK`/`ASKING`, four-state `SlotState`) and of replica-side write rejection — not
-placeholders. `execute_command`'s command-specific match arm that follows is roughly 3,900
+This is a genuine, working implementation of Redis ACL authorization (`-NOPERM` for both
+disallowed commands and disallowed keys, backed by real per-user command/key rules — see
+Component 15 for `AclUser`'s own real permission model), the Redis Cluster live-migration
+protocol (`MOVED`/`ASK`/`ASKING`, four-state `SlotState`), and replica-side write rejection —
+not placeholders. `execute_command`'s command-specific match arm that follows is roughly 3,900
 lines covering the full command surface; `execute_local_command` (the shard-local,
 synchronous counterpart called both for genuinely-local keys and for remote batches arriving
 via `ShardMessage::Batch`) is a similarly-sized ~3,750-line match. Both are too large to
@@ -348,45 +405,68 @@ are two independent match statements over the same `Command` enum kept in sync b
 shared function — that rationale still holds structurally, though the functions themselves
 have grown far beyond what that doc shows).
 
-### 4.6 `cmd_primary_key` / `cmd_keys` / `target_shard_of_cmd`: routing key extraction has grown, but the `MGET`/`MSET` gap has not been fixed
+### 4.6 `MGET`/`MSET` now genuinely fan out in parallel — real bucketing, a pooled channel set, and a spin-then-block harvest
 
-`cmd_primary_key` (one key per command, used for cluster-slot redirection checks and
-`WATCH`/transaction shard-set computation) and `target_shard_of_cmd` (used to decide
-squash-eligibility and bucket assignment) are both large `match` statements enumerating
-every command variant that carries a key. `target_shard_of_cmd` has grown one real
-capability beyond simple single-key routing: several multi-key commands are squashable
-*when all of their keys happen to hash to the same shard* (typically via a `{tag}` hash tag):
-
-```rust
-Command::Sinter(keys) | Command::Sunion(keys) | Command::Sdiff(keys)
-| Command::Zdiff { keys, .. } | Command::Zinter { keys, .. } | Command::Zunion { keys, .. }
-    if !keys.is_empty() && keys.iter().all(|k| target_shard(k, num_shards) == target_shard(&keys[0], num_shards)) =>
-{
-    Some(target_shard(&keys[0], num_shards))
-}
-```
-
-`MGET`/`MSET` are conspicuously **not** in that co-location list, and confirmed still absent
-from any bucketed fan-out — `execute_command`'s actual `Mget` arm is unchanged in spirit from
-the original design:
+**This closes the gap this doc previously flagged.** `execute_command`'s `Mget`/`Mset` arms
+now delegate to real `Router::mget`/`Router::mset` methods in `src/router.rs` (Component 04)
+instead of looping `router.get`/`router.set` per key:
 
 ```rust
 Command::Mget(keys) => {
     for key in &keys { record_client_read(router.port, client_id, key.as_ref()); }
-    out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
-    for key in keys {
-        match router.get(key).await { /* one full cross-shard round-trip per key, sequential */ }
-    }
+    let values = router.mget(keys).await;
+    write_resp_array_header(out, values.len());
+    for val in values { /* write bulk or null per value, in original key order */ }
     false
 }
 ```
 
-So the gap flagged in the earlier design doc (`docs/designs/components.md` Part 4 §6) is
-still real today, confirmed against the current source: a multi-key `MGET`/`MSET` spread
-across several remote shards still pays for one serialized round-trip per key rather than a
-parallel per-shard batch, even though the co-location mechanism above proves the codebase
-now has the building blocks (`target_shard` equality checks) to fix it the same way
-`Sinter`/`Sunion`/etc. already were.
+`Router::mget`/`mset` (verified in `src/router.rs`, summarized here since the mechanism is
+architecturally significant to how this file's commands behave — full detail belongs to
+Component 04):
+1. **Fast path**: if `num_shards <= 1`, every key is local — no channel involved at all.
+2. **Partition by slot using `slot_owners`** (the *dynamic*, migration-aware per-slot
+   ownership override — not the static `target_shard` function most other commands use),
+   without holding the `RefCell` borrow across an `.await` point.
+3. **Local keys execute immediately**, no I/O. If every key turned out to be local, return
+   immediately — zero channel operations for an all-local `MGET`/`MSET`.
+4. **Remote keys are bucketed one `Vec` per shard** and dispatched as single
+   `ShardMessage::Mget`/`Mset` messages (new variants added to `src/shard.rs`'s
+   `ShardMessage` enum in this change) over a **pooled, reusable channel set**
+   (`acquire_mget_channels`/`release_mget_channels`, backed by `Rc<RefCell<Vec<Vec<MgetChannel>>>>`)
+   — not a fresh one-shot channel per call, closing the "Router's per-op methods allocate a
+   fresh channel" gap this doc's Future Improvements once raised for the single-command path
+   specifically for these two commands.
+5. **Harvesting is spin-then-block, not an immediate `.await`**: after sending, up to 128
+   iterations of a tight loop non-blockingly `try_recv()`s every still-pending shard's
+   channel (with `std::hint::spin_loop()` between sweeps), only falling back to a real
+   `rx.recv_async().await` per still-outstanding shard if 128 spins weren't enough. On a
+   busy multi-core machine, a cross-shard hop often completes within microseconds — faster
+   than a scheduler round-trip would take — so this trades a bounded amount of CPU spinning
+   for avoiding that round-trip in the common case.
+
+**Two real, verified gaps in this new mechanism, not present in the old sequential code
+(which had no such edge cases because it never batched):**
+- **A `> 64` shard correctness bug.** `sent_mask`/`remaining_mask` are `u64` bitmasks, and
+  both the send loop and both harvest loops (spin and fallback) gate every bit operation on
+  `target_shard < 64`. The *send* to a shard `>= 64` still happens
+  (`self.senders[target_shard].send(msg)` is unconditional), but that shard's bit is never
+  set in `sent_mask`, so **its response is never collected in either harvest loop** — the
+  channel holding that reply is returned to the pool with an unread message still in it, and
+  every key that was routed to shard 64+ silently comes back as `None`/not-set in the
+  `MGET`/`MSET` reply, even though the key exists. `acquire_mget_channels` itself allocates
+  `self.num_shards` channels (not capped at 64), so this isn't an intentional scale limit —
+  it's a latent bug that only manifests on a deployment with more than 64 shards (`--threads`
+  above 64), which the default `num_cores.min(8)` and typical benchmark configurations never
+  exercise.
+- **Only the first key of a multi-key `MGET`/`MSET` is checked for squash-eligibility**
+  (§4.4's noted gap) — since `router.mget`/`mset` themselves are called either via the
+  sequential fallback (`execute_command`, which does its own ACL/slot check but — per the
+  code shown above — only against `cmd_primary_key`, i.e. the *first* key, before calling
+  `router.mget`) or via the squash path's special case (§4.4), no per-key ACL/slot-state
+  check happens inside `Router::mget`/`mset` itself for keys beyond the first. A client with
+  access to an `MGET`'s first key but not its second key would not be rejected by anything
+  observed in this file.
 
 ### 4.7 `format_score`: exact `%.17g` compatibility, verified accurate
 
@@ -422,8 +502,10 @@ and RESP3's native `,<double>\r\n` double type depending on `CURRENT_CLIENT_RESP
 
 - **`src/resp.rs`**: Supplies `parse_command`, decoding buffered bytes into `Command` values.
 - **`src/router.rs`**: `Router` provides `target_shard`/`key_slot`-based local/remote
-  decisions, the `senders` mesh, `slot_states` (cluster migration state), and
-  `stream_cold_read_local`/`check_auto_tier` (tiered-storage integration).
+  decisions, the `senders` mesh, `slot_states` (cluster migration state), `slot_owners`
+  (the dynamic ownership override `mget`/`mset` route by — see §4.6), the pooled
+  `mget`/`mset` channel sets, and `stream_cold_read_local`/`check_auto_tier`
+  (tiered-storage integration).
 - **`src/table.rs`** / **`src/shard.rs`**: `execute_local_command` mutates `ShardDb`/`RudisTable`
   directly; `CompactResp` (defined in `shard.rs`) is the reply payload type carried through
   `ShardMessage::Batch`.
@@ -434,8 +516,11 @@ and RESP3's native `,<double>\r\n` double type depending on `CURRENT_CLIENT_RESP
   `is_slave()` write-rejection check.
 - **`src/cluster.rs`**: `get_cluster_hub` supplies the gossiped slot-ownership table consulted
   during `MOVED` redirection.
-- **`src/acl.rs`**: `authenticated`/`auth_user` are checked against `get_acl_for_port` at
-  connection start and on every `AUTH`.
+- **`src/acl.rs`** (Component 15): `authenticated`/`auth_user` are checked against
+  `get_acl_for_port` at connection start and on every `AUTH`; `execute_command` and the
+  squash-eligibility gate (§4.4/§4.5) both now also enforce real per-command/per-key
+  authorization (`-NOPERM`) via `AclUser::can_execute_command`/`can_access_key`, not just
+  the initial authentication check.
 - **`src/aof.rs`**: `execute_local_command` takes an `Option<&RefCell<AofWriter>>` to append
   write commands for persistence; `command_to_resp` is also reused to detect "is this command
   a write" for the replica read-only guard.
@@ -453,15 +538,28 @@ and RESP3's native `,<double>\r\n` double type depending on `CURRENT_CLIENT_RESP
   global `CMD_STATS` map (`record_cmd_stat`) under a `RwLock`, plus per-client `last_cmd`
   bookkeeping — real but modest fixed overhead paid on every command, not just squashed
   batches.
-- **The MGET/MSET fan-out gap (§4.6) is a real, currently-unaddressed cost** on workloads that
-  spread multi-key reads/writes across shards without hash tags.
+- **`MGET`/`MSET` now genuinely parallelize across shards** (§4.6) via pooled channels and a
+  spin-then-block harvest, closing what was previously the single biggest cost on multi-shard
+  multi-key workloads — bounded by the slowest remote shard's response time now, not by the
+  sum of every remote shard's response time.
+- **The spin-then-block harvest trades CPU for latency, with a fairness cost worth naming**:
+  up to 128 non-blocking `try_recv` sweeps (`std::hint::spin_loop()` between them) happen
+  *without yielding to `monoio`'s cooperative scheduler* — on this shared-nothing,
+  single-threaded-per-core design, that means other connections' tasks on the *same core*
+  make no progress while an `MGET`/`MSET` is in its spin phase. Fine when remote shards
+  reply within microseconds (the common case this was tuned for); a burst of concurrent
+  `MGET`/`MSET` calls each waiting on a genuinely slow remote shard could measurably delay
+  unrelated connections sharing that core until the 128-iteration cap is hit and each falls
+  back to a real `.await`.
 
 ---
 
 ## 7. Future Improvements
 
-- **High — fix `MGET`/`MSET` to bucket-and-fan-out instead of one round-trip per key (§4.6).** The building block already exists: `target_shard_of_cmd`'s co-location check for `Sinter`/`Sunion`/etc. (§4.6) proves the codebase already computes "do all these keys land on the same shard." Extending `Mget`/`Mset` to bucket by shard and dispatch one `ShardMessage::Batch` per shard (mirroring `execute_commands_squashed`, §4.4) would turn an `O(remote shards touched)` sequential wait into a single parallel round-trip, matching the throughput profile every other multi-key command in this file already gets.
-- **High — close the correctness gap where the squashed fast path skips slot-migration redirection (§4.4/§4.5).** `execute_command`'s single-command path checks `router.slot_states` before executing (§4.5), but `execute_commands_squashed`'s squash-eligibility check (§4.4) never inspects `slot_states` for anything beyond `Stable`-vs-not — meaning once a slot enters `Migrating`/`Importing`/`Moved`, individual commands correctly redirect but *only if they can't be squashed for other reasons*. Confirm (or add) an explicit `SlotState::Stable` check inside the squash-eligibility loop itself so a pipelined batch can never silently execute against data mid-migration.
+- ~~High — fix `MGET`/`MSET` to bucket-and-fan-out instead of one round-trip per key.~~ **Resolved.** `Router::mget`/`mset` (§4.6) now bucket by shard via `slot_owners`, dispatch via pooled channels, and harvest with a spin-then-block loop. Replaced by two new findings below, both verified in the shipped fan-out code itself.
+- **High — fix the `> 64`-shard `MGET`/`MSET` response-collection bug (§4.6).** `sent_mask`/`remaining_mask` are `u64` bitmasks that silently exclude any `target_shard >= 64` from both harvest loops, even though the request is still sent and `acquire_mget_channels` allocates a full `num_shards`-sized channel set. On a deployment with more than 64 shards, every key routed to shard 64+ comes back as a false negative (`None`/missing) in the `MGET`/`MSET` reply. Fix: use a `Vec<bool>`/bitset sized to `num_shards` (or chunk the bitmask across multiple `u64`s) instead of a single fixed-width `u64`.
+- **Medium — check every key of a multi-key `MGET`/`MSET`/`SINTER`-style command for ACL/slot-state eligibility, not just the first (§4.4/§4.6).** `cmd_primary_key` deliberately returns one key for routing purposes, but reusing it for squash-eligibility and for `execute_command`'s ACL/slot gate means only that first key is actually checked. A command spanning a permitted-and-stable first key plus a forbidden-or-migrating second key currently isn't rejected by anything in this file. Fix: for known multi-key commands, iterate all their keys in the eligibility/ACL/slot checks rather than delegating to `cmd_primary_key` alone.
+- ~~High — close the correctness gap where the squashed fast path skips slot-migration redirection.~~ **Turned out already handled** for the `Migrating`/`Importing`/`Moved` states — that `SlotState::Stable`-vs-not check predates this round of changes. What genuinely *was* missing and has now been added: the `Stable`-but-a-different-node-owns-it-per-gossip case (§4.4), confirmed fixed by `test_cluster_pipelined_squashed_moved_redirect_e2e`.
 - **Medium — de-risk `execute_command`/`execute_local_command`'s ~3,900/~3,750-line hand-synced duplication (§4.5).** Two independent `match` statements over the same `Command` enum, kept in sync by hand, is exactly the kind of surface where a new command variant gets full local semantics but is forgotten in the remote-batch arm (or vice versa). A macro that generates both arms from one command-behavior definition, or at minimum a `cargo test` that asserts both matches are exhaustive over the same variant set, would catch that class of bug before it reaches production.
 - **Medium — replace the two-fresh-`Lua::new()`-per-`FCALL` pattern's blast radius on this file's dispatch cost.** Not this file's bug directly (Component 13 owns it), but every `Fcall`/`Eval`/`Evalsha` arm here pays for it; consider whether `connection.rs`'s command-dispatch layer should expose a lightweight "is this a scripting command" fast-path hint so future caching work in `scripting.rs` doesn't require touching this file's dispatch tables.
 - **Low — give `CMD_STATS`/`record_cmd_stat` a per-shard-then-aggregate design instead of one global `RwLock`ed map (§6).** Currently modest overhead, but as command volume grows this is one more process-wide lock on the per-command hot path alongside `BlockHub`/ACL/search/scripting — consolidating or sharding it would keep the "how many process-wide locks exist" count from growing unnoticed.

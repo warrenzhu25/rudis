@@ -211,11 +211,23 @@ one closure matching the requested name into the Lua registry (`create_registry_
 calls it directly with `(keys_tbl, argv_tbl)`. So a library's top-level code executes twice
 total per `FCALL` call across its lifetime relative to any single load: once at `FUNCTION
 LOAD` (to discover names) and once per `FCALL` (to actually get a callable closure) — there is
-no cached, ready-to-call function object between calls. **`FCALL`'s `aof` argument is
-hardcoded to `None`** in `connection.rs` (`crate::scripting::call_function(&function, &keys,
-&args, &router.local_db, None)`), unlike `EVAL`/`EVALSHA` which thread through
-`router.aof.as_deref()` — writes performed via `FCALL` are not appended to the AOF. This looks
-like an oversight rather than a documented design choice.
+no cached, ready-to-call function object between calls. **Update: the AOF bug below is now
+fixed.** `FCALL`'s `aof` argument was previously hardcoded to `None` in `connection.rs`,
+meaning writes performed via `FCALL` were silently dropped from the AOF. As of the current
+source, `connection.rs`'s `Command::Fcall` arm passes `router.aof.as_deref()` — the same way
+`EVAL`/`EVALSHA` already did — so `FCALL` writes are now correctly persisted:
+
+```rust
+Command::Fcall { function, keys, args } => {
+    match crate::scripting::call_function(&function, &keys, &args, &router.local_db, router.aof.as_deref()) {
+        ...
+    }
+}
+```
+
+This is verified by a new unit test in `scripting.rs` itself (`test_fcall_with_aof_writer`),
+which calls `call_function` with a real `AofWriter` and asserts the resulting AOF buffer
+contains the expected `SET` command.
 
 ### 4.5 What the old doc got right
 
@@ -237,8 +249,8 @@ match the old doc's description, modulo the exact function names.
   `redis.pcall` closures to turn Lua-supplied arguments back into a real `Command`.
 - **`src/shard.rs`/`src/table.rs`** (Components 04/05): mutated whenever a script's
   `redis.call` executes a write command, exactly as an ordinary client-issued command would.
-- **`src/aof.rs`**: `EVAL`/`EVALSHA` writes are appended via the `aof` parameter threaded into
-  `eval_script`; `FCALL` writes currently are not (§4.4).
+- **`src/aof.rs`**: `EVAL`/`EVALSHA` and, as of the current source, `FCALL` writes are all
+  appended via the `aof` parameter threaded into `eval_script`/`call_function` (§4.4).
 
 ---
 
@@ -262,7 +274,7 @@ match the old doc's description, modulo the exact function names.
 
 ## 7. Future Improvements
 
-- **High — fix `FCALL`'s hardcoded `None` AOF argument (§4.4).** This looks like a genuine oversight rather than a design choice: `EVAL`/`EVALSHA` correctly thread `router.aof.as_deref()` through to `eval_script`, but `connection.rs`'s `Fcall` arm passes `None` to `call_function`. Any write performed via a Redis Function today silently isn't persisted or replicated — a small, high-value fix (thread the same `router.aof.as_deref()` through) that closes a real durability gap.
+- **RESOLVED — `FCALL`'s hardcoded `None` AOF argument (§4.4).** Fixed: `connection.rs`'s `Fcall` arm now passes `router.aof.as_deref()`, the same as `EVAL`/`EVALSHA`, and a new unit test (`test_fcall_with_aof_writer`) verifies `FCALL` writes land in the AOF buffer. `FCALL` writes are also now covered by an E2E integration test per the commit history (`test(scripting): add unit and E2E integration tests for FCALL mutating AOF persistence`).
 - **Medium — cache compiled function objects instead of re-running a library's top-level code per `FCALL` (§4.4).** The current two-pass design (run once at `FUNCTION LOAD` just to discover names, run the *entire library* again from scratch on every `FCALL` to get a callable closure) means library init cost is paid on every single call, not just at load time. Since a fresh `Lua::new()` per call already means there's no persistent VM to hold a closure across calls, the more impactful fix is likely pairing this with the next item (a small VM pool) rather than trying to persist closures across genuinely separate VM instances.
 - **Medium — consider a small pool of reusable `Lua` VMs (or persistent per-shard VMs) instead of `Lua::new()` per call (§6).** Fresh-VM-per-call is simple and safe (no state leaks between scripts) but means every `EVAL`/`EVALSHA`/`FCALL` pays VM construction plus re-parsing the script source from scratch. A per-shard VM reused across calls (clearing globals between invocations, or using `mlua`'s sandboxing/scope features to isolate one call from the next) would remove both costs for script-heavy workloads, at the cost of more careful state-isolation reasoning than the current always-fresh approach needs.
 - **Medium — decide on and document a sandboxing posture (§2.2).** Today a script has full access to Lua's standard library (`io`, `os`, etc.) via `Lua::new()`'s defaults — fine if scripting is treated as an admin/trusted-operator-only feature, a real problem if any less-trusted caller can reach `EVAL`. Either explicitly strip dangerous globals (mirroring real Redis's Lua sandbox) or document clearly that `EVAL`/`FCALL` require the same trust level as shell access.

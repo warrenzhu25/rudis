@@ -18,15 +18,25 @@ operator/client-driven: read it out with `CRDT.DUMP`, transport those bytes your
 <payload>`. The "multi-region" framing in this file's doc comments describes the
 data types' *convergence properties*, not a built network protocol.
 
-**A second, more important scope note, verified directly in `connection.rs`**: every
-`Command::Crdt*` handler calls `router.local_db.borrow_mut().crdt_*(...)` directly —
-never `router.get`/`router.set` or any `target_shard_of_cmd`-based routing. This means a
-`CRDT.SET foo bar` issued over a connection pinned to shard 2 mutates *shard 2's own*
-`CrdtStore`, completely independent of whichever shard would own `foo` under the normal
-CRC16 key-slot scheme, and independent of any other shard's `CrdtStore` for the same key
-name. There is no cross-shard merge either — `CRDT.MERGE` only merges into the connection's
-local shard. In effect, `CrdtStore` is a per-shard-local CRDT toolkit, not a per-key,
-whole-node (let alone whole-cluster or whole-region) store.
+**Update — the routing gap below is now fixed.** An earlier version of this document found
+that every `Command::Crdt*` handler called `router.local_db.borrow_mut().crdt_*(...)`
+directly, bypassing normal key-based routing entirely, so the same key name could hold
+completely independent state on different shards. As of the current source, the single-key
+CRDT commands (`CrdtSet`/`CrdtGet`/`CrdtDel`/`CrdtIncrby`/`CrdtSadd`/`CrdtSmembers`/
+`CrdtSrem`) are now included in both `cmd_primary_key` and `target_shard_of_cmd`
+(`connection.rs`) and dispatch through the same local-vs-`execute_remote` fork every other
+keyed command uses — a `CRDT.SET foo bar` now always lands on the one shard `foo` actually
+hashes to, regardless of which shard's connection issued it. Separately, `CRDT.DUMP`,
+`CRDT.MERGE`, and `CRDT.GC` — which operate on an entire store, not one key — now
+explicitly fan out to *every* shard (`for sid in 0..router.num_shards { ... }`, via
+`router.execute_remote`) and aggregate the results: `CrdtDump` concatenates every shard's
+exported payload into one response, `CrdtMerge` sums the per-shard merged-item counts, and
+`CrdtGc` sums the per-shard tombstones-pruned counts. In effect, `CrdtStore` is still a
+genuinely separate `CrdtStore` instance per shard (the underlying data structure hasn't
+changed — see §3), but the command layer now presents it as one logical whole-node store:
+single-key operations are correctly routed to the one shard that owns the key, and
+whole-store operations correctly touch every shard rather than just the connection's local
+one.
 
 ---
 
@@ -52,17 +62,23 @@ whole-node (let alone whole-cluster or whole-region) store.
 ## 3. Component Architecture & Data Structures
 
 ```
-   Any client, on shard 2's connection          Any client, on shard 5's connection
+   Client, any shard's connection             Client, any shard's connection
+        CRDT.SET foo bar                            CRDT.SET foo baz
                   │                                            │
-        CRDT.SET foo bar                              CRDT.SET foo baz
+        target_shard_of_cmd("foo")                  target_shard_of_cmd("foo")
                   │                                            │
-   router.local_db (shard 2 only)              router.local_db (shard 5 only)
-   CrdtStore.registers["foo"]                   CrdtStore.registers["foo"]
-   = LwwRegister{baz? no: "bar", ts}            = LwwRegister{"baz", ts}
-                  │                                            │
-                  └──── independent stores; only merged ───────┘
-                        if an operator runs CRDT.DUMP on one
-                        and CRDT.MERGE <payload> on the other
+                  └──────────── both resolve to the SAME shard ────────────┘
+                                (foo's owning shard, via CRC16 —
+                                 local execute or router.execute_remote,
+                                 exactly like any other keyed command)
+
+   CRDT.DUMP / CRDT.MERGE <payload> / CRDT.GC  (whole-store commands)
+                  │
+                  ▼
+   local shard's CrdtStore  +  execute_remote(sid, same cmd) for every OTHER shard
+                  │
+                  ▼
+   aggregated result (concatenated dump / summed merge count / summed GC count)
 ```
 
 ### Real data structures (verbatim from `src/crdt.rs`)
@@ -232,10 +248,12 @@ anywhere in `server.rs` — it's an on-demand command.
 - **`src/resp.rs`**: parses `CRDT.SET|GET|DEL|INCRBY|SADD|SMEMBERS|SREM|DUMP|MERGE|GC`
   into the matching `Command::Crdt*` variants (`CrdtMerge(Bytes)` carries the raw sync
   payload as a normal bulk-string argument).
-- **`src/connection.rs`**: every `Command::Crdt*` arm calls `router.local_db.borrow_mut()`
-  directly — **no cross-shard routing at all** (see §1's second scope note). `CrdtSet`/
-  `CrdtDel`/`CrdtIncrby`/`CrdtSadd`/`CrdtSrem` also call `notify_key_invalidation` (RESP3
-  client-side-caching) the same way ordinary mutating commands do.
+- **`src/connection.rs`**: single-key `Command::Crdt*` arms now route via
+  `target_shard_of_cmd`/`execute_remote` like any other keyed command (see §1's update);
+  the whole-store commands (`CrdtDump`/`CrdtMerge`/`CrdtGc`) fan out to every shard and
+  aggregate. `CrdtSet`/`CrdtDel`/`CrdtIncrby`/`CrdtSadd`/`CrdtSrem` also call
+  `notify_key_invalidation` (RESP3 client-side-caching) the same way ordinary mutating
+  commands do.
 - **`src/replication.rs`**: no interaction. Primary/replica `PSYNC` streaming is a
   separate mechanism and does not carry CRDT state.
 - **`src/table.rs`**: no interaction. CRDT values are **not** stored as `RudisValue`
@@ -259,7 +277,7 @@ anywhere in `server.rs` — it's an on-demand command.
 
 ## 7. Future Improvements
 
-- **High — route CRDT commands through the normal key-slot mechanism instead of always hitting `router.local_db` (§1's second scope note).** This is the most surprising real gap: a `CRDT.SET foo bar` on shard 2 and a `CRDT.GET foo` on shard 5 see completely independent state for the same key name, with no error or warning. Making `Command::Crdt*` route through `target_shard_of_cmd` like every other keyed command (Component 02/04) would make a given key's CRDT state consistent regardless of which shard's connection touches it — a straightforward fix since the routing infrastructure already exists, it's just not applied here.
-- **High — build (or explicitly scope out) real automatic multi-region sync.** As documented, "multi-region CRDT" today means "manually run `CRDT.DUMP` and `CRDT.MERGE` yourself" — the data types genuinely support real automatic sync (their merge functions are commutative/idempotent, exactly what's needed), but nothing schedules or transports the exchange. A minimal real version: a background task that periodically pushes `export_sync_payload()` to a configured list of peer addresses and merges whatever it receives back — turning this from a manual toolkit into an actual active-active feature matching its name.
+- **RESOLVED — route CRDT commands through the normal key-slot mechanism (§1's update).** Fixed: single-key `Command::Crdt*` variants now go through `target_shard_of_cmd`/`execute_remote`, and `CrdtDump`/`CrdtMerge`/`CrdtGc` now fan out to every shard and aggregate, so `CrdtStore` is presented as one logical whole-node store instead of silently-independent per-shard state.
+- **High — build real automatic multi-region *network* sync.** Still open: "multi-region CRDT" is now a correct whole-node toolkit (per the fix above), but sync between separate Rudis *instances* is still entirely manual (`CRDT.DUMP` → transport the bytes yourself → `CRDT.MERGE`). The data types genuinely support real automatic sync (their merge functions are commutative/idempotent, exactly what's needed); a minimal real version would be a background task that periodically pushes each node's `export_sync_payload()`-equivalent (now whole-node, thanks to the fan-out fix) to a configured list of peer *nodes'* addresses and merges whatever it receives back — turning this from a manual toolkit into an actual active-active feature matching its name.
 - **Medium — schedule `CRDT.GC` automatically (§4.4)** rather than leaving tombstone cleanup entirely on-demand — a long-running instance with many deletes/removes will accumulate tombstones indefinitely otherwise, growing `export_sync_payload`'s output and memory footprint for no ongoing benefit once tombstones are older than any plausible in-flight merge.
 - **Low — add incremental/delta export** so `CRDT.DUMP` doesn't have to re-serialize the entire store on every call (§6) — matters once the store holds enough registers/sets/counters that a full dump becomes a non-trivial cost per sync cycle.

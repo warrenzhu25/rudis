@@ -153,7 +153,7 @@ pub enum QueryAst {
     NumericRange { field: String, min: f64, max: f64 },
     TagFilter { field: String, tags: Vec<String> },
     And(Vec<QueryAst>), Or(Vec<QueryAst>), Not(Box<QueryAst>),
-    KnnVector { field: String, k: usize, query_vec: Vec<f32> },
+    KnnVector { field: String, k: usize, query_vec: Vec<f32>, param_name: String },
     MatchAll,
 }
 ```
@@ -167,34 +167,72 @@ candidate scores per node (`And` intersects with position-preserved score accumu
 unions with accumulation, `Not` inverts against the full doc set), then sorts by `sortby` if
 given or by score descending, and paginates by `offset`/`limit`.
 
-### 4.3 A verified, real dead-code gap: KNN vector search never actually receives a vector
+### 4.3 KNN vector search — a previously-verified dead-code gap, now fixed
 
-`FT.SEARCH ... PARAMS n $param BLOB ...` parses those params into
-`SearchOptions.params: HashMap<String, Vec<u8>>` (`resp.rs:6826`, `options.params.insert(k, v)`),
-and `parse_query`'s KNN branch builds `QueryAst::KnnVector { query_vec: Vec::new(), ... }` with
-the comment `// Populated via PARAMS`. **Nothing ever populates it.** Grepping the whole file:
-`query_vec` is read exactly once, in `execute_search`'s `KnnVector` arm:
+An earlier version of this doc documented a precise, verified dead-code gap here: `parse_query`'s
+`KnnVector` node was always built with `query_vec: Vec::new()`, and nothing ever populated it
+from `PARAMS`, so `*=>[KNN ...]` queries silently matched zero vectors. **That has since been
+fixed.** `QueryAst::KnnVector` now carries a `param_name: String` alongside `query_vec`, captured
+from the query string itself:
 
 ```rust
-QueryAst::KnnVector { field, k, query_vec } => {
-    let mut vector_dists = Vec::new();
-    for (doc_id, doc) in &index.docs {
-        if let Some(doc_vec) = doc.vector_fields.get(field) {
-            if !query_vec.is_empty() && query_vec.len() == doc_vec.len() {
-                let sim = cosine_similarity(query_vec, doc_vec);
-                vector_dists.push((doc_id.clone(), sim));
-            }
-        }
+let param_name = tokens.get(2).map(|s| s.trim_start_matches('$').to_string()).unwrap_or_default();
+let knn_ast = QueryAst::KnnVector { field, k, query_vec: Vec::new(), param_name };
+```
+
+and `execute_search`'s `KnnVector` arm now resolves an `effective_vec` at query time — using
+`query_vec` directly if it's already non-empty (e.g. for callers that build a `QueryAst`
+programmatically), otherwise looking `param_name` up in `opts.params` (trying both the bare name
+and a `$`-prefixed variant, so it matches however the caller keyed it) and decoding it via the
+new `parse_vector_blob`:
+
+```rust
+let effective_vec = if !query_vec.is_empty() {
+    query_vec.clone()
+} else if !param_name.is_empty() {
+    opts.params.get(param_name).or_else(|| opts.params.get(&format!("${}", param_name)))
+        .map(|bytes| parse_vector_blob(bytes)).unwrap_or_default()
+} else { Vec::new() };
+```
+
+`parse_vector_blob` accepts two real formats, chosen automatically by a length check — not by an
+explicit format flag:
+
+```rust
+pub fn parse_vector_blob(bytes: &[u8]) -> Vec<f32> {
+    if bytes.len().is_multiple_of(4) && !bytes.is_empty() {
+        // interpret as tightly-packed little-endian f32s, 4 bytes each
+        let (chunks, _) = bytes.as_chunks::<4>();
+        chunks.iter().map(|c| f32::from_le_bytes(*c)).collect()
+    } else {
+        // fall back to a comma/whitespace/bracket-separated text encoding, e.g. "1.0, 0.0, 0.0"
+        String::from_utf8_lossy(bytes)
+            .split(|c: char| c == ',' || c.is_whitespace() || c == '[' || c == ']')
+            .filter_map(|s| s.trim().parse::<f32>().ok())
+            .collect()
     }
-    ...
 }
 ```
 
-Since `query_vec` is always the `Vec::new()` built at parse time, `!query_vec.is_empty()` is
-always `false`, so `vector_dists` stays empty and a `*=>[KNN ...]` query always returns zero
-vector matches (the base/lexical part of the query, if any, via the surrounding `And`, still
-works normally). **Hybrid keyword+vector search via `FT.SEARCH`'s KNN syntax is parseable but
-functionally a no-op today** — this is a precise, verified gap, not a design choice.
+The auto-indexing path (`index_document_hook` → `InvertedIndex::add_document`) got the matching
+other half of this fix: a document field declared `Vector` in the schema is now run through the
+same `parse_vector_blob` at index time (previously `vector_fields` was only ever populated by
+whatever the `vectors` parameter passed in directly, which nothing supplied via the normal
+`HSET`-driven ingestion path — so indexed documents' vector fields were themselves silently
+empty before this change, a second half of the same gap not fully called out in the original
+finding). **Hybrid keyword+vector search via `FT.SEARCH`'s KNN syntax is now a real, working
+path end to end**, verified by a new test (`test_knn_vector_search_with_params`) that indexes two
+documents with text-encoded vectors, queries with a raw-little-endian-float `PARAMS` blob, and
+asserts the nearer document is returned.
+
+**One real ambiguity worth knowing about `parse_vector_blob`'s auto-detection**: a byte string
+that happens to be a multiple of 4 bytes long is *always* treated as packed floats, never as
+text, even if it was actually meant as a short text encoding. `"1,0,0,1"` (8 ASCII bytes) would
+be parsed as text (8 is not relevant, its length just needs checking) — but a text vector whose
+byte length happens to land on a multiple of 4 (e.g. `"1,0,0"` is 5 bytes — fine — but `"1,-1"` is
+4 bytes exactly) would be silently reinterpreted as one packed `f32` instead of two text numbers.
+This is a real, narrow edge case, not a defect in the common case (real callers use one format
+consistently), but worth flagging (see §7).
 
 ### 4.4 Vector similarity when it *is* invoked directly (`FT.ADD` + brute-force cosine)
 
@@ -207,9 +245,11 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 }
 ```
 
-Even if `query_vec` were populated, the search itself (§4.3) is a full `O(num_docs)` scan
-computing cosine similarity against every document that has a vector in the queried field —
-there is no ANN index (no HNSW, no quantization) inside `search.rs` itself.
+Now that `query_vec`/`param_name` are genuinely resolved (§4.3), it's worth being precise about
+what kind of search that vector actually drives: the scan itself is still a full `O(num_docs)`
+loop computing cosine similarity against every document that has a vector in the queried field —
+there is no ANN index (no HNSW, no quantization) inside `search.rs` itself. The fix in §4.3 makes
+KNN *correct*, not fast — it's still brute force per query.
 
 ### 4.5 Reciprocal Rank Fusion — real, and matches the standard formula
 
@@ -244,7 +284,9 @@ that constructs both hit lists manually rather than through a real KNN search.
 - **`src/resp.rs`**: parses `FT.CREATE`'s `ON`/`PREFIX`/`SCHEMA` clauses and each field's
   `TEXT [WEIGHT w] [SORTABLE] [NOSTEM]` / `NUMERIC [SORTABLE]` / `TAG [SEPARATOR c]
   [CASESENSITIVE]` / `VECTOR ...` options into the real `IndexSchema`/`FieldType` values shown
-  in §3, and parses `FT.SEARCH ... PARAMS n k v ...` into `SearchOptions.params` (§4.3).
+  in §3, and parses `FT.SEARCH ... PARAMS n k v ...` into `SearchOptions.params`, keyed by the
+  bare parameter name with no `$` prefix (§4.3 — `execute_search` tries both forms when looking
+  a param up, so either convention on the query-string side resolves correctly).
 - **`src/vector.rs`** (Component 08): **not actually used by this file** — `HnswIndex` and this
   file's brute-force per-document vector scan are two independent, unconnected
   implementations of vector similarity search in the codebase.
@@ -274,7 +316,8 @@ that constructs both hit lists manually rather than through a real KNN search.
 
 ## 7. Future Improvements
 
-- **High — wire `PARAMS`-supplied vectors into `QueryAst::KnnVector` (§4.3).** This is a precise, verified dead-code gap, not a design choice: `SearchOptions.params` already carries the exact bytes `FT.SEARCH ... PARAMS n $param BLOB ...` supplies, but `parse_query`'s KNN branch never looks them up before building `query_vec: Vec::new()`. The fix is narrow and local — after parsing the query AST, walk it for `KnnVector` nodes and populate `query_vec` from `options.params` by name before calling `execute_search`. Until this lands, hybrid keyword+vector search is advertised syntax with no working vector half.
+- **RESOLVED — `PARAMS`-supplied vectors are now wired into `QueryAst::KnnVector` (§4.3).** Fixed by adding a `param_name` field captured at parse time, resolving it against `opts.params` (bare or `$`-prefixed) at execution time via the new `parse_vector_blob`, and — the other half of the same underlying gap — teaching the auto-indexing path (`add_document`) to populate `vector_fields` from a `Vector`-typed field's stored string value using the same decoder, since `index_document_hook` never supplied a `vectors` map directly. Verified by a new passing test (`test_knn_vector_search_with_params`). Hybrid keyword+vector search via `FT.SEARCH`'s KNN syntax is now real end to end, still brute-force (§4.4), not ANN-accelerated.
+- **Low — new, from the fix above: resolve `parse_vector_blob`'s format-detection ambiguity for short vectors (§4.3).** A byte string that happens to be a multiple of 4 bytes long is always decoded as packed little-endian floats, never as text — a short text-encoded vector whose byte length is coincidentally a multiple of 4 (e.g. `"1,-1"`, 4 bytes) would be silently misinterpreted as one packed float instead of two text numbers. An explicit format hint (e.g. requiring `PARAMS` values for vector fields to always be one format, documented and enforced) would remove the ambiguity; low priority since real callers use one format consistently in practice.
 - **Medium — either read `FieldType::Text.weight` in `bm25_score`, or remove it from `FT.CREATE`'s accepted syntax (§2.4).** Accepting and storing a per-field weight that scoring silently ignores is worse than not accepting it at all — a user who sets `WEIGHT 5.0` on a field reasonably expects it to matter. Implementing real per-field BM25F (per-field lengths and weighted term contributions) is the "correct" fix; dropping/erroring on `WEIGHT` until then is the honest one.
 - **Medium — shard or otherwise reduce contention on the global `SEARCH_INDICES` `RwLock` (§6).** Every `HSET`/`FT.SEARCH` across every shard takes this one process-wide lock, which is the same class of exception as `BlockHub` (Component 06) but on a much hotter path (every indexed write, not just blocking commands). A per-index `RwLock` (already partially true — `Arc<RwLock<InvertedIndex>>` per index — but the *registry* itself is one lock) or sharding indexes by name hash across a small pool of registries would reduce contention when many indexes are in active use concurrently.
 - **Low — either use the tracked term `positions` for real phrase-query support (`"exact phrase"` matching), or stop tracking them (§6).** Currently pure dead weight: computed and stored on every `Posting`, read by nothing.

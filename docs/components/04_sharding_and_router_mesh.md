@@ -254,33 +254,91 @@ the fast in-RAM path first, then (if the key is tiered) whether the shard is und
 memory pressure to warrant a zero-copy streaming cold read (`stream_cold_read_local`)
 versus loading the value back into RAM (`load_local`) before returning it.
 
-### 4.3 `MGET`/`MSET` — still sequential, not fan-out (a real, still-unfixed gap)
+### 4.3 `MGET`/`MSET` — now genuinely fan out, via dedicated `Router::mget`/`mset` methods (previously a real, unfixed gap — now resolved)
 
-Contrary to what an earlier draft of this document claimed (`execute_mget` bucketing keys
-by shard and awaiting them with `futures::future::join_all`), no such function exists.
-The actual handling, in `src/connection.rs`:
+`src/connection.rs`'s `Mget`/`Mset` arms no longer loop calling `router.get`/`router.set`
+per key. They call two new dedicated methods instead:
 
 ```rust
 Command::Mget(keys) => {
+    let values = router.mget(keys).await;
     ...
-    for key in keys {
-        match router.get(key).await {   // one full round-trip at a time
-            Some(v) => { ... }
-            None => { ... }
-        }
-    }
 }
 Command::Mset(pairs) => {
-    for (key, val) in pairs {
-        router.set(key, val, None).await;   // one full round-trip at a time
+    router.mset(pairs).await;
+    ...
+}
+```
+
+`Router::mget`/`mset` bucket keys by target shard, execute every local key inline
+(`get_local_direct`, a factored-out version of `get`'s fast/slow DRAM-vs-tiered logic),
+and dispatch **one `ShardMessage::Mget`/`Mset` per remote shard that owns at least one
+of the keys/pairs** — the same bucket-once-per-shard shape `execute_commands_squashed`
+(Component 02) already used for single-key pipelines, now applied to a single multi-key
+command's own key list:
+
+```rust
+{
+    let owners = self.slot_owners.borrow();
+    for (idx, key) in keys.into_iter().enumerate() {
+        let slot = key_slot(&key);
+        let target = owners[slot as usize];
+        if target == self.shard_id { local_keys.push((idx, key)); }
+        else { has_remote = true; remote_batches[target].push((idx, key)); }
     }
 }
 ```
 
-Each key is still routed and awaited one at a time. A multi-key `MGET`/`MSET` spanning
-several remote shards pays for that many serialized round-trips instead of a parallel
-fan-out. This is exactly the gap the original, accurate `docs/designs/components.md`
-Part 4 §6 identified — it has not been fixed.
+**Partitioning here uses the *dynamic* `slot_owners` array, not the static `target_shard`
+free function** that every single-key method (`get`/`set`/`del`/...) still uses — see the
+new inconsistency this creates, noted in §4.4 and §7.
+
+Three things beyond "just bucket and fan out" are worth understanding:
+
+1. **Pooled channel sets, not fresh allocations.** `mget_channel_pool`/`mset_channel_pool:
+   Rc<RefCell<Vec<Vec<MgetChannel/MsetChannel>>>>` hold spare `Vec<flume::bounded(1)>` sets
+   (one channel per shard) that `acquire_mget_channels`/`release_mget_channels` check out
+   and return, so a connection issuing repeated `MGET`s reuses the same channel vector
+   instead of calling `flume::bounded` fresh every time — closing the "one-shot channel
+   per call" gap that used to apply here (it still applies to the single-key per-op
+   methods in §4.2, unchanged).
+2. **A local-only fast path with zero channel operations**: if every key/pair in the call
+   happens to be local (`!has_remote`), `mget`/`mset` return immediately after the local
+   loop — no channel acquire, no send, no receive at all.
+3. **User-space "fast harvest" via non-blocking `try_recv`, falling back to a real
+   `.await` only if needed:**
+
+```rust
+let mut remaining_mask = sent_mask;
+for _ in 0..128 {
+    for (target_shard, (_, rx)) in channel_set.iter().enumerate() {
+        if (remaining_mask & (1 << target_shard)) != 0
+            && let Ok(shard_results) = rx.try_recv()
+        {
+            remaining_mask &= !(1 << target_shard);
+            for (idx, val) in shard_results { results[idx] = val; }
+        }
+    }
+    if remaining_mask == 0 { break; }
+    std::hint::spin_loop();
+}
+if remaining_mask != 0 {
+    // any shard that hasn't replied within ~128 spin iterations falls back
+    // to a real rx.recv_async().await here
+}
+```
+
+Because remote shards on other cores often finish a trivial `Mget`/`Mset` batch in well
+under a microsecond, this spins with `std::hint::spin_loop()` (a CPU hint, not a real
+sleep) polling every still-pending shard's channel with a non-blocking `try_recv` up to
+128 times before paying the cost of a real async suspend-and-wake. Correctness is
+unaffected either way (the slow path below still awaits properly), but this does mean
+the calling task **does not yield to other tasks on the same core** during the spin
+window — a deliberate latency-vs-fairness trade, bounded to a small fixed iteration
+count specifically so it can't spin forever if a remote shard is genuinely slow or stuck.
+`shard_id` values `>= 64` are silently excluded from the bitmask fan-out/harvest
+entirely (`target_shard < 64` guards throughout) — see §7 for why that's a real, if
+currently theoretical, limit.
 
 ### 4.4 `Router::check_slot_redirection` is dead, but the redirect feature itself is live — via a separate, duplicate implementation in `connection.rs` (correction to an earlier draft of this section)
 
@@ -339,11 +397,22 @@ Component 02 §4/§10) — grepping `slot_states` usage confirms the pipelined
 hitting a migrating/moved slot silently executes against the wrong data instead of
 redirecting**, while the same commands sent unpipelined (or as part of a
 squash-defeating pipeline) redirect correctly. This is the real, narrower gap — not "live
-migration is entirely unwired," which was the earlier draft's overstatement. As for
-`slot_owners` (a separate field from `slot_states`, used only by `Router::target_shard`,
-the dynamic method): that part of the original finding still holds — 16 of 17
-key-routing call sites use the static `target_shard()` free function instead, so
-`slot_owners` itself remains effectively unconsulted outside of `expiretime`.
+migration is entirely unwired," which was the earlier draft's overstatement.
+
+**Update since the original finding**: `slot_owners` (a separate field from
+`slot_states`) is no longer consulted by only one call site. `Router::mget`/`mset` (§4.3,
+newly added) now also partition keys via `self.slot_owners.borrow()[slot]` rather than
+the static `target_shard()` free function — so `slot_owners` now has three real
+consultation sites (the dynamic `Router::target_shard` method used by `expiretime`, plus
+`mget`, plus `mset`) instead of one. **This creates a new, sharper inconsistency rather
+than resolving the old one**: every single-key command (`get`, `set`, `del`, `exists`,
+...) still routes via the *static* `target_shard()` free function, which has no idea
+`slot_owners` exists — meaning during a live slot migration, `MGET foo` and `GET foo`
+could now legitimately disagree about which shard owns `foo`, if `set_slot_owner` has
+been called for that slot but the static formula would still point elsewhere. Before this
+change, at least every read/write path agreed with each other (all wrong in the same way,
+consistently); now there are two different, disagreeing notions of ownership active in
+the same file. See §7.
 
 ### 4.5 Cross-shard `SCAN` cursor encoding
 
@@ -405,8 +474,13 @@ simple mutual-exclusion lock per shard, not a full multi-version scheduler.
 - **`src/connection.rs`** (Component 02): calls `target_shard_of_cmd`/`Router` methods to
   decide local vs. remote dispatch for every command; the pipelined hot path builds
   `ShardMessage::Batch` directly rather than going through `Router`'s per-op methods.
+  `Mget`/`Mset` now call `router.mget(keys).await`/`router.mset(pairs).await` directly
+  (§4.3) instead of looping over `router.get`/`router.set`.
 - **`src/server.rs`** (Component 01): owns the receive side of every `ShardMessage`
-  variant, matched in the per-shard event loop.
+  variant, matched in the per-shard event loop, including the two new `Mget`/`Mset`
+  variants (§4.3) — the `Mget` handler itself branches on whether the shard has a
+  `tier_manager` at all, taking a fully synchronous `db.get()`-per-key loop when tiering
+  is disabled and a more careful (tiering-aware) path when it's enabled.
 - **`src/aof.rs`**: `Router` holds an optional `AofWriter` and calls
   `crate::aof::command_to_resp` to append write commands.
 - **`src/tiering.rs`**: `Router::spill_local`/`load_local`/`cool_local`/`decommit_local`/
@@ -435,16 +509,19 @@ simple mutual-exclusion lock per shard, not a full multi-version scheduler.
   `ShardMessage::Batch` path (Component 02) uses a pre-allocated pool.
 - **`CompactResp`'s 30-byte inline buffer** removes a heap allocation from the
   overwhelmingly common case (short RESP replies) of the cross-shard batch response path.
-- **`MGET`/`MSET` do not parallelize across shards** (§4.3) — throughput on multi-shard
-  keysets for these two commands is bounded by round-trip latency × number of remote
-  shards touched, not by the mesh's actual concurrency capacity.
+- **`MGET`/`MSET` now parallelize across shards, with pooled channels and a busy-poll
+  fast-harvest phase** (§4.3, resolved) — one `ShardMessage::Mget`/`Mset` per remote
+  shard touched, dispatched together and harvested via non-blocking `try_recv` before
+  falling back to a real `.await`, so throughput on multi-shard keysets is now bounded by
+  the slowest remote shard's response, not by the sum of every key's round-trip.
 
 ---
 
 ## 7. Future Improvements
 
-- **High — unify `slot_owners` and `slot_states`/`ClusterHub.my_slots` into one slot-authority mechanism (§4.4).** Right now there are effectively two independent, only-partially-overlapping systems that can disagree about "who owns this slot": `Router.slot_owners` (per-shard-local, consulted by exactly one method, `expiretime`) and `Router.slot_states` + `cluster.rs`'s gossiped `ClusterHub.my_slots`/`.nodes` (consulted by the real, live redirect logic inlined in `connection.rs`, §4.4/Component 11 §4.5). Having two sources of truth for the same concept is a correctness risk waiting for the right race condition; pick one (most likely `slot_states`/`ClusterHub`, since that's the one actually wired into the command path) and either delete `slot_owners` or make it derive from the same source.
-- **High — fix `MGET`/`MSET` fan-out (§4.3)** — see Component 02 §7 for the concrete approach (bucket by shard, dispatch one `ShardMessage::Batch` per shard, reuse the pattern already proven for `Sinter`/`Sunion`/co-located multi-key commands).
+- **High — unify `slot_owners` and `slot_states`/`ClusterHub.my_slots` into one slot-authority mechanism (§4.4). Now more urgent, not less.** The `MGET`/`MSET` fan-out fix (§4.3) made this worse in one specific way: `mget`/`mset` now route via `slot_owners` while every single-key command still routes via the static `target_shard()` free function, so the two families of commands can now genuinely disagree about slot ownership during a live migration, not just theoretically. Pick one source of truth (most likely `slot_states`/`ClusterHub`, since that's the one wired into `-MOVED`/`-ASK` redirection) and route every command — single-key and multi-key alike — through it.
+- ~~**High — fix `MGET`/`MSET` fan-out (§4.3)**~~ **Resolved.** `Router::mget`/`mset` now bucket by shard, dispatch one `ShardMessage::Mget`/`Mset` per remote shard via pooled channels, and harvest replies with a non-blocking `try_recv` sweep before falling back to `.await` (§4.3). Two real follow-ups from the fix itself: (1) the slot-authority split noted above, and (2) neither method's bitmask-based dispatch/harvest tracks shards with `target_shard >= 64` (the code guards every bitmask operation with `target_shard < 64`) — harmless at the default `num_shards.min(8)`, but if `--threads` is ever set above 64, keys landing on shard 64+ would be sent a message that's never waited on, silently leaving those result slots as `None`/unset. Worth an explicit assertion or a `Vec<bool>`-based tracking scheme instead of a `u64` bitmask if very high shard counts are ever supported.
+- **High — `MGET`/`MSET` never check `slot_states` for redirection at all, even on top of §4.4's gap (newly found).** `execute_command`'s slot-migration check (§4.4) is gated on `cmd_primary_key(&cmd)`, which has no arm for `Mget`/`Mset` (multi-key commands don't have one primary key) — so unlike every single-key command, a live `MGET`/`MSET` against a migrating/moved slot never redirects at all, squashed or not. Fixing this needs a per-key (not per-command) redirect check inside `Router::mget`/`mset` itself, likely alongside the `slot_owners` unification above.
 - **Medium — delete `Router::check_slot_redirection` or make it the single source of truth (§4.4).** Right now the real redirect logic lives duplicated inline in `connection.rs` while this near-identical helper method sits unused in `router.rs`. Either delete the dead helper (simplest — removes a maintenance trap where someone "fixes" the wrong copy) or refactor `connection.rs` to call it, eliminating the duplication risk either way.
-- **Medium — extend the live slot-migration redirect check to the pipelined squash path.** As flagged in Component 02 §7, only the single-command path (`execute_command`) currently checks `slot_states`; a pipelined batch of commands can execute against a migrating/moved slot without redirecting. This belongs conceptually to the router/slot-ownership design as much as to connection dispatch — worth tracking here too since it's this file's `slot_states` that would need to be consulted from the squash-eligibility check.
+- ~~**Medium — extend the live slot-migration redirect check to the pipelined squash path.**~~ **Turned out already handled, per Component 02 §7's correction.** The squash-eligibility gate's `SlotState::Stable`-vs-not check predates this round of changes — `Migrating`/`Importing`/`Moved` already correctly defeated squashing before. What this round of changes actually added on top: the `Stable`-but-a-different-node-owns-it-per-cluster-gossip case now also correctly defeats squashing, confirmed by the new `test_cluster_pipelined_squashed_moved_redirect_e2e` E2E test — closing the one piece of this that genuinely was missing.
 - **Low — reduce the ~10x duplicated local/remote-fork method bodies (§4).** The per-operation methods (`get`/`set`/`del`/`exists`/...) are intentionally monomorphic rather than generic (§4's stated rationale), which is a reasonable trade — but a thin macro that generates the boilerplate (target-shard computation, local-vs-remote branch, `flume::bounded(1)` fallback) from a one-line-per-command table would keep the monomorphic-dispatch benefit while cutting the ~10x copy-pasted structure down to one place to get right.

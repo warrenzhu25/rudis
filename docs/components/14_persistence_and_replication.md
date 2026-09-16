@@ -10,13 +10,15 @@ This subsystem covers two related but independent durability mechanisms:
    every command through the normal command-execution path.
 2. **Replication Hub (`src/replication.rs`)**: a per-port, process-wide `ReplicationHub`
    (master or slave role) that fans out every mutating command to connected replicas over
-   plain `flume` channels, and — on the replica side — connects to a master, requests a
-   **full** RDB snapshot every time, then applies the live command stream that follows.
+   plain `flume` channels. The master side now supports **real partial resync** (`+CONTINUE`
+   from the backlog) when a reconnecting client presents a valid replid+offset, falling back
+   to a full RDB snapshot otherwise — see §4.3 for the update to this (this doc previously,
+   correctly, documented this as entirely unimplemented; it has since been built).
 
-**Correction vs. an earlier draft of this document**: there is no AOF rewrite/compaction
-mechanism of any kind, and there is no partial resynchronization. Both "forkless rewrite"
-and "PSYNC partial resync" described previously do not exist in the real code — see §4.1
-and §4.3 for what's actually there instead.
+**Update**: AOF rewrite/compaction is still entirely absent (§4.1 — unchanged). Partial
+resynchronization, previously fully unimplemented, is now real on the **master** side
+(§4.3) — but see §4.3's caveat: this codebase's own **replica** implementation never
+actually requests one.
 
 ---
 
@@ -26,18 +28,24 @@ and §4.3 for what's actually there instead.
    (later flushed to disk via `write_all_at` at the current end-of-file `offset`). There is
    no `BGREWRITEAOF`, no periodic compaction, and no mechanism that ever shrinks or rewrites
    the file — it grows for as long as the process runs with AOF enabled.
-2. **Replication is always full resync.** The master side (`run_master_replica_stream` in
-   `src/connection.rs`) unconditionally replies `+FULLRESYNC <replid> <offset>` followed by
-   a complete RDB blob, regardless of what offset the replica actually asked for — the
-   `PSYNC` command's own arguments are received but never inspected (the handler's
-   `_psync_cmd` parameter is prefixed with `_` and unused). The replica side
-   (`run_replica_worker`) also only ever sends `PSYNC ? -1`, i.e. it never even attempts a
-   partial resync request.
-3. **The replication backlog is maintained but never read back.** `ReplicationHub::propagate`
-   appends every propagated command to `self.backlog` (a `ReplicationBacklog`) in addition to
-   forwarding it live to connected replicas — but nothing in the codebase ever calls a method
-   to serve a range of the backlog to a reconnecting replica. It exists to answer `INFO
-   replication`'s `repl_backlog_*` fields, not to actually enable resumption.
+2. **Master-side partial resync is now real; the replica side never asks for one.**
+   `run_master_replica_stream` (`src/connection.rs`) now inspects the `PSYNC` command's own
+   replid/offset arguments (previously received but discarded) via
+   `ReplicationHub::try_partial_resync`, and replies `+CONTINUE <replid>\r\n<backlog-diff-bytes>`
+   when the requested offset still falls inside the retained backlog window for a matching
+   replid, falling back to `+FULLRESYNC <replid> <offset>\r\n$<len>\r\n<rdb-bytes>` otherwise
+   (§4.3). **But** `run_replica_worker` — this codebase's own replica-side connect logic —
+   still unconditionally sends the literal `PSYNC ? -1` on every connection, including
+   reconnects; it never tracks or requests its own last-known offset. So a rudis replica
+   talking to a rudis (or real Redis) master never actually triggers the new `+CONTINUE` path
+   itself — the feature only benefits a *different* client (a real Redis replica, or a future
+   rudis version) connecting to a rudis master. See §4.3 and Future Improvements.
+3. **The replication backlog is maintained, and now genuinely read back — by the master
+   serving a partial resync.** `ReplicationHub::propagate` still appends every propagated
+   command to `self.backlog` (a `ReplicationBacklog`), and that data is no longer write-only:
+   `try_partial_resync`/`ReplicationBacklog::get_diff` (§4.3) slice it to answer a
+   `+CONTINUE` request. It's also still consulted for `INFO replication`'s `repl_backlog_*`
+   fields, as before.
 4. **Replication uses shared, cross-thread state (`Arc`/`RwLock`), unlike the request path.**
    `ReplicationHub` is looked up via `get_replication_hub(port)` from a process-wide
    `LazyLock<RwLock<HashMap<u16, Arc<ReplicationHub>>>>` — every shard on a given port shares
@@ -78,10 +86,18 @@ and §4.3 for what's actually there instead.
                                       │
                           run_replica_worker (replication.rs)
                   PING → REPLCONF listening-port → REPLCONF capa psync2 → PSYNC ? -1
+                        (this replica ALWAYS asks for "? -1" -- see §4.3 caveat)
                                       │
-                       always "+FULLRESYNC <replid> <offset>\r\n$<len>\r\n<rdb-bytes>"
-                                      │
-                    router.restore_rdb_bytes(rdb) then apply the live command stream
+                     hub.try_partial_resync(replid, offset)?  [master, connection.rs]
+                          ┌──────────yes──────────┐         ┌──────────no───────────┐
+                          ▼                        ▼         ▼                        ▼
+              "+CONTINUE <replid>\r\n"    backlog.get_diff()   "+FULLRESYNC id off\r\n"   generate_full_rdb()
+                          └──────────┬─────────────┘         └───────────┬────────────┘
+                                     ▼                                    ▼
+                    apply just the missing bytes         router.restore_rdb_bytes(rdb)
+                                     └──────────────┬─────────────────────┘
+                                                     ▼
+                                     then apply the live command stream
 ```
 
 ### `AofWriter` and `AofConfig` (`src/aof.rs`)
@@ -127,6 +143,7 @@ pub struct ReplicationHub {
     pub master_replid: String,
     pub master_repl_offset: AtomicU64,
     pub has_replicas: std::sync::atomic::AtomicBool,
+    pub backlog_active: std::sync::atomic::AtomicBool,   // new: keep the backlog live even with zero replicas
     pub backlog: RwLock<ReplicationBacklog>,
     pub replicas: RwLock<HashMap<u64, Arc<ConnectedReplica>>>,
     pub cancel_sync: RwLock<Option<flume::Sender<()>>>,
@@ -159,7 +176,17 @@ and recomputes `first_byte_offset` from the new length. This is a correct *bound
 window* (same end effect: only the most recent `max_size` bytes are retained), but it's
 implemented as a plain growable `Vec` with a linear `drain`, not a fixed-capacity circular
 buffer with modular read/write cursors — the "circular ring buffer" framing in an earlier
-draft of this doc was misleading. It also, per §2.3, is never actually read from again.
+draft of this doc was misleading. Per §2.3, it's now genuinely read back to serve partial
+resyncs.
+
+**`propagate` now backlogs independently of whether any replica is currently connected.**
+Previously (and still true for the live fan-out half) `propagate` only did anything if
+`is_master()` — but the backlog-append is now gated on a separate `backlog_active` flag,
+not on `has_replicas`. This matters precisely because partial resync needs history to exist
+*before* a replica reconnects: if the backlog only grew while a replica was actively
+connected, every replica that fully disconnected and came back would find an empty/stale
+backlog and be forced into a full resync anyway, defeating the point. `has_connected_replicas`
+now also reports `true` whenever `backlog_active` is set, even with zero live replicas.
 
 ---
 
@@ -256,27 +283,46 @@ on `AofWriter` itself just call `take_flush_chunk` once and await the write/fsyn
 those are the paths used by e.g. an explicit `sync_aof()` call from `Router::save_rdb`
 (Component 04), not the steady-state background cadence.
 
-### 4.3 Replication is unconditional full resync, both directions
+### 4.3 Partial resync is real on the master side; the replica side never requests one
 
 Master side, `run_master_replica_stream` (`src/connection.rs`, entered when a connection
-sends `PSYNC`):
+sends `PSYNC`) now genuinely inspects the request instead of discarding it:
 
 ```rust
-let rdb = router.generate_full_rdb().await;
-let _repl = hub.register_replica(client_id, write_tx.clone());
-let replid = hub.master_replid.clone();
-let offset = hub.master_repl_offset.load(Ordering::SeqCst);
-let mut initial_msg = format!("+FULLRESYNC {} {}\r\n${}\r\n", replid, offset, rdb.len()).into_bytes();
-initial_msg.extend_from_slice(&rdb);
-writer.write_all(initial_msg).await;
+let (req_replid, req_offset) = match &psync_cmd {
+    Command::Psync { replid, offset } => (std::str::from_utf8(replid).unwrap_or(""), *offset),
+    _ => ("", -1),
+};
+
+let partial = hub.try_partial_resync(client_id, write_tx.clone(), req_replid, req_offset);
+if let Some((replid, diff, _repl)) = partial {
+    let mut initial_msg = format!("+CONTINUE {}\r\n", replid).into_bytes();
+    initial_msg.extend_from_slice(&diff);
+    writer.write_all(initial_msg).await;
+} else {
+    let rdb = router.generate_full_rdb().await;
+    let _repl = hub.register_replica(client_id, write_tx.clone());
+    let replid = hub.master_replid.clone();
+    let offset = hub.master_repl_offset.load(Ordering::SeqCst);
+    let mut initial_msg = format!("+FULLRESYNC {} {}\r\n${}\r\n", replid, offset, rdb.len()).into_bytes();
+    initial_msg.extend_from_slice(&rdb);
+    writer.write_all(initial_msg).await;
+}
 ```
 
-The command that triggered this (`_psync_cmd`, i.e. whatever replid/offset the replica
-actually requested) is received but discarded — there is no code path that ever produces a
-`+CONTINUE` reply. After the initial RDB transfer, the connection is handed a dedicated
-writer task draining `write_rx` (fed by `ReplicationHub::propagate`, so this replica now
-receives every future mutation live) and a reader loop that only looks for
-`REPLCONF ACK <offset>` to update `ConnectedReplica::ack_offset`/`last_ack_time`.
+`ReplicationHub::try_partial_resync` (`src/replication.rs`) does the real work: it checks
+the requested replid against the master's own (or its previous `replid2`, for the "I was
+just promoted" case, gated by `second_offset`), then asks `ReplicationBacklog::can_partial_sync`/
+`get_diff` whether `target_offset = req_offset + 1` still falls inside the retained backlog
+window — if so, it returns the exact missing byte slice; if the offset is already
+up-to-date, an empty diff; if the offset predates what the backlog retained, `None` (forcing
+the caller to fall back to `+FULLRESYNC`). This is covered by real unit tests
+(`test_backlog_append_and_diff`, `test_try_partial_resync`) exercising the boundary cases
+(exactly up to date, mid-backlog, evicted-by-overflow, and an offset beyond the master's own).
+After either path, the connection is handed a dedicated writer task draining `write_rx` (fed
+by `ReplicationHub::propagate`, so this replica now receives every future mutation live) and
+a reader loop that only looks for `REPLCONF ACK <offset>` to update
+`ConnectedReplica::ack_offset`/`last_ack_time` — unchanged from before.
 
 Replica side, `run_replica_worker` (`src/replication.rs`) — a hand-rolled RESP handshake
 using a `send_and_expect_line!` macro (write a command, read until `\r\n`), not the shared
@@ -286,17 +332,25 @@ using a `send_and_expect_line!` macro (write a command, read until `\r\n`), not 
 // 1. PING → expect +PONG
 // 2. REPLCONF listening-port <port> → expect +OK
 // 3. REPLCONF capa psync2 → expect +OK
-// 4. PSYNC ? -1 → expect +FULLRESYNC <replid> <offset>
-// 5. Read "$<rdb_len>\r\n", then read exactly rdb_len more bytes
-// 6. router.restore_rdb_bytes(rdb_bytes).await
-// 7. mark link_status "up", set master_repl_offset = initial_offset
-// 8. loop: parse_command on the ongoing stream; REPLCONF GETACK → reply REPLCONF ACK <offset>;
+// 4. PSYNC ? -1 → expect +FULLRESYNC <replid> <offset>  OR  +CONTINUE <replid>
+// 5. (only if +FULLRESYNC) Read "$<rdb_len>\r\n", then read exactly rdb_len more bytes,
+//    then router.restore_rdb_bytes(rdb_bytes).await
+// 6. mark link_status "up", set master_repl_offset = initial_offset
+// 7. loop: parse_command on the ongoing stream; REPLCONF GETACK → reply REPLCONF ACK <offset>;
 //    everything else (except PING, which is just a keepalive/no-op) → router.execute_replica_command(cmd).await
 ```
 
-`PSYNC ? -1` is Redis's own wire syntax for "I have no prior state, give me everything" —
-the replica here never has any other code path, so it always looks like a brand-new replica
-to the master, every single time it (re)connects, even after a brief network blip.
+**The real, precise gap**: step 4's literal payload — `b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"`
+— is unconditional, hardcoded on every single call to `run_replica_worker`, including
+reconnects after a network blip. `PSYNC ? -1` is Redis's own wire syntax for "I have no
+prior state, give me everything," and `try_partial_resync` explicitly rejects any negative
+offset (`if req_offset < 0 { return None; }`). So **this codebase's own replica
+implementation can never trigger the `+CONTINUE` path it just gained**, against a rudis
+master or a real one — the new partial-resync machinery is real and tested, but today it
+can only be exercised by some *other* client that actually tracks and sends its own
+replid/offset (a real Redis replica, or a future rudis version that fixes this). The code
+does now branch on the reply (`is_continue`), so it would correctly *handle* a `+CONTINUE`
+if it ever received one — it just never asks for one.
 
 ### 4.4 `INFO replication` / `ROLE` are read directly off the atomics/`RwLock`, not cached
 
@@ -335,11 +389,12 @@ state currently is at request time.
   total lifetime write volume, since nothing ever compacts the file (§4.1). A long-running,
   write-heavy node with AOF enabled will have an ever-growing file and an ever-growing
   startup replay cost.
-- **Every full resync re-transfers the entire dataset**, serialized fresh via
-  `generate_full_rdb` (which itself fans out to every shard and waits for all chunks) —
-  there is no incremental/partial catch-up path (§4.3), so a replica that merely blips its
-  network connection pays the same full-dataset-transfer cost as a brand-new replica joining
-  for the first time.
+- **Full resync still re-transfers the entire dataset** via `generate_full_rdb` (fans out to
+  every shard, waits for all chunks) — but this is no longer the *only* path (§4.3): a
+  client presenting a still-in-backlog offset gets a `+CONTINUE` and just the missing bytes
+  instead. The catch, per §4.3, is that this codebase's own replica never actually asks for
+  the cheap path — a rudis-to-rudis pair still pays full-dataset-transfer cost on every
+  reconnect today, even though the master is capable of doing better.
 - **Replication fan-out itself is cheap per write**: `propagate` is an `O(num_replicas)`
   loop of non-blocking `flume` sends per mutating command, independent of dataset size.
 
@@ -348,6 +403,6 @@ state currently is at request time.
 ## 7. Future Improvements
 
 - **High — implement AOF rewrite/compaction (§4.1).** An AOF-enabled node that runs for a long time under sustained writes has an ever-growing file and an ever-growing restart replay cost, with no relief mechanism (no `BGREWRITEAOF` equivalent exists at all). Since `RudisTable` already has a working RDB chunk format (Component 05) used for full resync, the natural implementation is: periodically (or on an explicit `BGREWRITEAOF`-equivalent command) snapshot the current dataset to a fresh AOF-equivalent-from-RDB, atomically swap it in for the old growing file, and discard the old one — reusing existing RDB serialization rather than building new compaction logic from scratch.
-- **High — implement partial resynchronization using the backlog that already exists (§2.3/§4.3).** `ReplicationBacklog` is already maintained on every `propagate` call but never read back — the infrastructure for a real `+CONTINUE` partial-resync path is half-built. Finishing it (have the master check whether a reconnecting replica's requested offset still falls within the retained backlog window, and if so replay just that slice instead of a full RDB transfer) would make brief network blips cheap to recover from instead of paying a full-dataset re-transfer every time, which matters a lot more as dataset size grows.
+- **RESOLVED (master side) / High (replica side still open) — partial resynchronization (§2.3/§4.3).** The master now genuinely serves `+CONTINUE` with just the missing backlog bytes when a valid replid+offset is presented, tested against boundary cases (`test_backlog_append_and_diff`, `test_try_partial_resync`). What's still missing: `run_replica_worker` always sends `PSYNC ? -1`, never its own last-known offset, so this codebase's own replica can never actually trigger the path it just gained. The remaining fix is narrow: track `master_repl_offset`/`master_replid` across a replica's disconnect (they already live on `ReplicationRole::Slave`, just aren't read at handshake time) and send `PSYNC <replid> <offset>` instead of `PSYNC ? -1` whenever those are known from a prior successful sync.
 - **Low — derive `replid` from something closer to Redis's real generation scheme**, or at least document that the current `fxhash`-over-port-and-timestamp approach (§3) is a real, working, but not cryptographically-derived identifier — same category of note as Component 11's node-ID generation.
 - **Low — make the 1MB `ReplicationBacklog` size and the 50ms/~1s AOF flush/fsync cadence configurable** rather than hardcoded, once partial resync (above) makes the backlog size an operationally meaningful tuning knob rather than just an `INFO`-reporting detail.
