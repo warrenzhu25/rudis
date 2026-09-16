@@ -308,11 +308,41 @@ static CLIENT_WATCH_TAINTED: std::sync::LazyLock<
 pub static CMD_STATS: std::sync::LazyLock<std::sync::RwLock<hashbrown::HashMap<String, u64>>> =
     std::sync::LazyLock::new(|| std::sync::RwLock::new(hashbrown::HashMap::new()));
 
+thread_local! {
+    static LOCAL_CMD_STATS: RefCell<hashbrown::HashMap<&'static str, u64>> = RefCell::new(hashbrown::HashMap::new());
+    static LOCAL_CMD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[inline]
-pub fn record_cmd_stat(name: &str) {
-    if let Ok(mut map) = CMD_STATS.write() {
-        *map.entry(name.to_lowercase()).or_insert(0) += 1;
-    }
+pub fn record_cmd_stat(name: &'static str) {
+    LOCAL_CMD_STATS.with(|stats| {
+        let mut map = stats.borrow_mut();
+        *map.entry(name).or_insert(0) += 1;
+    });
+    LOCAL_CMD_COUNT.with(|count| {
+        let c = count.get() + 1;
+        if c >= 1024 {
+            count.set(0);
+            flush_local_cmd_stats();
+        } else {
+            count.set(c);
+        }
+    });
+}
+
+pub fn flush_local_cmd_stats() {
+    LOCAL_CMD_STATS.with(|stats| {
+        let mut local_map = stats.borrow_mut();
+        if local_map.is_empty() {
+            return;
+        }
+        if let Ok(mut global_map) = CMD_STATS.write() {
+            for (&cmd, &calls) in local_map.iter() {
+                *global_map.entry(cmd.to_lowercase()).or_insert(0) += calls;
+            }
+        }
+        local_map.clear();
+    });
 }
 
 pub static HAS_WATCHED_KEYS: std::sync::atomic::AtomicBool =
@@ -721,6 +751,7 @@ pub async fn handle_connection(
     }
     impl Drop for ClientCleanup {
         fn drop(&mut self) {
+            flush_local_cmd_stats();
             self.registry.borrow_mut().remove(&self.client_id);
             self.pubsub.borrow_mut().remove_client(self.client_id);
             unregister_client_tracking(self.port, self.client_id);
@@ -825,6 +856,9 @@ pub async fn handle_connection(
                             }
                         }
                     }
+                }
+                if buf.is_empty() {
+                    buf.clear();
                 }
 
                 // 2. Transition to Pub/Sub mode if SUBSCRIBE or PSUBSCRIBE is received
@@ -1185,8 +1219,13 @@ pub async fn handle_connection(
                             }
                         }
                     } else if commands.len() == 1 {
+                        let single_cmd = commands.pop().unwrap();
+                        if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                            c.last_active = Instant::now();
+                            c.last_cmd = get_cmd_name(&single_cmd).to_lowercase();
+                        }
                         let quit = execute_command(
-                            commands.pop().unwrap(),
+                            single_cmd,
                             &router,
                             client_id,
                             &client_registry,
@@ -2906,18 +2945,6 @@ async fn execute_command(
 ) -> bool {
     let cmd_name = get_cmd_name(&cmd);
     record_cmd_stat(cmd_name);
-    let is_resp3 = client_registry
-        .borrow()
-        .get(&client_id)
-        .map(|c| c.is_resp3)
-        .unwrap_or(false);
-    CURRENT_CLIENT_RESP3.set(is_resp3);
-    if !IN_TX.get()
-        && let Some(c) = client_registry.borrow_mut().get_mut(&client_id)
-    {
-        c.last_active = Instant::now();
-        c.last_cmd = cmd_name.to_lowercase();
-    }
 
     if !*authenticated
         && !matches!(
@@ -3027,8 +3054,7 @@ async fn execute_command(
             let val = if target == router.shard_id {
                 let local_val = router.local_db.borrow_mut().get(&key);
                 if let Some(v) = local_val {
-                    let stats = crate::tiering::get_tier_stats(router.port);
-                    stats.ram_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    router.tier_stats.ram_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     Some(v)
                 } else if router.local_db.borrow_mut().table.is_tiered(&key).is_none() {
                     None
@@ -3645,6 +3671,7 @@ async fn execute_command(
                 DIRTY_CHANGES.load(std::sync::atomic::Ordering::Relaxed)
             );
             let cmdstat_str = {
+                flush_local_cmd_stats();
                 let mut s = String::from("# Commandstats\r\n");
                 if let Ok(map) = CMD_STATS.read() {
                     let mut entries: Vec<_> = map.iter().collect();
@@ -3996,6 +4023,7 @@ async fn execute_command(
                     out.extend_from_slice(b"-ERR Invalid argument for CONFIG SET\r\n");
                 }
             } else if p_str == "resetstat" {
+                LOCAL_CMD_STATS.with(|stats| stats.borrow_mut().clear());
                 if let Ok(mut map) = CMD_STATS.write() {
                     map.clear();
                 }
@@ -5772,6 +5800,7 @@ async fn execute_command(
                 c.name = None;
                 c.is_resp3 = false;
             }
+            CURRENT_CLIENT_RESP3.set(false);
             unregister_client_tracking(router.port, client_id);
             *asking = false;
 
@@ -12322,6 +12351,19 @@ mod tests {
             .await;
             assert_eq!(out, b"*2\r\n$8\r\nlocal_v1\r\n$-1\r\n");
         });
+    }
+
+    #[test]
+    fn test_cmd_stats_thread_local_buffering_and_flush() {
+        record_cmd_stat("GET");
+        record_cmd_stat("GET");
+        record_cmd_stat("SET");
+
+        // Flush and verify in global map
+        flush_local_cmd_stats();
+        let map = CMD_STATS.read().unwrap();
+        assert!(map.get("get").copied().unwrap_or(0) >= 2);
+        assert!(map.get("set").copied().unwrap_or(0) >= 1);
     }
 }
 

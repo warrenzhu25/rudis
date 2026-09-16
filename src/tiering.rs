@@ -154,6 +154,12 @@ pub fn parse_memory_bytes(s: &str) -> Option<u64> {
 static TIER_STATS: RwLock<Option<HashMap<u16, Arc<TieringStats>>>> = RwLock::new(None);
 
 pub fn get_tier_stats(port: u16) -> Arc<TieringStats> {
+    if let Ok(guard) = TIER_STATS.read()
+        && let Some(map) = guard.as_ref()
+        && let Some(stats) = map.get(&port)
+    {
+        return stats.clone();
+    }
     let mut map = TIER_STATS.write().unwrap();
     let entry = map.get_or_insert_with(HashMap::new);
     entry

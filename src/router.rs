@@ -81,6 +81,7 @@ pub struct Router {
     pub remote_responder_pool: Rc<RefCell<Vec<crate::connection::ResponderChannel>>>,
     pub mget_batch_pool: Rc<RefCell<Vec<Vec<Vec<(usize, Option<Bytes>)>>>>>,
     pub mset_batch_pool: Rc<RefCell<Vec<Vec<Vec<(Bytes, Bytes)>>>>>,
+    pub tier_stats: std::sync::Arc<crate::tiering::TieringStats>,
 }
 
 impl Router {
@@ -123,6 +124,7 @@ impl Router {
             remote_responder_pool: Rc::new(RefCell::new(Vec::new())),
             mget_batch_pool: Rc::new(RefCell::new(Vec::new())),
             mset_batch_pool: Rc::new(RefCell::new(Vec::new())),
+            tier_stats: crate::tiering::get_tier_stats(port),
         }
     }
 
@@ -649,8 +651,7 @@ impl Router {
     pub async fn get_local_direct(&self, key: &Bytes) -> Option<Bytes> {
         let val = self.local_db.borrow_mut().get(key);
         if let Some(v) = val {
-            let stats = crate::tiering::get_tier_stats(self.port);
-            stats.ram_hits.fetch_add(1, Ordering::Relaxed);
+            self.tier_stats.ram_hits.fetch_add(1, Ordering::Relaxed);
             return Some(v);
         }
         if self.local_db.borrow_mut().table.is_tiered(key).is_some() {
@@ -779,7 +780,7 @@ impl Router {
 
     #[inline(always)]
     pub(crate) fn check_auto_tier_after_write(&self) {
-        let max_mem = crate::tiering::get_max_memory(self.port);
+        let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed);
         if max_mem > 0 {
             let used = self.local_db.borrow().table.used_memory;
             let shard_max_mem = (max_mem / self.num_shards.max(1) as u64) as usize;

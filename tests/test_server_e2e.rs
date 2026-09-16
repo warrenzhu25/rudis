@@ -6532,6 +6532,48 @@ fn test_sync_local_fast_path_and_reactive_harvest_e2e() {
     }
 }
 
+#[test]
+fn test_pipeline1_lockless_stats_and_buffer_recycling_e2e() {
+    let port = 16474;
+    start_test_server(port, 4);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. High-iteration single-command pipeline 1 requests
+    for i in 0..50 {
+        let set_cmd = format!("SET p1_key_{} p1_val_{}\r\n", i, i);
+        let resp = send_and_read(&mut client, set_cmd.as_bytes());
+        assert_eq!(resp, "+OK\r\n");
+
+        let get_cmd = format!("GET p1_key_{}\r\n", i);
+        let resp = send_and_read(&mut client, get_cmd.as_bytes());
+        assert_eq!(resp, format!("${}\r\np1_val_{}\r\n", 7 + i.to_string().len(), i));
+    }
+
+    // 2. Verify commandstats aggregation
+    client.write_all(b"INFO commandstats\r\n").unwrap();
+    let mut resp_buf = [0u8; 32768];
+    let mut total_n = 0;
+    while total_n < resp_buf.len() {
+        let n = client.read(&mut resp_buf[total_n..]).unwrap();
+        if n == 0 {
+            break;
+        }
+        total_n += n;
+        let s = String::from_utf8_lossy(&resp_buf[..total_n]);
+        if s.contains("cmdstat_set:calls=") && s.contains("cmdstat_get:calls=") {
+            break;
+        }
+    }
+    let resp = String::from_utf8_lossy(&resp_buf[..total_n]);
+    assert!(resp.contains("cmdstat_set:calls="));
+    assert!(resp.contains("cmdstat_get:calls="));
+
+    // 3. Reset stats
+    let resp = send_and_read(&mut client, b"CONFIG RESETSTAT\r\n");
+    assert_eq!(resp, "+OK\r\n");
+}
+
+
 
 
 
