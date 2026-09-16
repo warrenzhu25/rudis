@@ -887,36 +887,13 @@ impl Router {
         }
         self.mget_batch_pool.borrow_mut().push(remote_batches);
 
-        // Fast user-space harvest loop: sweep channels with non-blocking try_recv
-        let mut remaining_mask = sent_mask;
-        for _ in 0..128 {
-            for (target_shard, (_, rx)) in channel_set.iter().enumerate() {
-                if target_shard < 64
-                    && (remaining_mask & (1 << target_shard)) != 0
-                    && let Ok(shard_results) = rx.try_recv()
-                {
-                    remaining_mask &= !(1 << target_shard);
-                    for (idx, val) in shard_results {
-                        results[idx] = val;
-                    }
-                }
-            }
-            if remaining_mask == 0 {
-                break;
-            }
-            std::hint::spin_loop();
-        }
-
-        // Slow path fallback: if any remote shard hasn't finished yet, await asynchronously
-        if remaining_mask != 0 {
-            for (target_shard, (_, rx)) in channel_set.iter().enumerate() {
-                if target_shard < 64
-                    && (remaining_mask & (1 << target_shard)) != 0
-                    && let Ok(shard_results) = rx.recv_async().await
-                {
-                    for (idx, val) in shard_results {
-                        results[idx] = val;
-                    }
+        for (target_shard, (_, rx)) in channel_set.iter().enumerate() {
+            if target_shard < 64
+                && (sent_mask & (1 << target_shard)) != 0
+                && let Ok(shard_results) = rx.recv_async().await
+            {
+                for (idx, val) in shard_results {
+                    results[idx] = val;
                 }
             }
         }
@@ -1007,27 +984,9 @@ impl Router {
         }
         self.mset_batch_pool.borrow_mut().push(remote_batches);
 
-        let mut remaining_mask = sent_mask;
-        for _ in 0..128 {
-            for (target_shard, (_, rx)) in channel_set.iter().enumerate() {
-                if target_shard < 64
-                    && (remaining_mask & (1 << target_shard)) != 0
-                    && rx.try_recv().is_ok()
-                {
-                    remaining_mask &= !(1 << target_shard);
-                }
-            }
-            if remaining_mask == 0 {
-                break;
-            }
-            std::hint::spin_loop();
-        }
-
-        if remaining_mask != 0 {
-            for (target_shard, (_, rx)) in channel_set.iter().enumerate() {
-                if target_shard < 64 && (remaining_mask & (1 << target_shard)) != 0 {
-                    let _ = rx.recv_async().await;
-                }
+        for (target_shard, (_, rx)) in channel_set.iter().enumerate() {
+            if target_shard < 64 && (sent_mask & (1 << target_shard)) != 0 {
+                let _ = rx.recv_async().await;
             }
         }
 
@@ -2479,6 +2438,81 @@ mod tests {
             let res2 = router.mget(vec![k0.clone(), k1.clone()]).await;
             assert_eq!(res2, vec![Some(Bytes::from("v0_new")), Some(Bytes::from("v1_new"))]);
             assert_eq!(router.mget_batch_pool.borrow().len(), 1);
+        });
+    }
+
+    #[test]
+    fn test_router_mget_mset_reactive_await_clean_harvest() {
+        let (tx0, _rx0) = flume::unbounded();
+        let (tx1, rx1) = flume::unbounded();
+
+        let db0 = Rc::new(RefCell::new(ShardDb::new(9995)));
+        let senders = vec![tx0, tx1];
+        let router = Router::new(
+            0,
+            2,
+            9995,
+            db0.clone(),
+            senders,
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+
+        let mut k_shard0 = None;
+        let mut k_shard1 = None;
+        for i in 0..1000 {
+            let k = Bytes::from(format!("react_k_{}", i));
+            if target_shard(&k, 2) == 0 && k_shard0.is_none() {
+                k_shard0 = Some(k);
+            } else if target_shard(&k, 2) == 1 && k_shard1.is_none() {
+                k_shard1 = Some(k);
+            }
+            if k_shard0.is_some() && k_shard1.is_some() {
+                break;
+            }
+        }
+        let k0 = k_shard0.unwrap();
+        let k1 = k_shard1.unwrap();
+        let rx1_clone = rx1.clone();
+
+        std::thread::spawn(move || {
+            let mut remote_db = ShardDb::new(9995);
+            while let Ok(msg) = rx1_clone.recv() {
+                match msg {
+                    ShardMessage::Mget { keys, responder } => {
+                        let mut res = Vec::new();
+                        for (idx, k) in keys {
+                            let val = remote_db.get(&k);
+                            res.push((idx, val));
+                        }
+                        let _ = responder.send(res);
+                    }
+                    ShardMessage::Mset { pairs, responder } => {
+                        for (k, v) in pairs {
+                            remote_db.set(k, v, None);
+                        }
+                        let _ = responder.send(());
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async move {
+            // MSET scattered
+            router.mset(vec![(k0.clone(), Bytes::from("val_k0")), (k1.clone(), Bytes::from("val_k1"))]).await;
+
+            // MGET scattered
+            let res = router.mget(vec![k0.clone(), k1.clone()]).await;
+            assert_eq!(res.len(), 2);
+            assert_eq!(res[0], Some(Bytes::from("val_k0")));
+            assert_eq!(res[1], Some(Bytes::from("val_k1")));
         });
     }
 }

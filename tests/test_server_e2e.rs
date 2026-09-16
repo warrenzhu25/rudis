@@ -6378,6 +6378,34 @@ fn test_scattered_mget_mset_batch_pooling_e2e() {
     }
 }
 
+#[test]
+fn test_reactive_mget_mset_and_command_drain_e2e() {
+    let port = 16470;
+    start_test_server(port, 4);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // Verify pipelined batch execution with in-place drained command buffer
+    let mut batch = Vec::new();
+    for i in 0..25 {
+        batch.extend_from_slice(format!("SET drain_k_{} val_{}\r\n", i, i).as_bytes());
+    }
+    let resp = send_and_read(&mut client, &batch);
+    assert_eq!(resp.matches("+OK\r\n").count(), 25);
+
+    // Verify reactive MGET across shards
+    let mut mget_cmd = String::from("MGET");
+    for i in 0..25 {
+        mget_cmd.push_str(&format!(" drain_k_{}", i));
+    }
+    mget_cmd.push_str("\r\n");
+    let resp = send_and_read(&mut client, mget_cmd.as_bytes());
+    assert!(resp.starts_with("*25\r\n"));
+    for i in 0..25 {
+        assert!(resp.contains(&format!("val_{}", i)));
+    }
+}
+
+
 
 
 

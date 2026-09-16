@@ -747,6 +747,7 @@ pub async fn handle_connection(
         .map(|_| Vec::with_capacity(64))
         .collect();
     let mut squashed_responses = Vec::with_capacity(64);
+    let mut commands = Vec::with_capacity(64);
 
     let mut asking = false;
     let mut in_multi = false;
@@ -771,28 +772,30 @@ pub async fn handle_connection(
             Ok(n) => {
                 buf.extend_from_slice(&read_buf[..n]);
 
-                // Drain any additional bytes waiting in kernel TCP socket buffer
-                loop {
-                    let drain_n = unsafe {
-                        libc::recv(
-                            raw_fd,
-                            read_buf.as_mut_ptr() as *mut libc::c_void,
-                            read_buf.len(),
-                            libc::MSG_DONTWAIT,
-                        )
-                    };
-                    if drain_n > 0 {
-                        buf.extend_from_slice(&read_buf[..drain_n as usize]);
-                        if (drain_n as usize) < read_buf.len() {
+                // Drain any additional bytes waiting in kernel TCP socket buffer if read_buf was completely filled
+                if n == read_buf.len() {
+                    loop {
+                        let drain_n = unsafe {
+                            libc::recv(
+                                raw_fd,
+                                read_buf.as_mut_ptr() as *mut libc::c_void,
+                                read_buf.len(),
+                                libc::MSG_DONTWAIT,
+                            )
+                        };
+                        if drain_n > 0 {
+                            buf.extend_from_slice(&read_buf[..drain_n as usize]);
+                            if (drain_n as usize) < read_buf.len() {
+                                break;
+                            }
+                        } else {
                             break;
                         }
-                    } else {
-                        break;
                     }
                 }
 
                 // 1. Parse all complete commands currently in the buffer
-                let mut commands = Vec::new();
+                commands.clear();
                 let mut should_quit = false;
                 while !buf.is_empty() {
                     match parse_command(&mut buf) {
@@ -909,7 +912,7 @@ pub async fn handle_connection(
                         });
 
                     if has_tx {
-                        for cmd in commands {
+                        for cmd in commands.drain(..) {
                             if !IN_TX.get()
                                 && let Some(c) = client_registry.borrow_mut().get_mut(&client_id)
                             {
@@ -1136,7 +1139,7 @@ pub async fn handle_connection(
                                 }
                         )
                     }) {
-                        for cmd in commands {
+                        for cmd in commands.drain(..) {
                             if matches!(
                                 cmd,
                                 Command::Blpop { .. }
@@ -1183,7 +1186,7 @@ pub async fn handle_connection(
                         }
                     } else {
                         let quit = execute_commands_squashed(
-                            commands,
+                            &mut commands,
                             &router,
                             &responders,
                             &mut remote_batches,
@@ -1203,8 +1206,10 @@ pub async fn handle_connection(
                 }
 
                 // 4. Batch flush all accumulated responses in one io_uring write
-                while let Ok(inval) = track_rx.try_recv() {
-                    out_buf.extend_from_slice(&inval);
+                if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                    while let Ok(inval) = track_rx.try_recv() {
+                        out_buf.extend_from_slice(&inval);
+                    }
                 }
                 if !out_buf.is_empty() {
                     let (write_res, returned_buf) = stream.write_all(out_buf).await;
@@ -11648,7 +11653,7 @@ pub fn execute_local_command(
 }
 
 async fn execute_commands_squashed(
-    commands: Vec<Command>,
+    commands: &mut Vec<Command>,
     router: &Router,
     responders: &[ResponderChannel],
     remote_batches: &mut [Vec<(usize, Command)>],
@@ -11683,7 +11688,7 @@ async fn execute_commands_squashed(
             None
         };
         let my_slots_guard = hub.as_ref().map(|h| h.my_slots.read().unwrap());
-        for cmd in &commands {
+        for cmd in commands.iter() {
             if matches!(
                 cmd,
                 Command::Blpop { .. }
@@ -11760,7 +11765,7 @@ async fn execute_commands_squashed(
 
     if !can_squash {
         let mut should_close = false;
-        for cmd in commands {
+        for cmd in commands.drain(..) {
             if execute_command(
                 cmd,
                 router,
@@ -11800,7 +11805,7 @@ async fn execute_commands_squashed(
 
     // 1. Process local shard commands immediately; bucket remote commands by shard
     let mut has_local_writes = false;
-    for (idx, cmd) in commands.into_iter().enumerate() {
+    for (idx, cmd) in commands.drain(..).enumerate() {
         if let Some(target) = target_shard_of_cmd(&cmd, router.num_shards) {
             if target == router.shard_id {
                 local_buf.clear();
