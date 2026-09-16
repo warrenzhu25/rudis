@@ -6348,6 +6348,37 @@ fn test_pipeline1_fast_path_and_acl_bypass_e2e() {
     assert_eq!(resp, "$7\r\nnew_val\r\n");
 }
 
+#[test]
+fn test_scattered_mget_mset_batch_pooling_e2e() {
+    let port = 16460;
+    start_test_server(port, 4);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // Repeated scattered MSET and MGET of 10 keys across 4 shards
+    for round in 0..50 {
+        let mut mset_cmd = String::from("MSET");
+        for i in 0..10 {
+            mset_cmd.push_str(&format!(" scat_k_{} val_{}_{}", i, round, i));
+        }
+        mset_cmd.push_str("\r\n");
+        let resp = send_and_read(&mut client, mset_cmd.as_bytes());
+        assert_eq!(resp, "+OK\r\n");
+
+        let mut mget_cmd = String::from("MGET");
+        for i in 0..10 {
+            mget_cmd.push_str(&format!(" scat_k_{}", i));
+        }
+        mget_cmd.push_str("\r\n");
+        let resp = send_and_read(&mut client, mget_cmd.as_bytes());
+        assert!(resp.starts_with("*10\r\n"));
+        for i in 0..10 {
+            let expected_val = format!("val_{}_{}", round, i);
+            assert!(resp.contains(&expected_val));
+        }
+    }
+}
+
+
 
 
 

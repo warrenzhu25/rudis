@@ -11895,7 +11895,7 @@ async fn execute_commands_squashed(
             let (tx, rx) = &responders[target_shard];
             let is_resp3 = CURRENT_CLIENT_RESP3.get();
             let msg = ShardMessage::Batch {
-                items: std::mem::take(items),
+                items: std::mem::replace(items, Vec::with_capacity(64)),
                 responder: tx.clone(),
                 is_resp3,
             };

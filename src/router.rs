@@ -75,6 +75,8 @@ pub struct Router {
     pub set_channel_pool: Rc<RefCell<Vec<MsetChannel>>>,
     pub get_channel_pool: Rc<RefCell<Vec<(flume::Sender<Option<Bytes>>, flume::Receiver<Option<Bytes>>)>>>,
     pub remote_responder_pool: Rc<RefCell<Vec<crate::connection::ResponderChannel>>>,
+    pub mget_batch_pool: Rc<RefCell<Vec<Vec<Vec<(usize, Bytes)>>>>>,
+    pub mset_batch_pool: Rc<RefCell<Vec<Vec<Vec<(Bytes, Bytes)>>>>>,
 }
 
 impl Router {
@@ -115,6 +117,8 @@ impl Router {
             set_channel_pool: Rc::new(RefCell::new(Vec::new())),
             get_channel_pool: Rc::new(RefCell::new(Vec::new())),
             remote_responder_pool: Rc::new(RefCell::new(Vec::new())),
+            mget_batch_pool: Rc::new(RefCell::new(Vec::new())),
+            mset_batch_pool: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -833,11 +837,10 @@ impl Router {
             return results;
         }
 
-        let avg_cap = (keys.len() / self.num_shards.max(1)).max(4) + 4;
-        let mut remote_batches: Vec<Vec<(usize, Bytes)>> = (0..self.num_shards)
-            .map(|_| Vec::with_capacity(avg_cap))
-            .collect();
-        let mut local_keys = Vec::with_capacity(avg_cap);
+        let mut remote_batches = self.mget_batch_pool.borrow_mut().pop().unwrap_or_else(|| {
+            (0..self.num_shards).map(|_| Vec::new()).collect()
+        });
+        let mut local_keys = Vec::with_capacity(keys.len().min(16));
         let mut has_remote = false;
 
         // Partition local keys and remote keys without holding RefCell borrow across await
@@ -862,13 +865,15 @@ impl Router {
 
         // Fast path: all keys are local - 0 channel operations
         if !has_remote {
+            self.mget_batch_pool.borrow_mut().push(remote_batches);
             return results;
         }
 
         // Dispatch remote batches concurrently with pooled channels
         let channel_set = self.acquire_mget_channels();
         let mut sent_mask: u64 = 0;
-        for (target_shard, items) in remote_batches.into_iter().enumerate() {
+        for target_shard in 0..self.num_shards {
+            let items = std::mem::take(&mut remote_batches[target_shard]);
             if !items.is_empty() {
                 let (tx, _) = &channel_set[target_shard];
                 let msg = ShardMessage::Mget {
@@ -880,6 +885,7 @@ impl Router {
                 }
             }
         }
+        self.mget_batch_pool.borrow_mut().push(remote_batches);
 
         // Fast user-space harvest loop: sweep channels with non-blocking try_recv
         let mut remaining_mask = sent_mask;
@@ -942,11 +948,10 @@ impl Router {
             return;
         }
 
-        let avg_cap = (pairs.len() / self.num_shards.max(1)).max(4) + 4;
-        let mut remote_batches: Vec<Vec<(Bytes, Bytes)>> = (0..self.num_shards)
-            .map(|_| Vec::with_capacity(avg_cap))
-            .collect();
-        let mut local_batch = Vec::with_capacity(avg_cap);
+        let mut remote_batches = self.mset_batch_pool.borrow_mut().pop().unwrap_or_else(|| {
+            (0..self.num_shards).map(|_| Vec::new()).collect()
+        });
+        let mut local_batch = Vec::with_capacity(pairs.len().min(16));
         let mut has_remote = false;
 
         {
@@ -981,12 +986,14 @@ impl Router {
 
         // Fast path: all pairs are local
         if !has_remote {
+            self.mset_batch_pool.borrow_mut().push(remote_batches);
             return;
         }
 
         let channel_set = self.acquire_mset_channels();
         let mut sent_mask: u64 = 0;
-        for (target_shard, items) in remote_batches.into_iter().enumerate() {
+        for target_shard in 0..self.num_shards {
+            let items = std::mem::take(&mut remote_batches[target_shard]);
             if !items.is_empty() {
                 let (tx, _) = &channel_set[target_shard];
                 let msg = ShardMessage::Mset {
@@ -998,6 +1005,7 @@ impl Router {
                 }
             }
         }
+        self.mset_batch_pool.borrow_mut().push(remote_batches);
 
         let mut remaining_mask = sent_mask;
         for _ in 0..128 {
@@ -2386,6 +2394,91 @@ mod tests {
             let resp2 = router.execute_remote(1, Command::Ping(None)).await;
             assert_eq!(resp2, b"+PONG\r\n");
             assert_eq!(router.remote_responder_pool.borrow().len(), 1);
+        });
+    }
+
+    #[test]
+    fn test_router_mget_mset_batch_pool_reuse() {
+        let (tx0, _rx0) = flume::unbounded();
+        let (tx1, rx1) = flume::unbounded();
+
+        let db0 = Rc::new(RefCell::new(ShardDb::new(9996)));
+        let senders = vec![tx0, tx1];
+        let router = Router::new(
+            0,
+            2,
+            9996,
+            db0.clone(),
+            senders,
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+
+        let mut k_shard0 = None;
+        let mut k_shard1 = None;
+        for i in 0..1000 {
+            let k = Bytes::from(format!("batch_pool_k_{}", i));
+            if target_shard(&k, 2) == 0 && k_shard0.is_none() {
+                k_shard0 = Some(k);
+            } else if target_shard(&k, 2) == 1 && k_shard1.is_none() {
+                k_shard1 = Some(k);
+            }
+            if k_shard0.is_some() && k_shard1.is_some() {
+                break;
+            }
+        }
+        let k0 = k_shard0.unwrap();
+        let k1 = k_shard1.unwrap();
+        let rx1_clone = rx1.clone();
+
+        std::thread::spawn(move || {
+            let mut remote_db = ShardDb::new(9996);
+            while let Ok(msg) = rx1_clone.recv() {
+                match msg {
+                    ShardMessage::Mget { keys, responder } => {
+                        let mut res = Vec::new();
+                        for (idx, k) in keys {
+                            let val = remote_db.get(&k);
+                            res.push((idx, val));
+                        }
+                        let _ = responder.send(res);
+                    }
+                    ShardMessage::Mset { pairs, responder } => {
+                        for (k, v) in pairs {
+                            remote_db.set(k, v, None);
+                        }
+                        let _ = responder.send(());
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async move {
+            assert_eq!(router.mset_batch_pool.borrow().len(), 0);
+            assert_eq!(router.mget_batch_pool.borrow().len(), 0);
+
+            // MSET scattered
+            router.mset(vec![(k0.clone(), Bytes::from("v0")), (k1.clone(), Bytes::from("v1"))]).await;
+            assert_eq!(router.mset_batch_pool.borrow().len(), 1);
+
+            router.mset(vec![(k0.clone(), Bytes::from("v0_new")), (k1.clone(), Bytes::from("v1_new"))]).await;
+            assert_eq!(router.mset_batch_pool.borrow().len(), 1);
+
+            // MGET scattered
+            let res1 = router.mget(vec![k0.clone(), k1.clone()]).await;
+            assert_eq!(res1, vec![Some(Bytes::from("v0_new")), Some(Bytes::from("v1_new"))]);
+            assert_eq!(router.mget_batch_pool.borrow().len(), 1);
+
+            let res2 = router.mget(vec![k0.clone(), k1.clone()]).await;
+            assert_eq!(res2, vec![Some(Bytes::from("v0_new")), Some(Bytes::from("v1_new"))]);
+            assert_eq!(router.mget_batch_pool.borrow().len(), 1);
         });
     }
 }
