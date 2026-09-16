@@ -1308,6 +1308,40 @@ pub fn parse_command(buf: &mut BytesMut) -> Result<Option<Command>, String> {
     }
 }
 
+#[inline]
+pub fn parse_decimal_bytes(bytes: &[u8]) -> Option<usize> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut val: usize = 0;
+    for &b in bytes {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        val = val.checked_mul(10)?.checked_add((b - b'0') as usize)?;
+    }
+    Some(val)
+}
+
+#[inline]
+pub fn bytes_to_uppercase_ascii<'a>(
+    bytes: &'a [u8],
+    buf: &'a mut [u8; 64],
+    heap: &'a mut String,
+) -> &'a str {
+    if bytes.len() <= 64 && bytes.is_ascii() {
+        for (i, b) in bytes.iter().enumerate() {
+            buf[i] = b.to_ascii_uppercase();
+        }
+        // SAFETY: All input bytes were ASCII, and ASCII uppercase preserves ASCII values (< 128),
+        // which are guaranteed to be valid UTF-8.
+        unsafe { std::str::from_utf8_unchecked(&buf[..bytes.len()]) }
+    } else {
+        *heap = String::from_utf8_lossy(bytes).to_uppercase();
+        heap.as_str()
+    }
+}
+
 fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
     let newline_pos = match find_crlf(buf) {
         Some(pos) => pos,
@@ -1315,10 +1349,7 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
     };
 
     let line = &buf[1..newline_pos];
-    let num_args: usize = match std::str::from_utf8(line)
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
+    let num_args: usize = match parse_decimal_bytes(line) {
         Some(n) => n,
         None => return Err("Invalid array length in RESP frame".to_string()),
     };
@@ -1340,10 +1371,7 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
         };
 
         let len_str = &buf[scan_cursor + 1..next_crlf];
-        let arg_len: usize = match std::str::from_utf8(len_str)
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-        {
+        let arg_len: usize = match parse_decimal_bytes(len_str) {
             Some(len) => len,
             None => return Err("Invalid bulk string length".to_string()),
         };
@@ -1368,10 +1396,10 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
 
     for _ in 0..num_args {
         let header_crlf = find_crlf(buf).unwrap();
-        let arg_len: usize = std::str::from_utf8(&buf[1..header_crlf])
-            .unwrap()
-            .parse()
-            .unwrap();
+        let arg_len: usize = match parse_decimal_bytes(&buf[1..header_crlf]) {
+            Some(len) => len,
+            None => return Err("Invalid bulk string length".to_string()),
+        };
 
         buf.advance(header_crlf + 2); // Consume "$len\r\n"
         let data = buf.split_to(arg_len).freeze(); // Zero-copy slice!
@@ -1409,9 +1437,11 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
         return Ok(None);
     }
 
-    let cmd_name = String::from_utf8_lossy(&args[0]).to_uppercase();
+    let mut cmd_buf = [0u8; 64];
+    let mut cmd_heap = String::new();
+    let cmd_name = bytes_to_uppercase_ascii(&args[0], &mut cmd_buf, &mut cmd_heap);
 
-    match cmd_name.as_str() {
+    match cmd_name {
         "AUTH" => {
             if args.len() == 2 {
                 let password = String::from_utf8_lossy(&args[1]).to_string();
@@ -3120,7 +3150,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     return Err("syntax error".to_string());
                 }
             }
-            match cmd_name.as_str() {
+            match cmd_name {
                 "SINTERCARD" => Ok(Some(Command::Sintercard { keys, limit })),
                 "SUNIONCARD" => Ok(Some(Command::Sunioncard { keys, limit })),
                 _ => Ok(Some(Command::Sdiffcard { keys, limit })),
@@ -7501,7 +7531,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             Ok(Some(Command::XdpPacket(args[1].clone())))
         }
-        _ => Ok(Some(Command::Unknown(cmd_name))),
+        _ => Ok(Some(Command::Unknown(cmd_name.to_string()))),
     }
 }
 
@@ -8279,4 +8309,43 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn test_parse_decimal_bytes_and_ascii_uppercase() {
+        // Decimal parsing
+        assert_eq!(parse_decimal_bytes(b"0"), Some(0));
+        assert_eq!(parse_decimal_bytes(b"42"), Some(42));
+        assert_eq!(parse_decimal_bytes(b"1048576"), Some(1048576));
+        assert_eq!(parse_decimal_bytes(b""), None);
+        assert_eq!(parse_decimal_bytes(b"-1"), None);
+        assert_eq!(parse_decimal_bytes(b"abc"), None);
+
+        // ASCII uppercase
+        let mut buf = [0u8; 64];
+        let mut heap = String::new();
+        assert_eq!(bytes_to_uppercase_ascii(b"get", &mut buf, &mut heap), "GET");
+        assert_eq!(bytes_to_uppercase_ascii(b"SeT", &mut buf, &mut heap), "SET");
+        assert_eq!(bytes_to_uppercase_ascii(b"mget", &mut buf, &mut heap), "MGET");
+
+        // Command parsing through RESP array
+        let mut buf = BytesMut::from("*2\r\n$3\r\nget\r\n$3\r\nfoo\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(cmd, Command::Get(Bytes::from_static(b"foo")));
+
+        let mut buf = BytesMut::from("*3\r\n$3\r\nSET\r\n$3\r\nbar\r\n$3\r\nbaz\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        match cmd {
+            Command::Set { key, value, .. } => {
+                assert_eq!(key, Bytes::from_static(b"bar"));
+                assert_eq!(value, Bytes::from_static(b"baz"));
+            }
+            _ => panic!("Expected Set command"),
+        }
+
+        // Unknown command
+        let mut buf = BytesMut::from("*1\r\n$7\r\nunknown\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(cmd, Command::Unknown("UNKNOWN".to_string()));
+    }
 }
+

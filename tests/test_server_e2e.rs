@@ -6459,6 +6459,32 @@ fn test_mget_mset_in_place_recycling_scattered_e2e() {
     }
 }
 
+#[test]
+fn test_zero_alloc_command_dispatch_and_mixed_case_e2e() {
+    let port = 16472;
+    start_test_server(port, 4);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Lowercase commands via RESP
+    let resp = send_and_read(&mut client, b"*3\r\n$3\r\nset\r\n$7\r\nmykey01\r\n$8\r\nval_zero\r\n");
+    assert_eq!(resp, "+OK\r\n");
+
+    let resp = send_and_read(&mut client, b"*2\r\n$3\r\nget\r\n$7\r\nmykey01\r\n");
+    assert_eq!(resp, "$8\r\nval_zero\r\n");
+
+    // 2. Mixed-case commands
+    let resp = send_and_read(&mut client, b"*3\r\n$3\r\nSeT\r\n$7\r\nmykey02\r\n$7\r\nval_two\r\n");
+    assert_eq!(resp, "+OK\r\n");
+
+    let resp = send_and_read(&mut client, b"*2\r\n$3\r\nGeT\r\n$7\r\nmykey02\r\n");
+    assert_eq!(resp, "$7\r\nval_two\r\n");
+
+    // 3. Pipelined mix of commands
+    let pipeline = b"*3\r\n$3\r\nSET\r\n$2\r\np1\r\n$2\r\nv1\r\n*3\r\n$3\r\nset\r\n$2\r\np2\r\n$2\r\nv2\r\n*2\r\n$3\r\nget\r\n$2\r\np1\r\n*2\r\n$3\r\nGET\r\n$2\r\np2\r\n";
+    let resp = send_and_read(&mut client, pipeline);
+    assert_eq!(resp, "+OK\r\n+OK\r\n$2\r\nv1\r\n$2\r\nv2\r\n");
+}
+
 
 
 
