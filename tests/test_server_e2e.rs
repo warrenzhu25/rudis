@@ -7040,6 +7040,47 @@ fn test_panic_isolation_resilience_e2e() {
     assert!(prom_str.contains("rudis_isolated_panics_total 1"), "Expected rudis_isolated_panics_total 1 in Prometheus metrics");
 }
 
+#[test]
+fn test_multikey_acl_and_crossslot_enforcement_e2e() {
+    let port = 16735;
+    start_test_server(port, 2);
+
+    let mut admin = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    assert_eq!(send_and_read(&mut admin, b"SET allowed:1 v1\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut admin, b"SET allowed:2 v2\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut admin, b"SET secret:99 secret_value\r\n"), "+OK\r\n");
+
+    // Configure user 'restricted' with access only to ~allowed:*
+    assert_eq!(
+        send_and_read(&mut admin, b"ACL SETUSER restricted on >secpass +@all ~allowed:*\r\n"),
+        "+OK\r\n"
+    );
+
+    let mut user = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    assert_eq!(send_and_read(&mut user, b"AUTH restricted secpass\r\n"), "+OK\r\n");
+
+    // Permitted: MGET with all allowed keys
+    assert_eq!(
+        send_and_read(&mut user, b"MGET allowed:1 allowed:2\r\n"),
+        "*2\r\n$2\r\nv1\r\n$2\r\nv2\r\n"
+    );
+
+    // Rejected: MGET where first key is allowed, but second key is forbidden
+    let mget_resp = send_and_read(&mut user, b"MGET allowed:1 secret:99\r\n");
+    assert!(mget_resp.starts_with("-NOPERM"), "Expected -NOPERM on MGET with forbidden key, got {}", mget_resp);
+
+    // Rejected: DEL where first key is allowed, but second key is forbidden
+    let del_resp = send_and_read(&mut user, b"DEL allowed:1 secret:99\r\n");
+    assert!(del_resp.starts_with("-NOPERM"), "Expected -NOPERM on DEL with forbidden key, got {}", del_resp);
+
+    // Rejected: MSET where second key is forbidden
+    let mset_resp = send_and_read(&mut user, b"MSET allowed:1 new1 secret:99 newsecret\r\n");
+    assert!(mset_resp.starts_with("-NOPERM"), "Expected -NOPERM on MSET with forbidden key, got {}", mset_resp);
+
+    // Verify secret:99 was never modified
+    assert_eq!(send_and_read(&mut admin, b"GET secret:99\r\n"), "$12\r\nsecret_value\r\n");
+}
+
 
 
 

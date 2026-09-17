@@ -3068,13 +3068,13 @@ async fn execute_command(
                 );
                 return false;
             }
-            if let Some(key) = cmd_primary_key(&cmd)
-                && !user.can_access_key(key.as_ref())
-            {
-                out.extend_from_slice(
-                    b"-NOPERM this user has no permissions to access one of the keys used as arguments\r\n",
-                );
-                return false;
+            for key in cmd_keys(&cmd) {
+                if !user.can_access_key(key) {
+                    out.extend_from_slice(
+                        b"-NOPERM this user has no permissions to access one of the keys used as arguments\r\n",
+                    );
+                    return false;
+                }
             }
         }
     }
@@ -3087,6 +3087,23 @@ async fn execute_command(
 
     let is_asking = *asking;
     *asking = false;
+
+    if router.cluster_enabled
+        || crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        let keys = cmd_keys(&cmd);
+        if keys.len() > 1 {
+            let first_slot = key_slot(keys[0]);
+            for k in &keys[1..] {
+                if key_slot(k) != first_slot {
+                    out.extend_from_slice(
+                        b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                    );
+                    return false;
+                }
+            }
+        }
+    }
 
     if let Some(key) = cmd_primary_key(&cmd) {
         let slot = key_slot(key);
@@ -11966,31 +11983,46 @@ async fn execute_commands_squashed(
                 can_squash = false;
                 break;
             }
+            let cmd_keys_list = cmd_keys(cmd);
             if let Some(user) = &user {
                 let cmd_name = get_cmd_name(cmd);
                 if !user.can_execute_command(cmd_name) {
                     can_squash = false;
                     break;
                 }
-                if let Some(k) = cmd_primary_key(cmd)
-                    && !user.can_access_key(k.as_ref())
-                {
+                if cmd_keys_list.iter().any(|k| !user.can_access_key(k)) {
                     can_squash = false;
                     break;
                 }
             }
-            if let Some(k) = cmd_primary_key(cmd) {
-                let slot = key_slot(k);
-                if router.slot_states.borrow()[slot as usize] != crate::shard::SlotState::Stable {
-                    can_squash = false;
-                    break;
-                }
-                if let Some(my_slots) = &my_slots_guard {
-                    let owns_slot = my_slots.iter().any(|&(s, e)| slot >= s && slot <= e);
-                    if !owns_slot {
+            if !cmd_keys_list.is_empty() {
+                let is_cluster = router.cluster_enabled
+                    || crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed);
+                if is_cluster && cmd_keys_list.len() > 1 {
+                    let first_slot = key_slot(cmd_keys_list[0]);
+                    if cmd_keys_list[1..].iter().any(|k| key_slot(k) != first_slot) {
                         can_squash = false;
                         break;
                     }
+                }
+                let mut invalid_slot = false;
+                for k in &cmd_keys_list {
+                    let slot = key_slot(k);
+                    if router.slot_states.borrow()[slot as usize] != crate::shard::SlotState::Stable {
+                        invalid_slot = true;
+                        break;
+                    }
+                    if let Some(my_slots) = &my_slots_guard {
+                        let owns_slot = my_slots.iter().any(|&(s, e)| slot >= s && slot <= e);
+                        if !owns_slot {
+                            invalid_slot = true;
+                            break;
+                        }
+                    }
+                }
+                if invalid_slot {
+                    can_squash = false;
+                    break;
                 }
             } else if !matches!(
                 cmd,
@@ -12538,6 +12570,24 @@ mod tests {
         let initial = get_isolated_panics();
         inc_isolated_panics();
         assert_eq!(get_isolated_panics(), initial + 1);
+    }
+
+    #[test]
+    fn test_cmd_keys_multi_key_acl_coverage() {
+        let mget = Command::Mget(vec![Bytes::from("k1"), Bytes::from("k2"), Bytes::from("k3")]);
+        assert_eq!(cmd_keys(&mget), vec![b"k1", b"k2", b"k3"]);
+
+        let mset = Command::Mset(vec![
+            (Bytes::from("k1"), Bytes::from("v1")),
+            (Bytes::from("k2"), Bytes::from("v2")),
+        ]);
+        assert_eq!(cmd_keys(&mset), vec![b"k1", b"k2"]);
+
+        let del = Command::Del(vec![Bytes::from("d1"), Bytes::from("d2")]);
+        assert_eq!(cmd_keys(&del), vec![b"d1", b"d2"]);
+
+        let sinter = Command::Sinter(vec![Bytes::from("s1"), Bytes::from("s2")]);
+        assert_eq!(cmd_keys(&sinter), vec![b"s1", b"s2"]);
     }
 }
 
