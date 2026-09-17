@@ -6949,6 +6949,31 @@ fn test_linux_kernel_syscheck_e2e() {
     rudis::syscheck::print_sanity_warnings(&report);
 }
 
+#[test]
+fn test_prometheus_telemetry_metrics_e2e() {
+    let port = 16725;
+    start_test_server(port, 1);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    assert_eq!(send_and_read(&mut client, b"PING\r\n"), "+PONG\r\n");
+
+    client.write_all(b"INFO metrics\r\n").unwrap();
+    let mut buf = [0u8; 4096];
+    let n = client.read(&mut buf).unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(resp.contains("rudis_connected_clients"));
+    assert!(resp.contains("rudis_used_memory_bytes"));
+    assert!(resp.contains("rudis_max_clients"));
+
+    let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client2.write_all(b"INFO prometheus\r\n").unwrap();
+    let mut buf2 = [0u8; 4096];
+    let n2 = client2.read(&mut buf2).unwrap();
+    let resp_prom = String::from_utf8_lossy(&buf2[..n2]);
+    assert!(resp_prom.contains("rudis_connected_clients"));
+    assert!(resp_prom.contains("rudis_expired_keys_total"));
+}
+
 
 
 

@@ -3759,16 +3759,18 @@ async fn execute_command(
                     .load(std::sync::atomic::Ordering::Relaxed),
             );
             let stats_str = format!(
-                "# Stats\r\ntotal_connections_received:0\r\ntotal_commands_processed:0\r\ninstantaneous_ops_per_sec:0\r\ntotal_net_input_bytes:0\r\ntotal_net_output_bytes:0\r\ninstantaneous_input_kbps:0.00\r\ninstantaneous_output_kbps:0.00\r\nrejected_connections:0\r\nsync_full:0\r\nsync_partial_ok:0\r\nsync_partial_err:0\r\nexpired_keys:{}\r\nevicted_keys:0\r\nkeyspace_hits:0\r\nkeyspace_misses:0\r\npubsub_channels:0\r\npubsub_patterns:0\r\nlatest_fork_usec:0\r\n",
-                crate::table::get_expired_keys()
+                "# Stats\r\ntotal_connections_received:0\r\ntotal_commands_processed:0\r\ninstantaneous_ops_per_sec:0\r\ntotal_net_input_bytes:0\r\ntotal_net_output_bytes:0\r\ninstantaneous_input_kbps:0.00\r\ninstantaneous_output_kbps:0.00\r\nrejected_connections:0\r\nsync_full:0\r\nsync_partial_ok:0\r\nsync_partial_err:0\r\nexpired_keys:{}\r\nevicted_keys:{}\r\nkeyspace_hits:0\r\nkeyspace_misses:0\r\npubsub_channels:0\r\npubsub_patterns:0\r\nlatest_fork_usec:0\r\n",
+                crate::table::get_expired_keys(),
+                crate::table::get_evicted_keys()
             );
             let blocked_clients_count = {
                 let hub_arc = crate::block::get_block_hub_for_port(router.port);
                 hub_arc.lock().unwrap().blocked_clients_count()
             };
             let clients_str = format!(
-                "# Clients\r\nconnected_clients:{}\r\nblocked_clients:{}\r\ntracking_clients:0\r\n",
-                client_registry.borrow().len(),
+                "# Clients\r\nconnected_clients:{}\r\nmaxclients:{}\r\nblocked_clients:{}\r\ntracking_clients:0\r\n",
+                get_active_clients(),
+                get_max_clients(),
                 blocked_clients_count
             );
             let persistence_str = format!(
@@ -3800,6 +3802,9 @@ async fn execute_command(
                 Some(b"memory") | Some(b"MEMORY") => memory_str,
                 Some(b"stats") | Some(b"STATS") => stats_str,
                 Some(b"commandstats") | Some(b"COMMANDSTATS") => cmdstat_str,
+                Some(b"metrics") | Some(b"METRICS") | Some(b"prometheus") | Some(b"PROMETHEUS") => {
+                    crate::telemetry::format_prometheus_metrics(router.port, used_mem)
+                }
                 _ => {
                     format!(
                         "# Server\r\nrudis_version:0.1.0\r\narch:shared-nothing-io_uring\r\nshard_id:{}\r\nnum_shards:{}\r\n\

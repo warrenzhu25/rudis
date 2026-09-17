@@ -24,6 +24,7 @@ pub mod shard;
 pub mod shutdown;
 pub mod syscheck;
 pub mod table;
+pub mod telemetry;
 pub mod tiering;
 pub mod tls;
 pub mod vector;

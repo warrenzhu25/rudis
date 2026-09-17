@@ -64,6 +64,7 @@ struct Args {
 }
 
 fn main() {
+    rudis::telemetry::init_telemetry();
     rudis::shutdown::install_signal_handlers();
     let args = Args::parse();
 
