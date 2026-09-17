@@ -6,6 +6,7 @@ pub mod aof;
 
 pub mod block;
 pub mod cluster;
+pub mod config;
 pub mod connection;
 pub mod crdt;
 pub mod geo;

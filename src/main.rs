@@ -10,33 +10,37 @@ use rudis::server::run_shard_worker;
     about = "Multi-threaded Shared-Nothing Redis in Rust based on io_uring"
 )]
 struct Args {
+    /// Path to configuration file (e.g. rudis.conf or redis.conf)
+    #[arg(short = 'c', long)]
+    config: Option<std::path::PathBuf>,
+
     /// Port to listen on
-    #[arg(short, long, default_value_t = 6379)]
-    port: u16,
+    #[arg(short, long)]
+    port: Option<u16>,
 
     /// Number of worker threads / shards (defaults to number of CPU cores)
     #[arg(short, long)]
     threads: Option<usize>,
 
     /// Enable Append-Only File (AOF) persistence
-    #[arg(long, default_value_t = false)]
-    aof: bool,
+    #[arg(long)]
+    aof: Option<bool>,
 
     /// Directory to store AOF files
-    #[arg(long, default_value = ".")]
-    aof_dir: std::path::PathBuf,
+    #[arg(long)]
+    aof_dir: Option<std::path::PathBuf>,
 
     /// Max memory limit for tiered storage auto-tiering (e.g. 512mb, 1gb)
     #[arg(long)]
     maxmemory: Option<String>,
 
     /// Offload memory threshold percentage (default: 60)
-    #[arg(long, default_value_t = 60)]
-    tiered_offload_threshold: u64,
+    #[arg(long)]
+    tiered_offload_threshold: Option<u64>,
 
     /// Upload streaming memory threshold percentage (default: 80)
-    #[arg(long, default_value_t = 80)]
-    tiered_upload_threshold: u64,
+    #[arg(long)]
+    tiered_upload_threshold: Option<u64>,
 
     /// Disable CPU core affinity pinning
     #[arg(long, default_value_t = false)]
@@ -55,21 +59,46 @@ struct Args {
     tls_key_file: Option<std::path::PathBuf>,
 
     /// Enable Redis Cluster mode with per-shard direct routing (e.g. --cluster-enabled yes)
-    #[arg(long, default_value = "no")]
-    cluster_enabled: String,
+    #[arg(long)]
+    cluster_enabled: Option<String>,
 }
 
 fn main() {
     rudis::shutdown::install_signal_handlers();
     let args = Args::parse();
 
-    if let Some(ref m) = args.maxmemory
-        && let Some(bytes) = rudis::tiering::parse_memory_bytes(m)
-    {
-        rudis::tiering::set_max_memory(args.port, bytes);
+    // 1. Load initial config from file if provided, else use defaults
+    let mut server_config = if let Some(ref config_path) = args.config {
+        rudis::config::RudisConfig::load_file(config_path)
+            .unwrap_or_else(|e| panic!("Failed to load config file {:?}: {}", config_path, e))
+    } else {
+        rudis::config::RudisConfig::default()
+    };
+
+    // 2. Merge CLI overrides
+    let cluster_opt = args.cluster_enabled.as_ref().map(|s| {
+        matches!(s.to_lowercase().as_str(), "yes" | "true" | "1")
+    });
+    server_config.merge_cli(
+        args.port,
+        args.threads,
+        args.aof,
+        args.aof_dir,
+        args.maxmemory,
+        args.tiered_offload_threshold,
+        args.tiered_upload_threshold,
+        args.tls_port,
+        args.tls_cert_file,
+        args.tls_key_file,
+        cluster_opt,
+    );
+
+    let port = server_config.port;
+    if let Some(bytes) = server_config.maxmemory_bytes {
+        rudis::tiering::set_max_memory(port, bytes);
     }
-    rudis::tiering::set_offload_threshold_pct(args.port, args.tiered_offload_threshold);
-    rudis::tiering::set_upload_threshold_pct(args.port, args.tiered_upload_threshold);
+    rudis::tiering::set_offload_threshold_pct(port, server_config.tiered_offload_threshold);
+    rudis::tiering::set_upload_threshold_pct(port, server_config.tiered_upload_threshold);
 
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
     let num_cores = if !core_ids.is_empty() {
@@ -80,15 +109,11 @@ fn main() {
             .unwrap_or(1)
     };
 
-    let num_shards = args.threads.unwrap_or_else(|| num_cores.min(8));
+    let num_shards = server_config.threads.unwrap_or_else(|| num_cores.min(8));
 
-    let cluster_enabled = matches!(
-        args.cluster_enabled.to_lowercase().as_str(),
-        "yes" | "true" | "1"
-    );
-
+    let cluster_enabled = server_config.cluster_enabled;
     if cluster_enabled {
-        let hub = rudis::cluster::get_cluster_hub(args.port);
+        let hub = rudis::cluster::get_cluster_hub(port);
         hub.cluster_enabled
             .store(true, std::sync::atomic::Ordering::Release);
         hub.num_shards
@@ -96,13 +121,13 @@ fn main() {
     }
 
     let aof_config = rudis::aof::AofConfig {
-        enabled: args.aof,
-        dir: args.aof_dir,
+        enabled: server_config.appendonly,
+        dir: server_config.dir.clone(),
         fsync_every_sec: true,
     };
 
-    let tls_config = if let Some(tls_port) = args.tls_port {
-        let server_config = match (&args.tls_cert_file, &args.tls_key_file) {
+    let tls_config = if let Some(tls_port) = server_config.tls_port {
+        let server_config_tls = match (&server_config.tls_cert_file, &server_config.tls_key_file) {
             (Some(cert_path), Some(key_path)) => {
                 rudis::tls::load_certs_and_key_from_files(cert_path, key_path)
                     .expect("Failed to load TLS cert/key files")
@@ -119,7 +144,7 @@ fn main() {
         };
         Some(rudis::tls::TlsWorkerConfig {
             tls_port,
-            server_config,
+            server_config: server_config_tls,
         })
     } else {
         None
@@ -129,7 +154,7 @@ fn main() {
     println!("  rudis v0.1.0 (Redis in Rust)");
     println!("  Architecture: Multi-threaded Shared-Nothing (Thread-per-Core)");
     println!("  I/O Backend:  Linux io_uring (Monoio)");
-    println!("  Listening:    0.0.0.0:{}", args.port);
+    println!("  Listening:    0.0.0.0:{}", port);
     if let Some(ref tls_cfg) = tls_config {
         println!("  TLS Port:     0.0.0.0:{}", tls_cfg.tls_port);
     }
@@ -140,8 +165,8 @@ fn main() {
     if cluster_enabled {
         println!(
             "  Cluster Mode: ENABLED (Per-shard ports: {}-{})",
-            args.port,
-            args.port + num_shards as u16 - 1
+            port,
+            port + num_shards as u16 - 1
         );
     }
     println!(
@@ -160,7 +185,6 @@ fn main() {
     let mut handles = Vec::with_capacity(num_shards);
 
     for (shard_id, rx) in receivers.into_iter().enumerate() {
-        let port = args.port;
         let shard_senders = senders_mesh[shard_id].clone();
         let shard_aof_config = aof_config.clone();
         let shard_tls_config = tls_config.clone();

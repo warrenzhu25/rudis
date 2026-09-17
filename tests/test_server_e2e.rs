@@ -6828,6 +6828,54 @@ fn test_graceful_shutdown_command_and_worker_exit_e2e() {
     rudis::shutdown::reset_shutdown();
 }
 
+#[test]
+fn test_config_file_loading_and_cli_merge_e2e() {
+    let temp_dir = std::env::temp_dir();
+    let conf_path = temp_dir.join(format!("rudis_test_{}.conf", std::process::id()));
+    let conf_content = r#"
+    # Test redis.conf style configuration
+    port 16715
+    threads 2
+    maxmemory 256mb
+    tiered-offload-threshold 65
+    tiered-upload-threshold 85
+    appendonly yes
+    "#;
+    std::fs::write(&conf_path, conf_content).expect("Failed to write temp conf");
+
+    let mut cfg = rudis::config::RudisConfig::load_file(&conf_path).expect("Failed to load conf");
+    assert_eq!(cfg.port, 16715);
+    assert_eq!(cfg.threads, Some(2));
+    assert_eq!(cfg.maxmemory.as_deref(), Some("256mb"));
+    assert_eq!(cfg.maxmemory_bytes, Some(256 * 1024 * 1024));
+    assert_eq!(cfg.tiered_offload_threshold, 65);
+    assert_eq!(cfg.tiered_upload_threshold, 85);
+    assert!(cfg.appendonly);
+
+    // Test CLI overrides take precedence
+    cfg.merge_cli(
+        Some(16716),
+        Some(1),
+        None,
+        None,
+        Some("512mb".to_string()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(cfg.port, 16716);
+    assert_eq!(cfg.threads, Some(1));
+    assert_eq!(cfg.maxmemory.as_deref(), Some("512mb"));
+    assert_eq!(cfg.maxmemory_bytes, Some(512 * 1024 * 1024));
+    assert!(cfg.appendonly); // preserved from file
+
+    // Cleanup
+    let _ = std::fs::remove_file(conf_path);
+}
+
 
 
 
