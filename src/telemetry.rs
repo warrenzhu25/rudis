@@ -27,6 +27,7 @@ pub fn format_prometheus_metrics(port: u16, total_used_memory: usize) -> String 
     let evicted = crate::table::get_evicted_keys();
     let active_clients = crate::connection::get_active_clients();
     let max_clients = crate::connection::get_max_clients();
+    let isolated_panics = crate::connection::get_isolated_panics();
 
     format!(
         "# HELP rudis_connected_clients Current active client connections\n\
@@ -35,6 +36,9 @@ pub fn format_prometheus_metrics(port: u16, total_used_memory: usize) -> String 
          # HELP rudis_max_clients Configured max client connections\n\
          # TYPE rudis_max_clients gauge\n\
          rudis_max_clients {}\n\
+         # HELP rudis_isolated_panics_total Total count of panics caught and isolated\n\
+         # TYPE rudis_isolated_panics_total counter\n\
+         rudis_isolated_panics_total {}\n\
          # HELP rudis_used_memory_bytes Total RAM memory in bytes used by keyspace\n\
          # TYPE rudis_used_memory_bytes gauge\n\
          rudis_used_memory_bytes {}\n\
@@ -58,6 +62,7 @@ pub fn format_prometheus_metrics(port: u16, total_used_memory: usize) -> String 
          rudis_ram_misses_total {}\n",
         active_clients,
         max_clients,
+        isolated_panics,
         total_used_memory,
         max_mem,
         expired,
@@ -86,5 +91,6 @@ mod tests {
         assert!(metrics.contains("rudis_used_memory_bytes 1048576"));
         assert!(metrics.contains("rudis_expired_keys_total"));
         assert!(metrics.contains("rudis_evicted_keys_total"));
+        assert!(metrics.contains("rudis_isolated_panics_total"));
     }
 }

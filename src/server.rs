@@ -1,8 +1,33 @@
 use socket2::{Domain, Protocol, Socket, Type};
 use std::cell::RefCell;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
+use std::task::{Context, Poll};
+
+pub struct CatchUnwind<F> {
+    inner: F,
+}
+
+pub fn catch_unwind_async<F: Future>(f: F) -> CatchUnwind<F> {
+    CatchUnwind { inner: f }
+}
+
+impl<F: Future> Future for CatchUnwind<F> {
+    type Output = Result<F::Output, Box<dyn std::any::Any + Send + 'static>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = unsafe { Pin::new_unchecked(&mut self.get_unchecked_mut().inner) };
+        match std::panic::catch_unwind(AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(Poll::Ready(val)) => Poll::Ready(Ok(val)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(e) => Poll::Ready(Err(e)),
+        }
+    }
+}
 
 use crate::connection::{execute_local_command, handle_connection};
 use crate::resp::Command;
@@ -970,26 +995,33 @@ pub fn run_shard_worker(
                             let reg_clone = reg.clone();
                             let s_cfg = tls_cfg.server_config.clone();
                             monoio::spawn(async move {
-                                let mut session = match crate::tls::TlsSession::new(s_cfg) {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        eprintln!("[Shard {}] Failed to create TlsSession: {}", shard_id, e);
+                                let res = catch_unwind_async(async move {
+                                    let mut session = match crate::tls::TlsSession::new(s_cfg) {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            tracing::error!("[Shard {}] Failed to create TlsSession: {}", shard_id, e);
+                                            return;
+                                        }
+                                    };
+                                    if let Err(e) = session.handshake_monoio(&mut stream).await {
+                                        tracing::warn!("[Shard {}] TLS handshake error: {}", shard_id, e);
                                         return;
                                     }
-                                };
-                                if let Err(e) = session.handshake_monoio(&mut stream).await {
-                                    eprintln!("[Shard {}] TLS handshake error: {}", shard_id, e);
-                                    return;
-                                }
-                                crate::connection::handle_tls_connection(
-                                    stream,
-                                    session,
-                                    client_addr,
-                                    client_id,
-                                    reg_clone,
-                                    router_clone,
-                                )
+                                    crate::connection::handle_tls_connection(
+                                        stream,
+                                        session,
+                                        client_addr,
+                                        client_id,
+                                        reg_clone,
+                                        router_clone,
+                                    )
+                                    .await;
+                                })
                                 .await;
+                                if let Err(e) = res {
+                                    crate::connection::inc_isolated_panics();
+                                    tracing::error!(client_id = client_id, "Panic isolated in TLS client connection: {:?}", e);
+                                }
                             });
                         }
                         Err(e) => {
@@ -1041,7 +1073,14 @@ pub fn run_shard_worker(
                     next_client_id += 1;
                     let reg = client_registry.clone();
                     monoio::spawn(async move {
-                        handle_connection(stream, client_addr, client_id, reg, r).await;
+                        let res = catch_unwind_async(async move {
+                            handle_connection(stream, client_addr, client_id, reg, r).await;
+                        })
+                        .await;
+                        if let Err(e) = res {
+                            crate::connection::inc_isolated_panics();
+                            tracing::error!(client_id = client_id, "Panic isolated in client connection: {:?}", e);
+                        }
                     });
                 }
                 Err(e) => {
@@ -1069,4 +1108,27 @@ pub fn run_shard_worker(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[monoio::test]
+    async fn test_catch_unwind_async_catches_panic() {
+        let fut = catch_unwind_async(async {
+            panic!("deliberate panic for test");
+        });
+        let res = fut.await;
+        assert!(res.is_err());
+    }
+
+    #[monoio::test]
+    async fn test_catch_unwind_async_success() {
+        let fut = catch_unwind_async(async {
+            42
+        });
+        let res = fut.await;
+        assert_eq!(res.unwrap(), 42);
+    }
 }

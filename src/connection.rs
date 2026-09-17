@@ -644,6 +644,18 @@ pub fn get_max_memory_policy() -> String {
     }
 }
 
+pub static ISOLATED_PANICS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+pub fn inc_isolated_panics() {
+    ISOLATED_PANICS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub fn get_isolated_panics() -> u64 {
+    ISOLATED_PANICS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub async fn handle_tls_connection(
     mut stream: TcpStream,
     mut session: crate::tls::TlsSession,
@@ -3768,10 +3780,11 @@ async fn execute_command(
                 hub_arc.lock().unwrap().blocked_clients_count()
             };
             let clients_str = format!(
-                "# Clients\r\nconnected_clients:{}\r\nmaxclients:{}\r\nblocked_clients:{}\r\ntracking_clients:0\r\n",
+                "# Clients\r\nconnected_clients:{}\r\nmaxclients:{}\r\nblocked_clients:{}\r\ntracking_clients:0\r\nisolated_panics:{}\r\n",
                 get_active_clients(),
                 get_max_clients(),
-                blocked_clients_count
+                blocked_clients_count,
+                get_isolated_panics()
             );
             let persistence_str = format!(
                 "# Persistence\r\nloading:0\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:0\r\nrdb_last_save_time:0\r\nrdb_last_bgsave_status:ok\r\n",
@@ -7492,6 +7505,8 @@ async fn execute_command(
                     }
                     out.extend_from_slice(b"+OK\r\n");
                     return false;
+                } else if sub.eq_ignore_ascii_case(b"panic") {
+                    panic!("DEBUG PANIC requested by client");
                 }
             }
             out.extend_from_slice(b"+OK\r\n");
@@ -11706,6 +11721,8 @@ pub fn execute_local_command(
                     }
                     out.extend_from_slice(b"+OK\r\n");
                     return false;
+                } else if sub.eq_ignore_ascii_case(b"panic") {
+                    panic!("DEBUG PANIC requested by client");
                 }
             }
             out.extend_from_slice(b"+OK\r\n");
@@ -12514,6 +12531,13 @@ mod tests {
         let map = CMD_STATS.read().unwrap();
         assert!(map.get("get").copied().unwrap_or(0) >= 2);
         assert!(map.get("set").copied().unwrap_or(0) >= 1);
+    }
+
+    #[test]
+    fn test_isolated_panics_counter() {
+        let initial = get_isolated_panics();
+        inc_isolated_panics();
+        assert_eq!(get_isolated_panics(), initial + 1);
     }
 }
 

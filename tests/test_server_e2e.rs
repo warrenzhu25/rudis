@@ -7001,6 +7001,46 @@ fn test_deployment_configuration_and_service_assets_e2e() {
     assert!(ci_path.exists(), "CI workflow should exist");
 }
 
+#[test]
+fn test_panic_isolation_resilience_e2e() {
+    let port = 16730;
+    start_test_server(port, 1);
+
+    // Initial client connects and sets a key
+    let mut client1 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    assert_eq!(send_and_read(&mut client1, b"SET foo bar\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client1, b"GET foo\r\n"), "$3\r\nbar\r\n");
+
+    // Client sends DEBUG PANIC to deliberately trigger a panic in connection handler
+    let _ = client1.write_all(b"DEBUG PANIC\r\n");
+    // Client1 should be disconnected due to isolated panic
+    let mut buf = [0u8; 128];
+    let n = client1.read(&mut buf).unwrap_or(0);
+    assert_eq!(n, 0, "Client socket should be closed after panic unwinding");
+
+    // Verify server process and shard worker are STILL alive and completely operational!
+    let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    assert_eq!(send_and_read(&mut client2, b"PING\r\n"), "+PONG\r\n");
+    assert_eq!(send_and_read(&mut client2, b"GET foo\r\n"), "$3\r\nbar\r\n");
+    assert_eq!(send_and_read(&mut client2, b"SET baz qux\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client2, b"GET baz\r\n"), "$3\r\nqux\r\n");
+
+    // Check INFO clients shows isolated_panics count increased
+    client2.write_all(b"INFO clients\r\n").unwrap();
+    let mut info_buf = [0u8; 2048];
+    let info_n = client2.read(&mut info_buf).unwrap();
+    let info_str = String::from_utf8_lossy(&info_buf[..info_n]);
+    assert!(info_str.contains("isolated_panics:1"), "Expected isolated_panics:1 in INFO clients");
+
+    // Check INFO prometheus shows rudis_isolated_panics_total
+    client2.write_all(b"INFO prometheus\r\n").unwrap();
+    let mut prom_buf = [0u8; 4096];
+    let prom_n = client2.read(&mut prom_buf).unwrap();
+    let prom_str = String::from_utf8_lossy(&prom_buf[..prom_n]);
+    assert!(prom_str.contains("rudis_isolated_panics_total 1"), "Expected rudis_isolated_panics_total 1 in Prometheus metrics");
+}
+
+
 
 
 
