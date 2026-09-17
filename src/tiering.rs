@@ -73,6 +73,29 @@ impl Default for TieringStats {
     }
 }
 
+impl TieringStats {
+    pub fn reset_counters(&self) {
+        self.tiered_keys.store(0, Ordering::Relaxed);
+        self.tiered_bytes.store(0, Ordering::Relaxed);
+        self.ram_saved_bytes.store(0, Ordering::Relaxed);
+        self.disk_reads.store(0, Ordering::Relaxed);
+        self.disk_writes.store(0, Ordering::Relaxed);
+        self.dead_bytes.store(0, Ordering::Relaxed);
+        self.cooled_keys.store(0, Ordering::Relaxed);
+        self.decommit_count.store(0, Ordering::Relaxed);
+        self.ram_hits.store(0, Ordering::Relaxed);
+        self.ram_misses.store(0, Ordering::Relaxed);
+        self.total_stashes.store(0, Ordering::Relaxed);
+        self.total_fetches.store(0, Ordering::Relaxed);
+        self.total_deletes.store(0, Ordering::Relaxed);
+        self.coalesced_reads.store(0, Ordering::Relaxed);
+        self.bin_pages.store(0, Ordering::Relaxed);
+        self.streaming_reads.store(0, Ordering::Relaxed);
+        self.gc_reclaimed_bytes.store(0, Ordering::Relaxed);
+        self.gc_cycles.store(0, Ordering::Relaxed);
+    }
+}
+
 #[inline]
 pub fn set_max_memory(port: u16, bytes: u64) {
     get_tier_stats(port)
@@ -168,10 +191,18 @@ pub fn get_tier_stats(port: u16) -> Arc<TieringStats> {
         .clone()
 }
 
+/// Resets tiering statistics for the specified port in-place.
+///
+/// CAUTION: `Router` instances hold a cached `Arc<TieringStats>` clone initialized at startup
+/// for zero-lock tiering reads. This function mutates the existing `Arc<TieringStats>` counters
+/// in-place rather than replacing or removing the map entry, ensuring that active `Router`
+/// instances observe the reset and do not keep an orphaned, un-resettable reference.
 pub fn reset_tier_stats(port: u16) {
-    let mut map = TIER_STATS.write().unwrap();
-    if let Some(map) = map.as_mut() {
-        map.remove(&port);
+    if let Ok(guard) = TIER_STATS.read()
+        && let Some(map) = guard.as_ref()
+        && let Some(stats) = map.get(&port)
+    {
+        stats.reset_counters();
     }
 }
 
@@ -883,5 +914,19 @@ mod tests {
         // Finish pending stash relieves backpressure
         op_mgr.finish_pending_stash(&big_key, 17 * 1024 * 1024);
         assert!(!op_mgr.check_write_backpressure());
+    }
+
+    #[test]
+    fn test_reset_tier_stats_in_place() {
+        let port = 64999;
+        let stats = get_tier_stats(port);
+        stats.disk_reads.fetch_add(42, Ordering::Relaxed);
+        stats.ram_hits.fetch_add(10, Ordering::Relaxed);
+        assert_eq!(stats.disk_reads.load(Ordering::Relaxed), 42);
+
+        reset_tier_stats(port);
+
+        assert_eq!(stats.disk_reads.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.ram_hits.load(Ordering::Relaxed), 0);
     }
 }
