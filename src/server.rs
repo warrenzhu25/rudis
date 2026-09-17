@@ -949,7 +949,19 @@ pub fn run_shard_worker(
             monoio::spawn(async move {
                 let mut next_tls_client_id: u64 = ((shard_id as u64) << 48) | 0x8000_0000_0000;
                 loop {
-                    match tls_listener.accept().await {
+                    if crate::shutdown::is_shutting_down() {
+                        break;
+                    }
+                    let accept_res = match monoio::time::timeout(
+                        std::time::Duration::from_millis(200),
+                        tls_listener.accept(),
+                    )
+                    .await
+                    {
+                        Ok(res) => res,
+                        Err(_) => continue,
+                    };
+                    match accept_res {
                         Ok((mut stream, client_addr)) => {
                             let _ = stream.set_nodelay(true);
                             let client_id = next_tls_client_id;
@@ -991,7 +1003,19 @@ pub fn run_shard_worker(
         // 5. Accept loop
         let mut next_client_id: u64 = ((shard_id as u64) << 48) + 1;
         loop {
-            match listener.accept().await {
+            if crate::shutdown::is_shutting_down() {
+                break;
+            }
+            let accept_res = match monoio::time::timeout(
+                std::time::Duration::from_millis(200),
+                listener.accept(),
+            )
+            .await
+            {
+                Ok(res) => res,
+                Err(_) => continue,
+            };
+            match accept_res {
                 Ok((stream, client_addr)) => {
                     let _ = stream.set_nodelay(true);
                     let raw_fd = std::os::unix::io::AsRawFd::as_raw_fd(&stream);
@@ -1023,6 +1047,25 @@ pub fn run_shard_worker(
                 Err(e) => {
                     eprintln!("[Shard {}] Accept error: {}", shard_id, e);
                 }
+            }
+        }
+
+        // 6. Graceful shutdown cleanup: sync AOF and notify
+        if let Some(aof) = aof_writer {
+            let (file, chunk, offset) = {
+                let mut writer = aof.borrow_mut();
+                let file = writer.get_file();
+                if let Some((f, c, o)) = writer.take_flush_chunk() {
+                    (Some(f), c, o)
+                } else {
+                    (file, Vec::new(), 0)
+                }
+            };
+            if let Some(file) = file {
+                if !chunk.is_empty() {
+                    let _ = file.write_all_at(chunk, offset).await;
+                }
+                let _ = file.sync_data().await;
             }
         }
     });

@@ -60,6 +60,7 @@ struct Args {
 }
 
 fn main() {
+    rudis::shutdown::install_signal_handlers();
     let args = Args::parse();
 
     if let Some(ref m) = args.maxmemory
@@ -192,4 +193,5 @@ fn main() {
     for handle in handles {
         let _ = handle.join();
     }
+    println!("rudis server gracefully stopped. Goodbye!");
 }

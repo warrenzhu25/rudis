@@ -2660,6 +2660,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Role => "ROLE",
         Command::Tier(_) => "TIER",
         Command::ConfigGet(_) | Command::ConfigSet(_, _) => "CONFIG",
+        Command::Shutdown { .. } => "SHUTDOWN",
         Command::Quit => "QUIT",
         Command::Subscribe(_) => "SUBSCRIBE",
         Command::Unsubscribe(_) => "UNSUBSCRIBE",
@@ -7303,6 +7304,14 @@ async fn execute_command(
             false
         }
         Command::MemcachedQuit => true,
+        Command::Shutdown { save } => {
+            if save == Some(true) {
+                let _ = router.save_rdb().await;
+            }
+            crate::shutdown::request_shutdown();
+            out.extend_from_slice(b"+OK\r\n");
+            true
+        }
         Command::Quit => {
             out.extend_from_slice(b"+OK\r\n");
             true

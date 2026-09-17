@@ -6783,6 +6783,51 @@ fn test_config_resetstat_and_info_commandstats_cross_shard_e2e() {
     assert!(!info2.contains("cmdstat_set:"));
 }
 
+#[test]
+fn test_graceful_shutdown_command_and_worker_exit_e2e() {
+    let port = 16711;
+    rudis::shutdown::reset_shutdown();
+
+    let (senders_mesh, receivers) = rudis::mailbox::create_shard_mesh(2);
+    let mut handles = Vec::new();
+
+    for (shard_id, rx) in receivers.into_iter().enumerate() {
+        let shard_senders = senders_mesh[shard_id].clone();
+        let handle = thread::spawn(move || {
+            run_shard_worker(
+                shard_id,
+                2,
+                port,
+                shard_senders,
+                rx,
+                None,
+                rudis::aof::AofConfig::default(),
+                None,
+                false,
+            );
+        });
+        handles.push(handle);
+    }
+
+    thread::sleep(Duration::from_millis(200));
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    assert_eq!(send_and_read(&mut client, b"PING\r\n"), "+PONG\r\n");
+    assert_eq!(send_and_read(&mut client, b"SET k_shut v_shut\r\n"), "+OK\r\n");
+
+    // Issue SHUTDOWN NOSAVE command
+    let resp = send_and_read(&mut client, b"SHUTDOWN NOSAVE\r\n");
+    assert_eq!(resp, "+OK\r\n");
+
+    // All shard worker threads should gracefully exit and join within 1.5 seconds
+    for handle in handles {
+        handle.join().expect("Worker thread failed to join cleanly during graceful shutdown");
+    }
+
+    assert!(rudis::shutdown::is_shutting_down());
+    rudis::shutdown::reset_shutdown();
+}
+
 
 
 

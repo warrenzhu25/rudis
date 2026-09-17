@@ -518,6 +518,7 @@ pub enum Command {
     // CONFIG COMMANDS
     ConfigGet(Bytes),
     ConfigSet(Bytes, Bytes),
+    Shutdown { save: Option<bool> },
     Quit,
     // PUBSUB COMMANDS
     Subscribe(Vec<Bytes>),
@@ -4732,6 +4733,21 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
         }
         "QUIT" => Ok(Some(Command::Quit)),
+        "SHUTDOWN" => {
+            let save = if args.len() > 1 {
+                let arg = String::from_utf8_lossy(&args[1]).to_uppercase();
+                if arg == "SAVE" {
+                    Some(true)
+                } else if arg == "NOSAVE" {
+                    Some(false)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            Ok(Some(Command::Shutdown { save }))
+        }
         "SUBSCRIBE" => {
             if args.len() < 2 {
                 return Err("wrong number of arguments for 'subscribe' command".to_string());
