@@ -3865,8 +3865,8 @@ fn test_option3_modern_redis7_features_e2e() {
         "+OK\r\n"
     );
 
-    // Client 1 reads a key to track it
-    assert_eq!(send_and_read(&mut client1, b"GET track_k1\r\n"), "$-1\r\n");
+    // Client 1 reads a key to track it (RESP3 null is _\r\n)
+    assert_eq!(send_and_read(&mut client1, b"GET track_k1\r\n"), "_\r\n");
 
     // Client 2 modifies track_k1
     let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
@@ -6666,6 +6666,71 @@ fn test_cluster_mode_moved_redirection_and_per_shard_ports_e2e() {
     let shards_resp = send_and_read(&mut client0, b"CLUSTER SHARDS\r\n");
     assert!(shards_resp.starts_with("*4\r\n"));
     assert!(shards_resp.contains(&format!(":{}", base_port + 1)));
+}
+
+#[test]
+fn test_resp3_isolation_across_interleaved_clients_e2e() {
+    let port = 16390;
+    start_test_server(port, 1);
+
+    let mut client_resp3 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let mut client_resp2 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. client_resp3 negotiates RESP3
+    let hello_resp = send_and_read(&mut client_resp3, b"HELLO 3\r\n");
+    assert!(hello_resp.starts_with("%") || hello_resp.contains("proto"));
+
+    // 2. client_resp2 sends GET on nonexistent key.
+    // Under RESP2, null is "$-1\r\n". Under RESP3, null is "_\r\n".
+    let get_resp2 = send_and_read(&mut client_resp2, b"GET non_existent_key_resp2\r\n");
+    assert_eq!(
+        get_resp2, "$-1\r\n",
+        "RESP2 client received non-RESP2 null reply: {}",
+        get_resp2
+    );
+
+    // 3. client_resp3 sends GET on nonexistent key and receives RESP3 null "_\r\n"
+    let get_resp3 = send_and_read(&mut client_resp3, b"GET non_existent_key_resp3\r\n");
+    assert_eq!(
+        get_resp3, "_\r\n",
+        "RESP3 client did not receive RESP3 null reply: {}",
+        get_resp3
+    );
+
+    // 4. Interleave: client_resp2 must still receive RESP2 null "$-1\r\n", NOT "_\r\n"
+    let get_resp2_again = send_and_read(&mut client_resp2, b"GET non_existent_key_resp2_again\r\n");
+    assert_eq!(
+        get_resp2_again, "$-1\r\n",
+        "RESP2 client leaked RESP3 protocol mode after interleaved query: {}",
+        get_resp2_again
+    );
+
+    // 5. Test ZRANGE WITHSCORES:
+    // client_resp2 inserts and queries sorted set
+    let _ = send_and_read(&mut client_resp2, b"ZADD my_zset 42.5 member1\r\n");
+    let zrange_resp2 = send_and_read(&mut client_resp2, b"ZRANGE my_zset 0 -1 WITHSCORES\r\n");
+    // Under RESP2, flat array of length 2: *2\r\n...
+    assert!(
+        zrange_resp2.starts_with("*2\r\n"),
+        "RESP2 client did not get flat array: {}",
+        zrange_resp2
+    );
+
+    // client_resp3 queries sorted set: under RESP3, nested array: *1\r\n*2\r\n... with double ,42.5\r\n
+    let zrange_resp3 = send_and_read(&mut client_resp3, b"ZRANGE my_zset 0 -1 WITHSCORES\r\n");
+    assert!(
+        zrange_resp3.starts_with("*1\r\n*2\r\n") && zrange_resp3.contains(",42.5\r\n"),
+        "RESP3 client did not get nested array with double score: {}",
+        zrange_resp3
+    );
+
+    // client_resp2 queries again: must STILL be flat array *2\r\n
+    let zrange_resp2_again = send_and_read(&mut client_resp2, b"ZRANGE my_zset 0 -1 WITHSCORES\r\n");
+    assert!(
+        zrange_resp2_again.starts_with("*2\r\n"),
+        "RESP2 client leaked RESP3 nested array score format: {}",
+        zrange_resp2_again
+    );
 }
 
 

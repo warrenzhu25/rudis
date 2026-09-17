@@ -857,9 +857,6 @@ pub async fn handle_connection(
                         }
                     }
                 }
-                if buf.is_empty() {
-                    buf.clear();
-                }
 
                 // 2. Transition to Pub/Sub mode if SUBSCRIBE or PSUBSCRIBE is received
                 if let Some(sub_idx) = commands
@@ -1201,6 +1198,10 @@ pub async fn handle_connection(
                                     should_quit = true;
                                     break;
                                 }
+                            }
+                            if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                                c.last_active = Instant::now();
+                                c.last_cmd = get_cmd_name(&cmd);
                             }
                             let quit = execute_command(
                                 cmd,
@@ -2963,6 +2964,9 @@ async fn execute_command(
     authenticated: &mut bool,
     auth_user: &mut String,
 ) -> bool {
+    if let Some(client) = client_registry.borrow().get(&client_id) {
+        CURRENT_CLIENT_RESP3.set(client.is_resp3);
+    }
     let cmd_name = get_cmd_name(&cmd);
     record_cmd_stat(cmd_name);
 
@@ -3098,7 +3102,7 @@ async fn execute_command(
                     write_resp_bulk(out, &v);
                 }
                 None => {
-                    out.extend_from_slice(b"$-1\r\n");
+                    write_resp_null(out);
                 }
             }
             false
@@ -11770,6 +11774,9 @@ async fn execute_commands_squashed(
     authenticated: &mut bool,
     auth_user: &mut String,
 ) -> bool {
+    if let Some(client) = client_registry.borrow().get(&client_id) {
+        CURRENT_CLIENT_RESP3.set(client.is_resp3);
+    }
     let mut can_squash = *authenticated;
     if can_squash {
         let acl = if crate::acl::HAS_CUSTOM_ACL.load(std::sync::atomic::Ordering::Relaxed)
@@ -11922,10 +11929,10 @@ async fn execute_commands_squashed(
                         if let Some(v) = router.stream_cold_read_local(key).await {
                             write_resp_bulk(&mut local_buf, &v);
                         } else {
-                            local_buf.extend_from_slice(b"$-1\r\n");
+                            write_resp_null(&mut local_buf);
                         }
                     } else {
-                        local_buf.extend_from_slice(b"$-1\r\n");
+                        write_resp_null(&mut local_buf);
                     }
                 } else if router.aof.is_none()
                     && !crate::replication::has_connected_replicas(router.port)

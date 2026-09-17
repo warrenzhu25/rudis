@@ -487,13 +487,25 @@ impl Router {
         total
     }
 
+    #[inline(always)]
+    pub fn is_memory_constrained(&self) -> bool {
+        let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed);
+        if max_mem == 0 {
+            return false;
+        }
+        let offload_pct = self.tier_stats.offload_threshold_pct.load(Ordering::Relaxed);
+        let used_mem = self.local_db.borrow().table.used_memory;
+        let shard_threshold = (max_mem / self.num_shards.max(1) as u64) as usize;
+        used_mem >= (shard_threshold * offload_pct as usize) / 100
+    }
+
     pub async fn check_auto_tier(&self) {
         if self.is_auto_tiering.get() {
             return;
         }
         self.is_auto_tiering.set(true);
 
-        let max_mem = crate::tiering::get_max_memory(self.port);
+        let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed);
         if max_mem == 0 {
             self.is_auto_tiering.set(false);
             return;
@@ -552,14 +564,8 @@ impl Router {
     }
 
     pub async fn ensure_loaded(&self, key: &[u8]) -> bool {
-        let max_mem = crate::tiering::get_max_memory(self.port);
-        let offload_pct = crate::tiering::get_offload_threshold_pct(self.port);
-        if max_mem > 0 {
-            let used_mem = self.local_db.borrow().table.used_memory;
-            let shard_threshold = (max_mem / self.num_shards.max(1) as u64) as usize;
-            if used_mem >= (shard_threshold * offload_pct as usize) / 100 {
-                return false;
-            }
+        if self.is_memory_constrained() {
+            return false;
         }
 
         let target = target_shard(key, self.num_shards);
@@ -655,6 +661,21 @@ impl Router {
     }
 
     #[inline(always)]
+    pub async fn read_cold_key_local(&self, key: &Bytes) -> Option<Bytes> {
+        if self.is_memory_constrained() {
+            let val = self.stream_cold_read_local(key).await;
+            if val.is_some() {
+                self.tier_stats.streaming_reads.fetch_add(1, Ordering::Relaxed);
+                self.tier_stats.ram_misses.fetch_add(1, Ordering::Relaxed);
+            }
+            val
+        } else {
+            self.load_local(key).await;
+            self.local_db.borrow_mut().get(key)
+        }
+    }
+
+    #[inline(always)]
     pub async fn get_local_direct(&self, key: &Bytes) -> Option<Bytes> {
         let val = self.local_db.borrow_mut().get(key);
         if let Some(v) = val {
@@ -662,26 +683,7 @@ impl Router {
             return Some(v);
         }
         if self.local_db.borrow_mut().table.is_tiered(key).is_some() {
-            let max_mem = crate::tiering::get_max_memory(self.port);
-            let offload_pct = crate::tiering::get_offload_threshold_pct(self.port);
-            let is_constrained = if max_mem > 0 {
-                let used_mem = self.local_db.borrow().table.used_memory;
-                let shard_threshold = (max_mem / self.num_shards.max(1) as u64) as usize;
-                used_mem >= (shard_threshold * offload_pct as usize) / 100
-            } else {
-                false
-            };
-            if is_constrained {
-                if let Some(val) = self.stream_cold_read_local(key).await {
-                    let stats = crate::tiering::get_tier_stats(self.port);
-                    stats.streaming_reads.fetch_add(1, Ordering::Relaxed);
-                    stats.ram_misses.fetch_add(1, Ordering::Relaxed);
-                    return Some(val);
-                }
-            } else {
-                self.load_local(key).await;
-                return self.local_db.borrow_mut().get(key);
-            }
+            return self.read_cold_key_local(key).await;
         }
         None
     }
@@ -756,7 +758,7 @@ impl Router {
             self.local_db
                 .borrow_mut()
                 .set(key, value, expire_in);
-            let max_mem = crate::tiering::get_max_memory(self.port);
+            let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed);
             if max_mem > 0 {
                 let used = self.local_db.borrow().table.used_memory;
                 let shard_max_mem = (max_mem / self.num_shards.max(1) as u64) as usize;
