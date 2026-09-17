@@ -179,6 +179,8 @@ fn main() {
             "disabled"
         }
     );
+    let sanity_report = rudis::syscheck::run_system_sanity_checks();
+    rudis::syscheck::print_sanity_warnings(&sanity_report);
     println!("============================================================");
 
     // Create lock-free cross-shard communication mesh

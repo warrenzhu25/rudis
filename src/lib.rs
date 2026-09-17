@@ -22,6 +22,7 @@ pub mod search;
 pub mod server;
 pub mod shard;
 pub mod shutdown;
+pub mod syscheck;
 pub mod table;
 pub mod tiering;
 pub mod tls;

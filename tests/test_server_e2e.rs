@@ -6940,6 +6940,15 @@ fn test_maxclients_and_memory_eviction_e2e() {
     );
 }
 
+#[test]
+fn test_linux_kernel_syscheck_e2e() {
+    let report = rudis::syscheck::run_system_sanity_checks();
+    // Verify report fields are correctly inspected
+    assert!(report.max_open_files.is_some());
+    // Verify print does not panic
+    rudis::syscheck::print_sanity_warnings(&report);
+}
+
 
 
 
