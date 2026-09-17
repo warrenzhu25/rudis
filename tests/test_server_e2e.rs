@@ -6670,7 +6670,7 @@ fn test_cluster_mode_moved_redirection_and_per_shard_ports_e2e() {
 
 #[test]
 fn test_resp3_isolation_across_interleaved_clients_e2e() {
-    let port = 16390;
+    let port = 16709;
     start_test_server(port, 1);
 
     let mut client_resp3 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
@@ -6731,6 +6731,56 @@ fn test_resp3_isolation_across_interleaved_clients_e2e() {
         "RESP2 client leaked RESP3 nested array score format: {}",
         zrange_resp2_again
     );
+}
+
+#[test]
+fn test_config_resetstat_and_info_commandstats_cross_shard_e2e() {
+    let port = 16710;
+    start_test_server(port, 2);
+
+    let mut c1 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let mut c2 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Establish clean baseline
+    let reset_init = send_and_read(&mut c1, b"CONFIG RESETSTAT\r\n");
+    assert_eq!(reset_init, "+OK\r\n");
+
+    // 2. Issue commands across c1 and c2
+    assert_eq!(send_and_read(&mut c1, b"PING\r\n"), "+PONG\r\n");
+    assert_eq!(send_and_read(&mut c2, b"SET k_test v_test\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut c2, b"GET k_test\r\n"), "$6\r\nv_test\r\n");
+
+    // 3. Read full INFO commandstats response
+    c1.write_all(b"INFO commandstats\r\n").unwrap();
+    let mut buf = [0u8; 8192];
+    let mut total_n = 0;
+    while total_n < buf.len() {
+        let n = c1.read(&mut buf[total_n..]).unwrap();
+        if n == 0 {
+            break;
+        }
+        total_n += n;
+        let s = String::from_utf8_lossy(&buf[..total_n]);
+        if s.contains("cmdstat_ping:") && s.contains("cmdstat_get:") {
+            break;
+        }
+    }
+    let info1 = String::from_utf8_lossy(&buf[..total_n]);
+    assert!(info1.contains("cmdstat_ping:"));
+    assert!(info1.contains("cmdstat_get:"));
+    assert!(info1.contains("cmdstat_set:"));
+
+    // 4. Reset stats via CONFIG RESETSTAT on c1
+    let reset_resp = send_and_read(&mut c1, b"CONFIG RESETSTAT\r\n");
+    assert_eq!(reset_resp, "+OK\r\n");
+
+    // 5. Query INFO commandstats on c2: old ping/get/set counts must be wiped across all shards
+    c2.write_all(b"INFO commandstats\r\n").unwrap();
+    let mut buf2 = [0u8; 8192];
+    let n2 = c2.read(&mut buf2).unwrap();
+    let info2 = String::from_utf8_lossy(&buf2[..n2]);
+    assert!(!info2.contains("cmdstat_get:"));
+    assert!(!info2.contains("cmdstat_set:"));
 }
 
 

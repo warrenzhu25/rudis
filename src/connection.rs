@@ -345,6 +345,11 @@ pub fn flush_local_cmd_stats() {
     });
 }
 
+pub fn reset_local_cmd_stats() {
+    LOCAL_CMD_STATS.with(|stats| stats.borrow_mut().clear());
+    LOCAL_CMD_COUNT.with(|count| count.set(0));
+}
+
 pub static HAS_WATCHED_KEYS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -3704,7 +3709,7 @@ async fn execute_command(
                 DIRTY_CHANGES.load(std::sync::atomic::Ordering::Relaxed)
             );
             let cmdstat_str = {
-                flush_local_cmd_stats();
+                router.flush_all_command_stats().await;
                 let mut s = String::from("# Commandstats\r\n");
                 if let Ok(map) = CMD_STATS.read() {
                     let mut entries: Vec<_> = map.iter().collect();
@@ -4056,10 +4061,7 @@ async fn execute_command(
                     out.extend_from_slice(b"-ERR Invalid argument for CONFIG SET\r\n");
                 }
             } else if p_str == "resetstat" {
-                LOCAL_CMD_STATS.with(|stats| stats.borrow_mut().clear());
-                if let Ok(mut map) = CMD_STATS.write() {
-                    map.clear();
-                }
+                router.reset_command_stats().await;
                 out.extend_from_slice(b"+OK\r\n");
             } else {
                 out.extend_from_slice(b"+OK\r\n");

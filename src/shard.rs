@@ -160,6 +160,12 @@ pub enum ShardMessage {
     SyncAof {
         responder: flume::Sender<()>,
     },
+    FlushCommandStats {
+        responder: flume::Sender<()>,
+    },
+    ResetCommandStats {
+        responder: flume::Sender<()>,
+    },
     SaveRdbChunk {
         responder: flume::Sender<Vec<u8>>,
     },

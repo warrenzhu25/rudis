@@ -798,6 +798,14 @@ pub fn run_shard_worker(
                         execute_local_command(&cmd, &mut db, &mut dummy_out, aof_ref);
                         let _ = responder.send(());
                     }
+                    ShardMessage::FlushCommandStats { responder } => {
+                        crate::connection::flush_local_cmd_stats();
+                        let _ = responder.send(());
+                    }
+                    ShardMessage::ResetCommandStats { responder } => {
+                        crate::connection::reset_local_cmd_stats();
+                        let _ = responder.send(());
+                    }
                     ShardMessage::NotifyList { keys } => {
                         let mut db = cross_shard_db.borrow_mut();
                         let hub_arc = crate::block::get_block_hub_for_port(db.port);

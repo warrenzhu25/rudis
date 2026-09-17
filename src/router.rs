@@ -1417,6 +1417,35 @@ impl Router {
         out
     }
 
+    pub async fn reset_command_stats(&self) {
+        crate::connection::reset_local_cmd_stats();
+        if let Ok(mut map) = crate::connection::CMD_STATS.write() {
+            map.clear();
+        }
+        for (shard_id, sender) in self.senders.iter().enumerate() {
+            if shard_id != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::ResetCommandStats { responder: tx };
+                if sender.send(msg).is_ok() {
+                    let _ = rx.recv_async().await;
+                }
+            }
+        }
+    }
+
+    pub async fn flush_all_command_stats(&self) {
+        crate::connection::flush_local_cmd_stats();
+        for (shard_id, sender) in self.senders.iter().enumerate() {
+            if shard_id != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::FlushCommandStats { responder: tx };
+                if sender.send(msg).is_ok() {
+                    let _ = rx.recv_async().await;
+                }
+            }
+        }
+    }
+
     pub async fn execute_remote(&self, target: usize, cmd: Command) -> Vec<u8> {
         let is_resp3 = crate::connection::CURRENT_CLIENT_RESP3.get();
         let (tx, rx) = self
