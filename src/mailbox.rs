@@ -24,10 +24,10 @@ impl<T> std::ops::DerefMut for CachePadded<T> {
 /// Shared-memory Scatter-Gather Descriptor for multi-shard MGET.
 /// Remote shards write their looked up values directly into their respective slots.
 pub struct ScatterMgetDescriptor {
-    pub results: Box<[UnsafeCell<Option<Bytes>>]>,
+    pub results: Box<[CachePadded<UnsafeCell<Option<Bytes>>>]>,
     pub pending: AtomicUsize,
     pub notify: flume::Sender<()>,
-    pub recycled_keys: Box<[UnsafeCell<Vec<(usize, Bytes)>>]>,
+    pub recycled_keys: Box<[CachePadded<UnsafeCell<Vec<(usize, Bytes)>>>]>,
 }
 
 unsafe impl Send for ScatterMgetDescriptor {}
@@ -42,11 +42,11 @@ impl ScatterMgetDescriptor {
     ) -> Self {
         let mut vec = Vec::with_capacity(total_keys);
         for _ in 0..total_keys {
-            vec.push(UnsafeCell::new(None));
+            vec.push(CachePadded(UnsafeCell::new(None)));
         }
         let mut recycled = Vec::with_capacity(num_shards);
         for _ in 0..num_shards {
-            recycled.push(UnsafeCell::new(Vec::new()));
+            recycled.push(CachePadded(UnsafeCell::new(Vec::new())));
         }
         Self {
             results: vec.into_boxed_slice(),
@@ -100,7 +100,7 @@ impl ScatterMgetDescriptor {
 pub struct ScatterMsetDescriptor {
     pub pending: AtomicUsize,
     pub notify: flume::Sender<()>,
-    pub recycled_pairs: Box<[UnsafeCell<Vec<(Bytes, Bytes)>>]>,
+    pub recycled_pairs: Box<[CachePadded<UnsafeCell<Vec<(Bytes, Bytes)>>>]>,
 }
 
 unsafe impl Send for ScatterMsetDescriptor {}
@@ -110,7 +110,7 @@ impl ScatterMsetDescriptor {
     pub fn new(num_shards: usize, pending_shards: usize, notify: flume::Sender<()>) -> Self {
         let mut recycled = Vec::with_capacity(num_shards);
         for _ in 0..num_shards {
-            recycled.push(UnsafeCell::new(Vec::new()));
+            recycled.push(CachePadded(UnsafeCell::new(Vec::new())));
         }
         Self {
             pending: AtomicUsize::new(pending_shards),
@@ -146,7 +146,7 @@ impl ScatterMsetDescriptor {
 /// Direct shared-memory slot for single remote GET (bypasses responder channel allocations)
 pub struct FastGetDescriptor {
     pub key: Bytes,
-    pub val: UnsafeCell<Option<Bytes>>,
+    pub val: CachePadded<UnsafeCell<Option<Bytes>>>,
     pub done: AtomicBool,
     pub notify: flume::Sender<()>,
 }
@@ -159,7 +159,7 @@ impl FastGetDescriptor {
     pub fn new(key: Bytes, notify: flume::Sender<()>) -> Self {
         Self {
             key,
-            val: UnsafeCell::new(None),
+            val: CachePadded(UnsafeCell::new(None)),
             done: AtomicBool::new(false),
             notify,
         }
