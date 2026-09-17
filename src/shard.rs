@@ -1290,11 +1290,211 @@ impl ShardDb {
     #[inline]
     pub fn save_rdb_chunk(&mut self, buf: &mut Vec<u8>) {
         self.table.save_rdb_chunk(buf);
+        self.save_extended_rdb_chunk(buf);
     }
 
-    #[inline]
-    pub fn restore_rdb_chunk(&mut self, data: &[u8]) -> Result<(), &'static str> {
-        self.table.restore_rdb_chunk(data)
+    pub fn save_extended_rdb_chunk(&self, buf: &mut Vec<u8>) {
+        // 1. JSON documents
+        for (key, val) in self.json_store.iter() {
+            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            buf.extend_from_slice(key);
+            buf.push(7u8);
+            let json_str = val.to_string();
+            buf.extend_from_slice(&(json_str.len() as u32).to_le_bytes());
+            buf.extend_from_slice(json_str.as_bytes());
+        }
+
+        // 2. Bloom filters
+        for (key, bf) in &self.probabilistic_store.bloom_filters {
+            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            buf.extend_from_slice(key);
+            buf.push(8u8);
+            buf.extend_from_slice(&(bf.capacity as u64).to_le_bytes());
+            buf.extend_from_slice(&bf.error_rate.to_bits().to_le_bytes());
+            buf.extend_from_slice(&(bf.num_bits as u64).to_le_bytes());
+            buf.extend_from_slice(&(bf.num_hashes as u32).to_le_bytes());
+            buf.extend_from_slice(&(bf.count as u64).to_le_bytes());
+            buf.extend_from_slice(&(bf.bits.len() as u32).to_le_bytes());
+            for word in &bf.bits {
+                buf.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+
+        // 3. Vector indexes
+        for (name, index) in &self.vector_indexes {
+            for (key, &node_id) in &index.key_to_id {
+                if let Some(Some(node)) = index.nodes.get(node_id) {
+                    let full_key = format!("vec:{}:{}", name, String::from_utf8_lossy(key));
+                    buf.extend_from_slice(&(full_key.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(full_key.as_bytes());
+                    buf.push(9u8);
+                    buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(name.as_bytes());
+                    buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(key);
+                    buf.push(index.metric as u8);
+                    buf.extend_from_slice(&(node.vector.len() as u32).to_le_bytes());
+                    for &coord in &node.vector {
+                        buf.extend_from_slice(&coord.to_bits().to_le_bytes());
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn restore_rdb_chunk(&mut self, mut data: &[u8]) -> Result<(), &'static str> {
+        let unix_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        while !data.is_empty() {
+            let mut expire_at = None;
+            if data[0] == 0xFC {
+                if data.len() < 9 {
+                    return Err("Truncated RDB expire");
+                }
+                let exp_unix_ms = u64::from_le_bytes(data[1..9].try_into().unwrap());
+                data = &data[9..];
+                if exp_unix_ms <= unix_now {
+                    if data.len() < 4 {
+                        return Err("Truncated RDB key");
+                    }
+                    let k_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+                    data = &data[4..];
+                    if data.len() < k_len {
+                        return Err("Truncated RDB key");
+                    }
+                    data = &data[k_len..];
+                    let (_, consumed) = crate::table::RudisTable::deserialize_val_payload(data)?;
+                    data = &data[consumed..];
+                    continue;
+                }
+                let rem_ms = exp_unix_ms - unix_now;
+                expire_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(rem_ms));
+            }
+            if data.len() < 4 {
+                return Err("Truncated RDB key");
+            }
+            let k_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+            data = &data[4..];
+            if data.len() < k_len {
+                return Err("Truncated RDB key");
+            }
+            let key = bytes::Bytes::copy_from_slice(&data[..k_len]);
+            data = &data[k_len..];
+
+            if data.is_empty() {
+                return Err("Truncated RDB type");
+            }
+            let type_byte = data[0];
+            if type_byte == 7 {
+                data = &data[1..];
+                if data.len() < 4 {
+                    return Err("Truncated JSON len");
+                }
+                let json_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+                data = &data[4..];
+                if data.len() < json_len {
+                    return Err("Truncated JSON payload");
+                }
+                if let Ok(json_str) = std::str::from_utf8(&data[..json_len])
+                    && let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str)
+                {
+                    self.json_store.insert_raw(key, val);
+                }
+                data = &data[json_len..];
+                continue;
+            } else if type_byte == 8 {
+                data = &data[1..];
+                if data.len() < 40 {
+                    return Err("Truncated BloomFilter header");
+                }
+                let capacity = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
+                let error_rate = f64::from_bits(u64::from_le_bytes(data[8..16].try_into().unwrap()));
+                let num_bits = u64::from_le_bytes(data[16..24].try_into().unwrap()) as usize;
+                let num_hashes = u32::from_le_bytes(data[24..28].try_into().unwrap()) as usize;
+                let count_val = u64::from_le_bytes(data[28..36].try_into().unwrap()) as usize;
+                let bits_len = u32::from_le_bytes(data[36..40].try_into().unwrap()) as usize;
+                data = &data[40..];
+                if data.len() < bits_len * 8 {
+                    return Err("Truncated BloomFilter bits");
+                }
+                let mut bits = Vec::with_capacity(bits_len);
+                for i in 0..bits_len {
+                    bits.push(u64::from_le_bytes(data[i * 8..(i + 1) * 8].try_into().unwrap()));
+                }
+                data = &data[bits_len * 8..];
+                self.probabilistic_store.bloom_filters.insert(
+                    key,
+                    crate::probabilistic::BloomFilter {
+                        capacity,
+                        error_rate,
+                        num_bits,
+                        num_hashes,
+                        count: count_val,
+                        bits,
+                    },
+                );
+                continue;
+            } else if type_byte == 9 {
+                data = &data[1..];
+                if data.len() < 4 {
+                    return Err("Truncated vector index name len");
+                }
+                let idx_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+                data = &data[4..];
+                if data.len() < idx_len {
+                    return Err("Truncated vector index name");
+                }
+                let idx_name = String::from_utf8_lossy(&data[..idx_len]).to_string();
+                data = &data[idx_len..];
+
+                if data.len() < 4 {
+                    return Err("Truncated vector doc key len");
+                }
+                let doc_key_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+                data = &data[4..];
+                if data.len() < doc_key_len {
+                    return Err("Truncated vector doc key");
+                }
+                let doc_key = bytes::Bytes::copy_from_slice(&data[..doc_key_len]);
+                data = &data[doc_key_len..];
+
+                if data.len() < 5 {
+                    return Err("Truncated vector metric and dim");
+                }
+                let metric_byte = data[0];
+                let metric = match metric_byte {
+                    0 => crate::vector::VectorMetric::Cosine,
+                    1 => crate::vector::VectorMetric::L2,
+                    _ => crate::vector::VectorMetric::IP,
+                };
+                let vec_len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
+                data = &data[5..];
+                if data.len() < vec_len * 4 {
+                    return Err("Truncated vector coordinates");
+                }
+                let mut vector = Vec::with_capacity(vec_len);
+                for i in 0..vec_len {
+                    let bits = u32::from_le_bytes(data[i * 4..(i + 1) * 4].try_into().unwrap());
+                    vector.push(f32::from_bits(bits));
+                }
+                data = &data[vec_len * 4..];
+                let _ = self.vadd(&idx_name, doc_key, vector, Some(metric), false, false, false);
+                continue;
+            }
+
+            let (val, consumed) = crate::table::RudisTable::deserialize_val_payload(data)?;
+            data = &data[consumed..];
+
+            self.table.insert_entry(crate::table::RudisEntry {
+                key,
+                val,
+                expire_at,
+            });
+        }
+        Ok(())
     }
 
     #[inline]
@@ -1502,5 +1702,53 @@ impl ShardDb {
     pub fn crdt_gc(&mut self, ttl_ms: Option<u64>) -> (usize, usize) {
         let ttl = ttl_ms.unwrap_or(86_400_000); // 24 hours default
         self.crdt_store.gc_tombstones(ttl)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extended_rdb_save_and_restore() {
+        let mut db = ShardDb::new(0);
+
+        // 1. Add JSON
+        let _json_key = Bytes::from("user:101");
+        assert!(db.json_store.json_set(b"user:101", "$", r#"{"name":"alice","age":30}"#, false, false).unwrap());
+
+        // 2. Add Bloom filter
+        let bf_key = Bytes::from("bloom:test");
+        let mut bf = crate::probabilistic::BloomFilter::new(1000, 0.01);
+        bf.add(b"item_alpha");
+        db.probabilistic_store.bloom_filters.insert(bf_key.clone(), bf);
+
+        // 3. Add Vector
+        let vec_doc = Bytes::from("doc:1");
+        db.vadd("test_idx", vec_doc.clone(), vec![1.0, 2.0, 3.0], Some(crate::vector::VectorMetric::Cosine), false, false, false).unwrap();
+
+        // Serialize to RDB chunk
+        let mut chunk = Vec::new();
+        db.save_rdb_chunk(&mut chunk);
+        assert!(!chunk.is_empty());
+
+        // Restore into new ShardDb
+        let mut new_db = ShardDb::new(0);
+        new_db.restore_rdb_chunk(&chunk).expect("restore_rdb_chunk should succeed");
+
+        // Verify JSON
+        let json_val = new_db.json_store.json_get(b"user:101", &["$"]).expect("JSON document should exist");
+        assert!(json_val.contains("alice"));
+
+        // Verify Bloom filter
+        let restored_bf = new_db.probabilistic_store.bloom_filters.get(&bf_key).expect("Bloom filter should exist");
+        assert!(restored_bf.contains(b"item_alpha"));
+        assert!(!restored_bf.contains(b"nonexistent"));
+
+        // Verify Vector
+        assert!(new_db.vector_indexes.contains_key("test_idx"));
+        let neighbors = new_db.vquery("test_idx", &[1.0, 2.0, 3.0], 1, false);
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].0, vec_doc);
     }
 }

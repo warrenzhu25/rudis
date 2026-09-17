@@ -1360,6 +1360,12 @@ impl RudisTable {
         }
     }
 
+    #[inline]
+    pub fn insert_entry(&mut self, entry: RudisEntry) {
+        self.del(&entry.key);
+        self.table.insert(entry);
+    }
+
     pub fn recalculate_used_memory(&mut self) -> usize {
         let mut total = self.table.capacity * std::mem::size_of::<Option<RudisEntry>>()
             + self.table.ctrl.len()
@@ -7589,6 +7595,115 @@ pub fn load_rdb_bytes(
         }
         let key = Bytes::copy_from_slice(&data[cursor..cursor + k_len]);
         cursor += k_len;
+
+        if cursor >= content_len {
+            break;
+        }
+        let type_byte = data[cursor];
+        if type_byte == 7 {
+            cursor += 1;
+            if cursor + 4 > content_len {
+                break;
+            }
+            let json_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            if cursor + json_len > content_len {
+                break;
+            }
+            if let Ok(json_str) = std::str::from_utf8(&data[cursor..cursor + json_len])
+                && let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str)
+                && crate::router::target_shard(&key, num_shards) == shard_id
+            {
+                db.json_store.insert_raw(key.clone(), val);
+                count += 1;
+            }
+            cursor += json_len;
+            continue;
+        } else if type_byte == 8 {
+            cursor += 1;
+            if cursor + 40 > content_len {
+                break;
+            }
+            let capacity = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap()) as usize;
+            let error_rate = f64::from_bits(u64::from_le_bytes(data[cursor + 8..cursor + 16].try_into().unwrap()));
+            let num_bits = u64::from_le_bytes(data[cursor + 16..cursor + 24].try_into().unwrap()) as usize;
+            let num_hashes = u32::from_le_bytes(data[cursor + 24..cursor + 28].try_into().unwrap()) as usize;
+            let count_val = u64::from_le_bytes(data[cursor + 28..cursor + 36].try_into().unwrap()) as usize;
+            let bits_len = u32::from_le_bytes(data[cursor + 36..cursor + 40].try_into().unwrap()) as usize;
+            cursor += 40;
+            if cursor + bits_len * 8 > content_len {
+                break;
+            }
+            let mut bits = Vec::with_capacity(bits_len);
+            for i in 0..bits_len {
+                bits.push(u64::from_le_bytes(data[cursor + i * 8..cursor + (i + 1) * 8].try_into().unwrap()));
+            }
+            cursor += bits_len * 8;
+            if crate::router::target_shard(&key, num_shards) == shard_id {
+                db.probabilistic_store.bloom_filters.insert(
+                    key.clone(),
+                    crate::probabilistic::BloomFilter {
+                        capacity,
+                        error_rate,
+                        num_bits,
+                        num_hashes,
+                        count: count_val,
+                        bits,
+                    },
+                );
+                count += 1;
+            }
+            continue;
+        } else if type_byte == 9 {
+            cursor += 1;
+            if cursor + 4 > content_len {
+                break;
+            }
+            let idx_name_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            if cursor + idx_name_len > content_len {
+                break;
+            }
+            let idx_name = String::from_utf8_lossy(&data[cursor..cursor + idx_name_len]).to_string();
+            cursor += idx_name_len;
+
+            if cursor + 4 > content_len {
+                break;
+            }
+            let doc_key_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            if cursor + doc_key_len > content_len {
+                break;
+            }
+            let doc_key = Bytes::copy_from_slice(&data[cursor..cursor + doc_key_len]);
+            cursor += doc_key_len;
+
+            if cursor + 5 > content_len {
+                break;
+            }
+            let metric_byte = data[cursor];
+            let metric = match metric_byte {
+                0 => crate::vector::VectorMetric::Cosine,
+                1 => crate::vector::VectorMetric::L2,
+                _ => crate::vector::VectorMetric::IP,
+            };
+            let vec_len = u32::from_le_bytes(data[cursor + 1..cursor + 5].try_into().unwrap()) as usize;
+            cursor += 5;
+            if cursor + vec_len * 4 > content_len {
+                break;
+            }
+            let mut vector = Vec::with_capacity(vec_len);
+            for i in 0..vec_len {
+                let bits = u32::from_le_bytes(data[cursor + i * 4..cursor + (i + 1) * 4].try_into().unwrap());
+                vector.push(f32::from_bits(bits));
+            }
+            cursor += vec_len * 4;
+            if crate::router::target_shard(&doc_key, num_shards) == shard_id {
+                let _ = db.vadd(&idx_name, doc_key, vector, Some(metric), false, false, false);
+                count += 1;
+            }
+            continue;
+        }
 
         let (val, consumed) = match RudisTable::deserialize_val_payload(&data[cursor..content_len])
         {

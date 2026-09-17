@@ -7081,6 +7081,52 @@ fn test_multikey_acl_and_crossslot_enforcement_e2e() {
     assert_eq!(send_and_read(&mut admin, b"GET secret:99\r\n"), "$12\r\nsecret_value\r\n");
 }
 
+#[test]
+fn test_extended_types_rdb_persistence_e2e() {
+    let port = 16740;
+    start_test_server(port, 1);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Set JSON document
+    assert_eq!(
+        send_and_read(&mut client, b"JSON.SET doc:1 $ {\"title\":\"test\",\"rating\":5}\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"JSON.GET doc:1 $\r\n"),
+        "$27\r\n{\"rating\":5,\"title\":\"test\"}\r\n"
+    );
+
+    // 2. Add Bloom filter items
+    assert_eq!(
+        send_and_read(&mut client, b"BF.RESERVE bf:items 0.01 1000\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"BF.ADD bf:items my_token\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"BF.EXISTS bf:items my_token\r\n"),
+        ":1\r\n"
+    );
+
+    // 3. Trigger SAVE to generate RDB snapshot containing extended types
+    let save_resp = send_and_read(&mut client, b"SAVE\r\n");
+    assert_eq!(save_resp, "+OK\r\n");
+
+    // 4. Verify data remains valid and retrievable
+    assert_eq!(
+        send_and_read(&mut client, b"JSON.GET doc:1 $\r\n"),
+        "$27\r\n{\"rating\":5,\"title\":\"test\"}\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"BF.EXISTS bf:items my_token\r\n"),
+        ":1\r\n"
+    );
+}
+
 
 
 

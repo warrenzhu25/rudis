@@ -445,6 +445,16 @@ impl JsonStore {
         }
     }
 
+    #[inline]
+    pub fn iter(&self) -> impl Iterator<Item = (&Bytes, &Value)> {
+        self.docs.iter()
+    }
+
+    #[inline]
+    pub fn insert_raw(&mut self, key: Bytes, val: Value) {
+        self.docs.insert(key, val);
+    }
+
     /// JSON.SET <key> <path> <json_value> [NX|XX]
     pub fn json_set(
         &mut self,
