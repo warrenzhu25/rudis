@@ -428,3 +428,177 @@ pub fn create_shard_mesh(num_shards: usize) -> (Vec<Vec<ShardSender>>, Vec<Shard
     (senders_mesh, receivers)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    #[test]
+    fn test_cache_padded_alignment() {
+        assert_eq!(
+            std::mem::align_of::<CachePadded<UnsafeCell<Option<Bytes>>>>(),
+            64
+        );
+        assert!(std::mem::size_of::<CachePadded<UnsafeCell<Option<Bytes>>>>() >= 64);
+    }
+
+    #[test]
+    fn test_fast_get_descriptor() {
+        let (tx, rx) = flume::bounded(1);
+        let desc = Arc::new(FastGetDescriptor::new(Bytes::from("key1"), tx));
+        assert!(!desc.done.load(Ordering::Acquire));
+
+        let desc_clone = desc.clone();
+        let handle = thread::spawn(move || {
+            desc_clone.finish(Some(Bytes::from("val1")));
+        });
+
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("notification failed");
+        handle.join().unwrap();
+
+        assert!(desc.done.load(Ordering::Acquire));
+        let val = unsafe { (*desc.val.get()).take() };
+        assert_eq!(val, Some(Bytes::from("val1")));
+    }
+
+    #[test]
+    fn test_fast_set_descriptor() {
+        let (tx, rx) = flume::bounded(1);
+        let desc = Arc::new(FastSetDescriptor::new(
+            Bytes::from("key_set"),
+            Bytes::from("val_set"),
+            Some(Duration::from_secs(10)),
+            tx,
+        ));
+        assert!(!desc.done.load(Ordering::Acquire));
+        assert_eq!(desc.key, Bytes::from("key_set"));
+        assert_eq!(desc.value, Bytes::from("val_set"));
+        assert_eq!(desc.expire_in, Some(Duration::from_secs(10)));
+
+        let desc_clone = desc.clone();
+        let handle = thread::spawn(move || {
+            desc_clone.finish();
+        });
+
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("notification failed");
+        handle.join().unwrap();
+        assert!(desc.done.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_scatter_mget_descriptor_concurrent() {
+        let total_keys = 20;
+        let num_shards = 4;
+        let pending_shards = 4;
+        let (tx, rx) = flume::bounded(1);
+
+        let desc = Arc::new(ScatterMgetDescriptor::new(
+            total_keys,
+            num_shards,
+            pending_shards,
+            tx,
+        ));
+
+        let mut handles = Vec::new();
+        for shard_id in 0..num_shards {
+            let desc_clone = desc.clone();
+            handles.push(thread::spawn(move || {
+                let mut recycled = Vec::new();
+                for k_idx in 0..5 {
+                    let global_idx = shard_id * 5 + k_idx;
+                    desc_clone.write_result(
+                        global_idx,
+                        Some(Bytes::from(format!("val_{}", global_idx))),
+                    );
+                    recycled.push((global_idx, Bytes::from(format!("key_{}", global_idx))));
+                }
+                desc_clone.recycle_keys(shard_id, recycled);
+                desc_clone.finish_shard();
+            }));
+        }
+
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("mget notification timeout");
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let results = desc.into_results();
+        assert_eq!(results.len(), total_keys);
+        for (i, r) in results.iter().enumerate() {
+            assert_eq!(r, &Some(Bytes::from(format!("val_{}", i))));
+        }
+
+        let recycled = desc.take_recycled_keys();
+        assert_eq!(recycled.len(), num_shards);
+        for (shard_id, shard_keys) in recycled.iter().enumerate() {
+            assert_eq!(shard_keys.len(), 5);
+            for (k_idx, (global_idx, key)) in shard_keys.iter().enumerate() {
+                assert_eq!(*global_idx, shard_id * 5 + k_idx);
+                assert_eq!(key, &Bytes::from(format!("key_{}", global_idx)));
+            }
+        }
+    }
+
+    #[test]
+    fn test_scatter_mset_descriptor_concurrent() {
+        let num_shards = 3;
+        let pending_shards = 3;
+        let (tx, rx) = flume::bounded(1);
+
+        let desc = Arc::new(ScatterMsetDescriptor::new(num_shards, pending_shards, tx));
+
+        let mut handles = Vec::new();
+        for shard_id in 0..num_shards {
+            let desc_clone = desc.clone();
+            handles.push(thread::spawn(move || {
+                let pairs = vec![
+                    (Bytes::from(format!("k_{}_1", shard_id)), Bytes::from("v1")),
+                    (Bytes::from(format!("k_{}_2", shard_id)), Bytes::from("v2")),
+                ];
+                desc_clone.recycle_pairs(shard_id, pairs);
+                desc_clone.finish_shard();
+            }));
+        }
+
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("mset notification timeout");
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let recycled = desc.take_recycled_pairs();
+        assert_eq!(recycled.len(), num_shards);
+        for (shard_id, pairs) in recycled.iter().enumerate() {
+            assert_eq!(pairs.len(), 2);
+            assert_eq!(pairs[0].0, Bytes::from(format!("k_{}_1", shard_id)));
+            assert_eq!(pairs[1].0, Bytes::from(format!("k_{}_2", shard_id)));
+        }
+    }
+
+    #[test]
+    fn test_spsc_queue_push_pop_and_overflow() {
+        let queue = SpscQueue::new(4);
+        assert!(queue.is_empty());
+
+        queue.push(1);
+        queue.push(2);
+        queue.push(3);
+        assert!(!queue.is_empty());
+
+        queue.push(4);
+        queue.push(5);
+
+        assert_eq!(queue.pop(), Some(1));
+        assert_eq!(queue.pop(), Some(2));
+        assert_eq!(queue.pop(), Some(3));
+        assert_eq!(queue.pop(), Some(4));
+        assert_eq!(queue.pop(), Some(5));
+        assert_eq!(queue.pop(), None);
+        assert!(queue.is_empty());
+    }
+}
+
