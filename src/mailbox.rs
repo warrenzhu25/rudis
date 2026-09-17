@@ -509,10 +509,8 @@ mod tests {
                 let mut recycled = Vec::new();
                 for k_idx in 0..5 {
                     let global_idx = shard_id * 5 + k_idx;
-                    desc_clone.write_result(
-                        global_idx,
-                        Some(Bytes::from(format!("val_{}", global_idx))),
-                    );
+                    desc_clone
+                        .write_result(global_idx, Some(Bytes::from(format!("val_{}", global_idx))));
                     recycled.push((global_idx, Bytes::from(format!("key_{}", global_idx))));
                 }
                 desc_clone.recycle_keys(shard_id, recycled);
@@ -601,4 +599,3 @@ mod tests {
         assert!(queue.is_empty());
     }
 }
-

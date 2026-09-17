@@ -76,4 +76,3 @@ fn test_lock_free_spsc_queue_and_mesh() {
     h_producer.join().unwrap();
     h_consumer.join().unwrap();
 }
-

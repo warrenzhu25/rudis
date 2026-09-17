@@ -102,10 +102,8 @@ impl RudisConfig {
                     config.maxmemory_policy = rest[0].to_lowercase();
                 }
                 "appendonly" => {
-                    config.appendonly = matches!(
-                        rest[0].to_lowercase().as_str(),
-                        "yes" | "true" | "1"
-                    );
+                    config.appendonly =
+                        matches!(rest[0].to_lowercase().as_str(), "yes" | "true" | "1");
                 }
                 "dir" => {
                     // Strip quotes if present
@@ -127,9 +125,9 @@ impl RudisConfig {
                     config.requirepass = Some(pass);
                 }
                 "tls-port" => {
-                    let p = rest[0].parse::<u16>().map_err(|e| {
-                        format!("Invalid tls-port at line {}: {}", line_num + 1, e)
-                    })?;
+                    let p = rest[0]
+                        .parse::<u16>()
+                        .map_err(|e| format!("Invalid tls-port at line {}: {}", line_num + 1, e))?;
                     config.tls_port = Some(p);
                 }
                 "tls-cert-file" => {
@@ -139,10 +137,8 @@ impl RudisConfig {
                     config.tls_key_file = Some(PathBuf::from(rest.join(" ")));
                 }
                 "cluster-enabled" => {
-                    config.cluster_enabled = matches!(
-                        rest[0].to_lowercase().as_str(),
-                        "yes" | "true" | "1"
-                    );
+                    config.cluster_enabled =
+                        matches!(rest[0].to_lowercase().as_str(), "yes" | "true" | "1");
                 }
                 "tiered-offload-threshold" => {
                     let val = rest[0].parse::<u64>().map_err(|e| {
@@ -289,7 +285,10 @@ mod tests {
         assert!(cfg.cluster_enabled);
         assert_eq!(cfg.tiered_offload_threshold, 65);
         assert_eq!(cfg.tiered_upload_threshold, 85);
-        assert_eq!(cfg.extra_directives.get("save").map(|s| s.as_str()), Some("900 1"));
+        assert_eq!(
+            cfg.extra_directives.get("save").map(|s| s.as_str()),
+            Some("900 1")
+        );
     }
 
     #[test]

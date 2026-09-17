@@ -639,8 +639,17 @@ mod tests {
 
         let buf = aof.borrow().buffer().to_vec();
         let aof_str = String::from_utf8_lossy(&buf);
-        assert!(aof_str.contains("SET"), "AOF buffer must contain SET command");
-        assert!(aof_str.contains("test_key"), "AOF buffer must contain test_key");
-        assert!(aof_str.contains("test_val"), "AOF buffer must contain test_val");
+        assert!(
+            aof_str.contains("SET"),
+            "AOF buffer must contain SET command"
+        );
+        assert!(
+            aof_str.contains("test_key"),
+            "AOF buffer must contain test_key"
+        );
+        assert!(
+            aof_str.contains("test_val"),
+            "AOF buffer must contain test_val"
+        );
     }
 }

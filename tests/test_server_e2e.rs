@@ -77,11 +77,7 @@ fn start_test_server_cluster(port: u16, num_shards: usize) {
     thread::sleep(Duration::from_millis(200));
 }
 
-fn start_test_server_with_tls(
-    port: u16,
-    tls_port: u16,
-    num_shards: usize,
-) -> (Vec<u8>, Vec<u8>) {
+fn start_test_server_with_tls(port: u16, tls_port: u16, num_shards: usize) -> (Vec<u8>, Vec<u8>) {
     let (cert_der, key_der) = rudis::tls::generate_self_signed_cert(vec![
         "localhost".to_string(),
         "127.0.0.1".to_string(),
@@ -4880,11 +4876,17 @@ fn test_redisearch_fulltext_and_hybrid_vector_e2e() {
         "+OK\r\n"
     );
     assert_eq!(
-        send_and_read(&mut client, b"HSET vec:doc1 title First embedding 1.0,0.0,0.0\r\n"),
+        send_and_read(
+            &mut client,
+            b"HSET vec:doc1 title First embedding 1.0,0.0,0.0\r\n"
+        ),
         ":2\r\n"
     );
     assert_eq!(
-        send_and_read(&mut client, b"HSET vec:doc2 title Second embedding 0.0,1.0,0.0\r\n"),
+        send_and_read(
+            &mut client,
+            b"HSET vec:doc2 title Second embedding 0.0,1.0,0.0\r\n"
+        ),
         ":2\r\n"
     );
 
@@ -5453,10 +5455,10 @@ fn test_crdt_cross_shard_routing_e2e() {
     let num_shards = 4;
     start_test_server(port, num_shards);
 
-    let mut client1 = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .expect("Failed to connect client 1");
-    let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .expect("Failed to connect client 2");
+    let mut client1 =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect client 1");
+    let mut client2 =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect client 2");
 
     // Identify keys mapping to distinct shards in a 4-shard cluster
     let mut shard_keys = std::collections::HashMap::new();
@@ -5478,10 +5480,7 @@ fn test_crdt_cross_shard_routing_e2e() {
         assert!(resp.starts_with("+OK"));
 
         // Read back from Client 2 (cross-shard pipeline/dispatch)
-        let resp = send_and_read(
-            &mut client2,
-            format!("CRDT.GET {}\r\n", key).as_bytes(),
-        );
+        let resp = send_and_read(&mut client2, format!("CRDT.GET {}\r\n", key).as_bytes());
         assert_eq!(resp, format!("${}\r\n{}\r\n", val.len(), val));
 
         // Test CRDT counter on this shard: increment by 42 from client1, then by 1 from client2
@@ -5527,16 +5526,10 @@ fn test_crdt_cross_shard_routing_e2e() {
         assert_eq!(resp, "*0\r\n");
 
         // Delete register from Client 2 and verify nil from Client 1
-        let resp = send_and_read(
-            &mut client2,
-            format!("CRDT.DEL {}\r\n", key).as_bytes(),
-        );
+        let resp = send_and_read(&mut client2, format!("CRDT.DEL {}\r\n", key).as_bytes());
         assert_eq!(resp, ":1\r\n");
 
-        let resp = send_and_read(
-            &mut client1,
-            format!("CRDT.GET {}\r\n", key).as_bytes(),
-        );
+        let resp = send_and_read(&mut client1, format!("CRDT.GET {}\r\n", key).as_bytes());
         assert_eq!(resp, "$-1\r\n");
     }
 }
@@ -5641,8 +5634,8 @@ fn test_acl_permissions_and_hashed_passwords_e2e() {
     let port = 16670;
     start_test_server(port, 2);
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .expect("Failed to connect admin client");
+    let mut client =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect admin client");
 
     // 1. Create user 'carol' with restricted commands (-@all +get +ping) and restricted keys (~user:*)
     let pass = "carol_secure_pass";
@@ -5664,8 +5657,8 @@ fn test_acl_permissions_and_hashed_passwords_e2e() {
     );
 
     // 2. Connect as Carol and authenticate using plaintext password matching stored hash
-    let mut carol_client = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .expect("Failed to connect carol client");
+    let mut carol_client =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect carol client");
     assert_eq!(
         send_and_read(
             &mut carol_client,
@@ -5704,7 +5697,9 @@ fn test_psync_partial_resync_continue_e2e() {
     start_test_server(port, 2);
 
     let mut master = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
-    master.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    master
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
 
     // 1. Query master replication info
     let info = send_and_read(&mut master, b"INFO replication\r\n");
@@ -5735,7 +5730,9 @@ fn test_psync_partial_resync_continue_e2e() {
 
     // 4. Connect replica client requesting partial resync at offset1
     let mut replica = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
-    replica.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    replica
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
 
     let psync_cmd = format!("PSYNC {} {}\r\n", replid, offset1);
     replica.write_all(psync_cmd.as_bytes()).unwrap();
@@ -5767,7 +5764,9 @@ fn test_psync_partial_resync_continue_e2e() {
 
     // 6. Test invalid replid triggers +FULLRESYNC
     let mut bad_replica = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
-    bad_replica.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    bad_replica
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
     bad_replica
         .write_all(b"PSYNC 0000000000000000000000000000000000000000 0\r\n")
         .unwrap();
@@ -5825,8 +5824,8 @@ fn test_tls_port_listener_e2e() {
     assert_eq!(&buf[..n], b"$18\r\nencrypted_value_99\r\n");
 
     // 6. Connect to plain TCP port and verify shared database state
-    let mut plain_client = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .expect("Failed to connect plain client");
+    let mut plain_client =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect plain client");
     assert_eq!(
         send_and_read(&mut plain_client, b"GET secure_key\r\n"),
         "$18\r\nencrypted_value_99\r\n"
@@ -5849,9 +5848,11 @@ fn test_cross_shard_mget_mset_fanout_e2e() {
     let num_shards = 4;
     start_test_server(port, num_shards);
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .expect("Failed to connect client");
-    client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut client =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect client");
+    client
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
 
     // 1. Find 4 keys that each map to shard 0, 1, 2, 3
     let mut shard_keys: [String; 4] = Default::default();
@@ -5906,11 +5907,17 @@ fn test_cross_shard_mget_mset_fanout_e2e() {
 
     // 5. Co-located hash-tag keys (single-shard bypass path)
     let mset_tagged = "MSET {user:99}:name Alice {user:99}:city Seattle {user:99}:role Admin\r\n";
-    assert_eq!(send_and_read(&mut client, mset_tagged.as_bytes()), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client, mset_tagged.as_bytes()),
+        "+OK\r\n"
+    );
 
     let mget_tagged = "MGET {user:99}:city {user:99}:name {user:99}:missing {user:99}:role\r\n";
     let expected_tagged = "*4\r\n$7\r\nSeattle\r\n$5\r\nAlice\r\n$-1\r\n$5\r\nAdmin\r\n";
-    assert_eq!(send_and_read(&mut client, mget_tagged.as_bytes()), expected_tagged);
+    assert_eq!(
+        send_and_read(&mut client, mget_tagged.as_bytes()),
+        expected_tagged
+    );
 
     // 6. Pipelined MSET + MGET in a single network buffer
     let pipeline = format!(
@@ -5928,16 +5935,27 @@ fn test_mget_zero_alloc_resp2_resp3_serialization_e2e() {
     let num_shards = 2;
     start_test_server(port, num_shards);
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .expect("Failed to connect client");
-    client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut client =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect client");
+    client
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
 
-    assert_eq!(send_and_read(&mut client, b"SET key_alpha value_alpha\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client, b"SET key_beta value_beta\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"SET key_alpha value_alpha\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"SET key_beta value_beta\r\n"),
+        "+OK\r\n"
+    );
 
     // RESP2 test: missing key returns "$-1\r\n"
     let mget_resp2 = send_and_read(&mut client, b"MGET key_alpha key_missing key_beta\r\n");
-    assert_eq!(mget_resp2, "*3\r\n$11\r\nvalue_alpha\r\n$-1\r\n$10\r\nvalue_beta\r\n");
+    assert_eq!(
+        mget_resp2,
+        "*3\r\n$11\r\nvalue_alpha\r\n$-1\r\n$10\r\nvalue_beta\r\n"
+    );
 
     // Switch to RESP3 via HELLO 3
     let hello_resp = send_and_read(&mut client, b"HELLO 3\r\n");
@@ -5945,7 +5963,10 @@ fn test_mget_zero_alloc_resp2_resp3_serialization_e2e() {
 
     // RESP3 test: missing key returns "_\r\n" (null)
     let mget_resp3 = send_and_read(&mut client, b"MGET key_alpha key_missing key_beta\r\n");
-    assert_eq!(mget_resp3, "*3\r\n$11\r\nvalue_alpha\r\n_\r\n$10\r\nvalue_beta\r\n");
+    assert_eq!(
+        mget_resp3,
+        "*3\r\n$11\r\nvalue_alpha\r\n_\r\n$10\r\nvalue_beta\r\n"
+    );
 }
 
 #[test]
@@ -5954,27 +5975,43 @@ fn test_client_tracking_atomic_bypass_and_invalidation_e2e() {
     let num_shards = 2;
     start_test_server(port, num_shards);
 
-    let mut client1 = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .expect("Failed to connect client1");
-    client1.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut client1 =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect client1");
+    client1
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
 
-    let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .expect("Failed to connect client2");
-    client2.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut client2 =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect client2");
+    client2
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
 
     // 1. Initial MGET without tracking - verifies atomic bypass path
-    assert_eq!(send_and_read(&mut client1, b"SET tracked_k1 initial_v1\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client1, b"MGET tracked_k1\r\n"), "*1\r\n$10\r\ninitial_v1\r\n");
+    assert_eq!(
+        send_and_read(&mut client1, b"SET tracked_k1 initial_v1\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, b"MGET tracked_k1\r\n"),
+        "*1\r\n$10\r\ninitial_v1\r\n"
+    );
 
     // 2. Enable client tracking in RESP3 mode
     assert!(send_and_read(&mut client1, b"HELLO 3\r\n").starts_with('%') || true);
-    assert_eq!(send_and_read(&mut client1, b"CLIENT TRACKING on\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client1, b"CLIENT TRACKING on\r\n"),
+        "+OK\r\n"
+    );
 
     // 3. Read key with tracking enabled
     let _ = send_and_read(&mut client1, b"GET tracked_k1\r\n");
 
     // 4. Mutate key from client2
-    assert_eq!(send_and_read(&mut client2, b"SET tracked_k1 updated_v1\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client2, b"SET tracked_k1 updated_v1\r\n"),
+        "+OK\r\n"
+    );
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     // 5. Client 1 receives push invalidation message
@@ -5986,7 +6023,10 @@ fn test_client_tracking_atomic_bypass_and_invalidation_e2e() {
     assert!(next_resp.contains("invalidate") && next_resp.contains("tracked_k1"));
 
     // 6. Disable tracking - restores atomic bypass
-    assert_eq!(send_and_read(&mut client1, b"CLIENT TRACKING off\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client1, b"CLIENT TRACKING off\r\n"),
+        "+OK\r\n"
+    );
 }
 
 #[test]
@@ -5995,9 +6035,11 @@ fn test_mget_mset_8shard_preallocated_fanout_e2e() {
     let num_shards = 8;
     start_test_server(port, num_shards);
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .expect("Failed to connect client");
-    client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut client =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect client");
+    client
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
 
     // Find keys for all 8 shards
     let mut shard_keys: [String; 8] = Default::default();
@@ -6044,9 +6086,11 @@ fn test_mget_mset_pooled_channels_high_churn_e2e() {
     let num_shards = 4;
     start_test_server(port, num_shards);
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .expect("Failed to connect client");
-    client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut client =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect client");
+    client
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
 
     // Find 4 keys on 4 shards
     let mut keys = Vec::new();
@@ -6065,10 +6109,7 @@ fn test_mget_mset_pooled_channels_high_churn_e2e() {
         );
         assert_eq!(send_and_read(&mut client, set_cmd.as_bytes()), "+OK\r\n");
 
-        let get_cmd = format!(
-            "MGET {} {} {} {}\r\n",
-            keys[0], keys[1], keys[2], keys[3]
-        );
+        let get_cmd = format!("MGET {} {} {} {}\r\n", keys[0], keys[1], keys[2], keys[3]);
         let resp = send_and_read(&mut client, get_cmd.as_bytes());
         assert!(resp.contains(&format!("v_{}_0", iter)));
         assert!(resp.contains(&format!("v_{}_1", iter)));
@@ -6081,9 +6122,11 @@ fn test_mget_mset_pooled_channels_high_churn_e2e() {
 fn test_mget_burst_draining_and_single_pass_fanout_e2e() {
     let port = 16705;
     start_test_server(port, 8);
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .expect("Failed to connect client");
-    client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut client =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect client");
+    client
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
 
     // Form 16 keys across 8 shards (2 keys per shard)
     let mut keys = Vec::new();
@@ -6131,9 +6174,11 @@ fn test_mget_burst_draining_and_single_pass_fanout_e2e() {
 fn test_mget_fast_harvest_try_recv_sweep_e2e() {
     let port = 16706;
     start_test_server(port, 4);
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .expect("Failed to connect client");
-    client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut client =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect client");
+    client
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
 
     let keys = [
         "sweep_k_0".to_string(),
@@ -6150,16 +6195,21 @@ fn test_mget_fast_harvest_try_recv_sweep_e2e() {
 
     let get_cmd = format!("MGET {} {} {} {}\r\n", keys[0], keys[1], keys[2], keys[3]);
     let resp = send_and_read(&mut client, get_cmd.as_bytes());
-    assert_eq!(resp, "*4\r\n$4\r\nval0\r\n$4\r\nval1\r\n$4\r\nval2\r\n$4\r\nval3\r\n");
+    assert_eq!(
+        resp,
+        "*4\r\n$4\r\nval0\r\n$4\r\nval1\r\n$4\r\nval2\r\n$4\r\nval3\r\n"
+    );
 }
 
 #[test]
 fn test_pipelined_fast_path_set_and_scattered_mset_e2e() {
     let port = 16707;
     start_test_server(port, 4);
-    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port))
-        .expect("Failed to connect client");
-    client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut client =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect client");
+    client
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
 
     // 1. Pipelined fast-path SET with 1KB payloads (16 commands in single write)
     let val_1kb = vec![b'v'; 1024];
@@ -6167,7 +6217,13 @@ fn test_pipelined_fast_path_set_and_scattered_mset_e2e() {
     let mut pipeline_req = Vec::new();
     for i in 0..16 {
         pipeline_req.extend_from_slice(
-            format!("*3\r\n$3\r\nSET\r\n${}\r\nfast_k_{}\r\n$1024\r\n{}\r\n", 7 + i.to_string().len(), i, val_1kb_str).as_bytes()
+            format!(
+                "*3\r\n$3\r\nSET\r\n${}\r\nfast_k_{}\r\n$1024\r\n{}\r\n",
+                7 + i.to_string().len(),
+                i,
+                val_1kb_str
+            )
+            .as_bytes(),
         );
     }
     client.write_all(&pipeline_req).unwrap();
@@ -6189,12 +6245,18 @@ fn test_pipelined_fast_path_set_and_scattered_mset_e2e() {
     let expected_get_len = 16 * (7 + 1024 + 2); // $1024\r\n<1024 bytes>\r\n per key
     while get_resp.len() < expected_get_len {
         let n = client.read(&mut temp).unwrap();
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         get_resp.extend_from_slice(&temp[..n]);
     }
     let get_resp_str = String::from_utf8_lossy(&get_resp);
     for i in 0..16 {
-        assert!(get_resp_str.contains(val_1kb_str), "Missing 1KB payload for fast_k_{}", i);
+        assert!(
+            get_resp_str.contains(val_1kb_str),
+            "Missing 1KB payload for fast_k_{}",
+            i
+        );
     }
 
     // 3. Multi-key scattered MSET across shards
@@ -6312,7 +6374,9 @@ fn test_fragmented_socket_frame_draining_e2e() {
     let mut temp = [0u8; 1024];
     while responses.len() < 32 * 5 {
         let n = client.read(&mut temp).unwrap();
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         responses.extend_from_slice(&temp[..n]);
     }
 
@@ -6329,7 +6393,9 @@ fn test_fragmented_socket_frame_draining_e2e() {
         let mut temp = [0u8; 2048];
         while get_resp.len() < expected_get_len {
             let n = client.read(&mut temp).unwrap();
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             get_resp.extend_from_slice(&temp[..n]);
         }
         let resp_str = String::from_utf8_lossy(&get_resp);
@@ -6363,7 +6429,10 @@ fn test_pipeline1_fast_path_and_acl_bypass_e2e() {
     assert_eq!(resp, "$7\r\nnew_val\r\n");
 
     // 3. Test ACL configuration and execution
-    let resp = send_and_read(&mut client, b"ACL SETUSER alice on >secretpass +@all ~*\r\n");
+    let resp = send_and_read(
+        &mut client,
+        b"ACL SETUSER alice on >secretpass +@all ~*\r\n",
+    );
     assert_eq!(resp, "+OK\r\n");
 
     let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
@@ -6492,14 +6561,20 @@ fn test_zero_alloc_command_dispatch_and_mixed_case_e2e() {
     let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
 
     // 1. Lowercase commands via RESP
-    let resp = send_and_read(&mut client, b"*3\r\n$3\r\nset\r\n$7\r\nmykey01\r\n$8\r\nval_zero\r\n");
+    let resp = send_and_read(
+        &mut client,
+        b"*3\r\n$3\r\nset\r\n$7\r\nmykey01\r\n$8\r\nval_zero\r\n",
+    );
     assert_eq!(resp, "+OK\r\n");
 
     let resp = send_and_read(&mut client, b"*2\r\n$3\r\nget\r\n$7\r\nmykey01\r\n");
     assert_eq!(resp, "$8\r\nval_zero\r\n");
 
     // 2. Mixed-case commands
-    let resp = send_and_read(&mut client, b"*3\r\n$3\r\nSeT\r\n$7\r\nmykey02\r\n$7\r\nval_two\r\n");
+    let resp = send_and_read(
+        &mut client,
+        b"*3\r\n$3\r\nSeT\r\n$7\r\nmykey02\r\n$7\r\nval_two\r\n",
+    );
     assert_eq!(resp, "+OK\r\n");
 
     let resp = send_and_read(&mut client, b"*2\r\n$3\r\nGeT\r\n$7\r\nmykey02\r\n");
@@ -6572,7 +6647,10 @@ fn test_pipeline1_lockless_stats_and_buffer_recycling_e2e() {
 
         let get_cmd = format!("GET p1_key_{}\r\n", i);
         let resp = send_and_read(&mut client, get_cmd.as_bytes());
-        assert_eq!(resp, format!("${}\r\np1_val_{}\r\n", 7 + i.to_string().len(), i));
+        assert_eq!(
+            resp,
+            format!("${}\r\np1_val_{}\r\n", 7 + i.to_string().len(), i)
+        );
     }
 
     // 2. Verify commandstats aggregation
@@ -6725,7 +6803,8 @@ fn test_resp3_isolation_across_interleaved_clients_e2e() {
     );
 
     // client_resp2 queries again: must STILL be flat array *2\r\n
-    let zrange_resp2_again = send_and_read(&mut client_resp2, b"ZRANGE my_zset 0 -1 WITHSCORES\r\n");
+    let zrange_resp2_again =
+        send_and_read(&mut client_resp2, b"ZRANGE my_zset 0 -1 WITHSCORES\r\n");
     assert!(
         zrange_resp2_again.starts_with("*2\r\n"),
         "RESP2 client leaked RESP3 nested array score format: {}",
@@ -6748,7 +6827,10 @@ fn test_config_resetstat_and_info_commandstats_cross_shard_e2e() {
     // 2. Issue commands across c1 and c2
     assert_eq!(send_and_read(&mut c1, b"PING\r\n"), "+PONG\r\n");
     assert_eq!(send_and_read(&mut c2, b"SET k_test v_test\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut c2, b"GET k_test\r\n"), "$6\r\nv_test\r\n");
+    assert_eq!(
+        send_and_read(&mut c2, b"GET k_test\r\n"),
+        "$6\r\nv_test\r\n"
+    );
 
     // 3. Read full INFO commandstats response
     c1.write_all(b"INFO commandstats\r\n").unwrap();
@@ -6813,7 +6895,10 @@ fn test_graceful_shutdown_command_and_worker_exit_e2e() {
 
     let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     assert_eq!(send_and_read(&mut client, b"PING\r\n"), "+PONG\r\n");
-    assert_eq!(send_and_read(&mut client, b"SET k_shut v_shut\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"SET k_shut v_shut\r\n"),
+        "+OK\r\n"
+    );
 
     // Issue SHUTDOWN NOSAVE command
     let resp = send_and_read(&mut client, b"SHUTDOWN NOSAVE\r\n");
@@ -6821,7 +6906,9 @@ fn test_graceful_shutdown_command_and_worker_exit_e2e() {
 
     // All shard worker threads should gracefully exit and join within 1.5 seconds
     for handle in handles {
-        handle.join().expect("Worker thread failed to join cleanly during graceful shutdown");
+        handle
+            .join()
+            .expect("Worker thread failed to join cleanly during graceful shutdown");
     }
 
     assert!(rudis::shutdown::is_shutting_down());
@@ -6896,7 +6983,9 @@ fn test_maxclients_and_memory_eviction_e2e() {
     // Connecting a 2nd client should immediately be rejected with max number of clients reached
     let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     let mut buf = [0u8; 128];
-    client2.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    client2
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
     let n = client2.read(&mut buf).unwrap_or(0);
     let resp = String::from_utf8_lossy(&buf[..n]);
     assert!(resp.contains("-ERR max number of clients reached"));
@@ -6977,8 +7066,12 @@ fn test_prometheus_telemetry_metrics_e2e() {
 #[test]
 fn test_deployment_configuration_and_service_assets_e2e() {
     let conf_path = std::path::Path::new("rudis.conf");
-    assert!(conf_path.exists(), "rudis.conf should exist in repository root");
-    let cfg = rudis::config::RudisConfig::load_file(conf_path).expect("rudis.conf should parse cleanly");
+    assert!(
+        conf_path.exists(),
+        "rudis.conf should exist in repository root"
+    );
+    let cfg =
+        rudis::config::RudisConfig::load_file(conf_path).expect("rudis.conf should parse cleanly");
     assert_eq!(cfg.port, 6379);
     assert_eq!(cfg.maxclients, 10000);
     assert_eq!(cfg.maxmemory_policy, "allkeys-lru");
@@ -6986,13 +7079,19 @@ fn test_deployment_configuration_and_service_assets_e2e() {
     assert!(cfg.appendonly);
 
     let service_path = std::path::Path::new("rudis.service");
-    assert!(service_path.exists(), "rudis.service should exist in repository root");
+    assert!(
+        service_path.exists(),
+        "rudis.service should exist in repository root"
+    );
     let service_content = std::fs::read_to_string(service_path).unwrap();
     assert!(service_content.contains("ExecStart="));
     assert!(service_content.contains("LimitNOFILE="));
 
     let dockerfile_path = std::path::Path::new("Dockerfile");
-    assert!(dockerfile_path.exists(), "Dockerfile should exist in repository root");
+    assert!(
+        dockerfile_path.exists(),
+        "Dockerfile should exist in repository root"
+    );
     let docker_content = std::fs::read_to_string(dockerfile_path).unwrap();
     assert!(docker_content.contains("FROM rust:"));
     assert!(docker_content.contains("ENTRYPOINT"));
@@ -7030,14 +7129,20 @@ fn test_panic_isolation_resilience_e2e() {
     let mut info_buf = [0u8; 2048];
     let info_n = client2.read(&mut info_buf).unwrap();
     let info_str = String::from_utf8_lossy(&info_buf[..info_n]);
-    assert!(info_str.contains("isolated_panics:1"), "Expected isolated_panics:1 in INFO clients");
+    assert!(
+        info_str.contains("isolated_panics:1"),
+        "Expected isolated_panics:1 in INFO clients"
+    );
 
     // Check INFO prometheus shows rudis_isolated_panics_total
     client2.write_all(b"INFO prometheus\r\n").unwrap();
     let mut prom_buf = [0u8; 4096];
     let prom_n = client2.read(&mut prom_buf).unwrap();
     let prom_str = String::from_utf8_lossy(&prom_buf[..prom_n]);
-    assert!(prom_str.contains("rudis_isolated_panics_total 1"), "Expected rudis_isolated_panics_total 1 in Prometheus metrics");
+    assert!(
+        prom_str.contains("rudis_isolated_panics_total 1"),
+        "Expected rudis_isolated_panics_total 1 in Prometheus metrics"
+    );
 }
 
 #[test]
@@ -7046,18 +7151,33 @@ fn test_multikey_acl_and_crossslot_enforcement_e2e() {
     start_test_server(port, 2);
 
     let mut admin = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
-    assert_eq!(send_and_read(&mut admin, b"SET allowed:1 v1\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut admin, b"SET allowed:2 v2\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut admin, b"SET secret:99 secret_value\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut admin, b"SET allowed:1 v1\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut admin, b"SET allowed:2 v2\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut admin, b"SET secret:99 secret_value\r\n"),
+        "+OK\r\n"
+    );
 
     // Configure user 'restricted' with access only to ~allowed:*
     assert_eq!(
-        send_and_read(&mut admin, b"ACL SETUSER restricted on >secpass +@all ~allowed:*\r\n"),
+        send_and_read(
+            &mut admin,
+            b"ACL SETUSER restricted on >secpass +@all ~allowed:*\r\n"
+        ),
         "+OK\r\n"
     );
 
     let mut user = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
-    assert_eq!(send_and_read(&mut user, b"AUTH restricted secpass\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut user, b"AUTH restricted secpass\r\n"),
+        "+OK\r\n"
+    );
 
     // Permitted: MGET with all allowed keys
     assert_eq!(
@@ -7067,18 +7187,33 @@ fn test_multikey_acl_and_crossslot_enforcement_e2e() {
 
     // Rejected: MGET where first key is allowed, but second key is forbidden
     let mget_resp = send_and_read(&mut user, b"MGET allowed:1 secret:99\r\n");
-    assert!(mget_resp.starts_with("-NOPERM"), "Expected -NOPERM on MGET with forbidden key, got {}", mget_resp);
+    assert!(
+        mget_resp.starts_with("-NOPERM"),
+        "Expected -NOPERM on MGET with forbidden key, got {}",
+        mget_resp
+    );
 
     // Rejected: DEL where first key is allowed, but second key is forbidden
     let del_resp = send_and_read(&mut user, b"DEL allowed:1 secret:99\r\n");
-    assert!(del_resp.starts_with("-NOPERM"), "Expected -NOPERM on DEL with forbidden key, got {}", del_resp);
+    assert!(
+        del_resp.starts_with("-NOPERM"),
+        "Expected -NOPERM on DEL with forbidden key, got {}",
+        del_resp
+    );
 
     // Rejected: MSET where second key is forbidden
     let mset_resp = send_and_read(&mut user, b"MSET allowed:1 new1 secret:99 newsecret\r\n");
-    assert!(mset_resp.starts_with("-NOPERM"), "Expected -NOPERM on MSET with forbidden key, got {}", mset_resp);
+    assert!(
+        mset_resp.starts_with("-NOPERM"),
+        "Expected -NOPERM on MSET with forbidden key, got {}",
+        mset_resp
+    );
 
     // Verify secret:99 was never modified
-    assert_eq!(send_and_read(&mut admin, b"GET secret:99\r\n"), "$12\r\nsecret_value\r\n");
+    assert_eq!(
+        send_and_read(&mut admin, b"GET secret:99\r\n"),
+        "$12\r\nsecret_value\r\n"
+    );
 }
 
 #[test]
@@ -7090,7 +7225,10 @@ fn test_extended_types_rdb_persistence_e2e() {
 
     // 1. Set JSON document
     assert_eq!(
-        send_and_read(&mut client, b"JSON.SET doc:1 $ {\"title\":\"test\",\"rating\":5}\r\n"),
+        send_and_read(
+            &mut client,
+            b"JSON.SET doc:1 $ {\"title\":\"test\",\"rating\":5}\r\n"
+        ),
         "+OK\r\n"
     );
     assert_eq!(
@@ -7126,19 +7264,3 @@ fn test_extended_types_rdb_persistence_e2e() {
         ":1\r\n"
     );
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

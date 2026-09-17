@@ -7605,7 +7605,8 @@ pub fn load_rdb_bytes(
             if cursor + 4 > content_len {
                 break;
             }
-            let json_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+            let json_len =
+                u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
             cursor += 4;
             if cursor + json_len > content_len {
                 break;
@@ -7624,19 +7625,30 @@ pub fn load_rdb_bytes(
             if cursor + 40 > content_len {
                 break;
             }
-            let capacity = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap()) as usize;
-            let error_rate = f64::from_bits(u64::from_le_bytes(data[cursor + 8..cursor + 16].try_into().unwrap()));
-            let num_bits = u64::from_le_bytes(data[cursor + 16..cursor + 24].try_into().unwrap()) as usize;
-            let num_hashes = u32::from_le_bytes(data[cursor + 24..cursor + 28].try_into().unwrap()) as usize;
-            let count_val = u64::from_le_bytes(data[cursor + 28..cursor + 36].try_into().unwrap()) as usize;
-            let bits_len = u32::from_le_bytes(data[cursor + 36..cursor + 40].try_into().unwrap()) as usize;
+            let capacity =
+                u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap()) as usize;
+            let error_rate = f64::from_bits(u64::from_le_bytes(
+                data[cursor + 8..cursor + 16].try_into().unwrap(),
+            ));
+            let num_bits =
+                u64::from_le_bytes(data[cursor + 16..cursor + 24].try_into().unwrap()) as usize;
+            let num_hashes =
+                u32::from_le_bytes(data[cursor + 24..cursor + 28].try_into().unwrap()) as usize;
+            let count_val =
+                u64::from_le_bytes(data[cursor + 28..cursor + 36].try_into().unwrap()) as usize;
+            let bits_len =
+                u32::from_le_bytes(data[cursor + 36..cursor + 40].try_into().unwrap()) as usize;
             cursor += 40;
             if cursor + bits_len * 8 > content_len {
                 break;
             }
             let mut bits = Vec::with_capacity(bits_len);
             for i in 0..bits_len {
-                bits.push(u64::from_le_bytes(data[cursor + i * 8..cursor + (i + 1) * 8].try_into().unwrap()));
+                bits.push(u64::from_le_bytes(
+                    data[cursor + i * 8..cursor + (i + 1) * 8]
+                        .try_into()
+                        .unwrap(),
+                ));
             }
             cursor += bits_len * 8;
             if crate::router::target_shard(&key, num_shards) == shard_id {
@@ -7659,18 +7671,21 @@ pub fn load_rdb_bytes(
             if cursor + 4 > content_len {
                 break;
             }
-            let idx_name_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+            let idx_name_len =
+                u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
             cursor += 4;
             if cursor + idx_name_len > content_len {
                 break;
             }
-            let idx_name = String::from_utf8_lossy(&data[cursor..cursor + idx_name_len]).to_string();
+            let idx_name =
+                String::from_utf8_lossy(&data[cursor..cursor + idx_name_len]).to_string();
             cursor += idx_name_len;
 
             if cursor + 4 > content_len {
                 break;
             }
-            let doc_key_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+            let doc_key_len =
+                u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
             cursor += 4;
             if cursor + doc_key_len > content_len {
                 break;
@@ -7687,19 +7702,32 @@ pub fn load_rdb_bytes(
                 1 => crate::vector::VectorMetric::L2,
                 _ => crate::vector::VectorMetric::IP,
             };
-            let vec_len = u32::from_le_bytes(data[cursor + 1..cursor + 5].try_into().unwrap()) as usize;
+            let vec_len =
+                u32::from_le_bytes(data[cursor + 1..cursor + 5].try_into().unwrap()) as usize;
             cursor += 5;
             if cursor + vec_len * 4 > content_len {
                 break;
             }
             let mut vector = Vec::with_capacity(vec_len);
             for i in 0..vec_len {
-                let bits = u32::from_le_bytes(data[cursor + i * 4..cursor + (i + 1) * 4].try_into().unwrap());
+                let bits = u32::from_le_bytes(
+                    data[cursor + i * 4..cursor + (i + 1) * 4]
+                        .try_into()
+                        .unwrap(),
+                );
                 vector.push(f32::from_bits(bits));
             }
             cursor += vec_len * 4;
             if crate::router::target_shard(&doc_key, num_shards) == shard_id {
-                let _ = db.vadd(&idx_name, doc_key, vector, Some(metric), false, false, false);
+                let _ = db.vadd(
+                    &idx_name,
+                    doc_key,
+                    vector,
+                    Some(metric),
+                    false,
+                    false,
+                    false,
+                );
                 count += 1;
             }
             continue;
@@ -8472,8 +8500,14 @@ mod tests {
         assert_eq!(RudisTable::parse_i64_bytes(b"12345"), Some(12345));
         assert_eq!(RudisTable::parse_i64_bytes(b"-9876"), Some(-9876));
         assert_eq!(RudisTable::parse_i64_bytes(b"+42"), Some(42));
-        assert_eq!(RudisTable::parse_i64_bytes(b"9223372036854775807"), Some(i64::MAX));
-        assert_eq!(RudisTable::parse_i64_bytes(b"-9223372036854775808"), Some(i64::MIN));
+        assert_eq!(
+            RudisTable::parse_i64_bytes(b"9223372036854775807"),
+            Some(i64::MAX)
+        );
+        assert_eq!(
+            RudisTable::parse_i64_bytes(b"-9223372036854775808"),
+            Some(i64::MIN)
+        );
 
         // Long non-integers (>20 digits) early exit
         let long_payload = vec![b'a'; 1024];
@@ -8496,8 +8530,16 @@ mod tests {
         let mut table = RudisTable::new();
         // Insert keys
         table.set(Bytes::from("key1"), Bytes::from("val1"), None);
-        table.set(Bytes::from("key2"), Bytes::from("val2"), Some(Duration::from_secs(60)));
-        table.set(Bytes::from("key3"), Bytes::from("val3"), Some(Duration::from_secs(10)));
+        table.set(
+            Bytes::from("key2"),
+            Bytes::from("val2"),
+            Some(Duration::from_secs(60)),
+        );
+        table.set(
+            Bytes::from("key3"),
+            Bytes::from("val3"),
+            Some(Duration::from_secs(10)),
+        );
 
         assert_eq!(table.len(), 3);
 

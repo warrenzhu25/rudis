@@ -1125,9 +1125,7 @@ mod tests {
 
     #[monoio::test]
     async fn test_catch_unwind_async_success() {
-        let fut = catch_unwind_async(async {
-            42
-        });
+        let fut = catch_unwind_async(async { 42 });
         let res = fut.await;
         assert_eq!(res.unwrap(), 42);
     }

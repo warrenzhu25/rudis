@@ -1371,7 +1371,8 @@ impl ShardDb {
                     continue;
                 }
                 let rem_ms = exp_unix_ms - unix_now;
-                expire_at = Some(std::time::Instant::now() + std::time::Duration::from_millis(rem_ms));
+                expire_at =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(rem_ms));
             }
             if data.len() < 4 {
                 return Err("Truncated RDB key");
@@ -1411,7 +1412,8 @@ impl ShardDb {
                     return Err("Truncated BloomFilter header");
                 }
                 let capacity = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
-                let error_rate = f64::from_bits(u64::from_le_bytes(data[8..16].try_into().unwrap()));
+                let error_rate =
+                    f64::from_bits(u64::from_le_bytes(data[8..16].try_into().unwrap()));
                 let num_bits = u64::from_le_bytes(data[16..24].try_into().unwrap()) as usize;
                 let num_hashes = u32::from_le_bytes(data[24..28].try_into().unwrap()) as usize;
                 let count_val = u64::from_le_bytes(data[28..36].try_into().unwrap()) as usize;
@@ -1422,7 +1424,9 @@ impl ShardDb {
                 }
                 let mut bits = Vec::with_capacity(bits_len);
                 for i in 0..bits_len {
-                    bits.push(u64::from_le_bytes(data[i * 8..(i + 1) * 8].try_into().unwrap()));
+                    bits.push(u64::from_le_bytes(
+                        data[i * 8..(i + 1) * 8].try_into().unwrap(),
+                    ));
                 }
                 data = &data[bits_len * 8..];
                 self.probabilistic_store.bloom_filters.insert(
@@ -1481,7 +1485,15 @@ impl ShardDb {
                     vector.push(f32::from_bits(bits));
                 }
                 data = &data[vec_len * 4..];
-                let _ = self.vadd(&idx_name, doc_key, vector, Some(metric), false, false, false);
+                let _ = self.vadd(
+                    &idx_name,
+                    doc_key,
+                    vector,
+                    Some(metric),
+                    false,
+                    false,
+                    false,
+                );
                 continue;
             }
 
@@ -1715,17 +1727,38 @@ mod tests {
 
         // 1. Add JSON
         let _json_key = Bytes::from("user:101");
-        assert!(db.json_store.json_set(b"user:101", "$", r#"{"name":"alice","age":30}"#, false, false).unwrap());
+        assert!(
+            db.json_store
+                .json_set(
+                    b"user:101",
+                    "$",
+                    r#"{"name":"alice","age":30}"#,
+                    false,
+                    false
+                )
+                .unwrap()
+        );
 
         // 2. Add Bloom filter
         let bf_key = Bytes::from("bloom:test");
         let mut bf = crate::probabilistic::BloomFilter::new(1000, 0.01);
         bf.add(b"item_alpha");
-        db.probabilistic_store.bloom_filters.insert(bf_key.clone(), bf);
+        db.probabilistic_store
+            .bloom_filters
+            .insert(bf_key.clone(), bf);
 
         // 3. Add Vector
         let vec_doc = Bytes::from("doc:1");
-        db.vadd("test_idx", vec_doc.clone(), vec![1.0, 2.0, 3.0], Some(crate::vector::VectorMetric::Cosine), false, false, false).unwrap();
+        db.vadd(
+            "test_idx",
+            vec_doc.clone(),
+            vec![1.0, 2.0, 3.0],
+            Some(crate::vector::VectorMetric::Cosine),
+            false,
+            false,
+            false,
+        )
+        .unwrap();
 
         // Serialize to RDB chunk
         let mut chunk = Vec::new();
@@ -1734,14 +1767,23 @@ mod tests {
 
         // Restore into new ShardDb
         let mut new_db = ShardDb::new(0);
-        new_db.restore_rdb_chunk(&chunk).expect("restore_rdb_chunk should succeed");
+        new_db
+            .restore_rdb_chunk(&chunk)
+            .expect("restore_rdb_chunk should succeed");
 
         // Verify JSON
-        let json_val = new_db.json_store.json_get(b"user:101", &["$"]).expect("JSON document should exist");
+        let json_val = new_db
+            .json_store
+            .json_get(b"user:101", &["$"])
+            .expect("JSON document should exist");
         assert!(json_val.contains("alice"));
 
         // Verify Bloom filter
-        let restored_bf = new_db.probabilistic_store.bloom_filters.get(&bf_key).expect("Bloom filter should exist");
+        let restored_bf = new_db
+            .probabilistic_store
+            .bloom_filters
+            .get(&bf_key)
+            .expect("Bloom filter should exist");
         assert!(restored_bf.contains(b"item_alpha"));
         assert!(!restored_bf.contains(b"nonexistent"));
 

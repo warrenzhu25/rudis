@@ -77,9 +77,10 @@ fn main() {
     };
 
     // 2. Merge CLI overrides
-    let cluster_opt = args.cluster_enabled.as_ref().map(|s| {
-        matches!(s.to_lowercase().as_str(), "yes" | "true" | "1")
-    });
+    let cluster_opt = args
+        .cluster_enabled
+        .as_ref()
+        .map(|s| matches!(s.to_lowercase().as_str(), "yes" | "true" | "1"));
     server_config.merge_cli(
         args.port,
         args.threads,

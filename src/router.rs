@@ -475,7 +475,10 @@ impl Router {
         if max_mem == 0 {
             return false;
         }
-        let offload_pct = self.tier_stats.offload_threshold_pct.load(Ordering::Relaxed);
+        let offload_pct = self
+            .tier_stats
+            .offload_threshold_pct
+            .load(Ordering::Relaxed);
         let used_mem = self.local_db.borrow().table.used_memory;
         let shard_threshold = (max_mem / self.num_shards.max(1) as u64) as usize;
         used_mem >= (shard_threshold * offload_pct as usize) / 100
@@ -647,7 +650,9 @@ impl Router {
         if self.is_memory_constrained() {
             let val = self.stream_cold_read_local(key).await;
             if val.is_some() {
-                self.tier_stats.streaming_reads.fetch_add(1, Ordering::Relaxed);
+                self.tier_stats
+                    .streaming_reads
+                    .fetch_add(1, Ordering::Relaxed);
                 self.tier_stats.ram_misses.fetch_add(1, Ordering::Relaxed);
             }
             val
@@ -737,9 +742,7 @@ impl Router {
             {
                 aof.borrow_mut().append(&bytes);
             }
-            self.local_db
-                .borrow_mut()
-                .set(key, value, expire_in);
+            self.local_db.borrow_mut().set(key, value, expire_in);
             let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed);
             if max_mem > 0 {
                 let used = self.local_db.borrow().table.used_memory;
@@ -793,9 +796,7 @@ impl Router {
             if used > shard_max_mem && !self.is_auto_tiering.get() {
                 let decommitted = self.decommit_local(None);
                 let used_after = self.local_db.borrow().table.used_memory;
-                if (decommitted == 0 || used_after > shard_max_mem)
-                    && !self.is_auto_tiering.get()
-                {
+                if (decommitted == 0 || used_after > shard_max_mem) && !self.is_auto_tiering.get() {
                     let r = self.clone();
                     monoio::spawn(async move {
                         r.check_auto_tier().await;
@@ -847,9 +848,11 @@ impl Router {
             return results;
         }
 
-        let mut remote_batches = self.mget_batch_pool.borrow_mut().pop().unwrap_or_else(|| {
-            (0..self.num_shards).map(|_| Vec::new()).collect()
-        });
+        let mut remote_batches = self
+            .mget_batch_pool
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(|| (0..self.num_shards).map(|_| Vec::new()).collect());
         let mut local_keys = Vec::with_capacity(keys.len().min(16));
         let mut has_remote = false;
         let mut num_remote_shards = 0;
@@ -945,8 +948,7 @@ impl Router {
                 }
             }
             if let Some(aof) = &self.aof
-                && let Some(bytes) =
-                    crate::aof::command_to_resp(&crate::resp::Command::Mset(pairs))
+                && let Some(bytes) = crate::aof::command_to_resp(&crate::resp::Command::Mset(pairs))
             {
                 aof.borrow_mut().append(&bytes);
             }
@@ -954,9 +956,11 @@ impl Router {
             return;
         }
 
-        let mut remote_batches = self.mset_batch_pool.borrow_mut().pop().unwrap_or_else(|| {
-            (0..self.num_shards).map(|_| Vec::new()).collect()
-        });
+        let mut remote_batches = self
+            .mset_batch_pool
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(|| (0..self.num_shards).map(|_| Vec::new()).collect());
         let mut local_batch = Vec::with_capacity(pairs.len().min(16));
         let mut has_remote = false;
         let mut num_remote_shards = 0;
@@ -982,8 +986,9 @@ impl Router {
         if !has_remote {
             if !local_batch.is_empty() {
                 if let Some(aof) = &self.aof
-                    && let Some(bytes) =
-                        crate::aof::command_to_resp(&crate::resp::Command::Mset(local_batch.clone()))
+                    && let Some(bytes) = crate::aof::command_to_resp(&crate::resp::Command::Mset(
+                        local_batch.clone(),
+                    ))
                 {
                     aof.borrow_mut().append(&bytes);
                 }
@@ -2115,7 +2120,10 @@ mod tests {
                         }
                         let _ = responder.send(pairs);
                     }
-                    ShardMessage::Mget { mut keys, responder } => {
+                    ShardMessage::Mget {
+                        mut keys,
+                        responder,
+                    } => {
                         for item in &mut keys {
                             let val = db.get(item.1.as_ref().unwrap());
                             item.1 = val;
@@ -2205,7 +2213,6 @@ mod tests {
         });
     }
 
-
     #[test]
     fn test_mget_single_pass_and_bitmask_fanout() {
         let (mut senders_mesh, mut receivers) = crate::mailbox::create_shard_mesh(2);
@@ -2277,7 +2284,10 @@ mod tests {
                         }
                         let _ = responder.send(pairs);
                     }
-                    ShardMessage::Mget { mut keys, responder } => {
+                    ShardMessage::Mget {
+                        mut keys,
+                        responder,
+                    } => {
                         for item in &mut keys {
                             let val = remote_db.get(item.1.as_ref().unwrap());
                             item.1 = val;
@@ -2301,11 +2311,7 @@ mod tests {
             ];
             router.mset(pairs).await;
 
-            let keys = vec![
-                k0.clone(),
-                Bytes::from("nonexistent"),
-                k1.clone(),
-            ];
+            let keys = vec![k0.clone(), Bytes::from("nonexistent"), k1.clone()];
             let values = router.mget(keys).await;
             assert_eq!(values.len(), 3);
             assert_eq!(values[0], Some(Bytes::from("v0")));
@@ -2369,7 +2375,10 @@ mod tests {
                         descriptor.recycle_keys(shard_id, keys);
                         descriptor.finish_shard();
                     }
-                    ShardMessage::Mget { mut keys, responder } => {
+                    ShardMessage::Mget {
+                        mut keys,
+                        responder,
+                    } => {
                         for item in &mut keys {
                             let val = remote_db.get(item.1.as_ref().unwrap());
                             item.1 = val;
@@ -2387,7 +2396,8 @@ mod tests {
             .unwrap();
 
         rt.block_on(async move {
-            db0.borrow_mut().set(k0.clone(), Bytes::from("local_harvest_val"), None);
+            db0.borrow_mut()
+                .set(k0.clone(), Bytes::from("local_harvest_val"), None);
             let keys = vec![k0.clone(), k1.clone()];
             let values = router.mget(keys).await;
             assert_eq!(values.len(), 2);
@@ -2440,7 +2450,9 @@ mod tests {
                         let val = remote_db.get(&key);
                         let _ = responder.send(val);
                     }
-                    ShardMessage::Batch { items, responder, .. } => {
+                    ShardMessage::Batch {
+                        items, responder, ..
+                    } => {
                         let mut res = Vec::new();
                         for (idx, _cmd) in items {
                             res.push((idx, crate::shard::CompactResp::from_slice(b"+PONG\r\n")));
@@ -2543,7 +2555,10 @@ mod tests {
                         descriptor.recycle_keys(shard_id, keys);
                         descriptor.finish_shard();
                     }
-                    ShardMessage::Mget { mut keys, responder } => {
+                    ShardMessage::Mget {
+                        mut keys,
+                        responder,
+                    } => {
                         for item in &mut keys {
                             let val = remote_db.get(item.1.as_ref().unwrap());
                             item.1 = val;
@@ -2571,19 +2586,35 @@ mod tests {
             assert_eq!(router.mget_batch_pool.borrow().len(), 0);
 
             // MSET scattered
-            router.mset(vec![(k0.clone(), Bytes::from("v0")), (k1.clone(), Bytes::from("v1"))]).await;
+            router
+                .mset(vec![
+                    (k0.clone(), Bytes::from("v0")),
+                    (k1.clone(), Bytes::from("v1")),
+                ])
+                .await;
             assert_eq!(router.mset_batch_pool.borrow().len(), 1);
 
-            router.mset(vec![(k0.clone(), Bytes::from("v0_new")), (k1.clone(), Bytes::from("v1_new"))]).await;
+            router
+                .mset(vec![
+                    (k0.clone(), Bytes::from("v0_new")),
+                    (k1.clone(), Bytes::from("v1_new")),
+                ])
+                .await;
             assert_eq!(router.mset_batch_pool.borrow().len(), 1);
 
             // MGET scattered
             let res1 = router.mget(vec![k0.clone(), k1.clone()]).await;
-            assert_eq!(res1, vec![Some(Bytes::from("v0_new")), Some(Bytes::from("v1_new"))]);
+            assert_eq!(
+                res1,
+                vec![Some(Bytes::from("v0_new")), Some(Bytes::from("v1_new"))]
+            );
             assert_eq!(router.mget_batch_pool.borrow().len(), 1);
 
             let res2 = router.mget(vec![k0.clone(), k1.clone()]).await;
-            assert_eq!(res2, vec![Some(Bytes::from("v0_new")), Some(Bytes::from("v1_new"))]);
+            assert_eq!(
+                res2,
+                vec![Some(Bytes::from("v0_new")), Some(Bytes::from("v1_new"))]
+            );
             assert_eq!(router.mget_batch_pool.borrow().len(), 1);
             assert!(router.mset_batch_pool.borrow()[0][1].capacity() > 0);
             assert!(router.mget_batch_pool.borrow()[0][1].capacity() > 0);
@@ -2655,7 +2686,10 @@ mod tests {
                         descriptor.recycle_keys(shard_id, keys);
                         descriptor.finish_shard();
                     }
-                    ShardMessage::Mget { mut keys, responder } => {
+                    ShardMessage::Mget {
+                        mut keys,
+                        responder,
+                    } => {
                         for item in &mut keys {
                             let val = remote_db.get(item.1.as_ref().unwrap());
                             item.1 = val;
@@ -2682,7 +2716,9 @@ mod tests {
             for round in 0..10 {
                 let v0 = Bytes::from(format!("val0_{}", round));
                 let v1 = Bytes::from(format!("val1_{}", round));
-                router.mset(vec![(k0.clone(), v0.clone()), (k1.clone(), v1.clone())]).await;
+                router
+                    .mset(vec![(k0.clone(), v0.clone()), (k1.clone(), v1.clone())])
+                    .await;
                 let res = router.mget(vec![k0.clone(), k1.clone()]).await;
                 assert_eq!(res, vec![Some(v0), Some(v1)]);
                 assert!(router.mset_batch_pool.borrow()[0][1].capacity() >= 1);
@@ -2756,7 +2792,10 @@ mod tests {
                         descriptor.recycle_keys(shard_id, keys);
                         descriptor.finish_shard();
                     }
-                    ShardMessage::Mget { mut keys, responder } => {
+                    ShardMessage::Mget {
+                        mut keys,
+                        responder,
+                    } => {
                         for item in &mut keys {
                             let val = remote_db.get(item.1.as_ref().unwrap());
                             item.1 = val;
@@ -2781,7 +2820,12 @@ mod tests {
 
         rt.block_on(async move {
             // MSET scattered
-            router.mset(vec![(k0.clone(), Bytes::from("val_k0")), (k1.clone(), Bytes::from("val_k1"))]).await;
+            router
+                .mset(vec![
+                    (k0.clone(), Bytes::from("val_k0")),
+                    (k1.clone(), Bytes::from("val_k1")),
+                ])
+                .await;
 
             // MGET scattered
             let res = router.mget(vec![k0.clone(), k1.clone()]).await;
@@ -2791,4 +2835,3 @@ mod tests {
         });
     }
 }
-

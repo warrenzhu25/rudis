@@ -274,7 +274,8 @@ impl AclManager {
                 user.password_hashes.retain(|pass| pass != &h && pass != p);
             } else if let Some(h) = rule.strip_prefix('!') {
                 let full_hash = format!("#{}", h);
-                user.password_hashes.retain(|pass| pass != &full_hash && pass != h);
+                user.password_hashes
+                    .retain(|pass| pass != &full_hash && pass != h);
             } else if rule == "+@all" || rule == "+all" {
                 user.all_commands = true;
                 user.disallowed_commands.clear();
@@ -350,10 +351,7 @@ mod tests {
         assert!(alice.password_hashes.contains(&expected_hash));
 
         // Authenticate with plaintext password
-        assert_eq!(
-            mgr.check_auth(Some("alice"), pass),
-            Ok("alice".to_string())
-        );
+        assert_eq!(mgr.check_auth(Some("alice"), pass), Ok("alice".to_string()));
         assert!(mgr.check_auth(Some("alice"), "wrong_pw").is_err());
 
         // Set user directly with precomputed hash
@@ -400,4 +398,3 @@ mod tests {
         assert!(!user.can_access_key(b"admin:root"));
     }
 }
-

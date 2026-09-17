@@ -316,24 +316,22 @@ mod tests {
 
     #[test]
     fn test_tls_cert_generation_and_config() {
-        let (cert_der, key_der) = generate_self_signed_cert(vec![
-            "localhost".to_string(),
-            "127.0.0.1".to_string(),
-        ])
-        .expect("Failed to generate test self-signed cert");
+        let (cert_der, key_der) =
+            generate_self_signed_cert(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+                .expect("Failed to generate test self-signed cert");
         assert!(!cert_der.is_empty());
         assert!(!key_der.is_empty());
 
-        let config = create_server_config(&cert_der, &key_der)
-            .expect("Failed to create ServerConfig");
+        let config =
+            create_server_config(&cert_der, &key_der).expect("Failed to create ServerConfig");
         let session = TlsSession::new(config);
         assert!(session.is_ok());
     }
 
     #[test]
     fn test_tls_worker_config() {
-        let (cert_der, key_der) = generate_self_signed_cert(vec!["localhost".to_string()])
-            .expect("generate cert failed");
+        let (cert_der, key_der) =
+            generate_self_signed_cert(vec!["localhost".to_string()]).expect("generate cert failed");
         let server_config = create_server_config(&cert_der, &key_der).unwrap();
         let worker_cfg = TlsWorkerConfig {
             tls_port: 16379,

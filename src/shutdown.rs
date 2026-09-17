@@ -20,8 +20,14 @@ pub fn reset_shutdown() {
 /// Installs OS signal handlers (SIGINT, SIGTERM) to trigger graceful server shutdown.
 pub fn install_signal_handlers() {
     unsafe {
-        libc::signal(libc::SIGINT, handle_signal as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, handle_signal as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            handle_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            handle_signal as *const () as libc::sighandler_t,
+        );
     }
 }
 

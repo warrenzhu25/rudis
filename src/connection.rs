@@ -1636,10 +1636,7 @@ async fn run_master_replica_stream(
     let (write_tx, write_rx) = flume::unbounded::<Vec<u8>>();
 
     let (req_replid, req_offset) = match &psync_cmd {
-        Command::Psync { replid, offset } => (
-            std::str::from_utf8(replid).unwrap_or(""),
-            *offset,
-        ),
+        Command::Psync { replid, offset } => (std::str::from_utf8(replid).unwrap_or(""), *offset),
         _ => ("", -1),
     };
 
@@ -3136,7 +3133,9 @@ async fn execute_command(
                         );
                         return false;
                     }
-                } else if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
+                } else if crate::cluster::HAS_ACTIVE_CLUSTER
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                {
                     let hub = crate::cluster::get_cluster_hub(router.port);
                     let my_slots = hub.my_slots.read().unwrap();
                     let owns_slot = my_slots.iter().any(|&(s, e)| slot >= s && slot <= e);
@@ -3175,7 +3174,9 @@ async fn execute_command(
             let used = router.local_db.borrow().table.used_memory;
             let shard_max = (max_mem / router.num_shards.max(1) as u64) as usize;
             if used > shard_max {
-                out.extend_from_slice(b"-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+                out.extend_from_slice(
+                    b"-OOM command not allowed when used memory > 'maxmemory'.\r\n",
+                );
                 return false;
             }
         }
@@ -3188,7 +3189,10 @@ async fn execute_command(
             let val = if target == router.shard_id {
                 let local_val = router.local_db.borrow_mut().get(&key);
                 if let Some(v) = local_val {
-                    router.tier_stats.ram_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    router
+                        .tier_stats
+                        .ram_hits
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     Some(v)
                 } else if router.local_db.borrow_mut().table.is_tiered(&key).is_none() {
                     None
@@ -3438,7 +3442,9 @@ async fn execute_command(
                 record_client_read(router.port, client_id, key.as_ref());
             }
             let all_local = !keys.is_empty()
-                && keys.iter().all(|k| target_shard(k, router.num_shards) == router.shard_id);
+                && keys
+                    .iter()
+                    .all(|k| target_shard(k, router.num_shards) == router.shard_id);
             if all_local {
                 write_resp_array_header(out, keys.len());
                 let mut db = router.local_db.borrow_mut();
@@ -4103,11 +4109,7 @@ async fn execute_command(
                 out.extend_from_slice(resp.as_bytes());
             } else if p_str == "maxclients" {
                 let val = get_max_clients().to_string();
-                let resp = format!(
-                    "*2\r\n$10\r\nmaxclients\r\n${}\r\n{}\r\n",
-                    val.len(),
-                    val
-                );
+                let resp = format!("*2\r\n$10\r\nmaxclients\r\n${}\r\n{}\r\n", val.len(), val);
                 out.extend_from_slice(resp.as_bytes());
             } else if p_str == "maxmemory-policy" {
                 let val = get_max_memory_policy();
@@ -7753,9 +7755,9 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         }
         Command::Mset(pairs)
             if !pairs.is_empty()
-                && pairs
-                    .iter()
-                    .all(|(k, _)| target_shard(k, num_shards) == target_shard(&pairs[0].0, num_shards)) =>
+                && pairs.iter().all(|(k, _)| {
+                    target_shard(k, num_shards) == target_shard(&pairs[0].0, num_shards)
+                }) =>
         {
             Some(target_shard(&pairs[0].0, num_shards))
         }
@@ -11997,7 +11999,8 @@ async fn execute_commands_squashed(
             }
             if !cmd_keys_list.is_empty() {
                 let is_cluster = router.cluster_enabled
-                    || crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed);
+                    || crate::cluster::HAS_ACTIVE_CLUSTER
+                        .load(std::sync::atomic::Ordering::Relaxed);
                 if is_cluster && cmd_keys_list.len() > 1 {
                     let first_slot = key_slot(cmd_keys_list[0]);
                     if cmd_keys_list[1..].iter().any(|k| key_slot(k) != first_slot) {
@@ -12008,7 +12011,8 @@ async fn execute_commands_squashed(
                 let mut invalid_slot = false;
                 for k in &cmd_keys_list {
                     let slot = key_slot(k);
-                    if router.slot_states.borrow()[slot as usize] != crate::shard::SlotState::Stable {
+                    if router.slot_states.borrow()[slot as usize] != crate::shard::SlotState::Stable
+                    {
                         invalid_slot = true;
                         break;
                     }
@@ -12110,7 +12114,11 @@ async fn execute_commands_squashed(
                     } = cmd
                 {
                     has_local_writes = true;
-                    router.local_db.borrow_mut().table.set(key, value, expire_in);
+                    router
+                        .local_db
+                        .borrow_mut()
+                        .table
+                        .set(key, value, expire_in);
                     local_buf.extend_from_slice(b"+OK\r\n");
                 } else {
                     if matches!(
@@ -12285,14 +12293,20 @@ mod tests {
 
         // Co-located MGET
         let mget_colocated = Command::Mget(vec![k1.clone(), k2.clone()]);
-        assert_eq!(target_shard_of_cmd(&mget_colocated, num_shards), Some(expected_shard));
+        assert_eq!(
+            target_shard_of_cmd(&mget_colocated, num_shards),
+            Some(expected_shard)
+        );
 
         // Co-located MSET
         let mset_colocated = Command::Mset(vec![
             (k1.clone(), Bytes::from("val1")),
             (k2.clone(), Bytes::from("val2")),
         ]);
-        assert_eq!(target_shard_of_cmd(&mset_colocated, num_shards), Some(expected_shard));
+        assert_eq!(
+            target_shard_of_cmd(&mset_colocated, num_shards),
+            Some(expected_shard)
+        );
 
         // Non-colocated MGET
         let mut diff_key = Bytes::from("different_key");
@@ -12574,7 +12588,11 @@ mod tests {
 
     #[test]
     fn test_cmd_keys_multi_key_acl_coverage() {
-        let mget = Command::Mget(vec![Bytes::from("k1"), Bytes::from("k2"), Bytes::from("k3")]);
+        let mget = Command::Mget(vec![
+            Bytes::from("k1"),
+            Bytes::from("k2"),
+            Bytes::from("k3"),
+        ]);
         assert_eq!(cmd_keys(&mget), vec![b"k1", b"k2", b"k3"]);
 
         let mset = Command::Mset(vec![
@@ -12590,6 +12608,3 @@ mod tests {
         assert_eq!(cmd_keys(&sinter), vec![b"s1", b"s2"]);
     }
 }
-
-
-

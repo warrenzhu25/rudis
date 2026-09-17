@@ -6,8 +6,8 @@ static TELEMETRY_INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// Initializes structured logging with `tracing` and `EnvFilter` (default: INFO level).
 pub fn init_telemetry() {
     if !TELEMETRY_INITIALIZED.swap(true, Ordering::SeqCst) {
-        let env_filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("info,rudis=info"));
+        let env_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,rudis=info"));
 
         let _ = fmt()
             .with_env_filter(env_filter)

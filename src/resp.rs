@@ -518,7 +518,9 @@ pub enum Command {
     // CONFIG COMMANDS
     ConfigGet(Bytes),
     ConfigSet(Bytes, Bytes),
-    Shutdown { save: Option<bool> },
+    Shutdown {
+        save: Option<bool>,
+    },
     Quit,
     // PUBSUB COMMANDS
     Subscribe(Vec<Bytes>),
@@ -8341,7 +8343,10 @@ mod tests {
         let mut heap = String::new();
         assert_eq!(bytes_to_uppercase_ascii(b"get", &mut buf, &mut heap), "GET");
         assert_eq!(bytes_to_uppercase_ascii(b"SeT", &mut buf, &mut heap), "SET");
-        assert_eq!(bytes_to_uppercase_ascii(b"mget", &mut buf, &mut heap), "MGET");
+        assert_eq!(
+            bytes_to_uppercase_ascii(b"mget", &mut buf, &mut heap),
+            "MGET"
+        );
 
         // Command parsing through RESP array
         let mut buf = BytesMut::from("*2\r\n$3\r\nget\r\n$3\r\nfoo\r\n");
@@ -8364,4 +8369,3 @@ mod tests {
         assert_eq!(cmd, Command::Unknown("UNKNOWN".to_string()));
     }
 }
-

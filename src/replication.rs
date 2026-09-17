@@ -70,7 +70,8 @@ impl ReplicationBacklog {
         }
 
         let first_chunk = (self.max_size - self.write_idx).min(n);
-        self.buffer[self.write_idx..self.write_idx + first_chunk].copy_from_slice(&data[..first_chunk]);
+        self.buffer[self.write_idx..self.write_idx + first_chunk]
+            .copy_from_slice(&data[..first_chunk]);
         let second_chunk = n - first_chunk;
         if second_chunk > 0 {
             self.buffer[..second_chunk].copy_from_slice(&data[first_chunk..]);
@@ -322,7 +323,9 @@ impl ReplicationHub {
         if !self.is_master() {
             return;
         }
-        if !self.backlog_active.load(Ordering::Relaxed) && !self.has_replicas.load(Ordering::Relaxed) {
+        if !self.backlog_active.load(Ordering::Relaxed)
+            && !self.has_replicas.load(Ordering::Relaxed)
+        {
             return;
         }
         if self.backlog_active.load(Ordering::Relaxed) {
@@ -830,9 +833,10 @@ mod tests {
         let replid = hub.master_replid.clone();
 
         // Unknown replid fails
-        assert!(hub
-            .try_partial_resync(1, tx.clone(), "unknown_replid", 0)
-            .is_none());
+        assert!(
+            hub.try_partial_resync(1, tx.clone(), "unknown_replid", 0)
+                .is_none()
+        );
 
         // Negative offset fails
         assert!(hub.try_partial_resync(1, tx.clone(), &replid, -1).is_none());
@@ -866,9 +870,10 @@ mod tests {
         hub.unregister_replica(3);
 
         // Offset beyond master fails
-        assert!(hub
-            .try_partial_resync(4, tx.clone(), &replid, (current_offset + 10) as i64)
-            .is_none());
+        assert!(
+            hub.try_partial_resync(4, tx.clone(), &replid, (current_offset + 10) as i64)
+                .is_none()
+        );
     }
 
     #[test]
@@ -905,4 +910,3 @@ mod tests {
         assert!(!hub.is_slave());
     }
 }
-

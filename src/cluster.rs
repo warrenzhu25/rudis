@@ -163,7 +163,12 @@ impl ClusterHub {
                 let peer_id = format!("{:040x}", s + 1);
                 out.push_str(&format!(
                     "{} 127.0.0.1:{}@{} master - 0 0 {} connected {}-{}\n",
-                    peer_id, peer_port, peer_cport, s + 1, peer_start, peer_end
+                    peer_id,
+                    peer_port,
+                    peer_cport,
+                    s + 1,
+                    peer_start,
+                    peer_end
                 ));
             }
             return out;
