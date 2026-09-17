@@ -801,6 +801,19 @@ impl Router {
                         r.check_auto_tier().await;
                     });
                 }
+
+                // If memory is still above threshold after decommit/offload, evict keys based on maxmemory-policy
+                let policy = crate::connection::get_max_memory_policy();
+                if policy != "noeviction" {
+                    let mut db = self.local_db.borrow_mut();
+                    let mut attempts = 0;
+                    while db.table.used_memory > shard_max_mem && attempts < 32 {
+                        attempts += 1;
+                        if db.table.try_evict_one_key(&policy).is_none() {
+                            break;
+                        }
+                    }
+                }
             }
         }
     }

@@ -1298,6 +1298,7 @@ impl RudisFlatTable {
 }
 
 static EXPIRED_KEYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static EVICTED_KEYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[inline]
 pub fn inc_expired_keys() {
@@ -1307,6 +1308,16 @@ pub fn inc_expired_keys() {
 #[inline]
 pub fn get_expired_keys() -> u64 {
     EXPIRED_KEYS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[inline]
+pub fn inc_evicted_keys() {
+    EVICTED_KEYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub fn get_evicted_keys() -> u64 {
+    EVICTED_KEYS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[inline]
@@ -1385,6 +1396,61 @@ impl RudisTable {
         } else {
             false
         }
+    }
+
+    /// Attempts to evict one key under the specified eviction policy (allkeys-lru, volatile-lru, volatile-ttl, allkeys-random).
+    /// Returns the number of bytes freed, or None if no evictable key was found.
+    pub fn try_evict_one_key(&mut self, policy: &str) -> Option<usize> {
+        let cap = self.table.capacity();
+        if cap == 0 || self.table.is_empty() {
+            return None;
+        }
+
+        let policy_lower = policy.to_lowercase();
+        let is_volatile = policy_lower.starts_with("volatile");
+
+        // Sample up to 10 occupied slots starting at sample_cursor
+        let mut best_slot: Option<usize> = None;
+        let mut min_ttl: Option<Instant> = None;
+        let mut checked = 0;
+        let mut attempts = 0;
+
+        while checked < 10 && attempts < cap {
+            let idx = self.sample_cursor % cap;
+            self.sample_cursor = (self.sample_cursor + 1) % cap;
+            attempts += 1;
+
+            if let Some(entry) = self.table.get_slot(idx) {
+                // If volatile policy, key must have an expiration
+                if is_volatile && entry.expire_at.is_none() {
+                    continue;
+                }
+
+                if policy_lower.contains("ttl") {
+                    if let Some(exp) = entry.expire_at
+                        && (min_ttl.is_none() || Some(exp) < min_ttl)
+                    {
+                        min_ttl = Some(exp);
+                        best_slot = Some(idx);
+                    }
+                } else {
+                    // LRU / random sampling
+                    best_slot = Some(idx);
+                    checked += 1;
+                }
+            }
+        }
+
+        if let Some(slot_idx) = best_slot
+            && let Some(removed) = self.table.remove(slot_idx)
+        {
+            let freed = removed.key.len() + removed.val.approx_bytes() + 64;
+            self.used_memory = self.used_memory.saturating_sub(freed);
+            inc_evicted_keys();
+            return Some(freed);
+        }
+
+        None
     }
 
     pub fn is_key_expired(&mut self, key: &[u8]) -> bool {
@@ -8308,5 +8374,26 @@ mod tests {
         // Update with insert_prepared path
         table.set(Bytes::from("prep_k1"), Bytes::from("val2"), None);
         assert_eq!(table.get(b"prep_k1").unwrap(), Some(Bytes::from("val2")));
+    }
+
+    #[test]
+    fn test_memory_eviction_policies() {
+        let mut table = RudisTable::new();
+        // Insert keys
+        table.set(Bytes::from("key1"), Bytes::from("val1"), None);
+        table.set(Bytes::from("key2"), Bytes::from("val2"), Some(Duration::from_secs(60)));
+        table.set(Bytes::from("key3"), Bytes::from("val3"), Some(Duration::from_secs(10)));
+
+        assert_eq!(table.len(), 3);
+
+        // Under volatile-ttl, key3 has smaller ttl than key2, so it should be prioritized
+        let evicted = table.try_evict_one_key("volatile-ttl");
+        assert!(evicted.is_some());
+        assert_eq!(table.len(), 2);
+
+        // Under allkeys-lru, any remaining key can be evicted
+        let evicted2 = table.try_evict_one_key("allkeys-lru");
+        assert!(evicted2.is_some());
+        assert_eq!(table.len(), 1);
     }
 }

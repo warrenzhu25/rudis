@@ -99,6 +99,8 @@ fn main() {
     }
     rudis::tiering::set_offload_threshold_pct(port, server_config.tiered_offload_threshold);
     rudis::tiering::set_upload_threshold_pct(port, server_config.tiered_upload_threshold);
+    rudis::connection::set_max_clients(server_config.maxclients);
+    rudis::connection::set_max_memory_policy(&server_config.maxmemory_policy);
 
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
     let num_cores = if !core_ids.is_empty() {

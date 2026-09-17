@@ -6876,6 +6876,70 @@ fn test_config_file_loading_and_cli_merge_e2e() {
     let _ = std::fs::remove_file(conf_path);
 }
 
+#[test]
+fn test_maxclients_and_memory_eviction_e2e() {
+    let port = 16720;
+    start_test_server(port, 1);
+
+    let mut client1 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    assert_eq!(send_and_read(&mut client1, b"PING\r\n"), "+PONG\r\n");
+
+    // 1. Verify CONFIG GET and SET for maxclients
+    let cfg_resp = send_and_read(&mut client1, b"CONFIG GET maxclients\r\n");
+    assert!(cfg_resp.contains("maxclients"));
+
+    assert_eq!(
+        send_and_read(&mut client1, b"CONFIG SET maxclients 1\r\n"),
+        "+OK\r\n"
+    );
+
+    // Connecting a 2nd client should immediately be rejected with max number of clients reached
+    let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let mut buf = [0u8; 128];
+    client2.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+    let n = client2.read(&mut buf).unwrap_or(0);
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(resp.contains("-ERR max number of clients reached"));
+
+    // Reset maxclients so other tests and operations are not affected
+    assert_eq!(
+        send_and_read(&mut client1, b"CONFIG SET maxclients 10000\r\n"),
+        "+OK\r\n"
+    );
+
+    // 2. Verify CONFIG GET and SET for maxmemory-policy
+    assert_eq!(
+        send_and_read(&mut client1, b"CONFIG SET maxmemory-policy allkeys-lru\r\n"),
+        "+OK\r\n"
+    );
+    let policy_resp = send_and_read(&mut client1, b"CONFIG GET maxmemory-policy\r\n");
+    assert!(policy_resp.contains("allkeys-lru"));
+
+    // Set maxmemory to small value and verify keys can still be set under allkeys-lru (eviction succeeds)
+    assert_eq!(
+        send_and_read(&mut client1, b"CONFIG SET maxmemory 1mb\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, b"SET k_evict1 v_evict1\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, b"SET k_evict2 v_evict2\r\n"),
+        "+OK\r\n"
+    );
+
+    // Reset maxmemory to 0
+    assert_eq!(
+        send_and_read(&mut client1, b"CONFIG SET maxmemory 0\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, b"CONFIG SET maxmemory-policy noeviction\r\n"),
+        "+OK\r\n"
+    );
+}
+
 
 
 

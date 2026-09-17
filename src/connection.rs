@@ -610,6 +610,39 @@ pub static HASH_MAX_ENTRIES: std::sync::atomic::AtomicUsize =
 pub static HASH_MAX_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64);
 pub static ALLOW_ACCESS_EXPIRED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+pub static ACTIVE_CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static MAX_CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(10000);
+pub static MAX_MEMORY_POLICY: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+
+pub fn set_max_clients(limit: usize) {
+    MAX_CLIENTS.store(limit, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn get_max_clients() -> usize {
+    MAX_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn get_active_clients() -> usize {
+    ACTIVE_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_max_memory_policy(policy: &str) {
+    if let Ok(mut lock) = MAX_MEMORY_POLICY.write() {
+        *lock = policy.to_lowercase();
+    }
+}
+
+pub fn get_max_memory_policy() -> String {
+    if let Ok(lock) = MAX_MEMORY_POLICY.read() {
+        if lock.is_empty() {
+            "noeviction".to_string()
+        } else {
+            lock.clone()
+        }
+    } else {
+        "noeviction".to_string()
+    }
+}
 
 pub async fn handle_tls_connection(
     mut stream: TcpStream,
@@ -619,6 +652,15 @@ pub async fn handle_tls_connection(
     client_registry: Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
     router: Rc<Router>,
 ) {
+    let current_clients = ACTIVE_CLIENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let max_c = MAX_CLIENTS.load(std::sync::atomic::Ordering::Relaxed);
+    if max_c > 0 && current_clients > max_c {
+        ACTIVE_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let err_msg = b"-ERR max number of clients reached\r\n";
+        let _ = session.write_plaintext(&mut stream, err_msg).await;
+        return;
+    }
+
     let raw_fd = stream.as_raw_fd();
     let now = Instant::now();
     client_registry.borrow_mut().insert(
@@ -643,6 +685,7 @@ pub async fn handle_tls_connection(
     }
     impl Drop for TlsClientCleanup {
         fn drop(&mut self) {
+            ACTIVE_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             self.registry.borrow_mut().remove(&self.client_id);
             unregister_client_tracking(self.port, self.client_id);
             let hub_arc = crate::block::get_block_hub_for_port(self.port);
@@ -730,6 +773,15 @@ pub async fn handle_connection(
     client_registry: Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
     router: Rc<Router>,
 ) {
+    let current_clients = ACTIVE_CLIENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let max_c = MAX_CLIENTS.load(std::sync::atomic::Ordering::Relaxed);
+    if max_c > 0 && current_clients > max_c {
+        ACTIVE_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let err_msg = b"-ERR max number of clients reached\r\n";
+        let _ = stream.write_all(err_msg.to_vec()).await;
+        return;
+    }
+
     let raw_fd = stream.as_raw_fd();
     let now = Instant::now();
     let (track_tx, track_rx) = flume::unbounded::<Vec<u8>>();
@@ -756,6 +808,7 @@ pub async fn handle_connection(
     }
     impl Drop for ClientCleanup {
         fn drop(&mut self) {
+            ACTIVE_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             flush_local_cmd_stats();
             self.registry.borrow_mut().remove(&self.client_id);
             self.pubsub.borrow_mut().remove_client(self.client_id);
@@ -3086,6 +3139,19 @@ async fn execute_command(
         return false;
     }
 
+    // Enforce maxmemory with noeviction: return OOM if memory limit is exceeded
+    if crate::aof::command_to_resp(&cmd).is_some() {
+        let max_mem = crate::tiering::get_max_memory(router.port);
+        if max_mem > 0 && get_max_memory_policy() == "noeviction" {
+            let used = router.local_db.borrow().table.used_memory;
+            let shard_max = (max_mem / router.num_shards.max(1) as u64) as usize;
+            if used > shard_max {
+                out.extend_from_slice(b"-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+                return false;
+            }
+        }
+    }
+
     match cmd {
         Command::Get(key) => {
             record_client_read(router.port, client_id, key.as_ref());
@@ -4000,18 +4066,40 @@ async fn execute_command(
                     val
                 );
                 out.extend_from_slice(resp.as_bytes());
+            } else if p_str == "maxclients" {
+                let val = get_max_clients().to_string();
+                let resp = format!(
+                    "*2\r\n$10\r\nmaxclients\r\n${}\r\n{}\r\n",
+                    val.len(),
+                    val
+                );
+                out.extend_from_slice(resp.as_bytes());
+            } else if p_str == "maxmemory-policy" {
+                let val = get_max_memory_policy();
+                let resp = format!(
+                    "*2\r\n$16\r\nmaxmemory-policy\r\n${}\r\n{}\r\n",
+                    val.len(),
+                    val
+                );
+                out.extend_from_slice(resp.as_bytes());
             } else if p_str == "*" {
                 let max_mem = crate::tiering::get_max_memory(router.port).to_string();
                 let offload = crate::tiering::get_offload_threshold_pct(router.port).to_string();
                 let upload = crate::tiering::get_upload_threshold_pct(router.port).to_string();
+                let max_c = get_max_clients().to_string();
+                let policy = get_max_memory_policy();
                 let resp = format!(
-                    "*6\r\n$9\r\nmaxmemory\r\n${}\r\n{}\r\n$24\r\ntiered-offload-threshold\r\n${}\r\n{}\r\n$23\r\ntiered-upload-threshold\r\n${}\r\n{}\r\n",
+                    "*10\r\n$9\r\nmaxmemory\r\n${}\r\n{}\r\n$24\r\ntiered-offload-threshold\r\n${}\r\n{}\r\n$23\r\ntiered-upload-threshold\r\n${}\r\n{}\r\n$10\r\nmaxclients\r\n${}\r\n{}\r\n$16\r\nmaxmemory-policy\r\n${}\r\n{}\r\n",
                     max_mem.len(),
                     max_mem,
                     offload.len(),
                     offload,
                     upload.len(),
-                    upload
+                    upload,
+                    max_c.len(),
+                    max_c,
+                    policy.len(),
+                    policy
                 );
                 out.extend_from_slice(resp.as_bytes());
             } else {
@@ -4063,6 +4151,16 @@ async fn execute_command(
                 }
             } else if p_str == "resetstat" {
                 router.reset_command_stats().await;
+                out.extend_from_slice(b"+OK\r\n");
+            } else if p_str == "maxclients" {
+                if let Ok(n) = val_str.parse::<usize>() {
+                    set_max_clients(n);
+                    out.extend_from_slice(b"+OK\r\n");
+                } else {
+                    out.extend_from_slice(b"-ERR Invalid argument for CONFIG SET maxclients\r\n");
+                }
+            } else if p_str == "maxmemory-policy" {
+                set_max_memory_policy(&val_str);
                 out.extend_from_slice(b"+OK\r\n");
             } else {
                 out.extend_from_slice(b"+OK\r\n");
