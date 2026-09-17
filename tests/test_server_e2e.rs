@@ -6974,6 +6974,33 @@ fn test_prometheus_telemetry_metrics_e2e() {
     assert!(resp_prom.contains("rudis_expired_keys_total"));
 }
 
+#[test]
+fn test_deployment_configuration_and_service_assets_e2e() {
+    let conf_path = std::path::Path::new("rudis.conf");
+    assert!(conf_path.exists(), "rudis.conf should exist in repository root");
+    let cfg = rudis::config::RudisConfig::load_file(conf_path).expect("rudis.conf should parse cleanly");
+    assert_eq!(cfg.port, 6379);
+    assert_eq!(cfg.maxclients, 10000);
+    assert_eq!(cfg.maxmemory_policy, "allkeys-lru");
+    assert_eq!(cfg.maxmemory.as_deref(), Some("4gb"));
+    assert!(cfg.appendonly);
+
+    let service_path = std::path::Path::new("rudis.service");
+    assert!(service_path.exists(), "rudis.service should exist in repository root");
+    let service_content = std::fs::read_to_string(service_path).unwrap();
+    assert!(service_content.contains("ExecStart="));
+    assert!(service_content.contains("LimitNOFILE="));
+
+    let dockerfile_path = std::path::Path::new("Dockerfile");
+    assert!(dockerfile_path.exists(), "Dockerfile should exist in repository root");
+    let docker_content = std::fs::read_to_string(dockerfile_path).unwrap();
+    assert!(docker_content.contains("FROM rust:"));
+    assert!(docker_content.contains("ENTRYPOINT"));
+
+    let ci_path = std::path::Path::new(".github/workflows/ci.yml");
+    assert!(ci_path.exists(), "CI workflow should exist");
+}
+
 
 
 

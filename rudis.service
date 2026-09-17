@@ -1,0 +1,31 @@
+[Unit]
+Description=Rudis High-Performance In-Memory Data Store (io_uring)
+After=network.target network-online.target
+Wants=network-online.target
+Documentation=https://github.com/warrenzhu25/rudis
+
+[Service]
+Type=simple
+User=rudis
+Group=rudis
+ExecStart=/usr/local/bin/rudis -c /etc/rudis/rudis.conf
+Restart=always
+RestartSec=3s
+TimeoutStopSec=30s
+KillMode=mixed
+KillSignal=SIGTERM
+
+# Hardening & Production Limits
+LimitNOFILE=65536
+LimitNPROC=65536
+LimitMEMLOCK=infinity
+TasksMax=infinity
+
+# Security Sandboxing
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
