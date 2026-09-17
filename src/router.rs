@@ -63,8 +63,10 @@ pub struct Router {
     pub shard_id: usize,
     pub num_shards: usize,
     pub port: u16,
+    pub base_port: u16,
+    pub cluster_enabled: bool,
     pub local_db: Rc<RefCell<ShardDb>>,
-    pub senders: Vec<flume::Sender<ShardMessage>>,
+    pub senders: Vec<crate::mailbox::ShardSender>,
     pub slot_states: Rc<RefCell<Vec<crate::shard::SlotState>>>,
     pub slot_owners: Rc<RefCell<Vec<usize>>>,
     pub aof: Option<Rc<RefCell<crate::aof::AofWriter>>>,
@@ -92,7 +94,7 @@ impl Router {
         num_shards: usize,
         port: u16,
         local_db: Rc<RefCell<ShardDb>>,
-        senders: Vec<flume::Sender<ShardMessage>>,
+        senders: Vec<crate::mailbox::ShardSender>,
         aof: Option<Rc<RefCell<crate::aof::AofWriter>>>,
         pubsub: Rc<RefCell<crate::pubsub::PubSubHub>>,
         db_dir: std::path::PathBuf,
@@ -107,6 +109,8 @@ impl Router {
             shard_id,
             num_shards,
             port,
+            base_port: port,
+            cluster_enabled: false,
             local_db,
             senders,
             slot_states: Rc::new(RefCell::new(slot_states)),
@@ -694,12 +698,17 @@ impl Router {
             };
             let res = if self.senders[target].send(msg).is_ok() {
                 if !desc.done.load(Ordering::Acquire) {
-                    if let Ok(()) = rx.try_recv() {
-                        // fast completion
-                    } else {
+                    for _ in 0..32 {
+                        std::hint::spin_loop();
+                        if desc.done.load(Ordering::Acquire) {
+                            break;
+                        }
+                    }
+                    if !desc.done.load(Ordering::Acquire) {
                         let _ = rx.recv_async().await;
                     }
                 }
+                while rx.try_recv().is_ok() {}
                 unsafe { (*desc.val.get()).take() }
             } else {
                 None
@@ -775,11 +784,17 @@ impl Router {
             let msg = ShardMessage::FastSet {
                 descriptor: desc.clone(),
             };
-            if self.senders[target].send(msg).is_ok()
-                && !desc.done.load(Ordering::Acquire)
-                && rx.try_recv().is_err()
-            {
-                let _ = rx.recv_async().await;
+            if self.senders[target].send(msg).is_ok() && !desc.done.load(Ordering::Acquire) {
+                for _ in 0..32 {
+                    std::hint::spin_loop();
+                    if desc.done.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
+                if !desc.done.load(Ordering::Acquire) {
+                    let _ = rx.recv_async().await;
+                }
+                while rx.try_recv().is_ok() {}
             }
             self.release_notify_channel(tx, rx);
         }
@@ -816,7 +831,7 @@ impl Router {
 
     #[inline(always)]
     pub fn release_notify_channel(&self, tx: flume::Sender<()>, rx: flume::Receiver<()>) {
-        let _ = rx.try_recv();
+        while rx.try_recv().is_ok() {}
         self.notify_channel_pool.borrow_mut().push((tx, rx));
     }
 
@@ -929,12 +944,17 @@ impl Router {
 
         // Wait for all remote shards to complete their writes
         if descriptor.pending.load(Ordering::Acquire) != 0 {
-            if let Ok(()) = notify_rx.try_recv() {
-                // fast path
-            } else {
+            for _ in 0..32 {
+                std::hint::spin_loop();
+                if descriptor.pending.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+            }
+            if descriptor.pending.load(Ordering::Acquire) != 0 {
                 let _ = notify_rx.recv_async().await;
             }
         }
+        while notify_rx.try_recv().is_ok() {}
 
         let recycled = descriptor.take_recycled_keys();
         self.mget_batch_pool.borrow_mut().push(recycled);
@@ -1049,12 +1069,17 @@ impl Router {
         }
 
         if descriptor.pending.load(Ordering::Acquire) != 0 {
-            if let Ok(()) = notify_rx.try_recv() {
-                // fast path
-            } else {
+            for _ in 0..32 {
+                std::hint::spin_loop();
+                if descriptor.pending.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+            }
+            if descriptor.pending.load(Ordering::Acquire) != 0 {
                 let _ = notify_rx.recv_async().await;
             }
         }
+        while notify_rx.try_recv().is_ok() {}
 
         let recycled = descriptor.take_recycled_pairs();
         self.mset_batch_pool.borrow_mut().push(recycled);
@@ -2023,13 +2048,9 @@ mod tests {
     #[test]
     fn test_router_mget_mset_fanout() {
         let num_shards = 2;
-        let mut senders = Vec::new();
-        let mut receivers = Vec::new();
-        for _ in 0..num_shards {
-            let (tx, rx) = flume::unbounded::<ShardMessage>();
-            senders.push(tx);
-            receivers.push(rx);
-        }
+        let (mut senders_mesh, mut receivers) = crate::mailbox::create_shard_mesh(num_shards);
+        let senders = senders_mesh.remove(0);
+        drop(senders_mesh);
 
         let db0 = Rc::new(RefCell::new(ShardDb::new(9999)));
 
@@ -2149,13 +2170,13 @@ mod tests {
     #[test]
     fn test_router_mget_all_local_fast_path() {
         let db0 = Rc::new(RefCell::new(ShardDb::new(9999)));
-        let (tx, _rx) = flume::unbounded();
+        let (senders_mesh, _rx) = crate::mailbox::create_shard_mesh(1);
         let router = Router::new(
             0,
             1,
             9999,
             db0.clone(),
-            vec![tx],
+            senders_mesh[0].clone(),
             None,
             Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
             std::env::temp_dir(),
@@ -2189,13 +2210,13 @@ mod tests {
     #[test]
     fn test_channel_pool_acquire_and_release() {
         let db0 = Rc::new(RefCell::new(ShardDb::new(9999)));
-        let (tx, _rx) = flume::unbounded();
+        let (senders_mesh, _rx) = crate::mailbox::create_shard_mesh(4);
         let router = Router::new(
             0,
             4,
             9999,
             db0.clone(),
-            vec![tx.clone(), tx.clone(), tx.clone(), tx],
+            senders_mesh[0].clone(),
             None,
             Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
             std::env::temp_dir(),
@@ -2223,15 +2244,17 @@ mod tests {
 
     #[test]
     fn test_mget_single_pass_and_bitmask_fanout() {
-        let (tx0, _rx0) = flume::unbounded();
-        let (tx1, rx1) = flume::unbounded();
+        let (mut senders_mesh, mut receivers) = crate::mailbox::create_shard_mesh(2);
+        let senders = senders_mesh.remove(0);
+        drop(senders_mesh);
+        let rx1 = receivers.remove(1);
         let db0 = Rc::new(RefCell::new(ShardDb::new(9999)));
         let router = Router::new(
             0,
             2,
             9999,
             db0.clone(),
-            vec![tx0, tx1],
+            senders,
             None,
             Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
             std::env::temp_dir(),
@@ -2329,15 +2352,17 @@ mod tests {
 
     #[test]
     fn test_mget_user_space_fast_harvest_try_recv() {
-        let (tx0, _rx0) = flume::unbounded();
-        let (tx1, rx1) = flume::unbounded();
+        let (mut senders_mesh, mut receivers) = crate::mailbox::create_shard_mesh(2);
+        let senders = senders_mesh.remove(0);
+        drop(senders_mesh);
+        let rx1 = receivers.remove(1);
         let db0 = Rc::new(RefCell::new(ShardDb::new(9998)));
         let router = Router::new(
             0,
             2,
             9998,
             db0.clone(),
-            vec![tx0, tx1],
+            senders,
             None,
             Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
             std::env::temp_dir(),
@@ -2409,11 +2434,12 @@ mod tests {
 
     #[test]
     fn test_router_channel_pool_reuse() {
-        let (tx0, _rx0) = flume::unbounded();
-        let (tx1, rx1) = flume::unbounded();
+        let (mut senders_mesh, mut receivers) = crate::mailbox::create_shard_mesh(2);
+        let senders = senders_mesh.remove(0);
+        drop(senders_mesh);
+        let rx1 = receivers.remove(1);
 
         let db0 = Rc::new(RefCell::new(ShardDb::new(9997)));
-        let senders = vec![tx0, tx1];
         let router = Router::new(
             0,
             2,
@@ -2490,11 +2516,12 @@ mod tests {
 
     #[test]
     fn test_router_mget_mset_batch_pool_reuse() {
-        let (tx0, _rx0) = flume::unbounded();
-        let (tx1, rx1) = flume::unbounded();
+        let (mut senders_mesh, mut receivers) = crate::mailbox::create_shard_mesh(2);
+        let senders = senders_mesh.remove(0);
+        drop(senders_mesh);
+        let rx1 = receivers.remove(1);
 
         let db0 = Rc::new(RefCell::new(ShardDb::new(9996)));
-        let senders = vec![tx0, tx1];
         let router = Router::new(
             0,
             2,
@@ -2601,11 +2628,12 @@ mod tests {
 
     #[test]
     fn test_router_mget_mset_in_place_recycling_zero_alloc() {
-        let (tx0, _rx0) = flume::unbounded();
-        let (tx1, rx1) = flume::unbounded();
+        let (mut senders_mesh, mut receivers) = crate::mailbox::create_shard_mesh(2);
+        let senders = senders_mesh.remove(0);
+        drop(senders_mesh);
+        let rx1 = receivers.remove(1);
 
         let db0 = Rc::new(RefCell::new(ShardDb::new(9994)));
-        let senders = vec![tx0, tx1];
         let router = Router::new(
             0,
             2,
@@ -2701,11 +2729,12 @@ mod tests {
 
     #[test]
     fn test_router_mget_mset_reactive_await_clean_harvest() {
-        let (tx0, _rx0) = flume::unbounded();
-        let (tx1, rx1) = flume::unbounded();
+        let (mut senders_mesh, mut receivers) = crate::mailbox::create_shard_mesh(2);
+        let senders = senders_mesh.remove(0);
+        drop(senders_mesh);
+        let rx1 = receivers.remove(1);
 
         let db0 = Rc::new(RefCell::new(ShardDb::new(9995)));
-        let senders = vec![tx0, tx1];
         let router = Router::new(
             0,
             2,

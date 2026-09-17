@@ -353,7 +353,7 @@ def main():
 
         try:
             for w in WORKLOADS:
-                print(f"  --> Workload: {w['name']} (5 runs)...", end="", flush=True)
+                print(f"  --> Workload: {w['name']} ({ITERATIONS} runs)...", end="", flush=True)
                 flushall(engine_info["port"])
                 time.sleep(0.3)
 

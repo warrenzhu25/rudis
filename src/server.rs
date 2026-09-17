@@ -13,11 +13,12 @@ pub fn run_shard_worker(
     shard_id: usize,
     num_shards: usize,
     port: u16,
-    senders: Vec<flume::Sender<ShardMessage>>,
-    rx: flume::Receiver<ShardMessage>,
+    senders: Vec<crate::mailbox::ShardSender>,
+    rx: crate::mailbox::ShardReceiver,
     core_id: Option<core_affinity::CoreId>,
     aof_config: crate::aof::AofConfig,
     tls_config: Option<crate::tls::TlsWorkerConfig>,
+    cluster_enabled: bool,
 ) {
     if let Some(core) = core_id {
         core_affinity::set_for_current(core);
@@ -29,6 +30,13 @@ pub fn run_shard_worker(
         .expect("Failed to initialize Monoio io_uring runtime");
 
     rt.block_on(async move {
+        let base_port = port;
+        let shard_port = if cluster_enabled {
+            base_port + shard_id as u16
+        } else {
+            base_port
+        };
+
         // 1. Configure socket with SO_REUSEPORT and SO_REUSEADDR
         let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
             .expect("Failed to create socket");
@@ -44,7 +52,7 @@ pub fn run_shard_worker(
         let _ = socket.set_recv_buffer_size(512 * 1024);
         let _ = socket.set_send_buffer_size(512 * 1024);
 
-        let addr: SocketAddr = format!("0.0.0.0:{}", port)
+        let addr: SocketAddr = format!("0.0.0.0:{}", shard_port)
             .parse()
             .expect("Invalid address");
         socket.bind(&addr.into()).expect("Failed to bind socket");
@@ -177,16 +185,19 @@ pub fn run_shard_worker(
             crate::connection::ClientInfo,
         >::new()));
         let pubsub = Rc::new(RefCell::new(crate::pubsub::PubSubHub::new()));
-        let router = Rc::new(Router::new(
+        let mut r = Router::new(
             shard_id,
             num_shards,
-            port,
+            shard_port,
             local_db.clone(),
             senders,
             aof_writer.clone(),
             pubsub.clone(),
             aof_config.dir.clone(),
-        ));
+        );
+        r.base_port = base_port;
+        r.cluster_enabled = cluster_enabled;
+        let router = Rc::new(r);
 
         // Active expiration cycle: run every 100ms
         let active_db = local_db.clone();

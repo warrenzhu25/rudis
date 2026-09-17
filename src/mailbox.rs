@@ -210,3 +210,221 @@ impl FastSetDescriptor {
         let _ = self.notify.send(());
     }
 }
+
+/// Cache-line aligned, lock-free Single-Producer Single-Consumer circular ring buffer
+/// with fallback overflow queue for unbounded durability.
+#[repr(align(64))]
+pub struct SpscQueue<T> {
+    head: CachePadded<AtomicUsize>,
+    tail: CachePadded<AtomicUsize>,
+    buffer: Box<[UnsafeCell<Option<T>>]>,
+    capacity: usize,
+    mask: usize,
+    overflow: std::sync::Mutex<std::collections::VecDeque<T>>,
+    has_overflow: AtomicBool,
+}
+
+unsafe impl<T: Send> Send for SpscQueue<T> {}
+unsafe impl<T: Send> Sync for SpscQueue<T> {}
+
+impl<T> SpscQueue<T> {
+    pub fn new(capacity: usize) -> Self {
+        let cap = capacity.next_power_of_two();
+        let mut buf = Vec::with_capacity(cap);
+        for _ in 0..cap {
+            buf.push(UnsafeCell::new(None));
+        }
+        Self {
+            head: CachePadded(AtomicUsize::new(0)),
+            tail: CachePadded(AtomicUsize::new(0)),
+            buffer: buf.into_boxed_slice(),
+            capacity: cap,
+            mask: cap - 1,
+            overflow: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            has_overflow: AtomicBool::new(false),
+        }
+    }
+
+    #[inline(always)]
+    pub fn push(&self, item: T) {
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+        if tail.wrapping_sub(head) < self.capacity {
+            unsafe {
+                *self.buffer[tail & self.mask].get() = Some(item);
+            }
+            self.tail.store(tail.wrapping_add(1), Ordering::Release);
+        } else {
+            let mut q = self.overflow.lock().unwrap();
+            q.push_back(item);
+            self.has_overflow.store(true, Ordering::Release);
+        }
+    }
+
+    #[inline(always)]
+    pub fn pop(&self) -> Option<T> {
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
+        if head != tail {
+            let item = unsafe { (*self.buffer[head & self.mask].get()).take() };
+            self.head.store(head.wrapping_add(1), Ordering::Release);
+            item
+        } else if self.has_overflow.load(Ordering::Acquire) {
+            let mut q = self.overflow.lock().unwrap();
+            let item = q.pop_front();
+            if q.is_empty() {
+                self.has_overflow.store(false, Ordering::Release);
+            }
+            item
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
+        if head != tail {
+            return false;
+        }
+        if self.has_overflow.load(Ordering::Acquire) {
+            let q = self.overflow.lock().unwrap();
+            return q.is_empty();
+        }
+        true
+    }
+}
+
+impl<T> Drop for SpscQueue<T> {
+    fn drop(&mut self) {
+        while self.pop().is_some() {}
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SendError;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecvError;
+
+/// Sender handle from one shard to a specific target shard.
+/// Pushes to a dedicated lock-free SPSC ring and conditionally notifies the target thread.
+#[derive(Clone)]
+pub struct ShardSender {
+    pub target_shard: usize,
+    pub ring: std::sync::Arc<SpscQueue<crate::shard::ShardMessage>>,
+    pub target_notify: flume::Sender<()>,
+}
+
+impl ShardSender {
+    #[inline(always)]
+    pub fn send(&self, msg: crate::shard::ShardMessage) -> Result<(), SendError> {
+        self.ring.push(msg);
+        let _ = self.target_notify.try_send(());
+        Ok(())
+    }
+}
+
+/// Receiver handle for a shard worker.
+/// Checks incoming SPSC rings from all shards without locks, sleeping only when all are drained.
+#[derive(Clone)]
+pub struct ShardReceiver {
+    pub shard_id: usize,
+    pub incoming_rings: Vec<std::sync::Arc<SpscQueue<crate::shard::ShardMessage>>>,
+    pub notify_rx: flume::Receiver<()>,
+}
+
+impl ShardReceiver {
+    #[inline(always)]
+    pub fn try_recv(&self) -> Result<crate::shard::ShardMessage, RecvError> {
+        for ring in &self.incoming_rings {
+            if let Some(msg) = ring.pop() {
+                return Ok(msg);
+            }
+        }
+        Err(RecvError)
+    }
+
+    pub fn recv(&self) -> Result<crate::shard::ShardMessage, RecvError> {
+        loop {
+            if let Ok(msg) = self.try_recv() {
+                return Ok(msg);
+            }
+
+            if self.notify_rx.recv().is_err() {
+                return self.try_recv();
+            }
+            while self.notify_rx.try_recv().is_ok() {}
+
+            if let Ok(msg) = self.try_recv() {
+                return Ok(msg);
+            }
+        }
+    }
+
+    pub async fn recv_async(&self) -> Result<crate::shard::ShardMessage, RecvError> {
+        loop {
+            if let Ok(msg) = self.try_recv() {
+                return Ok(msg);
+            }
+
+            if self.notify_rx.recv_async().await.is_err() {
+                return self.try_recv();
+            }
+            while self.notify_rx.try_recv().is_ok() {}
+
+            if let Ok(msg) = self.try_recv() {
+                return Ok(msg);
+            }
+        }
+    }
+}
+
+/// Creates a fully-connected lock-free cross-shard communication mesh.
+pub fn create_shard_mesh(num_shards: usize) -> (Vec<Vec<ShardSender>>, Vec<ShardReceiver>) {
+    let mut notifiers = Vec::with_capacity(num_shards);
+    for _ in 0..num_shards {
+        notifiers.push(flume::bounded::<()>(1));
+    }
+
+    // Matrix of SPSC rings: rings[i][j] is the ring from producer shard i to consumer shard j
+    let mut rings: Vec<Vec<std::sync::Arc<SpscQueue<crate::shard::ShardMessage>>>> =
+        Vec::with_capacity(num_shards);
+    for _ in 0..num_shards {
+        let mut row = Vec::with_capacity(num_shards);
+        for _ in 0..num_shards {
+            row.push(std::sync::Arc::new(SpscQueue::new(4096)));
+        }
+        rings.push(row);
+    }
+
+    let mut senders_mesh = Vec::with_capacity(num_shards);
+    for row in &rings {
+        let mut shard_senders = Vec::with_capacity(num_shards);
+        for (j, ring) in row.iter().enumerate().take(num_shards) {
+            shard_senders.push(ShardSender {
+                target_shard: j,
+                ring: ring.clone(),
+                target_notify: notifiers[j].0.clone(),
+            });
+        }
+        senders_mesh.push(shard_senders);
+    }
+
+    let mut receivers = Vec::with_capacity(num_shards);
+    for (j, notifier) in notifiers.into_iter().enumerate().take(num_shards) {
+        let mut incoming = Vec::with_capacity(num_shards);
+        for row in &rings {
+            incoming.push(row[j].clone());
+        }
+        receivers.push(ShardReceiver {
+            shard_id: j,
+            incoming_rings: incoming,
+            notify_rx: notifier.1,
+        });
+    }
+
+    (senders_mesh, receivers)
+}
+

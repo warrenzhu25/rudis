@@ -3035,7 +3035,16 @@ async fn execute_command(
                 }
             }
             crate::shard::SlotState::Stable => {
-                if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
+                if router.cluster_enabled {
+                    let target_shard = router.target_shard_for_slot(slot);
+                    if target_shard != router.shard_id {
+                        let target_port = router.base_port + target_shard as u16;
+                        out.extend_from_slice(
+                            format!("-MOVED {} 127.0.0.1:{}\r\n", slot, target_port).as_bytes(),
+                        );
+                        return false;
+                    }
+                } else if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
                     let hub = crate::cluster::get_cluster_hub(router.port);
                     let my_slots = hub.my_slots.read().unwrap();
                     let owns_slot = my_slots.iter().any(|&(s, e)| slot >= s && slot <= e);
@@ -12216,14 +12225,14 @@ mod tests {
             .unwrap();
 
         rt.block_on(async {
-            let (tx, _rx) = flume::unbounded();
+            let (senders_mesh, _receivers) = crate::mailbox::create_shard_mesh(1);
             let db = Rc::new(RefCell::new(ShardDb::new(9993)));
             let router = Router::new(
                 0,
                 1,
                 9993,
                 db,
-                vec![tx],
+                senders_mesh[0].clone(),
                 None,
                 Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
                 std::env::temp_dir(),
@@ -12285,14 +12294,14 @@ mod tests {
             .unwrap();
 
         rt.block_on(async {
-            let (tx, _rx) = flume::unbounded();
+            let (senders_mesh, _receivers) = crate::mailbox::create_shard_mesh(1);
             let db = Rc::new(RefCell::new(ShardDb::new(9994)));
             let router = Router::new(
                 0,
                 1,
                 9994,
                 db,
-                vec![tx],
+                senders_mesh[0].clone(),
                 None,
                 Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
                 std::env::temp_dir(),

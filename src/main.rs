@@ -2,7 +2,6 @@ use clap::Parser;
 use std::thread;
 
 use rudis::server::run_shard_worker;
-use rudis::shard::ShardMessage;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -54,6 +53,10 @@ struct Args {
     /// Path to TLS private key PEM file
     #[arg(long)]
     tls_key_file: Option<std::path::PathBuf>,
+
+    /// Enable Redis Cluster mode with per-shard direct routing (e.g. --cluster-enabled yes)
+    #[arg(long, default_value = "no")]
+    cluster_enabled: String,
 }
 
 fn main() {
@@ -77,6 +80,19 @@ fn main() {
     };
 
     let num_shards = args.threads.unwrap_or_else(|| num_cores.min(8));
+
+    let cluster_enabled = matches!(
+        args.cluster_enabled.to_lowercase().as_str(),
+        "yes" | "true" | "1"
+    );
+
+    if cluster_enabled {
+        let hub = rudis::cluster::get_cluster_hub(args.port);
+        hub.cluster_enabled
+            .store(true, std::sync::atomic::Ordering::Release);
+        hub.num_shards
+            .store(num_shards, std::sync::atomic::Ordering::Release);
+    }
 
     let aof_config = rudis::aof::AofConfig {
         enabled: args.aof,
@@ -120,6 +136,13 @@ fn main() {
         "  Shards:       {} worker threads (pinned to CPU cores)",
         num_shards
     );
+    if cluster_enabled {
+        println!(
+            "  Cluster Mode: ENABLED (Per-shard ports: {}-{})",
+            args.port,
+            args.port + num_shards as u16 - 1
+        );
+    }
     println!(
         "  AOF Persist:  {}",
         if aof_config.enabled {
@@ -130,21 +153,14 @@ fn main() {
     );
     println!("============================================================");
 
-    // Create cross-shard communication mesh
-    let mut senders = Vec::with_capacity(num_shards);
-    let mut receivers = Vec::with_capacity(num_shards);
-
-    for _ in 0..num_shards {
-        let (tx, rx) = flume::unbounded::<ShardMessage>();
-        senders.push(tx);
-        receivers.push(rx);
-    }
+    // Create lock-free cross-shard communication mesh
+    let (senders_mesh, receivers) = rudis::mailbox::create_shard_mesh(num_shards);
 
     let mut handles = Vec::with_capacity(num_shards);
 
     for (shard_id, rx) in receivers.into_iter().enumerate() {
         let port = args.port;
-        let shard_senders = senders.clone();
+        let shard_senders = senders_mesh[shard_id].clone();
         let shard_aof_config = aof_config.clone();
         let shard_tls_config = tls_config.clone();
         let core_id = if !args.no_pin && shard_id < core_ids.len() {
@@ -165,6 +181,7 @@ fn main() {
                     core_id,
                     shard_aof_config,
                     shard_tls_config,
+                    cluster_enabled,
                 );
             })
             .expect("Failed to spawn shard worker thread");

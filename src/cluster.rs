@@ -46,6 +46,8 @@ pub struct ClusterHub {
     pub bus_running: AtomicBool,
     pub cancel_bus: RwLock<Option<flume::Sender<()>>>,
     pub active_migration: RwLock<Option<ActiveMigration>>,
+    pub cluster_enabled: AtomicBool,
+    pub num_shards: std::sync::atomic::AtomicUsize,
 }
 
 pub static HAS_ACTIVE_CLUSTER: AtomicBool = AtomicBool::new(false);
@@ -102,6 +104,8 @@ impl ClusterHub {
             bus_running: AtomicBool::new(false),
             cancel_bus: RwLock::new(None),
             active_migration: RwLock::new(None),
+            cluster_enabled: AtomicBool::new(false),
+            num_shards: std::sync::atomic::AtomicUsize::new(1),
         }
     }
 
@@ -121,15 +125,23 @@ impl ClusterHub {
         let role = self.role.read().unwrap().clone();
         let master_id = self.master_id.read().unwrap().clone();
         let cfg_epoch = self.config_epoch.load(Ordering::Relaxed);
-        let my_slots = self.my_slots.read().unwrap().clone();
-        let mut my_slots_str = String::new();
-        for (s, e) in &my_slots {
-            if s == e {
-                my_slots_str.push_str(&format!(" {}", s));
-            } else {
-                my_slots_str.push_str(&format!(" {}-{}", s, e));
+        let is_cluster = self.cluster_enabled.load(Ordering::Relaxed);
+        let num_shards = self.num_shards.load(Ordering::Relaxed).max(1);
+        let my_slots_str = if is_cluster && self.nodes.read().unwrap().is_empty() {
+            let end_slot = 16384 / num_shards - 1;
+            format!(" 0-{}", end_slot)
+        } else {
+            let my_slots = self.my_slots.read().unwrap().clone();
+            let mut s_str = String::new();
+            for (s, e) in &my_slots {
+                if s == e {
+                    s_str.push_str(&format!(" {}", s));
+                } else {
+                    s_str.push_str(&format!(" {}-{}", s, e));
+                }
             }
-        }
+            s_str
+        };
         let my_flags = format!("myself,{}", role);
         out.push_str(&format!(
             "{} 127.0.0.1:{}@{} {} {} 0 0 {} connected{}\n",
@@ -138,6 +150,24 @@ impl ClusterHub {
 
         // 2. Peer entries
         let mut nodes = self.nodes.write().unwrap();
+        if is_cluster && nodes.is_empty() {
+            for s in 1..num_shards {
+                let peer_port = self.port + s as u16;
+                let peer_cport = peer_port + 10000;
+                let peer_start = s * 16384 / num_shards;
+                let peer_end = if s == num_shards - 1 {
+                    16383
+                } else {
+                    (s + 1) * 16384 / num_shards - 1
+                };
+                let peer_id = format!("{:040x}", s + 1);
+                out.push_str(&format!(
+                    "{} 127.0.0.1:{}@{} master - 0 0 {} connected {}-{}\n",
+                    peer_id, peer_port, peer_cport, s + 1, peer_start, peer_end
+                ));
+            }
+            return out;
+        }
         let pfail_reports = self.pfail_reports.read().unwrap();
         let mut keys: Vec<String> = nodes.keys().cloned().collect();
         keys.sort();
@@ -396,12 +426,17 @@ impl ClusterHub {
                     (s + 1) * 16384 / num_shards - 1
                 };
                 let node_id = format!("{:040x}", s + 1);
+                let shard_port = if self.cluster_enabled.load(Ordering::Relaxed) {
+                    self.port + s as u16
+                } else {
+                    self.port
+                };
                 out.extend_from_slice(b"*3\r\n");
                 out.extend_from_slice(format!(":{}\r\n:{}\r\n", start_slot, end_slot).as_bytes());
                 out.extend_from_slice(
                     format!(
                         "*3\r\n$9\r\n127.0.0.1\r\n:{}\r\n${}\r\n{}\r\n",
-                        self.port,
+                        shard_port,
                         node_id.len(),
                         node_id
                     )
@@ -597,19 +632,49 @@ impl ClusterHub {
             }
         }
 
-        if shards.is_empty() {
-            // Fallback for single node
-            let shard_nodes = vec![(
-                my_id,
-                self.port,
-                "127.0.0.1".to_string(),
-                my_role,
-                "online".to_string(),
-            )];
-            shards.push(ShardItem {
-                slots: my_slots,
-                nodes: shard_nodes,
-            });
+        if shards.is_empty() || (nodes.is_empty() && self.cluster_enabled.load(Ordering::Relaxed)) {
+            if nodes.is_empty() && self.cluster_enabled.load(Ordering::Relaxed) {
+                shards.clear();
+                let num_shards = self.num_shards.load(Ordering::Relaxed).max(1);
+                for s in 0..num_shards {
+                    let start_slot = s * 16384 / num_shards;
+                    let end_slot = if s == num_shards - 1 {
+                        16383
+                    } else {
+                        (s + 1) * 16384 / num_shards - 1
+                    };
+                    let shard_port = self.port + s as u16;
+                    let node_id = if s == 0 {
+                        my_id.clone()
+                    } else {
+                        format!("{:040x}", s + 1)
+                    };
+                    let shard_nodes = vec![(
+                        node_id,
+                        shard_port,
+                        "127.0.0.1".to_string(),
+                        "master".to_string(),
+                        "online".to_string(),
+                    )];
+                    shards.push(ShardItem {
+                        slots: vec![(start_slot as u16, end_slot as u16)],
+                        nodes: shard_nodes,
+                    });
+                }
+            } else if shards.is_empty() {
+                // Fallback for single node
+                let shard_nodes = vec![(
+                    my_id,
+                    self.port,
+                    "127.0.0.1".to_string(),
+                    my_role,
+                    "online".to_string(),
+                )];
+                shards.push(ShardItem {
+                    slots: my_slots,
+                    nodes: shard_nodes,
+                });
+            }
         }
 
         out.extend_from_slice(format!("*{}\r\n", shards.len()).as_bytes());

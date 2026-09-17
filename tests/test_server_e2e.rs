@@ -5,24 +5,16 @@ use std::time::Duration;
 
 use rudis::router::target_shard;
 use rudis::server::run_shard_worker;
-use rudis::shard::ShardMessage;
 
 fn start_test_server(port: u16, num_shards: usize) {
     start_test_server_with_aof(port, num_shards, rudis::aof::AofConfig::default());
 }
 
 fn start_test_server_with_aof(port: u16, num_shards: usize, aof_config: rudis::aof::AofConfig) {
-    let mut senders = Vec::with_capacity(num_shards);
-    let mut receivers = Vec::with_capacity(num_shards);
-
-    for _ in 0..num_shards {
-        let (tx, rx) = flume::unbounded::<ShardMessage>();
-        senders.push(tx);
-        receivers.push(rx);
-    }
+    let (senders_mesh, receivers) = rudis::mailbox::create_shard_mesh(num_shards);
 
     for (shard_id, rx) in receivers.into_iter().enumerate() {
-        let shard_senders = senders.clone();
+        let shard_senders = senders_mesh[shard_id].clone();
         let shard_aof_config = aof_config.clone();
         thread::Builder::new()
             .name(format!("test-shard-{}", shard_id))
@@ -36,12 +28,52 @@ fn start_test_server_with_aof(port: u16, num_shards: usize, aof_config: rudis::a
                     None,
                     shard_aof_config,
                     None,
+                    false,
                 );
             })
             .expect("Failed to spawn test shard");
     }
 
     // Give server threads time to bind and listen
+    thread::sleep(Duration::from_millis(200));
+}
+
+fn start_test_server_cluster(port: u16, num_shards: usize) {
+    let hub = rudis::cluster::get_cluster_hub(port);
+    hub.cluster_enabled
+        .store(true, std::sync::atomic::Ordering::Release);
+    hub.num_shards
+        .store(num_shards, std::sync::atomic::Ordering::Release);
+
+    let aof_config = rudis::aof::AofConfig {
+        enabled: false,
+        dir: std::env::temp_dir(),
+        fsync_every_sec: false,
+    };
+
+    let (senders_mesh, receivers) = rudis::mailbox::create_shard_mesh(num_shards);
+
+    for (shard_id, rx) in receivers.into_iter().enumerate() {
+        let shard_senders = senders_mesh[shard_id].clone();
+        let shard_aof_config = aof_config.clone();
+        thread::Builder::new()
+            .name(format!("test-cluster-shard-{}", shard_id))
+            .spawn(move || {
+                run_shard_worker(
+                    shard_id,
+                    num_shards,
+                    port,
+                    shard_senders,
+                    rx,
+                    None,
+                    shard_aof_config,
+                    None,
+                    true,
+                );
+            })
+            .expect("Failed to spawn test cluster shard");
+    }
+
     thread::sleep(Duration::from_millis(200));
 }
 
@@ -70,17 +102,10 @@ fn start_test_server_with_tls(
         fsync_every_sec: false,
     };
 
-    let mut senders = Vec::with_capacity(num_shards);
-    let mut receivers = Vec::with_capacity(num_shards);
-
-    for _ in 0..num_shards {
-        let (tx, rx) = flume::unbounded::<ShardMessage>();
-        senders.push(tx);
-        receivers.push(rx);
-    }
+    let (senders_mesh, receivers) = rudis::mailbox::create_shard_mesh(num_shards);
 
     for (shard_id, rx) in receivers.into_iter().enumerate() {
-        let shard_senders = senders.clone();
+        let shard_senders = senders_mesh[shard_id].clone();
         let shard_aof_config = aof_config.clone();
         let shard_tls_config = Some(tls_config.clone());
         thread::Builder::new()
@@ -95,6 +120,7 @@ fn start_test_server_with_tls(
                     None,
                     shard_aof_config,
                     shard_tls_config,
+                    false,
                 );
             })
             .expect("Failed to spawn test shard");
@@ -6572,6 +6598,76 @@ fn test_pipeline1_lockless_stats_and_buffer_recycling_e2e() {
     let resp = send_and_read(&mut client, b"CONFIG RESETSTAT\r\n");
     assert_eq!(resp, "+OK\r\n");
 }
+
+#[test]
+fn test_cluster_mode_moved_redirection_and_per_shard_ports_e2e() {
+    let base_port = 17540;
+    start_test_server_cluster(base_port, 4);
+
+    // 1. Connect to Shard 0 (base_port)
+    let mut client0 = TcpStream::connect(format!("127.0.0.1:{}", base_port)).unwrap();
+
+    // 2. Query CLUSTER SLOTS and verify per-shard ports
+    let slots_resp = send_and_read(&mut client0, b"CLUSTER SLOTS\r\n");
+    assert!(slots_resp.starts_with("*4\r\n"));
+    assert!(slots_resp.contains(&format!(":{}", base_port)));
+    assert!(slots_resp.contains(&format!(":{}", base_port + 1)));
+    assert!(slots_resp.contains(&format!(":{}", base_port + 2)));
+    assert!(slots_resp.contains(&format!(":{}", base_port + 3)));
+
+    // 3. Find a key belonging to Shard 0 (slots 0..4095) and Shard 1 (slots 4096..8191)
+    let mut key_shard0 = None;
+    let mut key_shard1 = None;
+    for i in 0..2000 {
+        let k = format!("test_ck_{}", i);
+        let slot = rudis::router::key_slot(k.as_bytes());
+        let shard = rudis::router::slot_to_shard(slot, 4);
+        if shard == 0 && key_shard0.is_none() {
+            key_shard0 = Some((k, slot));
+        } else if shard == 1 && key_shard1.is_none() {
+            key_shard1 = Some((k, slot));
+        }
+        if key_shard0.is_some() && key_shard1.is_some() {
+            break;
+        }
+    }
+
+    let (k0, _slot0) = key_shard0.unwrap();
+    let (k1, slot1) = key_shard1.unwrap();
+
+    // 4. Local key on Shard 0 succeeds directly
+    let resp = send_and_read(&mut client0, format!("SET {} val0\r\n", k0).as_bytes());
+    assert_eq!(resp, "+OK\r\n");
+    let resp = send_and_read(&mut client0, format!("GET {}\r\n", k0).as_bytes());
+    assert_eq!(resp, "$4\r\nval0\r\n");
+
+    // 5. Remote key on Shard 0 returns -MOVED pointing to Shard 1 port
+    let resp = send_and_read(&mut client0, format!("GET {}\r\n", k1).as_bytes());
+    assert_eq!(
+        resp,
+        format!("-MOVED {} 127.0.0.1:{}\r\n", slot1, base_port + 1)
+    );
+
+    // 6. Connect directly to Shard 1 (base_port + 1) and execute the key directly
+    let mut client1 = TcpStream::connect(format!("127.0.0.1:{}", base_port + 1)).unwrap();
+    let resp = send_and_read(&mut client1, format!("SET {} val1\r\n", k1).as_bytes());
+    assert_eq!(resp, "+OK\r\n");
+    let resp = send_and_read(&mut client1, format!("GET {}\r\n", k1).as_bytes());
+    assert_eq!(resp, "$4\r\nval1\r\n");
+
+    // 7. Verify CLUSTER NODES shows all 4 shards
+    let nodes_resp = send_and_read(&mut client0, b"CLUSTER NODES\r\n");
+    assert!(nodes_resp.contains("myself,master"));
+    assert!(nodes_resp.contains(&format!("127.0.0.1:{}", base_port + 1)));
+    assert!(nodes_resp.contains(&format!("127.0.0.1:{}", base_port + 2)));
+    assert!(nodes_resp.contains(&format!("127.0.0.1:{}", base_port + 3)));
+
+    // 8. Verify CLUSTER SHARDS shows 4 shards with dedicated ports
+    let shards_resp = send_and_read(&mut client0, b"CLUSTER SHARDS\r\n");
+    assert!(shards_resp.starts_with("*4\r\n"));
+    assert!(shards_resp.contains(&format!(":{}", base_port + 1)));
+}
+
 
 
 
