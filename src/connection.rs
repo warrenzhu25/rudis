@@ -12329,7 +12329,6 @@ async fn execute_commands_squashed(
                         .incr_by_slice_fast(key, delta)
                     {
                         Ok(val) => {
-                            DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                 touch_watched_key(router.port, key.as_ref());
                             }

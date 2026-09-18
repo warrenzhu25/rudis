@@ -8750,3 +8750,26 @@ fn test_exists_fast_rejection_and_pipeline_e2e() {
     }
     assert_eq!(&buf[..], expected.as_bytes());
 }
+
+#[test]
+fn test_pipelined_incr_cross_shard_e2e() {
+    let port = 16455;
+    start_test_server(port, 4);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    let mut pipeline = String::new();
+    for i in 0..100 {
+        pipeline.push_str(&format!("INCR incr_key_{}\r\n", i % 10));
+    }
+    client.write_all(pipeline.as_bytes()).unwrap();
+
+    // 10 keys each incremented 1..=10. Numbers 1..=9 take 4 bytes, 10 takes 5 bytes. (9*4 + 5 = 41 bytes per key * 10 keys = 410 bytes)
+    let mut buf = vec![0u8; 410];
+    client.read_exact(&mut buf).unwrap();
+
+    assert_eq!(
+        send_and_read(&mut client, b"GET incr_key_0\r\n"),
+        "$2\r\n10\r\n"
+    );
+}

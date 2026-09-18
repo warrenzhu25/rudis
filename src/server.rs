@@ -578,7 +578,6 @@ pub fn run_shard_worker(
                                         has_writes = true;
                                         match r.local_db.borrow_mut().table.incr_by_slice_fast(key, delta) {
                                             Ok(val) => {
-                                                crate::connection::DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                                 if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                     crate::connection::touch_watched_key(r.port, key.as_ref());
                                                 }
@@ -784,7 +783,6 @@ pub fn run_shard_worker(
                                     has_writes = true;
                                     match db.table.incr_by_slice_fast(key, delta) {
                                         Ok(val) => {
-                                            crate::connection::DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                 crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
                                             }
