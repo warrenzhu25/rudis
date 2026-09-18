@@ -340,6 +340,11 @@ impl ShardDb {
         self.table.get(key).ok().flatten()
     }
 
+    #[inline(always)]
+    pub fn write_get_resp(&mut self, key: &[u8], out: &mut Vec<u8>) -> Result<bool, &'static str> {
+        self.table.write_get_resp(key, out)
+    }
+
     #[inline]
     pub fn set(&mut self, key: Bytes, value: Bytes, expire_in: Option<Duration>) {
         if let Some(tm) = &self.tier_manager {
@@ -537,6 +542,11 @@ impl ShardDb {
         self.table.hget(key, field)
     }
 
+    #[inline(always)]
+    pub fn write_hget_resp(&mut self, key: &[u8], field: &[u8], out: &mut Vec<u8>) -> Result<(), &'static str> {
+        self.table.write_hget_resp(key, field, out)
+    }
+
     #[inline]
     pub fn hmget(
         &mut self,
@@ -677,6 +687,11 @@ impl ShardDb {
         self.table.lpop(key, count)
     }
 
+    #[inline(always)]
+    pub fn write_lpop_resp(&mut self, key: &[u8], count: Option<usize>, out: &mut Vec<u8>) -> Result<bool, &'static str> {
+        self.table.write_lpop_resp(key, count, out)
+    }
+
     #[inline]
     pub fn rpop(&mut self, key: &[u8], count: usize) -> Result<Vec<Bytes>, &'static str> {
         self.table.rpop(key, count)
@@ -786,6 +801,11 @@ impl ShardDb {
     #[inline]
     pub fn sismember(&mut self, key: &[u8], member: &[u8]) -> Result<bool, &'static str> {
         self.table.sismember(key, member)
+    }
+
+    #[inline(always)]
+    pub fn write_sismember_resp(&mut self, key: &[u8], member: &[u8], out: &mut Vec<u8>) -> Result<(), &'static str> {
+        self.table.write_sismember_resp(key, member, out)
     }
 
     #[inline]

@@ -3636,8 +3636,10 @@ async fn execute_command(
             {
                 crate::replication::propagate_bytes(router.port, &bytes);
             }
-            for (key, _) in &pairs {
-                notify_key_invalidation(router.port, key.as_ref(), client_id);
+            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                for (key, _) in &pairs {
+                    notify_key_invalidation(router.port, key.as_ref(), client_id);
+                }
             }
             router.mset(pairs).await;
             out.extend_from_slice(b"+OK\r\n");
@@ -12272,17 +12274,17 @@ async fn execute_commands_squashed(
             if target == router.shard_id {
                 local_buf.clear();
                 if let Command::Get(ref key) = cmd {
-                    let val = router.local_db.borrow_mut().get(key);
-                    if let Some(v) = val {
-                        write_resp_bulk(&mut local_buf, &v);
-                    } else if router.local_db.borrow_mut().table.is_tiered(key).is_some() {
-                        if let Some(v) = router.stream_cold_read_local(key).await {
-                            write_resp_bulk(&mut local_buf, &v);
+                    let has_tiering = router.local_db.borrow().tier_manager.is_some();
+                    if !router.local_db.borrow_mut().write_get_resp(key.as_ref(), &mut local_buf).unwrap_or(false) {
+                        if has_tiering && router.local_db.borrow_mut().table.is_tiered(key).is_some() {
+                            if let Some(v) = router.stream_cold_read_local(key).await {
+                                write_resp_bulk(&mut local_buf, &v);
+                            } else {
+                                write_resp_null(&mut local_buf);
+                            }
                         } else {
                             write_resp_null(&mut local_buf);
                         }
-                    } else {
-                        write_resp_null(&mut local_buf);
                     }
                 } else if router.aof.is_none()
                     && !crate::replication::has_connected_replicas(router.port)
@@ -12348,10 +12350,8 @@ async fn execute_commands_squashed(
                         local_buf.extend_from_slice(b":0\r\n");
                     }
                 } else if let Command::Hget { ref key, ref field } = cmd {
-                    match router.local_db.borrow_mut().hget(key.as_ref(), field.as_ref()) {
-                        Ok(Some(v)) => write_resp_bulk(&mut local_buf, &v),
-                        Ok(None) => write_resp_null(&mut local_buf),
-                        Err(err) => write_resp_err(&mut local_buf, err),
+                    if let Err(err) = router.local_db.borrow_mut().write_hget_resp(key.as_ref(), field.as_ref(), &mut local_buf) {
+                        write_resp_err(&mut local_buf, err);
                     }
                 } else if router.aof.is_none()
                     && !crate::replication::has_connected_replicas(router.port)
@@ -12371,10 +12371,8 @@ async fn execute_commands_squashed(
                         }
                     }
                 } else if let Command::Sismember { ref key, ref member } = cmd {
-                    match router.local_db.borrow_mut().sismember(key.as_ref(), member.as_ref()) {
-                        Ok(true) => local_buf.extend_from_slice(b":1\r\n"),
-                        Ok(false) => local_buf.extend_from_slice(b":0\r\n"),
-                        Err(err) => write_resp_err(&mut local_buf, err),
+                    if let Err(err) = router.local_db.borrow_mut().write_sismember_resp(key.as_ref(), member.as_ref(), &mut local_buf) {
+                        write_resp_err(&mut local_buf, err);
                     }
                 } else if router.aof.is_none()
                     && !crate::replication::has_connected_replicas(router.port)
@@ -12415,24 +12413,14 @@ async fn execute_commands_squashed(
                     && !crate::replication::has_connected_replicas(router.port)
                     && let Command::Lpop { ref key, count } = cmd
                 {
-                    match router.local_db.borrow_mut().table.lpop(key.as_ref(), count.unwrap_or(1)) {
-                        Ok(vals) => {
-                            if !vals.is_empty() {
+                    match router.local_db.borrow_mut().write_lpop_resp(key.as_ref(), count, &mut local_buf) {
+                        Ok(has_pop) => {
+                            if has_pop {
                                 has_local_writes = true;
                                 DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                     touch_watched_key(router.port, key.as_ref());
                                 }
-                            }
-                            if count.is_some() {
-                                write_resp_array_header(&mut local_buf, vals.len());
-                                for v in &vals {
-                                    write_resp_bulk(&mut local_buf, v);
-                                }
-                            } else if let Some(v) = vals.first() {
-                                write_resp_bulk(&mut local_buf, v);
-                            } else {
-                                write_resp_null(&mut local_buf);
                             }
                         }
                         Err(err) => {

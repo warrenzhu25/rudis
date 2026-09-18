@@ -1618,26 +1618,67 @@ impl RudisTable {
 
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Bytes>, &'static str> {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h) {
-            if self.check_expired_slot(idx) {
+        if let Some(idx) = self.table.find(key, h)
+            && let Some(entry) = self.table.get_slot(idx)
+        {
+            if let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
                 return Ok(None);
             }
-            if let Some(entry) = self.table.get_slot(idx) {
-                let val_ref = match &entry.val {
-                    RudisValue::Cooled { val, .. } => val.as_ref(),
-                    other => other,
-                };
-                match val_ref {
-                    RudisValue::String(b) => Ok(Some(b.clone())),
-                    RudisValue::Int(n) => Ok(Some(Self::format_i64(*n))),
-                    RudisValue::HyperLogLog(regs) => Ok(Some(Bytes::copy_from_slice(&regs[..]))),
-                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
-                }
-            } else {
-                Ok(None)
+            let val_ref = match &entry.val {
+                RudisValue::Cooled { val, .. } => val.as_ref(),
+                other => other,
+            };
+            match val_ref {
+                RudisValue::String(b) => Ok(Some(b.clone())),
+                RudisValue::Int(n) => Ok(Some(Self::format_i64(*n))),
+                RudisValue::HyperLogLog(regs) => Ok(Some(Bytes::copy_from_slice(&regs[..]))),
+                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
             }
         } else {
             Ok(None)
+        }
+    }
+
+    #[inline(always)]
+    pub fn write_get_resp(&mut self, key: &[u8], out: &mut Vec<u8>) -> Result<bool, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h)
+            && let Some(entry) = self.table.get_slot(idx)
+        {
+            if let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+                crate::connection::write_resp_null(out);
+                return Ok(true);
+            }
+            let val_ref = match &entry.val {
+                RudisValue::Cooled { val, .. } => val.as_ref(),
+                other => other,
+            };
+            match val_ref {
+                RudisValue::String(b) => {
+                    crate::connection::write_resp_bulk(out, b);
+                    Ok(true)
+                }
+                RudisValue::Int(n) => {
+                    let formatted = Self::format_i64(*n);
+                    crate::connection::write_resp_bulk(out, &formatted);
+                    Ok(true)
+                }
+                RudisValue::HyperLogLog(regs) => {
+                    crate::connection::write_resp_bulk(out, &regs[..]);
+                    Ok(true)
+                }
+                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+            }
+        } else {
+            Ok(false)
         }
     }
 
@@ -2783,24 +2824,78 @@ impl RudisTable {
 
     pub fn hget(&mut self, key: &[u8], field: &[u8]) -> Result<Option<Bytes>, &'static str> {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h) {
-            if self.check_expired_slot(idx) {
+        if let Some(idx) = self.table.find(key, h)
+            && let Some(entry) = self.table.get_slot(idx)
+        {
+            if let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
                 return Ok(None);
             }
-            if let Some(entry) = self.table.get_slot(idx) {
-                match &entry.val {
-                    RudisValue::SmallHash(pairs) => Ok(pairs
-                        .iter()
-                        .find(|(k, _)| k == field)
-                        .map(|(_, v)| v.clone())),
-                    RudisValue::Hash(map) => Ok(map.get(field).cloned()),
-                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+            match &entry.val {
+                RudisValue::SmallHash(pairs) => {
+                    let f_len = field.len();
+                    for (k, v) in pairs {
+                        if k.len() == f_len && k.as_ref() == field {
+                            return Ok(Some(v.clone()));
+                        }
+                    }
+                    Ok(None)
                 }
-            } else {
-                Ok(None)
+                RudisValue::Hash(map) => Ok(map.get(field).cloned()),
+                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
             }
         } else {
             Ok(None)
+        }
+    }
+
+    #[inline(always)]
+    pub fn write_hget_resp(
+        &mut self,
+        key: &[u8],
+        field: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h)
+            && let Some(entry) = self.table.get_slot(idx)
+        {
+            if let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+                crate::connection::write_resp_null(out);
+                return Ok(());
+            }
+            match &entry.val {
+                RudisValue::SmallHash(pairs) => {
+                    let f_len = field.len();
+                    for (k, v) in pairs {
+                        if k.len() == f_len && k.as_ref() == field {
+                            crate::connection::write_resp_bulk(out, v);
+                            return Ok(());
+                        }
+                    }
+                    crate::connection::write_resp_null(out);
+                    Ok(())
+                }
+                RudisValue::Hash(map) => {
+                    if let Some(v) = map.get(field) {
+                        crate::connection::write_resp_bulk(out, v);
+                    } else {
+                        crate::connection::write_resp_null(out);
+                    }
+                    Ok(())
+                }
+                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+            }
+        } else {
+            crate::connection::write_resp_null(out);
+            Ok(())
         }
     }
 
@@ -3528,6 +3623,74 @@ impl RudisTable {
         self.rpushx_slice(&key, &values)
     }
 
+    #[inline(always)]
+    pub fn write_lpop_resp(
+        &mut self,
+        key: &[u8],
+        count: Option<usize>,
+        out: &mut Vec<u8>,
+    ) -> Result<bool, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if let Some(entry) = self.table.get_slot(idx)
+                && let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+                if count.is_some() {
+                    crate::connection::write_resp_array_header(out, 0);
+                } else {
+                    crate::connection::write_resp_null(out);
+                }
+                return Ok(false);
+            }
+
+            let mut has_written = false;
+            let is_empty = if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::List(deque) => {
+                        if let Some(cnt) = count {
+                            let n = cnt.min(deque.len());
+                            crate::connection::write_resp_array_header(out, n);
+                            for _ in 0..n {
+                                if let Some(val) = deque.pop_front() {
+                                    has_written = true;
+                                    crate::connection::write_resp_bulk(out, &val);
+                                }
+                            }
+                        } else if let Some(val) = deque.pop_front() {
+                            has_written = true;
+                            crate::connection::write_resp_bulk(out, &val);
+                        } else {
+                            crate::connection::write_resp_null(out);
+                        }
+                        deque.is_empty()
+                    }
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
+                }
+            } else {
+                false
+            };
+
+            if is_empty && let Some(entry) = self.table.remove(idx) {
+                self.recycle_value(entry.val);
+            }
+            Ok(has_written)
+        } else {
+            if count.is_some() {
+                crate::connection::write_resp_array_header(out, 0);
+            } else {
+                crate::connection::write_resp_null(out);
+            }
+            Ok(false)
+        }
+    }
+
     pub fn lpop(&mut self, key: &[u8], count: usize) -> Result<Vec<Bytes>, &'static str> {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
@@ -4204,23 +4367,58 @@ impl RudisTable {
 
     pub fn sismember(&mut self, key: &[u8], member: &[u8]) -> Result<bool, &'static str> {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h) {
-            if let Some(entry) = self.table.get_slot(idx) {
-                if let Some(expire_at) = entry.expire_at
-                    && Instant::now() >= expire_at
-                {
-                    self.table.remove(idx);
-                    return Ok(false);
-                }
-                match &entry.val {
-                    RudisValue::Set(set) => Ok(set.contains(member)),
-                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
-                }
-            } else {
-                Ok(false)
+        if let Some(idx) = self.table.find(key, h)
+            && let Some(entry) = self.table.get_slot(idx)
+        {
+            if let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+                return Ok(false);
+            }
+            match &entry.val {
+                RudisValue::Set(set) => Ok(set.contains(member)),
+                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
             }
         } else {
             Ok(false)
+        }
+    }
+
+    #[inline(always)]
+    pub fn write_sismember_resp(
+        &mut self,
+        key: &[u8],
+        member: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h)
+            && let Some(entry) = self.table.get_slot(idx)
+        {
+            if let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+                out.extend_from_slice(b":0\r\n");
+                return Ok(());
+            }
+            match &entry.val {
+                RudisValue::Set(set) => {
+                    if set.contains(member) {
+                        out.extend_from_slice(b":1\r\n");
+                    } else {
+                        out.extend_from_slice(b":0\r\n");
+                    }
+                    Ok(())
+                }
+                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+            }
+        } else {
+            out.extend_from_slice(b":0\r\n");
+            Ok(())
         }
     }
 

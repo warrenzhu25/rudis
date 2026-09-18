@@ -941,8 +941,11 @@ impl Router {
         // Fast path: all keys are local - 0 channel operations
         if !has_remote {
             let mut results = Vec::with_capacity(total_keys);
-            for (_, key) in local_keys {
-                results.push(self.get_local_direct(&key).await);
+            {
+                let mut db = self.local_db.borrow_mut();
+                for (_, key) in local_keys {
+                    results.push(db.get(&key));
+                }
             }
             self.mget_batch_pool.borrow_mut().push(remote_batches);
             return results;
@@ -967,9 +970,12 @@ impl Router {
         }
 
         // Execute local keys CONCURRENTLY while remote shards process their batches
-        for (idx, key) in local_keys {
-            let val = self.get_local_direct(&key).await;
-            descriptor.write_result(idx, val);
+        if !local_keys.is_empty() {
+            let mut db = self.local_db.borrow_mut();
+            for (idx, key) in local_keys {
+                let val = db.get(&key);
+                descriptor.write_result(idx, val);
+            }
         }
 
         // Wait for all remote shards to complete their writes
