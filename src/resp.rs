@@ -1377,8 +1377,11 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
 
     // First check if the full frame is present before consuming any bytes from buf
     let mut scan_cursor = newline_pos + 2;
+    let mut offsets = [(0usize, 0usize); 8];
+    let is_small = num_args <= 8;
 
-    for _ in 0..num_args {
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..num_args {
         if scan_cursor >= buf.len() {
             return Ok(None);
         }
@@ -1408,27 +1411,144 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
             return Err("Expected CRLF after bulk string data".to_string());
         }
 
+        if is_small {
+            offsets[i] = (data_start, arg_len);
+        }
+
         scan_cursor = data_end + 2;
     }
 
-    // Full frame is present! Now extract args with zero-copy Bytes::freeze
-    buf.advance(newline_pos + 2); // Consume "*N\r\n"
-    let mut args = Vec::with_capacity(num_args);
+    if is_small {
+        let frame = buf.split_to(scan_cursor).freeze();
+        if num_args > 0 {
+            let (cmd_start, cmd_len) = offsets[0];
+            let cmd_bytes = &frame[cmd_start..cmd_start + cmd_len];
+            match cmd_len {
+                3 => {
+                    if cmd_bytes.eq_ignore_ascii_case(b"GET") && num_args == 2 {
+                        let (k_start, k_len) = offsets[1];
+                        return Ok(Some(Command::Get(frame.slice(k_start..k_start + k_len))));
+                    }
+                    if cmd_bytes.eq_ignore_ascii_case(b"SET") && num_args == 3 {
+                        let (k_start, k_len) = offsets[1];
+                        let (v_start, v_len) = offsets[2];
+                        return Ok(Some(Command::Set {
+                            key: frame.slice(k_start..k_start + k_len),
+                            value: frame.slice(v_start..v_start + v_len),
+                            expire_in: None,
+                            condition: SetCondition::None,
+                            get: false,
+                            keepttl: false,
+                            past_expired: false,
+                        }));
+                    }
+                    if cmd_bytes.eq_ignore_ascii_case(b"DEL") && num_args == 2 {
+                        let (k_start, k_len) = offsets[1];
+                        return Ok(Some(Command::Del(vec![
+                            frame.slice(k_start..k_start + k_len),
+                        ])));
+                    }
+                }
+                4 => {
+                    if cmd_bytes.eq_ignore_ascii_case(b"INCR") && num_args == 2 {
+                        let (k_start, k_len) = offsets[1];
+                        return Ok(Some(Command::IncrBy(
+                            frame.slice(k_start..k_start + k_len),
+                            1,
+                        )));
+                    }
+                    if cmd_bytes.eq_ignore_ascii_case(b"HGET") && num_args == 3 {
+                        let (k_start, k_len) = offsets[1];
+                        let (f_start, f_len) = offsets[2];
+                        return Ok(Some(Command::Hget {
+                            key: frame.slice(k_start..k_start + k_len),
+                            field: frame.slice(f_start..f_start + f_len),
+                        }));
+                    }
+                    if cmd_bytes.eq_ignore_ascii_case(b"HSET") && num_args == 4 {
+                        let (k_start, k_len) = offsets[1];
+                        let (f_start, f_len) = offsets[2];
+                        let (v_start, v_len) = offsets[3];
+                        return Ok(Some(Command::Hset {
+                            key: frame.slice(k_start..k_start + k_len),
+                            fields: vec![(
+                                frame.slice(f_start..f_start + f_len),
+                                frame.slice(v_start..v_start + v_len),
+                            )],
+                        }));
+                    }
+                    if cmd_bytes.eq_ignore_ascii_case(b"SADD") && num_args == 3 {
+                        let (k_start, k_len) = offsets[1];
+                        let (m_start, m_len) = offsets[2];
+                        return Ok(Some(Command::Sadd {
+                            key: frame.slice(k_start..k_start + k_len),
+                            members: vec![frame.slice(m_start..m_start + m_len)],
+                        }));
+                    }
+                    if cmd_bytes.eq_ignore_ascii_case(b"LPOP") && num_args == 2 {
+                        let (k_start, k_len) = offsets[1];
+                        return Ok(Some(Command::Lpop {
+                            key: frame.slice(k_start..k_start + k_len),
+                            count: None,
+                        }));
+                    }
+                    if cmd_bytes.eq_ignore_ascii_case(b"PING") && num_args == 1 {
+                        return Ok(Some(Command::Ping(None)));
+                    }
+                }
+                5 => {
+                    if cmd_bytes.eq_ignore_ascii_case(b"LPUSH") && num_args == 3 {
+                        let (k_start, k_len) = offsets[1];
+                        let (v_start, v_len) = offsets[2];
+                        return Ok(Some(Command::Lpush {
+                            key: frame.slice(k_start..k_start + k_len),
+                            values: vec![frame.slice(v_start..v_start + v_len)],
+                        }));
+                    }
+                }
+                6 => {
+                    if cmd_bytes.eq_ignore_ascii_case(b"EXISTS") && num_args == 2 {
+                        let (k_start, k_len) = offsets[1];
+                        return Ok(Some(Command::Exists(vec![
+                            frame.slice(k_start..k_start + k_len),
+                        ])));
+                    }
+                }
+                9 if cmd_bytes.eq_ignore_ascii_case(b"SISMEMBER") && num_args == 3 => {
+                    let (k_start, k_len) = offsets[1];
+                    let (m_start, m_len) = offsets[2];
+                    return Ok(Some(Command::Sismember {
+                        key: frame.slice(k_start..k_start + k_len),
+                        member: frame.slice(m_start..m_start + m_len),
+                    }));
+                }
+                _ => {}
+            }
+        }
+        let mut args = Vec::with_capacity(num_args);
+        for &(start, len) in offsets.iter().take(num_args) {
+            args.push(frame.slice(start..start + len));
+        }
+        build_command(args)
+    } else {
+        buf.advance(newline_pos + 2); // Consume "*N\r\n"
+        let mut args = Vec::with_capacity(num_args);
 
-    for _ in 0..num_args {
-        let header_crlf = find_crlf(buf).unwrap();
-        let arg_len: usize = match parse_decimal_bytes(&buf[1..header_crlf]) {
-            Some(len) => len,
-            None => return Err("Invalid bulk string length".to_string()),
-        };
+        for _ in 0..num_args {
+            let header_crlf = find_crlf(buf).unwrap();
+            let arg_len: usize = match parse_decimal_bytes(&buf[1..header_crlf]) {
+                Some(len) => len,
+                None => return Err("Invalid bulk string length".to_string()),
+            };
 
-        buf.advance(header_crlf + 2); // Consume "$len\r\n"
-        let data = buf.split_to(arg_len).freeze(); // Zero-copy slice!
-        buf.advance(2); // Consume "\r\n"
-        args.push(data);
+            buf.advance(header_crlf + 2); // Consume "$len\r\n"
+            let data = buf.split_to(arg_len).freeze(); // Zero-copy slice!
+            buf.advance(2); // Consume "\r\n"
+            args.push(data);
+        }
+
+        build_command(args)
     }
-
-    build_command(args)
 }
 
 fn parse_inline_command(buf: &mut BytesMut) -> Result<Option<Command>, String> {
