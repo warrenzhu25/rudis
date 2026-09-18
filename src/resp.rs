@@ -106,6 +106,7 @@ pub enum MemorySubcommand {
     Stats,
     Purge,
     Doctor,
+    Defrag,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -4196,9 +4197,11 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "STATS" => Ok(Some(Command::Memory(MemorySubcommand::Stats))),
                 "PURGE" => Ok(Some(Command::Memory(MemorySubcommand::Purge))),
                 "DOCTOR" => Ok(Some(Command::Memory(MemorySubcommand::Doctor))),
+                "DEFRAG" => Ok(Some(Command::Memory(MemorySubcommand::Defrag))),
                 _ => Err(format!("unknown subcommand '{}' for 'memory'", sub)),
             }
         }
+        "DEFRAG" | "ACTIVE-DEFRAG" => Ok(Some(Command::Memory(MemorySubcommand::Defrag))),
         "EXPIREAT" => {
             if args.len() != 3 {
                 return Err("wrong number of arguments for 'expireat' command".to_string());

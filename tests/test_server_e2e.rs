@@ -7895,3 +7895,49 @@ fn test_del_multi_shard_parallel_fanout_e2e() {
     let del_again_resp = send_and_read(&mut client, del_cmd.as_bytes());
     assert_eq!(del_again_resp, ":0\r\n");
 }
+
+#[test]
+fn test_active_defrag_e2e() {
+    let port = 16770;
+    let num_shards = 2;
+    start_test_server(port, num_shards);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Insert 400 keys across shards
+    for i in 0..400 {
+        assert_eq!(
+            send_and_read(
+                &mut client,
+                format!("SET defrag_k_{} val_{}\r\n", i, i).as_bytes()
+            ),
+            "+OK\r\n"
+        );
+    }
+    assert_eq!(send_and_read(&mut client, b"DBSIZE\r\n"), ":400\r\n");
+
+    // 2. Delete 380 keys, generating lots of tombstones
+    for i in 0..380 {
+        assert_eq!(
+            send_and_read(&mut client, format!("DEL defrag_k_{}\r\n", i).as_bytes()),
+            ":1\r\n"
+        );
+    }
+    assert_eq!(send_and_read(&mut client, b"DBSIZE\r\n"), ":20\r\n");
+
+    // 3. Trigger MEMORY DEFRAG
+    let defrag_resp = send_and_read(&mut client, b"MEMORY DEFRAG\r\n");
+    assert_eq!(defrag_resp, "+OK\r\n");
+
+    // 4. Verify all remaining 20 keys are intact
+    for i in 380..400 {
+        assert_eq!(
+            send_and_read(&mut client, format!("GET defrag_k_{}\r\n", i).as_bytes()),
+            format!("${}\r\nval_{}\r\n", format!("val_{}", i).len(), i)
+        );
+    }
+
+    // 5. Test DEFRAG alias and MEMORY PURGE
+    assert_eq!(send_and_read(&mut client, b"DEFRAG\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"MEMORY PURGE\r\n"), "+OK\r\n");
+}

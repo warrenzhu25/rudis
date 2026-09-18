@@ -81,6 +81,9 @@ pub enum ShardMessage {
         keys: Vec<Bytes>,
         responder: flume::Sender<usize>,
     },
+    ActiveDefrag {
+        responder: flume::Sender<usize>,
+    },
     Exists {
         key: Bytes,
         responder: flume::Sender<bool>,
@@ -438,6 +441,11 @@ impl ShardDb {
             }
         }
         deleted
+    }
+
+    #[inline]
+    pub fn active_defrag(&mut self) -> usize {
+        self.table.active_defrag()
     }
 
     #[inline]

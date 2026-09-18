@@ -1266,6 +1266,28 @@ impl Router {
         total_deleted
     }
 
+    pub async fn active_defrag(&self) -> usize {
+        let mut total_freed = self.local_db.borrow_mut().active_defrag();
+        let mut responders = Vec::new();
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                if sender
+                    .send(ShardMessage::ActiveDefrag { responder: tx })
+                    .is_ok()
+                {
+                    responders.push(rx);
+                }
+            }
+        }
+        for rx in responders {
+            if let Ok(freed) = rx.recv_async().await {
+                total_freed += freed;
+            }
+        }
+        total_freed
+    }
+
     pub async fn exists(&self, key: Bytes) -> bool {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {

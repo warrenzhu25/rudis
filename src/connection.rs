@@ -7489,7 +7489,8 @@ async fn execute_command(
                 MemorySubcommand::Stats => {
                     out.extend_from_slice(b"*2\r\n$10\r\npeak.alloc\r\n:1048576\r\n");
                 }
-                MemorySubcommand::Purge => {
+                MemorySubcommand::Purge | MemorySubcommand::Defrag => {
+                    let _ = router.active_defrag().await;
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 MemorySubcommand::Doctor => {

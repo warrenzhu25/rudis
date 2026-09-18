@@ -375,6 +375,10 @@ pub fn run_shard_worker(
                         }
                         let _ = responder.send(count);
                     }
+                    ShardMessage::ActiveDefrag { responder } => {
+                        let freed = cross_shard_db.borrow_mut().active_defrag();
+                        let _ = responder.send(freed);
+                    }
                     ShardMessage::Exists { key, responder } => {
                         let exists = cross_shard_db.borrow_mut().exists(&key);
                         let _ = responder.send(exists);

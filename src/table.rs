@@ -1308,6 +1308,18 @@ impl RudisFlatTable {
         self.growth_left = (cap * 7) / 8;
         self.slot_counts.fill(0);
     }
+
+    pub fn defrag(&mut self) -> usize {
+        let optimal_cap = (self.items * 2).next_power_of_two().max(GROUP_SIZE).max(64);
+        let before_cap = self.capacity;
+        let has_deleted = self.ctrl.contains(&DELETED);
+        if optimal_cap < self.capacity || has_deleted {
+            self.resize(optimal_cap);
+            before_cap.saturating_sub(self.capacity)
+        } else {
+            0
+        }
+    }
 }
 
 static EXPIRED_KEYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1393,6 +1405,29 @@ impl RudisTable {
         }
         self.used_memory = total;
         total
+    }
+
+    pub fn active_defrag(&mut self) -> usize {
+        let freed = self.table.defrag();
+        for entry in self.table.slots.iter_mut().flatten() {
+            match &mut entry.val {
+                RudisValue::String(b) => {
+                    if !b.is_empty() {
+                        *b = Bytes::copy_from_slice(b.as_ref());
+                    }
+                }
+                RudisValue::SmallHash(pairs) => {
+                    pairs.shrink_to_fit();
+                    for (k, v) in pairs.iter_mut() {
+                        *k = Bytes::copy_from_slice(k.as_ref());
+                        *v = Bytes::copy_from_slice(v.as_ref());
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.recalculate_used_memory();
+        freed
     }
 
     #[inline]
@@ -8697,5 +8732,43 @@ mod tests {
         let evicted2 = table.try_evict_one_key("allkeys-lru");
         assert!(evicted2.is_some());
         assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn test_active_defrag_and_compaction() {
+        let mut table = RudisTable::new();
+        // 1. Insert 500 keys to expand table capacity
+        for i in 0..500 {
+            table.set(
+                Bytes::from(format!("key_{}", i)),
+                Bytes::from(format!("val_{}", i)),
+                None,
+            );
+        }
+        assert_eq!(table.len(), 500);
+        let expanded_cap = table.table.capacity();
+        assert!(expanded_cap >= 512);
+
+        // 2. Delete 490 keys, leaving 10 keys and lots of DELETED tombstones
+        for i in 0..490 {
+            table.del(&Bytes::from(format!("key_{}", i)));
+        }
+        assert_eq!(table.len(), 10);
+        assert_eq!(table.table.capacity(), expanded_cap);
+
+        // 3. Trigger active_defrag
+        let freed_cap = table.active_defrag();
+        assert!(freed_cap > 0);
+        let compacted_cap = table.table.capacity();
+        assert!(compacted_cap < expanded_cap);
+        assert_eq!(table.len(), 10);
+
+        // Verify remaining 10 keys are intact
+        for i in 490..500 {
+            assert_eq!(
+                table.get(format!("key_{}", i).as_bytes()).unwrap(),
+                Some(Bytes::from(format!("val_{}", i)))
+            );
+        }
     }
 }
