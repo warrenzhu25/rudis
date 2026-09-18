@@ -12383,6 +12383,98 @@ async fn execute_commands_squashed(
                     } else {
                         local_buf.extend_from_slice(b":0\r\n");
                     }
+                } else if let Command::Hget { ref key, ref field } = cmd {
+                    match router.local_db.borrow_mut().hget(key.as_ref(), field.as_ref()) {
+                        Ok(Some(v)) => write_resp_bulk(&mut local_buf, &v),
+                        Ok(None) => write_resp_null(&mut local_buf),
+                        Err(err) => write_resp_err(&mut local_buf, err),
+                    }
+                } else if router.aof.is_none()
+                    && !crate::replication::has_connected_replicas(router.port)
+                    && let Command::Hset { ref key, ref fields } = cmd
+                {
+                    has_local_writes = true;
+                    match router.local_db.borrow_mut().table.hset_slice(key.as_ref(), fields) {
+                        Ok(count) => {
+                            DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                touch_watched_key(router.port, key.as_ref());
+                            }
+                            write_resp_integer(&mut local_buf, count as i64);
+                        }
+                        Err(err) => {
+                            write_resp_err(&mut local_buf, err);
+                        }
+                    }
+                } else if let Command::Sismember { ref key, ref member } = cmd {
+                    match router.local_db.borrow_mut().sismember(key.as_ref(), member.as_ref()) {
+                        Ok(true) => local_buf.extend_from_slice(b":1\r\n"),
+                        Ok(false) => local_buf.extend_from_slice(b":0\r\n"),
+                        Err(err) => write_resp_err(&mut local_buf, err),
+                    }
+                } else if router.aof.is_none()
+                    && !crate::replication::has_connected_replicas(router.port)
+                    && let Command::Sadd { ref key, ref members } = cmd
+                {
+                    has_local_writes = true;
+                    match router.local_db.borrow_mut().table.sadd_slice(key.as_ref(), members) {
+                        Ok(count) => {
+                            DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                touch_watched_key(router.port, key.as_ref());
+                            }
+                            write_resp_integer(&mut local_buf, count as i64);
+                        }
+                        Err(err) => {
+                            write_resp_err(&mut local_buf, err);
+                        }
+                    }
+                } else if router.aof.is_none()
+                    && !crate::replication::has_connected_replicas(router.port)
+                    && !crate::block::has_blocked_waiters(router.port)
+                    && let Command::Lpush { ref key, ref values } = cmd
+                {
+                    has_local_writes = true;
+                    match router.local_db.borrow_mut().table.lpush_slice(key.as_ref(), values) {
+                        Ok(len) => {
+                            DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                touch_watched_key(router.port, key.as_ref());
+                            }
+                            write_resp_integer(&mut local_buf, len as i64);
+                        }
+                        Err(err) => {
+                            write_resp_err(&mut local_buf, err);
+                        }
+                    }
+                } else if router.aof.is_none()
+                    && !crate::replication::has_connected_replicas(router.port)
+                    && let Command::Lpop { ref key, count } = cmd
+                {
+                    match router.local_db.borrow_mut().table.lpop(key.as_ref(), count.unwrap_or(1)) {
+                        Ok(vals) => {
+                            if !vals.is_empty() {
+                                has_local_writes = true;
+                                DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                    touch_watched_key(router.port, key.as_ref());
+                                }
+                            }
+                            if count.is_some() {
+                                write_resp_array_header(&mut local_buf, vals.len());
+                                for v in &vals {
+                                    write_resp_bulk(&mut local_buf, v);
+                                }
+                            } else if let Some(v) = vals.first() {
+                                write_resp_bulk(&mut local_buf, v);
+                            } else {
+                                write_resp_null(&mut local_buf);
+                            }
+                        }
+                        Err(err) => {
+                            write_resp_err(&mut local_buf, err);
+                        }
+                    }
                 } else {
                     if matches!(
                         cmd,
