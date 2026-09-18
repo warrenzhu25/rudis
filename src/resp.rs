@@ -2259,7 +2259,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     }
                     Ok(Some(Command::Cluster(ClusterSubcommand::DelSlots(slots))))
                 }
-                "ADDSLOTSRANGE" => {
+                "ADDSLOTSRANGE" | "ADDSLOTS-RANGE" => {
                     if args.len() < 4 || !(args.len() - 2).is_multiple_of(2) {
                         return Err(
                             "wrong number of arguments for 'cluster addslotsrange' command"
@@ -2282,7 +2282,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         ranges,
                     ))))
                 }
-                "DELSLOTSRANGE" => {
+                "DELSLOTSRANGE" | "DELSLOTS-RANGE" => {
                     if args.len() < 4 || !(args.len() - 2).is_multiple_of(2) {
                         return Err(
                             "wrong number of arguments for 'cluster delslotsrange' command"

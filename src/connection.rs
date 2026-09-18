@@ -4299,20 +4299,60 @@ async fn execute_command(
                 },
                 ClusterSubcommand::SetSlot(slot, sub_cmd) => match sub_cmd {
                     SetSlotSubcommand::Migrating(node) => {
-                        router.set_slot_state(slot, crate::shard::SlotState::Migrating(node));
+                        let target_addr = if node.contains(':') {
+                            node.clone()
+                        } else {
+                            let hub = crate::cluster::get_cluster_hub(router.port);
+                            let nodes = hub.nodes.read().unwrap();
+                            if let Some(n) = nodes.get(&node) {
+                                format!("{}:{}", n.ip, n.port)
+                            } else {
+                                node.clone()
+                            }
+                        };
+                        router
+                            .set_slot_state(slot, crate::shard::SlotState::Migrating(target_addr));
+                        let hub = crate::cluster::get_cluster_hub(router.port);
+                        hub.slot_states
+                            .write()
+                            .unwrap()
+                            .insert(slot, ("migrating".to_string(), node));
                         out.extend_from_slice(b"+OK\r\n");
                     }
                     SetSlotSubcommand::Importing(node) => {
-                        router.set_slot_state(slot, crate::shard::SlotState::Importing(node));
+                        let source_addr = if node.contains(':') {
+                            node.clone()
+                        } else {
+                            let hub = crate::cluster::get_cluster_hub(router.port);
+                            let nodes = hub.nodes.read().unwrap();
+                            if let Some(n) = nodes.get(&node) {
+                                format!("{}:{}", n.ip, n.port)
+                            } else {
+                                node.clone()
+                            }
+                        };
+                        router
+                            .set_slot_state(slot, crate::shard::SlotState::Importing(source_addr));
+                        let hub = crate::cluster::get_cluster_hub(router.port);
+                        hub.slot_states
+                            .write()
+                            .unwrap()
+                            .insert(slot, ("importing".to_string(), node));
                         out.extend_from_slice(b"+OK\r\n");
                     }
                     SetSlotSubcommand::Stable => {
                         router.set_slot_state(slot, crate::shard::SlotState::Stable);
+                        let hub = crate::cluster::get_cluster_hub(router.port);
+                        hub.slot_states.write().unwrap().remove(&slot);
                         out.extend_from_slice(b"+OK\r\n");
                     }
                     SetSlotSubcommand::Node(node) => {
+                        let my_id = router.my_id();
                         let is_myself = node == "myself"
+                            || node == my_id
                             || (0..router.num_shards).any(|s| node == format!("{:040x}", s + 1));
+                        let hub = crate::cluster::get_cluster_hub(router.port);
+                        hub.slot_states.write().unwrap().remove(&slot);
                         if is_myself {
                             let shard = (0..router.num_shards)
                                 .find(|&s| node == format!("{:040x}", s + 1))
@@ -4320,8 +4360,28 @@ async fn execute_command(
                                     crate::router::slot_to_shard(slot, router.num_shards)
                                 });
                             router.set_slot_owner(slot, shard);
+                            router.set_slot_state(slot, crate::shard::SlotState::Stable);
+                            let mut my_slots = hub.my_slots.write().unwrap();
+                            if !my_slots.iter().any(|&(s, e)| slot >= s && slot <= e) {
+                                my_slots.push((slot, slot));
+                            }
+                            hub.config_epoch
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         } else {
-                            router.set_slot_state(slot, crate::shard::SlotState::Moved(node));
+                            let target_addr = if node.contains(':') {
+                                node
+                            } else {
+                                let nodes = hub.nodes.read().unwrap();
+                                if let Some(n) = nodes.get(&node) {
+                                    format!("{}:{}", n.ip, n.port)
+                                } else {
+                                    node
+                                }
+                            };
+                            let mut my_slots = hub.my_slots.write().unwrap();
+                            my_slots.retain(|&(s, e)| !(slot >= s && slot <= e));
+                            router
+                                .set_slot_state(slot, crate::shard::SlotState::Moved(target_addr));
                         }
                         out.extend_from_slice(b"+OK\r\n");
                     }

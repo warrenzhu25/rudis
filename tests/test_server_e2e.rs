@@ -7941,3 +7941,135 @@ fn test_active_defrag_e2e() {
     assert_eq!(send_and_read(&mut client, b"DEFRAG\r\n"), "+OK\r\n");
     assert_eq!(send_and_read(&mut client, b"MEMORY PURGE\r\n"), "+OK\r\n");
 }
+
+#[test]
+fn test_cluster_setslot_live_migration_and_ask_redirection_e2e() {
+    let port1 = 16771;
+    let port2 = 16772;
+    start_test_server(port1, 2);
+    start_test_server(port2, 2);
+
+    let mut c1 = TcpStream::connect(format!("127.0.0.1:{}", port1)).unwrap();
+    let mut c2 = TcpStream::connect(format!("127.0.0.1:{}", port2)).unwrap();
+
+    // 1. Assign slots: Node 1 owns 0-8191, Node 2 owns 8192-16383
+    assert_eq!(
+        send_and_read(&mut c1, b"CLUSTER ADDSLOTS-RANGE 0 8191\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut c2, b"CLUSTER ADDSLOTS-RANGE 8192 16383\r\n"),
+        "+OK\r\n"
+    );
+
+    // 2. Connect nodes via MEET
+    let meet_cmd = format!("CLUSTER MEET 127.0.0.1 {}\r\n", port2);
+    assert_eq!(send_and_read(&mut c1, meet_cmd.as_bytes()), "+OK\r\n");
+    thread::sleep(Duration::from_millis(200));
+
+    let myid1 = send_and_read(&mut c1, b"CLUSTER MYID\r\n")
+        .trim()
+        .replace("$40\r\n", "")
+        .replace("\r\n", "");
+    let myid2 = send_and_read(&mut c2, b"CLUSTER MYID\r\n")
+        .trim()
+        .replace("$40\r\n", "")
+        .replace("\r\n", "");
+
+    // 3. Find keys for slot (owned by Node 1: slot < 8192)
+    let k_existing = "{tag1}k1";
+    let k_migrated = "{tag1}k2";
+    let slot = rudis::router::key_slot(k_existing.as_bytes());
+    assert!(slot < 8192, "Slot {} must be owned by Node 1", slot);
+
+    // Populate k_existing on Node 1
+    assert_eq!(
+        send_and_read(
+            &mut c1,
+            format!("SET {} val_exist\r\n", k_existing).as_bytes()
+        ),
+        "+OK\r\n"
+    );
+
+    // 4. Set slot 100 into MIGRATING state on Node 1 and IMPORTING on Node 2
+    let setslot_mig = format!("CLUSTER SETSLOT {} MIGRATING {}\r\n", slot, myid2);
+    assert_eq!(send_and_read(&mut c1, setslot_mig.as_bytes()), "+OK\r\n");
+
+    let setslot_imp = format!("CLUSTER SETSLOT {} IMPORTING {}\r\n", slot, myid1);
+    assert_eq!(send_and_read(&mut c2, setslot_imp.as_bytes()), "+OK\r\n");
+
+    // Verify CLUSTER NODES on Node 1 shows [100->-<myid2>]
+    let nodes1 = send_and_read(&mut c1, b"CLUSTER NODES\r\n");
+    assert!(
+        nodes1.contains(&format!("[{}->-{}]", slot, myid2)),
+        "Node 1 should show migrating slot in CLUSTER NODES:\n{}",
+        nodes1
+    );
+
+    // 5. Querying k_existing from Node 1 succeeds locally
+    assert_eq!(
+        send_and_read(&mut c1, format!("GET {}\r\n", k_existing).as_bytes()),
+        "$9\r\nval_exist\r\n"
+    );
+
+    // 6. Querying non-existent k_migrated from Node 1 triggers -ASK redirection to Node 2!
+    let ask_resp = send_and_read(&mut c1, format!("GET {}\r\n", k_migrated).as_bytes());
+    assert!(
+        ask_resp.starts_with(&format!("-ASK {} 127.0.0.1:{}", slot, port2)),
+        "Expected -ASK redirect to Node 2, got: {}",
+        ask_resp
+    );
+
+    // 7. Querying k_migrated on Node 2 without ASKING is rejected with -MOVED
+    let moved_resp = send_and_read(&mut c2, format!("GET {}\r\n", k_migrated).as_bytes());
+    assert!(
+        moved_resp.starts_with(&format!("-MOVED {}", slot)),
+        "Expected -MOVED redirect back without ASKING, got: {}",
+        moved_resp
+    );
+
+    // 8. Following -ASK protocol: sending ASKING followed by command succeeds on Node 2!
+    assert_eq!(send_and_read(&mut c2, b"ASKING\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(
+            &mut c2,
+            format!("SET {} val_new\r\n", k_migrated).as_bytes()
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(send_and_read(&mut c2, b"ASKING\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut c2, format!("GET {}\r\n", k_migrated).as_bytes()),
+        "$7\r\nval_new\r\n"
+    );
+
+    // 9. Finalize migration: CLUSTER SETSLOT <slot> NODE
+    assert_eq!(
+        send_and_read(
+            &mut c2,
+            format!("CLUSTER SETSLOT {} NODE myself\r\n", slot).as_bytes()
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut c1,
+            format!("CLUSTER SETSLOT {} NODE {}\r\n", slot, myid2).as_bytes()
+        ),
+        "+OK\r\n"
+    );
+
+    // 10. After migration, querying Node 2 succeeds directly without ASKING
+    assert_eq!(
+        send_and_read(&mut c2, format!("GET {}\r\n", k_migrated).as_bytes()),
+        "$7\r\nval_new\r\n"
+    );
+
+    // And querying Node 1 redirects with -MOVED permanently to Node 2
+    let perm_moved = send_and_read(&mut c1, format!("GET {}\r\n", k_migrated).as_bytes());
+    assert!(
+        perm_moved.starts_with(&format!("-MOVED {} 127.0.0.1:{}", slot, port2)),
+        "Expected permanent -MOVED redirect, got: {}",
+        perm_moved
+    );
+}

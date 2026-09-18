@@ -46,6 +46,7 @@ pub struct ClusterHub {
     pub bus_running: AtomicBool,
     pub cancel_bus: RwLock<Option<flume::Sender<()>>>,
     pub active_migration: RwLock<Option<ActiveMigration>>,
+    pub slot_states: RwLock<HashMap<u16, (String, String)>>,
     pub cluster_enabled: AtomicBool,
     pub num_shards: std::sync::atomic::AtomicUsize,
 }
@@ -104,6 +105,7 @@ impl ClusterHub {
             bus_running: AtomicBool::new(false),
             cancel_bus: RwLock::new(None),
             active_migration: RwLock::new(None),
+            slot_states: RwLock::new(HashMap::new()),
             cluster_enabled: AtomicBool::new(false),
             num_shards: std::sync::atomic::AtomicUsize::new(1),
         }
@@ -142,10 +144,35 @@ impl ClusterHub {
             }
             s_str
         };
+
+        let migrating_str = {
+            let states = self.slot_states.read().unwrap();
+            let mut s = String::new();
+            let mut sorted_slots: Vec<_> = states.keys().copied().collect();
+            sorted_slots.sort();
+            for slot in sorted_slots {
+                if let Some((state, node_id)) = states.get(&slot) {
+                    if state == "migrating" {
+                        s.push_str(&format!(" [{}->-{}]", slot, node_id));
+                    } else if state == "importing" {
+                        s.push_str(&format!(" [{}-<-{}]", slot, node_id));
+                    }
+                }
+            }
+            s
+        };
+
         let my_flags = format!("myself,{}", role);
         out.push_str(&format!(
-            "{} 127.0.0.1:{}@{} {} {} 0 0 {} connected{}\n",
-            my_id, self.port, self.cport, my_flags, master_id, cfg_epoch, my_slots_str
+            "{} 127.0.0.1:{}@{} {} {} 0 0 {} connected{}{}\n",
+            my_id,
+            self.port,
+            self.cport,
+            my_flags,
+            master_id,
+            cfg_epoch,
+            my_slots_str,
+            migrating_str
         ));
 
         // 2. Peer entries
@@ -1694,5 +1721,40 @@ mod tests {
         assert!(
             nodes_output_escalated.contains(&format!("{} 127.0.0.1:7001@17001 fail", node2_id))
         );
+    }
+
+    #[test]
+    fn test_cluster_setslot_migrating_importing_formatting() {
+        let hub = Arc::new(ClusterHub::new(7100));
+        let target_node_id = "0123456789abcdef0123456789abcdef01234567";
+
+        // Initial state: no migrating slots
+        let initial_nodes = hub.cluster_nodes();
+        assert!(!initial_nodes.contains("->-"));
+        assert!(!initial_nodes.contains("-<-"));
+
+        // Set slot 500 to migrating
+        hub.slot_states
+            .write()
+            .unwrap()
+            .insert(500, ("migrating".to_string(), target_node_id.to_string()));
+        let migrating_nodes = hub.cluster_nodes();
+        assert!(migrating_nodes.contains(&format!("[500->-{}]", target_node_id)));
+
+        // Set slot 600 to importing
+        hub.slot_states
+            .write()
+            .unwrap()
+            .insert(600, ("importing".to_string(), target_node_id.to_string()));
+        let dual_nodes = hub.cluster_nodes();
+        assert!(dual_nodes.contains(&format!("[500->-{}]", target_node_id)));
+        assert!(dual_nodes.contains(&format!("[600-<-{}]", target_node_id)));
+
+        // Reset to stable
+        hub.slot_states.write().unwrap().remove(&500);
+        hub.slot_states.write().unwrap().remove(&600);
+        let stable_nodes = hub.cluster_nodes();
+        assert!(!stable_nodes.contains("->-"));
+        assert!(!stable_nodes.contains("-<-"));
     }
 }
