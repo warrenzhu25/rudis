@@ -26,7 +26,7 @@ impl<T> std::ops::DerefMut for CachePadded<T> {
 pub struct ScatterMgetDescriptor {
     pub results: Box<[CachePadded<UnsafeCell<Option<Bytes>>>]>,
     pub pending: AtomicUsize,
-    pub notify: flume::Sender<()>,
+    pub notify: CachePadded<UnsafeCell<flume::Sender<()>>>,
     pub recycled_keys: Box<[CachePadded<UnsafeCell<Vec<(usize, Bytes)>>>]>,
 }
 
@@ -51,8 +51,26 @@ impl ScatterMgetDescriptor {
         Self {
             results: vec.into_boxed_slice(),
             pending: AtomicUsize::new(pending_shards),
-            notify,
+            notify: CachePadded(UnsafeCell::new(notify)),
             recycled_keys: recycled.into_boxed_slice(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn reset(
+        &self,
+        total_keys: usize,
+        pending_shards: usize,
+        notify: flume::Sender<()>,
+    ) {
+        self.pending.store(pending_shards, Ordering::Release);
+        unsafe {
+            *self.notify.get() = notify;
+        }
+        for i in 0..total_keys.min(self.results.len()) {
+            unsafe {
+                *self.results[i].get() = None;
+            }
         }
     }
 
@@ -73,14 +91,21 @@ impl ScatterMgetDescriptor {
     #[inline(always)]
     pub fn finish_shard(&self) {
         if self.pending.fetch_sub(1, Ordering::Release) == 1 {
-            let _ = self.notify.send(());
+            let tx = unsafe { &*self.notify.get() };
+            let _ = tx.send(());
         }
     }
 
     #[inline(always)]
     pub fn into_results(&self) -> Vec<Option<Bytes>> {
-        let mut out = Vec::with_capacity(self.results.len());
-        for cell in self.results.iter() {
+        self.into_results_prefix(self.results.len())
+    }
+
+    #[inline(always)]
+    pub fn into_results_prefix(&self, total_keys: usize) -> Vec<Option<Bytes>> {
+        let n = total_keys.min(self.results.len());
+        let mut out = Vec::with_capacity(n);
+        for cell in self.results[..n].iter() {
             out.push(unsafe { (*cell.get()).take() });
         }
         out
@@ -99,7 +124,7 @@ impl ScatterMgetDescriptor {
 /// Shared-memory Scatter-Gather Descriptor for multi-shard MSET.
 pub struct ScatterMsetDescriptor {
     pub pending: AtomicUsize,
-    pub notify: flume::Sender<()>,
+    pub notify: CachePadded<UnsafeCell<flume::Sender<()>>>,
     pub recycled_pairs: Box<[CachePadded<UnsafeCell<Vec<(Bytes, Bytes)>>>]>,
 }
 
@@ -114,8 +139,16 @@ impl ScatterMsetDescriptor {
         }
         Self {
             pending: AtomicUsize::new(pending_shards),
-            notify,
+            notify: CachePadded(UnsafeCell::new(notify)),
             recycled_pairs: recycled.into_boxed_slice(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn reset(&self, pending_shards: usize, notify: flume::Sender<()>) {
+        self.pending.store(pending_shards, Ordering::Release);
+        unsafe {
+            *self.notify.get() = notify;
         }
     }
 
@@ -129,7 +162,8 @@ impl ScatterMsetDescriptor {
     #[inline(always)]
     pub fn finish_shard(&self) {
         if self.pending.fetch_sub(1, Ordering::Release) == 1 {
-            let _ = self.notify.send(());
+            let tx = unsafe { &*self.notify.get() };
+            let _ = tx.send(());
         }
     }
 

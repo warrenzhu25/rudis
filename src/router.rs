@@ -71,6 +71,8 @@ pub struct Router {
     pub remote_responder_pool: Rc<RefCell<Vec<crate::connection::ResponderChannel>>>,
     pub mget_batch_pool: Rc<RefCell<Vec<Vec<Vec<(usize, Bytes)>>>>>,
     pub mset_batch_pool: Rc<RefCell<Vec<Vec<Vec<(Bytes, Bytes)>>>>>,
+    pub mget_desc_pool: Rc<RefCell<Vec<std::sync::Arc<crate::mailbox::ScatterMgetDescriptor>>>>,
+    pub mset_desc_pool: Rc<RefCell<Vec<std::sync::Arc<crate::mailbox::ScatterMsetDescriptor>>>>,
     pub tier_stats: std::sync::Arc<crate::tiering::TieringStats>,
 }
 
@@ -113,6 +115,8 @@ impl Router {
             remote_responder_pool: Rc::new(RefCell::new(Vec::new())),
             mget_batch_pool: Rc::new(RefCell::new(Vec::new())),
             mset_batch_pool: Rc::new(RefCell::new(Vec::new())),
+            mget_desc_pool: Rc::new(RefCell::new(Vec::new())),
+            mset_desc_pool: Rc::new(RefCell::new(Vec::new())),
             tier_stats: crate::tiering::get_tier_stats(port),
         }
     }
@@ -833,6 +837,63 @@ impl Router {
         self.notify_channel_pool.borrow_mut().push((tx, rx));
     }
 
+    pub fn acquire_mget_descriptor(
+        &self,
+        total_keys: usize,
+        pending_shards: usize,
+        notify: flume::Sender<()>,
+    ) -> Arc<crate::mailbox::ScatterMgetDescriptor> {
+        let mut pool = self.mget_desc_pool.borrow_mut();
+        while let Some(desc) = pool.pop() {
+            if Arc::strong_count(&desc) == 1
+                && desc.results.len() >= total_keys
+                && desc.recycled_keys.len() >= self.num_shards
+            {
+                desc.reset(total_keys, pending_shards, notify);
+                return desc;
+            }
+        }
+        Arc::new(crate::mailbox::ScatterMgetDescriptor::new(
+            total_keys.max(64),
+            self.num_shards,
+            pending_shards,
+            notify,
+        ))
+    }
+
+    #[inline(always)]
+    pub fn release_mget_descriptor(&self, desc: Arc<crate::mailbox::ScatterMgetDescriptor>) {
+        if self.mget_desc_pool.borrow().len() < 32 {
+            self.mget_desc_pool.borrow_mut().push(desc);
+        }
+    }
+
+    pub fn acquire_mset_descriptor(
+        &self,
+        pending_shards: usize,
+        notify: flume::Sender<()>,
+    ) -> Arc<crate::mailbox::ScatterMsetDescriptor> {
+        let mut pool = self.mset_desc_pool.borrow_mut();
+        while let Some(desc) = pool.pop() {
+            if Arc::strong_count(&desc) == 1 && desc.recycled_pairs.len() >= self.num_shards {
+                desc.reset(pending_shards, notify);
+                return desc;
+            }
+        }
+        Arc::new(crate::mailbox::ScatterMsetDescriptor::new(
+            self.num_shards,
+            pending_shards,
+            notify,
+        ))
+    }
+
+    #[inline(always)]
+    pub fn release_mset_descriptor(&self, desc: Arc<crate::mailbox::ScatterMsetDescriptor>) {
+        if self.mset_desc_pool.borrow().len() < 32 {
+            self.mset_desc_pool.borrow_mut().push(desc);
+        }
+    }
+
     pub async fn mget(&self, keys: Vec<Bytes>) -> Vec<Option<Bytes>> {
         if keys.is_empty() {
             return Vec::new();
@@ -886,12 +947,7 @@ impl Router {
         }
 
         let (notify_tx, notify_rx) = self.acquire_notify_channel();
-        let descriptor = Arc::new(crate::mailbox::ScatterMgetDescriptor::new(
-            total_keys,
-            self.num_shards,
-            num_remote_shards,
-            notify_tx.clone(),
-        ));
+        let descriptor = self.acquire_mget_descriptor(total_keys, num_remote_shards, notify_tx.clone());
 
         // Dispatch remote batches concurrently with direct scatter-gather shared memory
         for (target_shard, batch) in remote_batches.iter_mut().enumerate().take(self.num_shards) {
@@ -916,7 +972,7 @@ impl Router {
 
         // Wait for all remote shards to complete their writes
         if descriptor.pending.load(Ordering::Acquire) != 0 {
-            for _ in 0..32 {
+            for _ in 0..256 {
                 std::hint::spin_loop();
                 if descriptor.pending.load(Ordering::Acquire) == 0 {
                     break;
@@ -932,7 +988,9 @@ impl Router {
         self.mget_batch_pool.borrow_mut().push(recycled);
         self.release_notify_channel(notify_tx, notify_rx);
 
-        descriptor.into_results()
+        let results = descriptor.into_results_prefix(total_keys);
+        self.release_mget_descriptor(descriptor);
+        results
     }
 
     pub async fn mset(&self, pairs: Vec<(Bytes, Bytes)>) {
@@ -1005,11 +1063,7 @@ impl Router {
         }
 
         let (notify_tx, notify_rx) = self.acquire_notify_channel();
-        let descriptor = Arc::new(crate::mailbox::ScatterMsetDescriptor::new(
-            self.num_shards,
-            num_remote_shards,
-            notify_tx.clone(),
-        ));
+        let descriptor = self.acquire_mset_descriptor(num_remote_shards, notify_tx.clone());
 
         for (target_shard, batch) in remote_batches.iter_mut().enumerate().take(self.num_shards) {
             let items = std::mem::take(batch);
@@ -1043,7 +1097,7 @@ impl Router {
         }
 
         if descriptor.pending.load(Ordering::Acquire) != 0 {
-            for _ in 0..32 {
+            for _ in 0..256 {
                 std::hint::spin_loop();
                 if descriptor.pending.load(Ordering::Acquire) == 0 {
                     break;
@@ -1058,6 +1112,7 @@ impl Router {
         let recycled = descriptor.take_recycled_pairs();
         self.mset_batch_pool.borrow_mut().push(recycled);
         self.release_notify_channel(notify_tx, notify_rx);
+        self.release_mset_descriptor(descriptor);
     }
 
     pub async fn json_mget(&self, keys: Vec<Bytes>, path: &str) -> Vec<Option<String>> {
