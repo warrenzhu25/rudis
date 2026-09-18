@@ -546,6 +546,15 @@ impl ShardDb {
         self.table.ttl(key, in_millis)
     }
 
+    #[inline(always)]
+    pub fn hset_slice_fast(
+        &mut self,
+        key: &Bytes,
+        fields: &[(Bytes, Bytes)],
+    ) -> Result<usize, &'static str> {
+        self.table.hset_slice_fast(key, fields)
+    }
+
     #[inline]
     pub fn hset_slice(
         &mut self,
@@ -680,6 +689,15 @@ impl ShardDb {
     }
 
     // LIST METHODS
+    #[inline(always)]
+    pub fn lpush_slice_fast(
+        &mut self,
+        key: &Bytes,
+        values: &[Bytes],
+    ) -> Result<usize, &'static str> {
+        self.table.lpush_slice_fast(key, values)
+    }
+
     #[inline]
     pub fn lpush_slice(&mut self, key: &[u8], values: &[Bytes]) -> Result<usize, &'static str> {
         self.table.lpush_slice(key, values)
@@ -821,6 +839,15 @@ impl ShardDb {
     }
 
     // SET METHODS
+    #[inline(always)]
+    pub fn sadd_slice_fast(
+        &mut self,
+        key: &Bytes,
+        members: &[Bytes],
+    ) -> Result<usize, &'static str> {
+        self.table.sadd_slice_fast(key, members)
+    }
+
     #[inline]
     pub fn sadd_slice(&mut self, key: &[u8], members: &[Bytes]) -> Result<usize, &'static str> {
         self.table.sadd_slice(key, members)
@@ -953,6 +980,16 @@ impl ShardDb {
         count: usize,
     ) -> Result<(usize, Vec<Bytes>), &'static str> {
         self.table.sscan(key, cursor, pattern, count)
+    }
+
+    #[inline(always)]
+    pub fn zadd_slice_fast(
+        &mut self,
+        key: &Bytes,
+        elements: &[(f64, Bytes)],
+        flags: crate::table::ZAddFlags,
+    ) -> Result<(usize, Option<f64>), &'static str> {
+        self.table.zadd_slice_fast(key, elements, flags)
     }
 
     #[inline]

@@ -2663,9 +2663,27 @@ impl RudisTable {
         Ok(delta)
     }
 
+    #[inline(always)]
+    pub fn hset_slice_fast(
+        &mut self,
+        key: &Bytes,
+        fields: &[(Bytes, Bytes)],
+    ) -> Result<usize, &'static str> {
+        self.hset_slice_internal(key.as_ref(), Some(key), fields)
+    }
+
     pub fn hset_slice(
         &mut self,
         key: &[u8],
+        fields: &[(Bytes, Bytes)],
+    ) -> Result<usize, &'static str> {
+        self.hset_slice_internal(key, None, fields)
+    }
+
+    fn hset_slice_internal(
+        &mut self,
+        key: &[u8],
+        key_bytes: Option<&Bytes>,
         fields: &[(Bytes, Bytes)],
     ) -> Result<usize, &'static str> {
         let max_entries =
@@ -2743,7 +2761,9 @@ impl RudisTable {
             (RudisValue::Hash(map), added)
         };
         let entry = RudisEntry {
-            key: Bytes::copy_from_slice(key),
+            key: key_bytes
+                .cloned()
+                .unwrap_or_else(|| Bytes::copy_from_slice(key)),
             val,
             expire_at: None,
         };
@@ -2753,7 +2773,7 @@ impl RudisTable {
 
     #[inline]
     pub fn hset(&mut self, key: Bytes, fields: Vec<(Bytes, Bytes)>) -> Result<usize, &'static str> {
-        self.hset_slice(&key, &fields)
+        self.hset_slice_fast(&key, &fields)
     }
 
     pub fn hsetnx(
@@ -3477,7 +3497,25 @@ impl RudisTable {
     }
 
     // LIST METHODS
+    #[inline(always)]
+    pub fn lpush_slice_fast(
+        &mut self,
+        key: &Bytes,
+        values: &[Bytes],
+    ) -> Result<usize, &'static str> {
+        self.lpush_slice_internal(key.as_ref(), Some(key), values)
+    }
+
     pub fn lpush_slice(&mut self, key: &[u8], values: &[Bytes]) -> Result<usize, &'static str> {
+        self.lpush_slice_internal(key, None, values)
+    }
+
+    fn lpush_slice_internal(
+        &mut self,
+        key: &[u8],
+        key_bytes: Option<&Bytes>,
+        values: &[Bytes],
+    ) -> Result<usize, &'static str> {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
@@ -3505,7 +3543,9 @@ impl RudisTable {
         }
         let len = deque.len();
         let entry = RudisEntry {
-            key: Bytes::copy_from_slice(key),
+            key: key_bytes
+                .cloned()
+                .unwrap_or_else(|| Bytes::copy_from_slice(key)),
             val: RudisValue::List(deque),
             expire_at: None,
         };
@@ -3515,7 +3555,7 @@ impl RudisTable {
 
     #[inline]
     pub fn lpush(&mut self, key: Bytes, values: Vec<Bytes>) -> Result<usize, &'static str> {
-        self.lpush_slice(&key, &values)
+        self.lpush_slice_fast(&key, &values)
     }
 
     pub fn rpush_slice(&mut self, key: &[u8], values: &[Bytes]) -> Result<usize, &'static str> {
@@ -4255,7 +4295,25 @@ impl RudisTable {
     }
 
     // SET METHODS
+    #[inline(always)]
+    pub fn sadd_slice_fast(
+        &mut self,
+        key: &Bytes,
+        members: &[Bytes],
+    ) -> Result<usize, &'static str> {
+        self.sadd_slice_internal(key.as_ref(), Some(key), members)
+    }
+
     pub fn sadd_slice(&mut self, key: &[u8], members: &[Bytes]) -> Result<usize, &'static str> {
+        self.sadd_slice_internal(key, None, members)
+    }
+
+    fn sadd_slice_internal(
+        &mut self,
+        key: &[u8],
+        key_bytes: Option<&Bytes>,
+        members: &[Bytes],
+    ) -> Result<usize, &'static str> {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
@@ -4298,7 +4356,9 @@ impl RudisTable {
         };
         let added = set.len();
         let entry = RudisEntry {
-            key: Bytes::copy_from_slice(key),
+            key: key_bytes
+                .cloned()
+                .unwrap_or_else(|| Bytes::copy_from_slice(key)),
             val: RudisValue::Set(set),
             expire_at: None,
         };
@@ -4308,7 +4368,7 @@ impl RudisTable {
 
     #[inline]
     pub fn sadd(&mut self, key: Bytes, members: Vec<Bytes>) -> Result<usize, &'static str> {
-        self.sadd_slice(&key, &members)
+        self.sadd_slice_fast(&key, &members)
     }
 
     pub fn srem(&mut self, key: &[u8], members: &[Bytes]) -> Result<usize, &'static str> {
@@ -5505,9 +5565,29 @@ impl RudisTable {
     // SORTED SET (ZSET) OPERATIONS
     // =========================================================================
 
+    #[inline(always)]
+    pub fn zadd_slice_fast(
+        &mut self,
+        key: &Bytes,
+        elements: &[(f64, Bytes)],
+        flags: ZAddFlags,
+    ) -> Result<(usize, Option<f64>), &'static str> {
+        self.zadd_slice_internal(key.as_ref(), Some(key), elements, flags)
+    }
+
     pub fn zadd_slice(
         &mut self,
         key: &[u8],
+        elements: &[(f64, Bytes)],
+        flags: ZAddFlags,
+    ) -> Result<(usize, Option<f64>), &'static str> {
+        self.zadd_slice_internal(key, None, elements, flags)
+    }
+
+    fn zadd_slice_internal(
+        &mut self,
+        key: &[u8],
+        key_bytes: Option<&Bytes>,
         elements: &[(f64, Bytes)],
         flags: ZAddFlags,
     ) -> Result<(usize, Option<f64>), &'static str> {
@@ -5603,7 +5683,9 @@ impl RudisTable {
         }
 
         let entry = RudisEntry {
-            key: Bytes::copy_from_slice(key),
+            key: key_bytes
+                .cloned()
+                .unwrap_or_else(|| Bytes::copy_from_slice(key)),
             val: RudisValue::ZSet(zset),
             expire_at: None,
         };
@@ -5618,7 +5700,7 @@ impl RudisTable {
         elements: Vec<(f64, Bytes)>,
         flags: ZAddFlags,
     ) -> Result<(usize, Option<f64>), &'static str> {
-        self.zadd_slice(&key, &elements, flags)
+        self.zadd_slice_fast(&key, &elements, flags)
     }
 
     pub fn zscore(&mut self, key: &[u8], member: &[u8]) -> Result<Option<f64>, &'static str> {

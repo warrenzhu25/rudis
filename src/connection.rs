@@ -12376,7 +12376,7 @@ async fn execute_commands_squashed(
                         .local_db
                         .borrow_mut()
                         .table
-                        .hset_slice(key.as_ref(), fields)
+                        .hset_slice_fast(key, fields)
                     {
                         Ok(count) => {
                             DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -12428,7 +12428,7 @@ async fn execute_commands_squashed(
                         .local_db
                         .borrow_mut()
                         .table
-                        .sadd_slice(key.as_ref(), members)
+                        .sadd_slice_fast(key, members)
                     {
                         Ok(count) => {
                             DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -12462,7 +12462,7 @@ async fn execute_commands_squashed(
                     match router
                         .local_db
                         .borrow_mut()
-                        .zadd_slice(key.as_ref(), elements, flags)
+                        .zadd_slice_fast(key, elements, flags)
                     {
                         Ok((count, incr_score)) => {
                             DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -12505,7 +12505,7 @@ async fn execute_commands_squashed(
                         .local_db
                         .borrow_mut()
                         .table
-                        .lpush_slice(key.as_ref(), values)
+                        .lpush_slice_fast(key, values)
                     {
                         Ok(len) => {
                             DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

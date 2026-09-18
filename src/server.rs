@@ -619,7 +619,7 @@ pub fn run_shard_worker(
                                         && let Command::Hset { ref key, ref fields } = cmd
                                     {
                                         has_writes = true;
-                                        match r.local_db.borrow_mut().table.hset_slice(key.as_ref(), fields) {
+                                        match r.local_db.borrow_mut().table.hset_slice_fast(key, fields) {
                                             Ok(count) => {
                                                 crate::connection::DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                                 if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -644,7 +644,7 @@ pub fn run_shard_worker(
                                         && let Command::Sadd { ref key, ref members } = cmd
                                     {
                                         has_writes = true;
-                                        match r.local_db.borrow_mut().table.sadd_slice(key.as_ref(), members) {
+                                        match r.local_db.borrow_mut().table.sadd_slice_fast(key, members) {
                                             Ok(count) => {
                                                 crate::connection::DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                                 if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -662,7 +662,7 @@ pub fn run_shard_worker(
                                         && let Command::Lpush { ref key, ref values } = cmd
                                     {
                                         has_writes = true;
-                                        match r.local_db.borrow_mut().table.lpush_slice(key.as_ref(), values) {
+                                        match r.local_db.borrow_mut().table.lpush_slice_fast(key, values) {
                                             Ok(len) => {
                                                 crate::connection::DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                                 if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -800,7 +800,7 @@ pub fn run_shard_worker(
                                     && let Command::Hset { ref key, ref fields } = cmd
                                 {
                                     has_writes = true;
-                                    match db.table.hset_slice(key.as_ref(), fields) {
+                                    match db.table.hset_slice_fast(key, fields) {
                                         Ok(count) => {
                                             crate::connection::DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -834,7 +834,7 @@ pub fn run_shard_worker(
                                     && let Command::Sadd { ref key, ref members } = cmd
                                 {
                                     has_writes = true;
-                                    match db.table.sadd_slice(key.as_ref(), members) {
+                                    match db.table.sadd_slice_fast(key, members) {
                                         Ok(count) => {
                                             crate::connection::DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -861,7 +861,7 @@ pub fn run_shard_worker(
                                     && let Command::Lpush { ref key, ref values } = cmd
                                 {
                                     has_writes = true;
-                                    match db.table.lpush_slice(key.as_ref(), values) {
+                                    match db.table.lpush_slice_fast(key, values) {
                                         Ok(len) => {
                                             crate::connection::DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -904,7 +904,7 @@ pub fn run_shard_worker(
                                     && let Command::Zadd { ref key, ref elements, flags } = cmd
                                 {
                                     has_writes = true;
-                                    match db.zadd_slice(key.as_ref(), elements, flags) {
+                                    match db.zadd_slice_fast(key, elements, flags) {
                                         Ok((count, incr_score)) => {
                                             crate::connection::DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
