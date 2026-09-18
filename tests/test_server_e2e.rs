@@ -153,7 +153,9 @@ fn start_test_server_with_tls(port: u16, tls_port: u16, num_shards: usize) -> (V
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
-        if TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
+        if TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok()
+            && TcpStream::connect(format!("127.0.0.1:{}", tls_port)).is_ok()
+        {
             break;
         }
         thread::sleep(Duration::from_millis(20));
@@ -5892,7 +5894,8 @@ fn test_tls_port_listener_e2e() {
         .expect("Failed to create ClientConnection");
     let sock = TcpStream::connect(format!("127.0.0.1:{}", tls_port))
         .expect("Failed to connect TCP socket to TLS port");
-    sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
     let mut tls_client = rustls::StreamOwned::new(conn, sock);
 
     // 3. Send PING over TLS
