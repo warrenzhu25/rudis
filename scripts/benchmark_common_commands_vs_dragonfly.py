@@ -465,11 +465,21 @@ def main():
     print("  Data Types: Strings, Hashes, Lists, Sets, ZSets, Keyspace      ")
     print("=================================================================")
 
+    out_file = "/usr/local/google/home/warrenzhu/github/rudis/benchmark_common_commands_results.json"
     final_results = {}
-    for cores in [16, 32]:
+    if os.path.exists(out_file):
+        try:
+            with open(out_file, "r") as f:
+                final_results = json.load(f)
+        except Exception:
+            final_results = {}
+
+    core_list = [16]
+    if len(sys.argv) > 1:
+        core_list = [int(x) for x in sys.argv[1].split(",")]
+    for cores in core_list:
         final_results[f"{cores}_cores"] = benchmark_at_core_count(cores)
 
-    out_file = "/usr/local/google/home/warrenzhu/github/rudis/benchmark_common_commands_results.json"
     with open(out_file, "w") as f:
         json.dump(final_results, f, indent=2)
     print(f"\nBenchmark completed successfully! Results written to {out_file}")
