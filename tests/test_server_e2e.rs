@@ -8773,3 +8773,32 @@ fn test_pipelined_incr_cross_shard_e2e() {
         "$2\r\n10\r\n"
     );
 }
+
+#[test]
+fn test_in_place_incr_single_pass_e2e() {
+    let port = 16456;
+    start_test_server(port, 2);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    assert_eq!(
+        send_and_read(&mut client, b"INCR counter_fast\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"INCR counter_fast\r\n"),
+        ":2\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"INCRBY counter_fast 8\r\n"),
+        ":10\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"INCRBY counter_fast -5\r\n"),
+        ":5\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"GET counter_fast\r\n"),
+        "$1\r\n5\r\n"
+    );
+}

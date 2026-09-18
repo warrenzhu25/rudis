@@ -1935,10 +1935,16 @@ impl RudisTable {
         delta: i64,
     ) -> Result<i64, &'static str> {
         let h = hash_key(key);
-        let (existing, candidate_idx) = self.table.find_or_prepare_insert(key, h);
-        if let Some(idx) = existing {
-            let was_exp = self.check_expired_slot(idx);
-            if !was_exp && let Some(entry) = self.table.get_slot_mut(idx) {
+        if let Some(idx) = self.table.find(key, h)
+            && let Some(entry) = self.table.get_slot_mut(idx)
+        {
+            if let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+            } else {
                 match &mut entry.val {
                     RudisValue::Int(n) => {
                         let nv = n
@@ -1965,6 +1971,7 @@ impl RudisTable {
             }
         }
 
+        let (_, candidate_idx) = self.table.find_or_prepare_insert(key, h);
         let new_val = delta;
         let entry = RudisEntry {
             key: key_bytes
@@ -8794,6 +8801,20 @@ mod tests {
         assert_eq!(std::mem::size_of::<RudisValue>(), 88);
         assert_eq!(std::mem::size_of::<RudisEntry>(), 136);
         assert_eq!(std::mem::size_of::<Option<RudisEntry>>(), 136);
+    }
+
+    #[test]
+    fn test_in_place_incr_single_pass() {
+        let mut table = RudisTable::new();
+        let key = Bytes::from_static(b"counter");
+        assert_eq!(table.incr_by_slice_fast(&key, 1).unwrap(), 1);
+        assert_eq!(table.incr_by_slice_fast(&key, 1).unwrap(), 2);
+        assert_eq!(table.incr_by_slice_fast(&key, 5).unwrap(), 7);
+
+        let h = hash_key(b"counter");
+        let idx = table.table.find(b"counter", h).unwrap();
+        let entry = table.table.get_slot(idx).unwrap();
+        assert_eq!(entry.val, RudisValue::Int(7));
     }
 
     #[test]
