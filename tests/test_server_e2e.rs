@@ -8711,3 +8711,42 @@ fn test_sadd_fx_hasher_large_set_e2e() {
         ":0\r\n"
     );
 }
+
+#[test]
+fn test_exists_fast_rejection_and_pipeline_e2e() {
+    let port = 16454;
+    start_test_server(port, 2);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    assert_eq!(send_and_read(&mut client, b"SET k1 v1\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"SET k12345 v2\r\n"), "+OK\r\n");
+
+    assert_eq!(send_and_read(&mut client, b"EXISTS k1\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"EXISTS k12345\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"EXISTS k12\r\n"), ":0\r\n");
+    assert_eq!(send_and_read(&mut client, b"EXISTS k\r\n"), ":0\r\n");
+    assert_eq!(send_and_read(&mut client, b"EXISTS k123456\r\n"), ":0\r\n");
+
+    let mut pipeline = String::new();
+    for i in 0..50 {
+        if i % 2 == 0 {
+            pipeline.push_str("EXISTS k1\r\n");
+        } else {
+            pipeline.push_str("EXISTS nonexisting\r\n");
+        }
+    }
+    client.write_all(pipeline.as_bytes()).unwrap();
+
+    let mut buf = vec![0u8; 50 * 4];
+    client.read_exact(&mut buf).unwrap();
+    let mut expected = String::new();
+    for i in 0..50 {
+        if i % 2 == 0 {
+            expected.push_str(":1\r\n");
+        } else {
+            expected.push_str(":0\r\n");
+        }
+    }
+    assert_eq!(&buf[..], expected.as_bytes());
+}

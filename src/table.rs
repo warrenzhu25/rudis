@@ -1221,6 +1221,7 @@ impl RudisFlatTable {
                 let offset = bits.trailing_zeros() as usize;
                 let slot_idx = (idx + offset) & self.mask;
                 if let Some(ref entry) = self.slots[slot_idx]
+                    && entry.key.len() == key.len()
                     && entry.key.as_ref() == key
                 {
                     return Some((slot_idx, entry));
@@ -1259,6 +1260,7 @@ impl RudisFlatTable {
                 let offset = bits.trailing_zeros() as usize;
                 let slot_idx = (idx + offset) & self.mask;
                 if let Some(ref entry) = self.slots[slot_idx]
+                    && entry.key.len() == key.len()
                     && entry.key.as_ref() == key
                 {
                     return (Some(slot_idx), slot_idx);
@@ -8784,6 +8786,15 @@ pub fn load_rdb_bytes(
 mod tests {
     use super::*;
     use std::thread;
+
+    #[test]
+    fn test_rudis_entry_size() {
+        assert_eq!(std::mem::size_of::<RudisStream>(), 80);
+        assert_eq!(std::mem::size_of::<RudisZSet>(), 64);
+        assert_eq!(std::mem::size_of::<RudisValue>(), 88);
+        assert_eq!(std::mem::size_of::<RudisEntry>(), 136);
+        assert_eq!(std::mem::size_of::<Option<RudisEntry>>(), 136);
+    }
 
     #[test]
     fn test_rudis_set_fx_hasher_and_dedup() {
