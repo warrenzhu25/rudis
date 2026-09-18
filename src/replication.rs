@@ -476,7 +476,7 @@ impl ReplicationHub {
     }
 }
 
-pub static HAS_ACTIVE_REPLICATION: AtomicBool = AtomicBool::new(true);
+pub static HAS_ACTIVE_REPLICATION: AtomicBool = AtomicBool::new(false);
 pub static HAS_SLAVE_INSTANCE: AtomicBool = AtomicBool::new(false);
 
 static REPLICATION_HUBS: LazyLock<RwLock<HashMap<u16, Arc<ReplicationHub>>>> =
