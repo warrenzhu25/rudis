@@ -7434,3 +7434,51 @@ fn test_geospatial_bounding_geohash_pruning_e2e() {
     assert!(res_search_box.contains("Palermo"));
     assert!(!res_search_box.contains("Catania"));
 }
+
+#[test]
+fn test_json_mget_multi_shard_parallel_fanout_e2e() {
+    let port = 16760;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Populate JSON documents mapped across distinct shards
+    assert_eq!(
+        send_and_read(
+            &mut client,
+            b"JSON.SET user:1 $ {\"name\":\"alice\",\"age\":30,\"score\":95}\r\n"
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut client,
+            b"JSON.SET user:2 $ {\"name\":\"bob\",\"age\":25,\"score\":88}\r\n"
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut client,
+            b"JSON.SET user:3 $ {\"name\":\"carol\",\"age\":35,\"score\":92}\r\n"
+        ),
+        "+OK\r\n"
+    );
+
+    // 2. Multi-shard JSON.MGET on specific path $.score
+    let resp = send_and_read(
+        &mut client,
+        b"JSON.MGET user:1 user:2 user:missing user:3 $.score\r\n",
+    );
+    assert_eq!(
+        resp, "*4\r\n$2\r\n95\r\n$2\r\n88\r\n$-1\r\n$2\r\n92\r\n",
+        "JSON.MGET should preserve exact requested order across shards"
+    );
+
+    // 3. Multi-shard JSON.MGET on root path $
+    let resp_root = send_and_read(&mut client, b"JSON.MGET user:1 user:missing $\r\n");
+    assert!(resp_root.starts_with("*2\r\n"));
+    assert!(resp_root.contains("alice"));
+    assert!(resp_root.ends_with("$-1\r\n"));
+}

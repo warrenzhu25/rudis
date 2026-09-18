@@ -4709,28 +4709,12 @@ async fn execute_command(
             false
         }
         Command::JsonMget { keys, path } => {
-            out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
-            for k in keys {
-                let single_cmd = Command::JsonGet {
-                    key: k.clone(),
-                    paths: vec![path.clone()],
-                };
-                if let Some(target) = target_shard_of_cmd(&single_cmd, router.num_shards) {
-                    if target == router.shard_id {
-                        let mut tmp = Vec::new();
-                        execute_local_command(
-                            &single_cmd,
-                            &mut router.local_db.borrow_mut(),
-                            &mut tmp,
-                            None,
-                        );
-                        out.extend_from_slice(&tmp);
-                    } else {
-                        let res = router.execute_remote(target, single_cmd).await;
-                        out.extend_from_slice(&res);
-                    }
-                } else {
-                    out.extend_from_slice(b"$-1\r\n");
+            let results = router.json_mget(keys, &path).await;
+            out.extend_from_slice(format!("*{}\r\n", results.len()).as_bytes());
+            for val in results {
+                match val {
+                    Some(s) => write_resp_bulk(out, s.as_bytes()),
+                    None => out.extend_from_slice(b"$-1\r\n"),
                 }
             }
             false

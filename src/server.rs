@@ -685,6 +685,16 @@ pub fn run_shard_worker(
                         descriptor.recycle_pairs(shard_id, pairs);
                         descriptor.finish_shard();
                     }
+                    ShardMessage::JsonMget { keys, path, responder } => {
+                        let db = cross_shard_db.borrow();
+                        let path_ref = path.as_str();
+                        let mut results = Vec::with_capacity(keys.len());
+                        for (idx, key) in keys {
+                            let val = db.json_store.json_get(&key, &[path_ref]);
+                            results.push((idx, val));
+                        }
+                        let _ = responder.send(results);
+                    }
                     ShardMessage::SetSlotState { slot, state } => {
                         cross_shard_slot_states.borrow_mut()[slot as usize] = state;
                     }

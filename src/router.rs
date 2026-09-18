@@ -1060,6 +1060,85 @@ impl Router {
         self.release_notify_channel(notify_tx, notify_rx);
     }
 
+    pub async fn json_mget(&self, keys: Vec<Bytes>, path: &str) -> Vec<Option<String>> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+
+        let total_keys = keys.len();
+
+        if self.num_shards <= 1 {
+            let db = self.local_db.borrow();
+            let mut results = Vec::with_capacity(total_keys);
+            for key in keys {
+                results.push(db.json_store.json_get(&key, &[path]));
+            }
+            return results;
+        }
+
+        let mut local_keys = Vec::with_capacity(total_keys.min(16));
+        let mut remote_batches: Vec<Vec<(usize, Bytes)>> =
+            (0..self.num_shards).map(|_| Vec::new()).collect();
+        let mut has_remote = false;
+
+        {
+            let owners = self.slot_owners.borrow();
+            for (idx, key) in keys.into_iter().enumerate() {
+                let slot = key_slot(&key);
+                let target = owners[slot as usize];
+                if target == self.shard_id {
+                    local_keys.push((idx, key));
+                } else {
+                    has_remote = true;
+                    remote_batches[target].push((idx, key));
+                }
+            }
+        }
+
+        let mut results: Vec<Option<String>> = (0..total_keys).map(|_| None).collect();
+
+        // 1. Evaluate all local keys directly in-place
+        {
+            let db = self.local_db.borrow();
+            for (idx, key) in local_keys {
+                results[idx] = db.json_store.json_get(&key, &[path]);
+            }
+        }
+
+        if !has_remote {
+            return results;
+        }
+
+        // 2. Dispatch batched requests to remote shards concurrently
+        let mut responders = Vec::new();
+        for (target_shard, shard_keys) in remote_batches.into_iter().enumerate() {
+            if !shard_keys.is_empty() {
+                let (tx, rx) = flume::bounded(1);
+                if self.senders[target_shard]
+                    .send(ShardMessage::JsonMget {
+                        keys: shard_keys,
+                        path: path.to_string(),
+                        responder: tx,
+                    })
+                    .is_ok()
+                {
+                    responders.push(rx);
+                }
+            }
+        }
+
+        // 3. Concurrently await all remote responses in parallel
+        for rx in responders {
+            if let Ok(shard_results) = rx.recv_async().await {
+                for (idx, val) in shard_results {
+                    results[idx] = val;
+                }
+            }
+        }
+
+        results
+    }
+
     pub async fn del(&self, key: Bytes) -> bool {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
@@ -2832,6 +2911,89 @@ mod tests {
             assert_eq!(res.len(), 2);
             assert_eq!(res[0], Some(Bytes::from("val_k0")));
             assert_eq!(res[1], Some(Bytes::from("val_k1")));
+        });
+    }
+
+    #[test]
+    fn test_router_json_mget_cross_shard_fanout() {
+        let (mut senders_mesh, mut receivers) = crate::mailbox::create_shard_mesh(2);
+        let senders = senders_mesh.remove(0);
+        drop(senders_mesh);
+        let rx1 = receivers.remove(1);
+
+        let db0 = Rc::new(RefCell::new(ShardDb::new(9996)));
+        let router = Router::new(
+            0,
+            2,
+            9996,
+            db0.clone(),
+            senders,
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+
+        let mut k_shard0 = None;
+        let mut k_shard1 = None;
+        for i in 0..1000 {
+            let k = Bytes::from(format!("jmget_k_{}", i));
+            if target_shard(&k, 2) == 0 && k_shard0.is_none() {
+                k_shard0 = Some(k);
+            } else if target_shard(&k, 2) == 1 && k_shard1.is_none() {
+                k_shard1 = Some(k);
+            }
+            if k_shard0.is_some() && k_shard1.is_some() {
+                break;
+            }
+        }
+        let k0 = k_shard0.unwrap();
+        let k1 = k_shard1.unwrap();
+        let rx1_clone = rx1.clone();
+
+        std::thread::spawn(move || {
+            let remote_db = ShardDb::new(9996);
+            while let Ok(msg) = rx1_clone.recv() {
+                match msg {
+                    ShardMessage::JsonMget {
+                        keys,
+                        path,
+                        responder,
+                    } => {
+                        let path_ref = path.as_str();
+                        let mut results = Vec::with_capacity(keys.len());
+                        for (idx, key) in keys {
+                            let val = remote_db.json_store.json_get(&key, &[path_ref]);
+                            results.push((idx, val));
+                        }
+                        let _ = responder.send(results);
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        // Populate local shard key
+        db0.borrow_mut()
+            .json_store
+            .json_set(&k0, "$", r#"{"score":100}"#, false, false)
+            .unwrap();
+
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async move {
+            let res = router
+                .json_mget(
+                    vec![k0.clone(), k1.clone(), Bytes::from("nonexistent")],
+                    "$.score",
+                )
+                .await;
+            assert_eq!(res.len(), 3);
+            assert_eq!(res[0], Some("100".to_string()));
+            assert_eq!(res[1], None);
+            assert_eq!(res[2], None);
         });
     }
 }

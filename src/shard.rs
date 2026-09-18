@@ -131,6 +131,11 @@ pub enum ShardMessage {
         pairs: Vec<(Bytes, Bytes)>,
         responder: flume::Sender<Vec<(Bytes, Bytes)>>,
     },
+    JsonMget {
+        keys: Vec<(usize, Bytes)>,
+        path: String,
+        responder: flume::Sender<Vec<(usize, Option<String>)>>,
+    },
     ScatterMset {
         shard_id: usize,
         pairs: Vec<(Bytes, Bytes)>,
