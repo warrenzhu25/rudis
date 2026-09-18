@@ -52,8 +52,14 @@ jobs:
         run: |
           set -o pipefail
           cargo test --test test_server_e2e -- --test-threads=1 2>&1 | tee e2e.log || {
-            grep -E '(FAILED|panicked at|failures:)' e2e.log | while read -r line; do
-              echo "::error title=E2E Failure::$line"
+            if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+              echo "### E2E Test Failures" >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+              sed -n '/failures:/,$p' e2e.log | head -n 300 >> "$GITHUB_STEP_SUMMARY" || cat e2e.log >> "$GITHUB_STEP_SUMMARY"
+              echo '```' >> "$GITHUB_STEP_SUMMARY"
+            fi
+            grep -n -A 2 "panicked at" e2e.log | head -n 10 | while read -r line; do
+              echo "::error title=Panic::$line"
             done
             exit 1
           }

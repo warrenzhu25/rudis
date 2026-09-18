@@ -7,10 +7,21 @@ use rudis::router::target_shard;
 use rudis::server::run_shard_worker;
 
 fn start_test_server(port: u16, num_shards: usize) {
-    start_test_server_with_aof(port, num_shards, rudis::aof::AofConfig::default());
+    let dir = std::env::temp_dir().join(format!("rudis-srv-{}-{}", std::process::id(), port));
+    let _ = std::fs::create_dir_all(&dir);
+    start_test_server_with_aof(
+        port,
+        num_shards,
+        rudis::aof::AofConfig {
+            enabled: false,
+            dir,
+            fsync_every_sec: false,
+        },
+    );
 }
 
 fn start_test_server_with_aof(port: u16, num_shards: usize, aof_config: rudis::aof::AofConfig) {
+    rudis::shutdown::reset_shutdown();
     let (senders_mesh, receivers) = rudis::mailbox::create_shard_mesh(num_shards);
 
     for (shard_id, rx) in receivers.into_iter().enumerate() {
@@ -34,20 +45,29 @@ fn start_test_server_with_aof(port: u16, num_shards: usize, aof_config: rudis::a
             .expect("Failed to spawn test shard");
     }
 
-    // Give server threads time to bind and listen
-    thread::sleep(Duration::from_millis(200));
+    // Wait until server is listening and accepting connections
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn start_test_server_cluster(port: u16, num_shards: usize) {
+    rudis::shutdown::reset_shutdown();
     let hub = rudis::cluster::get_cluster_hub(port);
     hub.cluster_enabled
         .store(true, std::sync::atomic::Ordering::Release);
     hub.num_shards
         .store(num_shards, std::sync::atomic::Ordering::Release);
 
+    let dir = std::env::temp_dir().join(format!("rudis-cluster-{}-{}", std::process::id(), port));
+    let _ = std::fs::create_dir_all(&dir);
     let aof_config = rudis::aof::AofConfig {
         enabled: false,
-        dir: std::env::temp_dir(),
+        dir,
         fsync_every_sec: false,
     };
 
@@ -74,10 +94,17 @@ fn start_test_server_cluster(port: u16, num_shards: usize) {
             .expect("Failed to spawn test cluster shard");
     }
 
-    thread::sleep(Duration::from_millis(200));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn start_test_server_with_tls(port: u16, tls_port: u16, num_shards: usize) -> (Vec<u8>, Vec<u8>) {
+    rudis::shutdown::reset_shutdown();
     let (cert_der, key_der) = rudis::tls::generate_self_signed_cert(vec![
         "localhost".to_string(),
         "127.0.0.1".to_string(),
@@ -92,9 +119,11 @@ fn start_test_server_with_tls(port: u16, tls_port: u16, num_shards: usize) -> (V
         server_config,
     };
 
+    let dir = std::env::temp_dir().join(format!("rudis-tls-{}-{}", std::process::id(), port));
+    let _ = std::fs::create_dir_all(&dir);
     let aof_config = rudis::aof::AofConfig {
         enabled: false,
-        dir: std::env::temp_dir(),
+        dir,
         fsync_every_sec: false,
     };
 
@@ -122,7 +151,13 @@ fn start_test_server_with_tls(port: u16, tls_port: u16, num_shards: usize) -> (V
             .expect("Failed to spawn test shard");
     }
 
-    thread::sleep(Duration::from_millis(200));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
     (cert_der, key_der)
 }
 
