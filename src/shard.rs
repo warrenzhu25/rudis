@@ -77,6 +77,10 @@ pub enum ShardMessage {
         key: Bytes,
         responder: flume::Sender<bool>,
     },
+    DelKeys {
+        keys: Vec<Bytes>,
+        responder: flume::Sender<usize>,
+    },
     Exists {
         key: Bytes,
         responder: flume::Sender<bool>,

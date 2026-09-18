@@ -3664,20 +3664,19 @@ async fn execute_command(
             false
         }
         Command::Del(keys) => {
-            let mut count = 0usize;
-            for key in keys.clone() {
+            for key in &keys {
                 notify_key_invalidation(router.port, key.as_ref(), client_id);
-                if router.del(key.clone()).await {
-                    count += 1;
-                    crate::search::delete_document_hook(&String::from_utf8_lossy(&key));
-                }
             }
-
-            if count > 0
-                && crate::replication::has_connected_replicas(router.port)
-                && let Some(bytes) = crate::aof::command_to_resp(&Command::Del(keys))
-            {
-                crate::replication::propagate_bytes(router.port, &bytes);
+            let count = router.del_keys(keys.clone()).await;
+            if count > 0 {
+                for key in &keys {
+                    crate::search::delete_document_hook(&String::from_utf8_lossy(key));
+                }
+                if crate::replication::has_connected_replicas(router.port)
+                    && let Some(bytes) = crate::aof::command_to_resp(&Command::Del(keys))
+                {
+                    crate::replication::propagate_bytes(router.port, &bytes);
+                }
             }
             write_resp_integer(out, count as i64);
             false

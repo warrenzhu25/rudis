@@ -1161,6 +1161,111 @@ impl Router {
         }
     }
 
+    pub async fn del_keys(&self, mut keys: Vec<Bytes>) -> usize {
+        if keys.is_empty() {
+            return 0;
+        }
+
+        if keys.len() == 1 {
+            return if self.del(keys.swap_remove(0)).await {
+                1
+            } else {
+                0
+            };
+        }
+
+        if self.num_shards <= 1 {
+            let mut count = 0;
+            let mut deleted_keys = Vec::with_capacity(keys.len());
+            {
+                let mut db = self.local_db.borrow_mut();
+                for k in keys {
+                    if db.del(&k) {
+                        count += 1;
+                        deleted_keys.push(k);
+                    }
+                }
+            }
+            if count > 0
+                && let Some(aof) = &self.aof
+                && let Some(bytes) = crate::aof::command_to_resp(&Command::Del(deleted_keys))
+            {
+                aof.borrow_mut().append(&bytes);
+            }
+            return count;
+        }
+
+        let mut local_keys = Vec::with_capacity(keys.len().min(16));
+        let mut remote_batches: Vec<Vec<Bytes>> =
+            (0..self.num_shards).map(|_| Vec::new()).collect();
+        let mut has_remote = false;
+
+        {
+            let owners = self.slot_owners.borrow();
+            for key in keys {
+                let slot = key_slot(&key);
+                let target = owners[slot as usize];
+                if target == self.shard_id {
+                    local_keys.push(key);
+                } else {
+                    has_remote = true;
+                    remote_batches[target].push(key);
+                }
+            }
+        }
+
+        // 1. Delete all local keys directly in-place
+        let mut total_deleted = 0;
+        if !local_keys.is_empty() {
+            let mut deleted_local = Vec::with_capacity(local_keys.len());
+            {
+                let mut db = self.local_db.borrow_mut();
+                for k in local_keys {
+                    if db.del(&k) {
+                        total_deleted += 1;
+                        deleted_local.push(k);
+                    }
+                }
+            }
+            if !deleted_local.is_empty()
+                && let Some(aof) = &self.aof
+                && let Some(bytes) = crate::aof::command_to_resp(&Command::Del(deleted_local))
+            {
+                aof.borrow_mut().append(&bytes);
+            }
+        }
+
+        if !has_remote {
+            return total_deleted;
+        }
+
+        // 2. Dispatch batched requests to remote shards concurrently in parallel
+        let mut responders = Vec::new();
+        for (target_shard, shard_keys) in remote_batches.into_iter().enumerate() {
+            if !shard_keys.is_empty() {
+                let (tx, rx) = flume::bounded(1);
+                if self.senders[target_shard]
+                    .send(ShardMessage::DelKeys {
+                        keys: shard_keys,
+                        responder: tx,
+                    })
+                    .is_ok()
+                {
+                    responders.push(rx);
+                }
+            }
+        }
+
+        // 3. Concurrently await all remote responses in parallel
+        for rx in responders {
+            if let Ok(shard_deleted) = rx.recv_async().await {
+                total_deleted += shard_deleted;
+            }
+        }
+
+        total_deleted
+    }
+
     pub async fn exists(&self, key: Bytes) -> bool {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
@@ -3044,6 +3149,107 @@ mod tests {
             assert_eq!(res[0], Some("100".to_string()));
             assert_eq!(res[1], None);
             assert_eq!(res[2], None);
+        });
+    }
+
+    #[test]
+    fn test_router_del_keys_cross_shard_fanout() {
+        let (mut senders_mesh, mut receivers) = crate::mailbox::create_shard_mesh(2);
+        let senders = senders_mesh.remove(0);
+        drop(senders_mesh);
+        let rx1 = receivers.remove(1);
+
+        let db0 = Rc::new(RefCell::new(ShardDb::new(9997)));
+        let router = Router::new(
+            0,
+            2,
+            9997,
+            db0.clone(),
+            senders,
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+
+        let mut k_shard0 = None;
+        let mut k_shard1 = None;
+        for i in 0..1000 {
+            let k = Bytes::from(format!("del_k_{}", i));
+            if target_shard(&k, 2) == 0 && k_shard0.is_none() {
+                k_shard0 = Some(k);
+            } else if target_shard(&k, 2) == 1 && k_shard1.is_none() {
+                k_shard1 = Some(k);
+            }
+            if k_shard0.is_some() && k_shard1.is_some() {
+                break;
+            }
+        }
+        let k0 = k_shard0.unwrap();
+        let k1 = k_shard1.unwrap();
+        let rx1_clone = rx1.clone();
+
+        std::thread::spawn(move || {
+            let mut remote_db = ShardDb::new(9997);
+            while let Ok(msg) = rx1_clone.recv() {
+                match msg {
+                    ShardMessage::Set {
+                        key,
+                        value,
+                        expire_in,
+                        responder,
+                    } => {
+                        remote_db.set(key, value, expire_in);
+                        let _ = responder.send(());
+                    }
+                    ShardMessage::FastSet { descriptor } => {
+                        remote_db.set(
+                            descriptor.key.clone(),
+                            descriptor.value.clone(),
+                            descriptor.expire_in,
+                        );
+                        descriptor.finish();
+                    }
+                    ShardMessage::DelKeys { keys, responder } => {
+                        let mut count = 0;
+                        for k in keys {
+                            if remote_db.del(&k) {
+                                count += 1;
+                            }
+                        }
+                        let _ = responder.send(count);
+                    }
+                    ShardMessage::Exists { key, responder } => {
+                        let ex = remote_db.exists(&key);
+                        let _ = responder.send(ex);
+                    }
+                    _ => break,
+                }
+            }
+        });
+
+        // Set local key
+        db0.borrow_mut().set(k0.clone(), Bytes::from("val0"), None);
+
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async move {
+            // Set remote key via router
+            router.set(k1.clone(), Bytes::from("val1"), None).await;
+
+            assert!(router.exists(k0.clone()).await);
+            assert!(router.exists(k1.clone()).await);
+
+            // Delete both keys in parallel plus a non-existent key
+            let deleted = router
+                .del_keys(vec![k0.clone(), k1.clone(), Bytes::from("missing")])
+                .await;
+            assert_eq!(deleted, 2);
+
+            assert!(!router.exists(k0).await);
+            assert!(!router.exists(k1).await);
         });
     }
 }

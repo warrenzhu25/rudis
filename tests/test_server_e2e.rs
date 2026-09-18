@@ -7837,3 +7837,61 @@ fn test_extended_rdb_full_server_bgsave_and_restore_e2e() {
 
     let _ = std::fs::remove_dir_all(rdb_dir);
 }
+
+#[test]
+fn test_del_multi_shard_parallel_fanout_e2e() {
+    let port = 16769;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Generate 80 keys distributed across all 4 shards
+    let mut keys_by_shard: Vec<Vec<String>> = (0..num_shards).map(|_| Vec::new()).collect();
+    let mut all_keys = Vec::new();
+    let mut i = 0;
+    while all_keys.len() < 80 {
+        let key = format!("del_fanout_key_{}", i);
+        let s = rudis::router::target_shard(key.as_bytes(), num_shards);
+        keys_by_shard[s].push(key.clone());
+        all_keys.push(key);
+        i += 1;
+    }
+
+    // Verify all 4 shards have keys
+    for (s, klist) in keys_by_shard.iter().enumerate() {
+        assert!(!klist.is_empty(), "Shard {} should have keys", s);
+    }
+
+    // 2. Populate all keys using MSET
+    let mut mset_cmd = format!("*{}\r\n$4\r\nMSET\r\n", all_keys.len() * 2 + 1);
+    for k in &all_keys {
+        mset_cmd.push_str(&format!("${}\r\n{}\r\n$3\r\nval\r\n", k.len(), k));
+    }
+    assert_eq!(send_and_read(&mut client, mset_cmd.as_bytes()), "+OK\r\n");
+
+    // 3. Issue parallel cross-shard DEL with all 80 keys + 10 non-existent keys
+    let mut del_cmd = format!("*{}\r\n$3\r\nDEL\r\n", all_keys.len() + 10 + 1);
+    for k in &all_keys {
+        del_cmd.push_str(&format!("${}\r\n{}\r\n", k.len(), k));
+    }
+    for j in 0..10 {
+        let missing = format!("missing_del_{}", j);
+        del_cmd.push_str(&format!("${}\r\n{}\r\n", missing.len(), missing));
+    }
+
+    let del_resp = send_and_read(&mut client, del_cmd.as_bytes());
+    assert_eq!(del_resp, ":80\r\n");
+
+    // 4. Verify all keys are truly deleted across all shards
+    for k in &all_keys {
+        assert_eq!(
+            send_and_read(&mut client, format!("EXISTS {}\r\n", k).as_bytes()),
+            ":0\r\n"
+        );
+    }
+
+    // 5. Deleting them again returns 0
+    let del_again_resp = send_and_read(&mut client, del_cmd.as_bytes());
+    assert_eq!(del_again_resp, ":0\r\n");
+}

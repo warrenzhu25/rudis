@@ -354,6 +354,27 @@ pub fn run_shard_worker(
                                 }
                         let _ = responder.send(deleted);
                     }
+                    ShardMessage::DelKeys { keys, responder } => {
+                        let mut count = 0usize;
+                        let mut deleted_keys = Vec::with_capacity(keys.len());
+                        {
+                            let mut db = cross_shard_db.borrow_mut();
+                            for k in keys {
+                                if db.del(&k) {
+                                    count += 1;
+                                    deleted_keys.push(k);
+                                }
+                            }
+                        }
+                        if count > 0
+                            && let Some(aof) = &cross_shard_aof
+                            && let Some(bytes) =
+                                crate::aof::command_to_resp(&crate::resp::Command::Del(deleted_keys))
+                        {
+                            aof.borrow_mut().append(&bytes);
+                        }
+                        let _ = responder.send(count);
+                    }
                     ShardMessage::Exists { key, responder } => {
                         let exists = cross_shard_db.borrow_mut().exists(&key);
                         let _ = responder.send(exists);
