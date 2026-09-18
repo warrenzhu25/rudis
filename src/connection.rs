@@ -18,8 +18,8 @@ use crate::shard::{CompactResp, ShardDb, ShardMessage};
 const READ_BUFFER_SIZE: usize = 65536;
 
 pub type ResponderChannel = (
-    flume::Sender<Vec<(usize, CompactResp)>>,
-    flume::Receiver<Vec<(usize, CompactResp)>>,
+    flume::Sender<(Vec<(usize, Command)>, Vec<(usize, CompactResp)>)>,
+    flume::Receiver<(Vec<(usize, Command)>, Vec<(usize, CompactResp)>)>,
 );
 
 #[derive(Clone, Debug)]
@@ -853,6 +853,12 @@ pub async fn handle_connection(
     let mut remote_batches: Vec<Vec<(usize, Command)>> = (0..router.num_shards)
         .map(|_| Vec::with_capacity(64))
         .collect();
+    let mut items_pool: Vec<Vec<(usize, Command)>> = (0..router.num_shards)
+        .map(|_| Vec::with_capacity(64))
+        .collect();
+    let mut results_pool: Vec<Vec<(usize, CompactResp)>> = (0..router.num_shards)
+        .map(|_| Vec::with_capacity(64))
+        .collect();
     let mut squashed_responses = Vec::with_capacity(64);
     let mut commands = Vec::with_capacity(64);
 
@@ -1321,6 +1327,8 @@ pub async fn handle_connection(
                             &router,
                             &responders,
                             &mut remote_batches,
+                            &mut items_pool,
+                            &mut results_pool,
                             &mut squashed_responses,
                             client_id,
                             &client_registry,
@@ -12096,6 +12104,8 @@ async fn execute_commands_squashed(
     router: &Router,
     responders: &[ResponderChannel],
     remote_batches: &mut [Vec<(usize, Command)>],
+    items_pool: &mut Vec<Vec<(usize, Command)>>,
+    results_pool: &mut Vec<Vec<(usize, CompactResp)>>,
     responses: &mut Vec<CompactResp>,
     client_id: u64,
     client_registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
@@ -12500,13 +12510,16 @@ async fn execute_commands_squashed(
     }
 
     // 2. Dispatch batched hops to all remote shards in parallel using pre-allocated channels
-    let mut pending = Vec::new();
+    let mut pending = Vec::with_capacity(remote_batches.len());
     for (target_shard, items) in remote_batches.iter_mut().enumerate() {
         if !items.is_empty() {
             let (tx, rx) = &responders[target_shard];
             let is_resp3 = CURRENT_CLIENT_RESP3.get();
+            let next_items = items_pool.pop().unwrap_or_else(|| Vec::with_capacity(64));
+            let results = results_pool.pop().unwrap_or_else(|| Vec::with_capacity(64));
             let msg = ShardMessage::Batch {
-                items: std::mem::replace(items, Vec::with_capacity(64)),
+                items: std::mem::replace(items, next_items),
+                results,
                 responder: tx.clone(),
                 is_resp3,
             };
@@ -12516,22 +12529,35 @@ async fn execute_commands_squashed(
         }
     }
 
-    // 3. Await parallel responses from all remote shards with initial non-blocking sweep
-    let mut pending_remaining = Vec::with_capacity(pending.len());
-    for rx in pending {
-        if let Ok(results) = rx.try_recv() {
-            for (idx, resp) in results {
-                responses[idx] = resp;
-            }
-        } else {
-            pending_remaining.push(rx);
+    // 3. Await parallel responses from all remote shards with spin-wait before async yield
+    for _spin in 0..48 {
+        if pending.is_empty() {
+            break;
         }
+        pending.retain(|rx| {
+            if let Ok((recycled_items, mut results)) = rx.try_recv() {
+                for (idx, resp) in results.drain(..) {
+                    responses[idx] = resp;
+                }
+                items_pool.push(recycled_items);
+                results_pool.push(results);
+                false
+            } else {
+                true
+            }
+        });
+        if pending.is_empty() {
+            break;
+        }
+        std::hint::spin_loop();
     }
-    for rx in pending_remaining {
-        if let Ok(results) = rx.recv_async().await {
-            for (idx, resp) in results {
+    for rx in pending {
+        if let Ok((recycled_items, mut results)) = rx.recv_async().await {
+            for (idx, resp) in results.drain(..) {
                 responses[idx] = resp;
             }
+            items_pool.push(recycled_items);
+            results_pool.push(results);
         }
     }
 

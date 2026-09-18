@@ -516,7 +516,12 @@ pub fn run_shard_worker(
                         }
                         let _ = responder.send(out);
                     }
-                    ShardMessage::Batch { items, responder, is_resp3 } => {
+                    ShardMessage::Batch {
+                        mut items,
+                        mut results,
+                        responder,
+                        is_resp3,
+                    } => {
                         let r = cross_shard_router.clone();
                         let aof_ref = cross_shard_aof.clone();
                         let has_tier_manager = cross_shard_db.borrow().tier_manager.is_some();
@@ -532,10 +537,10 @@ pub fn run_shard_worker(
                         if needs_async {
                             monoio::spawn(async move {
                                 crate::connection::CURRENT_CLIENT_RESP3.set(is_resp3);
-                                let mut results = Vec::with_capacity(items.len());
+                                results.clear();
                                 let mut temp_buf = Vec::with_capacity(128);
                                 let mut has_writes = false;
-                                for (idx, cmd) in items {
+                                for (idx, cmd) in items.drain(..) {
                                     temp_buf.clear();
                                     if let Command::Get(ref key) = cmd {
                                         let val = r.local_db.borrow_mut().get(key);
@@ -716,16 +721,16 @@ pub fn run_shard_worker(
                                 if has_writes {
                                     r.check_auto_tier_after_write();
                                 }
-                                let _ = responder.send(results);
+                                let _ = responder.send((items, results));
                             });
                         } else {
                             crate::connection::CURRENT_CLIENT_RESP3.set(is_resp3);
                             let mut db = cross_shard_db.borrow_mut();
-                            let mut results = Vec::with_capacity(items.len());
+                            results.clear();
                             let aof_ref = cross_shard_aof.as_deref();
                             let mut temp_buf = Vec::with_capacity(128);
                             let mut has_writes = false;
-                            for (idx, cmd) in items {
+                            for (idx, cmd) in items.drain(..) {
                                 temp_buf.clear();
                                 if let Command::Get(ref key) = cmd {
                                     if !db.write_get_resp(key.as_ref(), &mut temp_buf).unwrap_or(false) {
@@ -883,7 +888,7 @@ pub fn run_shard_worker(
                             if has_writes {
                                 cross_shard_router.check_auto_tier_after_write();
                             }
-                            let _ = responder.send(results);
+                            let _ = responder.send((items, results));
                         }
                     }
                     ShardMessage::Mget { mut keys, responder } => {

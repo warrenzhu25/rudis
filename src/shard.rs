@@ -122,7 +122,8 @@ pub enum ShardMessage {
     },
     Batch {
         items: Vec<(usize, Command)>,
-        responder: flume::Sender<Vec<(usize, CompactResp)>>,
+        results: Vec<(usize, CompactResp)>,
+        responder: flume::Sender<(Vec<(usize, Command)>, Vec<(usize, CompactResp)>)>,
         is_resp3: bool,
     },
     Mget {

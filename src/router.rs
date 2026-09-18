@@ -1742,11 +1742,12 @@ impl Router {
             .unwrap_or_else(|| flume::bounded(1));
         let msg = ShardMessage::Batch {
             items: vec![(0, cmd)],
+            results: Vec::with_capacity(1),
             responder: tx.clone(),
             is_resp3,
         };
         let res = if self.senders[target].send(msg).is_ok()
-            && let Ok(mut res) = rx.recv_async().await
+            && let Ok((_recycled_items, mut res)) = rx.recv_async().await
             && let Some((_, out)) = res.pop()
         {
             out.into_vec()
@@ -2770,13 +2771,16 @@ mod tests {
                         let _ = responder.send(val);
                     }
                     ShardMessage::Batch {
-                        items, responder, ..
+                        mut items,
+                        mut results,
+                        responder,
+                        ..
                     } => {
-                        let mut res = Vec::new();
-                        for (idx, _cmd) in items {
-                            res.push((idx, crate::shard::CompactResp::from_slice(b"+PONG\r\n")));
+                        results.clear();
+                        for (idx, _cmd) in items.drain(..) {
+                            results.push((idx, crate::shard::CompactResp::from_slice(b"+PONG\r\n")));
                         }
-                        let _ = responder.send(res);
+                        let _ = responder.send((items, results));
                     }
                     _ => break,
                 }
