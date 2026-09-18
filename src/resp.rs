@@ -1114,6 +1114,7 @@ pub enum Command {
         on_type: String,
         prefixes: Vec<String>,
         fields: std::collections::HashMap<String, crate::search::FieldType>,
+        schema_fields: Vec<crate::search::SchemaField>,
     },
     FtSearch {
         index: String,
@@ -7264,15 +7265,34 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
 
             let mut fields = std::collections::HashMap::new();
+            let mut schema_fields = Vec::new();
             while i < args.len() {
-                let fname = String::from_utf8_lossy(&args[i]).to_string();
+                let identifier = String::from_utf8_lossy(&args[i]).to_string();
                 i += 1;
                 if i >= args.len() {
                     break;
                 }
+                let mut alias = identifier.clone();
+                if i < args.len() && String::from_utf8_lossy(&args[i]).to_uppercase() == "AS" {
+                    if i + 1 < args.len() {
+                        alias = String::from_utf8_lossy(&args[i + 1]).to_string();
+                        i += 2;
+                    }
+                } else if alias.starts_with("$.") {
+                    alias = alias
+                        .trim_start_matches("$.")
+                        .trim_end_matches(".*")
+                        .trim_end_matches("[*]")
+                        .to_string();
+                }
+
+                if i >= args.len() {
+                    break;
+                }
+
                 let ftype_str = String::from_utf8_lossy(&args[i]).to_uppercase();
                 i += 1;
-                match ftype_str.as_str() {
+                let field_type = match ftype_str.as_str() {
                     "TEXT" => {
                         let mut weight = 1.0;
                         let mut sortable = false;
@@ -7293,14 +7313,11 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                                 break;
                             }
                         }
-                        fields.insert(
-                            fname,
-                            crate::search::FieldType::Text {
-                                weight,
-                                sortable,
-                                nostem,
-                            },
-                        );
+                        Some(crate::search::FieldType::Text {
+                            weight,
+                            sortable,
+                            nostem,
+                        })
                     }
                     "NUMERIC" => {
                         let mut sortable = false;
@@ -7310,7 +7327,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             sortable = true;
                             i += 1;
                         }
-                        fields.insert(fname, crate::search::FieldType::Numeric { sortable });
+                        Some(crate::search::FieldType::Numeric { sortable })
                     }
                     "TAG" => {
                         let mut separator = ',';
@@ -7330,13 +7347,10 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                                 break;
                             }
                         }
-                        fields.insert(
-                            fname,
-                            crate::search::FieldType::Tag {
-                                separator,
-                                casesensitive,
-                            },
-                        );
+                        Some(crate::search::FieldType::Tag {
+                            separator,
+                            casesensitive,
+                        })
                     }
                     "VECTOR" => {
                         let algorithm = if i < args.len() {
@@ -7371,16 +7385,25 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                                 break;
                             }
                         }
-                        fields.insert(
-                            fname,
-                            crate::search::FieldType::Vector {
-                                dim,
-                                distance_metric,
-                                algorithm,
-                            },
-                        );
+                        Some(crate::search::FieldType::Vector {
+                            dim,
+                            distance_metric,
+                            algorithm,
+                        })
                     }
-                    _ => {}
+                    _ => None,
+                };
+
+                if let Some(ftype) = field_type {
+                    fields.insert(alias.clone(), ftype.clone());
+                    if alias != identifier {
+                        fields.insert(identifier.clone(), ftype.clone());
+                    }
+                    schema_fields.push(crate::search::SchemaField {
+                        identifier,
+                        alias,
+                        field_type: ftype,
+                    });
                 }
             }
             Ok(Some(Command::FtCreate {
@@ -7388,6 +7411,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 on_type,
                 prefixes,
                 fields,
+                schema_fields,
             }))
         }
         "FT.SEARCH" => {

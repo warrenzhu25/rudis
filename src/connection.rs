@@ -7134,15 +7134,27 @@ async fn execute_command(
             on_type,
             prefixes,
             fields,
+            schema_fields,
         } => {
             let schema = crate::search::IndexSchema {
                 name: index,
                 on_type,
                 prefixes,
                 fields,
+                schema_fields,
             };
+            let on_type_str = schema.on_type.to_uppercase();
             match crate::search::create_search_index(schema) {
-                Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                Ok(()) => {
+                    if on_type_str == "JSON" {
+                        let local_db = router.local_db.borrow();
+                        for (k, doc) in local_db.json_store.iter() {
+                            let k_str = String::from_utf8_lossy(k);
+                            crate::search::index_json_document_hook(&k_str, doc);
+                        }
+                    }
+                    out.extend_from_slice(b"+OK\r\n");
+                }
                 Err(e) => out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes()),
             }
             false
@@ -10922,23 +10934,9 @@ pub fn execute_local_command(
         } => {
             match db.json_store.json_set(key, path, json_val, *nx, *xx) {
                 Ok(true) => {
-                    if path == "$"
-                        && let Ok(serde_json::Value::Object(map)) = serde_json::from_str(json_val)
-                    {
-                        let mut str_fields = std::collections::HashMap::new();
-                        for (k, v) in map {
-                            let val_str = match v {
-                                serde_json::Value::String(s) => s,
-                                serde_json::Value::Number(n) => n.to_string(),
-                                serde_json::Value::Bool(b) => b.to_string(),
-                                other => other.to_string(),
-                            };
-                            str_fields.insert(k, val_str);
-                        }
-                        crate::search::index_document_hook(
-                            &String::from_utf8_lossy(key),
-                            str_fields,
-                        );
+                    record_change!(cmd);
+                    if let Some(doc) = db.json_store.get(key) {
+                        crate::search::index_json_document_hook(&String::from_utf8_lossy(key), doc);
                     }
                     out.extend_from_slice(b"+OK\r\n");
                 }
@@ -10965,6 +10963,14 @@ pub fn execute_local_command(
         }
         Command::JsonDel { key, path } => {
             let count = db.json_store.json_del(key, path.as_deref());
+            if count > 0 {
+                record_change!(cmd);
+                if let Some(doc) = db.json_store.get(key) {
+                    crate::search::index_json_document_hook(&String::from_utf8_lossy(key), doc);
+                } else {
+                    crate::search::delete_document_hook(&String::from_utf8_lossy(key));
+                }
+            }
             write_resp_integer(out, count as i64);
             false
         }
@@ -10982,6 +10988,10 @@ pub fn execute_local_command(
         Command::JsonNumIncrBy { key, path, delta } => {
             match db.json_store.json_numincrby(key, path, *delta) {
                 Ok(new_val) => {
+                    record_change!(cmd);
+                    if let Some(doc) = db.json_store.get(key) {
+                        crate::search::index_json_document_hook(&String::from_utf8_lossy(key), doc);
+                    }
                     write_resp_bulk(out, new_val.as_bytes());
                 }
                 Err(err) => {
@@ -10997,6 +11007,13 @@ pub fn execute_local_command(
                         let new_num = cur * factor;
                         let delta = new_num - cur;
                         let _ = db.json_store.json_numincrby(key, path, delta);
+                        record_change!(cmd);
+                        if let Some(doc) = db.json_store.get(key) {
+                            crate::search::index_json_document_hook(
+                                &String::from_utf8_lossy(key),
+                                doc,
+                            );
+                        }
                         write_resp_bulk(out, new_num.to_string().as_bytes());
                     } else {
                         out.extend_from_slice(b"-ERR value at path is not a number\r\n");
@@ -11011,6 +11028,10 @@ pub fn execute_local_command(
         Command::JsonStrAppend { key, path, value } => {
             match db.json_store.json_strappend(key, path.as_deref(), value) {
                 Ok(new_len) => {
+                    record_change!(cmd);
+                    if let Some(doc) = db.json_store.get(key) {
+                        crate::search::index_json_document_hook(&String::from_utf8_lossy(key), doc);
+                    }
                     write_resp_integer(out, new_len as i64);
                 }
                 Err(err) => {
@@ -11034,6 +11055,10 @@ pub fn execute_local_command(
             let val_refs: Vec<&str> = values.iter().map(|v| v.as_str()).collect();
             match db.json_store.json_arrappend(key, path, &val_refs) {
                 Ok(new_len) => {
+                    record_change!(cmd);
+                    if let Some(doc) = db.json_store.get(key) {
+                        crate::search::index_json_document_hook(&String::from_utf8_lossy(key), doc);
+                    }
                     write_resp_integer(out, new_len as i64);
                 }
                 Err(err) => {
@@ -11056,6 +11081,10 @@ pub fn execute_local_command(
         Command::JsonArrPop { key, path, index } => {
             match db.json_store.json_arrpop(key, path.as_deref(), *index) {
                 Some(popped) => {
+                    record_change!(cmd);
+                    if let Some(doc) = db.json_store.get(key) {
+                        crate::search::index_json_document_hook(&String::from_utf8_lossy(key), doc);
+                    }
                     write_resp_bulk(out, popped.as_bytes());
                 }
                 None => {
@@ -11092,6 +11121,10 @@ pub fn execute_local_command(
         Command::JsonToggle { key, path } => {
             match db.json_store.json_toggle(key, path) {
                 Ok(b) => {
+                    record_change!(cmd);
+                    if let Some(doc) = db.json_store.get(key) {
+                        crate::search::index_json_document_hook(&String::from_utf8_lossy(key), doc);
+                    }
                     write_resp_bulk(out, b.as_bytes());
                 }
                 Err(err) => {
@@ -11102,6 +11135,12 @@ pub fn execute_local_command(
         }
         Command::JsonClear { key, path } => {
             let cleared = db.json_store.json_clear(key, path.as_deref());
+            if cleared > 0 {
+                record_change!(cmd);
+                if let Some(doc) = db.json_store.get(key) {
+                    crate::search::index_json_document_hook(&String::from_utf8_lossy(key), doc);
+                }
+            }
             write_resp_integer(out, cleared as i64);
             false
         }

@@ -22,12 +22,20 @@ pub enum FieldType {
     },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SchemaField {
+    pub identifier: String, // e.g. "$.title", "$.price", "title"
+    pub alias: String,      // e.g. "title" or "$.title"
+    pub field_type: FieldType,
+}
+
 #[derive(Debug, Clone)]
 pub struct IndexSchema {
     pub name: String,
     pub on_type: String, // "HASH" or "JSON"
     pub prefixes: Vec<String>,
     pub fields: HashMap<String, FieldType>,
+    pub schema_fields: Vec<SchemaField>,
 }
 
 #[derive(Debug, Clone)]
@@ -294,7 +302,18 @@ pub fn parse_vector_blob(bytes: &[u8]) -> Vec<f32> {
 }
 
 impl InvertedIndex {
-    pub fn new(schema: IndexSchema) -> Self {
+    pub fn new(mut schema: IndexSchema) -> Self {
+        if schema.schema_fields.is_empty() {
+            schema.schema_fields = schema
+                .fields
+                .iter()
+                .map(|(k, v)| SchemaField {
+                    identifier: k.clone(),
+                    alias: k.clone(),
+                    field_type: v.clone(),
+                })
+                .collect();
+        }
         Self {
             schema: Some(schema),
             inverted: HashMap::new(),
@@ -365,7 +384,7 @@ impl InvertedIndex {
                     }
                     FieldType::Vector { .. } => {}
                 }
-            } else {
+            } else if field_name != "$" {
                 // Untyped text fallback
                 let tokens = tokenize_text(field_val, true);
                 doc_len += tokens.len();
@@ -483,6 +502,9 @@ pub fn index_document_hook(key: &str, fields: HashMap<String, String>) {
     for idx_lock in registry.values() {
         let mut idx = idx_lock.write().unwrap();
         if let Some(schema) = &idx.schema {
+            if schema.on_type.to_uppercase() != "HASH" {
+                continue;
+            }
             let matched = if schema.prefixes.is_empty() {
                 true
             } else {
@@ -491,6 +513,154 @@ pub fn index_document_hook(key: &str, fields: HashMap<String, String>) {
             if matched {
                 idx.add_document(key, fields.clone(), None);
             }
+        }
+    }
+}
+
+pub fn index_json_document_hook(key: &str, root: &serde_json::Value) {
+    let registry = SEARCH_INDICES.read().unwrap();
+    for idx_lock in registry.values() {
+        let mut idx = idx_lock.write().unwrap();
+        if let Some(schema) = &idx.schema {
+            if schema.on_type.to_uppercase() != "JSON" {
+                continue;
+            }
+            let matched = if schema.prefixes.is_empty() {
+                true
+            } else {
+                schema.prefixes.iter().any(|p| key.starts_with(p))
+            };
+            if !matched {
+                continue;
+            }
+
+            let mut extracted_fields = HashMap::new();
+            let mut extracted_vectors = HashMap::new();
+
+            // Store full JSON document under "$"
+            let root_str = serde_json::to_string(root).unwrap_or_default();
+            extracted_fields.insert("$".to_string(), root_str);
+
+            for sf in &schema.schema_fields {
+                let segments = match crate::json::parse_json_path(&sf.identifier) {
+                    Ok(segs) => segs,
+                    Err(_) => continue,
+                };
+                let matches = crate::json::query_json_path(root, &segments);
+                if matches.is_empty() {
+                    continue;
+                }
+
+                match &sf.field_type {
+                    FieldType::Text { .. } => {
+                        let mut texts = Vec::new();
+                        for v in &matches {
+                            match v {
+                                serde_json::Value::String(s) => texts.push(s.clone()),
+                                serde_json::Value::Number(n) => texts.push(n.to_string()),
+                                serde_json::Value::Bool(b) => texts.push(b.to_string()),
+                                serde_json::Value::Array(arr) => {
+                                    for item in arr {
+                                        if let serde_json::Value::String(s) = item {
+                                            texts.push(s.clone());
+                                        } else {
+                                            texts.push(item.to_string());
+                                        }
+                                    }
+                                }
+                                other => texts.push(other.to_string()),
+                            }
+                        }
+                        let text_val = texts.join(" ");
+                        extracted_fields.insert(sf.alias.clone(), text_val.clone());
+                        if sf.alias != sf.identifier {
+                            extracted_fields.insert(sf.identifier.clone(), text_val);
+                        }
+                    }
+                    FieldType::Numeric { .. } => {
+                        if let Some(first) = matches.first() {
+                            let num_opt = match first {
+                                serde_json::Value::Number(n) => n.as_f64(),
+                                serde_json::Value::String(s) => s.trim().parse::<f64>().ok(),
+                                _ => None,
+                            };
+                            if let Some(num) = num_opt {
+                                let num_str = num.to_string();
+                                extracted_fields.insert(sf.alias.clone(), num_str.clone());
+                                if sf.alias != sf.identifier {
+                                    extracted_fields.insert(sf.identifier.clone(), num_str);
+                                }
+                            }
+                        }
+                    }
+                    FieldType::Tag { separator, .. } => {
+                        let mut tags = Vec::new();
+                        for v in &matches {
+                            match v {
+                                serde_json::Value::String(s) => tags.push(s.clone()),
+                                serde_json::Value::Array(arr) => {
+                                    for item in arr {
+                                        if let serde_json::Value::String(s) = item {
+                                            tags.push(s.clone());
+                                        } else {
+                                            tags.push(item.to_string());
+                                        }
+                                    }
+                                }
+                                other => tags.push(other.to_string()),
+                            }
+                        }
+                        let tag_str = tags.join(&separator.to_string());
+                        extracted_fields.insert(sf.alias.clone(), tag_str.clone());
+                        if sf.alias != sf.identifier {
+                            extracted_fields.insert(sf.identifier.clone(), tag_str);
+                        }
+                    }
+                    FieldType::Vector { .. } => {
+                        if let Some(first) = matches.first() {
+                            let vec_opt: Option<Vec<f32>> = match first {
+                                serde_json::Value::Array(arr) => {
+                                    let v: Vec<f32> = arr
+                                        .iter()
+                                        .filter_map(|x| x.as_f64().map(|f| f as f32))
+                                        .collect();
+                                    if !v.is_empty() { Some(v) } else { None }
+                                }
+                                serde_json::Value::String(s) => {
+                                    let v = parse_vector_blob(s.as_bytes());
+                                    if !v.is_empty() { Some(v) } else { None }
+                                }
+                                _ => None,
+                            };
+                            if let Some(vec) = vec_opt {
+                                extracted_vectors.insert(sf.alias.clone(), vec.clone());
+                                if sf.alias != sf.identifier {
+                                    extracted_vectors.insert(sf.identifier.clone(), vec.clone());
+                                }
+                                let s = vec
+                                    .iter()
+                                    .map(|f| f.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(",");
+                                extracted_fields.insert(sf.alias.clone(), s.clone());
+                                if sf.alias != sf.identifier {
+                                    extracted_fields.insert(sf.identifier.clone(), s);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            idx.add_document(
+                key,
+                extracted_fields,
+                if extracted_vectors.is_empty() {
+                    None
+                } else {
+                    Some(extracted_vectors)
+                },
+            );
         }
     }
 }
@@ -773,7 +943,10 @@ pub fn execute_search(
             if total > 0 {
                 for h in hits {
                     if let Some(doc) = index.docs.get(&h.doc_id)
-                        && doc.fields.contains_key(field)
+                        && (doc.fields.contains_key(field)
+                            || field
+                                .strip_prefix("$.")
+                                .is_some_and(|f| doc.fields.contains_key(f)))
                     {
                         candidate_scores.insert(h.doc_id, h.score);
                     }
@@ -782,7 +955,12 @@ pub fn execute_search(
         }
         QueryAst::NumericRange { field, min, max } => {
             for (doc_id, doc) in &index.docs {
-                if let Some(&val) = doc.numeric_fields.get(field)
+                let num_val = doc.numeric_fields.get(field).copied().or_else(|| {
+                    field
+                        .strip_prefix("$.")
+                        .and_then(|f| doc.numeric_fields.get(f).copied())
+                });
+                if let Some(val) = num_val
                     && val >= *min
                     && val <= *max
                 {
@@ -792,7 +970,11 @@ pub fn execute_search(
         }
         QueryAst::TagFilter { field, tags } => {
             for (doc_id, doc) in &index.docs {
-                if let Some(doc_tags) = doc.tag_fields.get(field) {
+                let tags_opt = doc
+                    .tag_fields
+                    .get(field)
+                    .or_else(|| field.strip_prefix("$.").and_then(|f| doc.tag_fields.get(f)));
+                if let Some(doc_tags) = tags_opt {
                     let matched = tags.iter().any(|t| doc_tags.contains(t));
                     if matched {
                         candidate_scores.insert(doc_id.clone(), 1.0);
@@ -893,7 +1075,12 @@ pub fn execute_search(
             let mut vector_dists = Vec::new();
             if !effective_vec.is_empty() {
                 for (doc_id, doc) in &index.docs {
-                    if let Some(doc_vec) = doc.vector_fields.get(field)
+                    let vec_opt = doc.vector_fields.get(field).or_else(|| {
+                        field
+                            .strip_prefix("$.")
+                            .and_then(|f| doc.vector_fields.get(f))
+                    });
+                    if let Some(doc_vec) = vec_opt
                         && effective_vec.len() == doc_vec.len()
                     {
                         let sim = cosine_similarity(&effective_vec, doc_vec);
@@ -918,10 +1105,22 @@ pub fn execute_search(
             let doc_a = index.docs.get(&a.0);
             let doc_b = index.docs.get(&b.0);
             let val_a = doc_a
-                .and_then(|d| d.numeric_fields.get(sort_field).copied())
+                .and_then(|d| {
+                    d.numeric_fields.get(sort_field).copied().or_else(|| {
+                        sort_field
+                            .strip_prefix("$.")
+                            .and_then(|f| d.numeric_fields.get(f).copied())
+                    })
+                })
                 .unwrap_or(f64::NEG_INFINITY);
             let val_b = doc_b
-                .and_then(|d| d.numeric_fields.get(sort_field).copied())
+                .and_then(|d| {
+                    d.numeric_fields.get(sort_field).copied().or_else(|| {
+                        sort_field
+                            .strip_prefix("$.")
+                            .and_then(|f| d.numeric_fields.get(f).copied())
+                    })
+                })
                 .unwrap_or(f64::NEG_INFINITY);
             if *asc {
                 val_a
@@ -951,6 +1150,10 @@ pub fn execute_search(
             if let Some(ret_fields) = &opts.return_fields {
                 for rf in ret_fields {
                     if let Some(v) = doc.fields.get(rf) {
+                        fields.insert(rf.clone(), v.clone());
+                    } else if let Some(stripped) = rf.strip_prefix("$.")
+                        && let Some(v) = doc.fields.get(stripped)
+                    {
                         fields.insert(rf.clone(), v.clone());
                     }
                 }
@@ -1052,6 +1255,7 @@ mod tests {
             on_type: "HASH".to_string(),
             prefixes: vec!["product:".to_string()],
             fields: schema_fields,
+            schema_fields: Vec::new(),
         };
 
         let mut idx = InvertedIndex::new(schema);
@@ -1152,6 +1356,7 @@ mod tests {
             on_type: "HASH".to_string(),
             prefixes: vec!["doc:".to_string()],
             fields,
+            schema_fields: Vec::new(),
         };
         let mut idx = InvertedIndex::new(schema);
 
@@ -1183,6 +1388,118 @@ mod tests {
         let (total, hits) = execute_search(&idx, &ast, &opts);
         assert_eq!(total, 1);
         assert_eq!(hits[0].doc_id, "doc:1");
+    }
+
+    #[test]
+    fn test_search_on_json_documents() {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "title".to_string(),
+            FieldType::Text {
+                weight: 1.0,
+                sortable: true,
+                nostem: false,
+            },
+        );
+        fields.insert("price".to_string(), FieldType::Numeric { sortable: true });
+        fields.insert(
+            "tags".to_string(),
+            FieldType::Tag {
+                separator: ',',
+                casesensitive: false,
+            },
+        );
+        fields.insert("rating".to_string(), FieldType::Numeric { sortable: true });
+
+        let schema_fields = vec![
+            SchemaField {
+                identifier: "$.title".to_string(),
+                alias: "title".to_string(),
+                field_type: FieldType::Text {
+                    weight: 1.0,
+                    sortable: true,
+                    nostem: false,
+                },
+            },
+            SchemaField {
+                identifier: "$.price".to_string(),
+                alias: "price".to_string(),
+                field_type: FieldType::Numeric { sortable: true },
+            },
+            SchemaField {
+                identifier: "$.tags.*".to_string(),
+                alias: "tags".to_string(),
+                field_type: FieldType::Tag {
+                    separator: ',',
+                    casesensitive: false,
+                },
+            },
+            SchemaField {
+                identifier: "$.meta.rating".to_string(),
+                alias: "rating".to_string(),
+                field_type: FieldType::Numeric { sortable: true },
+            },
+        ];
+
+        let schema = IndexSchema {
+            name: "idx:inventory_json".to_string(),
+            on_type: "JSON".to_string(),
+            prefixes: vec!["inv:".to_string()],
+            fields,
+            schema_fields,
+        };
+
+        // Create in global registry
+        assert!(create_search_index(schema).is_ok());
+
+        let json1 = serde_json::json!({
+            "title": "High performance Rust memory engine",
+            "price": 89.99,
+            "tags": ["database", "rust", "redis"],
+            "meta": { "rating": 4.8 }
+        });
+
+        let json2 = serde_json::json!({
+            "title": "Distributed stream processor in Go",
+            "price": 35.50,
+            "tags": ["streaming", "golang"],
+            "meta": { "rating": 4.1 }
+        });
+
+        index_json_document_hook("inv:1", &json1);
+        index_json_document_hook("inv:2", &json2);
+
+        let idx_arc = get_search_index("idx:inventory_json").expect("index exists");
+        let idx = idx_arc.read().unwrap();
+        assert_eq!(idx.total_docs, 2);
+
+        // 1. Text search for "rust"
+        let ast1 = parse_query("rust");
+        let (total1, hits1) = execute_search(&idx, &ast1, &SearchOptions::default());
+        assert_eq!(total1, 1);
+        assert_eq!(hits1[0].doc_id, "inv:1");
+
+        // 2. Numeric range query on price
+        let ast2 = parse_query("@price:[30 50]");
+        let (total2, hits2) = execute_search(&idx, &ast2, &SearchOptions::default());
+        assert_eq!(total2, 1);
+        assert_eq!(hits2[0].doc_id, "inv:2");
+
+        // 3. Tag filter on tags array extracted via wildcard
+        let ast3 = parse_query("@tags:{redis}");
+        let (total3, hits3) = execute_search(&idx, &ast3, &SearchOptions::default());
+        assert_eq!(total3, 1);
+        assert_eq!(hits3[0].doc_id, "inv:1");
+
+        // 4. Nested JSONPath numeric range: @rating:[4.5 5.0]
+        let ast4 = parse_query("@rating:[4.5 5.0]");
+        let (total4, hits4) = execute_search(&idx, &ast4, &SearchOptions::default());
+        assert_eq!(total4, 1);
+        assert_eq!(hits4[0].doc_id, "inv:1");
+
+        // Drop index cleanup
+        drop(idx);
+        assert!(drop_search_index("idx:inventory_json").is_ok());
     }
 
     fn h2_clone(h: &SearchHit) -> SearchHit {

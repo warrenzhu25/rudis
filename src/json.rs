@@ -455,6 +455,11 @@ impl JsonStore {
         self.docs.insert(key, val);
     }
 
+    #[inline]
+    pub fn get(&self, key: &[u8]) -> Option<&Value> {
+        self.docs.get(key)
+    }
+
     /// JSON.SET <key> <path> <json_value> [NX|XX]
     pub fn json_set(
         &mut self,

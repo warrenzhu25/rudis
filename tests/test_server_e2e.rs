@@ -8073,3 +8073,155 @@ fn test_cluster_setslot_live_migration_and_ask_redirection_e2e() {
         perm_moved
     );
 }
+
+#[test]
+fn test_redisearch_on_json_secondary_index_e2e() {
+    let port = 16773;
+    let num_shards = 2;
+    start_test_server(port, num_shards);
+
+    let mut client =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect client");
+    client
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+
+    // 1. Create index ON JSON with JSONPath fields and AS aliases
+    assert_eq!(
+        send_and_read(
+            &mut client,
+            b"FT.CREATE idx:inventory ON JSON PREFIX 1 item: SCHEMA $.title AS title TEXT $.price AS price NUMERIC $.tags.* AS tags TAG $.details.in_stock AS in_stock NUMERIC\r\n"
+        ),
+        "+OK\r\n"
+    );
+
+    // 2. Populate JSON documents via JSON.SET
+    let item1 = br#"{"title": "High performance Rust distributed database", "price": 99.99, "tags": ["rust", "database", "distributed"], "details": {"in_stock": 1}}"#;
+    let mut cmd1 = format!(
+        "*4\r\n$8\r\nJSON.SET\r\n$6\r\nitem:1\r\n$1\r\n$\r\n${}\r\n",
+        item1.len()
+    )
+    .into_bytes();
+    cmd1.extend_from_slice(item1);
+    cmd1.extend_from_slice(b"\r\n");
+    assert_eq!(send_and_read(&mut client, &cmd1), "+OK\r\n");
+
+    let item2 = br#"{"title": "Dragonfly in-memory data store in C++", "price": 49.50, "tags": ["cache", "memory"], "details": {"in_stock": 0}}"#;
+    let mut cmd2 = format!(
+        "*4\r\n$8\r\nJSON.SET\r\n$6\r\nitem:2\r\n$1\r\n$\r\n${}\r\n",
+        item2.len()
+    )
+    .into_bytes();
+    cmd2.extend_from_slice(item2);
+    cmd2.extend_from_slice(b"\r\n");
+    assert_eq!(send_and_read(&mut client, &cmd2), "+OK\r\n");
+
+    let item3 = br#"{"title": "Kafka distributed stream broker in Scala and Java", "price": 120.00, "tags": ["streaming", "distributed"], "details": {"in_stock": 1}}"#;
+    let mut cmd3 = format!(
+        "*4\r\n$8\r\nJSON.SET\r\n$6\r\nitem:3\r\n$1\r\n$\r\n${}\r\n",
+        item3.len()
+    )
+    .into_bytes();
+    cmd3.extend_from_slice(item3);
+    cmd3.extend_from_slice(b"\r\n");
+    assert_eq!(send_and_read(&mut client, &cmd3), "+OK\r\n");
+
+    // 3. Query 1: Full-text search for "distributed" (matches item:1 and item:3)
+    let search1 = send_and_read(
+        &mut client,
+        b"*3\r\n$9\r\nFT.SEARCH\r\n$13\r\nidx:inventory\r\n$11\r\ndistributed\r\n",
+    );
+    assert!(
+        search1.starts_with("*5\r\n:2\r\n"),
+        "Expected 2 hits, got: {}",
+        search1
+    );
+    assert!(search1.contains("item:1"));
+    assert!(search1.contains("item:3"));
+
+    // 4. Query 2: Numeric range on price: @price:[40 100] (matches item:1 and item:2)
+    let search2 = send_and_read(
+        &mut client,
+        b"*3\r\n$9\r\nFT.SEARCH\r\n$13\r\nidx:inventory\r\n$15\r\n@price:[40 100]\r\n",
+    );
+    assert!(
+        search2.starts_with("*5\r\n:2\r\n"),
+        "Expected 2 hits, got: {}",
+        search2
+    );
+    assert!(search2.contains("item:1"));
+    assert!(search2.contains("item:2"));
+
+    // 5. Query 3: Tag filter: @tags:{rust} (matches item:1)
+    let q3 = "@tags:{rust}";
+    let search3_cmd = format!(
+        "*3\r\n$9\r\nFT.SEARCH\r\n$13\r\nidx:inventory\r\n${}\r\n{}\r\n",
+        q3.len(),
+        q3
+    );
+    let search3 = send_and_read(&mut client, search3_cmd.as_bytes());
+    assert!(
+        search3.starts_with("*3\r\n:1\r\n"),
+        "Expected 1 hit, got: {}",
+        search3
+    );
+    assert!(search3.contains("item:1"));
+
+    // 6. Query 4: Nested JSONPath numeric range: @in_stock:[1 1] (matches item:1 and item:3)
+    let q4 = "@in_stock:[1 1]";
+    let search4_cmd = format!(
+        "*3\r\n$9\r\nFT.SEARCH\r\n$13\r\nidx:inventory\r\n${}\r\n{}\r\n",
+        q4.len(),
+        q4
+    );
+    let search4 = send_and_read(&mut client, search4_cmd.as_bytes());
+    assert!(
+        search4.starts_with("*5\r\n:2\r\n"),
+        "Expected 2 hits, got: {}",
+        search4
+    );
+    assert!(search4.contains("item:1"));
+    assert!(search4.contains("item:3"));
+
+    // 7. Mutate subpath: JSON.SET item:2 $.price 35.00
+    let mutate_cmd = "*4\r\n$8\r\nJSON.SET\r\n$6\r\nitem:2\r\n$7\r\n$.price\r\n$5\r\n35.00\r\n";
+    assert_eq!(send_and_read(&mut client, mutate_cmd.as_bytes()), "+OK\r\n");
+    let q_mut = "@price:[30 40]";
+    let search_mut_cmd = format!(
+        "*3\r\n$9\r\nFT.SEARCH\r\n$13\r\nidx:inventory\r\n${}\r\n{}\r\n",
+        q_mut.len(),
+        q_mut
+    );
+    let search_mutated = send_and_read(&mut client, search_mut_cmd.as_bytes());
+    assert!(
+        search_mutated.starts_with("*3\r\n:1\r\n"),
+        "Expected 1 hit after subpath update, got: {}",
+        search_mutated
+    );
+    assert!(search_mutated.contains("item:2"));
+
+    // 8. Test RETURN fields
+    let search_return = send_and_read(
+        &mut client,
+        b"*7\r\n$9\r\nFT.SEARCH\r\n$13\r\nidx:inventory\r\n$4\r\nRust\r\n$6\r\nRETURN\r\n$1\r\n2\r\n$5\r\ntitle\r\n$5\r\nprice\r\n",
+    );
+    assert!(search_return.contains("item:1"));
+    assert!(search_return.contains("High performance Rust distributed database"));
+
+    // 9. Document deletion via JSON.DEL
+    assert_eq!(
+        send_and_read(&mut client, b"JSON.DEL item:1 $\r\n"),
+        ":1\r\n"
+    );
+    let search_after_del = send_and_read(
+        &mut client,
+        b"*3\r\n$9\r\nFT.SEARCH\r\n$13\r\nidx:inventory\r\n$4\r\nRust\r\n",
+    );
+    assert_eq!(search_after_del, "*1\r\n:0\r\n");
+
+    // 10. Clean up index
+    assert_eq!(
+        send_and_read(&mut client, b"FT.DROPINDEX idx:inventory\r\n"),
+        "+OK\r\n"
+    );
+}
