@@ -1412,16 +1412,23 @@ async fn run_pubsub_loop(
             Command::Quit => "QUIT",
             _ => "OTHER",
         };
+        let is_resp3 = client_registry
+            .borrow()
+            .get(&client_id)
+            .map(|c| c.is_resp3)
+            .unwrap_or(false);
         if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
             c.last_active = Instant::now();
             c.last_cmd = cmd_name;
         }
+        let prefix = if is_resp3 { b">3\r\n" } else { b"*3\r\n" };
         match cmd {
             Command::Subscribe(channels) => {
                 let mut hub = router.pubsub.borrow_mut();
                 for ch in channels {
-                    let count = hub.subscribe(client_id, ch.clone(), write_tx.clone());
-                    out.extend_from_slice(b"*3\r\n$9\r\nsubscribe\r\n$");
+                    let count = hub.subscribe(client_id, ch.clone(), write_tx.clone(), is_resp3);
+                    out.extend_from_slice(prefix);
+                    out.extend_from_slice(b"$9\r\nsubscribe\r\n$");
                     out.extend_from_slice(ch.len().to_string().as_bytes());
                     out.extend_from_slice(b"\r\n");
                     out.extend_from_slice(&ch);
@@ -1437,12 +1444,14 @@ async fn run_pubsub_loop(
                     let unsubs = hub.unsubscribe_all(client_id);
                     if unsubs.is_empty() {
                         let total = hub.total_subscriptions(client_id);
+                        out.extend_from_slice(prefix);
                         out.extend_from_slice(
-                            format!("*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:{}\r\n", total).as_bytes(),
+                            format!("$11\r\nunsubscribe\r\n$-1\r\n:{}\r\n", total).as_bytes(),
                         );
                     } else {
                         for (ch, remaining) in unsubs {
-                            out.extend_from_slice(b"*3\r\n$11\r\nunsubscribe\r\n$");
+                            out.extend_from_slice(prefix);
+                            out.extend_from_slice(b"$11\r\nunsubscribe\r\n$");
                             out.extend_from_slice(ch.len().to_string().as_bytes());
                             out.extend_from_slice(b"\r\n");
                             out.extend_from_slice(&ch);
@@ -1454,7 +1463,8 @@ async fn run_pubsub_loop(
                 } else {
                     for ch in channels {
                         let remaining = hub.unsubscribe(client_id, &ch);
-                        out.extend_from_slice(b"*3\r\n$11\r\nunsubscribe\r\n$");
+                        out.extend_from_slice(prefix);
+                        out.extend_from_slice(b"$11\r\nunsubscribe\r\n$");
                         out.extend_from_slice(ch.len().to_string().as_bytes());
                         out.extend_from_slice(b"\r\n");
                         out.extend_from_slice(&ch);
@@ -1468,8 +1478,9 @@ async fn run_pubsub_loop(
             Command::Psubscribe(patterns) => {
                 let mut hub = router.pubsub.borrow_mut();
                 for pat in patterns {
-                    let count = hub.psubscribe(client_id, pat.clone(), write_tx.clone());
-                    out.extend_from_slice(b"*3\r\n$10\r\npsubscribe\r\n$");
+                    let count = hub.psubscribe(client_id, pat.clone(), write_tx.clone(), is_resp3);
+                    out.extend_from_slice(prefix);
+                    out.extend_from_slice(b"$10\r\npsubscribe\r\n$");
                     out.extend_from_slice(pat.len().to_string().as_bytes());
                     out.extend_from_slice(b"\r\n");
                     out.extend_from_slice(&pat);
@@ -1485,13 +1496,14 @@ async fn run_pubsub_loop(
                     let unsubs = hub.punsubscribe_all(client_id);
                     if unsubs.is_empty() {
                         let total = hub.total_subscriptions(client_id);
+                        out.extend_from_slice(prefix);
                         out.extend_from_slice(
-                            format!("*3\r\n$12\r\npunsubscribe\r\n$-1\r\n:{}\r\n", total)
-                                .as_bytes(),
+                            format!("$12\r\npunsubscribe\r\n$-1\r\n:{}\r\n", total).as_bytes(),
                         );
                     } else {
                         for (pat, remaining) in unsubs {
-                            out.extend_from_slice(b"*3\r\n$12\r\npunsubscribe\r\n$");
+                            out.extend_from_slice(prefix);
+                            out.extend_from_slice(b"$12\r\npunsubscribe\r\n$");
                             out.extend_from_slice(pat.len().to_string().as_bytes());
                             out.extend_from_slice(b"\r\n");
                             out.extend_from_slice(&pat);
@@ -1503,7 +1515,8 @@ async fn run_pubsub_loop(
                 } else {
                     for pat in patterns {
                         let remaining = hub.punsubscribe(client_id, &pat);
-                        out.extend_from_slice(b"*3\r\n$12\r\npunsubscribe\r\n$");
+                        out.extend_from_slice(prefix);
+                        out.extend_from_slice(b"$12\r\npunsubscribe\r\n$");
                         out.extend_from_slice(pat.len().to_string().as_bytes());
                         out.extend_from_slice(b"\r\n");
                         out.extend_from_slice(&pat);

@@ -7482,3 +7482,58 @@ fn test_json_mget_multi_shard_parallel_fanout_e2e() {
     assert!(resp_root.contains("alice"));
     assert!(resp_root.ends_with("$-1\r\n"));
 }
+
+#[test]
+fn test_pubsub_resp3_push_frames_e2e() {
+    let port = 16761;
+    let num_shards = 2;
+    start_test_server(port, num_shards);
+
+    // 1. Client 1 negotiates RESP3 via HELLO 3, then subscribes
+    let mut client_resp3 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let hello_resp = send_and_read(&mut client_resp3, b"HELLO 3\r\n");
+    assert!(hello_resp.starts_with('%') || hello_resp.starts_with('*'));
+
+    let sub3_resp = send_and_read(&mut client_resp3, b"SUBSCRIBE updates\r\n");
+    assert!(
+        sub3_resp.starts_with(">3\r\n"),
+        "RESP3 subscriber should receive push frame acknowledgment (>3), got: {}",
+        sub3_resp
+    );
+    assert!(sub3_resp.contains("subscribe"));
+
+    // 2. Client 2 stays in default RESP2, then subscribes
+    let mut client_resp2 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let sub2_resp = send_and_read(&mut client_resp2, b"SUBSCRIBE updates\r\n");
+    assert!(
+        sub2_resp.starts_with("*3\r\n"),
+        "RESP2 subscriber should receive standard array frame (*3), got: {}",
+        sub2_resp
+    );
+
+    // 3. Publisher sends PUBLISH
+    let mut publisher = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let pub_resp = send_and_read(&mut publisher, b"PUBLISH updates payload123\r\n");
+    assert_eq!(pub_resp, ":2\r\n");
+
+    // 4. Verify Client 1 receives RESP3 push message (>3)
+    let mut buf = [0u8; 512];
+    let n1 = client_resp3.read(&mut buf).unwrap();
+    let msg1 = String::from_utf8_lossy(&buf[..n1]);
+    assert!(
+        msg1.starts_with(">3\r\n"),
+        "RESP3 client should receive >3 push message, got: {}",
+        msg1
+    );
+    assert!(msg1.contains("payload123"));
+
+    // 5. Verify Client 2 receives RESP2 array message (*3)
+    let n2 = client_resp2.read(&mut buf).unwrap();
+    let msg2 = String::from_utf8_lossy(&buf[..n2]);
+    assert!(
+        msg2.starts_with("*3\r\n"),
+        "RESP2 client should receive *3 array message, got: {}",
+        msg2
+    );
+    assert!(msg2.contains("payload123"));
+}

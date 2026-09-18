@@ -37,6 +37,7 @@ pub struct PubSubHub {
     pub clients: hashbrown::HashMap<u64, flume::Sender<Vec<u8>>>,
     pub client_channels: hashbrown::HashMap<u64, hashbrown::HashSet<Bytes>>,
     pub client_patterns: hashbrown::HashMap<u64, hashbrown::HashSet<Bytes>>,
+    pub client_resp3: hashbrown::HashSet<u64>,
 }
 
 impl PubSubHub {
@@ -63,8 +64,14 @@ impl PubSubHub {
         client_id: u64,
         channel: Bytes,
         tx: flume::Sender<Vec<u8>>,
+        is_resp3: bool,
     ) -> usize {
         self.clients.insert(client_id, tx);
+        if is_resp3 {
+            self.client_resp3.insert(client_id);
+        } else {
+            self.client_resp3.remove(&client_id);
+        }
         self.channels
             .entry(channel.clone())
             .or_default()
@@ -92,6 +99,7 @@ impl PubSubHub {
         let total = self.total_subscriptions(client_id);
         if total == 0 {
             self.clients.remove(&client_id);
+            self.client_resp3.remove(&client_id);
         }
         total
     }
@@ -112,6 +120,7 @@ impl PubSubHub {
         }
         if self.total_subscriptions(client_id) == 0 {
             self.clients.remove(&client_id);
+            self.client_resp3.remove(&client_id);
         }
         res
     }
@@ -121,8 +130,14 @@ impl PubSubHub {
         client_id: u64,
         pattern: Bytes,
         tx: flume::Sender<Vec<u8>>,
+        is_resp3: bool,
     ) -> usize {
         self.clients.insert(client_id, tx);
+        if is_resp3 {
+            self.client_resp3.insert(client_id);
+        } else {
+            self.client_resp3.remove(&client_id);
+        }
         self.patterns
             .entry(pattern.clone())
             .or_default()
@@ -150,6 +165,7 @@ impl PubSubHub {
         let total = self.total_subscriptions(client_id);
         if total == 0 {
             self.clients.remove(&client_id);
+            self.client_resp3.remove(&client_id);
         }
         total
     }
@@ -170,6 +186,7 @@ impl PubSubHub {
         }
         if self.total_subscriptions(client_id) == 0 {
             self.clients.remove(&client_id);
+            self.client_resp3.remove(&client_id);
         }
         res
     }
@@ -179,18 +196,26 @@ impl PubSubHub {
 
         // 1. Direct channel subscribers
         if let Some(subscribers) = self.channels.get(channel) {
-            let mut frame = Vec::new();
-            frame.extend_from_slice(b"*3\r\n$7\r\nmessage\r\n$");
-            frame.extend_from_slice(channel.len().to_string().as_bytes());
-            frame.extend_from_slice(b"\r\n");
-            frame.extend_from_slice(channel);
-            frame.extend_from_slice(b"\r\n$");
-            frame.extend_from_slice(message.len().to_string().as_bytes());
-            frame.extend_from_slice(b"\r\n");
-            frame.extend_from_slice(message);
-            frame.extend_from_slice(b"\r\n");
+            let mut frame_resp2 = Vec::new();
+            frame_resp2.extend_from_slice(b"*3\r\n$7\r\nmessage\r\n$");
+            frame_resp2.extend_from_slice(channel.len().to_string().as_bytes());
+            frame_resp2.extend_from_slice(b"\r\n");
+            frame_resp2.extend_from_slice(channel);
+            frame_resp2.extend_from_slice(b"\r\n$");
+            frame_resp2.extend_from_slice(message.len().to_string().as_bytes());
+            frame_resp2.extend_from_slice(b"\r\n");
+            frame_resp2.extend_from_slice(message);
+            frame_resp2.extend_from_slice(b"\r\n");
+
+            let mut frame_resp3 = frame_resp2.clone();
+            frame_resp3[0] = b'>';
 
             for client_id in subscribers {
+                let frame = if self.client_resp3.contains(client_id) {
+                    &frame_resp3
+                } else {
+                    &frame_resp2
+                };
                 if let Some(tx) = self.clients.get(client_id)
                     && tx.send(frame.clone()).is_ok()
                 {
@@ -202,22 +227,30 @@ impl PubSubHub {
         // 2. Pattern subscribers
         for (pattern, subscribers) in &self.patterns {
             if glob_match(pattern, channel) {
-                let mut frame = Vec::new();
-                frame.extend_from_slice(b"*4\r\n$8\r\npmessage\r\n$");
-                frame.extend_from_slice(pattern.len().to_string().as_bytes());
-                frame.extend_from_slice(b"\r\n");
-                frame.extend_from_slice(pattern);
-                frame.extend_from_slice(b"\r\n$");
-                frame.extend_from_slice(channel.len().to_string().as_bytes());
-                frame.extend_from_slice(b"\r\n");
-                frame.extend_from_slice(channel);
-                frame.extend_from_slice(b"\r\n$");
-                frame.extend_from_slice(message.len().to_string().as_bytes());
-                frame.extend_from_slice(b"\r\n");
-                frame.extend_from_slice(message);
-                frame.extend_from_slice(b"\r\n");
+                let mut frame_resp2 = Vec::new();
+                frame_resp2.extend_from_slice(b"*4\r\n$8\r\npmessage\r\n$");
+                frame_resp2.extend_from_slice(pattern.len().to_string().as_bytes());
+                frame_resp2.extend_from_slice(b"\r\n");
+                frame_resp2.extend_from_slice(pattern);
+                frame_resp2.extend_from_slice(b"\r\n$");
+                frame_resp2.extend_from_slice(channel.len().to_string().as_bytes());
+                frame_resp2.extend_from_slice(b"\r\n");
+                frame_resp2.extend_from_slice(channel);
+                frame_resp2.extend_from_slice(b"\r\n$");
+                frame_resp2.extend_from_slice(message.len().to_string().as_bytes());
+                frame_resp2.extend_from_slice(b"\r\n");
+                frame_resp2.extend_from_slice(message);
+                frame_resp2.extend_from_slice(b"\r\n");
+
+                let mut frame_resp3 = frame_resp2.clone();
+                frame_resp3[0] = b'>';
 
                 for client_id in subscribers {
+                    let frame = if self.client_resp3.contains(client_id) {
+                        &frame_resp3
+                    } else {
+                        &frame_resp2
+                    };
                     if let Some(tx) = self.clients.get(client_id)
                         && tx.send(frame.clone()).is_ok()
                     {
@@ -233,6 +266,7 @@ impl PubSubHub {
     pub fn remove_client(&mut self, client_id: u64) {
         self.unsubscribe_all(client_id);
         self.punsubscribe_all(client_id);
+        self.client_resp3.remove(&client_id);
     }
 
     pub fn channels(&self, pattern: Option<&[u8]>) -> Vec<Bytes> {
@@ -255,5 +289,53 @@ impl PubSubHub {
 
     pub fn numpat(&self) -> usize {
         self.patterns.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pubsub_resp2_and_resp3_push_frames() {
+        let mut hub = PubSubHub::new();
+        let (tx1, rx1) = flume::unbounded();
+        let (tx2, rx2) = flume::unbounded();
+        let (tx3, rx3) = flume::unbounded();
+        let (tx4, rx4) = flume::unbounded();
+
+        // Client 1: RESP2 subscriber
+        hub.subscribe(1, Bytes::from_static(b"news"), tx1, false);
+        // Client 2: RESP3 subscriber
+        hub.subscribe(2, Bytes::from_static(b"news"), tx2, true);
+        // Client 3: RESP3 pattern subscriber
+        hub.psubscribe(3, Bytes::from_static(b"news*"), tx3, true);
+        // Client 4: RESP2 pattern subscriber
+        hub.psubscribe(4, Bytes::from_static(b"news*"), tx4, false);
+
+        let count = hub.publish(b"news", b"breaking");
+        assert_eq!(count, 4);
+
+        // Client 1 receives RESP2 array: *3
+        let msg1 = rx1.try_recv().unwrap();
+        assert!(msg1.starts_with(b"*3\r\n$7\r\nmessage\r\n"));
+
+        // Client 2 receives RESP3 push: >3
+        let msg2 = rx2.try_recv().unwrap();
+        assert!(msg2.starts_with(b">3\r\n$7\r\nmessage\r\n"));
+
+        // Client 3 receives RESP3 pattern push: >4
+        let msg3 = rx3.try_recv().unwrap();
+        assert!(msg3.starts_with(b">4\r\n$8\r\npmessage\r\n"));
+
+        // Client 4 receives RESP2 pattern array: *4
+        let msg4 = rx4.try_recv().unwrap();
+        assert!(msg4.starts_with(b"*4\r\n$8\r\npmessage\r\n"));
+
+        // Unsubscribe cleans up client_resp3
+        hub.unsubscribe(2, b"news");
+        assert!(!hub.client_resp3.contains(&2));
+        hub.punsubscribe(3, b"news*");
+        assert!(!hub.client_resp3.contains(&3));
     }
 }
