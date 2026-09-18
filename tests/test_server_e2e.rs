@@ -8348,3 +8348,117 @@ fn test_simd_vector_distance_acceleration_hnsw_e2e() {
     let info = send_and_read(&mut client, b"VINFO simd_idx\r\n");
     assert!(info.starts_with("*8\r\n"));
 }
+
+#[test]
+fn test_af_xdp_kernel_bypass_zero_copy_rings_e2e() {
+    let port = 16775;
+    let num_shards = 2;
+    start_test_server(port, num_shards);
+
+    let mut client =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect client");
+    client
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+
+    // 1. Verify XDP.INFO shows kernel bypass engine and active queues
+    let info = send_and_read(&mut client, b"XDP.INFO\r\n");
+    assert!(info.contains("active_xsk_queues:"));
+    assert!(info.contains("interface:"));
+
+    // 2. Query XDP.SOCKET for queue 0
+    let sock_stat = send_and_read(&mut client, b"XDP.SOCKET 0\r\n");
+    assert!(sock_stat.starts_with("*8\r\n"));
+    assert!(sock_stat.contains("rx_len"));
+    assert!(sock_stat.contains("fill_len"));
+
+    // 3. Inject RESP command directly into AF_XDP zero-copy Rx ring for Shard 0
+    let resp_cmd = b"*3\r\n$3\r\nSET\r\n$7\r\nxdp_key\r\n$7\r\nxdp_val\r\n";
+    let mut inject_frame = format!(
+        "*3\r\n$10\r\nXDP.INJECT\r\n$1\r\n0\r\n${}\r\n",
+        resp_cmd.len()
+    )
+    .into_bytes();
+    inject_frame.extend_from_slice(resp_cmd);
+    inject_frame.extend_from_slice(b"\r\n");
+
+    assert_eq!(send_and_read(&mut client, &inject_frame), "+OK\r\n");
+
+    // Give shard worker kernel bypass loop a moment to drain the Rx ring
+    std::thread::sleep(Duration::from_millis(50));
+
+    // 4. Verify state mutation over standard TCP interface
+    assert_eq!(
+        send_and_read(&mut client, b"GET xdp_key\r\n"),
+        "$7\r\nxdp_val\r\n"
+    );
+
+    // 5. Inject a raw Ethernet + IPv4 + TCP packet containing a Redis command
+    // Construct 54-byte Ethernet/IPv4/TCP frame
+    let mut raw_packet = vec![0u8; 54];
+    raw_packet[12] = 0x08;
+    raw_packet[13] = 0x00; // Ethernet IPv4
+    raw_packet[14] = 0x45; // IPv4, header len 20 bytes (5 * 4)
+    raw_packet[14 + 9] = 6; // TCP protocol
+    raw_packet[14 + 12] = 192;
+    raw_packet[14 + 13] = 168;
+    raw_packet[14 + 14] = 1;
+    raw_packet[14 + 15] = 100; // src IP: 192.168.1.100
+    raw_packet[34 + 12] = 0x50; // TCP data offset = 20 bytes (5 * 4)
+
+    let cmd_payload = b"*3\r\n$3\r\nSET\r\n$8\r\nxdp_net2\r\n$4\r\npass\r\n";
+    raw_packet.extend_from_slice(cmd_payload);
+
+    let mut inject_net_frame = format!(
+        "*3\r\n$10\r\nXDP.INJECT\r\n$1\r\n0\r\n${}\r\n",
+        raw_packet.len()
+    )
+    .into_bytes();
+    inject_net_frame.extend_from_slice(&raw_packet);
+    inject_net_frame.extend_from_slice(b"\r\n");
+
+    assert_eq!(send_and_read(&mut client, &inject_net_frame), "+OK\r\n");
+
+    std::thread::sleep(Duration::from_millis(50));
+
+    assert_eq!(
+        send_and_read(&mut client, b"GET xdp_net2\r\n"),
+        "$4\r\npass\r\n"
+    );
+
+    // 6. Test eBPF firewall rule enforcement: DROP 10.0.0.0/8
+    let rule_add_resp = send_and_read(&mut client, b"XDP.RULE ADD DROP 10.0.0.0/8\r\n");
+    assert!(rule_add_resp.starts_with(':'));
+    let rule_id: u32 = rule_add_resp
+        .trim_start_matches(':')
+        .trim()
+        .parse()
+        .expect("Parsed rule ID");
+
+    // Construct raw IPv4 packet from 10.1.2.3
+    let mut drop_packet = vec![0u8; 40];
+    drop_packet[0] = 0x45; // IPv4
+    drop_packet[9] = 6;
+    drop_packet[12] = 10;
+    drop_packet[13] = 1;
+    drop_packet[14] = 2;
+    drop_packet[15] = 3;
+    drop_packet.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$7\r\ndropkey\r\n$7\r\ndropval\r\n");
+
+    let mut test_packet_cmd =
+        format!("*2\r\n$10\r\nXDP.PACKET\r\n${}\r\n", drop_packet.len()).into_bytes();
+    test_packet_cmd.extend_from_slice(&drop_packet);
+    test_packet_cmd.extend_from_slice(b"\r\n");
+
+    let action_resp = send_and_read(&mut client, &test_packet_cmd);
+    assert_eq!(action_resp, "+DROP\r\n");
+
+    // Clean up rule
+    assert_eq!(
+        send_and_read(
+            &mut client,
+            format!("XDP.RULE DEL {}\r\n", rule_id).as_bytes()
+        ),
+        "+OK\r\n"
+    );
+}

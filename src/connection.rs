@@ -2859,6 +2859,8 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         | Command::XdpRuleDel(_)
         | Command::XdpRuleList
         | Command::XdpStats
+        | Command::XdpSocket(_)
+        | Command::XdpInject { .. }
         | Command::XdpPacket(_) => "XDP",
         Command::DflyCluster(_) => "DFLYCLUSTER",
         Command::DflyMigrate(_) => "DFLYMIGRATE",
@@ -7303,6 +7305,30 @@ async fn execute_command(
             let action = crate::xdp::get_xdp_engine().process_packet(&payload);
             let s = format!("+{}\r\n", action);
             out.extend_from_slice(s.as_bytes());
+            false
+        }
+        Command::XdpSocket(qid) => {
+            let engine = crate::xdp::get_xdp_engine();
+            let sock = engine.get_or_create_socket(router.port, qid);
+            out.extend_from_slice(b"*8\r\n");
+            write_resp_bulk(out, b"queue_id");
+            write_resp_integer(out, qid as i64);
+            write_resp_bulk(out, b"rx_len");
+            write_resp_integer(out, sock.rx_ring.len() as i64);
+            write_resp_bulk(out, b"fill_len");
+            write_resp_integer(out, sock.fill_ring.len() as i64);
+            write_resp_bulk(out, b"tx_len");
+            write_resp_integer(out, sock.tx_ring.len() as i64);
+            false
+        }
+        Command::XdpInject { queue_id, payload } => {
+            let engine = crate::xdp::get_xdp_engine();
+            let sock = engine.get_or_create_socket(router.port, queue_id);
+            if sock.inject_rx(&payload) {
+                out.extend_from_slice(b"+OK\r\n");
+            } else {
+                out.extend_from_slice(b"-ERR ring full\r\n");
+            }
             false
         }
         Command::DflyCluster(sub) => {

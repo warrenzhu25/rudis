@@ -251,6 +251,52 @@ pub fn run_shard_worker(
             }
         });
 
+        // 5. AF_XDP Kernel Bypass Ingress Loop: poll zero-copy Rx ring for packet descriptors
+        let xdp_engine = crate::xdp::get_xdp_engine();
+        let xsk_socket = xdp_engine.get_or_create_socket(shard_port, shard_id as u32);
+        let xdp_db = local_db.clone();
+        let xdp_aof = aof_writer.clone();
+        let xdp_router = router.clone();
+        monoio::spawn(async move {
+            let mut frames = Vec::with_capacity(32);
+            loop {
+                let count = xsk_socket.rx_burst(&mut frames, 32);
+                if count > 0 {
+                    for frame in frames.drain(..) {
+                        let action = xdp_engine.process_packet(&frame);
+                        if (action == crate::xdp::XdpAction::Pass
+                            || action == crate::xdp::XdpAction::Redirect)
+                            && let Some(cmd_payload) = crate::xdp::extract_transport_payload(&frame)
+                        {
+                            let mut b_mut = bytes::BytesMut::from(&cmd_payload[..]);
+                            if let Ok(Some(cmd)) = crate::resp::parse_command(&mut b_mut) {
+                                let target_sid = crate::connection::target_shard_of_cmd(&cmd, xdp_router.num_shards)
+                                    .unwrap_or(xdp_router.shard_id);
+                                let mut out = Vec::new();
+                                if target_sid == xdp_router.shard_id {
+                                    let mut db = xdp_db.borrow_mut();
+                                    let _ = crate::connection::execute_local_command(
+                                        &cmd,
+                                        &mut db,
+                                        &mut out,
+                                        xdp_aof.as_ref().map(|a| a.as_ref()),
+                                    );
+                                } else {
+                                    let resp = xdp_router.execute_remote(target_sid, cmd).await;
+                                    out.extend_from_slice(&resp);
+                                }
+                                if !out.is_empty() {
+                                    xsk_socket.tx_burst(&[&out]);
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    monoio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            }
+        });
+
         // 4. Spawn background worker to handle incoming cross-shard messages from peer cores
         let cross_shard_db = local_db.clone();
         let cross_shard_router = router.clone();

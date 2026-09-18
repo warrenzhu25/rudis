@@ -1146,6 +1146,11 @@ pub enum Command {
     XdpRuleList,
     XdpStats,
     XdpPacket(Bytes),
+    XdpSocket(u32),
+    XdpInject {
+        queue_id: u32,
+        payload: Bytes,
+    },
     // Dragonfly native extensions
     DflyCluster(DflyClusterSubcommand),
     DflyMigrate(DflyMigrateSubcommand),
@@ -7577,6 +7582,23 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'xdp.packet' command".to_string());
             }
             Ok(Some(Command::XdpPacket(args[1].clone())))
+        }
+        "XDP.SOCKET" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'xdp.socket' command".to_string());
+            }
+            let qid: u32 = String::from_utf8_lossy(&args[1]).parse().unwrap_or(0);
+            Ok(Some(Command::XdpSocket(qid)))
+        }
+        "XDP.INJECT" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'xdp.inject' command".to_string());
+            }
+            let qid: u32 = String::from_utf8_lossy(&args[1]).parse().unwrap_or(0);
+            Ok(Some(Command::XdpInject {
+                queue_id: qid,
+                payload: args[2].clone(),
+            }))
         }
         _ => Ok(Some(Command::Unknown(cmd_name.to_string()))),
     }
