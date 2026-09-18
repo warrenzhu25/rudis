@@ -49,4 +49,12 @@ jobs:
         run: cargo test --test test_cross_thread
 
       - name: Run End-to-End Integration Tests (serial)
-        run: cargo test --test test_server_e2e -- --test-threads=1
+        run: |
+          set -o pipefail
+          cargo test --test test_server_e2e -- --test-threads=1 2>&1 | tee e2e.log || {
+            grep -E '(FAILED|panicked at|failures:)' e2e.log | while read -r line; do
+              echo "::error title=E2E Failure::$line"
+            done
+            exit 1
+          }
+
