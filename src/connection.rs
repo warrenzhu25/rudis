@@ -847,9 +847,10 @@ pub async fn handle_connection(
     let mut read_buf = vec![0u8; READ_BUFFER_SIZE];
     let mut out_buf = Vec::with_capacity(65536);
 
-    // Pre-allocated reusable channel responders (1 per shard, 0 allocations per hop in steady-state)
-    let responders: Vec<ResponderChannel> =
-        (0..router.num_shards).map(|_| flume::bounded(1)).collect();
+    // Pre-allocated reusable lock-free batch responders (1 per shard, 0 mutex contention in steady-state)
+    let responders: Vec<std::sync::Arc<crate::mailbox::BatchResponder>> = (0..router.num_shards)
+        .map(|_| std::sync::Arc::new(crate::mailbox::BatchResponder::new()))
+        .collect();
     let mut remote_batches: Vec<Vec<(usize, Command)>> = (0..router.num_shards)
         .map(|_| Vec::with_capacity(64))
         .collect();
@@ -12082,7 +12083,7 @@ pub fn execute_local_command(
 async fn execute_commands_squashed(
     commands: &mut Vec<Command>,
     router: &Router,
-    responders: &[ResponderChannel],
+    responders: &[std::sync::Arc<crate::mailbox::BatchResponder>],
     remote_batches: &mut [Vec<(usize, Command)>],
     items_pool: &mut Vec<Vec<(usize, Command)>>,
     results_pool: &mut Vec<Vec<(usize, CompactResp)>>,
@@ -12654,29 +12655,29 @@ async fn execute_commands_squashed(
     let mut pending = Vec::with_capacity(remote_batches.len());
     for (target_shard, items) in remote_batches.iter_mut().enumerate() {
         if !items.is_empty() {
-            let (tx, rx) = &responders[target_shard];
+            let responder = &responders[target_shard];
             let is_resp3 = CURRENT_CLIENT_RESP3.get();
             let next_items = items_pool.pop().unwrap_or_else(|| Vec::with_capacity(64));
             let results = results_pool.pop().unwrap_or_else(|| Vec::with_capacity(64));
             let msg = ShardMessage::Batch {
                 items: std::mem::replace(items, next_items),
                 results,
-                responder: tx.clone(),
+                responder: responder.clone(),
                 is_resp3,
             };
             if router.senders[target_shard].send(msg).is_ok() {
-                pending.push(rx);
+                pending.push(responder);
             }
         }
     }
 
-    // 3. Await parallel responses from all remote shards with spin-wait before async yield
-    for _spin in 0..256 {
+    // 3. Await parallel responses from all remote shards with lock-free spin-wait before async yield
+    for _spin in 0..64 {
         if pending.is_empty() {
             break;
         }
-        pending.retain(|rx| {
-            if let Ok((recycled_items, mut results)) = rx.try_recv() {
+        pending.retain(|responder| {
+            if let Some((recycled_items, mut results)) = responder.try_take() {
                 for (idx, resp) in results.drain(..) {
                     responses[idx] = resp;
                 }
@@ -12692,13 +12693,19 @@ async fn execute_commands_squashed(
         }
         std::hint::spin_loop();
     }
-    for rx in pending {
-        if let Ok((recycled_items, mut results)) = rx.recv_async().await {
-            for (idx, resp) in results.drain(..) {
-                responses[idx] = resp;
+    for responder in pending {
+        loop {
+            if let Some((recycled_items, mut results)) = responder.try_take() {
+                for (idx, resp) in results.drain(..) {
+                    responses[idx] = resp;
+                }
+                items_pool.push(recycled_items);
+                results_pool.push(results);
+                break;
             }
-            items_pool.push(recycled_items);
-            results_pool.push(results);
+            if responder.notify_rx.recv_async().await.is_err() {
+                break;
+            }
         }
     }
 

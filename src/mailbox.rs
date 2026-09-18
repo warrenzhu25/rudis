@@ -240,6 +240,71 @@ impl FastSetDescriptor {
     }
 }
 
+/// Direct shared-memory slot for cross-shard squashed batch responses.
+/// Completely eliminates Flume mutex contention during multi-core spin-waits.
+pub struct BatchResponder {
+    pub ready: CachePadded<AtomicBool>,
+    pub payload: CachePadded<
+        UnsafeCell<
+            Option<(
+                Vec<(usize, crate::resp::Command)>,
+                Vec<(usize, crate::shard::CompactResp)>,
+            )>,
+        >,
+    >,
+    pub notify_tx: flume::Sender<()>,
+    pub notify_rx: flume::Receiver<()>,
+}
+
+unsafe impl Send for BatchResponder {}
+unsafe impl Sync for BatchResponder {}
+
+impl BatchResponder {
+    pub fn new() -> Self {
+        let (tx, rx) = flume::bounded(1);
+        Self {
+            ready: CachePadded(AtomicBool::new(false)),
+            payload: CachePadded(UnsafeCell::new(None)),
+            notify_tx: tx,
+            notify_rx: rx,
+        }
+    }
+
+    #[inline(always)]
+    pub fn finish(
+        &self,
+        items: Vec<(usize, crate::resp::Command)>,
+        results: Vec<(usize, crate::shard::CompactResp)>,
+    ) {
+        unsafe {
+            *self.payload.get() = Some((items, results));
+        }
+        self.ready.store(true, Ordering::Release);
+        let _ = self.notify_tx.try_send(());
+    }
+
+    #[inline(always)]
+    pub fn try_take(
+        &self,
+    ) -> Option<(
+        Vec<(usize, crate::resp::Command)>,
+        Vec<(usize, crate::shard::CompactResp)>,
+    )> {
+        if self.ready.load(Ordering::Acquire) {
+            self.ready.store(false, Ordering::Relaxed);
+            unsafe { (*self.payload.get()).take() }
+        } else {
+            None
+        }
+    }
+}
+
+impl Default for BatchResponder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Cache-line aligned, lock-free Single-Producer Single-Consumer circular ring buffer
 /// with fallback overflow queue for unbounded durability.
 #[repr(align(64))]

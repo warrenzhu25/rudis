@@ -729,7 +729,7 @@ pub fn run_shard_worker(
                                 if has_writes {
                                     r.check_auto_tier_after_write();
                                 }
-                                let _ = responder.send((items, results));
+                                responder.finish(items, results);
                             });
                         } else {
                             crate::connection::CURRENT_CLIENT_RESP3.set(is_resp3);
@@ -975,7 +975,7 @@ pub fn run_shard_worker(
                             if has_writes {
                                 cross_shard_router.check_auto_tier_after_write();
                             }
-                            let _ = responder.send((items, results));
+                            responder.finish(items, results);
                         }
                     }
                     ShardMessage::Mget { mut keys, responder } => {

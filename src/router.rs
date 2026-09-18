@@ -77,7 +77,7 @@ pub struct Router {
     pub db_dir: std::path::PathBuf,
     pub is_auto_tiering: Rc<Cell<bool>>,
     pub notify_channel_pool: Rc<RefCell<Vec<(flume::Sender<()>, flume::Receiver<()>)>>>,
-    pub remote_responder_pool: Rc<RefCell<Vec<crate::connection::ResponderChannel>>>,
+    pub remote_responder_pool: Rc<RefCell<Vec<std::sync::Arc<crate::mailbox::BatchResponder>>>>,
     pub mget_batch_pool: Rc<RefCell<Vec<Vec<Vec<(usize, Bytes)>>>>>,
     pub mset_batch_pool: Rc<RefCell<Vec<Vec<Vec<(Bytes, Bytes)>>>>>,
     pub mget_desc_pool: Rc<RefCell<Vec<std::sync::Arc<crate::mailbox::ScatterMgetDescriptor>>>>,
@@ -1863,26 +1863,42 @@ impl Router {
 
     pub async fn execute_remote(&self, target: usize, cmd: Command) -> Vec<u8> {
         let is_resp3 = crate::connection::CURRENT_CLIENT_RESP3.get();
-        let (tx, rx) = self
+        let responder = self
             .remote_responder_pool
             .borrow_mut()
             .pop()
-            .unwrap_or_else(|| flume::bounded(1));
+            .unwrap_or_else(|| std::sync::Arc::new(crate::mailbox::BatchResponder::new()));
         let msg = ShardMessage::Batch {
             items: vec![(0, cmd)],
             results: Vec::with_capacity(1),
-            responder: tx.clone(),
+            responder: responder.clone(),
             is_resp3,
         };
-        let res = if self.senders[target].send(msg).is_ok()
-            && let Ok((_recycled_items, mut res)) = rx.recv_async().await
-            && let Some((_, out)) = res.pop()
-        {
-            out.into_vec()
+        let res = if self.senders[target].send(msg).is_ok() {
+            let mut got = None;
+            for _spin in 0..48 {
+                if let Some((_recycled_items, mut res)) = responder.try_take() {
+                    got = res.pop().map(|(_, out)| out.into_vec());
+                    break;
+                }
+                std::hint::spin_loop();
+            }
+            if got.is_none() {
+                while got.is_none() {
+                    if let Some((_recycled_items, mut res)) = responder.try_take() {
+                        got = res.pop().map(|(_, out)| out.into_vec());
+                        break;
+                    }
+                    if responder.notify_rx.recv_async().await.is_err() {
+                        break;
+                    }
+                }
+            }
+            got.unwrap_or_else(|| b"-ERR internal shard routing error\r\n".to_vec())
         } else {
             b"-ERR internal shard routing error\r\n".to_vec()
         };
-        self.remote_responder_pool.borrow_mut().push((tx, rx));
+        self.remote_responder_pool.borrow_mut().push(responder);
         res
     }
 
@@ -2909,7 +2925,7 @@ mod tests {
                             results
                                 .push((idx, crate::shard::CompactResp::from_slice(b"+PONG\r\n")));
                         }
-                        let _ = responder.send((items, results));
+                        responder.finish(items, results);
                     }
                     _ => break,
                 }
