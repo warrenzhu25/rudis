@@ -7710,3 +7710,130 @@ fn test_aof_bgrewriteaof_compaction_e2e() {
 
     let _ = std::fs::remove_dir_all(aof_dir);
 }
+
+#[test]
+fn test_extended_rdb_full_server_bgsave_and_restore_e2e() {
+    let port1 = 16767;
+    let port2 = 16768;
+    let num_shards = 2;
+    let rdb_dir = std::env::temp_dir().join(format!("rudis-rdb-extended-e2e-{}", port1));
+    let _ = std::fs::remove_dir_all(&rdb_dir);
+    std::fs::create_dir_all(&rdb_dir).unwrap();
+
+    let aof_config1 = rudis::aof::AofConfig {
+        enabled: false,
+        dir: rdb_dir.clone(),
+        fsync_every_sec: false,
+    };
+
+    // 1. Start Server 1 with RDB persistence (AOF disabled)
+    start_test_server_with_aof(port1, num_shards, aof_config1);
+
+    let mut client1 = TcpStream::connect(format!("127.0.0.1:{}", port1)).unwrap();
+
+    // 2. Populate diverse data types across extended subsystems
+    assert_eq!(
+        send_and_read(&mut client1, b"SET str_test value_one\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut client1,
+            b"JSON.SET doc_snap $ {\"status\":\"persisted\",\"tier\":1}\r\n"
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, b"BF.RESERVE snap_bf 0.01 1000\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, b"BF.ADD snap_bf item_beta\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, b"CF.RESERVE snap_cf 1000\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, b"CF.ADD snap_cf item_gamma\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, b"CMS.INITBYDIM snap_cms 200 5\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, b"CMS.INCRBY snap_cms metric_hits 88\r\n"),
+        "*1\r\n:88\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, b"TOPK.RESERVE snap_topk 3\r\n"),
+        "+OK\r\n"
+    );
+    let topk_add_res = send_and_read(&mut client1, b"TOPK.ADD snap_topk user_super\r\n");
+    assert!(topk_add_res.starts_with("*1\r\n"));
+
+    assert!(send_and_read(&mut client1, b"CRDT.SET crdt_snap val_snap\r\n").starts_with("+OK"));
+
+    // 3. Trigger synchronous SAVE to write dump.rdb
+    let save_res = send_and_read(&mut client1, b"SAVE\r\n");
+    assert_eq!(save_res, "+OK\r\n");
+
+    let rdb_file = rdb_dir.join("dump.rdb");
+    assert!(rdb_file.exists());
+    assert!(rdb_file.metadata().map(|m| m.len()).unwrap_or(0) > 0);
+
+    drop(client1);
+    thread::sleep(Duration::from_millis(200));
+
+    // 4. Start Server 2 pointing to the same RDB directory
+    let aof_config2 = rudis::aof::AofConfig {
+        enabled: false,
+        dir: rdb_dir.clone(),
+        fsync_every_sec: false,
+    };
+    start_test_server_with_aof(port2, num_shards, aof_config2);
+
+    let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", port2)).unwrap();
+
+    // 5. Verify all extended data restored cleanly from dump.rdb on cold start
+    assert_eq!(
+        send_and_read(&mut client2, b"GET str_test\r\n"),
+        "$9\r\nvalue_one\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client2, b"JSON.GET doc_snap $.status\r\n"),
+        "$11\r\n\"persisted\"\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client2, b"BF.EXISTS snap_bf item_beta\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client2, b"BF.EXISTS snap_bf nonexistent\r\n"),
+        ":0\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client2, b"CF.EXISTS snap_cf item_gamma\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client2, b"CF.EXISTS snap_cf nonexistent\r\n"),
+        ":0\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client2, b"CMS.QUERY snap_cms metric_hits\r\n"),
+        "*1\r\n:88\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client2, b"TOPK.QUERY snap_topk user_super\r\n"),
+        "*1\r\n:1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client2, b"CRDT.GET crdt_snap\r\n"),
+        "$8\r\nval_snap\r\n"
+    );
+
+    let _ = std::fs::remove_dir_all(rdb_dir);
+}

@@ -1350,6 +1350,62 @@ impl ShardDb {
                 }
             }
         }
+
+        // 4. Cuckoo filters
+        for (key, cf) in &self.probabilistic_store.cuckoo_filters {
+            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            buf.extend_from_slice(key);
+            buf.push(10u8);
+            buf.extend_from_slice(&(cf.capacity as u64).to_le_bytes());
+            buf.extend_from_slice(&(cf.num_buckets as u64).to_le_bytes());
+            buf.extend_from_slice(&(cf.count as u64).to_le_bytes());
+            buf.extend_from_slice(&(cf.buckets.len() as u32).to_le_bytes());
+            for bucket in &cf.buckets {
+                for &fp in bucket {
+                    buf.extend_from_slice(&fp.to_le_bytes());
+                }
+            }
+        }
+
+        // 5. Count-Min Sketches
+        for (key, cms) in &self.probabilistic_store.cms_sketches {
+            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            buf.extend_from_slice(key);
+            buf.push(11u8);
+            buf.extend_from_slice(&(cms.width as u64).to_le_bytes());
+            buf.extend_from_slice(&(cms.depth as u32).to_le_bytes());
+            buf.extend_from_slice(&cms.total_count.to_le_bytes());
+            for row in &cms.table {
+                for &cell in row {
+                    buf.extend_from_slice(&cell.to_le_bytes());
+                }
+            }
+        }
+
+        // 6. Top-K trackers
+        for (key, topk) in &self.probabilistic_store.topk_trackers {
+            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            buf.extend_from_slice(key);
+            buf.push(12u8);
+            buf.extend_from_slice(&(topk.k as u64).to_le_bytes());
+            buf.extend_from_slice(&(topk.items.len() as u32).to_le_bytes());
+            for (item_key, &count_val) in &topk.items {
+                buf.extend_from_slice(&(item_key.len() as u32).to_le_bytes());
+                buf.extend_from_slice(item_key);
+                buf.extend_from_slice(&count_val.to_le_bytes());
+            }
+        }
+
+        // 7. CRDT sync state
+        let crdt_payload = self.crdt_store.export_sync_payload();
+        if !crdt_payload.is_empty() {
+            let crdt_marker = Bytes::from_static(b"__rudis_crdt_sync__");
+            buf.extend_from_slice(&(crdt_marker.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&crdt_marker);
+            buf.push(13u8);
+            buf.extend_from_slice(&(crdt_payload.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&crdt_payload);
+        }
     }
 
     pub fn restore_rdb_chunk(&mut self, mut data: &[u8]) -> Result<(), &'static str> {
@@ -1504,6 +1560,114 @@ impl ShardDb {
                     false,
                     false,
                 );
+                continue;
+            } else if type_byte == 10 {
+                data = &data[1..];
+                if data.len() < 28 {
+                    return Err("Truncated CuckooFilter header");
+                }
+                let capacity = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
+                let num_buckets = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
+                let count_val = u64::from_le_bytes(data[16..24].try_into().unwrap()) as usize;
+                let buckets_len = u32::from_le_bytes(data[24..28].try_into().unwrap()) as usize;
+                data = &data[28..];
+                if data.len() < buckets_len * 8 {
+                    return Err("Truncated CuckooFilter buckets");
+                }
+                let mut buckets = Vec::with_capacity(buckets_len);
+                for i in 0..buckets_len {
+                    let base = i * 8;
+                    let fp0 = u16::from_le_bytes(data[base..base + 2].try_into().unwrap());
+                    let fp1 = u16::from_le_bytes(data[base + 2..base + 4].try_into().unwrap());
+                    let fp2 = u16::from_le_bytes(data[base + 4..base + 6].try_into().unwrap());
+                    let fp3 = u16::from_le_bytes(data[base + 6..base + 8].try_into().unwrap());
+                    buckets.push([fp0, fp1, fp2, fp3]);
+                }
+                data = &data[buckets_len * 8..];
+                self.probabilistic_store.cuckoo_filters.insert(
+                    key,
+                    crate::probabilistic::CuckooFilter {
+                        capacity,
+                        num_buckets,
+                        count: count_val,
+                        buckets,
+                    },
+                );
+                continue;
+            } else if type_byte == 11 {
+                data = &data[1..];
+                if data.len() < 20 {
+                    return Err("Truncated CountMinSketch header");
+                }
+                let width = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
+                let depth = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+                let total_count = u64::from_le_bytes(data[12..20].try_into().unwrap());
+                data = &data[20..];
+                let total_cells = width * depth;
+                if data.len() < total_cells * 8 {
+                    return Err("Truncated CountMinSketch cells");
+                }
+                let mut table = Vec::with_capacity(depth);
+                for _ in 0..depth {
+                    let mut row = Vec::with_capacity(width);
+                    for _ in 0..width {
+                        let cell = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                        data = &data[8..];
+                        row.push(cell);
+                    }
+                    table.push(row);
+                }
+                self.probabilistic_store.cms_sketches.insert(
+                    key,
+                    crate::probabilistic::CountMinSketch {
+                        width,
+                        depth,
+                        total_count,
+                        table,
+                    },
+                );
+                continue;
+            } else if type_byte == 12 {
+                data = &data[1..];
+                if data.len() < 12 {
+                    return Err("Truncated TopK header");
+                }
+                let k = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
+                let items_len = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
+                data = &data[12..];
+                let mut items = hashbrown::HashMap::with_capacity(items_len);
+                for _ in 0..items_len {
+                    if data.len() < 4 {
+                        return Err("Truncated TopK item len");
+                    }
+                    let item_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+                    data = &data[4..];
+                    if data.len() < item_len + 8 {
+                        return Err("Truncated TopK item data");
+                    }
+                    let item_key = bytes::Bytes::copy_from_slice(&data[..item_len]);
+                    data = &data[item_len..];
+                    let count_val = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                    data = &data[8..];
+                    items.insert(item_key, count_val);
+                }
+                self.probabilistic_store
+                    .topk_trackers
+                    .insert(key, crate::probabilistic::TopK { k, items });
+                continue;
+            } else if type_byte == 13 {
+                data = &data[1..];
+                if data.len() < 4 {
+                    return Err("Truncated CRDT payload len");
+                }
+                let payload_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+                data = &data[4..];
+                if data.len() < payload_len {
+                    return Err("Truncated CRDT payload");
+                }
+                let payload = &data[..payload_len];
+                data = &data[payload_len..];
+                let _ = self.crdt_store.merge_sync_payload(payload);
                 continue;
             }
 
@@ -1757,7 +1921,38 @@ mod tests {
             .bloom_filters
             .insert(bf_key.clone(), bf);
 
-        // 3. Add Vector
+        // 3. Add Cuckoo filter
+        let cf_key = Bytes::from("cuckoo:test");
+        let mut cf = crate::probabilistic::CuckooFilter::new(100);
+        cf.add(b"cf_alpha").unwrap();
+        db.probabilistic_store
+            .cuckoo_filters
+            .insert(cf_key.clone(), cf);
+
+        // 4. Add CountMinSketch
+        let cms_key = Bytes::from("cms:test");
+        let mut cms = crate::probabilistic::CountMinSketch::new(100, 4);
+        cms.incr_by(b"packet_loss", 42);
+        db.probabilistic_store
+            .cms_sketches
+            .insert(cms_key.clone(), cms);
+
+        // 5. Add TopK
+        let topk_key = Bytes::from("topk:test");
+        let mut topk = crate::probabilistic::TopK::new(3);
+        topk.add(Bytes::from_static(b"user_vip"), 100);
+        db.probabilistic_store
+            .topk_trackers
+            .insert(topk_key.clone(), topk);
+
+        // 6. Add CRDT registers and counters
+        db.crdt_set(
+            Bytes::from_static(b"crdt:reg"),
+            Bytes::from_static(b"val_crdt"),
+        );
+        db.crdt_incrby(Bytes::from_static(b"crdt:cnt"), 99);
+
+        // 7. Add Vector
         let vec_doc = Bytes::from("doc:1");
         db.vadd(
             "test_idx",
@@ -1796,6 +1991,41 @@ mod tests {
             .expect("Bloom filter should exist");
         assert!(restored_bf.contains(b"item_alpha"));
         assert!(!restored_bf.contains(b"nonexistent"));
+
+        // Verify Cuckoo filter
+        let restored_cf = new_db
+            .probabilistic_store
+            .cuckoo_filters
+            .get(&cf_key)
+            .expect("Cuckoo filter should exist");
+        assert!(restored_cf.contains(b"cf_alpha"));
+        assert!(!restored_cf.contains(b"nonexistent"));
+
+        // Verify CountMinSketch
+        let restored_cms = new_db
+            .probabilistic_store
+            .cms_sketches
+            .get(&cms_key)
+            .expect("CMS should exist");
+        assert_eq!(restored_cms.query(b"packet_loss"), 42);
+
+        // Verify TopK
+        let restored_topk = new_db
+            .probabilistic_store
+            .topk_trackers
+            .get(&topk_key)
+            .expect("TopK should exist");
+        assert!(restored_topk.query(b"user_vip"));
+
+        // Verify CRDT
+        assert_eq!(
+            new_db.crdt_get(&Bytes::from_static(b"crdt:reg")),
+            Some(Bytes::from_static(b"val_crdt"))
+        );
+        assert_eq!(
+            new_db.crdt_counter_get(&Bytes::from_static(b"crdt:cnt")),
+            99
+        );
 
         // Verify Vector
         assert!(new_db.vector_indexes.contains_key("test_idx"));

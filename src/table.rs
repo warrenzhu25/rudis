@@ -7749,6 +7749,133 @@ pub fn load_rdb_bytes(
                 count += 1;
             }
             continue;
+        } else if type_byte == 10 {
+            cursor += 1;
+            if cursor + 28 > content_len {
+                break;
+            }
+            let capacity =
+                u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap()) as usize;
+            let num_buckets =
+                u64::from_le_bytes(data[cursor + 8..cursor + 16].try_into().unwrap()) as usize;
+            let count_val =
+                u64::from_le_bytes(data[cursor + 16..cursor + 24].try_into().unwrap()) as usize;
+            let buckets_len =
+                u32::from_le_bytes(data[cursor + 24..cursor + 28].try_into().unwrap()) as usize;
+            cursor += 28;
+            if cursor + buckets_len * 8 > content_len {
+                break;
+            }
+            let mut buckets = Vec::with_capacity(buckets_len);
+            for i in 0..buckets_len {
+                let base = cursor + i * 8;
+                let fp0 = u16::from_le_bytes(data[base..base + 2].try_into().unwrap());
+                let fp1 = u16::from_le_bytes(data[base + 2..base + 4].try_into().unwrap());
+                let fp2 = u16::from_le_bytes(data[base + 4..base + 6].try_into().unwrap());
+                let fp3 = u16::from_le_bytes(data[base + 6..base + 8].try_into().unwrap());
+                buckets.push([fp0, fp1, fp2, fp3]);
+            }
+            cursor += buckets_len * 8;
+            if crate::router::target_shard(&key, num_shards) == shard_id {
+                db.probabilistic_store.cuckoo_filters.insert(
+                    key.clone(),
+                    crate::probabilistic::CuckooFilter {
+                        capacity,
+                        num_buckets,
+                        count: count_val,
+                        buckets,
+                    },
+                );
+                count += 1;
+            }
+            continue;
+        } else if type_byte == 11 {
+            cursor += 1;
+            if cursor + 20 > content_len {
+                break;
+            }
+            let width = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap()) as usize;
+            let depth =
+                u32::from_le_bytes(data[cursor + 8..cursor + 12].try_into().unwrap()) as usize;
+            let total_count =
+                u64::from_le_bytes(data[cursor + 12..cursor + 20].try_into().unwrap());
+            cursor += 20;
+            let total_cells = width * depth;
+            if cursor + total_cells * 8 > content_len {
+                break;
+            }
+            let mut table = Vec::with_capacity(depth);
+            for _ in 0..depth {
+                let mut row = Vec::with_capacity(width);
+                for _ in 0..width {
+                    let cell = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                    cursor += 8;
+                    row.push(cell);
+                }
+                table.push(row);
+            }
+            if crate::router::target_shard(&key, num_shards) == shard_id {
+                db.probabilistic_store.cms_sketches.insert(
+                    key.clone(),
+                    crate::probabilistic::CountMinSketch {
+                        width,
+                        depth,
+                        total_count,
+                        table,
+                    },
+                );
+                count += 1;
+            }
+            continue;
+        } else if type_byte == 12 {
+            cursor += 1;
+            if cursor + 12 > content_len {
+                break;
+            }
+            let k = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap()) as usize;
+            let items_len =
+                u32::from_le_bytes(data[cursor + 8..cursor + 12].try_into().unwrap()) as usize;
+            cursor += 12;
+            let mut items = hashbrown::HashMap::with_capacity(items_len);
+            for _ in 0..items_len {
+                if cursor + 4 > content_len {
+                    break;
+                }
+                let item_len =
+                    u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                cursor += 4;
+                if cursor + item_len + 8 > content_len {
+                    break;
+                }
+                let item_key = Bytes::copy_from_slice(&data[cursor..cursor + item_len]);
+                cursor += item_len;
+                let count_val = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                cursor += 8;
+                items.insert(item_key, count_val);
+            }
+            if crate::router::target_shard(&key, num_shards) == shard_id {
+                db.probabilistic_store
+                    .topk_trackers
+                    .insert(key.clone(), crate::probabilistic::TopK { k, items });
+                count += 1;
+            }
+            continue;
+        } else if type_byte == 13 {
+            cursor += 1;
+            if cursor + 4 > content_len {
+                break;
+            }
+            let payload_len =
+                u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            if cursor + payload_len > content_len {
+                break;
+            }
+            let payload = &data[cursor..cursor + payload_len];
+            cursor += payload_len;
+            let _ = db.crdt_store.merge_sync_payload(payload);
+            count += 1;
+            continue;
         }
 
         let (val, consumed) = match RudisTable::deserialize_val_payload(&data[cursor..content_len])
