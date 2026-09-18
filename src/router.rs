@@ -974,7 +974,7 @@ impl Router {
 
         // Wait for all remote shards to complete their writes
         if descriptor.pending.load(Ordering::Acquire) != 0 {
-            for _ in 0..1024 {
+            for _ in 0..64 {
                 std::hint::spin_loop();
                 if descriptor.pending.load(Ordering::Acquire) == 0 {
                     break;
@@ -1099,7 +1099,7 @@ impl Router {
         }
 
         if descriptor.pending.load(Ordering::Acquire) != 0 {
-            for _ in 0..1024 {
+            for _ in 0..64 {
                 std::hint::spin_loop();
                 if descriptor.pending.load(Ordering::Acquire) == 0 {
                     break;
