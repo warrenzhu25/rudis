@@ -29,6 +29,86 @@ pub struct ActiveMigration {
     pub keys_migrated: u64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SlotMigrationPlan {
+    pub slot: u16,
+    pub source_node_id: String,
+    pub source_addr: String,
+    pub target_node_id: String,
+    pub target_addr: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RebalanceOptions {
+    pub weights: HashMap<String, f64>,
+    pub simulate: bool,
+    pub threshold: f64,
+    pub pipeline: usize,
+    pub target_host_port: Option<(String, u16, Option<usize>)>,
+}
+
+impl Default for RebalanceOptions {
+    fn default() -> Self {
+        Self {
+            weights: HashMap::new(),
+            simulate: false,
+            threshold: 1.25,
+            pipeline: 16,
+            target_host_port: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClusterCheckReport {
+    pub ok: bool,
+    pub masters: usize,
+    pub replicas: usize,
+    pub total_slots_assigned: usize,
+    pub open_slots: Vec<u16>,
+    pub duplicate_slots: Vec<u16>,
+    pub migrating_slots: Vec<(u16, String)>,
+    pub importing_slots: Vec<(u16, String)>,
+}
+
+impl ClusterCheckReport {
+    pub fn format_report(&self) -> String {
+        let mut out = String::new();
+        if self.ok {
+            out.push_str(&format!(
+                "[OK] All 16384 slots covered by {} master nodes. 0 open slots, 0 duplicate slots.\r\n",
+                self.masters
+            ));
+        } else {
+            out.push_str(&format!(
+                "[WARNING] Cluster check found issues: {} slots assigned, {} open/unassigned, {} duplicate.\r\n",
+                self.total_slots_assigned,
+                self.open_slots.len(),
+                self.duplicate_slots.len()
+            ));
+            if !self.open_slots.is_empty() {
+                out.push_str(&format!(
+                    "Open slots: {:?}\r\n",
+                    &self.open_slots[..self.open_slots.len().min(20)]
+                ));
+            }
+            if !self.duplicate_slots.is_empty() {
+                out.push_str(&format!(
+                    "Duplicate slots: {:?}\r\n",
+                    &self.duplicate_slots[..self.duplicate_slots.len().min(20)]
+                ));
+            }
+        }
+        if !self.migrating_slots.is_empty() {
+            out.push_str(&format!("Migrating slots: {:?}\r\n", self.migrating_slots));
+        }
+        if !self.importing_slots.is_empty() {
+            out.push_str(&format!("Importing slots: {:?}\r\n", self.importing_slots));
+        }
+        out
+    }
+}
+
 pub struct ClusterHub {
     pub port: u16,
     pub cport: u16,
@@ -777,6 +857,9 @@ impl ClusterHub {
             }
         }
         let mut my_slots = self.my_slots.write().unwrap();
+        if my_slots.len() == 1 && my_slots[0] == (0, 16383) {
+            my_slots.clear();
+        }
         for &s in slots {
             my_slots.push((s, s));
         }
@@ -797,6 +880,9 @@ impl ClusterHub {
             }
         }
         let mut my_slots = self.my_slots.write().unwrap();
+        if my_slots.len() == 1 && my_slots[0] == (0, 16383) {
+            my_slots.clear();
+        }
         for &(start, end) in ranges {
             my_slots.push((start, end));
         }
@@ -829,6 +915,356 @@ impl ClusterHub {
                 let _ = stream.write_all(msg.as_bytes());
             }
         }
+    }
+
+    pub fn cluster_check(&self) -> ClusterCheckReport {
+        let is_cluster = self.cluster_enabled.load(Ordering::Relaxed);
+        let num_shards = self.num_shards.load(Ordering::Relaxed).max(1);
+        let mut slot_owners: HashMap<u16, Vec<String>> = HashMap::new();
+
+        let my_id = self.my_id();
+        let is_master = self.role.read().unwrap().contains("master");
+        if is_master {
+            let my_slots = self.my_slots.read().unwrap();
+            for &(s, e) in my_slots.iter() {
+                for slot in s..=e {
+                    slot_owners.entry(slot).or_default().push(my_id.clone());
+                }
+            }
+        }
+
+        let nodes = self.nodes.read().unwrap();
+        let mut masters_count = if is_master { 1 } else { 0 };
+        let mut replicas_count = if is_master { 0 } else { 1 };
+
+        if is_cluster && nodes.is_empty() && num_shards > 1 {
+            masters_count = num_shards;
+            for s in 1..num_shards {
+                let peer_start = (s * 16384 / num_shards) as u16;
+                let peer_end = if s == num_shards - 1 {
+                    16383
+                } else {
+                    ((s + 1) * 16384 / num_shards - 1) as u16
+                };
+                let peer_id = format!("{:040x}", s + 1);
+                for slot in peer_start..=peer_end {
+                    slot_owners.entry(slot).or_default().push(peer_id.clone());
+                }
+            }
+        } else {
+            for node in nodes.values() {
+                if node.flags.contains("master") {
+                    masters_count += 1;
+                    for &(s, e) in &node.slots {
+                        for slot in s..=e {
+                            slot_owners.entry(slot).or_default().push(node.id.clone());
+                        }
+                    }
+                } else {
+                    replicas_count += 1;
+                }
+            }
+        }
+
+        let mut open_slots = Vec::new();
+        let mut duplicate_slots = Vec::new();
+        let mut total_assigned = 0;
+
+        for slot in 0..16384u16 {
+            match slot_owners.get(&slot) {
+                None => open_slots.push(slot),
+                Some(owners) => {
+                    total_assigned += 1;
+                    if owners.len() > 1 {
+                        duplicate_slots.push(slot);
+                    }
+                }
+            }
+        }
+
+        let mut migrating_slots = Vec::new();
+        let mut importing_slots = Vec::new();
+        {
+            let states = self.slot_states.read().unwrap();
+            for (&slot, (state, target)) in states.iter() {
+                if state == "migrating" {
+                    migrating_slots.push((slot, target.clone()));
+                } else if state == "importing" {
+                    importing_slots.push((slot, target.clone()));
+                }
+            }
+        }
+
+        let ok = open_slots.is_empty() && duplicate_slots.is_empty();
+
+        ClusterCheckReport {
+            ok,
+            masters: masters_count,
+            replicas: replicas_count,
+            total_slots_assigned: total_assigned,
+            open_slots,
+            duplicate_slots,
+            migrating_slots,
+            importing_slots,
+        }
+    }
+
+    pub fn compute_rebalance_plan(
+        &self,
+        options: &RebalanceOptions,
+    ) -> Result<Vec<SlotMigrationPlan>, String> {
+        struct Master {
+            id: String,
+            addr: String,
+            port: u16,
+            slots: Vec<u16>,
+        }
+
+        let mut masters = Vec::new();
+        let my_id = self.my_id();
+        let my_addr = format!("127.0.0.1:{}", self.port);
+        let my_slots: Vec<u16> = {
+            let ranges = self.my_slots.read().unwrap();
+            let mut s = Vec::new();
+            for &(start, end) in ranges.iter() {
+                for slot in start..=end {
+                    s.push(slot);
+                }
+            }
+            s
+        };
+
+        if self.role.read().unwrap().contains("master") {
+            masters.push(Master {
+                id: my_id.clone(),
+                addr: my_addr,
+                port: self.port,
+                slots: my_slots,
+            });
+        }
+
+        {
+            let nodes = self.nodes.read().unwrap();
+            for n in nodes.values() {
+                if n.flags.contains("master") && n.id != my_id {
+                    let mut s = Vec::new();
+                    for &(start, end) in &n.slots {
+                        for slot in start..=end {
+                            s.push(slot);
+                        }
+                    }
+                    masters.push(Master {
+                        id: n.id.clone(),
+                        addr: format!("{}:{}", n.ip, n.port),
+                        port: n.port,
+                        slots: s,
+                    });
+                }
+            }
+        }
+
+        if masters.is_empty() {
+            return Err("No master nodes found in cluster".to_string());
+        }
+
+        // Targeted rebalance to a specific node:
+        if let Some((ref target_host, target_port, opt_slots)) = options.target_host_port {
+            let target_idx = masters.iter().position(|m| {
+                m.port == target_port || m.addr == format!("{}:{}", target_host, target_port)
+            });
+            let (target_node_id, target_addr) = match target_idx {
+                Some(idx) => (masters[idx].id.clone(), masters[idx].addr.clone()),
+                None => (
+                    generate_node_id(target_port),
+                    format!("{}:{}", target_host, target_port),
+                ),
+            };
+
+            let num_slots = opt_slots.unwrap_or(1);
+            let mut plans = Vec::new();
+
+            let donor_idx = if target_idx.is_some_and(|idx| masters[idx].id == my_id) {
+                masters
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| Some(*i) != target_idx)
+                    .max_by_key(|(_, m)| m.slots.len())
+                    .map(|(i, _)| i)
+            } else {
+                masters.iter().position(|m| m.id == my_id).or(Some(0))
+            };
+
+            if let Some(d_idx) = donor_idx {
+                let donor = &mut masters[d_idx];
+                let to_take = num_slots.min(donor.slots.len());
+
+                for _ in 0..to_take {
+                    if let Some(slot) = donor.slots.pop() {
+                        plans.push(SlotMigrationPlan {
+                            slot,
+                            source_node_id: donor.id.clone(),
+                            source_addr: donor.addr.clone(),
+                            target_node_id: target_node_id.clone(),
+                            target_addr: target_addr.clone(),
+                        });
+                    }
+                }
+            }
+            return Ok(plans);
+        }
+
+        if masters.len() <= 1 {
+            return Ok(Vec::new());
+        }
+
+        // Auto / Weighted rebalance across all masters:
+        let num_m = masters.len();
+        let weights: Vec<f64> = masters
+            .iter()
+            .map(|m| options.weights.get(&m.id).copied().unwrap_or(1.0).max(0.01))
+            .collect();
+        let total_weight: f64 = weights.iter().sum();
+
+        let mut target_slots: Vec<usize> = weights
+            .iter()
+            .map(|&w| ((w / total_weight) * 16384.0).floor() as usize)
+            .collect();
+        let allocated: usize = target_slots.iter().sum();
+        let mut remainder = 16384usize.saturating_sub(allocated);
+
+        let mut remainders: Vec<(usize, f64)> = weights
+            .iter()
+            .enumerate()
+            .map(|(i, &w)| {
+                let exact = (w / total_weight) * 16384.0;
+                (i, exact - exact.floor())
+            })
+            .collect();
+        remainders.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for &(i, _) in &remainders {
+            if remainder == 0 {
+                break;
+            }
+            target_slots[i] += 1;
+            remainder -= 1;
+        }
+
+        let avg_slots = 16384.0 / num_m as f64;
+        let threshold_slots = ((options.threshold / 100.0) * avg_slots).ceil() as isize;
+
+        let mut deltas: Vec<isize> = masters
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (m.slots.len() as isize) - (target_slots[i] as isize))
+            .collect();
+
+        if deltas.iter().all(|&d| d.abs() <= threshold_slots) {
+            return Ok(Vec::new());
+        }
+
+        let mut plans = Vec::new();
+
+        loop {
+            let donor_idx = deltas
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| **d > 0)
+                .max_by_key(|(_, d)| **d)
+                .map(|(i, _)| i);
+            let receiver_idx = deltas
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| **d < 0)
+                .min_by_key(|(_, d)| **d)
+                .map(|(i, _)| i);
+
+            match (donor_idx, receiver_idx) {
+                (Some(d), Some(r)) => {
+                    let to_move = (deltas[d] as usize).min((-deltas[r]) as usize);
+                    if to_move == 0 {
+                        break;
+                    }
+                    let target_id = masters[r].id.clone();
+                    let target_addr = masters[r].addr.clone();
+                    let source_id = masters[d].id.clone();
+                    let source_addr = masters[d].addr.clone();
+
+                    for _ in 0..to_move {
+                        if let Some(slot) = masters[d].slots.pop() {
+                            plans.push(SlotMigrationPlan {
+                                slot,
+                                source_node_id: source_id.clone(),
+                                source_addr: source_addr.clone(),
+                                target_node_id: target_id.clone(),
+                                target_addr: target_addr.clone(),
+                            });
+                        }
+                    }
+
+                    deltas[d] -= to_move as isize;
+                    deltas[r] += to_move as isize;
+                }
+                _ => break,
+            }
+        }
+
+        Ok(plans)
+    }
+
+    pub fn compute_reshard_plan(
+        &self,
+        target_node_id: &str,
+        source_node_id: &str,
+        num_slots: usize,
+    ) -> Result<Vec<SlotMigrationPlan>, String> {
+        let my_id = self.my_id();
+        let (source_addr, mut source_slots) = if source_node_id == my_id {
+            let ranges = self.my_slots.read().unwrap();
+            let mut s = Vec::new();
+            for &(start, end) in ranges.iter() {
+                for slot in start..=end {
+                    s.push(slot);
+                }
+            }
+            (format!("127.0.0.1:{}", self.port), s)
+        } else {
+            let nodes = self.nodes.read().unwrap();
+            let node = nodes
+                .get(source_node_id)
+                .ok_or_else(|| format!("Source node {} not found", source_node_id))?;
+            let mut s = Vec::new();
+            for &(start, end) in &node.slots {
+                for slot in start..=end {
+                    s.push(slot);
+                }
+            }
+            (format!("{}:{}", node.ip, node.port), s)
+        };
+
+        let target_addr = if target_node_id == my_id {
+            format!("127.0.0.1:{}", self.port)
+        } else {
+            let nodes = self.nodes.read().unwrap();
+            let node = nodes
+                .get(target_node_id)
+                .ok_or_else(|| format!("Target node {} not found", target_node_id))?;
+            format!("{}:{}", node.ip, node.port)
+        };
+
+        let to_take = num_slots.min(source_slots.len());
+        let mut plans = Vec::with_capacity(to_take);
+        for _ in 0..to_take {
+            if let Some(slot) = source_slots.pop() {
+                plans.push(SlotMigrationPlan {
+                    slot,
+                    source_node_id: source_node_id.to_string(),
+                    source_addr: source_addr.clone(),
+                    target_node_id: target_node_id.to_string(),
+                    target_addr: target_addr.clone(),
+                });
+            }
+        }
+        Ok(plans)
     }
 
     pub fn start_election(&self) {
@@ -1756,5 +2192,72 @@ mod tests {
         let stable_nodes = hub.cluster_nodes();
         assert!(!stable_nodes.contains("->-"));
         assert!(!stable_nodes.contains("-<-"));
+    }
+
+    #[test]
+    fn test_cluster_check_and_auto_rebalance_planner() {
+        let hub = Arc::new(ClusterHub::new(7200));
+
+        // 1. Cluster check on standalone initial master
+        let report = hub.cluster_check();
+        assert!(report.ok);
+        assert_eq!(report.masters, 1);
+        assert_eq!(report.total_slots_assigned, 16384);
+        assert!(report.open_slots.is_empty());
+        assert!(report.duplicate_slots.is_empty());
+        assert!(
+            report
+                .format_report()
+                .contains("[OK] All 16384 slots covered")
+        );
+
+        // 2. Add peer master node with 0 slots initially
+        let peer_id = "1111111111111111111111111111111111111111".to_string();
+        hub.nodes.write().unwrap().insert(
+            peer_id.clone(),
+            ClusterNodeInfo {
+                id: peer_id.clone(),
+                ip: "127.0.0.1".to_string(),
+                port: 7201,
+                cport: 17201,
+                flags: "master".to_string(),
+                master_id: "-".to_string(),
+                ping_sent: 0,
+                pong_recv: 0,
+                config_epoch: 2,
+                link_state: "connected".to_string(),
+                slots: Vec::new(),
+            },
+        );
+
+        // 3. Compute auto-rebalance plan between the 2 masters
+        let opts = RebalanceOptions::default();
+        let plan = hub.compute_rebalance_plan(&opts).expect("Plan computed");
+        // Each master should have 8192 slots, so exactly 8192 slots should be planned to move from hub to peer
+        assert_eq!(plan.len(), 8192);
+        assert_eq!(plan[0].source_node_id, hub.my_id());
+        assert_eq!(plan[0].target_node_id, peer_id);
+
+        // 4. Test programmatic reshard plan: move exactly 50 slots
+        let reshard_plan = hub
+            .compute_reshard_plan(&peer_id, &hub.my_id(), 50)
+            .expect("Reshard plan computed");
+        assert_eq!(reshard_plan.len(), 50);
+
+        // 5. Update peer slots to simulate balanced cluster (each has 8192 slots)
+        let peer_slots = vec![(8192, 16383)];
+        hub.nodes.write().unwrap().get_mut(&peer_id).unwrap().slots = peer_slots;
+        *hub.my_slots.write().unwrap() = vec![(0, 8191)];
+
+        // Re-check: cluster is fully covered with 2 masters
+        let report2 = hub.cluster_check();
+        assert!(report2.ok);
+        assert_eq!(report2.masters, 2);
+        assert_eq!(report2.total_slots_assigned, 16384);
+        assert!(report2.open_slots.is_empty());
+
+        // Auto-rebalance on already balanced cluster should generate 0 migration plans
+        let plan_balanced = hub.compute_rebalance_plan(&opts).expect("Plan computed");
+        assert_eq!(plan_balanced.len(), 0);
     }
 }

@@ -8462,3 +8462,67 @@ fn test_af_xdp_kernel_bypass_zero_copy_rings_e2e() {
         "+OK\r\n"
     );
 }
+
+#[test]
+fn test_cluster_check_and_rebalance_live_migration_e2e() {
+    let port1 = 16776;
+    let port2 = 16777;
+    start_test_server(port1, 2);
+    start_test_server(port2, 2);
+
+    let mut c1 = TcpStream::connect(format!("127.0.0.1:{}", port1)).unwrap();
+    let mut c2 = TcpStream::connect(format!("127.0.0.1:{}", port2)).unwrap();
+    c1.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    c2.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+
+    // 1. Assign slots: Node 1 initially owns 0-12000, Node 2 owns 12001-16383 (imbalanced)
+    assert_eq!(
+        send_and_read(&mut c1, b"CLUSTER ADDSLOTS-RANGE 0 12000\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut c2, b"CLUSTER ADDSLOTS-RANGE 12001 16383\r\n"),
+        "+OK\r\n"
+    );
+
+    // 2. Connect nodes via MEET
+    let meet_cmd = format!("CLUSTER MEET 127.0.0.1 {}\r\n", port2);
+    assert_eq!(send_and_read(&mut c1, meet_cmd.as_bytes()), "+OK\r\n");
+    thread::sleep(Duration::from_millis(250));
+
+    let myid1 = send_and_read(&mut c1, b"CLUSTER MYID\r\n")
+        .trim()
+        .replace("$40\r\n", "")
+        .replace("\r\n", "");
+    let myid2 = send_and_read(&mut c2, b"CLUSTER MYID\r\n")
+        .trim()
+        .replace("$40\r\n", "")
+        .replace("\r\n", "");
+
+    // 3. CLUSTER CHECK on Node 1: verifies all 16384 slots are covered across the 2 nodes
+    let check1 = send_and_read(&mut c1, b"CLUSTER CHECK\r\n");
+    assert!(check1.contains("[OK] All 16384 slots covered"));
+
+    // 4. CLUSTER REBALANCE SIMULATE: preview rebalancing plan without moving slots
+    let sim_resp = send_and_read(&mut c1, b"CLUSTER REBALANCE SIMULATE\r\n");
+    assert!(sim_resp.contains("Moving slot"));
+    assert!(sim_resp.contains(&myid1));
+    assert!(sim_resp.contains(&myid2));
+
+    // 5. CLUSTER RESHARD: move 10 slots from Node 1 to Node 2
+    let reshard_cmd = format!("CLUSTER RESHARD {} {} 10\r\n", myid2, myid1);
+    let reshard_resp = send_and_read(&mut c1, reshard_cmd.as_bytes());
+    assert_eq!(reshard_resp, ":10\r\n");
+
+    // 6. Targeted CLUSTER REBALANCE: move 5 slots to Node 2
+    let rebalance_cmd = format!("CLUSTER REBALANCE 127.0.0.1 {} 5\r\n", port2);
+    let rebalance_resp = send_and_read(&mut c1, rebalance_cmd.as_bytes());
+    assert_eq!(rebalance_resp, ":5\r\n");
+
+    // 7. Verify CLUSTER CHECK is healthy after migrations
+    let check_after = send_and_read(&mut c1, b"CLUSTER CHECK\r\n");
+    assert!(check_after.contains("[OK]"));
+
+    let check_c2 = send_and_read(&mut c2, b"CLUSTER CHECK\r\n");
+    assert!(check_c2.contains("[OK]"));
+}

@@ -9,7 +9,7 @@ pub enum SetSlotSubcommand {
     Node(String),
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum ClusterSubcommand {
     KeySlot(Bytes),
     CountKeysInSlot(u16),
@@ -35,9 +35,19 @@ pub enum ClusterSubcommand {
         port: u16,
     },
     Rebalance {
-        host: String,
-        port: u16,
+        host: Option<String>,
+        port: Option<u16>,
         slots: Option<usize>,
+        weights: Vec<(String, f64)>,
+        simulate: bool,
+        threshold: f64,
+        pipeline: usize,
+    },
+    Check,
+    Reshard {
+        target_node_id: String,
+        source_node_id: String,
+        slots: usize,
     },
     Failover {
         force: bool,
@@ -2350,26 +2360,81 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     })))
                 }
                 "REBALANCE" => {
-                    if args.len() < 4 {
-                        return Err(
-                            "wrong number of arguments for 'cluster rebalance' command".to_string()
-                        );
+                    let mut host = None;
+                    let mut port = None;
+                    let mut slots = None;
+                    let mut weights = Vec::new();
+                    let mut simulate = false;
+                    let mut threshold = 1.25;
+                    let mut pipeline = 16;
+
+                    let mut i = 2;
+                    while i < args.len() {
+                        let token = String::from_utf8_lossy(&args[i]).to_uppercase();
+                        if token == "SIMULATE" {
+                            simulate = true;
+                            i += 1;
+                        } else if token == "THRESHOLD" && i + 1 < args.len() {
+                            threshold = String::from_utf8_lossy(&args[i + 1])
+                                .parse()
+                                .unwrap_or(1.25);
+                            i += 2;
+                        } else if token == "PIPELINE" && i + 1 < args.len() {
+                            pipeline = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(16);
+                            i += 2;
+                        } else if token == "WEIGHTS" {
+                            i += 1;
+                            while i < args.len() {
+                                let w_str = String::from_utf8_lossy(&args[i]);
+                                if let Some((node, w_val)) = w_str.split_once('=') {
+                                    if let Ok(w) = w_val.parse::<f64>() {
+                                        weights.push((node.to_string(), w));
+                                    }
+                                    i += 1;
+                                } else {
+                                    break;
+                                }
+                            }
+                        } else if host.is_none() && i + 1 < args.len() && !token.starts_with('-') {
+                            host = Some(String::from_utf8_lossy(&args[i]).to_string());
+                            port = String::from_utf8_lossy(&args[i + 1]).parse().ok();
+                            i += 2;
+                            if i < args.len()
+                                && let Ok(s) = String::from_utf8_lossy(&args[i]).parse::<usize>()
+                            {
+                                slots = Some(s);
+                                i += 1;
+                            }
+                        } else {
+                            i += 1;
+                        }
                     }
-                    let host = String::from_utf8_lossy(&args[2]).to_string();
-                    let port: u16 = std::str::from_utf8(&args[3])
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-                    let slots = if args.len() > 4 {
-                        std::str::from_utf8(&args[4])
-                            .ok()
-                            .and_then(|s| s.parse().ok())
-                    } else {
-                        None
-                    };
                     Ok(Some(Command::Cluster(ClusterSubcommand::Rebalance {
                         host,
                         port,
+                        slots,
+                        weights,
+                        simulate,
+                        threshold,
+                        pipeline,
+                    })))
+                }
+                "CHECK" => Ok(Some(Command::Cluster(ClusterSubcommand::Check))),
+                "RESHARD" => {
+                    if args.len() < 5 {
+                        return Err(
+                            "wrong number of arguments for 'cluster reshard' command".to_string()
+                        );
+                    }
+                    let target_node_id = String::from_utf8_lossy(&args[2]).to_string();
+                    let source_node_id = String::from_utf8_lossy(&args[3]).to_string();
+                    let slots: usize = std::str::from_utf8(&args[4])
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                    Ok(Some(Command::Cluster(ClusterSubcommand::Reshard {
+                        target_node_id,
+                        source_node_id,
                         slots,
                     })))
                 }

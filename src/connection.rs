@@ -2455,6 +2455,112 @@ async fn migrate_keys_to_node(
     Ok(count)
 }
 
+async fn execute_rebalance_plans(
+    router: &Router,
+    hub: &std::sync::Arc<crate::cluster::ClusterHub>,
+    plans: &[crate::cluster::SlotMigrationPlan],
+) -> usize {
+    let mut moved = 0;
+    for p in plans {
+        let (host, port_str) = match p.target_addr.split_once(':') {
+            Some((h, prt)) => (h.to_string(), prt),
+            None => ("127.0.0.1".to_string(), "6379"),
+        };
+        let target_port: u16 = port_str.parse().unwrap_or(6379);
+
+        if p.source_node_id == hub.my_id() {
+            hub.slot_states
+                .write()
+                .unwrap()
+                .insert(p.slot, ("migrating".to_string(), p.target_node_id.clone()));
+            router.set_slot_state(
+                p.slot,
+                crate::shard::SlotState::Migrating(p.target_addr.clone()),
+            );
+
+            let target_sock = format!("{}:{}", host, target_port)
+                .parse::<std::net::SocketAddr>()
+                .ok();
+            if let Some(sock_addr) = target_sock
+                && let Ok(mut stream) = monoio::net::TcpStream::connect(sock_addr).await
+            {
+                let cmd_importing = format!(
+                    "*4\r\n$7\r\nCLUSTER\r\n$7\r\nSETSLOT\r\n${}\r\n{}\r\n$9\r\nIMPORTING\r\n${}\r\n{}\r\n",
+                    p.slot.to_string().len(),
+                    p.slot,
+                    hub.my_id().len(),
+                    hub.my_id()
+                );
+                let (w_res, _) = stream.write_all(cmd_importing.into_bytes()).await;
+                if w_res.is_ok() {
+                    let buf = vec![0u8; 64];
+                    let _ = stream.read(buf).await;
+                }
+            }
+
+            loop {
+                let keys = router.get_keys_in_slot(p.slot, 100).await;
+                if keys.is_empty() {
+                    break;
+                }
+                if migrate_keys_to_node(router, &keys, &host, target_port, false)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+
+            if let Some(sock_addr) = target_sock
+                && let Ok(mut stream) = monoio::net::TcpStream::connect(sock_addr).await
+            {
+                let cmd_node = format!(
+                    "*4\r\n$7\r\nCLUSTER\r\n$7\r\nSETSLOT\r\n${}\r\n{}\r\n$4\r\nNODE\r\n$6\r\nmyself\r\n",
+                    p.slot.to_string().len(),
+                    p.slot
+                );
+                let (w_res, _) = stream.write_all(cmd_node.into_bytes()).await;
+                if w_res.is_ok() {
+                    let buf = vec![0u8; 64];
+                    let _ = stream.read(buf).await;
+                }
+            }
+
+            router.set_slot_state(
+                p.slot,
+                crate::shard::SlotState::Moved(p.target_addr.clone()),
+            );
+            crate::cluster::remove_slots(&mut hub.my_slots.write().unwrap(), &[p.slot]);
+            hub.slot_states.write().unwrap().remove(&p.slot);
+
+            if let Some(target_node) = hub.nodes.write().unwrap().get_mut(&p.target_node_id) {
+                target_node.slots.push((p.slot, p.slot));
+                crate::cluster::compact_slots(&mut target_node.slots);
+            }
+            moved += 1;
+        } else if p.target_node_id == hub.my_id() {
+            hub.slot_states
+                .write()
+                .unwrap()
+                .insert(p.slot, ("importing".to_string(), p.source_node_id.clone()));
+            router.set_slot_state(
+                p.slot,
+                crate::shard::SlotState::Importing(p.source_addr.clone()),
+            );
+
+            hub.my_slots.write().unwrap().push((p.slot, p.slot));
+            crate::cluster::compact_slots(&mut hub.my_slots.write().unwrap());
+            hub.slot_states.write().unwrap().remove(&p.slot);
+
+            if let Some(src_node) = hub.nodes.write().unwrap().get_mut(&p.source_node_id) {
+                crate::cluster::remove_slots(&mut src_node.slots, &[p.slot]);
+            }
+            moved += 1;
+        }
+    }
+    moved
+}
+
 fn parse_bulk_str_from_resp(res: &[u8]) -> Option<Bytes> {
     if res.starts_with(b"$") && !res.starts_with(b"$-1") {
         let mut parts = res[1..].splitn(2, |&b| b == b'\r');
@@ -4457,29 +4563,83 @@ async fn execute_command(
                     router.set_slot_state(slot, crate::shard::SlotState::Moved(target_addr));
                     out.extend_from_slice(b"+OK\r\n");
                 }
-                ClusterSubcommand::Rebalance { host, port, slots } => {
-                    let num_slots = slots.unwrap_or(1);
-                    let mut migrated_count = 0;
-                    for s in 0..16384u16 {
-                        if migrated_count >= num_slots {
-                            break;
-                        }
-                        let is_stable = matches!(
-                            router.slot_states.borrow()[s as usize],
-                            crate::shard::SlotState::Stable
-                        );
-                        if is_stable {
-                            let keys = router.get_keys_in_slot(s, 100).await;
-                            if !keys.is_empty() {
-                                let _ =
-                                    migrate_keys_to_node(router, &keys, &host, port, false).await;
+                ClusterSubcommand::Rebalance {
+                    host,
+                    port,
+                    slots,
+                    weights,
+                    simulate,
+                    threshold,
+                    pipeline: _,
+                } => {
+                    let hub = crate::cluster::get_cluster_hub(router.port);
+                    let target_hp = match (host, port) {
+                        (Some(h), Some(p)) => Some((h, p, slots)),
+                        _ => None,
+                    };
+                    let opts = crate::cluster::RebalanceOptions {
+                        weights: weights.into_iter().collect(),
+                        simulate,
+                        threshold,
+                        pipeline: 16,
+                        target_host_port: target_hp,
+                    };
+
+                    match hub.compute_rebalance_plan(&opts) {
+                        Ok(plans) => {
+                            if simulate {
+                                if plans.is_empty() {
+                                    out.extend_from_slice(
+                                        b"*1\r\n$49\r\n*** No rebalancing needed! All nodes balanced. ***\r\n",
+                                    );
+                                } else {
+                                    let preview_count = plans.len().min(5);
+                                    out.extend_from_slice(
+                                        format!("*{}\r\n", preview_count).as_bytes(),
+                                    );
+                                    for p in plans.iter().take(preview_count) {
+                                        let desc = format!(
+                                            "Moving slot {} from {} ({}) to {} ({})",
+                                            p.slot,
+                                            p.source_node_id,
+                                            p.source_addr,
+                                            p.target_node_id,
+                                            p.target_addr
+                                        );
+                                        write_resp_bulk(out, desc.as_bytes());
+                                    }
+                                }
+                            } else {
+                                let moved = execute_rebalance_plans(router, &hub, &plans).await;
+                                write_resp_integer(out, moved as i64);
                             }
-                            let target_addr = format!("{}:{}", host, port);
-                            router.set_slot_state(s, crate::shard::SlotState::Moved(target_addr));
-                            migrated_count += 1;
+                        }
+                        Err(e) => {
+                            out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes());
                         }
                     }
-                    out.extend_from_slice(format!(":{}\r\n", migrated_count).as_bytes());
+                }
+                ClusterSubcommand::Check => {
+                    let hub = crate::cluster::get_cluster_hub(router.port);
+                    let report = hub.cluster_check();
+                    let desc = report.format_report();
+                    write_resp_bulk(out, desc.as_bytes());
+                }
+                ClusterSubcommand::Reshard {
+                    target_node_id,
+                    source_node_id,
+                    slots,
+                } => {
+                    let hub = crate::cluster::get_cluster_hub(router.port);
+                    match hub.compute_reshard_plan(&target_node_id, &source_node_id, slots) {
+                        Ok(plans) => {
+                            let moved = execute_rebalance_plans(router, &hub, &plans).await;
+                            write_resp_integer(out, moved as i64);
+                        }
+                        Err(e) => {
+                            out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes());
+                        }
+                    }
                 }
                 ClusterSubcommand::Failover { force } => match router.cluster_failover(force) {
                     Ok(_) => out.extend_from_slice(b"+OK\r\n"),
