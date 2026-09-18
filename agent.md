@@ -71,12 +71,31 @@ Every commit to `main` must strictly adhere to the following four rules:
     * `test(scope):` test additions or improvements
     * `docs(scope):` documentation and benchmark records
 
-### Rule 4: Every Commit Must Be Pushed Immediately
-* **Every commit created must be pushed immediately to `origin main`**:
+### Rule 4: Every Commit Must Pass CI Before Push
+* **Every commit must pass the full CI quality gate before pushing to `origin main`**:
+  Under no circumstances should an unverified commit or failing test ever be pushed. The entire CI check suite matching `.github/workflows/ci.yml` must be executed and pass with zero failures and zero warnings:
+  ```bash
+  # 1. Check code formatting
+  cargo fmt --check
+
+  # 2. Run Clippy linter with zero warnings tolerated
+  cargo clippy --all-targets -- -D warnings
+
+  # 3. Run all unit tests
+  cargo test --lib
+
+  # 4. Run cross-thread integration tests
+  cargo test --test test_cross_thread
+
+  # 5. Run end-to-end integration tests (serial)
+  cargo test --test test_server_e2e -- --test-threads=1
+  ```
+* **Immediate Push Upon Green CI**:
+  Once the CI suite passes cleanly, the commit must be pushed immediately to `origin main`:
   ```bash
   git push origin main
   ```
-* Never leave completed commits unpushed. Local `main` and `origin/main` must remain synchronized at all times.
+* Never leave completed commits unpushed, and never push without verifying the full CI suite. Local `main` and `origin/main` must remain synchronized and green at all times.
 
 
 ---
