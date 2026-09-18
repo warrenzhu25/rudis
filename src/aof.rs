@@ -1031,3 +1031,274 @@ pub fn replay_aof(path: &Path, db: &mut ShardDb) -> std::io::Result<usize> {
     }
     Ok(count)
 }
+
+pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::io::Result<usize> {
+    use std::io::Write;
+    let mut buf = Vec::with_capacity(65536);
+    let mut count = 0;
+    let now = std::time::Instant::now();
+
+    // 1. Snapshot all non-expired entries in RudisTable as canonical RESP commands
+    for entry in db.table.entries() {
+        if let Some(exp) = entry.expire_at
+            && exp <= now
+        {
+            continue;
+        }
+        let k = entry.key.as_ref();
+        let val_ref = match &entry.val {
+            crate::table::RudisValue::Cooled { val, .. } => val.as_ref(),
+            other => other,
+        };
+        match val_ref {
+            crate::table::RudisValue::String(val) => {
+                if let Some(exp) = entry.expire_at {
+                    let rem_ms = exp.duration_since(now).as_millis() as u64;
+                    let rem_ms_str = rem_ms.to_string();
+                    buf.extend_from_slice(b"*5\r\n$3\r\nSET\r\n$");
+                    buf.extend_from_slice(k.len().to_string().as_bytes());
+                    buf.extend_from_slice(b"\r\n");
+                    buf.extend_from_slice(k);
+                    buf.extend_from_slice(b"\r\n$");
+                    buf.extend_from_slice(val.len().to_string().as_bytes());
+                    buf.extend_from_slice(b"\r\n");
+                    buf.extend_from_slice(val.as_ref());
+                    buf.extend_from_slice(b"\r\n$2\r\nPX\r\n$");
+                    buf.extend_from_slice(rem_ms_str.len().to_string().as_bytes());
+                    buf.extend_from_slice(b"\r\n");
+                    buf.extend_from_slice(rem_ms_str.as_bytes());
+                    buf.extend_from_slice(b"\r\n");
+                } else {
+                    buf.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$");
+                    buf.extend_from_slice(k.len().to_string().as_bytes());
+                    buf.extend_from_slice(b"\r\n");
+                    buf.extend_from_slice(k);
+                    buf.extend_from_slice(b"\r\n$");
+                    buf.extend_from_slice(val.len().to_string().as_bytes());
+                    buf.extend_from_slice(b"\r\n");
+                    buf.extend_from_slice(val.as_ref());
+                    buf.extend_from_slice(b"\r\n");
+                }
+                count += 1;
+            }
+            crate::table::RudisValue::Int(val) => {
+                let val_str = val.to_string();
+                buf.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$");
+                buf.extend_from_slice(k.len().to_string().as_bytes());
+                buf.extend_from_slice(b"\r\n");
+                buf.extend_from_slice(k);
+                buf.extend_from_slice(b"\r\n$");
+                buf.extend_from_slice(val_str.len().to_string().as_bytes());
+                buf.extend_from_slice(b"\r\n");
+                buf.extend_from_slice(val_str.as_bytes());
+                buf.extend_from_slice(b"\r\n");
+                count += 1;
+            }
+            crate::table::RudisValue::SmallHash(pairs) if !pairs.is_empty() => {
+                buf.extend_from_slice(
+                    format!("*{}\r\n$4\r\nHSET\r\n${}\r\n", pairs.len() * 2 + 2, k.len())
+                        .as_bytes(),
+                );
+                buf.extend_from_slice(k);
+                buf.extend_from_slice(b"\r\n");
+                for (field, v) in pairs {
+                    buf.extend_from_slice(format!("${}\r\n", field.len()).as_bytes());
+                    buf.extend_from_slice(field.as_ref());
+                    buf.extend_from_slice(format!("\r\n${}\r\n", v.len()).as_bytes());
+                    buf.extend_from_slice(v.as_ref());
+                    buf.extend_from_slice(b"\r\n");
+                }
+                count += 1;
+            }
+            crate::table::RudisValue::Hash(map) if !map.is_empty() => {
+                buf.extend_from_slice(
+                    format!("*{}\r\n$4\r\nHSET\r\n${}\r\n", map.len() * 2 + 2, k.len()).as_bytes(),
+                );
+                buf.extend_from_slice(k);
+                buf.extend_from_slice(b"\r\n");
+                for (field, v) in map {
+                    buf.extend_from_slice(format!("${}\r\n", field.len()).as_bytes());
+                    buf.extend_from_slice(field.as_ref());
+                    buf.extend_from_slice(format!("\r\n${}\r\n", v.len()).as_bytes());
+                    buf.extend_from_slice(v.as_ref());
+                    buf.extend_from_slice(b"\r\n");
+                }
+                count += 1;
+            }
+            crate::table::RudisValue::List(list) if !list.is_empty() => {
+                buf.extend_from_slice(
+                    format!("*{}\r\n$5\r\nRPUSH\r\n${}\r\n", list.len() + 2, k.len()).as_bytes(),
+                );
+                buf.extend_from_slice(k);
+                buf.extend_from_slice(b"\r\n");
+                for item in list {
+                    buf.extend_from_slice(format!("${}\r\n", item.len()).as_bytes());
+                    buf.extend_from_slice(item.as_ref());
+                    buf.extend_from_slice(b"\r\n");
+                }
+                count += 1;
+            }
+            crate::table::RudisValue::Set(set) if !set.is_empty() => {
+                let members: Vec<bytes::Bytes> = match set {
+                    crate::table::RudisSet::Small(v) => v.clone(),
+                    crate::table::RudisSet::Full(s) => s.iter().cloned().collect(),
+                };
+                buf.extend_from_slice(
+                    format!("*{}\r\n$4\r\nSADD\r\n${}\r\n", members.len() + 2, k.len()).as_bytes(),
+                );
+                buf.extend_from_slice(k);
+                buf.extend_from_slice(b"\r\n");
+                for m in members {
+                    buf.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
+                    buf.extend_from_slice(m.as_ref());
+                    buf.extend_from_slice(b"\r\n");
+                }
+                count += 1;
+            }
+            crate::table::RudisValue::ZSet(zset) if !zset.is_empty() => {
+                let elements = zset.to_vec();
+                buf.extend_from_slice(
+                    format!(
+                        "*{}\r\n$4\r\nZADD\r\n${}\r\n",
+                        elements.len() * 2 + 2,
+                        k.len()
+                    )
+                    .as_bytes(),
+                );
+                buf.extend_from_slice(k);
+                buf.extend_from_slice(b"\r\n");
+                for (member, score) in elements {
+                    let score_str = score.to_string();
+                    buf.extend_from_slice(
+                        format!(
+                            "${}\r\n{}\r\n${}\r\n",
+                            score_str.len(),
+                            score_str,
+                            member.len()
+                        )
+                        .as_bytes(),
+                    );
+                    buf.extend_from_slice(member.as_ref());
+                    buf.extend_from_slice(b"\r\n");
+                }
+                count += 1;
+            }
+            _ => {}
+        }
+    }
+
+    // 2. Snapshot JSON documents
+    for (k, doc) in db.json_store.iter() {
+        let doc_str = serde_json::to_string(doc).unwrap_or_default();
+        buf.extend_from_slice(format!("*4\r\n$8\r\nJSON.SET\r\n${}\r\n", k.len()).as_bytes());
+        buf.extend_from_slice(k.as_ref());
+        buf.extend_from_slice(
+            format!("\r\n$1\r\n$\r\n${}\r\n{}\r\n", doc_str.len(), doc_str).as_bytes(),
+        );
+        count += 1;
+    }
+
+    // 3. Atomically write to temp file and rename
+    static TMP_REWRITE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let tmp_id = TMP_REWRITE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = dir.join(format!(
+        "appendonly-{}.aof.tmp.{}_{}",
+        shard_id,
+        std::process::id(),
+        tmp_id
+    ));
+    let target_path = dir.join(format!("appendonly-{}.aof", shard_id));
+
+    let mut file = std::fs::File::create(&tmp_path)?;
+    file.write_all(&buf)?;
+    file.sync_all()?;
+    std::fs::rename(&tmp_path, &target_path)?;
+
+    Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use std::time::Duration;
+
+    #[test]
+    fn test_aof_compaction_and_rewrite() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("rudis-aof-rewrite-unit-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let mut db = ShardDb::new(6379);
+
+        // 1. Populate various data types in ShardDb
+        db.set(Bytes::from("str1"), Bytes::from("val1"), None);
+        db.set(
+            Bytes::from("str2"),
+            Bytes::from("val2"),
+            Some(Duration::from_secs(3600)),
+        );
+        db.hset(
+            Bytes::from("hash1"),
+            vec![
+                (Bytes::from("f1"), Bytes::from("v1")),
+                (Bytes::from("f2"), Bytes::from("v2")),
+            ],
+        )
+        .unwrap();
+        db.rpush(
+            Bytes::from("list1"),
+            vec![Bytes::from("elem1"), Bytes::from("elem2")],
+        )
+        .unwrap();
+        db.sadd(
+            Bytes::from("set1"),
+            vec![Bytes::from("m1"), Bytes::from("m2")],
+        )
+        .unwrap();
+        db.zadd(
+            Bytes::from("zset1"),
+            vec![(10.5, Bytes::from("z1")), (20.0, Bytes::from("z2"))],
+            crate::table::ZAddFlags::default(),
+        )
+        .unwrap();
+        db.json_store
+            .json_set(b"doc1", "$", r#"{"title":"rewrite"}"#, false, false)
+            .unwrap();
+
+        // 2. Perform AOF rewrite
+        let rewritten_count =
+            rewrite_shard_aof(&mut db, &temp_dir, 0).expect("rewrite should succeed");
+        assert_eq!(rewritten_count, 7);
+
+        let aof_file = temp_dir.join("appendonly-0.aof");
+        assert!(aof_file.exists());
+
+        // 3. Replay rewritten AOF into fresh ShardDb and verify all state is restored
+        let mut new_db = ShardDb::new(6379);
+        let replayed = replay_aof(&aof_file, &mut new_db).expect("replay should succeed");
+        assert_eq!(replayed, 7);
+
+        assert_eq!(new_db.get(b"str1"), Some(Bytes::from("val1")));
+        assert_eq!(new_db.get(b"str2"), Some(Bytes::from("val2")));
+        assert_eq!(
+            new_db.hget(b"hash1", b"f1").unwrap(),
+            Some(Bytes::from("v1"))
+        );
+        assert_eq!(
+            new_db.lrange(b"list1", 0, -1).unwrap(),
+            vec![Bytes::from("elem1"), Bytes::from("elem2")]
+        );
+        assert!(new_db.sismember(b"set1", b"m1").unwrap());
+        assert_eq!(new_db.zscore(b"zset1", b"z1").unwrap(), Some(10.5));
+        assert!(
+            new_db
+                .json_store
+                .json_get(b"doc1", &["$"])
+                .unwrap()
+                .contains("rewrite")
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+}

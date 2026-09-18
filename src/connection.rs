@@ -2725,6 +2725,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Msetnx(_) => "MSETNX",
         Command::Save => "SAVE",
         Command::Bgsave => "BGSAVE",
+        Command::Bgrewriteaof => "BGREWRITEAOF",
         Command::Lastsave => "LASTSAVE",
         Command::Ping(_) => "PING",
         Command::CommandDocs => "COMMAND",
@@ -6280,6 +6281,18 @@ async fn execute_command(
             match router.bgsave().await {
                 Ok(_) => {
                     out.extend_from_slice(b"+Background saving started\r\n");
+                }
+                Err(e) => {
+                    let err = format!("-ERR {}\r\n", e);
+                    out.extend_from_slice(err.as_bytes());
+                }
+            }
+            false
+        }
+        Command::Bgrewriteaof => {
+            match router.bgrewriteaof().await {
+                Ok(_) => {
+                    out.extend_from_slice(b"+Background append only file rewriting started\r\n");
                 }
                 Err(e) => {
                     let err = format!("-ERR {}\r\n", e);

@@ -136,6 +136,11 @@ pub enum ShardMessage {
         path: String,
         responder: flume::Sender<Vec<(usize, Option<String>)>>,
     },
+    RewriteAof {
+        dir: std::path::PathBuf,
+        shard_id: usize,
+        responder: flume::Sender<Result<usize, String>>,
+    },
     ScatterMset {
         shard_id: usize,
         pairs: Vec<(Bytes, Bytes)>,

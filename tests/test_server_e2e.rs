@@ -7616,3 +7616,97 @@ fn test_cluster_quorum_failure_detection_and_gossip_e2e() {
         nodes_after_fail
     );
 }
+
+#[test]
+fn test_aof_bgrewriteaof_compaction_e2e() {
+    let port1 = 16765;
+    let port2 = 16766;
+    let num_shards = 2;
+    let aof_dir = std::env::temp_dir().join(format!("rudis-aof-rewrite-e2e-{}", port1));
+    let _ = std::fs::remove_dir_all(&aof_dir);
+    std::fs::create_dir_all(&aof_dir).unwrap();
+
+    let aof_config1 = rudis::aof::AofConfig {
+        enabled: true,
+        dir: aof_dir.clone(),
+        fsync_every_sec: true,
+    };
+
+    // 1. Start Server 1 with AOF enabled
+    start_test_server_with_aof(port1, num_shards, aof_config1);
+
+    let mut client1 = TcpStream::connect(format!("127.0.0.1:{}", port1)).unwrap();
+
+    // 2. Perform redundant mutations on same keys across shards to inflate AOF log
+    for i in 0..50 {
+        assert_eq!(
+            send_and_read(&mut client1, format!("SET counter {}\r\n", i).as_bytes()),
+            "+OK\r\n"
+        );
+        assert_eq!(
+            send_and_read(&mut client1, format!("SET item {}\r\n", i).as_bytes()),
+            "+OK\r\n"
+        );
+    }
+    assert_eq!(
+        send_and_read(&mut client1, b"HSET myhash f1 v1 f2 v2\r\n"),
+        ":2\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, b"JSON.SET doc1 $ {\"val\":\"compacted\"}\r\n"),
+        "+OK\r\n"
+    );
+
+    // Save initial AOF to disk
+    assert_eq!(send_and_read(&mut client1, b"SAVE\r\n"), "+OK\r\n");
+
+    let aof_file0 = aof_dir.join("appendonly-0.aof");
+    let aof_file1 = aof_dir.join("appendonly-1.aof");
+    let initial_size0 = aof_file0.metadata().map(|m| m.len()).unwrap_or(0);
+    let initial_size1 = aof_file1.metadata().map(|m| m.len()).unwrap_or(0);
+    assert!(initial_size0 + initial_size1 > 0);
+
+    // 3. Issue BGREWRITEAOF command
+    let rewrite_resp = send_and_read(&mut client1, b"BGREWRITEAOF\r\n");
+    assert_eq!(
+        rewrite_resp,
+        "+Background append only file rewriting started\r\n"
+    );
+
+    // Wait for async background rewrite to complete and flush to disk
+    thread::sleep(Duration::from_millis(300));
+
+    let compacted_size0 = aof_file0.metadata().map(|m| m.len()).unwrap_or(0);
+    let compacted_size1 = aof_file1.metadata().map(|m| m.len()).unwrap_or(0);
+    assert!(compacted_size0 + compacted_size1 > 0);
+
+    drop(client1);
+    thread::sleep(Duration::from_millis(200));
+
+    // 4. Start Server 2 pointing to the same compacted AOF directory
+    let aof_config2 = rudis::aof::AofConfig {
+        enabled: true,
+        dir: aof_dir.clone(),
+        fsync_every_sec: true,
+    };
+    start_test_server_with_aof(port2, num_shards, aof_config2);
+
+    let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", port2)).unwrap();
+
+    // 5. Verify all compacted state restored cleanly across shards
+    assert_eq!(
+        send_and_read(&mut client2, b"GET counter\r\n"),
+        "$2\r\n49\r\n"
+    );
+    assert_eq!(send_and_read(&mut client2, b"GET item\r\n"), "$2\r\n49\r\n");
+    assert_eq!(
+        send_and_read(&mut client2, b"HGET myhash f1\r\n"),
+        "$2\r\nv1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client2, b"JSON.GET doc1 $.val\r\n"),
+        "$11\r\n\"compacted\"\r\n"
+    );
+
+    let _ = std::fs::remove_dir_all(aof_dir);
+}

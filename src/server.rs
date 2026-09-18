@@ -695,6 +695,16 @@ pub fn run_shard_worker(
                         }
                         let _ = responder.send(results);
                     }
+                    ShardMessage::RewriteAof {
+                        dir,
+                        shard_id,
+                        responder,
+                    } => {
+                        let mut db = cross_shard_db.borrow_mut();
+                        let res = crate::aof::rewrite_shard_aof(&mut db, &dir, shard_id)
+                            .map_err(|e| e.to_string());
+                        let _ = responder.send(res);
+                    }
                     ShardMessage::SetSlotState { slot, state } => {
                         cross_shard_slot_states.borrow_mut()[slot as usize] = state;
                     }

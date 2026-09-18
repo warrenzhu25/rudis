@@ -1903,6 +1903,56 @@ impl Router {
         Ok(())
     }
 
+    pub async fn bgrewriteaof(&self) -> Result<(), String> {
+        if self
+            .is_saving
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("Background save or rewrite already in progress".to_string());
+        }
+        let router_clone = self.clone();
+        monoio::spawn(async move {
+            let _ = router_clone.perform_rewrite_aof().await;
+        });
+        Ok(())
+    }
+
+    pub async fn perform_rewrite_aof(&self) -> Result<usize, String> {
+        self.sync_aof().await;
+        let mut total_rewritten = {
+            let mut db = self.local_db.borrow_mut();
+            crate::aof::rewrite_shard_aof(&mut db, &self.db_dir, self.shard_id)
+                .map_err(|e| e.to_string())?
+        };
+
+        let mut responders = Vec::new();
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                if sender
+                    .send(ShardMessage::RewriteAof {
+                        dir: self.db_dir.clone(),
+                        shard_id: sid,
+                        responder: tx,
+                    })
+                    .is_ok()
+                {
+                    responders.push(rx);
+                }
+            }
+        }
+
+        for rx in responders {
+            if let Ok(Ok(count)) = rx.recv_async().await {
+                total_rewritten += count;
+            }
+        }
+
+        self.is_saving.store(false, Ordering::SeqCst);
+        Ok(total_rewritten)
+    }
+
     pub async fn generate_full_rdb(&self) -> Vec<u8> {
         let mut full_rdb = Vec::new();
         full_rdb.extend_from_slice(b"REDIS0011");

@@ -1379,6 +1379,11 @@ impl RudisTable {
         self.table.insert(entry);
     }
 
+    #[inline]
+    pub fn entries(&self) -> impl Iterator<Item = &RudisEntry> {
+        self.table.slots.iter().flatten()
+    }
+
     pub fn recalculate_used_memory(&mut self) -> usize {
         let mut total = self.table.capacity * std::mem::size_of::<Option<RudisEntry>>()
             + self.table.ctrl.len()

@@ -485,6 +485,7 @@ pub enum Command {
     Msetnx(Vec<(Bytes, Bytes)>),
     Save,
     Bgsave,
+    Bgrewriteaof,
     Lastsave,
     Ping(Option<Bytes>),
     CommandDocs,
@@ -4353,6 +4354,7 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
         }
         "SAVE" => Ok(Some(Command::Save)),
         "BGSAVE" => Ok(Some(Command::Bgsave)),
+        "BGREWRITEAOF" => Ok(Some(Command::Bgrewriteaof)),
         "LASTSAVE" => Ok(Some(Command::Lastsave)),
         "COMMAND" => Ok(Some(Command::CommandDocs)),
         "INFO" => {
