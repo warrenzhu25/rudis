@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use fxhash::hash64;
+use fxhash::{FxBuildHasher, hash64};
 use hashbrown::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -646,7 +646,7 @@ const SMALL_SET_LIMIT: usize = 64;
 #[derive(Clone, Debug)]
 pub enum RudisSet {
     Small(Vec<Bytes>),
-    Full(hashbrown::HashSet<Bytes>),
+    Full(hashbrown::HashSet<Bytes, FxBuildHasher>),
 }
 
 impl Default for RudisSet {
@@ -701,7 +701,10 @@ impl RudisSet {
         if cap <= SMALL_SET_LIMIT {
             RudisSet::Small(Vec::with_capacity(cap))
         } else {
-            RudisSet::Full(hashbrown::HashSet::with_capacity(cap))
+            RudisSet::Full(hashbrown::HashSet::with_capacity_and_hasher(
+                cap,
+                FxBuildHasher::default(),
+            ))
         }
     }
 
@@ -770,7 +773,10 @@ impl RudisSet {
                 }
                 v.push(member);
                 if v.len() > SMALL_SET_LIMIT {
-                    let mut set = hashbrown::HashSet::with_capacity(v.len());
+                    let mut set = hashbrown::HashSet::with_capacity_and_hasher(
+                        v.len(),
+                        FxBuildHasher::default(),
+                    );
                     for m in v.drain(..) {
                         set.insert(m);
                     }
@@ -4415,6 +4421,9 @@ impl RudisTable {
                     RudisValue::Set(set) => {
                         let mut added = 0;
                         for m in members {
+                            if set.contains(m.as_ref()) {
+                                continue;
+                            }
                             if set.insert(m.clone()) {
                                 added += 1;
                             }
@@ -4440,7 +4449,10 @@ impl RudisTable {
             }
             RudisSet::Small(v)
         } else {
-            let mut set = hashbrown::HashSet::with_capacity(members.len());
+            let mut set = hashbrown::HashSet::with_capacity_and_hasher(
+                members.len(),
+                FxBuildHasher::default(),
+            );
             for m in members {
                 set.insert(m.clone());
             }
@@ -8772,6 +8784,17 @@ pub fn load_rdb_bytes(
 mod tests {
     use super::*;
     use std::thread;
+
+    #[test]
+    fn test_rudis_set_fx_hasher_and_dedup() {
+        let mut set = RudisSet::with_capacity(100);
+        assert!(matches!(set, RudisSet::Full(_)));
+        assert!(set.insert(Bytes::from_static(b"foo")));
+        assert!(!set.insert(Bytes::from_static(b"foo")));
+        assert!(set.contains(b"foo"));
+        assert!(!set.contains(b"bar"));
+        assert_eq!(set.len(), 1);
+    }
 
     #[test]
     fn test_flat_table_crud_and_growth() {

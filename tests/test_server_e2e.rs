@@ -8674,3 +8674,40 @@ fn test_smallvec_exists_and_sadd_e2e() {
     );
     assert_eq!(send_and_read(&mut client, b"SCARD myset\r\n"), ":3\r\n");
 }
+
+#[test]
+fn test_sadd_fx_hasher_large_set_e2e() {
+    let port = 16453;
+    start_test_server(port, 2);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    let mut cmd = String::from("SADD largeset");
+    for i in 0..100 {
+        cmd.push_str(&format!(" elem_{}", i));
+    }
+    cmd.push_str("\r\n");
+    assert_eq!(send_and_read(&mut client, cmd.as_bytes()), ":100\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"SCARD largeset\r\n"),
+        ":100\r\n"
+    );
+
+    assert_eq!(
+        send_and_read(&mut client, b"SADD largeset elem_0 elem_50 elem_99\r\n"),
+        ":0\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"SCARD largeset\r\n"),
+        ":100\r\n"
+    );
+
+    assert_eq!(
+        send_and_read(&mut client, b"SISMEMBER largeset elem_50\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"SISMEMBER largeset elem_999\r\n"),
+        ":0\r\n"
+    );
+}
