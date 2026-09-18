@@ -159,9 +159,8 @@ impl TlsSession {
 
         // Try promoting to kTLS if on Linux
         let raw_fd = stream.as_raw_fd();
-        if enable_ktls(raw_fd).is_ok() {
-            self.is_ktls_active = true;
-        }
+        let _ = enable_ktls(raw_fd);
+        self.is_ktls_active = false;
 
         Ok(())
     }
@@ -210,9 +209,8 @@ impl TlsSession {
         }
 
         let raw_fd = stream.as_raw_fd();
-        if enable_ktls(raw_fd).is_ok() {
-            self.is_ktls_active = true;
-        }
+        let _ = enable_ktls(raw_fd);
+        self.is_ktls_active = false;
 
         Ok(())
     }
