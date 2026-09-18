@@ -576,13 +576,20 @@ pub fn run_shard_worker(
                                         && let Command::IncrBy(ref key, delta) = cmd
                                     {
                                         has_writes = true;
-                                        match r.local_db.borrow_mut().table.incr_by_slice(key.as_ref(), delta) {
+                                        match r.local_db.borrow_mut().table.incr_by_slice_fast(key, delta) {
                                             Ok(val) => {
                                                 crate::connection::DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                                 if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                     crate::connection::touch_watched_key(r.port, key.as_ref());
                                                 }
-                                                crate::connection::write_resp_integer(&mut temp_buf, val);
+                                                if val == 1 {
+                                                    results.push((idx, crate::shard::CompactResp::INT_1));
+                                                } else if val == 0 {
+                                                    results.push((idx, crate::shard::CompactResp::INT_0));
+                                                } else {
+                                                    results.push((idx, crate::shard::CompactResp::from_integer(val)));
+                                                }
+                                                continue;
                                             }
                                             Err(err) => {
                                                 crate::connection::write_resp_err(&mut temp_buf, err);
@@ -759,13 +766,20 @@ pub fn run_shard_worker(
                                     && let Command::IncrBy(ref key, delta) = cmd
                                 {
                                     has_writes = true;
-                                    match db.table.incr_by_slice(key.as_ref(), delta) {
+                                    match db.table.incr_by_slice_fast(key, delta) {
                                         Ok(val) => {
                                             crate::connection::DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                 crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
                                             }
-                                            crate::connection::write_resp_integer(&mut temp_buf, val);
+                                            if val == 1 {
+                                                results.push((idx, crate::shard::CompactResp::INT_1));
+                                            } else if val == 0 {
+                                                results.push((idx, crate::shard::CompactResp::INT_0));
+                                            } else {
+                                                results.push((idx, crate::shard::CompactResp::from_integer(val)));
+                                            }
+                                            continue;
                                         }
                                         Err(err) => {
                                             crate::connection::write_resp_err(&mut temp_buf, err);
@@ -811,9 +825,7 @@ pub fn run_shard_worker(
                                             } else if count == 0 {
                                                 results.push((idx, crate::shard::CompactResp::INT_0));
                                             } else {
-                                                temp_buf.clear();
-                                                crate::connection::write_resp_integer(&mut temp_buf, count as i64);
-                                                results.push((idx, crate::shard::CompactResp::from_slice(&temp_buf)));
+                                                results.push((idx, crate::shard::CompactResp::from_integer(count as i64)));
                                             }
                                             continue;
                                         }
@@ -845,9 +857,7 @@ pub fn run_shard_worker(
                                             } else if count == 0 {
                                                 results.push((idx, crate::shard::CompactResp::INT_0));
                                             } else {
-                                                temp_buf.clear();
-                                                crate::connection::write_resp_integer(&mut temp_buf, count as i64);
-                                                results.push((idx, crate::shard::CompactResp::from_slice(&temp_buf)));
+                                                results.push((idx, crate::shard::CompactResp::from_integer(count as i64)));
                                             }
                                             continue;
                                         }
@@ -867,7 +877,14 @@ pub fn run_shard_worker(
                                             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                 crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
                                             }
-                                            crate::connection::write_resp_integer(&mut temp_buf, len as i64);
+                                            if len == 1 {
+                                                results.push((idx, crate::shard::CompactResp::INT_1));
+                                            } else if len == 0 {
+                                                results.push((idx, crate::shard::CompactResp::INT_0));
+                                            } else {
+                                                results.push((idx, crate::shard::CompactResp::from_integer(len as i64)));
+                                            }
+                                            continue;
                                         }
                                         Err(err) => {
                                             crate::connection::write_resp_err(&mut temp_buf, err);
@@ -923,9 +940,7 @@ pub fn run_shard_worker(
                                             } else if count == 0 {
                                                 results.push((idx, crate::shard::CompactResp::INT_0));
                                             } else {
-                                                temp_buf.clear();
-                                                crate::connection::write_resp_integer(&mut temp_buf, count as i64);
-                                                results.push((idx, crate::shard::CompactResp::from_slice(&temp_buf)));
+                                                results.push((idx, crate::shard::CompactResp::from_integer(count as i64)));
                                             }
                                             continue;
                                         }

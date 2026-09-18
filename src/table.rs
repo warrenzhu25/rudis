@@ -1876,7 +1876,21 @@ impl RudisTable {
         false
     }
 
+    #[inline(always)]
+    pub fn incr_by_slice_fast(&mut self, key: &Bytes, delta: i64) -> Result<i64, &'static str> {
+        self.incr_by_slice_internal(key.as_ref(), Some(key), delta)
+    }
+
     pub fn incr_by_slice(&mut self, key: &[u8], delta: i64) -> Result<i64, &'static str> {
+        self.incr_by_slice_internal(key, None, delta)
+    }
+
+    fn incr_by_slice_internal(
+        &mut self,
+        key: &[u8],
+        key_bytes: Option<&Bytes>,
+        delta: i64,
+    ) -> Result<i64, &'static str> {
         let h = hash_key(key);
         let (existing, candidate_idx) = self.table.find_or_prepare_insert(key, h);
         if let Some(idx) = existing {
@@ -1910,7 +1924,9 @@ impl RudisTable {
 
         let new_val = delta;
         let entry = RudisEntry {
-            key: Bytes::copy_from_slice(key),
+            key: key_bytes
+                .cloned()
+                .unwrap_or_else(|| Bytes::copy_from_slice(key)),
             val: RudisValue::Int(new_val),
             expire_at: None,
         };
@@ -1921,7 +1937,7 @@ impl RudisTable {
 
     #[inline]
     pub fn incr_by(&mut self, key: Bytes, delta: i64) -> Result<i64, String> {
-        self.incr_by_slice(key.as_ref(), delta)
+        self.incr_by_slice_fast(&key, delta)
             .map_err(|e| e.to_string())
     }
 

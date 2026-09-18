@@ -12316,14 +12316,21 @@ async fn execute_commands_squashed(
                         .local_db
                         .borrow_mut()
                         .table
-                        .incr_by_slice(key.as_ref(), delta)
+                        .incr_by_slice_fast(key, delta)
                     {
                         Ok(val) => {
                             DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                 touch_watched_key(router.port, key.as_ref());
                             }
-                            write_resp_integer(&mut local_buf, val);
+                            if val == 1 {
+                                responses[idx] = crate::shard::CompactResp::INT_1;
+                            } else if val == 0 {
+                                responses[idx] = crate::shard::CompactResp::INT_0;
+                            } else {
+                                responses[idx] = crate::shard::CompactResp::from_integer(val);
+                            }
+                            continue;
                         }
                         Err(err) => {
                             write_resp_err(&mut local_buf, err);
@@ -12388,9 +12395,8 @@ async fn execute_commands_squashed(
                             } else if count == 0 {
                                 responses[idx] = crate::shard::CompactResp::INT_0;
                             } else {
-                                local_buf.clear();
-                                write_resp_integer(&mut local_buf, count as i64);
-                                responses[idx] = CompactResp::from_slice(&local_buf);
+                                responses[idx] =
+                                    crate::shard::CompactResp::from_integer(count as i64);
                             }
                             continue;
                         }
@@ -12440,9 +12446,8 @@ async fn execute_commands_squashed(
                             } else if count == 0 {
                                 responses[idx] = crate::shard::CompactResp::INT_0;
                             } else {
-                                local_buf.clear();
-                                write_resp_integer(&mut local_buf, count as i64);
-                                responses[idx] = CompactResp::from_slice(&local_buf);
+                                responses[idx] =
+                                    crate::shard::CompactResp::from_integer(count as i64);
                             }
                             continue;
                         }
@@ -12482,9 +12487,8 @@ async fn execute_commands_squashed(
                             } else if count == 0 {
                                 responses[idx] = crate::shard::CompactResp::INT_0;
                             } else {
-                                local_buf.clear();
-                                write_resp_integer(&mut local_buf, count as i64);
-                                responses[idx] = CompactResp::from_slice(&local_buf);
+                                responses[idx] =
+                                    crate::shard::CompactResp::from_integer(count as i64);
                             }
                             continue;
                         }
@@ -12512,7 +12516,15 @@ async fn execute_commands_squashed(
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                 touch_watched_key(router.port, key.as_ref());
                             }
-                            write_resp_integer(&mut local_buf, len as i64);
+                            if len == 1 {
+                                responses[idx] = crate::shard::CompactResp::INT_1;
+                            } else if len == 0 {
+                                responses[idx] = crate::shard::CompactResp::INT_0;
+                            } else {
+                                responses[idx] =
+                                    crate::shard::CompactResp::from_integer(len as i64);
+                            }
+                            continue;
                         }
                         Err(err) => {
                             write_resp_err(&mut local_buf, err);

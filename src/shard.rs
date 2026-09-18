@@ -53,6 +53,42 @@ impl CompactResp {
     };
 
     #[inline(always)]
+    pub fn from_integer(val: i64) -> Self {
+        let mut data = [0u8; 30];
+        data[0] = b':';
+        let mut len = 1;
+        let mut n = if val < 0 {
+            data[1] = b'-';
+            len = 2;
+            val.unsigned_abs()
+        } else {
+            val as u64
+        };
+        if n == 0 {
+            data[len] = b'0';
+            len += 1;
+        } else {
+            let mut rev = [0u8; 20];
+            let mut rev_len = 0;
+            while n > 0 {
+                rev[rev_len] = b'0' + (n % 10) as u8;
+                rev_len += 1;
+                n /= 10;
+            }
+            for i in (0..rev_len).rev() {
+                data[len] = rev[i];
+                len += 1;
+            }
+        }
+        data[len] = b'\r';
+        data[len + 1] = b'\n';
+        CompactResp::Small {
+            len: (len + 2) as u8,
+            data,
+        }
+    }
+
+    #[inline(always)]
     pub fn from_slice(bytes: &[u8]) -> Self {
         let len = bytes.len();
         if len <= 30 {
@@ -519,6 +555,11 @@ impl ShardDb {
     #[inline]
     pub fn exists(&mut self, key: &[u8]) -> bool {
         self.table.exists(key)
+    }
+
+    #[inline(always)]
+    pub fn incr_by_slice_fast(&mut self, key: &Bytes, delta: i64) -> Result<i64, &'static str> {
+        self.table.incr_by_slice_fast(key, delta)
     }
 
     #[inline]
