@@ -1200,8 +1200,9 @@ impl RudisFlatTable {
         }
     }
 
-    /// Finds the index of a matching key, if present.
-    pub fn find(&self, key: &[u8], hash: u64) -> Option<usize> {
+    /// Finds the index and entry reference of a matching key, if present.
+    #[inline(always)]
+    pub fn find_entry(&self, key: &[u8], hash: u64) -> Option<(usize, &RudisEntry)> {
         let tag = fingerprint(hash);
         let mut idx = (hash as usize) & self.mask;
         let mut step = 0;
@@ -1217,7 +1218,7 @@ impl RudisFlatTable {
                 if let Some(ref entry) = self.slots[slot_idx]
                     && entry.key.as_ref() == key
                 {
-                    return Some(slot_idx);
+                    return Some((slot_idx, entry));
                 }
                 bits &= bits - 1;
             }
@@ -1229,6 +1230,12 @@ impl RudisFlatTable {
             step += GROUP_SIZE;
             idx = (idx + step) & self.mask;
         }
+    }
+
+    /// Finds the index of a matching key, if present.
+    #[inline(always)]
+    pub fn find(&self, key: &[u8], hash: u64) -> Option<usize> {
+        self.find_entry(key, hash).map(|(idx, _)| idx)
     }
 
     /// Searches for key and returns either `(Some(existing_slot_idx), candidate_insert_idx)`
@@ -1646,9 +1653,7 @@ impl RudisTable {
     #[inline(always)]
     pub fn write_get_resp(&mut self, key: &[u8], out: &mut Vec<u8>) -> Result<bool, &'static str> {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h)
-            && let Some(entry) = self.table.get_slot(idx)
-        {
+        if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if let Some(expire_at) = entry.expire_at
                 && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -1835,17 +1840,12 @@ impl RudisTable {
     #[inline(always)]
     pub fn del(&mut self, key: &[u8]) -> bool {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h) {
-            if let Some(entry) = self.table.get_slot(idx)
-                && let Some(expire_at) = entry.expire_at
+        if let Some((idx, entry)) = self.table.find_entry(key, h) {
+            if let Some(expire_at) = entry.expire_at
                 && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
             {
-                if let Some(removed) = self.table.remove(idx) {
-                    let freed = removed.key.len() + removed.val.approx_bytes() + 64;
-                    self.used_memory = self.used_memory.saturating_sub(freed);
-                    inc_expired_keys();
-                }
+                self.expire_slot(idx);
                 return false;
             }
             if let Some(entry) = self.table.remove(idx) {
@@ -1861,18 +1861,12 @@ impl RudisTable {
     #[inline(always)]
     pub fn exists(&mut self, key: &[u8]) -> bool {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h)
-            && let Some(entry) = self.table.get_slot(idx)
-        {
+        if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if let Some(expire_at) = entry.expire_at
                 && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
             {
-                if let Some(removed) = self.table.remove(idx) {
-                    let freed = removed.key.len() + removed.val.approx_bytes() + 64;
-                    self.used_memory = self.used_memory.saturating_sub(freed);
-                    inc_expired_keys();
-                }
+                self.expire_slot(idx);
                 return false;
             }
             return true;
@@ -2860,9 +2854,7 @@ impl RudisTable {
         out: &mut Vec<u8>,
     ) -> Result<(), &'static str> {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h)
-            && let Some(entry) = self.table.get_slot(idx)
-        {
+        if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if let Some(expire_at) = entry.expire_at
                 && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -4394,9 +4386,7 @@ impl RudisTable {
         out: &mut Vec<u8>,
     ) -> Result<(), &'static str> {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h)
-            && let Some(entry) = self.table.get_slot(idx)
-        {
+        if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if let Some(expire_at) = entry.expire_at
                 && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at

@@ -1453,7 +1453,7 @@ fn parse_inline_command(buf: &mut BytesMut) -> Result<Option<Command>, String> {
     build_command(parts)
 }
 
-pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
+pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
     if args.is_empty() {
         return Ok(None);
     }
@@ -1805,7 +1805,8 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() < 2 {
                 return Err("wrong number of arguments for 'mget' command".to_string());
             }
-            Ok(Some(Command::Mget(args[1..].to_vec())))
+            args.remove(0);
+            Ok(Some(Command::Mget(args)))
         }
         "MSET" => {
             if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
@@ -2018,14 +2019,16 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     noreply,
                 }))
             } else {
-                Ok(Some(Command::Del(args[1..].to_vec())))
+                args.remove(0);
+                Ok(Some(Command::Del(args)))
             }
         }
         "EXISTS" => {
             if args.len() < 2 {
                 return Err("wrong number of arguments for 'exists' command".to_string());
             }
-            Ok(Some(Command::Exists(args[1..].to_vec())))
+            args.remove(0);
+            Ok(Some(Command::Exists(args)))
         }
         "INCR" => {
             if args.len() < 2 {
@@ -4315,7 +4318,8 @@ pub fn build_command(args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() < 2 {
                 return Err("wrong number of arguments for 'touch' command".to_string());
             }
-            Ok(Some(Command::Touch(args[1..].to_vec())))
+            args.remove(0);
+            Ok(Some(Command::Touch(args)))
         }
         "RENAME" => {
             if args.len() != 3 {
