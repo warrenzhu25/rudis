@@ -673,7 +673,9 @@ impl Router {
             self.tier_stats.ram_hits.fetch_add(1, Ordering::Relaxed);
             return Some(v);
         }
-        if self.local_db.borrow_mut().table.is_tiered(key).is_some() {
+        if self.local_db.borrow().tier_manager.is_some()
+            && self.local_db.borrow_mut().table.is_tiered(key).is_some()
+        {
             return self.read_cold_key_local(key).await;
         }
         None
@@ -972,7 +974,7 @@ impl Router {
 
         // Wait for all remote shards to complete their writes
         if descriptor.pending.load(Ordering::Acquire) != 0 {
-            for _ in 0..256 {
+            for _ in 0..1024 {
                 std::hint::spin_loop();
                 if descriptor.pending.load(Ordering::Acquire) == 0 {
                     break;
@@ -1097,7 +1099,7 @@ impl Router {
         }
 
         if descriptor.pending.load(Ordering::Acquire) != 0 {
-            for _ in 0..256 {
+            for _ in 0..1024 {
                 std::hint::spin_loop();
                 if descriptor.pending.load(Ordering::Acquire) == 0 {
                     break;

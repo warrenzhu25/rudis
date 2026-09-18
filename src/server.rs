@@ -973,9 +973,10 @@ pub fn run_shard_worker(
                         let mut db = cross_shard_db.borrow_mut();
                         let mut cold_keys = Vec::new();
 
+                        let has_tiering = db.tier_manager.is_some();
                         for (idx, key) in &keys {
                             let val = db.get(key);
-                            if val.is_none() && db.table.is_tiered(key).is_some() {
+                            if val.is_none() && has_tiering && db.table.is_tiered(key).is_some() {
                                 cold_keys.push((*idx, key.clone()));
                             } else {
                                 descriptor.write_result(*idx, val);
