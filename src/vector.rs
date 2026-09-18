@@ -51,6 +51,182 @@ unsafe fn hsum256_ps(v: core::arch::x86_64::__m256) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx512f")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn hsum512_ps(v: core::arch::x86_64::__m512) -> f32 {
+    use core::arch::x86_64::*;
+    let low = _mm512_castps512_ps256(v);
+    let high = _mm512_extractf32x8_ps(v, 1);
+    let sum256 = _mm256_add_ps(low, high);
+    hsum256_ps(sum256)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn dot_product_avx512(a: &[f32], b: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+    let len = a.len().min(b.len());
+    let mut i = 0;
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
+
+    while i + 32 <= len {
+        let va0 = _mm512_loadu_ps(a.as_ptr().add(i));
+        let vb0 = _mm512_loadu_ps(b.as_ptr().add(i));
+        acc0 = _mm512_fmadd_ps(va0, vb0, acc0);
+
+        let va1 = _mm512_loadu_ps(a.as_ptr().add(i + 16));
+        let vb1 = _mm512_loadu_ps(b.as_ptr().add(i + 16));
+        acc1 = _mm512_fmadd_ps(va1, vb1, acc1);
+
+        i += 32;
+    }
+
+    if i + 16 <= len {
+        let va = _mm512_loadu_ps(a.as_ptr().add(i));
+        let vb = _mm512_loadu_ps(b.as_ptr().add(i));
+        acc0 = _mm512_fmadd_ps(va, vb, acc0);
+        i += 16;
+    }
+
+    let acc = _mm512_add_ps(acc0, acc1);
+    let mut sum = hsum512_ps(acc);
+
+    while i < len {
+        sum += *a.get_unchecked(i) * *b.get_unchecked(i);
+        i += 1;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn l2_distance_sq_avx512(a: &[f32], b: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+    let len = a.len().min(b.len());
+    let mut i = 0;
+    let mut acc0 = _mm512_setzero_ps();
+    let mut acc1 = _mm512_setzero_ps();
+
+    while i + 32 <= len {
+        let va0 = _mm512_loadu_ps(a.as_ptr().add(i));
+        let vb0 = _mm512_loadu_ps(b.as_ptr().add(i));
+        let diff0 = _mm512_sub_ps(va0, vb0);
+        acc0 = _mm512_fmadd_ps(diff0, diff0, acc0);
+
+        let va1 = _mm512_loadu_ps(a.as_ptr().add(i + 16));
+        let vb1 = _mm512_loadu_ps(b.as_ptr().add(i + 16));
+        let diff1 = _mm512_sub_ps(va1, vb1);
+        acc1 = _mm512_fmadd_ps(diff1, diff1, acc1);
+
+        i += 32;
+    }
+
+    if i + 16 <= len {
+        let va = _mm512_loadu_ps(a.as_ptr().add(i));
+        let vb = _mm512_loadu_ps(b.as_ptr().add(i));
+        let diff = _mm512_sub_ps(va, vb);
+        acc0 = _mm512_fmadd_ps(diff, diff, acc0);
+        i += 16;
+    }
+
+    let acc = _mm512_add_ps(acc0, acc1);
+    let mut sum = hsum512_ps(acc);
+
+    while i < len {
+        let diff = *a.get_unchecked(i) - *b.get_unchecked(i);
+        sum += diff * diff;
+        i += 1;
+    }
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn cosine_distance_avx2(a: &[f32], b: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+    let len = a.len().min(b.len());
+    let mut i = 0;
+    let mut acc_dot = _mm256_setzero_ps();
+    let mut acc_na = _mm256_setzero_ps();
+    let mut acc_nb = _mm256_setzero_ps();
+
+    while i + 8 <= len {
+        let va = _mm256_loadu_ps(a.as_ptr().add(i));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+        acc_dot = _mm256_fmadd_ps(va, vb, acc_dot);
+        acc_na = _mm256_fmadd_ps(va, va, acc_na);
+        acc_nb = _mm256_fmadd_ps(vb, vb, acc_nb);
+        i += 8;
+    }
+
+    let mut dot = hsum256_ps(acc_dot);
+    let mut na = hsum256_ps(acc_na);
+    let mut nb = hsum256_ps(acc_nb);
+
+    while i < len {
+        let x = *a.get_unchecked(i);
+        let y = *b.get_unchecked(i);
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+        i += 1;
+    }
+
+    let norm = (na * nb).sqrt();
+    if norm == 0.0 {
+        1.0
+    } else {
+        (1.0 - (dot / norm)).max(0.0)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn cosine_distance_avx512(a: &[f32], b: &[f32]) -> f32 {
+    use core::arch::x86_64::*;
+    let len = a.len().min(b.len());
+    let mut i = 0;
+    let mut acc_dot = _mm512_setzero_ps();
+    let mut acc_na = _mm512_setzero_ps();
+    let mut acc_nb = _mm512_setzero_ps();
+
+    while i + 16 <= len {
+        let va = _mm512_loadu_ps(a.as_ptr().add(i));
+        let vb = _mm512_loadu_ps(b.as_ptr().add(i));
+        acc_dot = _mm512_fmadd_ps(va, vb, acc_dot);
+        acc_na = _mm512_fmadd_ps(va, va, acc_na);
+        acc_nb = _mm512_fmadd_ps(vb, vb, acc_nb);
+        i += 16;
+    }
+
+    let mut dot = hsum512_ps(acc_dot);
+    let mut na = hsum512_ps(acc_na);
+    let mut nb = hsum512_ps(acc_nb);
+
+    while i < len {
+        let x = *a.get_unchecked(i);
+        let y = *b.get_unchecked(i);
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+        i += 1;
+    }
+
+    let norm = (na * nb).sqrt();
+    if norm == 0.0 {
+        1.0
+    } else {
+        (1.0 - (dot / norm)).max(0.0)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 #[allow(unsafe_op_in_unsafe_fn)]
 unsafe fn dot_product_avx2(a: &[f32], b: &[f32]) -> f32 {
@@ -209,11 +385,14 @@ unsafe fn l2_f32_u8_avx2(query: &[f32], u8_data: &[u8], min_val: f32, scale: f32
     sum
 }
 
-/// Computes SIMD-accelerated dot product of two float vectors with runtime AVX2 detection.
+/// Computes SIMD-accelerated dot product of two float vectors with runtime AVX-512 / AVX2 detection.
 #[inline]
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
+        if is_x86_feature_detected!("avx512f") {
+            return unsafe { dot_product_avx512(a, b) };
+        }
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return unsafe { dot_product_avx2(a, b) };
         }
@@ -240,11 +419,14 @@ fn dot_product_portable(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
-/// Computes SIMD-accelerated squared L2 Euclidean distance with runtime AVX2 detection.
+/// Computes SIMD-accelerated squared L2 Euclidean distance with runtime AVX-512 / AVX2 detection.
 #[inline]
 pub fn l2_distance_sq(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
+        if is_x86_feature_detected!("avx512f") {
+            return unsafe { l2_distance_sq_avx512(a, b) };
+        }
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             return unsafe { l2_distance_sq_avx2(a, b) };
         }
@@ -273,22 +455,58 @@ fn l2_distance_sq_portable(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+/// Computes SIMD-accelerated Cosine distance in a single pass with runtime AVX-512 / AVX2 detection.
+#[inline]
+pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx512f") {
+            return unsafe { cosine_distance_avx512(a, b) };
+        }
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { cosine_distance_avx2(a, b) };
+        }
+    }
+    cosine_distance_portable(a, b)
+}
+
+#[inline]
+fn cosine_distance_portable(a: &[f32], b: &[f32]) -> f32 {
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    let (chunks_a, rem_a) = a.as_chunks::<8>();
+    let (chunks_b, rem_b) = b.as_chunks::<8>();
+
+    for (ca, cb) in chunks_a.iter().zip(chunks_b.iter()) {
+        for i in 0..8 {
+            let x = ca[i];
+            let y = cb[i];
+            dot += x * y;
+            na += x * x;
+            nb += y * y;
+        }
+    }
+    for (va, vb) in rem_a.iter().zip(rem_b.iter()) {
+        dot += va * vb;
+        na += va * va;
+        nb += vb * vb;
+    }
+    let norm = (na * nb).sqrt();
+    if norm == 0.0 {
+        1.0
+    } else {
+        (1.0 - (dot / norm)).max(0.0)
+    }
+}
+
 /// Computes vector distance according to selected metric.
 #[inline]
 pub fn compute_distance(a: &[f32], b: &[f32], metric: VectorMetric) -> f32 {
     match metric {
         VectorMetric::L2 => l2_distance_sq(a, b).sqrt(),
         VectorMetric::IP => -dot_product(a, b),
-        VectorMetric::Cosine => {
-            let dot = dot_product(a, b);
-            let norm_a = dot_product(a, a).sqrt();
-            let norm_b = dot_product(b, b).sqrt();
-            if norm_a == 0.0 || norm_b == 0.0 {
-                1.0
-            } else {
-                (1.0 - (dot / (norm_a * norm_b))).max(0.0)
-            }
-        }
+        VectorMetric::Cosine => cosine_distance(a, b),
     }
 }
 
@@ -1110,5 +1328,51 @@ mod tests {
         let res = index.search(&query, 1);
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].0, Bytes::from("doc_pos"));
+    }
+
+    #[test]
+    fn test_simd_distance_acceleration_parity() {
+        // Test high-dimensional vector (e.g. 64-dim)
+        let a: Vec<f32> = (0..64).map(|i| (i as f32 * 0.1).sin()).collect();
+        let b: Vec<f32> = (0..64).map(|i| (i as f32 * 0.1 + 0.5).cos()).collect();
+
+        // 1. Dot product
+        let dot_simd = dot_product(&a, &b);
+        let dot_port = dot_product_portable(&a, &b);
+        assert!(
+            (dot_simd - dot_port).abs() < 1e-4,
+            "dot_simd ({}) vs dot_port ({}) mismatch",
+            dot_simd,
+            dot_port
+        );
+
+        // 2. L2 distance squared
+        let l2_simd = l2_distance_sq(&a, &b);
+        let l2_port = l2_distance_sq_portable(&a, &b);
+        assert!(
+            (l2_simd - l2_port).abs() < 1e-4,
+            "l2_simd ({}) vs l2_port ({}) mismatch",
+            l2_simd,
+            l2_port
+        );
+
+        // 3. Cosine distance
+        let cos_simd = cosine_distance(&a, &b);
+        let cos_port = cosine_distance_portable(&a, &b);
+        assert!(
+            (cos_simd - cos_port).abs() < 1e-4,
+            "cos_simd ({}) vs cos_port ({}) mismatch",
+            cos_simd,
+            cos_port
+        );
+
+        // 4. Distance metrics via compute_distance
+        let d_cos = compute_distance(&a, &b, VectorMetric::Cosine);
+        let d_l2 = compute_distance(&a, &b, VectorMetric::L2);
+        let d_ip = compute_distance(&a, &b, VectorMetric::IP);
+
+        assert!((d_cos - cos_simd).abs() < 1e-4);
+        assert!((d_l2 - l2_simd.sqrt()).abs() < 1e-4);
+        assert!((d_ip - (-dot_simd)).abs() < 1e-4);
     }
 }

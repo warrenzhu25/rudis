@@ -8225,3 +8225,126 @@ fn test_redisearch_on_json_secondary_index_e2e() {
         "+OK\r\n"
     );
 }
+
+#[test]
+fn test_simd_vector_distance_acceleration_hnsw_e2e() {
+    let port = 16774;
+    let num_shards = 2;
+    start_test_server(port, num_shards);
+
+    let mut client =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect client");
+    client
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+
+    // 1. Ingest 16-dimensional vectors into HNSW index
+    // doc_a: mostly along axis 0
+    let v_a = "1.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0";
+    assert_eq!(
+        send_and_read(
+            &mut client,
+            format!("VADD simd_idx doc_a {}\r\n", v_a).as_bytes()
+        ),
+        "+OK\r\n"
+    );
+
+    // doc_b: mostly along axis 1
+    let v_b = "0.0 1.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0";
+    assert_eq!(
+        send_and_read(
+            &mut client,
+            format!("VADD simd_idx doc_b {}\r\n", v_b).as_bytes()
+        ),
+        "+OK\r\n"
+    );
+
+    // doc_c: close to doc_a (0.95 on axis 0, 0.05 on axis 1)
+    let v_c = "0.95 0.05 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0";
+    assert_eq!(
+        send_and_read(
+            &mut client,
+            format!("VADD simd_idx doc_c {}\r\n", v_c).as_bytes()
+        ),
+        "+OK\r\n"
+    );
+
+    // doc_d: close to doc_b (0.05 on axis 0, 0.95 on axis 1)
+    let v_d = "0.05 0.95 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0";
+    assert_eq!(
+        send_and_read(
+            &mut client,
+            format!("VADD simd_idx doc_d {}\r\n", v_d).as_bytes()
+        ),
+        "+OK\r\n"
+    );
+
+    // 2. Query top-2 nearest neighbors to doc_a
+    let q_a = "1.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0";
+    let query_res = send_and_read(
+        &mut client,
+        format!("VQUERY simd_idx 2 {}\r\n", q_a).as_bytes(),
+    );
+    assert!(
+        query_res.starts_with("*4\r\n"),
+        "Expected 2 key-dist pairs, got: {}",
+        query_res
+    );
+    assert!(query_res.contains("doc_a"));
+    assert!(query_res.contains("doc_c"));
+
+    // 3. VSIM across metrics
+    // Cosine distance between doc_a and doc_c (small distance)
+    let sim_ac = send_and_read(&mut client, b"VSIM simd_idx doc_a doc_c COSINE\r\n");
+    assert!(sim_ac.starts_with('$'));
+    let dist_ac: f32 = sim_ac
+        .lines()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .expect("Parsed float distance");
+    assert!(dist_ac < 0.05, "Expected close distance, got: {}", dist_ac);
+
+    // Cosine distance between doc_a and doc_b (orthogonal -> ~1.0)
+    let sim_ab = send_and_read(&mut client, b"VSIM simd_idx doc_a doc_b COSINE\r\n");
+    let dist_ab: f32 = sim_ab
+        .lines()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .expect("Parsed float distance");
+    assert!(
+        (dist_ab - 1.0).abs() < 0.05,
+        "Expected orthogonal ~1.0 distance, got: {}",
+        dist_ab
+    );
+
+    // L2 Euclidean distance between doc_a and doc_b (~sqrt(2) = 1.414)
+    let sim_l2 = send_and_read(&mut client, b"VSIM simd_idx doc_a doc_b L2\r\n");
+    let dist_l2: f32 = sim_l2
+        .lines()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .expect("Parsed float distance");
+    assert!(
+        (dist_l2 - std::f32::consts::SQRT_2).abs() < 0.05,
+        "Expected L2 sqrt(2), got: {}",
+        dist_l2
+    );
+
+    // 4. VDEL doc_a
+    assert_eq!(
+        send_and_read(&mut client, b"VDEL simd_idx doc_a\r\n"),
+        ":1\r\n"
+    );
+
+    // 5. Query after deletion: doc_c should now be the top-1 result
+    let query_after_del = send_and_read(
+        &mut client,
+        format!("VQUERY simd_idx 1 {}\r\n", q_a).as_bytes(),
+    );
+    assert!(query_after_del.contains("doc_c"));
+    assert!(!query_after_del.contains("doc_a"));
+
+    // 6. VINFO verification
+    let info = send_and_read(&mut client, b"VINFO simd_idx\r\n");
+    assert!(info.starts_with("*8\r\n"));
+}
