@@ -1932,7 +1932,7 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
     }
 }
 
-pub fn cmd_keys(cmd: &Command) -> Vec<&[u8]> {
+pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
     match cmd {
         Command::Get(k)
         | Command::IncrBy(k, _)
@@ -1952,7 +1952,7 @@ pub fn cmd_keys(cmd: &Command) -> Vec<&[u8]> {
         | Command::Strlen(k)
         | Command::Expiretime(k, _)
         | Command::Dump(k)
-        | Command::Xlen(k) => vec![k.as_ref()],
+        | Command::Xlen(k) => f(k.as_ref()),
 
         Command::Set { key, .. }
         | Command::Hget { key, .. }
@@ -2072,7 +2072,7 @@ pub fn cmd_keys(cmd: &Command) -> Vec<&[u8]> {
         | Command::TopkAdd { key, .. }
         | Command::TopkQuery { key, .. }
         | Command::TopkList(key)
-        | Command::TopkInfo(key) => vec![key.as_ref()],
+        | Command::TopkInfo(key) => f(key.as_ref()),
 
         Command::Smove {
             source,
@@ -2089,41 +2089,58 @@ pub fn cmd_keys(cmd: &Command) -> Vec<&[u8]> {
             destination,
             ..
         } => {
-            vec![source.as_ref(), destination.as_ref()]
+            f(source.as_ref());
+            f(destination.as_ref());
         }
         Command::Sort { key, store, .. } => {
+            f(key.as_ref());
             if let Some(dest) = store {
-                vec![key.as_ref(), dest.as_ref()]
-            } else {
-                vec![key.as_ref()]
+                f(dest.as_ref());
             }
         }
 
         Command::Mget(keys) | Command::Del(keys) | Command::Exists(keys) | Command::Touch(keys) => {
-            keys.iter().map(|k| k.as_ref()).collect()
+            for k in keys {
+                f(k.as_ref());
+            }
         }
-        Command::Pfcount { keys } => keys.iter().map(|k| k.as_ref()).collect(),
+        Command::Pfcount { keys } => {
+            for k in keys {
+                f(k.as_ref());
+            }
+        }
         Command::Xread { keys, .. } | Command::Xreadgroup { keys, .. } => {
-            keys.iter().map(|k| k.as_ref()).collect()
+            for k in keys {
+                f(k.as_ref());
+            }
         }
         Command::Blpop { keys, .. }
         | Command::Brpop { keys, .. }
         | Command::Bzpopmin { keys, .. }
         | Command::Bzpopmax { keys, .. }
         | Command::Zmpop { keys, .. }
-        | Command::Bzmpop { keys, .. } => keys.iter().map(|k| k.as_ref()).collect(),
+        | Command::Bzmpop { keys, .. } => {
+            for k in keys {
+                f(k.as_ref());
+            }
+        }
         Command::Sinter(keys)
         | Command::Sunion(keys)
         | Command::Sdiff(keys)
         | Command::Sintercard { keys, .. }
         | Command::Sunioncard { keys, .. }
-        | Command::Sdiffcard { keys, .. } => keys.iter().map(|k| k.as_ref()).collect(),
+        | Command::Sdiffcard { keys, .. } => {
+            for k in keys {
+                f(k.as_ref());
+            }
+        }
         Command::Sinterstore { destination, keys }
         | Command::Sunionstore { destination, keys }
         | Command::Sdiffstore { destination, keys } => {
-            let mut v = vec![destination.as_ref()];
-            v.extend(keys.iter().map(|k| k.as_ref()));
-            v
+            f(destination.as_ref());
+            for k in keys {
+                f(k.as_ref());
+            }
         }
         Command::Zunionstore {
             destination, keys, ..
@@ -2132,47 +2149,65 @@ pub fn cmd_keys(cmd: &Command) -> Vec<&[u8]> {
             destination, keys, ..
         }
         | Command::Zdiffstore { destination, keys } => {
-            let mut v = vec![destination.as_ref()];
-            v.extend(keys.iter().map(|k| k.as_ref()));
-            v
+            f(destination.as_ref());
+            for k in keys {
+                f(k.as_ref());
+            }
         }
         Command::Zdiff { keys, .. }
         | Command::Zinter { keys, .. }
         | Command::Zunion { keys, .. }
-        | Command::Zintercard { keys, .. } => keys.iter().map(|k| k.as_ref()).collect(),
+        | Command::Zintercard { keys, .. } => {
+            for k in keys {
+                f(k.as_ref());
+            }
+        }
 
         Command::Mset(pairs) | Command::Msetnx(pairs) | Command::Msetex { pairs, .. } => {
-            pairs.iter().map(|(k, _)| k.as_ref()).collect()
+            for (k, _) in pairs {
+                f(k.as_ref());
+            }
         }
 
         Command::Lcs { key1, key2, .. } => {
-            vec![key1.as_ref(), key2.as_ref()]
+            f(key1.as_ref());
+            f(key2.as_ref());
         }
 
         Command::Digest(key) => {
-            vec![key.as_ref()]
+            f(key.as_ref());
         }
 
         Command::Rename { key, newkey, .. } => {
-            vec![key.as_ref(), newkey.as_ref()]
+            f(key.as_ref());
+            f(newkey.as_ref());
         }
 
         Command::Bitop {
             destkey, srckeys, ..
         }
         | Command::Pfmerge { destkey, srckeys } => {
-            let mut v = vec![destkey.as_ref()];
-            v.extend(srckeys.iter().map(|k| k.as_ref()));
-            v
+            f(destkey.as_ref());
+            for k in srckeys {
+                f(k.as_ref());
+            }
         }
 
-        Command::Hmget { key, .. } | Command::Hdel { key, .. } => vec![key.as_ref()],
+        Command::Hmget { key, .. } | Command::Hdel { key, .. } => f(key.as_ref()),
         Command::Eval { keys, .. } | Command::Evalsha { keys, .. } => {
-            keys.iter().map(|k| k.as_ref()).collect()
+            for k in keys {
+                f(k.as_ref());
+            }
         }
 
-        _ => Vec::new(),
+        _ => {}
     }
+}
+
+pub fn cmd_keys(cmd: &Command) -> Vec<&[u8]> {
+    let mut v = Vec::new();
+    for_each_cmd_key(cmd, |k| v.push(k));
+    v
 }
 
 async fn migrate_keys_to_node(
@@ -8086,8 +8121,10 @@ pub fn execute_local_command(
     macro_rules! record_change {
         ($cmd_expr:expr) => {
             DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            for k in cmd_keys($cmd_expr) {
-                touch_watched_key(db.port, k.as_ref());
+            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                for_each_cmd_key($cmd_expr, |k| {
+                    touch_watched_key(db.port, k);
+                });
             }
             let need_aof = aof.is_some();
             let need_rep = crate::replication::has_connected_replicas(db.port);
@@ -8453,7 +8490,7 @@ pub fn execute_local_command(
             false
         }
         Command::IncrBy(key, delta) => {
-            match db.incr_by(key.clone(), *delta) {
+            match db.incr_by_slice(key.as_ref(), *delta) {
                 Ok(val) => {
                     record_change!(cmd);
                     write_resp_integer(out, val);
@@ -12162,57 +12199,64 @@ async fn execute_commands_squashed(
                 can_squash = false;
                 break;
             }
-            let cmd_keys_list = cmd_keys(cmd);
             if let Some(user) = &user {
                 let cmd_name = get_cmd_name(cmd);
                 if !user.can_execute_command(cmd_name) {
                     can_squash = false;
                     break;
                 }
-                if cmd_keys_list.iter().any(|k| !user.can_access_key(k)) {
+                let mut forbidden = false;
+                for_each_cmd_key(cmd, |k| {
+                    if !user.can_access_key(k) {
+                        forbidden = true;
+                    }
+                });
+                if forbidden {
                     can_squash = false;
                     break;
                 }
             }
-            if !cmd_keys_list.is_empty() {
-                let is_cluster = router.cluster_enabled;
-                if is_cluster && cmd_keys_list.len() > 1 {
-                    let first_slot = key_slot(cmd_keys_list[0]);
-                    if cmd_keys_list[1..].iter().any(|k| key_slot(k) != first_slot) {
-                        can_squash = false;
-                        break;
-                    }
-                }
+            let is_cluster = router.cluster_enabled || my_slots_guard.is_some();
+            if is_cluster {
+                let mut first_slot: Option<u16> = None;
                 let mut invalid_slot = false;
-                for k in &cmd_keys_list {
+                let mut has_keys = false;
+                for_each_cmd_key(cmd, |k| {
+                    has_keys = true;
                     let slot = key_slot(k);
+                    if let Some(fs) = first_slot {
+                        if fs != slot {
+                            invalid_slot = true;
+                        }
+                    } else {
+                        first_slot = Some(slot);
+                    }
                     if router.slot_states.borrow()[slot as usize] != crate::shard::SlotState::Stable
                     {
                         invalid_slot = true;
-                        break;
                     }
                     if let Some(my_slots) = &my_slots_guard {
                         let owns_slot = my_slots.iter().any(|&(s, e)| slot >= s && slot <= e);
                         if !owns_slot {
                             invalid_slot = true;
-                            break;
                         }
                     }
-                }
+                });
                 if invalid_slot {
                     can_squash = false;
                     break;
                 }
-            } else if !matches!(
-                cmd,
-                Command::Ping(_)
-                    | Command::CommandDocs
-                    | Command::Quit
-                    | Command::Time
-                    | Command::Echo(_)
-            ) {
-                can_squash = false;
-                break;
+                if !has_keys && !matches!(
+                    cmd,
+                    Command::Ping(_)
+                        | Command::CommandDocs
+                        | Command::Quit
+                        | Command::Time
+                        | Command::Echo(_)
+                ) {
+                    can_squash = false;
+                    break;
+                }
             }
         }
     }
@@ -12295,6 +12339,50 @@ async fn execute_commands_squashed(
                         .table
                         .set(key, value, expire_in);
                     local_buf.extend_from_slice(b"+OK\r\n");
+                } else if router.aof.is_none()
+                    && !crate::replication::has_connected_replicas(router.port)
+                    && let Command::IncrBy(ref key, delta) = cmd
+                {
+                    has_local_writes = true;
+                    match router
+                        .local_db
+                        .borrow_mut()
+                        .table
+                        .incr_by_slice(key.as_ref(), delta)
+                    {
+                        Ok(val) => {
+                            DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                touch_watched_key(router.port, key.as_ref());
+                            }
+                            write_resp_integer(&mut local_buf, val);
+                        }
+                        Err(err) => {
+                            write_resp_err(&mut local_buf, err);
+                        }
+                    }
+                } else if let Command::Exists(ref keys) = cmd && keys.len() == 1 {
+                    let exists = router.local_db.borrow_mut().exists(keys[0].as_ref());
+                    if exists {
+                        local_buf.extend_from_slice(b":1\r\n");
+                    } else {
+                        local_buf.extend_from_slice(b":0\r\n");
+                    }
+                } else if router.aof.is_none()
+                    && !crate::replication::has_connected_replicas(router.port)
+                    && let Command::Del(ref keys) = cmd && keys.len() == 1
+                {
+                    let deleted = router.local_db.borrow_mut().del(keys[0].as_ref());
+                    if deleted {
+                        has_local_writes = true;
+                        DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                            touch_watched_key(router.port, keys[0].as_ref());
+                        }
+                        local_buf.extend_from_slice(b":1\r\n");
+                    } else {
+                        local_buf.extend_from_slice(b":0\r\n");
+                    }
                 } else {
                     if matches!(
                         cmd,

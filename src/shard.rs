@@ -484,6 +484,11 @@ impl ShardDb {
     }
 
     #[inline]
+    pub fn incr_by_slice(&mut self, key: &[u8], delta: i64) -> Result<i64, &'static str> {
+        self.table.incr_by_slice(key, delta)
+    }
+
+    #[inline]
     pub fn incr_by(&mut self, key: Bytes, delta: i64) -> Result<i64, String> {
         self.table.incr_by(key, delta)
     }

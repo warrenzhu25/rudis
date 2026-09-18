@@ -1735,9 +1735,9 @@ impl RudisTable {
         }
     }
 
-    pub fn incr_by(&mut self, key: Bytes, delta: i64) -> Result<i64, String> {
-        let h = hash_key(&key);
-        let (existing, _) = self.table.find_or_prepare_insert(&key, h);
+    pub fn incr_by_slice(&mut self, key: &[u8], delta: i64) -> Result<i64, &'static str> {
+        let h = hash_key(key);
+        let (existing, candidate_idx) = self.table.find_or_prepare_insert(key, h);
         if let Some(idx) = existing {
             let was_exp = self.check_expired_slot(idx);
             if !was_exp && let Some(entry) = self.table.get_slot_mut(idx) {
@@ -1745,23 +1745,22 @@ impl RudisTable {
                     RudisValue::Int(n) => {
                         let nv = n
                             .checked_add(delta)
-                            .ok_or_else(|| "increment or decrement would overflow".to_string())?;
+                            .ok_or("increment or decrement would overflow")?;
                         *n = nv;
                         return Ok(nv);
                     }
                     RudisValue::String(b) => {
                         let current = Self::parse_i64_bytes(b)
-                            .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                            .ok_or("value is not an integer or out of range")?;
                         let nv = current
                             .checked_add(delta)
-                            .ok_or_else(|| "increment or decrement would overflow".to_string())?;
+                            .ok_or("increment or decrement would overflow")?;
                         entry.val = RudisValue::Int(nv);
                         return Ok(nv);
                     }
                     _ => {
                         return Err(
-                            "WRONGTYPE Operation against a key holding the wrong kind of value"
-                                .to_string(),
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
                         );
                     }
                 }
@@ -1770,12 +1769,19 @@ impl RudisTable {
 
         let new_val = delta;
         let entry = RudisEntry {
-            key,
+            key: Bytes::copy_from_slice(key),
             val: RudisValue::Int(new_val),
             expire_at: None,
         };
-        self.table.insert(entry);
+        self.table.insert_prepared(entry, h, candidate_idx);
+        self.used_memory += key.len() + 8 + 64;
         Ok(new_val)
+    }
+
+    #[inline]
+    pub fn incr_by(&mut self, key: Bytes, delta: i64) -> Result<i64, String> {
+        self.incr_by_slice(key.as_ref(), delta)
+            .map_err(|e| e.to_string())
     }
 
     pub fn expire(&mut self, key: &[u8], duration: Duration) -> bool {
