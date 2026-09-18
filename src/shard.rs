@@ -702,6 +702,17 @@ impl ShardDb {
         self.table.lrange(key, start, stop)
     }
 
+    #[inline(always)]
+    pub fn write_lrange_resp(
+        &mut self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+        out: &mut Vec<u8>,
+    ) -> Result<(), &'static str> {
+        self.table.write_lrange_resp(key, start, stop, out)
+    }
+
     #[inline]
     pub fn ltrim(&mut self, key: &[u8], start: i64, stop: i64) -> Result<(), &'static str> {
         self.table.ltrim(key, start, stop)
@@ -937,6 +948,17 @@ impl ShardDb {
         opts: &crate::table::ZRangeOpts,
     ) -> Result<Vec<(Bytes, f64)>, &'static str> {
         self.table.zrange(key, opts)
+    }
+
+    #[inline(always)]
+    pub fn write_zrange_resp(
+        &mut self,
+        key: &[u8],
+        opts: &crate::table::ZRangeOpts,
+        is_resp3: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<(), &'static str> {
+        self.table.write_zrange_resp(key, opts, is_resp3, out)
     }
 
     #[inline]

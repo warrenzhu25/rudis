@@ -8963,18 +8963,8 @@ pub fn execute_local_command(
             false
         }
         Command::Lrange { key, start, stop } => {
-            match db.lrange(key, *start, *stop) {
-                Ok(items) => {
-                    out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
-                    for v in items {
-                        out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                        out.extend_from_slice(&v);
-                        out.extend_from_slice(b"\r\n");
-                    }
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
+            if let Err(err) = db.write_lrange_resp(key.as_ref(), *start, *stop, out) {
+                write_resp_err(out, err);
             }
             false
         }
@@ -9350,35 +9340,9 @@ pub fn execute_local_command(
             false
         }
         Command::Zrange { key, opts } => {
-            match db.zrange(key, opts) {
-                Ok(items) => {
-                    if opts.with_scores {
-                        if CURRENT_CLIENT_RESP3.get() {
-                            out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
-                            for (m, s) in items {
-                                out.extend_from_slice(b"*2\r\n");
-                                write_resp_bulk(out, &m);
-                                write_resp_score(out, s);
-                            }
-                        } else {
-                            out.extend_from_slice(format!("*{}\r\n", items.len() * 2).as_bytes());
-                            for (m, s) in items {
-                                write_resp_bulk(out, &m);
-                                write_resp_score(out, s);
-                            }
-                        }
-                    } else {
-                        out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
-                        for (m, _) in items {
-                            out.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
-                            out.extend_from_slice(&m);
-                            out.extend_from_slice(b"\r\n");
-                        }
-                    }
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
+            let is_resp3 = CURRENT_CLIENT_RESP3.get();
+            if let Err(err) = db.write_zrange_resp(key.as_ref(), opts, is_resp3, out) {
+                write_resp_err(out, err);
             }
             false
         }
@@ -12474,6 +12438,15 @@ async fn execute_commands_squashed(
                         Err(err) => {
                             write_resp_err(&mut local_buf, err);
                         }
+                    }
+                } else if let Command::Lrange { ref key, start, stop } = cmd {
+                    if let Err(err) = router.local_db.borrow_mut().write_lrange_resp(key.as_ref(), start, stop, &mut local_buf) {
+                        write_resp_err(&mut local_buf, err);
+                    }
+                } else if let Command::Zrange { ref key, ref opts } = cmd {
+                    let is_resp3 = CURRENT_CLIENT_RESP3.get();
+                    if let Err(err) = router.local_db.borrow_mut().write_zrange_resp(key.as_ref(), opts, is_resp3, &mut local_buf) {
+                        write_resp_err(&mut local_buf, err);
                     }
                 } else {
                     if matches!(

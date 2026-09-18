@@ -696,6 +696,14 @@ pub fn run_shard_worker(
                                                 crate::connection::write_resp_err(&mut temp_buf, err);
                                             }
                                         }
+                                    } else if let Command::Lrange { ref key, start, stop } = cmd {
+                                        if let Err(err) = r.local_db.borrow_mut().write_lrange_resp(key.as_ref(), start, stop, &mut temp_buf) {
+                                            crate::connection::write_resp_err(&mut temp_buf, err);
+                                        }
+                                    } else if let Command::Zrange { ref key, ref opts } = cmd {
+                                        if let Err(err) = r.local_db.borrow_mut().write_zrange_resp(key.as_ref(), opts, is_resp3, &mut temp_buf) {
+                                            crate::connection::write_resp_err(&mut temp_buf, err);
+                                        }
                                     } else {
                                         if matches!(cmd, Command::Set { .. } | Command::Del(_) | Command::IncrBy { .. }) {
                                             has_writes = true;
@@ -871,6 +879,14 @@ pub fn run_shard_worker(
                                         Err(err) => {
                                             crate::connection::write_resp_err(&mut temp_buf, err);
                                         }
+                                    }
+                                } else if let Command::Lrange { ref key, start, stop } = cmd {
+                                    if let Err(err) = db.write_lrange_resp(key.as_ref(), start, stop, &mut temp_buf) {
+                                        crate::connection::write_resp_err(&mut temp_buf, err);
+                                    }
+                                } else if let Command::Zrange { ref key, ref opts } = cmd {
+                                    if let Err(err) = db.write_zrange_resp(key.as_ref(), opts, is_resp3, &mut temp_buf) {
+                                        crate::connection::write_resp_err(&mut temp_buf, err);
                                     }
                                 } else {
                                     if matches!(cmd, Command::Set { .. } | Command::Del(_) | Command::IncrBy { .. }) {

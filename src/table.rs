@@ -1521,6 +1521,15 @@ impl RudisTable {
     }
 
     #[inline]
+    fn expire_slot(&mut self, slot_idx: usize) {
+        if let Some(removed) = self.table.remove(slot_idx) {
+            let freed = removed.key.len() + removed.val.approx_bytes() + 64;
+            self.used_memory = self.used_memory.saturating_sub(freed);
+            inc_expired_keys();
+        }
+    }
+
+    #[inline]
     fn check_expired_slot(&mut self, slot_idx: usize) -> bool {
         if crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed) {
             return false;
@@ -1536,11 +1545,7 @@ impl RudisTable {
         };
 
         if is_exp {
-            if let Some(removed) = self.table.remove(slot_idx) {
-                let freed = removed.key.len() + removed.val.approx_bytes() + 64;
-                self.used_memory = self.used_memory.saturating_sub(freed);
-                inc_expired_keys();
-            }
+            self.expire_slot(slot_idx);
             true
         } else {
             false
@@ -3694,6 +3699,60 @@ impl RudisTable {
         }
     }
 
+    pub fn write_lrange_resp(
+        &mut self,
+        key: &[u8],
+        mut start: i64,
+        mut stop: i64,
+        out: &mut Vec<u8>,
+    ) -> Result<(), &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h)
+            && let Some(entry) = self.table.get_slot(idx)
+        {
+            if let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+                crate::connection::write_resp_array_header(out, 0);
+                return Ok(());
+            }
+            match &entry.val {
+                RudisValue::List(deque) => {
+                    let n = deque.len() as i64;
+                    if n == 0 {
+                        crate::connection::write_resp_array_header(out, 0);
+                        return Ok(());
+                    }
+                    if start < 0 {
+                        start = (n + start).max(0);
+                    }
+                    if stop < 0 {
+                        stop += n;
+                    }
+                    if start > stop || start >= n {
+                        crate::connection::write_resp_array_header(out, 0);
+                        return Ok(());
+                    }
+                    let start_u = start.max(0) as usize;
+                    let stop_u = (stop.min(n - 1) as usize).max(start_u);
+                    let count = stop_u - start_u + 1;
+                    crate::connection::write_resp_array_header(out, count);
+                    for i in start_u..=stop_u {
+                        if let Some(v) = deque.get(i) {
+                            crate::connection::write_resp_bulk(out, v);
+                        }
+                    }
+                    return Ok(());
+                }
+                _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+            }
+        }
+        crate::connection::write_resp_array_header(out, 0);
+        Ok(())
+    }
+
     pub fn ltrim(&mut self, key: &[u8], mut start: i64, mut stop: i64) -> Result<(), &'static str> {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
@@ -5496,6 +5555,177 @@ impl RudisTable {
         } else {
             Ok(Vec::new())
         }
+    }
+
+    pub fn write_zrange_resp(
+        &mut self,
+        key: &[u8],
+        opts: &ZRangeOpts,
+        is_resp3: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<(), &'static str> {
+        if opts.by_score || opts.by_lex {
+            let items = self.zrange(key, opts)?;
+            if opts.with_scores {
+                if is_resp3 {
+                    crate::connection::write_resp_array_header(out, items.len());
+                    for (m, s) in items {
+                        out.extend_from_slice(b"*2\r\n");
+                        crate::connection::write_resp_bulk(out, &m);
+                        crate::connection::write_resp_score(out, s);
+                    }
+                } else {
+                    crate::connection::write_resp_array_header(out, items.len() * 2);
+                    for (m, s) in items {
+                        crate::connection::write_resp_bulk(out, &m);
+                        crate::connection::write_resp_score(out, s);
+                    }
+                }
+            } else {
+                crate::connection::write_resp_array_header(out, items.len());
+                for (m, _) in items {
+                    crate::connection::write_resp_bulk(out, &m);
+                }
+            }
+            return Ok(());
+        }
+
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h)
+            && let Some(entry) = self.table.get_slot(idx)
+        {
+            if let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+                crate::connection::write_resp_array_header(out, 0);
+                return Ok(());
+            }
+            match &entry.val {
+                RudisValue::ZSet(zset) => {
+                    let n = zset.len();
+                    if n == 0 {
+                        crate::connection::write_resp_array_header(out, 0);
+                        return Ok(());
+                    }
+                    let mut start = opts.start;
+                    let mut stop = opts.stop;
+                    let n_i = n as i64;
+                    if start < 0 {
+                        start = (n_i + start).max(0);
+                    }
+                    if stop < 0 {
+                        stop += n_i;
+                    }
+                    if start > stop || start >= n_i {
+                        crate::connection::write_resp_array_header(out, 0);
+                        return Ok(());
+                    }
+                    let start_u = start.max(0) as usize;
+                    let stop_u = (stop.min(n_i - 1) as usize).max(start_u);
+                    let limit = stop_u - start_u + 1;
+
+                    if opts.with_scores {
+                        if is_resp3 {
+                            crate::connection::write_resp_array_header(out, limit);
+                            match zset {
+                                RudisZSet::Small(v) => {
+                                    if opts.rev {
+                                        for (OrderedScore(s), m) in v.iter().rev().skip(start_u).take(limit) {
+                                            out.extend_from_slice(b"*2\r\n");
+                                            crate::connection::write_resp_bulk(out, m);
+                                            crate::connection::write_resp_score(out, *s);
+                                        }
+                                    } else {
+                                        for (OrderedScore(s), m) in v.iter().skip(start_u).take(limit) {
+                                            out.extend_from_slice(b"*2\r\n");
+                                            crate::connection::write_resp_bulk(out, m);
+                                            crate::connection::write_resp_score(out, *s);
+                                        }
+                                    }
+                                }
+                                RudisZSet::Full { tree, .. } => {
+                                    if opts.rev {
+                                        for (OrderedScore(s), m) in tree.iter().rev().skip(start_u).take(limit) {
+                                            out.extend_from_slice(b"*2\r\n");
+                                            crate::connection::write_resp_bulk(out, m);
+                                            crate::connection::write_resp_score(out, *s);
+                                        }
+                                    } else {
+                                        for (OrderedScore(s), m) in tree.iter().skip(start_u).take(limit) {
+                                            out.extend_from_slice(b"*2\r\n");
+                                            crate::connection::write_resp_bulk(out, m);
+                                            crate::connection::write_resp_score(out, *s);
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            crate::connection::write_resp_array_header(out, limit * 2);
+                            match zset {
+                                RudisZSet::Small(v) => {
+                                    if opts.rev {
+                                        for (OrderedScore(s), m) in v.iter().rev().skip(start_u).take(limit) {
+                                            crate::connection::write_resp_bulk(out, m);
+                                            crate::connection::write_resp_score(out, *s);
+                                        }
+                                    } else {
+                                        for (OrderedScore(s), m) in v.iter().skip(start_u).take(limit) {
+                                            crate::connection::write_resp_bulk(out, m);
+                                            crate::connection::write_resp_score(out, *s);
+                                        }
+                                    }
+                                }
+                                RudisZSet::Full { tree, .. } => {
+                                    if opts.rev {
+                                        for (OrderedScore(s), m) in tree.iter().rev().skip(start_u).take(limit) {
+                                            crate::connection::write_resp_bulk(out, m);
+                                            crate::connection::write_resp_score(out, *s);
+                                        }
+                                    } else {
+                                        for (OrderedScore(s), m) in tree.iter().skip(start_u).take(limit) {
+                                            crate::connection::write_resp_bulk(out, m);
+                                            crate::connection::write_resp_score(out, *s);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        crate::connection::write_resp_array_header(out, limit);
+                        match zset {
+                            RudisZSet::Small(v) => {
+                                if opts.rev {
+                                    for (_, m) in v.iter().rev().skip(start_u).take(limit) {
+                                        crate::connection::write_resp_bulk(out, m);
+                                    }
+                                } else {
+                                    for (_, m) in v.iter().skip(start_u).take(limit) {
+                                        crate::connection::write_resp_bulk(out, m);
+                                    }
+                                }
+                            }
+                            RudisZSet::Full { tree, .. } => {
+                                if opts.rev {
+                                    for (_, m) in tree.iter().rev().skip(start_u).take(limit) {
+                                        crate::connection::write_resp_bulk(out, m);
+                                    }
+                                } else {
+                                    for (_, m) in tree.iter().skip(start_u).take(limit) {
+                                        crate::connection::write_resp_bulk(out, m);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+            }
+        }
+        crate::connection::write_resp_array_header(out, 0);
+        Ok(())
     }
 
     pub fn zrangestore(
