@@ -604,6 +604,98 @@ pub fn run_shard_worker(
                                         } else {
                                             temp_buf.extend_from_slice(b":0\r\n");
                                         }
+                                    } else if let Command::Hget { ref key, ref field } = cmd {
+                                        match r.local_db.borrow_mut().hget(key.as_ref(), field.as_ref()) {
+                                            Ok(Some(v)) => crate::connection::write_resp_bulk(&mut temp_buf, &v),
+                                            Ok(None) => crate::connection::write_resp_null(&mut temp_buf),
+                                            Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
+                                        }
+                                    } else if aof_ref.is_none()
+                                        && !crate::replication::has_connected_replicas(r.port)
+                                        && let Command::Hset { ref key, ref fields } = cmd
+                                    {
+                                        has_writes = true;
+                                        match r.local_db.borrow_mut().table.hset_slice(key.as_ref(), fields) {
+                                            Ok(count) => {
+                                                crate::connection::DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                                if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                                    crate::connection::touch_watched_key(r.port, key.as_ref());
+                                                }
+                                                crate::connection::write_resp_integer(&mut temp_buf, count as i64);
+                                            }
+                                            Err(err) => {
+                                                crate::connection::write_resp_err(&mut temp_buf, err);
+                                            }
+                                        }
+                                    } else if let Command::Sismember { ref key, ref member } = cmd {
+                                        match r.local_db.borrow_mut().sismember(key.as_ref(), member.as_ref()) {
+                                            Ok(true) => temp_buf.extend_from_slice(b":1\r\n"),
+                                            Ok(false) => temp_buf.extend_from_slice(b":0\r\n"),
+                                            Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
+                                        }
+                                    } else if aof_ref.is_none()
+                                        && !crate::replication::has_connected_replicas(r.port)
+                                        && let Command::Sadd { ref key, ref members } = cmd
+                                    {
+                                        has_writes = true;
+                                        match r.local_db.borrow_mut().table.sadd_slice(key.as_ref(), members) {
+                                            Ok(count) => {
+                                                crate::connection::DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                                if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                                    crate::connection::touch_watched_key(r.port, key.as_ref());
+                                                }
+                                                crate::connection::write_resp_integer(&mut temp_buf, count as i64);
+                                            }
+                                            Err(err) => {
+                                                crate::connection::write_resp_err(&mut temp_buf, err);
+                                            }
+                                        }
+                                    } else if aof_ref.is_none()
+                                        && !crate::replication::has_connected_replicas(r.port)
+                                        && !crate::block::has_blocked_waiters(r.port)
+                                        && let Command::Lpush { ref key, ref values } = cmd
+                                    {
+                                        has_writes = true;
+                                        match r.local_db.borrow_mut().table.lpush_slice(key.as_ref(), values) {
+                                            Ok(len) => {
+                                                crate::connection::DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                                if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                                    crate::connection::touch_watched_key(r.port, key.as_ref());
+                                                }
+                                                crate::connection::write_resp_integer(&mut temp_buf, len as i64);
+                                            }
+                                            Err(err) => {
+                                                crate::connection::write_resp_err(&mut temp_buf, err);
+                                            }
+                                        }
+                                    } else if aof_ref.is_none()
+                                        && !crate::replication::has_connected_replicas(r.port)
+                                        && let Command::Lpop { ref key, count } = cmd
+                                    {
+                                        match r.local_db.borrow_mut().table.lpop(key.as_ref(), count.unwrap_or(1)) {
+                                            Ok(vals) => {
+                                                if !vals.is_empty() {
+                                                    has_writes = true;
+                                                    crate::connection::DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                                    if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                                        crate::connection::touch_watched_key(r.port, key.as_ref());
+                                                    }
+                                                }
+                                                if count.is_some() {
+                                                    crate::connection::write_resp_array_header(&mut temp_buf, vals.len());
+                                                    for v in &vals {
+                                                        crate::connection::write_resp_bulk(&mut temp_buf, v);
+                                                    }
+                                                } else if let Some(v) = vals.first() {
+                                                    crate::connection::write_resp_bulk(&mut temp_buf, v);
+                                                } else {
+                                                    crate::connection::write_resp_null(&mut temp_buf);
+                                                }
+                                            }
+                                            Err(err) => {
+                                                crate::connection::write_resp_err(&mut temp_buf, err);
+                                            }
+                                        }
                                     } else {
                                         if matches!(cmd, Command::Set { .. } | Command::Del(_) | Command::IncrBy { .. }) {
                                             has_writes = true;
@@ -687,6 +779,98 @@ pub fn run_shard_worker(
                                         temp_buf.extend_from_slice(b":1\r\n");
                                     } else {
                                         temp_buf.extend_from_slice(b":0\r\n");
+                                    }
+                                } else if let Command::Hget { ref key, ref field } = cmd {
+                                    match db.hget(key.as_ref(), field.as_ref()) {
+                                        Ok(Some(v)) => crate::connection::write_resp_bulk(&mut temp_buf, &v),
+                                        Ok(None) => crate::connection::write_resp_null(&mut temp_buf),
+                                        Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
+                                    }
+                                } else if aof_ref.is_none()
+                                    && !crate::replication::has_connected_replicas(cross_shard_router.port)
+                                    && let Command::Hset { ref key, ref fields } = cmd
+                                {
+                                    has_writes = true;
+                                    match db.table.hset_slice(key.as_ref(), fields) {
+                                        Ok(count) => {
+                                            crate::connection::DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                                crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
+                                            }
+                                            crate::connection::write_resp_integer(&mut temp_buf, count as i64);
+                                        }
+                                        Err(err) => {
+                                            crate::connection::write_resp_err(&mut temp_buf, err);
+                                        }
+                                    }
+                                } else if let Command::Sismember { ref key, ref member } = cmd {
+                                    match db.sismember(key.as_ref(), member.as_ref()) {
+                                        Ok(true) => temp_buf.extend_from_slice(b":1\r\n"),
+                                        Ok(false) => temp_buf.extend_from_slice(b":0\r\n"),
+                                        Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
+                                    }
+                                } else if aof_ref.is_none()
+                                    && !crate::replication::has_connected_replicas(cross_shard_router.port)
+                                    && let Command::Sadd { ref key, ref members } = cmd
+                                {
+                                    has_writes = true;
+                                    match db.table.sadd_slice(key.as_ref(), members) {
+                                        Ok(count) => {
+                                            crate::connection::DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                                crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
+                                            }
+                                            crate::connection::write_resp_integer(&mut temp_buf, count as i64);
+                                        }
+                                        Err(err) => {
+                                            crate::connection::write_resp_err(&mut temp_buf, err);
+                                        }
+                                    }
+                                } else if aof_ref.is_none()
+                                    && !crate::replication::has_connected_replicas(cross_shard_router.port)
+                                    && !crate::block::has_blocked_waiters(cross_shard_router.port)
+                                    && let Command::Lpush { ref key, ref values } = cmd
+                                {
+                                    has_writes = true;
+                                    match db.table.lpush_slice(key.as_ref(), values) {
+                                        Ok(len) => {
+                                            crate::connection::DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                                crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
+                                            }
+                                            crate::connection::write_resp_integer(&mut temp_buf, len as i64);
+                                        }
+                                        Err(err) => {
+                                            crate::connection::write_resp_err(&mut temp_buf, err);
+                                        }
+                                    }
+                                } else if aof_ref.is_none()
+                                    && !crate::replication::has_connected_replicas(cross_shard_router.port)
+                                    && let Command::Lpop { ref key, count } = cmd
+                                {
+                                    match db.table.lpop(key.as_ref(), count.unwrap_or(1)) {
+                                        Ok(vals) => {
+                                            if !vals.is_empty() {
+                                                has_writes = true;
+                                                crate::connection::DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                                if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                                    crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
+                                                }
+                                            }
+                                            if count.is_some() {
+                                                crate::connection::write_resp_array_header(&mut temp_buf, vals.len());
+                                                for v in &vals {
+                                                    crate::connection::write_resp_bulk(&mut temp_buf, v);
+                                                }
+                                            } else if let Some(v) = vals.first() {
+                                                crate::connection::write_resp_bulk(&mut temp_buf, v);
+                                            } else {
+                                                crate::connection::write_resp_null(&mut temp_buf);
+                                            }
+                                        }
+                                        Err(err) => {
+                                            crate::connection::write_resp_err(&mut temp_buf, err);
+                                        }
                                     }
                                 } else {
                                     if matches!(cmd, Command::Set { .. } | Command::Del(_) | Command::IncrBy { .. }) {
