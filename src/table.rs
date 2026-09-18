@@ -725,12 +725,34 @@ impl RudisSet {
     pub fn contains(&self, member: &[u8]) -> bool {
         match self {
             RudisSet::Small(v) => {
-                for m in v {
-                    if m.as_ref() == member {
-                        return true;
+                let m_len = member.len();
+                match v.len() {
+                    0 => false,
+                    1 => v[0].len() == m_len && v[0].as_ref() == member,
+                    2 => {
+                        (v[0].len() == m_len && v[0].as_ref() == member)
+                            || (v[1].len() == m_len && v[1].as_ref() == member)
+                    }
+                    3 => {
+                        (v[0].len() == m_len && v[0].as_ref() == member)
+                            || (v[1].len() == m_len && v[1].as_ref() == member)
+                            || (v[2].len() == m_len && v[2].as_ref() == member)
+                    }
+                    4 => {
+                        (v[0].len() == m_len && v[0].as_ref() == member)
+                            || (v[1].len() == m_len && v[1].as_ref() == member)
+                            || (v[2].len() == m_len && v[2].as_ref() == member)
+                            || (v[3].len() == m_len && v[3].as_ref() == member)
+                    }
+                    _ => {
+                        for m in v {
+                            if m.len() == m_len && m.as_ref() == member {
+                                return true;
+                            }
+                        }
+                        false
                     }
                 }
-                false
             }
             RudisSet::Full(s) => s.contains(member),
         }
@@ -740,8 +762,9 @@ impl RudisSet {
         match self {
             RudisSet::Small(v) => {
                 let m_bytes = member.as_ref();
+                let m_len = m_bytes.len();
                 for m in v.iter() {
-                    if m.as_ref() == m_bytes {
+                    if m.len() == m_len && m.as_ref() == m_bytes {
                         return false;
                     }
                 }
@@ -1062,33 +1085,77 @@ pub fn fingerprint(hash: u64) -> u8 {
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn match_control_bytes_simd(ptr: *const u8, target: u8) -> u16 {
+unsafe fn probe_group_match_or_empty(ptr: *const u8, tag: u8) -> (u16, u16) {
     use std::arch::x86_64::*;
     unsafe {
         let group = _mm_loadu_si128(ptr as *const __m128i);
-        let match_target = _mm_set1_epi8(target as i8);
-        let cmp = _mm_cmpeq_epi8(group, match_target);
-        _mm_movemask_epi8(cmp) as u16
+        let tag_target = _mm_set1_epi8(tag as i8);
+        let empty_target = _mm_set1_epi8(EMPTY as i8);
+        let match_cmp = _mm_cmpeq_epi8(group, tag_target);
+        let empty_cmp = _mm_cmpeq_epi8(group, empty_target);
+        (
+            _mm_movemask_epi8(match_cmp) as u16,
+            _mm_movemask_epi8(empty_cmp) as u16,
+        )
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn probe_group_match_del_empty(ptr: *const u8, tag: u8) -> (u16, u16, u16) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let group = _mm_loadu_si128(ptr as *const __m128i);
+        let tag_target = _mm_set1_epi8(tag as i8);
+        let del_target = _mm_set1_epi8(DELETED as i8);
+        let empty_target = _mm_set1_epi8(EMPTY as i8);
+        let match_cmp = _mm_cmpeq_epi8(group, tag_target);
+        let del_cmp = _mm_cmpeq_epi8(group, del_target);
+        let empty_cmp = _mm_cmpeq_epi8(group, empty_target);
+        (
+            _mm_movemask_epi8(match_cmp) as u16,
+            _mm_movemask_epi8(del_cmp) as u16,
+            _mm_movemask_epi8(empty_cmp) as u16,
+        )
     }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
-unsafe fn match_control_bytes_simd(ptr: *const u8, target: u8) -> u16 {
-    let mut mask = 0u16;
+unsafe fn probe_group_match_or_empty(ptr: *const u8, tag: u8) -> (u16, u16) {
+    let mut match_mask = 0u16;
+    let mut empty_mask = 0u16;
     for i in 0..16 {
-        unsafe {
-            if *ptr.add(i) == target {
-                mask |= 1 << i;
-            }
+        let b = *ptr.add(i);
+        if b == tag {
+            match_mask |= 1 << i;
+        }
+        if b == EMPTY {
+            empty_mask |= 1 << i;
         }
     }
-    mask
+    (match_mask, empty_mask)
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 #[inline(always)]
-fn match_control_bytes(ctrl: &[u8], offset: usize, target: u8) -> u16 {
-    unsafe { match_control_bytes_simd(ctrl.as_ptr().add(offset), target) }
+unsafe fn probe_group_match_del_empty(ptr: *const u8, tag: u8) -> (u16, u16, u16) {
+    let mut match_mask = 0u16;
+    let mut del_mask = 0u16;
+    let mut empty_mask = 0u16;
+    for i in 0..16 {
+        let b = *ptr.add(i);
+        if b == tag {
+            match_mask |= 1 << i;
+        }
+        if b == DELETED {
+            del_mask |= 1 << i;
+        }
+        if b == EMPTY {
+            empty_mask |= 1 << i;
+        }
+    }
+    (match_mask, del_mask, empty_mask)
 }
 
 /// A high-performance flat hash table utilizing 16-slot SIMD group probing
@@ -1140,7 +1207,9 @@ impl RudisFlatTable {
         let mut step = 0;
 
         loop {
-            let match_mask = match_control_bytes(&self.ctrl, idx, tag);
+            let (match_mask, empty_mask) = unsafe {
+                probe_group_match_or_empty(self.ctrl.as_ptr().add(idx), tag)
+            };
             let mut bits = match_mask;
             while bits != 0 {
                 let offset = bits.trailing_zeros() as usize;
@@ -1153,7 +1222,6 @@ impl RudisFlatTable {
                 bits &= bits - 1;
             }
 
-            let empty_mask = match_control_bytes(&self.ctrl, idx, EMPTY);
             if empty_mask != 0 {
                 return None;
             }
@@ -1172,7 +1240,9 @@ impl RudisFlatTable {
         let mut first_free: Option<usize> = None;
 
         loop {
-            let match_mask = match_control_bytes(&self.ctrl, idx, tag);
+            let (match_mask, del_mask, empty_mask) = unsafe {
+                probe_group_match_del_empty(self.ctrl.as_ptr().add(idx), tag)
+            };
             let mut bits = match_mask;
             while bits != 0 {
                 let offset = bits.trailing_zeros() as usize;
@@ -1185,15 +1255,11 @@ impl RudisFlatTable {
                 bits &= bits - 1;
             }
 
-            if first_free.is_none() {
-                let del_mask = match_control_bytes(&self.ctrl, idx, DELETED);
-                if del_mask != 0 {
-                    let offset = del_mask.trailing_zeros() as usize;
-                    first_free = Some((idx + offset) & self.mask);
-                }
+            if first_free.is_none() && del_mask != 0 {
+                let offset = del_mask.trailing_zeros() as usize;
+                first_free = Some((idx + offset) & self.mask);
             }
 
-            let empty_mask = match_control_bytes(&self.ctrl, idx, EMPTY);
             if empty_mask != 0 {
                 let free_idx = match first_free {
                     Some(f) => f,
@@ -1227,7 +1293,12 @@ impl RudisFlatTable {
 
     pub fn insert(&mut self, entry: RudisEntry) -> Option<RudisEntry> {
         if self.growth_left == 0 {
-            self.resize(self.capacity * 2);
+            let new_cap = if self.items * 2 < self.capacity && self.capacity > GROUP_SIZE {
+                self.capacity
+            } else {
+                self.capacity * 2
+            };
+            self.resize(new_cap);
         }
 
         let h = hash_key(&entry.key);
@@ -1238,8 +1309,10 @@ impl RudisFlatTable {
         } else {
             let tag = fingerprint(h);
             self.set_ctrl(insert_idx, tag);
-            let slot = crate::router::key_slot(&entry.key) as usize;
-            self.slot_counts[slot] += 1;
+            if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
+                let slot = crate::router::key_slot(&entry.key) as usize;
+                self.slot_counts[slot] += 1;
+            }
             self.slots[insert_idx] = Some(entry);
             self.items += 1;
             self.growth_left = self.growth_left.saturating_sub(1);
@@ -1255,8 +1328,10 @@ impl RudisFlatTable {
         }
         let tag = fingerprint(hash);
         self.set_ctrl(insert_idx, tag);
-        let slot = crate::router::key_slot(&entry.key) as usize;
-        self.slot_counts[slot] += 1;
+        if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
+            let slot = crate::router::key_slot(&entry.key) as usize;
+            self.slot_counts[slot] += 1;
+        }
         self.slots[insert_idx] = Some(entry);
         self.items += 1;
         self.growth_left = self.growth_left.saturating_sub(1);
@@ -1266,7 +1341,9 @@ impl RudisFlatTable {
         self.set_ctrl(slot_idx, DELETED);
         self.items -= 1;
         let entry = self.slots[slot_idx].take();
-        if let Some(ref e) = entry {
+        if let Some(ref e) = entry
+            && crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed)
+        {
             let slot = crate::router::key_slot(&e.key) as usize;
             self.slot_counts[slot] = self.slot_counts[slot].saturating_sub(1);
         }
@@ -1709,11 +1786,20 @@ impl RudisTable {
         self.used_memory += entry_mem;
     }
 
+    #[inline(always)]
     pub fn del(&mut self, key: &[u8]) -> bool {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
-            let was_exp = self.check_expired_slot(idx);
-            if was_exp {
+            if let Some(entry) = self.table.get_slot(idx)
+                && let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                if let Some(removed) = self.table.remove(idx) {
+                    let freed = removed.key.len() + removed.val.approx_bytes() + 64;
+                    self.used_memory = self.used_memory.saturating_sub(freed);
+                    inc_expired_keys();
+                }
                 return false;
             }
             if let Some(entry) = self.table.remove(idx) {
@@ -1726,13 +1812,26 @@ impl RudisTable {
         false
     }
 
+    #[inline(always)]
     pub fn exists(&mut self, key: &[u8]) -> bool {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h) {
-            !self.check_expired_slot(idx)
-        } else {
-            false
+        if let Some(idx) = self.table.find(key, h)
+            && let Some(entry) = self.table.get_slot(idx)
+        {
+            if let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                if let Some(removed) = self.table.remove(idx) {
+                    let freed = removed.key.len() + removed.val.approx_bytes() + 64;
+                    self.used_memory = self.used_memory.saturating_sub(freed);
+                    inc_expired_keys();
+                }
+                return false;
+            }
+            return true;
         }
+        false
     }
 
     pub fn incr_by_slice(&mut self, key: &[u8], delta: i64) -> Result<i64, &'static str> {

@@ -120,6 +120,8 @@ fn main() {
         let hub = rudis::cluster::get_cluster_hub(port);
         hub.cluster_enabled
             .store(true, std::sync::atomic::Ordering::Release);
+        rudis::cluster::HAS_ACTIVE_CLUSTER
+            .store(true, std::sync::atomic::Ordering::Release);
         hub.num_shards
             .store(num_shards, std::sync::atomic::Ordering::Release);
     }
