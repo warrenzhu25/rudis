@@ -7264,3 +7264,58 @@ fn test_extended_types_rdb_persistence_e2e() {
         ":1\r\n"
     );
 }
+
+#[test]
+fn test_geospatial_bounding_geohash_pruning_e2e() {
+    let port = 16745;
+    start_test_server(port, 1);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    assert_eq!(
+        send_and_read(
+            &mut client,
+            b"GEOADD Sicily 13.361389 38.115556 Palermo 15.087269 37.502669 Catania 12.496366 41.902782 Rome\r\n"
+        ),
+        ":3\r\n"
+    );
+
+    // 1. GEORADIUS: 100km around Palermo should return ONLY Palermo
+    let res_100 = send_and_read(
+        &mut client,
+        b"GEORADIUS Sicily 13.361389 38.115556 100 km\r\n",
+    );
+    assert!(res_100.contains("Palermo"));
+    assert!(!res_100.contains("Catania"));
+    assert!(!res_100.contains("Rome"));
+
+    // 2. GEORADIUS: 200km around Palermo should return Palermo and Catania, but NOT Rome
+    let res_200 = send_and_read(
+        &mut client,
+        b"GEORADIUS Sicily 13.361389 38.115556 200 km\r\n",
+    );
+    assert!(res_200.contains("Palermo"));
+    assert!(res_200.contains("Catania"));
+    assert!(!res_200.contains("Rome"));
+
+    // 3. GEORADIUSBYMEMBER: 100km from Palermo
+    let res_member = send_and_read(&mut client, b"GEORADIUSBYMEMBER Sicily Palermo 100 km\r\n");
+    assert!(res_member.contains("Palermo"));
+    assert!(!res_member.contains("Catania"));
+
+    // 4. GEOSEARCH by radius
+    let res_search_rad = send_and_read(
+        &mut client,
+        b"GEOSEARCH Sicily FROMLONLAT 13.361389 38.115556 BYRADIUS 100 km\r\n",
+    );
+    assert!(res_search_rad.contains("Palermo"));
+    assert!(!res_search_rad.contains("Catania"));
+
+    // 5. GEOSEARCH by box
+    let res_search_box = send_and_read(
+        &mut client,
+        b"GEOSEARCH Sicily FROMLONLAT 13.361389 38.115556 BYBOX 100 100 km\r\n",
+    );
+    assert!(res_search_box.contains("Palermo"));
+    assert!(!res_search_box.contains("Catania"));
+}

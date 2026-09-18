@@ -344,7 +344,20 @@ impl RudisZSet {
 
             let get_items: Box<dyn Iterator<Item = &(OrderedScore, Bytes)>> = match self {
                 RudisZSet::Small(v) => Box::new(v.iter().filter(filter_fn)),
-                RudisZSet::Full { tree, .. } => Box::new(tree.iter().filter(filter_fn)),
+                RudisZSet::Full { tree, .. } => Box::new(
+                    tree.range((
+                        std::ops::Bound::Included((OrderedScore(min), Bytes::new())),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .take_while(move |item| {
+                        if max_inc {
+                            item.0.0 <= max
+                        } else {
+                            item.0.0 < max
+                        }
+                    })
+                    .filter(filter_fn),
+                ),
             };
 
             if opts.rev {

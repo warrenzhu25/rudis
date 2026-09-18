@@ -11139,56 +11139,11 @@ pub fn execute_local_command(
             count,
             asc,
         } => {
-            let radius_meters = unit.to_meters(*radius);
-            let mut results = Vec::new();
-            let z_opts = crate::table::ZRangeOpts {
-                start: 0,
-                stop: -1,
-                with_scores: true,
-                ..Default::default()
-            };
-            if let Ok(pairs) = db.zrange(key, &z_opts) {
-                for (member, score) in pairs {
-                    let (m_lon, m_lat) = crate::geo::decode_geohash(score as u64);
-                    let dist = crate::geo::haversine_distance(*lon, *lat, m_lon, m_lat);
-                    if dist <= radius_meters {
-                        results.push(crate::geo::GeoItemResult {
-                            member,
-                            dist: if *withdist {
-                                Some(unit.from_meters(dist))
-                            } else {
-                                None
-                            },
-                            hash: if *withhash { Some(score as u64) } else { None },
-                            coord: if *withcoord {
-                                Some((m_lon, m_lat))
-                            } else {
-                                None
-                            },
-                        });
-                    }
-                }
-            }
-            if let Some(is_asc) = asc {
-                if *is_asc {
-                    results.sort_by(|a, b| {
-                        a.dist
-                            .unwrap_or(0.0)
-                            .partial_cmp(&b.dist.unwrap_or(0.0))
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                } else {
-                    results.sort_by(|a, b| {
-                        b.dist
-                            .unwrap_or(0.0)
-                            .partial_cmp(&a.dist.unwrap_or(0.0))
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                }
-            }
-            if let Some(c) = count {
-                results.truncate(*c);
-            }
+            let radius_m = unit.to_meters(*radius);
+            let shape = crate::geo::GeoSearchShape::Radius { radius_m };
+            let results = crate::geo::execute_geo_query(
+                db, key, *lon, *lat, shape, *unit, *withdist, *withhash, *withcoord, *count, *asc,
+            );
             let has_options = *withcoord || *withdist || *withhash;
             crate::geo::format_geo_results(out, &results, has_options);
             false
@@ -11207,58 +11162,12 @@ pub fn execute_local_command(
             match db.zscore(key, member) {
                 Ok(Some(score)) => {
                     let (center_lon, center_lat) = crate::geo::decode_geohash(score as u64);
-                    let radius_meters = unit.to_meters(*radius);
-                    let mut results = Vec::new();
-                    let z_opts = crate::table::ZRangeOpts {
-                        start: 0,
-                        stop: -1,
-                        with_scores: true,
-                        ..Default::default()
-                    };
-                    if let Ok(pairs) = db.zrange(key, &z_opts) {
-                        for (m, sc) in pairs {
-                            let (m_lon, m_lat) = crate::geo::decode_geohash(sc as u64);
-                            let dist = crate::geo::haversine_distance(
-                                center_lon, center_lat, m_lon, m_lat,
-                            );
-                            if dist <= radius_meters {
-                                results.push(crate::geo::GeoItemResult {
-                                    member: m,
-                                    dist: if *withdist {
-                                        Some(unit.from_meters(dist))
-                                    } else {
-                                        None
-                                    },
-                                    hash: if *withhash { Some(sc as u64) } else { None },
-                                    coord: if *withcoord {
-                                        Some((m_lon, m_lat))
-                                    } else {
-                                        None
-                                    },
-                                });
-                            }
-                        }
-                    }
-                    if let Some(is_asc) = asc {
-                        if *is_asc {
-                            results.sort_by(|a, b| {
-                                a.dist
-                                    .unwrap_or(0.0)
-                                    .partial_cmp(&b.dist.unwrap_or(0.0))
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            });
-                        } else {
-                            results.sort_by(|a, b| {
-                                b.dist
-                                    .unwrap_or(0.0)
-                                    .partial_cmp(&a.dist.unwrap_or(0.0))
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            });
-                        }
-                    }
-                    if let Some(c) = count {
-                        results.truncate(*c);
-                    }
+                    let radius_m = unit.to_meters(*radius);
+                    let shape = crate::geo::GeoSearchShape::Radius { radius_m };
+                    let results = crate::geo::execute_geo_query(
+                        db, key, center_lon, center_lat, shape, *unit, *withdist, *withhash,
+                        *withcoord, *count, *asc,
+                    );
                     let has_options = *withcoord || *withdist || *withhash;
                     crate::geo::format_geo_results(out, &results, has_options);
                 }
@@ -11299,76 +11208,32 @@ pub fn execute_local_command(
                 }
             };
 
-            let mut results = Vec::new();
-            let z_opts = crate::table::ZRangeOpts {
-                start: 0,
-                stop: -1,
-                with_scores: true,
-                ..Default::default()
+            let (shape, unit) = if let Some((rad, u)) = by_radius {
+                (
+                    crate::geo::GeoSearchShape::Radius {
+                        radius_m: u.to_meters(*rad),
+                    },
+                    *u,
+                )
+            } else if let Some((w, h, u)) = by_box {
+                (
+                    crate::geo::GeoSearchShape::Box {
+                        width_m: u.to_meters(*w),
+                        height_m: u.to_meters(*h),
+                    },
+                    *u,
+                )
+            } else {
+                (
+                    crate::geo::GeoSearchShape::Radius { radius_m: 0.0 },
+                    crate::geo::GeoUnit::Meters,
+                )
             };
-            if let Ok(pairs) = db.zrange(key, &z_opts) {
-                for (member, score) in pairs {
-                    let (m_lon, m_lat) = crate::geo::decode_geohash(score as u64);
-                    let dist_m =
-                        crate::geo::haversine_distance(center_lon, center_lat, m_lon, m_lat);
 
-                    let inside = if let Some((rad, u)) = by_radius {
-                        dist_m <= u.to_meters(*rad)
-                    } else if let Some((w, h, u)) = by_box {
-                        let w_m = u.to_meters(*w) / 2.0;
-                        let h_m = u.to_meters(*h) / 2.0;
-                        let dlat_m = (m_lat - center_lat).abs() * 111_320.0;
-                        let dlon_m = (m_lon - center_lon).abs()
-                            * 111_320.0
-                            * (center_lat.to_radians().cos());
-                        dlat_m <= h_m && dlon_m <= w_m
-                    } else {
-                        true
-                    };
-
-                    if inside {
-                        let dist_unit = by_radius
-                            .map(|(_, u)| u)
-                            .or_else(|| by_box.map(|(_, _, u)| u))
-                            .unwrap_or(crate::geo::GeoUnit::Meters);
-                        results.push(crate::geo::GeoItemResult {
-                            member,
-                            dist: if *withdist {
-                                Some(dist_unit.from_meters(dist_m))
-                            } else {
-                                None
-                            },
-                            hash: if *withhash { Some(score as u64) } else { None },
-                            coord: if *withcoord {
-                                Some((m_lon, m_lat))
-                            } else {
-                                None
-                            },
-                        });
-                    }
-                }
-            }
-
-            if let Some(is_asc) = asc {
-                if *is_asc {
-                    results.sort_by(|a, b| {
-                        a.dist
-                            .unwrap_or(0.0)
-                            .partial_cmp(&b.dist.unwrap_or(0.0))
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                } else {
-                    results.sort_by(|a, b| {
-                        b.dist
-                            .unwrap_or(0.0)
-                            .partial_cmp(&a.dist.unwrap_or(0.0))
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                }
-            }
-            if let Some(c) = count {
-                results.truncate(*c);
-            }
+            let results = crate::geo::execute_geo_query(
+                db, key, center_lon, center_lat, shape, unit, *withdist, *withhash, *withcoord,
+                *count, *asc,
+            );
             let has_options = *withcoord || *withdist || *withhash;
             crate::geo::format_geo_results(out, &results, has_options);
             false
