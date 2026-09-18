@@ -1492,6 +1492,20 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
                             count: None,
                         }));
                     }
+                    if cmd_bytes.eq_ignore_ascii_case(b"ZADD") && num_args == 4 {
+                        let (k_start, k_len) = offsets[1];
+                        let (s_start, s_len) = offsets[2];
+                        let (m_start, m_len) = offsets[3];
+                        if let Ok(score_str) = std::str::from_utf8(&frame[s_start..s_start + s_len])
+                            && let Ok(score) = score_str.parse::<f64>()
+                        {
+                            return Ok(Some(Command::Zadd {
+                                key: frame.slice(k_start..k_start + k_len),
+                                elements: vec![(score, frame.slice(m_start..m_start + m_len))],
+                                flags: crate::table::ZAddFlags::default(),
+                            }));
+                        }
+                    }
                     if cmd_bytes.eq_ignore_ascii_case(b"PING") && num_args == 1 {
                         return Ok(Some(Command::Ping(None)));
                     }

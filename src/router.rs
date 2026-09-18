@@ -860,12 +860,17 @@ impl Router {
     ) -> Arc<crate::mailbox::ScatterMgetDescriptor> {
         let mut pool = self.mget_desc_pool.borrow_mut();
         while let Some(desc) = pool.pop() {
-            if Arc::strong_count(&desc) == 1
-                && desc.results.len() >= total_keys
-                && desc.recycled_keys.len() >= self.num_shards
-            {
-                desc.reset(total_keys, pending_shards, notify);
-                return desc;
+            if desc.results.len() >= total_keys && desc.recycled_keys.len() >= self.num_shards {
+                for _ in 0..16 {
+                    if Arc::strong_count(&desc) == 1 {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+                if Arc::strong_count(&desc) == 1 {
+                    desc.reset(total_keys, pending_shards, notify);
+                    return desc;
+                }
             }
         }
         Arc::new(crate::mailbox::ScatterMgetDescriptor::new(
@@ -890,9 +895,17 @@ impl Router {
     ) -> Arc<crate::mailbox::ScatterMsetDescriptor> {
         let mut pool = self.mset_desc_pool.borrow_mut();
         while let Some(desc) = pool.pop() {
-            if Arc::strong_count(&desc) == 1 && desc.recycled_pairs.len() >= self.num_shards {
-                desc.reset(pending_shards, notify);
-                return desc;
+            if desc.recycled_pairs.len() >= self.num_shards {
+                for _ in 0..16 {
+                    if Arc::strong_count(&desc) == 1 {
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+                if Arc::strong_count(&desc) == 1 {
+                    desc.reset(pending_shards, notify);
+                    return desc;
+                }
             }
         }
         Arc::new(crate::mailbox::ScatterMsetDescriptor::new(
@@ -990,7 +1003,7 @@ impl Router {
 
         // Wait for all remote shards to complete their writes
         if descriptor.pending.load(Ordering::Acquire) != 0 {
-            for _ in 0..64 {
+            for _ in 0..256 {
                 std::hint::spin_loop();
                 if descriptor.pending.load(Ordering::Acquire) == 0 {
                     break;
@@ -1111,7 +1124,7 @@ impl Router {
         }
 
         if descriptor.pending.load(Ordering::Acquire) != 0 {
-            for _ in 0..64 {
+            for _ in 0..256 {
                 std::hint::spin_loop();
                 if descriptor.pending.load(Ordering::Acquire) == 0 {
                     break;

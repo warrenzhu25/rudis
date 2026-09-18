@@ -12403,7 +12403,16 @@ async fn execute_commands_squashed(
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                 touch_watched_key(router.port, key.as_ref());
                             }
-                            write_resp_integer(&mut local_buf, count as i64);
+                            if count == 1 {
+                                responses[idx] = crate::shard::CompactResp::INT_1;
+                            } else if count == 0 {
+                                responses[idx] = crate::shard::CompactResp::INT_0;
+                            } else {
+                                local_buf.clear();
+                                write_resp_integer(&mut local_buf, count as i64);
+                                responses[idx] = CompactResp::from_slice(&local_buf);
+                            }
+                            continue;
                         }
                         Err(err) => {
                             write_resp_err(&mut local_buf, err);
@@ -12446,7 +12455,58 @@ async fn execute_commands_squashed(
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                 touch_watched_key(router.port, key.as_ref());
                             }
-                            write_resp_integer(&mut local_buf, count as i64);
+                            if count == 1 {
+                                responses[idx] = crate::shard::CompactResp::INT_1;
+                            } else if count == 0 {
+                                responses[idx] = crate::shard::CompactResp::INT_0;
+                            } else {
+                                local_buf.clear();
+                                write_resp_integer(&mut local_buf, count as i64);
+                                responses[idx] = CompactResp::from_slice(&local_buf);
+                            }
+                            continue;
+                        }
+                        Err(err) => {
+                            write_resp_err(&mut local_buf, err);
+                        }
+                    }
+                } else if router.aof.is_none()
+                    && !crate::replication::has_connected_replicas(router.port)
+                    && let Command::Zadd {
+                        ref key,
+                        ref elements,
+                        flags,
+                    } = cmd
+                {
+                    has_local_writes = true;
+                    match router
+                        .local_db
+                        .borrow_mut()
+                        .zadd_slice(key.as_ref(), elements, flags)
+                    {
+                        Ok((count, incr_score)) => {
+                            DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                touch_watched_key(router.port, key.as_ref());
+                            }
+                            if flags.incr {
+                                local_buf.clear();
+                                if let Some(score) = incr_score {
+                                    write_resp_score(&mut local_buf, score);
+                                } else {
+                                    write_resp_null(&mut local_buf);
+                                }
+                                responses[idx] = CompactResp::from_slice(&local_buf);
+                            } else if count == 1 {
+                                responses[idx] = crate::shard::CompactResp::INT_1;
+                            } else if count == 0 {
+                                responses[idx] = crate::shard::CompactResp::INT_0;
+                            } else {
+                                local_buf.clear();
+                                write_resp_integer(&mut local_buf, count as i64);
+                                responses[idx] = CompactResp::from_slice(&local_buf);
+                            }
+                            continue;
                         }
                         Err(err) => {
                             write_resp_err(&mut local_buf, err);
