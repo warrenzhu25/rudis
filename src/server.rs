@@ -657,7 +657,14 @@ pub fn run_shard_worker(
                                                 if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                     crate::connection::touch_watched_key(r.port, key.as_ref());
                                                 }
-                                                crate::connection::write_resp_integer(&mut temp_buf, count as i64);
+                                                if count == 1 {
+                                                    results.push((idx, crate::shard::CompactResp::INT_1));
+                                                } else if count == 0 {
+                                                    results.push((idx, crate::shard::CompactResp::INT_0));
+                                                } else {
+                                                    results.push((idx, crate::shard::CompactResp::from_integer(count as i64)));
+                                                }
+                                                continue;
                                             }
                                             Err(err) => {
                                                 crate::connection::write_resp_err(&mut temp_buf, err);
@@ -1575,5 +1582,15 @@ mod tests {
         let fut = catch_unwind_async(async { 42 });
         let res = fut.await;
         assert_eq!(res.unwrap(), 42);
+    }
+
+    #[test]
+    fn test_sadd_compact_resp_encoding() {
+        assert_eq!(crate::shard::CompactResp::INT_1.as_slice(), b":1\r\n");
+        assert_eq!(crate::shard::CompactResp::INT_0.as_slice(), b":0\r\n");
+        assert_eq!(
+            crate::shard::CompactResp::from_integer(42).as_slice(),
+            b":42\r\n"
+        );
     }
 }

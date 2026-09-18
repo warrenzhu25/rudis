@@ -8620,3 +8620,28 @@ fn test_small_collection_arena_and_slice_dispatch_e2e() {
     assert!(info_resp.contains("used_memory:"));
     assert!(info_resp.contains("mem_allocator:"));
 }
+
+#[test]
+fn test_pipelined_cross_shard_sadd_compact_resp_e2e() {
+    let port = 16450;
+    start_test_server(port, 4);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    let mut pipeline = String::new();
+    for i in 0..100 {
+        pipeline.push_str(&format!("SADD set:k:{} m1\r\n", i));
+    }
+    client.write_all(pipeline.as_bytes()).unwrap();
+
+    let mut buf = vec![0u8; 100 * 4];
+    client.read_exact(&mut buf).unwrap();
+    let expected = ":1\r\n".repeat(100);
+    assert_eq!(&buf[..], expected.as_bytes());
+
+    // Re-inserting the same member should return :0\r\n for all keys
+    client.write_all(pipeline.as_bytes()).unwrap();
+    client.read_exact(&mut buf).unwrap();
+    let expected_zero = ":0\r\n".repeat(100);
+    assert_eq!(&buf[..], expected_zero.as_bytes());
+}
