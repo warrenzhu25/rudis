@@ -1894,9 +1894,8 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         Command::Smove { source, .. }
         | Command::Lmove { source, .. }
         | Command::Blmove { source, .. } => Some(source),
-        Command::Touch(keys) | Command::Del(keys) | Command::Exists(keys) | Command::Mget(keys) => {
-            keys.first()
-        }
+        Command::Touch(keys) | Command::Del(keys) | Command::Mget(keys) => keys.first(),
+        Command::Exists(keys) => keys.first(),
         Command::Pfcount { keys } => keys.first(),
         Command::Xread { keys, .. } | Command::Xreadgroup { keys, .. } => keys.first(),
         Command::Blpop { keys, .. }
@@ -2108,7 +2107,12 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
             }
         }
 
-        Command::Mget(keys) | Command::Del(keys) | Command::Exists(keys) | Command::Touch(keys) => {
+        Command::Mget(keys) | Command::Del(keys) | Command::Touch(keys) => {
+            for k in keys {
+                f(k.as_ref());
+            }
+        }
+        Command::Exists(keys) => {
             for k in keys {
                 f(k.as_ref());
             }
@@ -8043,9 +8047,10 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         {
             Some(target_shard(destkey, num_shards))
         }
-        Command::Touch(keys) | Command::Del(keys) | Command::Exists(keys) if keys.len() == 1 => {
+        Command::Touch(keys) | Command::Del(keys) if keys.len() == 1 => {
             Some(target_shard(&keys[0], num_shards))
         }
+        Command::Exists(keys) if keys.len() == 1 => Some(target_shard(&keys[0], num_shards)),
         Command::Mget(keys)
             if !keys.is_empty()
                 && keys

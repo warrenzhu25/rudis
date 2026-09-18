@@ -1,4 +1,5 @@
 use bytes::{Buf, Bytes, BytesMut};
+use smallvec::{SmallVec, smallvec};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -207,7 +208,7 @@ pub enum Command {
     },
     Digest(Bytes),
     Del(Vec<Bytes>),
-    Exists(Vec<Bytes>),
+    Exists(SmallVec<[Bytes; 1]>),
     IncrBy(Bytes, i64),
     Expire(Bytes, Duration),
     Persist(Bytes),
@@ -312,7 +313,7 @@ pub enum Command {
     // SET COMMANDS
     Sadd {
         key: Bytes,
-        members: Vec<Bytes>,
+        members: SmallVec<[Bytes; 1]>,
     },
     Srem {
         key: Bytes,
@@ -1482,7 +1483,7 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
                         let (m_start, m_len) = offsets[2];
                         return Ok(Some(Command::Sadd {
                             key: frame.slice(k_start..k_start + k_len),
-                            members: vec![frame.slice(m_start..m_start + m_len)],
+                            members: smallvec![frame.slice(m_start..m_start + m_len)],
                         }));
                     }
                     if cmd_bytes.eq_ignore_ascii_case(b"LPOP") && num_args == 2 {
@@ -1523,7 +1524,7 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
                 6 => {
                     if cmd_bytes.eq_ignore_ascii_case(b"EXISTS") && num_args == 2 {
                         let (k_start, k_len) = offsets[1];
-                        return Ok(Some(Command::Exists(vec![
+                        return Ok(Some(Command::Exists(smallvec![
                             frame.slice(k_start..k_start + k_len),
                         ])));
                     }
@@ -2162,7 +2163,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'exists' command".to_string());
             }
             args.remove(0);
-            Ok(Some(Command::Exists(args)))
+            Ok(Some(Command::Exists(SmallVec::from_vec(args))))
         }
         "INCR" => {
             if args.len() < 2 {
@@ -3225,7 +3226,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             Ok(Some(Command::Sadd {
                 key: args[1].clone(),
-                members: args[2..].to_vec(),
+                members: SmallVec::from_vec(args[2..].to_vec()),
             }))
         }
         "SREM" => {
@@ -8621,5 +8622,46 @@ mod tests {
         let mut buf = BytesMut::from("*1\r\n$7\r\nunknown\r\n");
         let cmd = parse_command(&mut buf).unwrap().unwrap();
         assert_eq!(cmd, Command::Unknown("UNKNOWN".to_string()));
+    }
+
+    #[test]
+    fn test_smallvec_exists_and_sadd_parsing() {
+        // Single-key EXISTS fast path
+        let mut buf = BytesMut::from("*2\r\n$6\r\nEXISTS\r\n$4\r\nmyk1\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        match cmd {
+            Command::Exists(keys) => {
+                assert_eq!(keys.len(), 1);
+                assert!(!keys.spilled());
+                assert_eq!(keys[0], Bytes::from_static(b"myk1"));
+            }
+            _ => panic!("Expected Exists command"),
+        }
+
+        // Single-member SADD fast path
+        let mut buf = BytesMut::from("*3\r\n$4\r\nSADD\r\n$4\r\nmyk1\r\n$4\r\nmbr1\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        match cmd {
+            Command::Sadd { key, members } => {
+                assert_eq!(key, Bytes::from_static(b"myk1"));
+                assert_eq!(members.len(), 1);
+                assert!(!members.spilled());
+                assert_eq!(members[0], Bytes::from_static(b"mbr1"));
+            }
+            _ => panic!("Expected Sadd command"),
+        }
+
+        // Multi-key EXISTS
+        let mut buf = BytesMut::from("*3\r\n$6\r\nEXISTS\r\n$2\r\nk1\r\n$2\r\nk2\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        match cmd {
+            Command::Exists(keys) => {
+                assert_eq!(keys.len(), 2);
+                assert!(keys.spilled());
+                assert_eq!(keys[0], Bytes::from_static(b"k1"));
+                assert_eq!(keys[1], Bytes::from_static(b"k2"));
+            }
+            _ => panic!("Expected Exists command"),
+        }
     }
 }

@@ -8645,3 +8645,32 @@ fn test_pipelined_cross_shard_sadd_compact_resp_e2e() {
     let expected_zero = ":0\r\n".repeat(100);
     assert_eq!(&buf[..], expected_zero.as_bytes());
 }
+
+#[test]
+fn test_smallvec_exists_and_sadd_e2e() {
+    let port = 16451;
+    start_test_server(port, 2);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    // 1. Single SADD and single EXISTS
+    assert_eq!(
+        send_and_read(&mut client, b"SADD myset alpha\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(send_and_read(&mut client, b"EXISTS myset\r\n"), ":1\r\n");
+    assert_eq!(send_and_read(&mut client, b"EXISTS nokey\r\n"), ":0\r\n");
+
+    // 2. Multi-key EXISTS
+    assert_eq!(
+        send_and_read(&mut client, b"EXISTS myset nokey\r\n"),
+        ":1\r\n"
+    );
+
+    // 3. Multi-member SADD
+    assert_eq!(
+        send_and_read(&mut client, b"SADD myset beta gamma\r\n"),
+        ":2\r\n"
+    );
+    assert_eq!(send_and_read(&mut client, b"SCARD myset\r\n"), ":3\r\n");
+}

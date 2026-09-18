@@ -11,6 +11,7 @@ crc16 = "0.4.0"
 flume = "0.12.0"
 hashbrown = "0.17.1"
 fxhash = "0.2.1"
+smallvec = "1.14"
 mimalloc = { version = "0.1.52", default-features = false }
 monoio = { version = "0.2.4", features = ["sync", "zero-copy"] }
 socket2 = { version = "0.6.5", features = ["all"] }
