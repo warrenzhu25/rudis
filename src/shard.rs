@@ -20,6 +20,38 @@ impl CompactResp {
         }
     }
 
+    pub const OK: Self = CompactResp::Small {
+        len: 5,
+        data: [
+            b'+', b'O', b'K', b'\r', b'\n', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0,
+        ],
+    };
+
+    pub const INT_0: Self = CompactResp::Small {
+        len: 4,
+        data: [
+            b':', b'0', b'\r', b'\n', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0,
+        ],
+    };
+
+    pub const INT_1: Self = CompactResp::Small {
+        len: 4,
+        data: [
+            b':', b'1', b'\r', b'\n', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0,
+        ],
+    };
+
+    pub const NULL: Self = CompactResp::Small {
+        len: 5,
+        data: [
+            b'$', b'-', b'1', b'\r', b'\n', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0,
+        ],
+    };
+
     #[inline(always)]
     pub fn from_slice(bytes: &[u8]) -> Self {
         let len = bytes.len();
@@ -544,7 +576,12 @@ impl ShardDb {
     }
 
     #[inline(always)]
-    pub fn write_hget_resp(&mut self, key: &[u8], field: &[u8], out: &mut Vec<u8>) -> Result<(), &'static str> {
+    pub fn write_hget_resp(
+        &mut self,
+        key: &[u8],
+        field: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), &'static str> {
         self.table.write_hget_resp(key, field, out)
     }
 
@@ -689,7 +726,12 @@ impl ShardDb {
     }
 
     #[inline(always)]
-    pub fn write_lpop_resp(&mut self, key: &[u8], count: Option<usize>, out: &mut Vec<u8>) -> Result<bool, &'static str> {
+    pub fn write_lpop_resp(
+        &mut self,
+        key: &[u8],
+        count: Option<usize>,
+        out: &mut Vec<u8>,
+    ) -> Result<bool, &'static str> {
         self.table.write_lpop_resp(key, count, out)
     }
 
@@ -805,7 +847,21 @@ impl ShardDb {
     }
 
     #[inline(always)]
-    pub fn write_sismember_resp(&mut self, key: &[u8], member: &[u8], out: &mut Vec<u8>) -> Result<(), &'static str> {
+    pub fn sismember_compact(
+        &mut self,
+        key: &[u8],
+        member: &[u8],
+    ) -> Result<CompactResp, &'static str> {
+        self.table.sismember_compact(key, member)
+    }
+
+    #[inline(always)]
+    pub fn write_sismember_resp(
+        &mut self,
+        key: &[u8],
+        member: &[u8],
+        out: &mut Vec<u8>,
+    ) -> Result<(), &'static str> {
         self.table.write_sismember_resp(key, member, out)
     }
 

@@ -57,12 +57,7 @@ impl ScatterMgetDescriptor {
     }
 
     #[inline(always)]
-    pub fn reset(
-        &self,
-        total_keys: usize,
-        pending_shards: usize,
-        notify: flume::Sender<()>,
-    ) {
+    pub fn reset(&self, total_keys: usize, pending_shards: usize, notify: flume::Sender<()>) {
         self.pending.store(pending_shards, Ordering::Release);
         unsafe {
             *self.notify.get() = notify;

@@ -36,11 +36,20 @@ pub fn slot_to_shard(slot: u16, num_shards: usize) -> usize {
     }
 }
 
-/// Calculates the target shard ID for a given key using CRC16 slot mapping.
-#[inline]
+/// Calculates the target shard ID for a given key.
+/// In Redis Cluster mode, uses CRC16 slot mapping.
+/// In standalone mode, uses high-performance 64-bit hashing for optimal key distribution across cores.
+#[inline(always)]
 pub fn target_shard(key: &[u8], num_shards: usize) -> usize {
-    let slot = key_slot(key);
-    slot_to_shard(slot, num_shards)
+    if num_shards <= 1 {
+        0
+    } else if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
+        let slot = key_slot(key);
+        slot_to_shard(slot, num_shards)
+    } else {
+        let tag = extract_hash_tag(key);
+        (crate::table::hash_key(tag) as usize) % num_shards
+    }
 }
 
 use std::sync::atomic::Ordering;
@@ -126,8 +135,12 @@ impl Router {
     }
 
     pub fn target_shard(&self, key: &[u8]) -> usize {
-        let slot = key_slot(key);
-        self.target_shard_for_slot(slot)
+        if self.cluster_enabled || crate::cluster::HAS_ACTIVE_CLUSTER.load(Ordering::Relaxed) {
+            let slot = key_slot(key);
+            self.target_shard_for_slot(slot)
+        } else {
+            target_shard(key, self.num_shards)
+        }
     }
 
     pub fn check_slot_redirection(
@@ -921,20 +934,16 @@ impl Router {
         let mut num_remote_shards = 0;
 
         // Partition local keys and remote keys without holding RefCell borrow across await
-        {
-            let owners = self.slot_owners.borrow();
-            for (idx, key) in keys.into_iter().enumerate() {
-                let slot = key_slot(&key);
-                let target = owners[slot as usize];
-                if target == self.shard_id {
-                    local_keys.push((idx, key));
-                } else {
-                    has_remote = true;
-                    if remote_batches[target].is_empty() {
-                        num_remote_shards += 1;
-                    }
-                    remote_batches[target].push((idx, key));
+        for (idx, key) in keys.into_iter().enumerate() {
+            let target = self.target_shard(&key);
+            if target == self.shard_id {
+                local_keys.push((idx, key));
+            } else {
+                has_remote = true;
+                if remote_batches[target].is_empty() {
+                    num_remote_shards += 1;
                 }
+                remote_batches[target].push((idx, key));
             }
         }
 
@@ -952,7 +961,8 @@ impl Router {
         }
 
         let (notify_tx, notify_rx) = self.acquire_notify_channel();
-        let descriptor = self.acquire_mget_descriptor(total_keys, num_remote_shards, notify_tx.clone());
+        let descriptor =
+            self.acquire_mget_descriptor(total_keys, num_remote_shards, notify_tx.clone());
 
         // Dispatch remote batches concurrently with direct scatter-gather shared memory
         for (target_shard, batch) in remote_batches.iter_mut().enumerate().take(self.num_shards) {
@@ -1031,20 +1041,16 @@ impl Router {
         let mut has_remote = false;
         let mut num_remote_shards = 0;
 
-        {
-            let owners = self.slot_owners.borrow();
-            for (k, v) in pairs {
-                let slot = key_slot(&k);
-                let target = owners[slot as usize];
-                if target == self.shard_id {
-                    local_batch.push((k, v));
-                } else {
-                    has_remote = true;
-                    if remote_batches[target].is_empty() {
-                        num_remote_shards += 1;
-                    }
-                    remote_batches[target].push((k, v));
+        for (k, v) in pairs {
+            let target = self.target_shard(&k);
+            if target == self.shard_id {
+                local_batch.push((k, v));
+            } else {
+                has_remote = true;
+                if remote_batches[target].is_empty() {
+                    num_remote_shards += 1;
                 }
+                remote_batches[target].push((k, v));
             }
         }
 
@@ -1144,17 +1150,13 @@ impl Router {
             (0..self.num_shards).map(|_| Vec::new()).collect();
         let mut has_remote = false;
 
-        {
-            let owners = self.slot_owners.borrow();
-            for (idx, key) in keys.into_iter().enumerate() {
-                let slot = key_slot(&key);
-                let target = owners[slot as usize];
-                if target == self.shard_id {
-                    local_keys.push((idx, key));
-                } else {
-                    has_remote = true;
-                    remote_batches[target].push((idx, key));
-                }
+        for (idx, key) in keys.into_iter().enumerate() {
+            let target = self.target_shard(&key);
+            if target == self.shard_id {
+                local_keys.push((idx, key));
+            } else {
+                has_remote = true;
+                remote_batches[target].push((idx, key));
             }
         }
 
@@ -1263,17 +1265,13 @@ impl Router {
             (0..self.num_shards).map(|_| Vec::new()).collect();
         let mut has_remote = false;
 
-        {
-            let owners = self.slot_owners.borrow();
-            for key in keys {
-                let slot = key_slot(&key);
-                let target = owners[slot as usize];
-                if target == self.shard_id {
-                    local_keys.push(key);
-                } else {
-                    has_remote = true;
-                    remote_batches[target].push(key);
-                }
+        for key in keys {
+            let target = self.target_shard(&key);
+            if target == self.shard_id {
+                local_keys.push(key);
+            } else {
+                has_remote = true;
+                remote_batches[target].push(key);
             }
         }
 
@@ -2778,7 +2776,8 @@ mod tests {
                     } => {
                         results.clear();
                         for (idx, _cmd) in items.drain(..) {
-                            results.push((idx, crate::shard::CompactResp::from_slice(b"+PONG\r\n")));
+                            results
+                                .push((idx, crate::shard::CompactResp::from_slice(b"+PONG\r\n")));
                         }
                         let _ = responder.send((items, results));
                     }

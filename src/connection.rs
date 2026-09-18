@@ -12222,14 +12222,16 @@ async fn execute_commands_squashed(
                     can_squash = false;
                     break;
                 }
-                if !has_keys && !matches!(
-                    cmd,
-                    Command::Ping(_)
-                        | Command::CommandDocs
-                        | Command::Quit
-                        | Command::Time
-                        | Command::Echo(_)
-                ) {
+                if !has_keys
+                    && !matches!(
+                        cmd,
+                        Command::Ping(_)
+                            | Command::CommandDocs
+                            | Command::Quit
+                            | Command::Time
+                            | Command::Echo(_)
+                    )
+                {
                     can_squash = false;
                     break;
                 }
@@ -12285,16 +12287,25 @@ async fn execute_commands_squashed(
                 local_buf.clear();
                 if let Command::Get(ref key) = cmd {
                     let has_tiering = router.local_db.borrow().tier_manager.is_some();
-                    if !router.local_db.borrow_mut().write_get_resp(key.as_ref(), &mut local_buf).unwrap_or(false) {
-                        if has_tiering && router.local_db.borrow_mut().table.is_tiered(key).is_some() {
+                    if !router
+                        .local_db
+                        .borrow_mut()
+                        .write_get_resp(key.as_ref(), &mut local_buf)
+                        .unwrap_or(false)
+                    {
+                        if has_tiering
+                            && router.local_db.borrow_mut().table.is_tiered(key).is_some()
+                        {
                             if let Some(v) = router.stream_cold_read_local(key).await {
                                 write_resp_bulk(&mut local_buf, &v);
+                                responses[idx] = CompactResp::from_slice(&local_buf);
                             } else {
-                                write_resp_null(&mut local_buf);
+                                responses[idx] = crate::shard::CompactResp::NULL;
                             }
                         } else {
-                            write_resp_null(&mut local_buf);
+                            responses[idx] = crate::shard::CompactResp::NULL;
                         }
+                        continue;
                     }
                 } else if router.aof.is_none()
                     && !crate::replication::has_connected_replicas(router.port)
@@ -12314,7 +12325,8 @@ async fn execute_commands_squashed(
                         .borrow_mut()
                         .table
                         .set(key, value, expire_in);
-                    local_buf.extend_from_slice(b"+OK\r\n");
+                    responses[idx] = crate::shard::CompactResp::OK;
+                    continue;
                 } else if router.aof.is_none()
                     && !crate::replication::has_connected_replicas(router.port)
                     && let Command::IncrBy(ref key, delta) = cmd
@@ -12337,16 +12349,20 @@ async fn execute_commands_squashed(
                             write_resp_err(&mut local_buf, err);
                         }
                     }
-                } else if let Command::Exists(ref keys) = cmd && keys.len() == 1 {
+                } else if let Command::Exists(ref keys) = cmd
+                    && keys.len() == 1
+                {
                     let exists = router.local_db.borrow_mut().exists(keys[0].as_ref());
-                    if exists {
-                        local_buf.extend_from_slice(b":1\r\n");
+                    responses[idx] = if exists {
+                        crate::shard::CompactResp::INT_1
                     } else {
-                        local_buf.extend_from_slice(b":0\r\n");
-                    }
+                        crate::shard::CompactResp::INT_0
+                    };
+                    continue;
                 } else if router.aof.is_none()
                     && !crate::replication::has_connected_replicas(router.port)
-                    && let Command::Del(ref keys) = cmd && keys.len() == 1
+                    && let Command::Del(ref keys) = cmd
+                    && keys.len() == 1
                 {
                     let deleted = router.local_db.borrow_mut().del(keys[0].as_ref());
                     if deleted {
@@ -12355,20 +12371,33 @@ async fn execute_commands_squashed(
                         if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                             touch_watched_key(router.port, keys[0].as_ref());
                         }
-                        local_buf.extend_from_slice(b":1\r\n");
+                        responses[idx] = crate::shard::CompactResp::INT_1;
                     } else {
-                        local_buf.extend_from_slice(b":0\r\n");
+                        responses[idx] = crate::shard::CompactResp::INT_0;
                     }
+                    continue;
                 } else if let Command::Hget { ref key, ref field } = cmd {
-                    if let Err(err) = router.local_db.borrow_mut().write_hget_resp(key.as_ref(), field.as_ref(), &mut local_buf) {
+                    if let Err(err) = router.local_db.borrow_mut().write_hget_resp(
+                        key.as_ref(),
+                        field.as_ref(),
+                        &mut local_buf,
+                    ) {
                         write_resp_err(&mut local_buf, err);
                     }
                 } else if router.aof.is_none()
                     && !crate::replication::has_connected_replicas(router.port)
-                    && let Command::Hset { ref key, ref fields } = cmd
+                    && let Command::Hset {
+                        ref key,
+                        ref fields,
+                    } = cmd
                 {
                     has_local_writes = true;
-                    match router.local_db.borrow_mut().table.hset_slice(key.as_ref(), fields) {
+                    match router
+                        .local_db
+                        .borrow_mut()
+                        .table
+                        .hset_slice(key.as_ref(), fields)
+                    {
                         Ok(count) => {
                             DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -12380,16 +12409,38 @@ async fn execute_commands_squashed(
                             write_resp_err(&mut local_buf, err);
                         }
                     }
-                } else if let Command::Sismember { ref key, ref member } = cmd {
-                    if let Err(err) = router.local_db.borrow_mut().write_sismember_resp(key.as_ref(), member.as_ref(), &mut local_buf) {
-                        write_resp_err(&mut local_buf, err);
+                } else if let Command::Sismember {
+                    ref key,
+                    ref member,
+                } = cmd
+                {
+                    match router
+                        .local_db
+                        .borrow_mut()
+                        .sismember_compact(key.as_ref(), member.as_ref())
+                    {
+                        Ok(resp) => {
+                            responses[idx] = resp;
+                            continue;
+                        }
+                        Err(err) => {
+                            write_resp_err(&mut local_buf, err);
+                        }
                     }
                 } else if router.aof.is_none()
                     && !crate::replication::has_connected_replicas(router.port)
-                    && let Command::Sadd { ref key, ref members } = cmd
+                    && let Command::Sadd {
+                        ref key,
+                        ref members,
+                    } = cmd
                 {
                     has_local_writes = true;
-                    match router.local_db.borrow_mut().table.sadd_slice(key.as_ref(), members) {
+                    match router
+                        .local_db
+                        .borrow_mut()
+                        .table
+                        .sadd_slice(key.as_ref(), members)
+                    {
                         Ok(count) => {
                             DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -12404,10 +12455,18 @@ async fn execute_commands_squashed(
                 } else if router.aof.is_none()
                     && !crate::replication::has_connected_replicas(router.port)
                     && !crate::block::has_blocked_waiters(router.port)
-                    && let Command::Lpush { ref key, ref values } = cmd
+                    && let Command::Lpush {
+                        ref key,
+                        ref values,
+                    } = cmd
                 {
                     has_local_writes = true;
-                    match router.local_db.borrow_mut().table.lpush_slice(key.as_ref(), values) {
+                    match router
+                        .local_db
+                        .borrow_mut()
+                        .table
+                        .lpush_slice(key.as_ref(), values)
+                    {
                         Ok(len) => {
                             DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -12423,7 +12482,11 @@ async fn execute_commands_squashed(
                     && !crate::replication::has_connected_replicas(router.port)
                     && let Command::Lpop { ref key, count } = cmd
                 {
-                    match router.local_db.borrow_mut().write_lpop_resp(key.as_ref(), count, &mut local_buf) {
+                    match router.local_db.borrow_mut().write_lpop_resp(
+                        key.as_ref(),
+                        count,
+                        &mut local_buf,
+                    ) {
                         Ok(has_pop) => {
                             if has_pop {
                                 has_local_writes = true;
@@ -12437,13 +12500,28 @@ async fn execute_commands_squashed(
                             write_resp_err(&mut local_buf, err);
                         }
                     }
-                } else if let Command::Lrange { ref key, start, stop } = cmd {
-                    if let Err(err) = router.local_db.borrow_mut().write_lrange_resp(key.as_ref(), start, stop, &mut local_buf) {
+                } else if let Command::Lrange {
+                    ref key,
+                    start,
+                    stop,
+                } = cmd
+                {
+                    if let Err(err) = router.local_db.borrow_mut().write_lrange_resp(
+                        key.as_ref(),
+                        start,
+                        stop,
+                        &mut local_buf,
+                    ) {
                         write_resp_err(&mut local_buf, err);
                     }
                 } else if let Command::Zrange { ref key, ref opts } = cmd {
                     let is_resp3 = CURRENT_CLIENT_RESP3.get();
-                    if let Err(err) = router.local_db.borrow_mut().write_zrange_resp(key.as_ref(), opts, is_resp3, &mut local_buf) {
+                    if let Err(err) = router.local_db.borrow_mut().write_zrange_resp(
+                        key.as_ref(),
+                        opts,
+                        is_resp3,
+                        &mut local_buf,
+                    ) {
                         write_resp_err(&mut local_buf, err);
                     }
                 } else {

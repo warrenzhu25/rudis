@@ -569,7 +569,8 @@ pub fn run_shard_worker(
                                     {
                                         has_writes = true;
                                         r.local_db.borrow_mut().table.set(key, value, expire_in);
-                                        temp_buf.extend_from_slice(b"+OK\r\n");
+                                        results.push((idx, crate::shard::CompactResp::OK));
+                                        continue;
                                     } else if aof_ref.is_none()
                                         && !crate::replication::has_connected_replicas(r.port)
                                         && let Command::IncrBy(ref key, delta) = cmd
@@ -589,11 +590,8 @@ pub fn run_shard_worker(
                                         }
                                     } else if let Command::Exists(ref keys) = cmd && keys.len() == 1 {
                                         let exists = r.local_db.borrow_mut().exists(keys[0].as_ref());
-                                        if exists {
-                                            temp_buf.extend_from_slice(b":1\r\n");
-                                        } else {
-                                            temp_buf.extend_from_slice(b":0\r\n");
-                                        }
+                                        results.push((idx, if exists { crate::shard::CompactResp::INT_1 } else { crate::shard::CompactResp::INT_0 }));
+                                        continue;
                                     } else if aof_ref.is_none()
                                         && !crate::replication::has_connected_replicas(r.port)
                                         && let Command::Del(ref keys) = cmd && keys.len() == 1
@@ -605,10 +603,11 @@ pub fn run_shard_worker(
                                             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                 crate::connection::touch_watched_key(r.port, keys[0].as_ref());
                                             }
-                                            temp_buf.extend_from_slice(b":1\r\n");
+                                            results.push((idx, crate::shard::CompactResp::INT_1));
                                         } else {
-                                            temp_buf.extend_from_slice(b":0\r\n");
+                                            results.push((idx, crate::shard::CompactResp::INT_0));
                                         }
+                                        continue;
                                     } else if let Command::Hget { ref key, ref field } = cmd {
                                         match r.local_db.borrow_mut().hget(key.as_ref(), field.as_ref()) {
                                             Ok(Some(v)) => crate::connection::write_resp_bulk(&mut temp_buf, &v),
@@ -633,9 +632,11 @@ pub fn run_shard_worker(
                                             }
                                         }
                                     } else if let Command::Sismember { ref key, ref member } = cmd {
-                                        match r.local_db.borrow_mut().sismember(key.as_ref(), member.as_ref()) {
-                                            Ok(true) => temp_buf.extend_from_slice(b":1\r\n"),
-                                            Ok(false) => temp_buf.extend_from_slice(b":0\r\n"),
+                                        match r.local_db.borrow_mut().sismember_compact(key.as_ref(), member.as_ref()) {
+                                            Ok(resp) => {
+                                                results.push((idx, resp));
+                                                continue;
+                                            }
                                             Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
                                         }
                                     } else if aof_ref.is_none()
@@ -734,7 +735,8 @@ pub fn run_shard_worker(
                                 temp_buf.clear();
                                 if let Command::Get(ref key) = cmd {
                                     if !db.write_get_resp(key.as_ref(), &mut temp_buf).unwrap_or(false) {
-                                        crate::connection::write_resp_null(&mut temp_buf);
+                                        results.push((idx, crate::shard::CompactResp::NULL));
+                                        continue;
                                     }
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
@@ -750,7 +752,8 @@ pub fn run_shard_worker(
                                 {
                                     has_writes = true;
                                     db.table.set(key, value, expire_in);
-                                    temp_buf.extend_from_slice(b"+OK\r\n");
+                                    results.push((idx, crate::shard::CompactResp::OK));
+                                    continue;
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
                                     && let Command::IncrBy(ref key, delta) = cmd
@@ -770,11 +773,8 @@ pub fn run_shard_worker(
                                     }
                                 } else if let Command::Exists(ref keys) = cmd && keys.len() == 1 {
                                     let exists = db.exists(keys[0].as_ref());
-                                    if exists {
-                                        temp_buf.extend_from_slice(b":1\r\n");
-                                    } else {
-                                        temp_buf.extend_from_slice(b":0\r\n");
-                                    }
+                                    results.push((idx, if exists { crate::shard::CompactResp::INT_1 } else { crate::shard::CompactResp::INT_0 }));
+                                    continue;
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
                                     && let Command::Del(ref keys) = cmd && keys.len() == 1
@@ -786,10 +786,11 @@ pub fn run_shard_worker(
                                         if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                             crate::connection::touch_watched_key(cross_shard_router.port, keys[0].as_ref());
                                         }
-                                        temp_buf.extend_from_slice(b":1\r\n");
+                                        results.push((idx, crate::shard::CompactResp::INT_1));
                                     } else {
-                                        temp_buf.extend_from_slice(b":0\r\n");
+                                        results.push((idx, crate::shard::CompactResp::INT_0));
                                     }
+                                    continue;
                                 } else if let Command::Hget { ref key, ref field } = cmd {
                                     if let Err(err) = db.write_hget_resp(key.as_ref(), field.as_ref(), &mut temp_buf) {
                                         crate::connection::write_resp_err(&mut temp_buf, err);
@@ -812,8 +813,12 @@ pub fn run_shard_worker(
                                         }
                                     }
                                 } else if let Command::Sismember { ref key, ref member } = cmd {
-                                    if let Err(err) = db.write_sismember_resp(key.as_ref(), member.as_ref(), &mut temp_buf) {
-                                        crate::connection::write_resp_err(&mut temp_buf, err);
+                                    match db.sismember_compact(key.as_ref(), member.as_ref()) {
+                                        Ok(resp) => {
+                                            results.push((idx, resp));
+                                            continue;
+                                        }
+                                        Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
                                     }
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)

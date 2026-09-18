@@ -1208,9 +1208,8 @@ impl RudisFlatTable {
         let mut step = 0;
 
         loop {
-            let (match_mask, empty_mask) = unsafe {
-                probe_group_match_or_empty(self.ctrl.as_ptr().add(idx), tag)
-            };
+            let (match_mask, empty_mask) =
+                unsafe { probe_group_match_or_empty(self.ctrl.as_ptr().add(idx), tag) };
             let mut bits = match_mask;
             while bits != 0 {
                 let offset = bits.trailing_zeros() as usize;
@@ -1247,9 +1246,8 @@ impl RudisFlatTable {
         let mut first_free: Option<usize> = None;
 
         loop {
-            let (match_mask, del_mask, empty_mask) = unsafe {
-                probe_group_match_del_empty(self.ctrl.as_ptr().add(idx), tag)
-            };
+            let (match_mask, del_mask, empty_mask) =
+                unsafe { probe_group_match_del_empty(self.ctrl.as_ptr().add(idx), tag) };
             let mut bits = match_mask;
             while bits != 0 {
                 let offset = bits.trailing_zeros() as usize;
@@ -1629,7 +1627,8 @@ impl RudisTable {
             && let Some(entry) = self.table.get_slot(idx)
         {
             if let Some(expire_at) = entry.expire_at
-                && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -1655,7 +1654,8 @@ impl RudisTable {
         let h = hash_key(key);
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if let Some(expire_at) = entry.expire_at
-                && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -1842,7 +1842,8 @@ impl RudisTable {
         let h = hash_key(key);
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if let Some(expire_at) = entry.expire_at
-                && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -1863,7 +1864,8 @@ impl RudisTable {
         let h = hash_key(key);
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if let Some(expire_at) = entry.expire_at
-                && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -2822,7 +2824,8 @@ impl RudisTable {
             && let Some(entry) = self.table.get_slot(idx)
         {
             if let Some(expire_at) = entry.expire_at
-                && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -2856,7 +2859,8 @@ impl RudisTable {
         let h = hash_key(key);
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if let Some(expire_at) = entry.expire_at
-                && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -3626,7 +3630,8 @@ impl RudisTable {
         if let Some(idx) = self.table.find(key, h) {
             if let Some(entry) = self.table.get_slot(idx)
                 && let Some(expire_at) = entry.expire_at
-                && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -3866,7 +3871,8 @@ impl RudisTable {
             && let Some(entry) = self.table.get_slot(idx)
         {
             if let Some(expire_at) = entry.expire_at
-                && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -3901,7 +3907,11 @@ impl RudisTable {
                     }
                     return Ok(());
                 }
-                _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                _ => {
+                    return Err(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
+                }
             }
         }
         crate::connection::write_resp_array_header(out, 0);
@@ -4363,7 +4373,8 @@ impl RudisTable {
             && let Some(entry) = self.table.get_slot(idx)
         {
             if let Some(expire_at) = entry.expire_at
-                && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -4379,6 +4390,37 @@ impl RudisTable {
     }
 
     #[inline(always)]
+    pub fn sismember_compact(
+        &mut self,
+        key: &[u8],
+        member: &[u8],
+    ) -> Result<crate::shard::CompactResp, &'static str> {
+        let h = hash_key(key);
+        if let Some((idx, entry)) = self.table.find_entry(key, h) {
+            if let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+                return Ok(crate::shard::CompactResp::INT_0);
+            }
+            match &entry.val {
+                RudisValue::Set(set) => {
+                    if set.contains(member) {
+                        Ok(crate::shard::CompactResp::INT_1)
+                    } else {
+                        Ok(crate::shard::CompactResp::INT_0)
+                    }
+                }
+                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+            }
+        } else {
+            Ok(crate::shard::CompactResp::INT_0)
+        }
+    }
+
+    #[inline(always)]
     pub fn write_sismember_resp(
         &mut self,
         key: &[u8],
@@ -4388,7 +4430,8 @@ impl RudisTable {
         let h = hash_key(key);
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if let Some(expire_at) = entry.expire_at
-                && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -5783,7 +5826,8 @@ impl RudisTable {
             && let Some(entry) = self.table.get_slot(idx)
         {
             if let Some(expire_at) = entry.expire_at
-                && !crate::connection::ALLOW_ACCESS_EXPIRED.load(std::sync::atomic::Ordering::Relaxed)
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
@@ -5820,13 +5864,17 @@ impl RudisTable {
                             match zset {
                                 RudisZSet::Small(v) => {
                                     if opts.rev {
-                                        for (OrderedScore(s), m) in v.iter().rev().skip(start_u).take(limit) {
+                                        for (OrderedScore(s), m) in
+                                            v.iter().rev().skip(start_u).take(limit)
+                                        {
                                             out.extend_from_slice(b"*2\r\n");
                                             crate::connection::write_resp_bulk(out, m);
                                             crate::connection::write_resp_score(out, *s);
                                         }
                                     } else {
-                                        for (OrderedScore(s), m) in v.iter().skip(start_u).take(limit) {
+                                        for (OrderedScore(s), m) in
+                                            v.iter().skip(start_u).take(limit)
+                                        {
                                             out.extend_from_slice(b"*2\r\n");
                                             crate::connection::write_resp_bulk(out, m);
                                             crate::connection::write_resp_score(out, *s);
@@ -5835,13 +5883,17 @@ impl RudisTable {
                                 }
                                 RudisZSet::Full { tree, .. } => {
                                     if opts.rev {
-                                        for (OrderedScore(s), m) in tree.iter().rev().skip(start_u).take(limit) {
+                                        for (OrderedScore(s), m) in
+                                            tree.iter().rev().skip(start_u).take(limit)
+                                        {
                                             out.extend_from_slice(b"*2\r\n");
                                             crate::connection::write_resp_bulk(out, m);
                                             crate::connection::write_resp_score(out, *s);
                                         }
                                     } else {
-                                        for (OrderedScore(s), m) in tree.iter().skip(start_u).take(limit) {
+                                        for (OrderedScore(s), m) in
+                                            tree.iter().skip(start_u).take(limit)
+                                        {
                                             out.extend_from_slice(b"*2\r\n");
                                             crate::connection::write_resp_bulk(out, m);
                                             crate::connection::write_resp_score(out, *s);
@@ -5854,12 +5906,16 @@ impl RudisTable {
                             match zset {
                                 RudisZSet::Small(v) => {
                                     if opts.rev {
-                                        for (OrderedScore(s), m) in v.iter().rev().skip(start_u).take(limit) {
+                                        for (OrderedScore(s), m) in
+                                            v.iter().rev().skip(start_u).take(limit)
+                                        {
                                             crate::connection::write_resp_bulk(out, m);
                                             crate::connection::write_resp_score(out, *s);
                                         }
                                     } else {
-                                        for (OrderedScore(s), m) in v.iter().skip(start_u).take(limit) {
+                                        for (OrderedScore(s), m) in
+                                            v.iter().skip(start_u).take(limit)
+                                        {
                                             crate::connection::write_resp_bulk(out, m);
                                             crate::connection::write_resp_score(out, *s);
                                         }
@@ -5867,12 +5923,16 @@ impl RudisTable {
                                 }
                                 RudisZSet::Full { tree, .. } => {
                                     if opts.rev {
-                                        for (OrderedScore(s), m) in tree.iter().rev().skip(start_u).take(limit) {
+                                        for (OrderedScore(s), m) in
+                                            tree.iter().rev().skip(start_u).take(limit)
+                                        {
                                             crate::connection::write_resp_bulk(out, m);
                                             crate::connection::write_resp_score(out, *s);
                                         }
                                     } else {
-                                        for (OrderedScore(s), m) in tree.iter().skip(start_u).take(limit) {
+                                        for (OrderedScore(s), m) in
+                                            tree.iter().skip(start_u).take(limit)
+                                        {
                                             crate::connection::write_resp_bulk(out, m);
                                             crate::connection::write_resp_score(out, *s);
                                         }
@@ -5909,7 +5969,11 @@ impl RudisTable {
                     }
                     return Ok(());
                 }
-                _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                _ => {
+                    return Err(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
+                }
             }
         }
         crate::connection::write_resp_array_header(out, 0);
