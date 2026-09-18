@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  MONOIO_FORCE_LEGACY_DRIVER: 1
 
 jobs:
   build_and_test:
