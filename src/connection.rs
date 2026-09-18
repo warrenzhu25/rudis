@@ -54,6 +54,9 @@ thread_local! {
 #[inline]
 pub fn notify_list_or_defer(db: &mut ShardDb, key: &Bytes) {
     touch_watched_key(db.port, key.as_ref());
+    if !crate::block::has_blocked_waiters(db.port) {
+        return;
+    }
     let hub_arc = crate::block::get_block_hub_for_port(db.port);
     let mut hub = hub_arc.lock().unwrap();
     if hub.is_paused() {
@@ -66,6 +69,9 @@ pub fn notify_list_or_defer(db: &mut ShardDb, key: &Bytes) {
 #[inline]
 pub fn notify_zset_or_defer(db: &mut ShardDb, key: &Bytes) {
     touch_watched_key(db.port, key.as_ref());
+    if !crate::block::has_blocked_waiters(db.port) {
+        return;
+    }
     let hub_arc = crate::block::get_block_hub_for_port(db.port);
     let mut hub = hub_arc.lock().unwrap();
     if hub.is_paused() {
@@ -8484,19 +8490,24 @@ pub fn execute_local_command(
             false
         }
         Command::Hset { key, fields } => {
-            match db.hset(key.clone(), fields.clone()) {
+            match db.hset_slice(key.as_ref(), fields) {
                 Ok(count) => {
                     record_change!(cmd);
-                    let str_fields: std::collections::HashMap<String, String> = fields
-                        .iter()
-                        .map(|(k, v)| {
-                            (
-                                String::from_utf8_lossy(k).to_string(),
-                                String::from_utf8_lossy(v).to_string(),
-                            )
-                        })
-                        .collect();
-                    crate::search::index_document_hook(&String::from_utf8_lossy(key), str_fields);
+                    if crate::search::has_active_search_indices() {
+                        let str_fields: std::collections::HashMap<String, String> = fields
+                            .iter()
+                            .map(|(k, v)| {
+                                (
+                                    String::from_utf8_lossy(k).to_string(),
+                                    String::from_utf8_lossy(v).to_string(),
+                                )
+                            })
+                            .collect();
+                        crate::search::index_document_hook(
+                            &String::from_utf8_lossy(key),
+                            str_fields,
+                        );
+                    }
                     write_resp_integer(out, count as i64);
                 }
                 Err(err) => {
@@ -8520,19 +8531,24 @@ pub fn execute_local_command(
             false
         }
         Command::Hmset { key, fields } => {
-            match db.hset(key.clone(), fields.clone()) {
+            match db.hset_slice(key.as_ref(), fields) {
                 Ok(_) => {
                     record_change!(cmd);
-                    let str_fields: std::collections::HashMap<String, String> = fields
-                        .iter()
-                        .map(|(k, v)| {
-                            (
-                                String::from_utf8_lossy(k).to_string(),
-                                String::from_utf8_lossy(v).to_string(),
-                            )
-                        })
-                        .collect();
-                    crate::search::index_document_hook(&String::from_utf8_lossy(key), str_fields);
+                    if crate::search::has_active_search_indices() {
+                        let str_fields: std::collections::HashMap<String, String> = fields
+                            .iter()
+                            .map(|(k, v)| {
+                                (
+                                    String::from_utf8_lossy(k).to_string(),
+                                    String::from_utf8_lossy(v).to_string(),
+                                )
+                            })
+                            .collect();
+                        crate::search::index_document_hook(
+                            &String::from_utf8_lossy(key),
+                            str_fields,
+                        );
+                    }
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 Err(err) => {
@@ -8710,7 +8726,7 @@ pub fn execute_local_command(
         }
         // LIST COMMANDS
         Command::Lpush { key, values } => {
-            match db.lpush(key.clone(), values.clone()) {
+            match db.lpush_slice(key.as_ref(), values) {
                 Ok(len) => {
                     record_change!(cmd);
                     notify_list_or_defer(db, key);
@@ -8723,7 +8739,7 @@ pub fn execute_local_command(
             false
         }
         Command::Rpush { key, values } => {
-            match db.rpush(key.clone(), values.clone()) {
+            match db.rpush_slice(key.as_ref(), values) {
                 Ok(len) => {
                     record_change!(cmd);
                     notify_list_or_defer(db, key);
@@ -8736,7 +8752,7 @@ pub fn execute_local_command(
             false
         }
         Command::Lpushx { key, values } => {
-            match db.lpushx(key.clone(), values.clone()) {
+            match db.lpushx_slice(key.as_ref(), values) {
                 Ok(len) => {
                     if len > 0 {
                         record_change!(cmd);
@@ -8751,7 +8767,7 @@ pub fn execute_local_command(
             false
         }
         Command::Rpushx { key, values } => {
-            match db.rpushx(key.clone(), values.clone()) {
+            match db.rpushx_slice(key.as_ref(), values) {
                 Ok(len) => {
                     if len > 0 {
                         record_change!(cmd);
@@ -8927,7 +8943,7 @@ pub fn execute_local_command(
         }
         // SET COMMANDS
         Command::Sadd { key, members } => {
-            match db.sadd(key.clone(), members.clone()) {
+            match db.sadd_slice(key.as_ref(), members) {
                 Ok(added) => {
                     if added > 0 {
                         record_change!(cmd);
@@ -9139,7 +9155,7 @@ pub fn execute_local_command(
             elements,
             flags,
         } => {
-            match db.zadd(key.clone(), elements.clone(), *flags) {
+            match db.zadd_slice(key.as_ref(), elements, *flags) {
                 Ok((count, incr_score)) => {
                     if flags.incr {
                         if incr_score.is_some() {

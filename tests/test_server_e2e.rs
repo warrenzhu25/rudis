@@ -8526,3 +8526,97 @@ fn test_cluster_check_and_rebalance_live_migration_e2e() {
     let check_c2 = send_and_read(&mut c2, b"CLUSTER CHECK\r\n");
     assert!(check_c2.contains("[OK]"));
 }
+
+#[test]
+fn test_small_collection_arena_and_slice_dispatch_e2e() {
+    let port = 16778;
+    start_test_server(port, 2);
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    // 1. Rapid List operations (LPUSH, LRANGE, LPOP to empty)
+    for i in 0..50 {
+        let key = format!("list_{}", i);
+        let push_cmd = format!("LPUSH {} val_a val_b val_c\r\n", key);
+        assert_eq!(send_and_read(&mut client, push_cmd.as_bytes()), ":3\r\n");
+
+        let lrange_cmd = format!("LRANGE {} 0 -1\r\n", key);
+        let lrange_resp = send_and_read(&mut client, lrange_cmd.as_bytes());
+        assert_eq!(lrange_resp.lines().next().unwrap(), "*3");
+
+        let lpop_cmd = format!("LPOP {} 3\r\n", key);
+        let lpop_resp = send_and_read(&mut client, lpop_cmd.as_bytes());
+        assert_eq!(lpop_resp.lines().next().unwrap(), "*3");
+
+        // Key should be deleted after all elements popped
+        assert_eq!(
+            send_and_read(&mut client, format!("EXISTS {}\r\n", key).as_bytes()),
+            ":0\r\n"
+        );
+    }
+
+    // 2. Rapid Hash operations (HSET, HGET, HDEL to empty)
+    for i in 0..50 {
+        let key = format!("hash_{}", i);
+        let hset_cmd = format!("HSET {} f1 v1 f2 v2\r\n", key);
+        assert_eq!(send_and_read(&mut client, hset_cmd.as_bytes()), ":2\r\n");
+
+        let hget_cmd = format!("HGET {} f1\r\n", key);
+        assert_eq!(
+            send_and_read(&mut client, hget_cmd.as_bytes()),
+            "$2\r\nv1\r\n"
+        );
+
+        let hdel_cmd = format!("HDEL {} f1 f2\r\n", key);
+        assert_eq!(send_and_read(&mut client, hdel_cmd.as_bytes()), ":2\r\n");
+
+        assert_eq!(
+            send_and_read(&mut client, format!("EXISTS {}\r\n", key).as_bytes()),
+            ":0\r\n"
+        );
+    }
+
+    // 3. Rapid Set operations (SADD, SISMEMBER, SREM to empty)
+    for i in 0..50 {
+        let key = format!("set_{}", i);
+        let sadd_cmd = format!("SADD {} m1 m2\r\n", key);
+        assert_eq!(send_and_read(&mut client, sadd_cmd.as_bytes()), ":2\r\n");
+
+        let sismember_cmd = format!("SISMEMBER {} m1\r\n", key);
+        assert_eq!(
+            send_and_read(&mut client, sismember_cmd.as_bytes()),
+            ":1\r\n"
+        );
+
+        let srem_cmd = format!("SREM {} m1 m2\r\n", key);
+        assert_eq!(send_and_read(&mut client, srem_cmd.as_bytes()), ":2\r\n");
+
+        assert_eq!(
+            send_and_read(&mut client, format!("EXISTS {}\r\n", key).as_bytes()),
+            ":0\r\n"
+        );
+    }
+
+    // 4. Rapid ZSet operations (ZADD, ZRANGE, ZREM to empty)
+    for i in 0..50 {
+        let key = format!("zset_{}", i);
+        let zadd_cmd = format!("ZADD {} 1.5 zm1 2.5 zm2\r\n", key);
+        assert_eq!(send_and_read(&mut client, zadd_cmd.as_bytes()), ":2\r\n");
+
+        let zrange_cmd = format!("ZRANGE {} 0 -1\r\n", key);
+        let zrange_resp = send_and_read(&mut client, zrange_cmd.as_bytes());
+        assert_eq!(zrange_resp.lines().next().unwrap(), "*2");
+
+        let zrem_cmd = format!("ZREM {} zm1 zm2\r\n", key);
+        assert_eq!(send_and_read(&mut client, zrem_cmd.as_bytes()), ":2\r\n");
+
+        assert_eq!(
+            send_and_read(&mut client, format!("EXISTS {}\r\n", key).as_bytes()),
+            ":0\r\n"
+        );
+    }
+
+    // 5. Memory INFO telemetry verification
+    let info_resp = send_and_read(&mut client, b"INFO memory\r\n");
+    assert!(info_resp.contains("used_memory:"));
+    assert!(info_resp.contains("mem_allocator:"));
+}

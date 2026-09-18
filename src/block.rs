@@ -85,6 +85,13 @@ pub struct BlockHub {
 
 pub static PORT_BLOCK_HUBS: LazyLock<Mutex<HashMap<u16, Arc<Mutex<BlockHub>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static TOTAL_BLOCKED_WAITERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[inline(always)]
+pub fn has_blocked_waiters(_port: u16) -> bool {
+    TOTAL_BLOCKED_WAITERS.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
 
 pub fn get_block_hub_for_port(port: u16) -> Arc<Mutex<BlockHub>> {
     let mut map = PORT_BLOCK_HUBS.lock().unwrap();
@@ -113,12 +120,24 @@ impl BlockHub {
         }
     }
 
+    #[inline(always)]
+    pub fn sync_atomic_waiters_count(&self) {
+        let count = self.paused_count
+            + self.list_waiters.values().map(|w| w.len()).sum::<usize>()
+            + self.zset_waiters.values().map(|w| w.len()).sum::<usize>()
+            + self.stream_waiters.values().map(|w| w.len()).sum::<usize>()
+            + self.blocked_clients.len()
+            + self.blocked_zset_clients.len();
+        TOTAL_BLOCKED_WAITERS.store(count, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn is_paused(&self) -> bool {
         self.paused_count > 0
     }
 
     pub fn pause(&mut self) {
         self.paused_count += 1;
+        self.sync_atomic_waiters_count();
     }
 
     pub fn add_pending_notify(&mut self, key: Bytes) {
@@ -131,6 +150,7 @@ impl BlockHub {
         if self.paused_count > 0 {
             self.paused_count -= 1;
         }
+        self.sync_atomic_waiters_count();
         if self.paused_count == 0 {
             std::mem::take(&mut self.pending_notifies)
         } else {
@@ -143,6 +163,7 @@ impl BlockHub {
             self.paused_count -= 1;
         }
         self.pending_notifies.clear();
+        self.sync_atomic_waiters_count();
     }
 
     pub fn blocked_clients_count(&self) -> usize {
@@ -151,6 +172,7 @@ impl BlockHub {
 
     pub fn register_blocked_client(&mut self, client_id: u64, sender: Sender<BlockedListResult>) {
         self.blocked_clients.insert(client_id, sender);
+        self.sync_atomic_waiters_count();
     }
 
     pub fn register_blocked_zset_client(
@@ -159,6 +181,7 @@ impl BlockHub {
         sender: Sender<BlockedZSetResult>,
     ) {
         self.blocked_zset_clients.insert(client_id, sender);
+        self.sync_atomic_waiters_count();
     }
 
     pub fn is_blocked(&self, client_id: u64) -> bool {
@@ -175,6 +198,7 @@ impl BlockHub {
         }
         self.blocked_clients.remove(&client_id);
         self.blocked_zset_clients.remove(&client_id);
+        self.sync_atomic_waiters_count();
     }
 
     pub fn unregister_blocked_client(&mut self, client_id: u64) {
@@ -197,6 +221,9 @@ impl BlockHub {
             }
             unblocked = true;
         }
+        if unblocked {
+            self.sync_atomic_waiters_count();
+        }
         unblocked
     }
 
@@ -217,6 +244,7 @@ impl BlockHub {
                 op: WaiterOp::Pop { pop_type, count },
                 sender,
             });
+        self.sync_atomic_waiters_count();
     }
 
     pub fn register_move_waiter(
@@ -241,6 +269,7 @@ impl BlockHub {
                 },
                 sender,
             });
+        self.sync_atomic_waiters_count();
     }
 
     /// Called when LPUSH or RPUSH adds values to a list.
@@ -360,6 +389,7 @@ impl BlockHub {
                 is_zmpop,
                 sender,
             });
+        self.sync_atomic_waiters_count();
     }
 
     /// Called when elements are added to a sorted set.
@@ -412,6 +442,7 @@ impl BlockHub {
             .entry(key.clone())
             .or_default()
             .push(StreamWaiter { key, sender });
+        self.sync_atomic_waiters_count();
     }
 
     /// Called when XADD adds an entry to a stream.
@@ -420,6 +451,7 @@ impl BlockHub {
             for waiter in waiters {
                 let _ = waiter.sender.send(());
             }
+            self.sync_atomic_waiters_count();
         }
     }
 }

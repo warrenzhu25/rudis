@@ -466,6 +466,13 @@ impl InvertedIndex {
 // Global registry of indices: IndexName -> InvertedIndex
 static SEARCH_INDICES: LazyLock<RwLock<HashMap<String, Arc<RwLock<InvertedIndex>>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+static SEARCH_INDICES_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[inline(always)]
+pub fn has_active_search_indices() -> bool {
+    SEARCH_INDICES_COUNT.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
 
 pub fn get_search_index(name: &str) -> Option<Arc<RwLock<InvertedIndex>>> {
     let registry = SEARCH_INDICES.read().unwrap();
@@ -480,12 +487,14 @@ pub fn create_search_index(schema: IndexSchema) -> Result<(), String> {
     let name = schema.name.clone();
     let idx = Arc::new(RwLock::new(InvertedIndex::new(schema)));
     registry.insert(name, idx);
+    SEARCH_INDICES_COUNT.store(registry.len(), std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
 pub fn drop_search_index(name: &str) -> Result<(), String> {
     let mut registry = SEARCH_INDICES.write().unwrap();
     if registry.remove(name).is_some() {
+        SEARCH_INDICES_COUNT.store(registry.len(), std::sync::atomic::Ordering::Relaxed);
         Ok(())
     } else {
         Err(format!("Unknown index name: {}", name))

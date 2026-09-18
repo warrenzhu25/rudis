@@ -504,6 +504,15 @@ impl ShardDb {
     }
 
     #[inline]
+    pub fn hset_slice(
+        &mut self,
+        key: &[u8],
+        fields: &[(Bytes, Bytes)],
+    ) -> Result<usize, &'static str> {
+        self.table.hset_slice(key, fields)
+    }
+
+    #[inline]
     pub fn hset(&mut self, key: Bytes, fields: Vec<(Bytes, Bytes)>) -> Result<usize, &'static str> {
         self.table.hset(key, fields)
     }
@@ -619,8 +628,18 @@ impl ShardDb {
 
     // LIST METHODS
     #[inline]
+    pub fn lpush_slice(&mut self, key: &[u8], values: &[Bytes]) -> Result<usize, &'static str> {
+        self.table.lpush_slice(key, values)
+    }
+
+    #[inline]
     pub fn lpush(&mut self, key: Bytes, values: Vec<Bytes>) -> Result<usize, &'static str> {
         self.table.lpush(key, values)
+    }
+
+    #[inline]
+    pub fn rpush_slice(&mut self, key: &[u8], values: &[Bytes]) -> Result<usize, &'static str> {
+        self.table.rpush_slice(key, values)
     }
 
     #[inline]
@@ -629,8 +648,18 @@ impl ShardDb {
     }
 
     #[inline]
+    pub fn lpushx_slice(&mut self, key: &[u8], values: &[Bytes]) -> Result<usize, &'static str> {
+        self.table.lpushx_slice(key, values)
+    }
+
+    #[inline]
     pub fn lpushx(&mut self, key: Bytes, values: Vec<Bytes>) -> Result<usize, &'static str> {
         self.table.lpushx(key, values)
+    }
+
+    #[inline]
+    pub fn rpushx_slice(&mut self, key: &[u8], values: &[Bytes]) -> Result<usize, &'static str> {
+        self.table.rpushx_slice(key, values)
     }
 
     #[inline]
@@ -718,6 +747,11 @@ impl ShardDb {
     }
 
     // SET METHODS
+    #[inline]
+    pub fn sadd_slice(&mut self, key: &[u8], members: &[Bytes]) -> Result<usize, &'static str> {
+        self.table.sadd_slice(key, members)
+    }
+
     #[inline]
     pub fn sadd(&mut self, key: Bytes, members: Vec<Bytes>) -> Result<usize, &'static str> {
         self.table.sadd(key, members)
@@ -826,6 +860,16 @@ impl ShardDb {
         count: usize,
     ) -> Result<(usize, Vec<Bytes>), &'static str> {
         self.table.sscan(key, cursor, pattern, count)
+    }
+
+    #[inline]
+    pub fn zadd_slice(
+        &mut self,
+        key: &[u8],
+        elements: &[(f64, Bytes)],
+        flags: crate::table::ZAddFlags,
+    ) -> Result<(usize, Option<f64>), &'static str> {
+        self.table.zadd_slice(key, elements, flags)
     }
 
     #[inline]
