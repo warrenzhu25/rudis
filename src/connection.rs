@@ -3610,32 +3610,12 @@ async fn execute_command(
             }
         }
         Command::Mget(keys) => {
-            for key in &keys {
-                record_client_read(router.port, client_id, key.as_ref());
-            }
-            let all_local = !keys.is_empty()
-                && keys
-                    .iter()
-                    .all(|k| target_shard(k, router.num_shards) == router.shard_id);
-            if all_local {
-                write_resp_array_header(out, keys.len());
-                let mut db = router.local_db.borrow_mut();
-                for k in &keys {
-                    match db.get(k) {
-                        Some(v) => write_resp_bulk(out, &v),
-                        None => write_resp_null(out),
-                    }
-                }
-                return false;
-            }
-            let values = router.mget(keys).await;
-            write_resp_array_header(out, values.len());
-            for val in values {
-                match val {
-                    Some(v) => write_resp_bulk(out, &v),
-                    None => write_resp_null(out),
+            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                for key in &keys {
+                    record_client_read(router.port, client_id, key.as_ref());
                 }
             }
+            router.write_mget_resp(keys, out).await;
             false
         }
         Command::Mset(pairs) => {

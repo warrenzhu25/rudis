@@ -1024,6 +1024,123 @@ impl Router {
         results
     }
 
+    pub async fn write_mget_resp(&self, keys: Vec<Bytes>, out: &mut Vec<u8>) {
+        if keys.is_empty() {
+            crate::connection::write_resp_array_header(out, 0);
+            return;
+        }
+
+        let total_keys = keys.len();
+
+        if self.num_shards <= 1 {
+            crate::connection::write_resp_array_header(out, total_keys);
+            for key in keys {
+                if let Some(v) = self.get_local_direct(&key).await {
+                    crate::connection::write_resp_bulk(out, &v);
+                } else {
+                    crate::connection::write_resp_null(out);
+                }
+            }
+            return;
+        }
+
+        let mut remote_batches = self
+            .mget_batch_pool
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(|| (0..self.num_shards).map(|_| Vec::new()).collect());
+        let mut local_keys = Vec::with_capacity(keys.len().min(16));
+        let mut has_remote = false;
+        let mut num_remote_shards = 0;
+
+        for (idx, key) in keys.into_iter().enumerate() {
+            let target = self.target_shard(&key);
+            if target == self.shard_id {
+                local_keys.push((idx, key));
+            } else {
+                has_remote = true;
+                if remote_batches[target].is_empty() {
+                    num_remote_shards += 1;
+                }
+                remote_batches[target].push((idx, key));
+            }
+        }
+
+        // Fast path: all keys are local - 0 channel operations
+        if !has_remote {
+            crate::connection::write_resp_array_header(out, total_keys);
+            {
+                let mut db = self.local_db.borrow_mut();
+                for (_, key) in local_keys {
+                    if let Some(v) = db.get(&key) {
+                        crate::connection::write_resp_bulk(out, &v);
+                    } else {
+                        crate::connection::write_resp_null(out);
+                    }
+                }
+            }
+            self.mget_batch_pool.borrow_mut().push(remote_batches);
+            return;
+        }
+
+        let (notify_tx, notify_rx) = self.acquire_notify_channel();
+        let descriptor =
+            self.acquire_mget_descriptor(total_keys, num_remote_shards, notify_tx.clone());
+
+        for (target_shard, batch) in remote_batches.iter_mut().enumerate().take(self.num_shards) {
+            let items = std::mem::take(batch);
+            if !items.is_empty() {
+                let msg = ShardMessage::ScatterMget {
+                    shard_id: target_shard,
+                    keys: items,
+                    descriptor: descriptor.clone(),
+                };
+                if self.senders[target_shard].send(msg).is_err() {
+                    descriptor.finish_shard();
+                }
+            }
+        }
+
+        // Execute local keys CONCURRENTLY while remote shards process their batches
+        if !local_keys.is_empty() {
+            let mut db = self.local_db.borrow_mut();
+            for (idx, key) in local_keys {
+                let val = db.get(&key);
+                descriptor.write_result(idx, val);
+            }
+        }
+
+        // Wait for all remote shards to complete their writes
+        if descriptor.pending.load(Ordering::Acquire) != 0 {
+            for _ in 0..256 {
+                std::hint::spin_loop();
+                if descriptor.pending.load(Ordering::Acquire) == 0 {
+                    break;
+                }
+            }
+            if descriptor.pending.load(Ordering::Acquire) != 0 {
+                let _ = notify_rx.recv_async().await;
+            }
+        }
+        while notify_rx.try_recv().is_ok() {}
+
+        let recycled = descriptor.take_recycled_keys();
+        self.mget_batch_pool.borrow_mut().push(recycled);
+        self.release_notify_channel(notify_tx, notify_rx);
+
+        crate::connection::write_resp_array_header(out, total_keys);
+        unsafe {
+            for i in 0..total_keys {
+                let slot = &*descriptor.results[i].get();
+                match slot {
+                    Some(v) => crate::connection::write_resp_bulk(out, v),
+                    None => crate::connection::write_resp_null(out),
+                }
+            }
+        }
+        self.release_mget_descriptor(descriptor);
+    }
+
     pub async fn mset(&self, pairs: Vec<(Bytes, Bytes)>) {
         if pairs.is_empty() {
             return;
