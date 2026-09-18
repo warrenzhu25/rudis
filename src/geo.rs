@@ -336,8 +336,14 @@ pub fn execute_geo_query(
                             None
                         },
                     });
+                    if asc.is_none() && count.is_some_and(|c| results.len() >= c) {
+                        break;
+                    }
                 }
             }
+        }
+        if asc.is_none() && count.is_some_and(|c| results.len() >= c) {
+            break;
         }
     }
 
