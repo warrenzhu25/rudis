@@ -2148,6 +2148,7 @@ fn test_rdb_snapshot_forkless_e2e() {
     // 5. Test asynchronous BGSAVE
     let bgsave_resp = send_and_read(&mut client, b"BGSAVE\r\n");
     assert_eq!(bgsave_resp, "+Background saving started\r\n");
+    thread::sleep(Duration::from_millis(200));
 
     // Clean up dump file & dir
     let _ = std::fs::remove_dir_all(&rdb_dir);
@@ -2969,10 +2970,16 @@ fn test_primary_replica_replication_e2e() {
     assert_eq!(rep_resp, "+OK\r\n");
 
     // Wait for handshake, RDB snapshot generation, transfer, and restore
-    thread::sleep(Duration::from_millis(300));
+    let mut replica_role = String::new();
+    for _ in 0..40 {
+        replica_role = send_and_read(&mut replica_client, b"ROLE\r\n");
+        if replica_role.contains("slave") && replica_role.contains("connected") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 
     // 4. Verify replica role and link status
-    let replica_role = send_and_read(&mut replica_client, b"ROLE\r\n");
     assert!(
         replica_role.contains("slave"),
         "Expected slave role, got {}",
@@ -3021,7 +3028,12 @@ fn test_primary_replica_replication_e2e() {
     );
 
     // Wait for replication stream propagation
-    thread::sleep(Duration::from_millis(150));
+    for _ in 0..40 {
+        if send_and_read(&mut replica_client, b"GET live_key\r\n") == "$8\r\nlive_val\r\n" {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 
     // Verify replicated on replica
     assert_eq!(
@@ -3285,10 +3297,18 @@ fn test_cluster_bus_gossip_failover_e2e() {
     );
 
     // Wait for cluster bus gossip heartbeats to propagate transitively
-    thread::sleep(Duration::from_millis(1200));
+    let mut nodes1 = String::new();
+    for _ in 0..40 {
+        nodes1 = send_and_read(&mut c1, b"CLUSTER NODES\r\n");
+        if nodes1.contains(&format!("127.0.0.1:{}@{}", port2, port2 + 10000))
+            && (nodes1.contains(&myid3) || nodes1.contains(&format!("127.0.0.1:{}", port3)))
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 
     // Verify Node 1 cluster nodes shows cport (26440, 26441)
-    let nodes1 = send_and_read(&mut c1, b"CLUSTER NODES\r\n");
     assert!(
         nodes1.contains("myself,master"),
         "Node 1 should be myself,master"
@@ -3312,7 +3332,14 @@ fn test_cluster_bus_gossip_failover_e2e() {
     );
     assert_eq!(rep_resp, "+OK\r\n");
 
-    let nodes2_after_rep = send_and_read(&mut c2, b"CLUSTER NODES\r\n");
+    let mut nodes2_after_rep = String::new();
+    for _ in 0..30 {
+        nodes2_after_rep = send_and_read(&mut c2, b"CLUSTER NODES\r\n");
+        if nodes2_after_rep.contains("myself,slave") && nodes2_after_rep.contains(&myid1) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
     assert!(
         nodes2_after_rep.contains("myself,slave"),
         "Node 2 should be myself,slave"
@@ -3326,7 +3353,14 @@ fn test_cluster_bus_gossip_failover_e2e() {
     let failover_resp = send_and_read(&mut c2, b"CLUSTER FAILOVER\r\n");
     assert_eq!(failover_resp, "+OK\r\n");
 
-    let nodes2_after_failover = send_and_read(&mut c2, b"CLUSTER NODES\r\n");
+    let mut nodes2_after_failover = String::new();
+    for _ in 0..30 {
+        nodes2_after_failover = send_and_read(&mut c2, b"CLUSTER NODES\r\n");
+        if nodes2_after_failover.contains("myself,master") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
     assert!(
         nodes2_after_failover.contains("myself,master"),
         "Node 2 should be promoted to myself,master after failover"
@@ -3345,7 +3379,14 @@ fn test_cluster_bus_gossip_failover_e2e() {
         send_and_read(&mut c1, format!("CLUSTER FORGET {}\r\n", myid3).as_bytes()),
         "+OK\r\n"
     );
-    let nodes1_after_forget = send_and_read(&mut c1, b"CLUSTER NODES\r\n");
+    let mut nodes1_after_forget = String::new();
+    for _ in 0..30 {
+        nodes1_after_forget = send_and_read(&mut c1, b"CLUSTER NODES\r\n");
+        if !nodes1_after_forget.contains(&myid3) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
     assert!(
         !nodes1_after_forget.contains(&myid3),
         "Node 3 should be forgotten from Node 1"
@@ -4550,10 +4591,14 @@ fn test_cluster_bus_shards_and_automated_failover_e2e() {
     );
 
     // Wait for gossip tick & slot exchange over cluster bus
-    thread::sleep(Duration::from_millis(1500));
-
-    // 4. Test CLUSTER SLOTS introspection
-    let slots_resp1 = send_and_read(&mut c1, b"CLUSTER SLOTS\r\n");
+    let mut slots_resp1 = String::new();
+    for _ in 0..40 {
+        slots_resp1 = send_and_read(&mut c1, b"CLUSTER SLOTS\r\n");
+        if slots_resp1.contains(":0\r\n:8191\r\n") && slots_resp1.contains(":8192\r\n:16383\r\n") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
     assert!(
         slots_resp1.contains(":0\r\n:8191\r\n"),
         "Node 1 should report range 0-8191. Resp: {}",
@@ -4701,10 +4746,14 @@ fn test_cluster_bus_shards_and_automated_failover_e2e() {
 
     // Trigger failover on Node 3
     assert_eq!(send_and_read(&mut c3, b"CLUSTER FAILOVER\r\n"), "+OK\r\n");
-    thread::sleep(Duration::from_millis(500));
-
-    // Verify Node 3 is now master with config epoch updated
-    let nodes3 = send_and_read(&mut c3, b"CLUSTER NODES\r\n");
+    let mut nodes3 = String::new();
+    for _ in 0..30 {
+        nodes3 = send_and_read(&mut c3, b"CLUSTER NODES\r\n");
+        if nodes3.contains("myself,master") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
     assert!(
         nodes3.contains("myself,master"),
         "Node 3 should be promoted to myself,master. Nodes:\n{}",
@@ -5250,7 +5299,7 @@ fn test_harness_and_extended_command_coverage_e2e() {
 
 #[test]
 fn test_ping_resp_array_tcp() {
-    let port = 16399;
+    let port = 16750;
     let num_shards = 2;
     start_test_server(port, num_shards);
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
@@ -5260,7 +5309,7 @@ fn test_ping_resp_array_tcp() {
 
 #[test]
 fn test_msetex_e2e() {
-    let port = 16405;
+    let port = 16751;
     let num_shards = 2;
     start_test_server(port, num_shards);
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
@@ -5300,7 +5349,7 @@ fn test_msetex_e2e() {
 
 #[test]
 fn test_all_remaining_uncovered_commands_e2e() {
-    let port = 16406;
+    let port = 16752;
     let num_shards = 2;
     start_test_server(port, num_shards);
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
@@ -5575,7 +5624,13 @@ fn test_cluster_pipelined_squashed_moved_redirect_e2e() {
     );
 
     // Wait for gossip tick & slot exchange
-    thread::sleep(Duration::from_millis(1500));
+    for _ in 0..40 {
+        let slots = send_and_read(&mut c1, b"CLUSTER SLOTS\r\n");
+        if slots.contains(":8192\r\n:16383\r\n") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 
     // Find a key belonging to Node 1 (slot < 8192) and one to Node 2 (slot >= 8192)
     let mut key_node1 = String::new();
@@ -6281,8 +6336,8 @@ fn test_pipelined_fast_path_set_and_scattered_mset_e2e() {
 
 #[test]
 fn test_replication_atomic_bypass_and_slave_gate_e2e() {
-    let master_port = 16430;
-    let replica_port = 16431;
+    let master_port = 16753;
+    let replica_port = 16754;
 
     start_test_server(master_port, 2);
     start_test_server(replica_port, 2);
@@ -6302,7 +6357,13 @@ fn test_replication_atomic_bypass_and_slave_gate_e2e() {
         format!("REPLICAOF 127.0.0.1 {}\r\n", master_port).as_bytes(),
     );
     assert_eq!(rep_resp, "+OK\r\n");
-    thread::sleep(Duration::from_millis(300));
+    for _ in 0..40 {
+        let role = send_and_read(&mut replica_client, b"ROLE\r\n");
+        if role.contains("slave") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 
     // 3. Replica rejects direct writes with -READONLY
     let write_rep = send_and_read(&mut replica_client, b"SET forbidden_k val\r\n");
@@ -6317,7 +6378,12 @@ fn test_replication_atomic_bypass_and_slave_gate_e2e() {
         send_and_read(&mut master_client, b"SET live_k live_v\r\n"),
         "+OK\r\n"
     );
-    thread::sleep(Duration::from_millis(150));
+    for _ in 0..40 {
+        if send_and_read(&mut replica_client, b"GET live_k\r\n") == "$6\r\nlive_v\r\n" {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
     assert_eq!(
         send_and_read(&mut replica_client, b"GET live_k\r\n"),
         "$6\r\nlive_v\r\n"
@@ -6343,7 +6409,7 @@ fn test_replication_atomic_bypass_and_slave_gate_e2e() {
 
 #[test]
 fn test_fragmented_socket_frame_draining_e2e() {
-    let port = 16440;
+    let port = 16755;
     start_test_server(port, 4);
 
     let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
@@ -6556,7 +6622,7 @@ fn test_mget_mset_in_place_recycling_scattered_e2e() {
 
 #[test]
 fn test_zero_alloc_command_dispatch_and_mixed_case_e2e() {
-    let port = 16472;
+    let port = 16756;
     start_test_server(port, 4);
     let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
 
