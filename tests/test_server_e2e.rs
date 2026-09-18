@@ -7537,3 +7537,82 @@ fn test_pubsub_resp3_push_frames_e2e() {
     );
     assert!(msg2.contains("payload123"));
 }
+
+#[test]
+fn test_cluster_quorum_failure_detection_and_gossip_e2e() {
+    let port1 = 16762;
+    let port2 = 16763;
+    let port3 = 16764;
+
+    start_test_server(port1, 2);
+    start_test_server(port2, 2);
+    start_test_server(port3, 2);
+
+    let mut c1 = TcpStream::connect(format!("127.0.0.1:{}", port1)).unwrap();
+    let mut c2 = TcpStream::connect(format!("127.0.0.1:{}", port2)).unwrap();
+    let mut c3 = TcpStream::connect(format!("127.0.0.1:{}", port3)).unwrap();
+
+    // Meet nodes into 3-node cluster
+    assert_eq!(
+        send_and_read(
+            &mut c1,
+            format!("CLUSTER MEET 127.0.0.1 {}\r\n", port2).as_bytes()
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut c2,
+            format!("CLUSTER MEET 127.0.0.1 {}\r\n", port3).as_bytes()
+        ),
+        "+OK\r\n"
+    );
+
+    // Wait for cluster bus gossip convergence
+    for _ in 0..40 {
+        let nodes1 = send_and_read(&mut c1, b"CLUSTER NODES\r\n");
+        if nodes1.contains(&format!("127.0.0.1:{}", port2))
+            && nodes1.contains(&format!("127.0.0.1:{}", port3))
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    // Identify Node 3 ID
+    let myid3 = {
+        let resp3 = send_and_read(&mut c3, b"CLUSTER MYID\r\n");
+        resp3
+            .trim_start_matches('$')
+            .split("\r\n")
+            .nth(1)
+            .unwrap()
+            .to_string()
+    };
+
+    // Before FAIL message, all nodes are connected masters
+    let nodes_init = send_and_read(&mut c1, b"CLUSTER NODES\r\n");
+    assert!(!nodes_init.contains(&format!("{} fail", myid3)));
+
+    // Connect to Node 1's cluster bus port and broadcast FAIL message for Node 3
+    let mut bus_client = TcpStream::connect(format!("127.0.0.1:{}", port1 + 10000)).unwrap();
+    bus_client
+        .write_all(format!("FAIL {}\r\n", myid3).as_bytes())
+        .unwrap();
+    let mut vbuf = [0u8; 64];
+    let n = bus_client.read(&mut vbuf).unwrap();
+    assert_eq!(&vbuf[..n], b"+OK\r\n");
+
+    // Verify Node 1 now flags Node 3 as fail
+    let nodes_after_fail = send_and_read(&mut c1, b"CLUSTER NODES\r\n");
+    assert!(
+        nodes_after_fail.contains(&format!(
+            "{} 127.0.0.1:{}@{} fail",
+            myid3,
+            port3,
+            port3 + 10000
+        )),
+        "Node 3 should be marked fail on Node 1 after FAIL message. Nodes:\n{}",
+        nodes_after_fail
+    );
+}

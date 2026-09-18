@@ -177,23 +177,32 @@ impl ClusterHub {
         let mut keys: Vec<String> = nodes.keys().cloned().collect();
         keys.sort();
 
+        let total_masters = nodes
+            .values()
+            .filter(|n| n.flags.contains("master"))
+            .count()
+            + if *self.role.read().unwrap() == "master" {
+                1
+            } else {
+                0
+            };
+        let quorum = (total_masters / 2) + 1;
+
         for id in keys {
             if id == my_id {
                 continue;
             }
             if let Some(node) = nodes.get_mut(&id) {
                 let silence = now.saturating_sub(node.pong_recv);
-                if silence > 10000 {
+                let pfail_count = pfail_reports.get(&id).map(|s| s.len()).unwrap_or(0);
+                let total_pfail_votes = pfail_count + if silence > 5000 { 1 } else { 0 };
+
+                if node.flags == "fail" || total_pfail_votes >= quorum {
                     node.flags = "fail".to_string();
                     node.link_state = "disconnected".to_string();
                 } else if silence > 5000 {
-                    let reports = pfail_reports.get(&id).map(|s| s.len()).unwrap_or(0);
-                    if reports >= 1 {
-                        node.flags = "fail".to_string();
-                    } else {
-                        node.flags = "fail?".to_string();
-                    }
-                } else if node.flags == "fail?" || node.flags == "fail" {
+                    node.flags = "fail?".to_string();
+                } else if node.flags == "fail?" {
                     node.flags = "master".to_string();
                     node.link_state = "connected".to_string();
                 }
@@ -1247,6 +1256,19 @@ fn handle_cluster_bus_conn(mut stream: TcpStream, hub: &Arc<ClusterHub>) {
                                     let gcport: u16 = fields[3].parse().unwrap_or(0);
                                     let gflags = fields[4].to_string();
                                     if gid != hub.my_id() {
+                                        if gflags.contains("fail") {
+                                            hub.pfail_reports
+                                                .write()
+                                                .unwrap()
+                                                .entry(gid.clone())
+                                                .or_default()
+                                                .insert(peer_id.clone());
+                                        } else if let Some(reports) =
+                                            hub.pfail_reports.write().unwrap().get_mut(&gid)
+                                        {
+                                            reports.remove(&peer_id);
+                                        }
+
                                         let mut nodes = hub.nodes.write().unwrap();
                                         if let Some(n) = nodes.get_mut(&gid) {
                                             if gflags == "fail" {
@@ -1413,12 +1435,22 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
         .unwrap_or_default()
         .as_millis() as u64;
 
-    let peers: Vec<(String, String, u16, u16)> = {
+    let (peers, quorum): (Vec<(String, String, u16, u16)>, usize) = {
         let nodes = hub.nodes.read().unwrap();
-        nodes
+        let p = nodes
             .values()
             .map(|n| (n.id.clone(), n.ip.clone(), n.port, n.cport))
-            .collect()
+            .collect();
+        let total_masters = nodes
+            .values()
+            .filter(|n| n.flags.contains("master"))
+            .count()
+            + if *hub.role.read().unwrap() == "master" {
+                1
+            } else {
+                0
+            };
+        (p, (total_masters / 2) + 1)
     };
 
     // Prepare gossip payload of all known nodes
@@ -1519,13 +1551,27 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
                     if node.flags == "fail?" || node.flags == "fail" {
                         node.flags = "master".to_string();
                     }
+                    if let Some(reports) = hub.pfail_reports.write().unwrap().get_mut(&id) {
+                        reports.remove(&hub.my_id());
+                    }
                 } else {
                     let elapsed = now.saturating_sub(node.pong_recv);
-                    if elapsed > 10000 {
-                        node.flags = "fail".to_string();
-                        node.link_state = "disconnected".to_string();
-                    } else if elapsed > 5000 {
-                        node.flags = "fail?".to_string();
+                    if elapsed > 5000 {
+                        let pfail_count = hub
+                            .pfail_reports
+                            .read()
+                            .unwrap()
+                            .get(&id)
+                            .map(|s| s.len())
+                            .unwrap_or(0);
+                        let total_votes = pfail_count + 1;
+                        if total_votes >= quorum || elapsed > 15000 {
+                            node.flags = "fail".to_string();
+                            node.link_state = "disconnected".to_string();
+                            hub.broadcast_to_peers(&format!("FAIL {}\r\n", node.id));
+                        } else {
+                            node.flags = "fail?".to_string();
+                        }
                     }
                 }
             }
@@ -1533,11 +1579,22 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
             && let Some(node) = nodes.get_mut(&id)
         {
             let elapsed = now.saturating_sub(node.pong_recv);
-            if elapsed > 10000 {
-                node.flags = "fail".to_string();
-                node.link_state = "disconnected".to_string();
-            } else if elapsed > 5000 {
-                node.flags = "fail?".to_string();
+            if elapsed > 5000 {
+                let pfail_count = hub
+                    .pfail_reports
+                    .read()
+                    .unwrap()
+                    .get(&id)
+                    .map(|s| s.len())
+                    .unwrap_or(0);
+                let total_votes = pfail_count + 1;
+                if total_votes >= quorum || elapsed > 15000 {
+                    node.flags = "fail".to_string();
+                    node.link_state = "disconnected".to_string();
+                    hub.broadcast_to_peers(&format!("FAIL {}\r\n", node.id));
+                } else {
+                    node.flags = "fail?".to_string();
+                }
             }
         }
     }
@@ -1562,5 +1619,80 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
         std::thread::spawn(move || {
             hub_election.start_election();
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cluster_quorum_pfail_to_fail_escalation() {
+        let hub = ClusterHub::new(7000);
+        let node2_id = "node2_abcdef0123456789abcdef0123456789abcd".to_string();
+        let node3_id = "node3_abcdef0123456789abcdef0123456789abcd".to_string();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        // Insert Node 2 and Node 3 as masters
+        {
+            let mut nodes = hub.nodes.write().unwrap();
+            nodes.insert(
+                node2_id.clone(),
+                ClusterNodeInfo {
+                    id: node2_id.clone(),
+                    ip: "127.0.0.1".to_string(),
+                    port: 7001,
+                    cport: 17001,
+                    flags: "master".to_string(),
+                    master_id: "-".to_string(),
+                    ping_sent: now,
+                    pong_recv: now.saturating_sub(6000), // silent for 6s (>5s PFAIL threshold)
+                    config_epoch: 1,
+                    link_state: "connected".to_string(),
+                    slots: vec![(0, 5460)],
+                },
+            );
+            nodes.insert(
+                node3_id.clone(),
+                ClusterNodeInfo {
+                    id: node3_id.clone(),
+                    ip: "127.0.0.1".to_string(),
+                    port: 7002,
+                    cport: 17002,
+                    flags: "master".to_string(),
+                    master_id: "-".to_string(),
+                    ping_sent: now,
+                    pong_recv: now,
+                    config_epoch: 1,
+                    link_state: "connected".to_string(),
+                    slots: vec![(5461, 10922)],
+                },
+            );
+        }
+
+        // Total masters: hub(7000) + node2 + node3 = 3. Quorum = (3/2) + 1 = 2.
+        // 1. Without peer corroboration, Node 2 is marked fail? (PFAIL), NOT fail
+        let nodes_output = hub.cluster_nodes();
+        assert!(nodes_output.contains(&format!("{} 127.0.0.1:7001@17001 fail?", node2_id)));
+        assert!(!nodes_output.contains(&format!("{} 127.0.0.1:7001@17001 fail ", node2_id)));
+
+        // 2. Node 3 reports Node 2 as failing
+        hub.pfail_reports
+            .write()
+            .unwrap()
+            .entry(node2_id.clone())
+            .or_default()
+            .insert(node3_id.clone());
+
+        // Now total votes = 1 (local) + 1 (node 3) = 2 >= quorum(2).
+        // Node 2 must be promoted to fail!
+        let nodes_output_escalated = hub.cluster_nodes();
+        assert!(
+            nodes_output_escalated.contains(&format!("{} 127.0.0.1:7001@17001 fail", node2_id))
+        );
     }
 }
