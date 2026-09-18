@@ -6,7 +6,7 @@ fn test_cross_thread_flume() {
     let (tx, rx) = flume::bounded::<u32>(10);
 
     let h1 = thread::spawn(move || {
-        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
             .enable_all()
             .build()
             .unwrap();
@@ -46,7 +46,7 @@ fn test_lock_free_spsc_queue_and_mesh() {
     let rx_1 = receivers.into_iter().nth(1).unwrap();
 
     let h_consumer = thread::spawn(move || {
-        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
             .enable_all()
             .build()
             .unwrap();

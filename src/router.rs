@@ -2136,7 +2136,7 @@ mod tests {
             let _ = done_tx.send(db.get(&k_shard1_verify));
         });
 
-        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
             .enable_all()
             .build()
             .unwrap();
@@ -2188,7 +2188,7 @@ mod tests {
             std::env::temp_dir(),
         );
 
-        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
             .enable_all()
             .build()
             .unwrap();
@@ -2299,7 +2299,7 @@ mod tests {
             }
         });
 
-        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
             .enable_all()
             .build()
             .unwrap();
@@ -2390,7 +2390,7 @@ mod tests {
             }
         });
 
-        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
             .enable_all()
             .build()
             .unwrap();
@@ -2464,7 +2464,7 @@ mod tests {
             }
         });
 
-        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
             .enable_all()
             .build()
             .unwrap();
@@ -2576,7 +2576,7 @@ mod tests {
             }
         });
 
-        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
             .enable_all()
             .build()
             .unwrap();
@@ -2707,7 +2707,7 @@ mod tests {
             }
         });
 
-        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
             .enable_all()
             .build()
             .unwrap();
@@ -2813,7 +2813,7 @@ mod tests {
             }
         });
 
-        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
             .enable_all()
             .build()
             .unwrap();

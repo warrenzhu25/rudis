@@ -12267,7 +12267,7 @@ mod tests {
 
     #[test]
     fn test_pipeline1_execute_command_lockless_bypass() {
-        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
             .enable_all()
             .build()
             .unwrap();

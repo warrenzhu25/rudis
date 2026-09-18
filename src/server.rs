@@ -49,7 +49,7 @@ pub fn run_shard_worker(
         core_affinity::set_for_current(core);
     }
 
-    let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+    let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
         .enable_timer()
         .build()
         .expect("Failed to initialize Monoio io_uring runtime");
