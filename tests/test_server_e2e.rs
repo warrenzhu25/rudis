@@ -7219,7 +7219,14 @@ fn test_multikey_acl_and_crossslot_enforcement_e2e() {
 #[test]
 fn test_extended_types_rdb_persistence_e2e() {
     let port = 16740;
-    start_test_server(port, 1);
+    let rdb_dir = std::env::temp_dir().join(format!("rudis-rdb-ext-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&rdb_dir);
+    let aof_config = rudis::aof::AofConfig {
+        enabled: false,
+        dir: rdb_dir.clone(),
+        fsync_every_sec: false,
+    };
+    start_test_server_with_aof(port, 1, aof_config);
 
     let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
 
@@ -7227,42 +7234,46 @@ fn test_extended_types_rdb_persistence_e2e() {
     assert_eq!(
         send_and_read(
             &mut client,
-            b"JSON.SET doc:1 $ {\"title\":\"test\",\"rating\":5}\r\n"
+            b"JSON.SET doc:ext_1 $ {\"title\":\"test\",\"rating\":5}\r\n"
         ),
         "+OK\r\n"
     );
     assert_eq!(
-        send_and_read(&mut client, b"JSON.GET doc:1 $\r\n"),
+        send_and_read(&mut client, b"JSON.GET doc:ext_1 $\r\n"),
         "$27\r\n{\"rating\":5,\"title\":\"test\"}\r\n"
     );
 
     // 2. Add Bloom filter items
     assert_eq!(
-        send_and_read(&mut client, b"BF.RESERVE bf:items 0.01 1000\r\n"),
+        send_and_read(&mut client, b"BF.RESERVE bf:items_ext 0.01 1000\r\n"),
         "+OK\r\n"
     );
     assert_eq!(
-        send_and_read(&mut client, b"BF.ADD bf:items my_token\r\n"),
+        send_and_read(&mut client, b"BF.ADD bf:items_ext my_token\r\n"),
         ":1\r\n"
     );
     assert_eq!(
-        send_and_read(&mut client, b"BF.EXISTS bf:items my_token\r\n"),
+        send_and_read(&mut client, b"BF.EXISTS bf:items_ext my_token\r\n"),
         ":1\r\n"
     );
 
     // 3. Trigger SAVE to generate RDB snapshot containing extended types
     let save_resp = send_and_read(&mut client, b"SAVE\r\n");
     assert_eq!(save_resp, "+OK\r\n");
+    let rdb_file = rdb_dir.join("dump.rdb");
+    assert!(rdb_file.exists(), "RDB snapshot should exist in temp dir");
 
     // 4. Verify data remains valid and retrievable
     assert_eq!(
-        send_and_read(&mut client, b"JSON.GET doc:1 $\r\n"),
+        send_and_read(&mut client, b"JSON.GET doc:ext_1 $\r\n"),
         "$27\r\n{\"rating\":5,\"title\":\"test\"}\r\n"
     );
     assert_eq!(
-        send_and_read(&mut client, b"BF.EXISTS bf:items my_token\r\n"),
+        send_and_read(&mut client, b"BF.EXISTS bf:items_ext my_token\r\n"),
         ":1\r\n"
     );
+
+    let _ = std::fs::remove_dir_all(rdb_dir);
 }
 
 #[test]

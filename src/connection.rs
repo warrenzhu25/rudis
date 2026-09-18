@@ -3085,9 +3085,7 @@ async fn execute_command(
     let is_asking = *asking;
     *asking = false;
 
-    if router.cluster_enabled
-        || crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed)
-    {
+    if router.cluster_enabled {
         let keys = cmd_keys(&cmd);
         if keys.len() > 1 {
             let first_slot = key_slot(keys[0]);
@@ -3170,7 +3168,10 @@ async fn execute_command(
     // Enforce maxmemory with noeviction: return OOM if memory limit is exceeded
     if crate::aof::command_to_resp(&cmd).is_some() {
         let max_mem = crate::tiering::get_max_memory(router.port);
-        if max_mem > 0 && get_max_memory_policy() == "noeviction" {
+        if max_mem > 0
+            && get_max_memory_policy() == "noeviction"
+            && router.local_db.borrow().tier_manager.is_none()
+        {
             let used = router.local_db.borrow().table.used_memory;
             let shard_max = (max_mem / router.num_shards.max(1) as u64) as usize;
             if used > shard_max {
@@ -11863,9 +11864,7 @@ async fn execute_commands_squashed(
                 }
             }
             if !cmd_keys_list.is_empty() {
-                let is_cluster = router.cluster_enabled
-                    || crate::cluster::HAS_ACTIVE_CLUSTER
-                        .load(std::sync::atomic::Ordering::Relaxed);
+                let is_cluster = router.cluster_enabled;
                 if is_cluster && cmd_keys_list.len() > 1 {
                     let first_slot = key_slot(cmd_keys_list[0]);
                     if cmd_keys_list[1..].iter().any(|k| key_slot(k) != first_slot) {
