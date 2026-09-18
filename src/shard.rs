@@ -9,6 +9,7 @@ use crate::resp::Command;
 pub enum CompactResp {
     Small { len: u8, data: [u8; 30] },
     Big(Vec<u8>),
+    Bulk(Bytes),
 }
 
 impl CompactResp {
@@ -51,6 +52,51 @@ impl CompactResp {
             0, 0, 0, 0, 0, 0, 0,
         ],
     };
+
+    #[inline(always)]
+    pub fn from_bulk(bytes: &Bytes) -> Self {
+        let n = bytes.len();
+        if n <= 20 {
+            let mut data = [0u8; 30];
+            data[0] = b'$';
+            let mut len = 1;
+            if n < 10 {
+                data[len] = b'0' + n as u8;
+                len += 1;
+            } else if n < 100 {
+                data[len] = b'0' + (n / 10) as u8;
+                data[len + 1] = b'0' + (n % 10) as u8;
+                len += 2;
+            } else {
+                let mut rev = [0u8; 10];
+                let mut rev_len = 0;
+                let mut val = n;
+                while val > 0 {
+                    rev[rev_len] = b'0' + (val % 10) as u8;
+                    rev_len += 1;
+                    val /= 10;
+                }
+                for i in (0..rev_len).rev() {
+                    data[len] = rev[i];
+                    len += 1;
+                }
+            }
+            data[len] = b'\r';
+            data[len + 1] = b'\n';
+            len += 2;
+            data[len..len + n].copy_from_slice(bytes.as_ref());
+            len += n;
+            data[len] = b'\r';
+            data[len + 1] = b'\n';
+            len += 2;
+            CompactResp::Small {
+                len: len as u8,
+                data,
+            }
+        } else {
+            CompactResp::Bulk(bytes.clone())
+        }
+    }
 
     #[inline(always)]
     pub fn from_integer(val: i64) -> Self {
@@ -113,10 +159,20 @@ impl CompactResp {
     }
 
     #[inline(always)]
+    pub fn write_to(&self, out: &mut Vec<u8>) {
+        match self {
+            CompactResp::Small { len, data } => out.extend_from_slice(&data[..*len as usize]),
+            CompactResp::Big(vec) => out.extend_from_slice(vec),
+            CompactResp::Bulk(bytes) => crate::connection::write_resp_bulk(out, bytes),
+        }
+    }
+
+    #[inline(always)]
     pub fn as_slice(&self) -> &[u8] {
         match self {
             CompactResp::Small { len, data } => &data[..*len as usize],
             CompactResp::Big(vec) => vec.as_slice(),
+            CompactResp::Bulk(bytes) => bytes.as_ref(),
         }
     }
 
@@ -125,6 +181,11 @@ impl CompactResp {
         match self {
             CompactResp::Small { len, data } => data[..len as usize].to_vec(),
             CompactResp::Big(vec) => vec,
+            CompactResp::Bulk(bytes) => {
+                let mut v = Vec::with_capacity(bytes.len() + 16);
+                crate::connection::write_resp_bulk(&mut v, &bytes);
+                v
+            }
         }
     }
 }
@@ -555,6 +616,16 @@ impl ShardDb {
     #[inline]
     pub fn exists(&mut self, key: &[u8]) -> bool {
         self.table.exists(key)
+    }
+
+    #[inline(always)]
+    pub fn get_compact(&mut self, key: &[u8]) -> Result<Option<CompactResp>, &'static str> {
+        self.table.get_compact(key)
+    }
+
+    #[inline(always)]
+    pub fn hget_compact(&mut self, key: &[u8], field: &[u8]) -> Result<CompactResp, &'static str> {
+        self.table.hget_compact(key, field)
     }
 
     #[inline(always)]

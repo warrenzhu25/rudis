@@ -1650,6 +1650,41 @@ impl RudisTable {
     }
 
     #[inline(always)]
+    pub fn get_compact(
+        &mut self,
+        key: &[u8],
+    ) -> Result<Option<crate::shard::CompactResp>, &'static str> {
+        let h = hash_key(key);
+        if let Some((idx, entry)) = self.table.find_entry(key, h) {
+            if let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+                return Ok(None);
+            }
+            let val_ref = match &entry.val {
+                RudisValue::Cooled { val, .. } => val.as_ref(),
+                other => other,
+            };
+            match val_ref {
+                RudisValue::String(b) => Ok(Some(crate::shard::CompactResp::from_bulk(b))),
+                RudisValue::Int(n) => {
+                    let formatted = Self::format_i64(*n);
+                    Ok(Some(crate::shard::CompactResp::from_slice(&formatted)))
+                }
+                RudisValue::HyperLogLog(regs) => Ok(Some(crate::shard::CompactResp::from_bulk(
+                    &Bytes::copy_from_slice(&regs[..]),
+                ))),
+                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[inline(always)]
     pub fn write_get_resp(&mut self, key: &[u8], out: &mut Vec<u8>) -> Result<bool, &'static str> {
         let h = hash_key(key);
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
@@ -2882,6 +2917,47 @@ impl RudisTable {
             }
         } else {
             Ok(None)
+        }
+    }
+
+    #[inline(always)]
+    pub fn hget_compact(
+        &mut self,
+        key: &[u8],
+        field: &[u8],
+    ) -> Result<crate::shard::CompactResp, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h)
+            && let Some(entry) = self.table.get_slot(idx)
+        {
+            if let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+                return Ok(crate::shard::CompactResp::NULL);
+            }
+            match &entry.val {
+                RudisValue::SmallHash(pairs) => {
+                    let f_len = field.len();
+                    for (k, v) in pairs {
+                        if k.len() == f_len && k.as_ref() == field {
+                            return Ok(crate::shard::CompactResp::from_bulk(v));
+                        }
+                    }
+                    Ok(crate::shard::CompactResp::NULL)
+                }
+                RudisValue::Hash(map) => {
+                    if let Some(v) = map.get(field) {
+                        return Ok(crate::shard::CompactResp::from_bulk(v));
+                    }
+                    Ok(crate::shard::CompactResp::NULL)
+                }
+                _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+            }
+        } else {
+            Ok(crate::shard::CompactResp::NULL)
         }
     }
 

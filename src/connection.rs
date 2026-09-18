@@ -12267,25 +12267,29 @@ async fn execute_commands_squashed(
                 local_buf.clear();
                 if let Command::Get(ref key) = cmd {
                     let has_tiering = router.local_db.borrow().tier_manager.is_some();
-                    if !router
-                        .local_db
-                        .borrow_mut()
-                        .write_get_resp(key.as_ref(), &mut local_buf)
-                        .unwrap_or(false)
-                    {
-                        if has_tiering
-                            && router.local_db.borrow_mut().table.is_tiered(key).is_some()
-                        {
-                            if let Some(v) = router.stream_cold_read_local(key).await {
-                                write_resp_bulk(&mut local_buf, &v);
-                                responses[idx] = CompactResp::from_slice(&local_buf);
+                    let compact_res = router.local_db.borrow_mut().table.get_compact(key.as_ref());
+                    match compact_res {
+                        Ok(Some(resp)) => {
+                            responses[idx] = resp;
+                            continue;
+                        }
+                        Ok(None) => {
+                            let is_tiered = has_tiering
+                                && router.local_db.borrow_mut().table.is_tiered(key).is_some();
+                            if is_tiered {
+                                if let Some(v) = router.stream_cold_read_local(key).await {
+                                    responses[idx] = CompactResp::Bulk(v);
+                                } else {
+                                    responses[idx] = crate::shard::CompactResp::NULL;
+                                }
                             } else {
                                 responses[idx] = crate::shard::CompactResp::NULL;
                             }
-                        } else {
-                            responses[idx] = crate::shard::CompactResp::NULL;
+                            continue;
                         }
-                        continue;
+                        Err(err) => {
+                            write_resp_err(&mut local_buf, err);
+                        }
                     }
                 } else if router.aof.is_none()
                     && !crate::replication::has_connected_replicas(router.port)
@@ -12364,12 +12368,19 @@ async fn execute_commands_squashed(
                     }
                     continue;
                 } else if let Command::Hget { ref key, ref field } = cmd {
-                    if let Err(err) = router.local_db.borrow_mut().write_hget_resp(
-                        key.as_ref(),
-                        field.as_ref(),
-                        &mut local_buf,
-                    ) {
-                        write_resp_err(&mut local_buf, err);
+                    match router
+                        .local_db
+                        .borrow_mut()
+                        .table
+                        .hget_compact(key.as_ref(), field.as_ref())
+                    {
+                        Ok(resp) => {
+                            responses[idx] = resp;
+                            continue;
+                        }
+                        Err(err) => {
+                            write_resp_err(&mut local_buf, err);
+                        }
                     }
                 } else if router.aof.is_none()
                     && !crate::replication::has_connected_replicas(router.port)
@@ -12660,7 +12671,7 @@ async fn execute_commands_squashed(
     }
 
     // 3. Await parallel responses from all remote shards with spin-wait before async yield
-    for _spin in 0..48 {
+    for _spin in 0..256 {
         if pending.is_empty() {
             break;
         }
@@ -12693,7 +12704,7 @@ async fn execute_commands_squashed(
 
     // 4. Append responses in exact FIFO pipeline order
     for resp in responses.iter() {
-        out.extend_from_slice(resp.as_slice());
+        resp.write_to(out);
     }
 
     should_close

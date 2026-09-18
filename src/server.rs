@@ -741,9 +741,18 @@ pub fn run_shard_worker(
                             for (idx, cmd) in items.drain(..) {
                                 temp_buf.clear();
                                 if let Command::Get(ref key) = cmd {
-                                    if !db.write_get_resp(key.as_ref(), &mut temp_buf).unwrap_or(false) {
-                                        results.push((idx, crate::shard::CompactResp::NULL));
-                                        continue;
+                                    match db.get_compact(key.as_ref()) {
+                                        Ok(Some(resp)) => {
+                                            results.push((idx, resp));
+                                            continue;
+                                        }
+                                        Ok(None) => {
+                                            results.push((idx, crate::shard::CompactResp::NULL));
+                                            continue;
+                                        }
+                                        Err(err) => {
+                                            crate::connection::write_resp_err(&mut temp_buf, err);
+                                        }
                                     }
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
@@ -806,8 +815,14 @@ pub fn run_shard_worker(
                                     }
                                     continue;
                                 } else if let Command::Hget { ref key, ref field } = cmd {
-                                    if let Err(err) = db.write_hget_resp(key.as_ref(), field.as_ref(), &mut temp_buf) {
-                                        crate::connection::write_resp_err(&mut temp_buf, err);
+                                    match db.hget_compact(key.as_ref(), field.as_ref()) {
+                                        Ok(resp) => {
+                                            results.push((idx, resp));
+                                            continue;
+                                        }
+                                        Err(err) => {
+                                            crate::connection::write_resp_err(&mut temp_buf, err);
+                                        }
                                     }
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
