@@ -9480,4 +9480,11 @@ fn test_overlapped_remote_dispatch_and_coordinator_recycle_e2e() {
     client.write_all(pipeline3.as_bytes()).unwrap();
     client.read_exact(&mut buf).unwrap();
     assert_eq!(String::from_utf8_lossy(&buf), expected);
+
+    drop(client);
+    let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let pipeline4 = pipeline.replace("ov_", "od_");
+    client2.write_all(pipeline4.as_bytes()).unwrap();
+    client2.read_exact(&mut buf).unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf), expected);
 }

@@ -455,9 +455,13 @@ pub fn register_client_tracking(
 }
 
 pub fn unregister_client_tracking(port: u16, client_id: u64) {
+    if !HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let mut map = TRACKING_CLIENTS.write().unwrap();
-    map.remove(&(port, client_id));
-    HAS_TRACKING_CLIENTS.store(!map.is_empty(), std::sync::atomic::Ordering::Release);
+    if map.remove(&(port, client_id)).is_some() {
+        HAS_TRACKING_CLIENTS.store(!map.is_empty(), std::sync::atomic::Ordering::Release);
+    }
 }
 
 #[inline(always)]
@@ -706,9 +710,11 @@ pub async fn handle_tls_connection(
             ACTIVE_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             self.registry.borrow_mut().remove(&self.client_id);
             unregister_client_tracking(self.port, self.client_id);
-            let hub_arc = crate::block::get_block_hub_for_port(self.port);
-            let mut hub = hub_arc.lock().unwrap();
-            hub.unregister_blocked_client(self.client_id);
+            if crate::block::has_blocked_waiters(self.port) {
+                let hub_arc = crate::block::get_block_hub_for_port(self.port);
+                let mut hub = hub_arc.lock().unwrap();
+                hub.unregister_blocked_client(self.client_id);
+            }
         }
     }
     let _cleanup = TlsClientCleanup {
@@ -723,10 +729,11 @@ pub async fn handle_tls_connection(
     let mut out_buf = Vec::with_capacity(65536);
 
     let mut asking = false;
-    let mut authenticated = !crate::acl::get_acl_for_port(router.port)
-        .read()
-        .unwrap()
-        .is_auth_required_for_default();
+    let mut authenticated = !crate::acl::HAS_CUSTOM_ACL.load(std::sync::atomic::Ordering::Relaxed)
+        || !crate::acl::get_acl_for_port(router.port)
+            .read()
+            .unwrap()
+            .is_auth_required_for_default();
     let mut auth_user = "default".to_string();
 
     loop {
@@ -829,11 +836,15 @@ pub async fn handle_connection(
             ACTIVE_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             flush_local_cmd_stats();
             self.registry.borrow_mut().remove(&self.client_id);
-            self.pubsub.borrow_mut().remove_client(self.client_id);
+            if !self.pubsub.borrow().clients.is_empty() {
+                self.pubsub.borrow_mut().remove_client(self.client_id);
+            }
             unregister_client_tracking(self.port, self.client_id);
-            let hub_arc = crate::block::get_block_hub_for_port(self.port);
-            let mut hub = hub_arc.lock().unwrap();
-            hub.unregister_blocked_client(self.client_id);
+            if crate::block::has_blocked_waiters(self.port) {
+                let hub_arc = crate::block::get_block_hub_for_port(self.port);
+                let mut hub = hub_arc.lock().unwrap();
+                hub.unregister_blocked_client(self.client_id);
+            }
         }
     }
     let _cleanup = ClientCleanup {
@@ -843,33 +854,26 @@ pub async fn handle_connection(
         pubsub: router.pubsub.clone(),
     };
 
-    let mut buf = BytesMut::with_capacity(131072);
-    let mut out_buf = Vec::with_capacity(65536);
-
-    // Pre-allocated reusable lock-free batch responders (1 per shard, 0 mutex contention in steady-state)
-    let responders: Vec<std::sync::Arc<crate::mailbox::BatchResponder>> = (0..router.num_shards)
-        .map(|_| std::sync::Arc::new(crate::mailbox::BatchResponder::new()))
-        .collect();
-    let mut remote_batches: Vec<Vec<(usize, u64, Command)>> = (0..router.num_shards)
-        .map(|_| Vec::with_capacity(64))
-        .collect();
-    let mut items_pool: Vec<Vec<(usize, u64, Command)>> = (0..router.num_shards)
-        .map(|_| Vec::with_capacity(64))
-        .collect();
-    let mut results_pool: Vec<Vec<(usize, CompactResp)>> = (0..router.num_shards)
-        .map(|_| Vec::with_capacity(64))
-        .collect();
-    let mut squashed_responses = Vec::with_capacity(64);
-    let mut commands = Vec::with_capacity(64);
+    let ConnScratch {
+        mut buf,
+        mut out_buf,
+        responders,
+        mut remote_batches,
+        mut items_pool,
+        mut results_pool,
+        mut squashed_responses,
+        mut commands,
+    } = take_conn_scratch(router.num_shards);
 
     let mut asking = false;
     let mut in_multi = false;
     let mut tx_queue: Vec<Command> = Vec::new();
     let mut tx_has_error = false;
-    let mut authenticated = !crate::acl::get_acl_for_port(router.port)
-        .read()
-        .unwrap()
-        .is_auth_required_for_default();
+    let mut authenticated = !crate::acl::HAS_CUSTOM_ACL.load(std::sync::atomic::Ordering::Relaxed)
+        || !crate::acl::get_acl_for_port(router.port)
+            .read()
+            .unwrap()
+            .is_auth_required_for_default();
     let mut auth_user = "default".to_string();
 
     const MIN_READ_SPARE: usize = 16 * 1024;
@@ -1420,9 +1424,100 @@ pub async fn handle_connection(
             }
         }
     }
-    client_registry.borrow_mut().remove(&client_id);
+    recycle_conn_scratch(ConnScratch {
+        buf,
+        out_buf,
+        responders,
+        remote_batches,
+        items_pool,
+        results_pool,
+        squashed_responses,
+        commands,
+    });
     unwatch_keys(router.port, client_id);
-    unregister_client_tracking(router.port, client_id);
+}
+
+struct ConnScratch {
+    buf: BytesMut,
+    out_buf: Vec<u8>,
+    responders: Vec<std::sync::Arc<crate::mailbox::BatchResponder>>,
+    remote_batches: Vec<Vec<(usize, u64, Command)>>,
+    items_pool: Vec<Vec<(usize, u64, Command)>>,
+    results_pool: Vec<Vec<(usize, CompactResp)>>,
+    squashed_responses: Vec<CompactResp>,
+    commands: Vec<Command>,
+}
+
+thread_local! {
+    static CONN_SCRATCH_POOL: RefCell<Vec<ConnScratch>> = const { RefCell::new(Vec::new()) };
+}
+
+fn take_conn_scratch(num_shards: usize) -> ConnScratch {
+    if let Some(mut s) = CONN_SCRATCH_POOL.with(|pool| {
+        let mut p = pool.borrow_mut();
+        p.iter()
+            .rposition(|item| item.responders.len() == num_shards)
+            .map(|idx| p.swap_remove(idx))
+    }) {
+        s.buf.clear();
+        let _ = s.buf.try_reclaim(131072);
+        s.out_buf.clear();
+        s.squashed_responses.clear();
+        s.commands.clear();
+        for b in &mut s.remote_batches {
+            b.clear();
+        }
+        return s;
+    }
+    ConnScratch {
+        buf: BytesMut::with_capacity(131072),
+        out_buf: Vec::with_capacity(65536),
+        responders: (0..num_shards)
+            .map(|_| std::sync::Arc::new(crate::mailbox::BatchResponder::new()))
+            .collect(),
+        remote_batches: (0..num_shards).map(|_| Vec::with_capacity(64)).collect(),
+        items_pool: (0..num_shards).map(|_| Vec::with_capacity(64)).collect(),
+        results_pool: (0..num_shards).map(|_| Vec::with_capacity(64)).collect(),
+        squashed_responses: Vec::with_capacity(64),
+        commands: Vec::with_capacity(64),
+    }
+}
+
+fn recycle_conn_scratch(mut s: ConnScratch) {
+    // A remote shard holds an Arc clone of a BatchResponder for as long as its batch
+    // is in flight, and writes the payload cross-thread through an UnsafeCell in
+    // BatchResponder::finish(). If this connection tore down (client hang-up, write
+    // error) while a batch was still outstanding, handing that responder to the next
+    // connection would let the late finish() deliver another client's results, or
+    // leave a stale ready=true that desyncs the new harvest loop. Only pool scratch
+    // whose responders are provably unreferenced and idle; otherwise drop it and let
+    // the straggling shard release the Arc normally.
+    let reusable = s.responders.iter().all(|r| {
+        std::sync::Arc::strong_count(r) == 1 && !r.ready.load(std::sync::atomic::Ordering::Acquire)
+    });
+    if !reusable {
+        return;
+    }
+    s.commands.clear();
+    s.squashed_responses.clear();
+    s.out_buf.clear();
+    s.buf.clear();
+    let _ = s.buf.try_reclaim(131072);
+    for b in &mut s.remote_batches {
+        b.clear();
+    }
+    for b in &mut s.items_pool {
+        b.clear();
+    }
+    for b in &mut s.results_pool {
+        b.clear();
+    }
+    CONN_SCRATCH_POOL.with(|pool| {
+        let mut p = pool.borrow_mut();
+        if p.len() < 32 {
+            p.push(s);
+        }
+    });
 }
 
 async fn run_pubsub_loop(
@@ -13321,5 +13416,67 @@ mod tests {
         drop(cmd);
         assert!(recovered.try_reclaim(64));
         assert_eq!(recovered.capacity(), 64);
+    }
+
+    #[test]
+    fn test_conn_scratch_pool_reuse_and_inflight_responder_guard() {
+        // Drain anything a previous test on this thread may have pooled.
+        CONN_SCRATCH_POOL.with(|p| p.borrow_mut().clear());
+
+        // 1. An idle scratch round-trips through the pool and reuses its allocations.
+        let mut scratch = take_conn_scratch(4);
+        assert_eq!(scratch.responders.len(), 4);
+        let out_ptr = scratch.out_buf.as_ptr();
+        scratch.out_buf.extend_from_slice(b"+OK\r\n");
+        scratch
+            .commands
+            .push(Command::Get(Bytes::from_static(b"k")));
+        recycle_conn_scratch(scratch);
+
+        let reused = take_conn_scratch(4);
+        assert!(reused.out_buf.is_empty(), "pooled out_buf must be cleared");
+        assert!(
+            reused.commands.is_empty(),
+            "pooled commands must be cleared"
+        );
+        assert_eq!(
+            reused.out_buf.as_ptr(),
+            out_ptr,
+            "pooled scratch must reuse the same heap allocation"
+        );
+
+        // 2. Scratch whose responder is still referenced by an in-flight remote shard
+        //    batch must NOT be pooled, or a late finish() would write another client's
+        //    results into the next connection's responder.
+        let inflight = std::sync::Arc::clone(&reused.responders[2]);
+        recycle_conn_scratch(reused);
+        CONN_SCRATCH_POOL.with(|p| {
+            assert!(
+                p.borrow().is_empty(),
+                "scratch with an outstanding responder Arc must not be pooled"
+            );
+        });
+        drop(inflight);
+
+        // 3. Scratch carrying an unharvested ready=true payload must also be rejected.
+        let stale = take_conn_scratch(4);
+        stale.responders[1]
+            .ready
+            .store(true, std::sync::atomic::Ordering::Release);
+        recycle_conn_scratch(stale);
+        CONN_SCRATCH_POOL.with(|p| {
+            assert!(
+                p.borrow().is_empty(),
+                "scratch with a stale ready responder must not be pooled"
+            );
+        });
+
+        // 4. A different shard count never aliases a pooled entry.
+        let clean = take_conn_scratch(4);
+        recycle_conn_scratch(clean);
+        let other = take_conn_scratch(8);
+        assert_eq!(other.responders.len(), 8);
+        assert_eq!(other.remote_batches.len(), 8);
+        recycle_conn_scratch(other);
     }
 }
