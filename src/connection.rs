@@ -872,8 +872,9 @@ pub async fn handle_connection(
         .is_auth_required_for_default();
     let mut auth_user = "default".to_string();
 
+    const MIN_READ_SPARE: usize = 16 * 1024;
     loop {
-        if buf.capacity() - buf.len() < READ_BUFFER_SIZE {
+        if buf.capacity() - buf.len() < MIN_READ_SPARE {
             buf.reserve(READ_BUFFER_SIZE);
         }
         let avail_before = buf.capacity() - buf.len();
@@ -891,7 +892,7 @@ pub async fn handle_connection(
                 // Drain any additional bytes waiting in kernel TCP socket buffer if spare capacity was completely filled
                 if n == avail_before {
                     loop {
-                        if buf.capacity() - buf.len() < READ_BUFFER_SIZE {
+                        if buf.capacity() - buf.len() < MIN_READ_SPARE {
                             buf.reserve(READ_BUFFER_SIZE);
                         }
                         let spare = buf.spare_capacity_mut();
@@ -931,7 +932,7 @@ pub async fn handle_connection(
                         }
                         Ok(None) => {
                             // Incomplete frame: check if remaining bytes just arrived in kernel buffer
-                            if buf.capacity() - buf.len() < READ_BUFFER_SIZE {
+                            if buf.capacity() - buf.len() < MIN_READ_SPARE {
                                 buf.reserve(READ_BUFFER_SIZE);
                             }
                             let spare = buf.spare_capacity_mut();
@@ -1368,6 +1369,10 @@ pub async fn handle_connection(
                             should_quit = true;
                         }
                     }
+                    commands.clear();
+                }
+                if buf.is_empty() {
+                    let _ = buf.try_reclaim(READ_BUFFER_SIZE);
                 }
 
                 // 4. Batch flush all accumulated responses: direct non-blocking send with io_uring fallback
@@ -13312,5 +13317,9 @@ mod tests {
         let cmd = parse_command(&mut recovered).unwrap().unwrap();
         assert_eq!(cmd, Command::Get(Bytes::from_static(b"myk1")));
         assert!(recovered.is_empty());
+        assert!(!recovered.try_reclaim(64));
+        drop(cmd);
+        assert!(recovered.try_reclaim(64));
+        assert_eq!(recovered.capacity(), 64);
     }
 }

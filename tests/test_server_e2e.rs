@@ -9469,10 +9469,15 @@ fn test_overlapped_remote_dispatch_and_coordinator_recycle_e2e() {
     client.read_exact(&mut buf).unwrap();
     assert_eq!(String::from_utf8_lossy(&buf), expected);
 
-    // Second consecutive burst over the same connection exercises RecvBytesMut
-    // after BytesMut::try_reclaim resets the read buffer offset.
+    // Second and third consecutive bursts over the same connection exercise RecvBytesMut
+    // after post-execution commands.clear() + BytesMut::try_reclaim resets the read buffer offset.
     let pipeline2 = pipeline.replace("ov_", "ob_");
     client.write_all(pipeline2.as_bytes()).unwrap();
+    client.read_exact(&mut buf).unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf), expected);
+
+    let pipeline3 = pipeline.replace("ov_", "oc_");
+    client.write_all(pipeline3.as_bytes()).unwrap();
     client.read_exact(&mut buf).unwrap();
     assert_eq!(String::from_utf8_lossy(&buf), expected);
 }
