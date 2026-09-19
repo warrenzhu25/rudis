@@ -622,7 +622,14 @@ def main():
     if len(sys.argv) > 1:
         core_list = [int(x) for x in sys.argv[1].split(",")]
     for cores in core_list:
-        final_results[f"{cores}_cores"] = benchmark_at_core_count(cores)
+        key = f"{cores}_cores"
+        new_res = benchmark_at_core_count(cores)
+        if key not in final_results:
+            final_results[key] = new_res
+        else:
+            for engine in ["Dragonfly", "Rudis"]:
+                if engine in new_res:
+                    final_results[key].setdefault(engine, {}).update(new_res[engine])
 
     with open(out_file, "w") as f:
         json.dump(final_results, f, indent=2)
