@@ -391,18 +391,17 @@ pub fn run_shard_worker(
                         let deleted = cross_shard_db.borrow_mut().del(&key);
                         if deleted
                             && let Some(aof) = &cross_shard_aof
-                                && let Some(bytes) =
-                                    crate::aof::command_to_resp(&crate::resp::Command::Del(vec![
-                                        key,
-                                    ]))
-                                {
-                                    aof.borrow_mut().append(&bytes);
-                                }
+                            && let Some(bytes) = crate::aof::command_to_resp(
+                                &crate::resp::Command::Del(smallvec::smallvec![key]),
+                            )
+                        {
+                            aof.borrow_mut().append(&bytes);
+                        }
                         let _ = responder.send(deleted);
                     }
                     ShardMessage::DelKeys { keys, responder } => {
                         let mut count = 0usize;
-                        let mut deleted_keys = Vec::with_capacity(keys.len());
+                        let mut deleted_keys = smallvec::SmallVec::with_capacity(keys.len());
                         {
                             let mut db = cross_shard_db.borrow_mut();
                             for k in keys {

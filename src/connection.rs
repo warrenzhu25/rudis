@@ -2108,12 +2108,12 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
             }
         }
 
-        Command::Mget(keys) | Command::Del(keys) | Command::Touch(keys) => {
+        Command::Mget(keys) | Command::Touch(keys) => {
             for k in keys {
                 f(k.as_ref());
             }
         }
-        Command::Exists(keys) => {
+        Command::Del(keys) | Command::Exists(keys) => {
             for k in keys {
                 f(k.as_ref());
             }
@@ -3526,7 +3526,9 @@ async fn execute_command(
                         db.del(&key);
                         if let Some(aof) = &router.aof
                             && let Some(bytes) =
-                                crate::aof::command_to_resp(&Command::Del(vec![key.clone()]))
+                                crate::aof::command_to_resp(&Command::Del(smallvec::smallvec![
+                                    key.clone()
+                                ]))
                         {
                             aof.borrow_mut().append(&bytes);
                         }
@@ -13229,7 +13231,7 @@ mod tests {
         ]);
         assert_eq!(cmd_keys(&mset), vec![b"k1", b"k2"]);
 
-        let del = Command::Del(vec![Bytes::from("d1"), Bytes::from("d2")]);
+        let del = Command::Del(smallvec::smallvec![Bytes::from("d1"), Bytes::from("d2")]);
         assert_eq!(cmd_keys(&del), vec![b"d1", b"d2"]);
 
         let sinter = Command::Sinter(vec![Bytes::from("s1"), Bytes::from("s2")]);

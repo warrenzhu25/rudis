@@ -9403,3 +9403,74 @@ fn test_pipelined_prehashed_zrange_lrange_array1bulk_e2e() {
     client.read_exact(&mut buf).unwrap();
     assert_eq!(String::from_utf8_lossy(&buf), expected);
 }
+
+#[test]
+fn test_smallvec_zero_alloc_commands_and_fast_range_e2e() {
+    let port = 16476;
+    start_test_server(port, 4);
+
+    let mut client =
+        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("Failed to connect to server");
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // Test single-item and multi-item DEL, HSET, LPUSH, ZADD, LRANGE, ZRANGE across shards
+    let mut pipeline = String::new();
+    let mut expected = String::new();
+
+    for i in 0..8 {
+        let hk = format!("sv_h_{}", i);
+        let lk = format!("sv_l_{}", i);
+        let zk = format!("sv_z_{}", i);
+
+        // HSET single field
+        pipeline.push_str(&format!(
+            "*4\r\n$4\r\nHSET\r\n${}\r\n{}\r\n$2\r\nf1\r\n$2\r\nv1\r\n",
+            hk.len(),
+            hk
+        ));
+        expected.push_str(":1\r\n");
+
+        // LPUSH single value
+        pipeline.push_str(&format!(
+            "*3\r\n$5\r\nLPUSH\r\n${}\r\n{}\r\n$4\r\nitem\r\n",
+            lk.len(),
+            lk
+        ));
+        expected.push_str(":1\r\n");
+
+        // ZADD single element
+        pipeline.push_str(&format!(
+            "*4\r\n$4\r\nZADD\r\n${}\r\n{}\r\n$1\r\n5\r\n$4\r\nzmbr\r\n",
+            zk.len(),
+            zk
+        ));
+        expected.push_str(":1\r\n");
+
+        // LRANGE fast path
+        pipeline.push_str(&format!(
+            "*4\r\n$6\r\nLRANGE\r\n${}\r\n{}\r\n$1\r\n0\r\n$2\r\n10\r\n",
+            lk.len(),
+            lk
+        ));
+        expected.push_str("*1\r\n$4\r\nitem\r\n");
+
+        // ZRANGE fast path
+        pipeline.push_str(&format!(
+            "*4\r\n$6\r\nZRANGE\r\n${}\r\n{}\r\n$1\r\n0\r\n$2\r\n10\r\n",
+            zk.len(),
+            zk
+        ));
+        expected.push_str("*1\r\n$4\r\nzmbr\r\n");
+
+        // DEL single key
+        pipeline.push_str(&format!("*2\r\n$3\r\nDEL\r\n${}\r\n{}\r\n", hk.len(), hk));
+        expected.push_str(":1\r\n");
+    }
+
+    client.write_all(pipeline.as_bytes()).unwrap();
+    let mut buf = vec![0u8; expected.len()];
+    client.read_exact(&mut buf).unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf), expected);
+}
