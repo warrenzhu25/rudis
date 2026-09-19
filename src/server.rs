@@ -333,7 +333,12 @@ pub fn run_shard_worker(
                         };
                         match monoio::net::TcpStream::from_std(std_stream) {
                             Ok(stream) => {
-                                crate::conn_balance::register_conn(shard_id);
+                                // Deliberately no register_conn here: the
+                                // handing-off shard already reserved our census
+                                // slot before sending. Registering on arrival
+                                // would leave us looking idle for the whole
+                                // in-flight window, and every other shard
+                                // accepting concurrently would pile onto us.
                                 let r = cross_shard_router.clone();
                                 let reg = cross_shard_clients.clone();
                                 let client_id = ADOPTED_CLIENT_SEQ.with(|s| {
@@ -358,6 +363,9 @@ pub fn run_shard_worker(
                                 });
                             }
                             Err(e) => {
+                                // The connection never starts, so release the
+                                // slot the sender reserved for it.
+                                crate::conn_balance::unregister_conn(shard_id);
                                 tracing::error!(
                                     shard_id = shard_id,
                                     "Failed to adopt handed-off connection: {}",
@@ -1691,43 +1699,46 @@ pub fn run_shard_worker(
                     // connection elsewhere would answer from the wrong shard
                     // and break MOVED redirection. It also has nothing to fix,
                     // since the distribution is client-chosen, not hashed.
-                    let plan = if cluster_enabled {
-                        None
+                    let owner = if cluster_enabled {
+                        crate::conn_balance::register_conn(shard_id);
+                        shard_id
                     } else {
-                        crate::conn_balance::plan_handoff(shard_id, num_shards)
+                        crate::conn_balance::claim_owner(shard_id, num_shards)
                     };
-                    match plan {
-                        Some(target) => {
-                            // Release the fd without closing it; the target
-                            // shard adopts it. into_raw_fd consumes the stream
-                            // so no Drop runs and the fd stays valid.
-                            let fd = std::os::unix::io::IntoRawFd::into_raw_fd(stream);
-                            let handed = router.senders[target]
-                                .send(ShardMessage::AdoptConnection {
-                                    fd,
-                                    peer: client_addr,
-                                })
-                                .is_ok();
-                            if !handed {
-                                // Target mailbox is gone; we still own the fd,
-                                // so close it rather than leak it.
-                                unsafe { libc::close(fd) };
+                    if owner != shard_id {
+                        // claim_owner already reserved the target's slot, so
+                        // the target must not register again on arrival; it
+                        // only unregisters when the connection ends.
+                        //
+                        // Release the fd without closing it; the target shard
+                        // adopts it. into_raw_fd consumes the stream so no Drop
+                        // runs and the fd stays valid.
+                        let fd = std::os::unix::io::IntoRawFd::into_raw_fd(stream);
+                        let handed = router.senders[owner]
+                            .send(ShardMessage::AdoptConnection {
+                                fd,
+                                peer: client_addr,
+                            })
+                            .is_ok();
+                        if !handed {
+                            // Target mailbox is gone; we still own the fd, so
+                            // close it rather than leak it, and give back the
+                            // slot that was reserved for it.
+                            crate::conn_balance::unregister_conn(owner);
+                            unsafe { libc::close(fd) };
+                        }
+                    } else {
+                        monoio::spawn(async move {
+                            let res = catch_unwind_async(async move {
+                                handle_connection(stream, client_addr, client_id, reg, r).await;
+                            })
+                            .await;
+                            crate::conn_balance::unregister_conn(shard_id);
+                            if let Err(e) = res {
+                                crate::connection::inc_isolated_panics();
+                                tracing::error!(client_id = client_id, "Panic isolated in client connection: {:?}", e);
                             }
-                        }
-                        None => {
-                            crate::conn_balance::register_conn(shard_id);
-                            monoio::spawn(async move {
-                                let res = catch_unwind_async(async move {
-                                    handle_connection(stream, client_addr, client_id, reg, r).await;
-                                })
-                                .await;
-                                crate::conn_balance::unregister_conn(shard_id);
-                                if let Err(e) = res {
-                                    crate::connection::inc_isolated_panics();
-                                    tracing::error!(client_id = client_id, "Panic isolated in client connection: {:?}", e);
-                                }
-                            });
-                        }
+                        });
                     }
                 }
                 Err(e) => {
