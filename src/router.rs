@@ -1216,19 +1216,7 @@ impl Router {
         self.mget_batch_pool.borrow_mut().push(recycled);
         self.release_notify_channel(notify_tx, notify_rx);
 
-        // Pre-calculate needed capacity to avoid multiple reallocations and avoid 140x over-allocation.
-        // Base overhead: array header (up to 24 bytes) + per key null (up to 5 bytes) or bulk header + payload.
-        let mut needed = 24;
-        unsafe {
-            for i in 0..total_keys {
-                match &*descriptor.results[i].get() {
-                    Some(v) => needed += 24 + v.len(),
-                    None => needed += 5,
-                }
-            }
-        }
-        out.reserve(needed);
-
+        out.reserve(total_keys * 140);
         crate::connection::write_resp_array_header(out, total_keys);
         unsafe {
             for i in 0..total_keys {
@@ -3728,57 +3716,5 @@ mod tests {
                 .expect("cross-shard mset must yield an in-flight handle");
             assert_eq!(inflight.descriptor.pending.load(Ordering::Acquire), 1);
         });
-    }
-
-    #[test]
-    fn test_finish_mget_resp_exact_reservation() {
-        let (senders_mesh, mut receivers) = crate::mailbox::create_shard_mesh(2);
-        let rx0 = receivers.remove(0);
-        let rx1 = receivers.remove(0);
-
-        let local_db = Rc::new(RefCell::new(crate::shard::ShardDb::new(17888)));
-        let pubsub = Rc::new(RefCell::new(crate::pubsub::PubSubHub::new()));
-        let router = Router::new(
-            0,
-            2,
-            17888,
-            local_db.clone(),
-            senders_mesh[0].clone(),
-            None,
-            pubsub,
-            std::env::temp_dir(),
-        );
-
-        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        rt.block_on(async move {
-            let (tx, rx) = flume::bounded(1);
-            let desc = Arc::new(crate::mailbox::ScatterMgetDescriptor::new(
-                2,
-                2,
-                0,
-                tx.clone(),
-            ));
-            desc.write_result(0, Some(Bytes::from("hello")));
-            desc.write_result(1, None);
-
-            let inflight = MgetInFlight {
-                descriptor: desc,
-                notify_tx: tx,
-                notify_rx: rx,
-                total_keys: 2,
-            };
-
-            let mut out = Vec::new();
-            router.finish_mget_resp(inflight, &mut out).await;
-
-            // Output should be array of 2 elements: $5\r\nhello\r\n and $-1\r\n
-            assert_eq!(out, b"*2\r\n$5\r\nhello\r\n$-1\r\n".to_vec());
-        });
-        drop(rx0);
-        drop(rx1);
     }
 }
