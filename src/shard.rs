@@ -937,6 +937,15 @@ impl ShardDb {
     }
 
     #[inline]
+    pub fn rpush_slice_fast(
+        &mut self,
+        key: &Bytes,
+        values: &[Bytes],
+    ) -> Result<usize, &'static str> {
+        self.table.rpush_slice_fast(key, values)
+    }
+
+    #[inline]
     pub fn rpush_slice(&mut self, key: &[u8], values: &[Bytes]) -> Result<usize, &'static str> {
         self.table.rpush_slice(key, values)
     }

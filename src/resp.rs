@@ -270,11 +270,11 @@ pub enum Command {
     // LIST COMMANDS
     Lpush {
         key: Bytes,
-        values: Vec<Bytes>,
+        values: SmallVec<[Bytes; 1]>,
     },
     Rpush {
         key: Bytes,
-        values: Vec<Bytes>,
+        values: SmallVec<[Bytes; 1]>,
     },
     Lpushx {
         key: Bytes,
@@ -359,7 +359,7 @@ pub enum Command {
     // ZSET COMMANDS
     Zadd {
         key: Bytes,
-        elements: Vec<(f64, Bytes)>,
+        elements: SmallVec<[(f64, Bytes); 1]>,
         flags: crate::table::ZAddFlags,
     },
     Zrem {
@@ -1502,7 +1502,7 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
                         {
                             return Ok(Some(Command::Zadd {
                                 key: frame.slice(k_start..k_start + k_len),
-                                elements: vec![(score, frame.slice(m_start..m_start + m_len))],
+                                elements: smallvec![(score, frame.slice(m_start..m_start + m_len))],
                                 flags: crate::table::ZAddFlags::default(),
                             }));
                         }
@@ -1517,7 +1517,7 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
                         let (v_start, v_len) = offsets[2];
                         return Ok(Some(Command::Lpush {
                             key: frame.slice(k_start..k_start + k_len),
-                            values: vec![frame.slice(v_start..v_start + v_len)],
+                            values: smallvec![frame.slice(v_start..v_start + v_len)],
                         }));
                     }
                 }
@@ -2993,7 +2993,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             Ok(Some(Command::Lpush {
                 key: args[1].clone(),
-                values: args[2..].to_vec(),
+                values: args[2..].iter().cloned().collect(),
             }))
         }
         "RPUSH" => {
@@ -3002,7 +3002,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             Ok(Some(Command::Rpush {
                 key: args[1].clone(),
-                values: args[2..].to_vec(),
+                values: args[2..].iter().cloned().collect(),
             }))
         }
         "LPUSHX" => {
@@ -3461,7 +3461,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if flags.incr && remaining.len() != 2 {
                 return Err("INCR option supports a single increment-element pair".to_string());
             }
-            let mut elements = Vec::with_capacity(remaining.len() / 2);
+            let mut elements = SmallVec::with_capacity(remaining.len() / 2);
             let mut j = 0;
             while j < remaining.len() {
                 let score_str =
@@ -8772,6 +8772,33 @@ mod tests {
                 assert_eq!(keys[1], Bytes::from_static(b"k2"));
             }
             _ => panic!("Expected Del command"),
+        }
+
+        // Single-element ZADD: not spilled
+        let mut buf = BytesMut::from("*4\r\n$4\r\nZADD\r\n$4\r\nmyz1\r\n$2\r\n10\r\n$2\r\nm1\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        match cmd {
+            Command::Zadd { key, elements, .. } => {
+                assert_eq!(key, Bytes::from_static(b"myz1"));
+                assert_eq!(elements.len(), 1);
+                assert!(!elements.spilled());
+                assert_eq!(elements[0].0, 10.0);
+                assert_eq!(elements[0].1, Bytes::from_static(b"m1"));
+            }
+            _ => panic!("Expected Zadd command"),
+        }
+
+        // Single-element LPUSH: not spilled
+        let mut buf = BytesMut::from("*3\r\n$5\r\nLPUSH\r\n$4\r\nmyl1\r\n$2\r\nv1\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        match cmd {
+            Command::Lpush { key, values } => {
+                assert_eq!(key, Bytes::from_static(b"myl1"));
+                assert_eq!(values.len(), 1);
+                assert!(!values.spilled());
+                assert_eq!(values[0], Bytes::from_static(b"v1"));
+            }
+            _ => panic!("Expected Lpush command"),
         }
     }
 }

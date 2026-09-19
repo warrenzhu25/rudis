@@ -8956,7 +8956,7 @@ pub fn execute_local_command(
             false
         }
         Command::Rpush { key, values } => {
-            match db.rpush_slice(key.as_ref(), values) {
+            match db.rpush_slice_fast(key, values) {
                 Ok(len) => {
                     record_change!(cmd);
                     notify_list_or_defer(db, key);

@@ -3991,9 +3991,31 @@ impl RudisTable {
         self.lpush_slice_fast(&key, &values)
     }
 
+    #[inline(always)]
+    pub fn rpush_slice_fast(
+        &mut self,
+        key: &Bytes,
+        values: &[Bytes],
+    ) -> Result<usize, &'static str> {
+        let h = hash_key(key);
+        self.rpush_slice_internal(key.as_ref(), h, Some(key), values)
+    }
+
     pub fn rpush_slice(&mut self, key: &[u8], values: &[Bytes]) -> Result<usize, &'static str> {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h) {
+        self.rpush_slice_internal(key, h, None, values)
+    }
+
+    #[inline(always)]
+    fn rpush_slice_internal(
+        &mut self,
+        key: &[u8],
+        h: u64,
+        key_bytes: Option<&Bytes>,
+        values: &[Bytes],
+    ) -> Result<usize, &'static str> {
+        let (existing, insert_idx) = self.table.find_or_prepare_insert(key, h);
+        if let Some(idx) = existing {
             if self.num_expires > 0 && self.check_expired_slot(idx) {
                 // Key was expired and removed
             } else if let Some(entry) = self.table.get_slot_mut(idx) {
@@ -4019,11 +4041,17 @@ impl RudisTable {
         }
         let len = deque.len();
         let entry = RudisEntry {
-            key: Bytes::copy_from_slice(key),
+            key: key_bytes
+                .cloned()
+                .unwrap_or_else(|| Bytes::copy_from_slice(key)),
             val: RudisValue::List(deque),
             expire_at: None,
         };
-        self.table.insert(entry);
+        if existing.is_none() {
+            self.table.insert_prepared(entry, h, insert_idx);
+        } else {
+            self.table.insert(entry);
+        }
         Ok(len)
     }
 
