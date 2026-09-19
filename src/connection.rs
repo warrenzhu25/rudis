@@ -12363,7 +12363,6 @@ async fn execute_commands_squashed(
                     let deleted = router.local_db.borrow_mut().del(keys[0].as_ref());
                     if deleted {
                         has_local_writes = true;
-                        DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                             touch_watched_key(router.port, keys[0].as_ref());
                         }
@@ -12402,7 +12401,6 @@ async fn execute_commands_squashed(
                         .hset_slice_fast(key, fields)
                     {
                         Ok(count) => {
-                            DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                 touch_watched_key(router.port, key.as_ref());
                             }
@@ -12453,7 +12451,6 @@ async fn execute_commands_squashed(
                         .sadd_slice_fast(key, members)
                     {
                         Ok(count) => {
-                            DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                 touch_watched_key(router.port, key.as_ref());
                             }
@@ -12486,7 +12483,6 @@ async fn execute_commands_squashed(
                         .zadd_slice_fast(key, elements, flags)
                     {
                         Ok((count, incr_score)) => {
-                            DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                 touch_watched_key(router.port, key.as_ref());
                             }
@@ -12528,7 +12524,6 @@ async fn execute_commands_squashed(
                         .lpush_slice_fast(key, values)
                     {
                         Ok(len) => {
-                            DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                 touch_watched_key(router.port, key.as_ref());
                             }
@@ -12558,7 +12553,6 @@ async fn execute_commands_squashed(
                         Ok(has_pop) => {
                             if has_pop {
                                 has_local_writes = true;
-                                DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                     touch_watched_key(router.port, key.as_ref());
                                 }
