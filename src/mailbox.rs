@@ -87,7 +87,7 @@ impl ScatterMgetDescriptor {
     pub fn finish_shard(&self) {
         if self.pending.fetch_sub(1, Ordering::Release) == 1 {
             let tx = unsafe { &*self.notify.get() };
-            let _ = tx.send(());
+            let _ = tx.try_send(());
         }
     }
 
@@ -158,7 +158,7 @@ impl ScatterMsetDescriptor {
     pub fn finish_shard(&self) {
         if self.pending.fetch_sub(1, Ordering::Release) == 1 {
             let tx = unsafe { &*self.notify.get() };
-            let _ = tx.send(());
+            let _ = tx.try_send(());
         }
     }
 
@@ -200,7 +200,7 @@ impl FastGetDescriptor {
             *self.val.get() = val;
         }
         self.done.store(true, Ordering::Release);
-        let _ = self.notify.send(());
+        let _ = self.notify.try_send(());
     }
 }
 
@@ -217,7 +217,6 @@ unsafe impl Send for FastSetDescriptor {}
 unsafe impl Sync for FastSetDescriptor {}
 
 impl FastSetDescriptor {
-    #[inline(always)]
     pub fn new(
         key: Bytes,
         value: Bytes,
@@ -236,7 +235,7 @@ impl FastSetDescriptor {
     #[inline(always)]
     pub fn finish(&self) {
         self.done.store(true, Ordering::Release);
-        let _ = self.notify.send(());
+        let _ = self.notify.try_send(());
     }
 }
 
@@ -669,6 +668,26 @@ mod tests {
             assert_eq!(pairs[0].0, Bytes::from(format!("k_{}_1", shard_id)));
             assert_eq!(pairs[1].0, Bytes::from(format!("k_{}_2", shard_id)));
         }
+    }
+
+    #[test]
+    fn test_descriptors_finish_nonblocking_when_notify_channel_full() {
+        // Regression guard: if the bounded(1) notify channel already has a permit,
+        // finish_shard() or finish() MUST NOT block the calling shard thread.
+        let (tx, _rx) = flume::bounded(1);
+        tx.send(()).unwrap(); // fill channel to capacity 1
+
+        let mget_desc = ScatterMgetDescriptor::new(1, 1, 1, tx.clone());
+        mget_desc.finish_shard(); // must return immediately without blocking
+
+        let mset_desc = ScatterMsetDescriptor::new(1, 1, tx.clone());
+        mset_desc.finish_shard(); // must return immediately without blocking
+
+        let fast_get = FastGetDescriptor::new(Bytes::from("k"), tx.clone());
+        fast_get.finish(None); // must return immediately without blocking
+
+        let fast_set = FastSetDescriptor::new(Bytes::from("k"), Bytes::from("v"), None, tx);
+        fast_set.finish(); // must return immediately without blocking
     }
 
     #[test]

@@ -9613,3 +9613,47 @@ fn test_connection_balancing_across_shards_e2e() {
         after
     );
 }
+
+#[test]
+fn test_cross_shard_mset_mget_deadlock_free_e2e() {
+    let port = 16795;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    // Hammer cross-shard MSET and MGET across multiple client connections
+    // to verify shards never deadlock on scatter/gather notifications.
+    let mut conns: Vec<TcpStream> = (0..8)
+        .map(|_| TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap())
+        .collect();
+
+    for round in 0..50 {
+        for (i, c) in conns.iter_mut().enumerate() {
+            let mset_cmd = format!(
+                "MSET dk_{}_a val_a dk_{}_b val_b dk_{}_c val_c dk_{}_d val_d\r\n",
+                i + round * 10,
+                i + round * 10,
+                i + round * 10,
+                i + round * 10
+            );
+            assert_eq!(send_and_read(c, mset_cmd.as_bytes()), "+OK\r\n");
+
+            let mget_cmd = format!(
+                "MGET dk_{}_a dk_{}_b dk_{}_c dk_{}_d\r\n",
+                i + round * 10,
+                i + round * 10,
+                i + round * 10,
+                i + round * 10
+            );
+            let resp = send_and_read(c, mget_cmd.as_bytes());
+            assert!(
+                resp.starts_with("*4\r\n"),
+                "round {} client {} MGET failed: {}",
+                round,
+                i,
+                resp
+            );
+        }
+    }
+
+    drop(conns);
+}
