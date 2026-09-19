@@ -296,16 +296,29 @@ def populate(port, pop_type):
         return
 
     json_tmp = f"/tmp/pop_{port}_{pop_type}.json"
+    # Populate from ONE connection covering the whole keyspace.
+    #
+    # memtier gives every connection the same key sequence rather than
+    # partitioning the range between them, so -n is the number of DISTINCT keys
+    # created no matter how many threads and connections are used. The previous
+    # "-t 16 -c 4 -n 500" wrote the same 500 keys 64 times over and produced
+    # DBSIZE=500, not the 32,000 its comment claimed. Reading back randomly
+    # across --key-maximum 64000 then missed ~99% of the time, so the read
+    # workloads were benchmarking the null-reply path and never transferred a
+    # value at all. Verified with DBSIZE:
+    #   -t16 -c4 -n500  S:S -> 500        (what this used to do)
+    #   -t1  -c1 -n64000 S:S -> 64000     (what it does now)
     cmd = [
         "taskset", "-c", CLIENT_CPUS_ACTIVE,
         MEMTIER_BIN,
         "-s", "127.0.0.1",
         "-p", str(port),
-        "-t", "16",
-        "-c", "4",
-        "-n", "500",  # 32,000 keys
+        "-t", "1",
+        "-c", "1",
+        "-n", str(KEY_MAX),
         "--key-maximum", str(KEY_MAX),
-        "--pipeline", "16",
+        "--key-minimum", "1",
+        "--pipeline", "64",
         "--hide-histogram",
         "--json-out-file", json_tmp,
     ]
@@ -316,28 +329,40 @@ def populate(port, pop_type):
         cmd.extend([
             "--command=HSET __key__ field1 __data__",
             "--command-ratio=1",
-            "--command-key-pattern=R",
+            # Sequential so the single populate connection walks the entire
+            # range exactly once. Random placement leaves ~37% of the keyspace
+            # empty by the coupon-collector bound, which shows up as misses.
+            "--command-key-pattern=S",
             "-d", "128",
         ])
     elif pop_type == "list":
         cmd.extend([
             "--command=LPUSH __key__ __data__",
             "--command-ratio=1",
-            "--command-key-pattern=R",
+            # Sequential so the single populate connection walks the entire
+            # range exactly once. Random placement leaves ~37% of the keyspace
+            # empty by the coupon-collector bound, which shows up as misses.
+            "--command-key-pattern=S",
             "-d", "128",
         ])
     elif pop_type == "set":
         cmd.extend([
             "--command=SADD __key__ __data__",
             "--command-ratio=1",
-            "--command-key-pattern=R",
+            # Sequential so the single populate connection walks the entire
+            # range exactly once. Random placement leaves ~37% of the keyspace
+            # empty by the coupon-collector bound, which shows up as misses.
+            "--command-key-pattern=S",
             "-d", "64",
         ])
     elif pop_type == "zset":
         cmd.extend([
             "--command=ZADD __key__ 100 __data__",
             "--command-ratio=1",
-            "--command-key-pattern=R",
+            # Sequential so the single populate connection walks the entire
+            # range exactly once. Random placement leaves ~37% of the keyspace
+            # empty by the coupon-collector bound, which shows up as misses.
+            "--command-key-pattern=S",
             "-d", "64",
         ])
 
@@ -375,6 +400,9 @@ def run_single_memtier(port, workload, run_idx):
         cmd.extend([
             f"--command={workload['command']}",
             "--command-ratio=1",
+            # Random access for the measured workload, so the benchmark spreads
+            # over the keyspace rather than walking it in cache-friendly order.
+            # (The populate step uses S deliberately; that is a different call.)
             "--command-key-pattern=R",
             "--key-maximum", str(KEY_MAX),
         ])
