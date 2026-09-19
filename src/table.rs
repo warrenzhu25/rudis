@@ -1441,6 +1441,7 @@ impl RudisFlatTable {
         self.growth_left = self.growth_left.saturating_sub(1);
     }
 
+    #[inline(always)]
     pub fn remove(&mut self, slot_idx: usize) -> Option<RudisEntry> {
         self.set_ctrl(slot_idx, DELETED);
         self.items -= 1;
@@ -2040,7 +2041,7 @@ impl RudisTable {
                 return false;
             }
             if let Some(entry) = self.table.remove(idx) {
-                if entry.expire_at.is_some() {
+                if self.num_expires > 0 && entry.expire_at.is_some() {
                     self.num_expires = self.num_expires.saturating_sub(1);
                 }
                 let freed = entry.key.len() + entry.val.approx_bytes() + 64;
@@ -10607,5 +10608,28 @@ mod tests {
                 Some(Bytes::from(format!("val_{}", i)))
             );
         }
+    }
+
+    #[test]
+    fn test_del_with_hash_and_exists_zero_expires() {
+        let mut table = RudisTable::new();
+        let key = Bytes::from("bench_key");
+        let h = hash_key(key.as_ref());
+
+        // Key doesn't exist yet
+        assert!(!table.exists_with_hash(key.as_ref(), h));
+        assert!(!table.del_with_hash(key.as_ref(), h));
+
+        // Insert key without expiry
+        table.set(key.clone(), Bytes::from("bench_val"), None);
+        assert_eq!(table.num_expires, 0);
+
+        // Exists check via contains() fast path
+        assert!(table.exists_with_hash(key.as_ref(), h));
+
+        // Del check via fast path
+        assert!(table.del_with_hash(key.as_ref(), h));
+        assert!(!table.exists_with_hash(key.as_ref(), h));
+        assert!(!table.del_with_hash(key.as_ref(), h));
     }
 }

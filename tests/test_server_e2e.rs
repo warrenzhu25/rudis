@@ -9657,3 +9657,46 @@ fn test_cross_shard_mset_mget_deadlock_free_e2e() {
 
     drop(conns);
 }
+
+#[test]
+fn test_pipelined_del_exists_e2e() {
+    let port = 16796;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut conn = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // Populate a set of keys
+    for i in 0..100 {
+        let set_cmd = format!("SET de_key_{} val_{}\r\n", i, i);
+        assert_eq!(send_and_read(&mut conn, set_cmd.as_bytes()), "+OK\r\n");
+    }
+
+    // Verify EXISTS returns 1 for all
+    for i in 0..100 {
+        let exists_cmd = format!("EXISTS de_key_{}\r\n", i);
+        assert_eq!(send_and_read(&mut conn, exists_cmd.as_bytes()), ":1\r\n");
+    }
+
+    // DEL half the keys
+    for i in 0..50 {
+        let del_cmd = format!("DEL de_key_{}\r\n", i);
+        assert_eq!(send_and_read(&mut conn, del_cmd.as_bytes()), ":1\r\n");
+    }
+
+    // Verify deleted keys return 0 and intact keys return 1
+    for i in 0..50 {
+        let exists_cmd = format!("EXISTS de_key_{}\r\n", i);
+        assert_eq!(send_and_read(&mut conn, exists_cmd.as_bytes()), ":0\r\n");
+    }
+    for i in 50..100 {
+        let exists_cmd = format!("EXISTS de_key_{}\r\n", i);
+        assert_eq!(send_and_read(&mut conn, exists_cmd.as_bytes()), ":1\r\n");
+    }
+
+    // Second DEL on already deleted keys returns 0
+    for i in 0..50 {
+        let del_cmd = format!("DEL de_key_{}\r\n", i);
+        assert_eq!(send_and_read(&mut conn, del_cmd.as_bytes()), ":0\r\n");
+    }
+}
