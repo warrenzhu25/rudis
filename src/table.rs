@@ -4472,6 +4472,9 @@ impl RudisTable {
                     RudisValue::Set(set) => {
                         let mut added = 0;
                         for m in members {
+                            if set.contains(m.as_ref()) {
+                                continue;
+                            }
                             if set.insert(m.clone()) {
                                 added += 1;
                             }
@@ -4489,17 +4492,27 @@ impl RudisTable {
 
         let set = if members.len() <= SMALL_SET_LIMIT {
             let mut v = self.arena.acquire_small_set(members.len());
-            for m in members {
+            if members.len() == 1 {
+                let m = &members[0];
                 let m_bytes = m.as_ref();
                 let m_hash = hash64(m_bytes);
-                let m_len = m_bytes.len();
-                if !v.iter().any(|x| {
-                    x.hash == m_hash && x.member.len() == m_len && x.member.as_ref() == m_bytes
-                }) {
-                    v.push(SmallSetEntry {
-                        hash: m_hash,
-                        member: m.clone(),
-                    });
+                v.push(SmallSetEntry {
+                    hash: m_hash,
+                    member: m.clone(),
+                });
+            } else {
+                for m in members {
+                    let m_bytes = m.as_ref();
+                    let m_hash = hash64(m_bytes);
+                    let m_len = m_bytes.len();
+                    if !v.iter().any(|x| {
+                        x.hash == m_hash && x.member.len() == m_len && x.member.as_ref() == m_bytes
+                    }) {
+                        v.push(SmallSetEntry {
+                            hash: m_hash,
+                            member: m.clone(),
+                        });
+                    }
                 }
             }
             RudisSet::Small(v)

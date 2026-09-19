@@ -171,7 +171,7 @@ impl SmallCollectionArena {
             }
             v
         } else {
-            Vec::with_capacity(min_cap.max(16))
+            Vec::with_capacity(min_cap.max(8))
         }
     }
 
