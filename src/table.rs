@@ -1765,6 +1765,15 @@ impl RudisTable {
         key: &[u8],
     ) -> Result<Option<crate::shard::CompactResp>, &'static str> {
         let h = hash_key(key);
+        self.get_compact_with_hash(key, h)
+    }
+
+    #[inline(always)]
+    pub fn get_compact_with_hash(
+        &mut self,
+        key: &[u8],
+        h: u64,
+    ) -> Result<Option<crate::shard::CompactResp>, &'static str> {
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at
@@ -1937,8 +1946,15 @@ impl RudisTable {
         }
     }
 
+    #[inline(always)]
     pub fn set(&mut self, key: Bytes, value: Bytes, expire_in: Option<Duration>) {
-        self.set_extended(key, value, expire_in, false);
+        let h = hash_key(&key);
+        self.set_extended_with_hash(key, h, value, expire_in, false);
+    }
+
+    #[inline(always)]
+    pub fn set_with_hash(&mut self, key: Bytes, h: u64, value: Bytes, expire_in: Option<Duration>) {
+        self.set_extended_with_hash(key, h, value, expire_in, false);
     }
 
     pub fn set_extended(
@@ -1949,6 +1965,18 @@ impl RudisTable {
         keepttl: bool,
     ) {
         let h = hash_key(&key);
+        self.set_extended_with_hash(key, h, value, expire_in, keepttl);
+    }
+
+    #[inline(always)]
+    pub fn set_extended_with_hash(
+        &mut self,
+        key: Bytes,
+        h: u64,
+        value: Bytes,
+        expire_in: Option<Duration>,
+        keepttl: bool,
+    ) {
         let val = if let Some(int_val) = Self::parse_i64_bytes(&value) {
             RudisValue::Int(int_val)
         } else {
@@ -2051,20 +2079,33 @@ impl RudisTable {
 
     #[inline(always)]
     pub fn incr_by_slice_fast(&mut self, key: &Bytes, delta: i64) -> Result<i64, &'static str> {
-        self.incr_by_slice_internal(key.as_ref(), Some(key), delta)
+        let h = hash_key(key);
+        self.incr_by_slice_internal(key.as_ref(), h, Some(key), delta)
+    }
+
+    #[inline(always)]
+    pub fn incr_by_slice_with_hash(
+        &mut self,
+        key: &Bytes,
+        h: u64,
+        delta: i64,
+    ) -> Result<i64, &'static str> {
+        self.incr_by_slice_internal(key.as_ref(), h, Some(key), delta)
     }
 
     pub fn incr_by_slice(&mut self, key: &[u8], delta: i64) -> Result<i64, &'static str> {
-        self.incr_by_slice_internal(key, None, delta)
+        let h = hash_key(key);
+        self.incr_by_slice_internal(key, h, None, delta)
     }
 
+    #[inline(always)]
     fn incr_by_slice_internal(
         &mut self,
         key: &[u8],
+        h: u64,
         key_bytes: Option<&Bytes>,
         delta: i64,
     ) -> Result<i64, &'static str> {
-        let h = hash_key(key);
         let (existing, candidate_idx) = self.table.find_or_prepare_insert(key, h);
         if let Some(idx) = existing
             && let Some(entry) = self.table.get_slot_mut(idx)
@@ -2879,7 +2920,18 @@ impl RudisTable {
         key: &Bytes,
         fields: &[(Bytes, Bytes)],
     ) -> Result<usize, &'static str> {
-        self.hset_slice_internal(key.as_ref(), Some(key), fields)
+        let h = hash_key(key);
+        self.hset_slice_internal(key.as_ref(), h, Some(key), fields)
+    }
+
+    #[inline(always)]
+    pub fn hset_slice_with_hash(
+        &mut self,
+        key: &Bytes,
+        h: u64,
+        fields: &[(Bytes, Bytes)],
+    ) -> Result<usize, &'static str> {
+        self.hset_slice_internal(key.as_ref(), h, Some(key), fields)
     }
 
     pub fn hset_slice(
@@ -2887,12 +2939,15 @@ impl RudisTable {
         key: &[u8],
         fields: &[(Bytes, Bytes)],
     ) -> Result<usize, &'static str> {
-        self.hset_slice_internal(key, None, fields)
+        let h = hash_key(key);
+        self.hset_slice_internal(key, h, None, fields)
     }
 
+    #[inline(always)]
     fn hset_slice_internal(
         &mut self,
         key: &[u8],
+        h: u64,
         key_bytes: Option<&Bytes>,
         fields: &[(Bytes, Bytes)],
     ) -> Result<usize, &'static str> {
@@ -2900,7 +2955,6 @@ impl RudisTable {
             crate::connection::HASH_MAX_ENTRIES.load(std::sync::atomic::Ordering::Relaxed);
         let max_value =
             crate::connection::HASH_MAX_VALUE.load(std::sync::atomic::Ordering::Relaxed);
-        let h = hash_key(key);
         let (existing, insert_idx) = self.table.find_or_prepare_insert(key, h);
         if let Some(idx) = existing
             && !self.check_expired_slot(idx)
@@ -3096,6 +3150,16 @@ impl RudisTable {
         field: &[u8],
     ) -> Result<crate::shard::CompactResp, &'static str> {
         let h = hash_key(key);
+        self.hget_compact_with_hash(key, h, field)
+    }
+
+    #[inline(always)]
+    pub fn hget_compact_with_hash(
+        &mut self,
+        key: &[u8],
+        h: u64,
+        field: &[u8],
+    ) -> Result<crate::shard::CompactResp, &'static str> {
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at
@@ -3776,20 +3840,33 @@ impl RudisTable {
         key: &Bytes,
         values: &[Bytes],
     ) -> Result<usize, &'static str> {
-        self.lpush_slice_internal(key.as_ref(), Some(key), values)
+        let h = hash_key(key);
+        self.lpush_slice_internal(key.as_ref(), h, Some(key), values)
+    }
+
+    #[inline(always)]
+    pub fn lpush_slice_with_hash(
+        &mut self,
+        key: &Bytes,
+        h: u64,
+        values: &[Bytes],
+    ) -> Result<usize, &'static str> {
+        self.lpush_slice_internal(key.as_ref(), h, Some(key), values)
     }
 
     pub fn lpush_slice(&mut self, key: &[u8], values: &[Bytes]) -> Result<usize, &'static str> {
-        self.lpush_slice_internal(key, None, values)
+        let h = hash_key(key);
+        self.lpush_slice_internal(key, h, None, values)
     }
 
+    #[inline(always)]
     fn lpush_slice_internal(
         &mut self,
         key: &[u8],
+        h: u64,
         key_bytes: Option<&Bytes>,
         values: &[Bytes],
     ) -> Result<usize, &'static str> {
-        let h = hash_key(key);
         let (existing, insert_idx) = self.table.find_or_prepare_insert(key, h);
         if let Some(idx) = existing {
             if self.check_expired_slot(idx) {
@@ -4009,6 +4086,15 @@ impl RudisTable {
     #[inline(always)]
     pub fn lpop_one(&mut self, key: &[u8]) -> Result<Option<Bytes>, &'static str> {
         let h = hash_key(key);
+        self.lpop_one_with_hash(key, h)
+    }
+
+    #[inline(always)]
+    pub fn lpop_one_with_hash(
+        &mut self,
+        key: &[u8],
+        h: u64,
+    ) -> Result<Option<Bytes>, &'static str> {
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
                 return Ok(None);
@@ -4249,6 +4335,67 @@ impl RudisTable {
         }
     }
 
+    #[inline(always)]
+    pub fn lrange_compact_with_hash(
+        &mut self,
+        key: &[u8],
+        h: u64,
+        mut start: i64,
+        mut stop: i64,
+        out: &mut Vec<u8>,
+    ) -> Result<crate::shard::CompactResp, &'static str> {
+        if let Some((idx, entry)) = self.table.find_entry(key, h) {
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+                return Ok(crate::shard::CompactResp::EMPTY_ARRAY);
+            }
+            match &entry.val {
+                RudisValue::List(deque) => {
+                    let n = deque.len() as i64;
+                    if n == 0 {
+                        return Ok(crate::shard::CompactResp::EMPTY_ARRAY);
+                    }
+                    if start < 0 {
+                        start = (n + start).max(0);
+                    }
+                    if stop < 0 {
+                        stop += n;
+                    }
+                    if start > stop || start >= n {
+                        return Ok(crate::shard::CompactResp::EMPTY_ARRAY);
+                    }
+                    let start_u = start.max(0) as usize;
+                    let stop_u = (stop.min(n - 1) as usize).max(start_u);
+                    let count = stop_u - start_u + 1;
+                    if count == 1
+                        && let Some(v) = deque.get(start_u)
+                    {
+                        return Ok(crate::shard::CompactResp::Array1Bulk(v.clone()));
+                    }
+                    out.clear();
+                    crate::connection::write_resp_array_header(out, count);
+                    for i in start_u..=stop_u {
+                        if let Some(v) = deque.get(i) {
+                            crate::connection::write_resp_bulk(out, v);
+                        }
+                    }
+                    return Ok(crate::shard::CompactResp::from_vec(std::mem::take(out)));
+                }
+                _ => {
+                    return Err(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
+                }
+            }
+        }
+        Ok(crate::shard::CompactResp::EMPTY_ARRAY)
+    }
+
     pub fn write_lrange_resp(
         &mut self,
         key: &[u8],
@@ -4257,10 +4404,9 @@ impl RudisTable {
         out: &mut Vec<u8>,
     ) -> Result<(), &'static str> {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h)
-            && let Some(entry) = self.table.get_slot(idx)
-        {
-            if let Some(expire_at) = entry.expire_at
+        if let Some((idx, entry)) = self.table.find_entry(key, h) {
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -4651,20 +4797,33 @@ impl RudisTable {
         key: &Bytes,
         members: &[Bytes],
     ) -> Result<usize, &'static str> {
-        self.sadd_slice_internal(key.as_ref(), Some(key), members)
+        let h = hash_key(key);
+        self.sadd_slice_internal(key.as_ref(), h, Some(key), members)
+    }
+
+    #[inline(always)]
+    pub fn sadd_slice_with_hash(
+        &mut self,
+        key: &Bytes,
+        h: u64,
+        members: &[Bytes],
+    ) -> Result<usize, &'static str> {
+        self.sadd_slice_internal(key.as_ref(), h, Some(key), members)
     }
 
     pub fn sadd_slice(&mut self, key: &[u8], members: &[Bytes]) -> Result<usize, &'static str> {
-        self.sadd_slice_internal(key, None, members)
+        let h = hash_key(key);
+        self.sadd_slice_internal(key, h, None, members)
     }
 
+    #[inline(always)]
     fn sadd_slice_internal(
         &mut self,
         key: &[u8],
+        h: u64,
         key_bytes: Option<&Bytes>,
         members: &[Bytes],
     ) -> Result<usize, &'static str> {
-        let h = hash_key(key);
         let (existing, insert_idx) = self.table.find_or_prepare_insert(key, h);
         if let Some(idx) = existing {
             if self.check_expired_slot(idx) {
@@ -4830,6 +4989,16 @@ impl RudisTable {
         member: &[u8],
     ) -> Result<crate::shard::CompactResp, &'static str> {
         let h = hash_key(key);
+        self.sismember_compact_with_hash(key, h, member)
+    }
+
+    #[inline(always)]
+    pub fn sismember_compact_with_hash(
+        &mut self,
+        key: &[u8],
+        h: u64,
+        member: &[u8],
+    ) -> Result<crate::shard::CompactResp, &'static str> {
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at
@@ -5967,7 +6136,19 @@ impl RudisTable {
         elements: &[(f64, Bytes)],
         flags: ZAddFlags,
     ) -> Result<(usize, Option<f64>), &'static str> {
-        self.zadd_slice_internal(key.as_ref(), Some(key), elements, flags)
+        let h = hash_key(key);
+        self.zadd_slice_internal(key.as_ref(), h, Some(key), elements, flags)
+    }
+
+    #[inline(always)]
+    pub fn zadd_slice_with_hash(
+        &mut self,
+        key: &Bytes,
+        h: u64,
+        elements: &[(f64, Bytes)],
+        flags: ZAddFlags,
+    ) -> Result<(usize, Option<f64>), &'static str> {
+        self.zadd_slice_internal(key.as_ref(), h, Some(key), elements, flags)
     }
 
     pub fn zadd_slice(
@@ -5976,17 +6157,19 @@ impl RudisTable {
         elements: &[(f64, Bytes)],
         flags: ZAddFlags,
     ) -> Result<(usize, Option<f64>), &'static str> {
-        self.zadd_slice_internal(key, None, elements, flags)
+        let h = hash_key(key);
+        self.zadd_slice_internal(key, h, None, elements, flags)
     }
 
+    #[inline(always)]
     fn zadd_slice_internal(
         &mut self,
         key: &[u8],
+        h: u64,
         key_bytes: Option<&Bytes>,
         elements: &[(f64, Bytes)],
         flags: ZAddFlags,
     ) -> Result<(usize, Option<f64>), &'static str> {
-        let h = hash_key(key);
         let (existing, insert_idx) = self.table.find_or_prepare_insert(key, h);
         if let Some(idx) = existing {
             if self.check_expired_slot(idx) {
@@ -6270,6 +6453,114 @@ impl RudisTable {
         }
     }
 
+    #[inline(always)]
+    pub fn zrange_compact_with_hash(
+        &mut self,
+        key: &[u8],
+        h: u64,
+        opts: &ZRangeOpts,
+        is_resp3: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<crate::shard::CompactResp, &'static str> {
+        if !opts.by_score && !opts.by_lex {
+            if let Some((idx, entry)) = self.table.find_entry(key, h) {
+                if self.num_expires > 0
+                    && let Some(expire_at) = entry.expire_at
+                    && !crate::connection::ALLOW_ACCESS_EXPIRED
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    && Instant::now() >= expire_at
+                {
+                    self.expire_slot(idx);
+                    return Ok(crate::shard::CompactResp::EMPTY_ARRAY);
+                }
+                match &entry.val {
+                    RudisValue::ZSet(zset) => {
+                        let n = zset.len();
+                        if n == 0 {
+                            return Ok(crate::shard::CompactResp::EMPTY_ARRAY);
+                        }
+                        let mut start = opts.start;
+                        let mut stop = opts.stop;
+                        let n_i = n as i64;
+                        if start < 0 {
+                            start = (n_i + start).max(0);
+                        }
+                        if stop < 0 {
+                            stop += n_i;
+                        }
+                        if start > stop || start >= n_i {
+                            return Ok(crate::shard::CompactResp::EMPTY_ARRAY);
+                        }
+                        let start_u = start.max(0) as usize;
+                        let stop_u = (stop.min(n_i - 1) as usize).max(start_u);
+                        let limit = stop_u - start_u + 1;
+
+                        if !opts.with_scores {
+                            if limit == 1 {
+                                match zset {
+                                    RudisZSet::Small(v) => {
+                                        let elem_idx =
+                                            if opts.rev { n - 1 - start_u } else { start_u };
+                                        return Ok(crate::shard::CompactResp::Array1Bulk(
+                                            v[elem_idx].1.clone(),
+                                        ));
+                                    }
+                                    RudisZSet::Full { tree, .. } => {
+                                        let m_opt = if opts.rev {
+                                            tree.iter().rev().nth(start_u).map(|(_, m)| m.clone())
+                                        } else {
+                                            tree.iter().nth(start_u).map(|(_, m)| m.clone())
+                                        };
+                                        if let Some(m) = m_opt {
+                                            return Ok(crate::shard::CompactResp::Array1Bulk(m));
+                                        }
+                                    }
+                                }
+                            }
+                            out.clear();
+                            crate::connection::write_resp_array_header(out, limit);
+                            match zset {
+                                RudisZSet::Small(v) => {
+                                    if opts.rev {
+                                        for (_, m) in v.iter().rev().skip(start_u).take(limit) {
+                                            crate::connection::write_resp_bulk(out, m);
+                                        }
+                                    } else {
+                                        for (_, m) in &v[start_u..=stop_u] {
+                                            crate::connection::write_resp_bulk(out, m);
+                                        }
+                                    }
+                                }
+                                RudisZSet::Full { tree, .. } => {
+                                    if opts.rev {
+                                        for (_, m) in tree.iter().rev().skip(start_u).take(limit) {
+                                            crate::connection::write_resp_bulk(out, m);
+                                        }
+                                    } else {
+                                        for (_, m) in tree.iter().skip(start_u).take(limit) {
+                                            crate::connection::write_resp_bulk(out, m);
+                                        }
+                                    }
+                                }
+                            }
+                            return Ok(crate::shard::CompactResp::from_vec(std::mem::take(out)));
+                        }
+                    }
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
+                }
+            } else {
+                return Ok(crate::shard::CompactResp::EMPTY_ARRAY);
+            }
+        }
+        out.clear();
+        self.write_zrange_resp(key, opts, is_resp3, out)?;
+        Ok(crate::shard::CompactResp::from_vec(std::mem::take(out)))
+    }
+
     pub fn write_zrange_resp(
         &mut self,
         key: &[u8],
@@ -6304,10 +6595,9 @@ impl RudisTable {
         }
 
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h)
-            && let Some(entry) = self.table.get_slot(idx)
-        {
-            if let Some(expire_at) = entry.expire_at
+        if let Some((idx, entry)) = self.table.find_entry(key, h) {
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -9423,6 +9713,66 @@ mod tests {
         assert_eq!(
             table.hget_compact(b"h_fast", b"f_missing").unwrap(),
             crate::shard::CompactResp::NULL
+        );
+    }
+
+    #[test]
+    fn test_with_hash_methods_and_array1_bulk_compact_resp() {
+        assert_eq!(std::mem::size_of::<crate::shard::CompactResp>(), 40);
+
+        let mut table = RudisTable::new();
+        let mut scratch = Vec::new();
+
+        // 1. ZRANGE compact with hash (empty -> 1 element Array1Bulk -> 2 elements)
+        let zk = Bytes::from_static(b"z_hash_key");
+        let zh = hash_key(&zk);
+        let zopts = ZRangeOpts {
+            start: 0,
+            stop: 10,
+            ..Default::default()
+        };
+        assert_eq!(
+            table
+                .zrange_compact_with_hash(&zk, zh, &zopts, false, &mut scratch)
+                .unwrap(),
+            crate::shard::CompactResp::EMPTY_ARRAY
+        );
+
+        let zm1 = Bytes::from_static(b"z_member_one_payload_longer_than_30_bytes");
+        table
+            .zadd_slice_with_hash(&zk, zh, &[(1.0, zm1.clone())], ZAddFlags::default())
+            .unwrap();
+        let zresp1 = table
+            .zrange_compact_with_hash(&zk, zh, &zopts, false, &mut scratch)
+            .unwrap();
+        assert_eq!(zresp1, crate::shard::CompactResp::Array1Bulk(zm1.clone()));
+        let mut serialized = Vec::new();
+        zresp1.write_to(&mut serialized);
+        assert_eq!(
+            serialized,
+            b"*1\r\n$41\r\nz_member_one_payload_longer_than_30_bytes\r\n"
+        );
+
+        // 2. LRANGE compact with hash (empty -> 1 element Array1Bulk -> pop)
+        let lk = Bytes::from_static(b"l_hash_key");
+        let lh = hash_key(&lk);
+        assert_eq!(
+            table
+                .lrange_compact_with_hash(&lk, lh, 0, 10, &mut scratch)
+                .unwrap(),
+            crate::shard::CompactResp::EMPTY_ARRAY
+        );
+        let lm1 = Bytes::from_static(b"list_element_one_payload_over_30_bytes");
+        table
+            .lpush_slice_with_hash(&lk, lh, std::slice::from_ref(&lm1))
+            .unwrap();
+        let lresp1 = table
+            .lrange_compact_with_hash(&lk, lh, 0, 10, &mut scratch)
+            .unwrap();
+        assert_eq!(lresp1, crate::shard::CompactResp::Array1Bulk(lm1.clone()));
+        assert_eq!(
+            table.lpop_one_with_hash(&lk, lh).unwrap(),
+            Some(lm1.clone())
         );
     }
 

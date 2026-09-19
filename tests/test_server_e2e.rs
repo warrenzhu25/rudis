@@ -9329,3 +9329,77 @@ fn test_pipelined_lpush_lpop_large_bulk_and_incr_e2e() {
     client.read_exact(&mut buf).unwrap();
     assert_eq!(String::from_utf8_lossy(&buf), expected);
 }
+
+#[test]
+fn test_pipelined_prehashed_zrange_lrange_array1bulk_e2e() {
+    let port = 16475;
+    start_test_server(port, 4);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    // 1. Populate 1-element ZSETs and LISTs across shards + query ZRANGE/LRANGE
+    let mut pipeline = String::new();
+    let mut expected = String::new();
+    for i in 0..8 {
+        let zk = format!("z_single_{}", i);
+        let zm = format!("z_payload_over_thirty_bytes_index_{:04}", i);
+        pipeline.push_str(&format!(
+            "*4\r\n$4\r\nZADD\r\n${}\r\n{}\r\n$2\r\n10\r\n${}\r\n{}\r\n",
+            zk.len(),
+            zk,
+            zm.len(),
+            zm
+        ));
+        expected.push_str(":1\r\n");
+
+        let lk = format!("l_single_{}", i);
+        let lm = format!("l_payload_over_thirty_bytes_index_{:04}", i);
+        pipeline.push_str(&format!(
+            "*3\r\n$5\r\nLPUSH\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+            lk.len(),
+            lk,
+            lm.len(),
+            lm
+        ));
+        expected.push_str(":1\r\n");
+    }
+    client.write_all(pipeline.as_bytes()).unwrap();
+    let mut buf = vec![0u8; expected.len()];
+    client.read_exact(&mut buf).unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf), expected);
+
+    // 2. Pipeline ZRANGE 0 10 and LRANGE 0 10 (including missing keys for EMPTY_ARRAY)
+    pipeline.clear();
+    expected.clear();
+    for i in 0..8 {
+        let zk = format!("z_single_{}", i);
+        let zm = format!("z_payload_over_thirty_bytes_index_{:04}", i);
+        pipeline.push_str(&format!(
+            "*4\r\n$6\r\nZRANGE\r\n${}\r\n{}\r\n$1\r\n0\r\n$2\r\n10\r\n",
+            zk.len(),
+            zk
+        ));
+        expected.push_str(&format!("*1\r\n${}\r\n{}\r\n", zm.len(), zm));
+
+        let lk = format!("l_single_{}", i);
+        let lm = format!("l_payload_over_thirty_bytes_index_{:04}", i);
+        pipeline.push_str(&format!(
+            "*4\r\n$6\r\nLRANGE\r\n${}\r\n{}\r\n$1\r\n0\r\n$2\r\n10\r\n",
+            lk.len(),
+            lk
+        ));
+        expected.push_str(&format!("*1\r\n${}\r\n{}\r\n", lm.len(), lm));
+
+        let missing = format!("missing_range_{}", i);
+        pipeline.push_str(&format!(
+            "*4\r\n$6\r\nZRANGE\r\n${}\r\n{}\r\n$1\r\n0\r\n$2\r\n10\r\n",
+            missing.len(),
+            missing
+        ));
+        expected.push_str("*0\r\n");
+    }
+    client.write_all(pipeline.as_bytes()).unwrap();
+    let mut buf = vec![0u8; expected.len()];
+    client.read_exact(&mut buf).unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf), expected);
+}

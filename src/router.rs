@@ -1988,8 +1988,11 @@ impl Router {
             .borrow_mut()
             .pop()
             .unwrap_or_else(|| std::sync::Arc::new(crate::mailbox::BatchResponder::new()));
+        let h = crate::connection::cmd_primary_key(&cmd)
+            .map(|k| crate::table::hash_key(k))
+            .unwrap_or(0);
         let msg = ShardMessage::Batch {
-            items: vec![(0, cmd)],
+            items: vec![(0, h, cmd)],
             results: Vec::with_capacity(1),
             responder: responder.clone(),
             is_resp3,
@@ -3041,7 +3044,7 @@ mod tests {
                         ..
                     } => {
                         results.clear();
-                        for (idx, _cmd) in items.drain(..) {
+                        for (idx, _h, _cmd) in items.drain(..) {
                             results
                                 .push((idx, crate::shard::CompactResp::from_slice(b"+PONG\r\n")));
                         }

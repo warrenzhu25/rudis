@@ -851,10 +851,10 @@ pub async fn handle_connection(
     let responders: Vec<std::sync::Arc<crate::mailbox::BatchResponder>> = (0..router.num_shards)
         .map(|_| std::sync::Arc::new(crate::mailbox::BatchResponder::new()))
         .collect();
-    let mut remote_batches: Vec<Vec<(usize, Command)>> = (0..router.num_shards)
+    let mut remote_batches: Vec<Vec<(usize, u64, Command)>> = (0..router.num_shards)
         .map(|_| Vec::with_capacity(64))
         .collect();
-    let mut items_pool: Vec<Vec<(usize, Command)>> = (0..router.num_shards)
+    let mut items_pool: Vec<Vec<(usize, u64, Command)>> = (0..router.num_shards)
         .map(|_| Vec::with_capacity(64))
         .collect();
     let mut results_pool: Vec<Vec<(usize, CompactResp)>> = (0..router.num_shards)
@@ -8122,6 +8122,38 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
     }
 }
 
+#[inline(always)]
+pub fn target_shard_and_hash_of_cmd(cmd: &Command, num_shards: usize) -> Option<(usize, u64)> {
+    match cmd {
+        Command::Exists(keys) if keys.len() == 1 => {
+            Some(crate::router::target_shard_and_hash(&keys[0], num_shards))
+        }
+        Command::Del(keys) if keys.len() == 1 => {
+            Some(crate::router::target_shard_and_hash(&keys[0], num_shards))
+        }
+        Command::Sismember { key, .. }
+        | Command::Sadd { key, .. }
+        | Command::Hset { key, .. }
+        | Command::Hget { key, .. }
+        | Command::Lpop { key, .. }
+        | Command::Lpush { key, .. }
+        | Command::Zadd { key, .. }
+        | Command::Get(key)
+        | Command::Set { key, .. }
+        | Command::IncrBy(key, _)
+        | Command::Lrange { key, .. }
+        | Command::Zrange { key, .. } => {
+            Some(crate::router::target_shard_and_hash(key, num_shards))
+        }
+        _ => target_shard_of_cmd(cmd, num_shards).map(|s| {
+            let h = cmd_primary_key(cmd)
+                .map(|k| crate::table::hash_key(k))
+                .unwrap_or(0);
+            (s, h)
+        }),
+    }
+}
+
 pub fn execute_local_command(
     cmd: &Command,
     db: &mut ShardDb,
@@ -12103,8 +12135,8 @@ async fn execute_commands_squashed(
     commands: &mut Vec<Command>,
     router: &Router,
     responders: &[std::sync::Arc<crate::mailbox::BatchResponder>],
-    remote_batches: &mut [Vec<(usize, Command)>],
-    items_pool: &mut Vec<Vec<(usize, Command)>>,
+    remote_batches: &mut [Vec<(usize, u64, Command)>],
+    items_pool: &mut Vec<Vec<(usize, u64, Command)>>,
     results_pool: &mut Vec<Vec<(usize, CompactResp)>>,
     responses: &mut Vec<CompactResp>,
     client_id: u64,
@@ -12114,8 +12146,12 @@ async fn execute_commands_squashed(
     authenticated: &mut bool,
     auth_user: &mut String,
 ) -> bool {
-    if let Some(client) = client_registry.borrow().get(&client_id) {
-        CURRENT_CLIENT_RESP3.set(client.is_resp3);
+    if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+        CURRENT_CLIENT_RESP3.set(c.is_resp3);
+        c.last_active = Instant::now();
+        if let Some(last_cmd) = commands.last() {
+            c.last_cmd = get_cmd_name(last_cmd);
+        }
     }
     let mut can_squash = *authenticated;
     if can_squash {
@@ -12263,16 +12299,9 @@ async fn execute_commands_squashed(
     *asking = false;
 
     let n = commands.len();
-    if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
-        c.last_active = Instant::now();
-        if let Some(last_cmd) = commands.last() {
-            let cmd_name = get_cmd_name(last_cmd);
-            c.last_cmd = cmd_name;
-        }
-    }
     responses.clear();
     responses.resize(n, CompactResp::empty());
-    let mut local_buf = Vec::with_capacity(128);
+    let mut local_buf = Vec::new();
     let mut should_close = false;
     // Cross-shard MGET/MSET are dispatched without awaiting so that every command in
     // the pipeline is in flight before we pay a single round-trip stall. These hold
@@ -12287,11 +12316,15 @@ async fn execute_commands_squashed(
     // 1. Process local shard commands immediately; bucket remote commands by shard
     let mut has_local_writes = false;
     for (idx, cmd) in commands.drain(..).enumerate() {
-        if let Some(target) = target_shard_of_cmd(&cmd, router.num_shards) {
+        if let Some((target, key_hash)) = target_shard_and_hash_of_cmd(&cmd, router.num_shards) {
             if target == router.shard_id {
                 local_buf.clear();
                 if let Command::Get(ref key) = cmd {
-                    let compact_res = router.local_db.borrow_mut().table.get_compact(key.as_ref());
+                    let compact_res = router
+                        .local_db
+                        .borrow_mut()
+                        .table
+                        .get_compact_with_hash(key.as_ref(), key_hash);
                     match compact_res {
                         Ok(Some(resp)) => {
                             responses[idx] = resp;
@@ -12332,7 +12365,7 @@ async fn execute_commands_squashed(
                         .local_db
                         .borrow_mut()
                         .table
-                        .set(key, value, expire_in);
+                        .set_with_hash(key, key_hash, value, expire_in);
                     responses[idx] = crate::shard::CompactResp::OK;
                     continue;
                 } else if router.aof.is_none()
@@ -12344,7 +12377,7 @@ async fn execute_commands_squashed(
                         .local_db
                         .borrow_mut()
                         .table
-                        .incr_by_slice_fast(key, delta)
+                        .incr_by_slice_with_hash(key, key_hash, delta)
                     {
                         Ok(val) => {
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -12366,7 +12399,11 @@ async fn execute_commands_squashed(
                 } else if let Command::Exists(ref keys) = cmd
                     && keys.len() == 1
                 {
-                    let exists = router.local_db.borrow_mut().table.exists(keys[0].as_ref());
+                    let exists = router
+                        .local_db
+                        .borrow_mut()
+                        .table
+                        .exists_with_hash(keys[0].as_ref(), key_hash);
                     responses[idx] = if exists {
                         crate::shard::CompactResp::INT_1
                     } else {
@@ -12378,7 +12415,10 @@ async fn execute_commands_squashed(
                     && let Command::Del(ref keys) = cmd
                     && keys.len() == 1
                 {
-                    let deleted = router.local_db.borrow_mut().del(keys[0].as_ref());
+                    let deleted = router
+                        .local_db
+                        .borrow_mut()
+                        .del_with_hash(keys[0].as_ref(), key_hash);
                     if deleted {
                         has_local_writes = true;
                         if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -12390,12 +12430,11 @@ async fn execute_commands_squashed(
                     }
                     continue;
                 } else if let Command::Hget { ref key, ref field } = cmd {
-                    match router
-                        .local_db
-                        .borrow_mut()
-                        .table
-                        .hget_compact(key.as_ref(), field.as_ref())
-                    {
+                    match router.local_db.borrow_mut().table.hget_compact_with_hash(
+                        key.as_ref(),
+                        key_hash,
+                        field.as_ref(),
+                    ) {
                         Ok(resp) => {
                             responses[idx] = resp;
                             continue;
@@ -12416,7 +12455,7 @@ async fn execute_commands_squashed(
                         .local_db
                         .borrow_mut()
                         .table
-                        .hset_slice_fast(key, fields)
+                        .hset_slice_with_hash(key, key_hash, fields)
                     {
                         Ok(count) => {
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -12444,7 +12483,8 @@ async fn execute_commands_squashed(
                     match router
                         .local_db
                         .borrow_mut()
-                        .sismember_compact(key.as_ref(), member.as_ref())
+                        .table
+                        .sismember_compact_with_hash(key.as_ref(), key_hash, member.as_ref())
                     {
                         Ok(resp) => {
                             responses[idx] = resp;
@@ -12466,7 +12506,7 @@ async fn execute_commands_squashed(
                         .local_db
                         .borrow_mut()
                         .table
-                        .sadd_slice_fast(key, members)
+                        .sadd_slice_with_hash(key, key_hash, members)
                     {
                         Ok(count) => {
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -12498,7 +12538,8 @@ async fn execute_commands_squashed(
                     match router
                         .local_db
                         .borrow_mut()
-                        .zadd_slice_fast(key, elements, flags)
+                        .table
+                        .zadd_slice_with_hash(key, key_hash, elements, flags)
                     {
                         Ok((count, incr_score)) => {
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -12539,7 +12580,7 @@ async fn execute_commands_squashed(
                         .local_db
                         .borrow_mut()
                         .table
-                        .lpush_slice_fast(key, values)
+                        .lpush_slice_with_hash(key, key_hash, values)
                     {
                         Ok(len) => {
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -12564,7 +12605,12 @@ async fn execute_commands_squashed(
                     && let Command::Lpop { ref key, count } = cmd
                 {
                     if count.is_none() {
-                        match router.local_db.borrow_mut().lpop_one(key.as_ref()) {
+                        match router
+                            .local_db
+                            .borrow_mut()
+                            .table
+                            .lpop_one_with_hash(key.as_ref(), key_hash)
+                        {
                             Ok(Some(v)) => {
                                 has_local_writes = true;
                                 if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -12606,23 +12652,33 @@ async fn execute_commands_squashed(
                     stop,
                 } = cmd
                 {
-                    if let Err(err) = router.local_db.borrow_mut().write_lrange_resp(
+                    match router.local_db.borrow_mut().table.lrange_compact_with_hash(
                         key.as_ref(),
+                        key_hash,
                         start,
                         stop,
                         &mut local_buf,
                     ) {
-                        write_resp_err(&mut local_buf, err);
+                        Ok(resp) => {
+                            responses[idx] = resp;
+                            continue;
+                        }
+                        Err(err) => write_resp_err(&mut local_buf, err),
                     }
                 } else if let Command::Zrange { ref key, ref opts } = cmd {
                     let is_resp3 = CURRENT_CLIENT_RESP3.get();
-                    if let Err(err) = router.local_db.borrow_mut().write_zrange_resp(
+                    match router.local_db.borrow_mut().table.zrange_compact_with_hash(
                         key.as_ref(),
+                        key_hash,
                         opts,
                         is_resp3,
                         &mut local_buf,
                     ) {
-                        write_resp_err(&mut local_buf, err);
+                        Ok(resp) => {
+                            responses[idx] = resp;
+                            continue;
+                        }
+                        Err(err) => write_resp_err(&mut local_buf, err),
                     }
                 } else {
                     if matches!(
@@ -12642,7 +12698,7 @@ async fn execute_commands_squashed(
                 }
                 responses[idx] = CompactResp::from_vec(std::mem::take(&mut local_buf));
             } else {
-                remote_batches[target].push((idx, cmd));
+                remote_batches[target].push((idx, key_hash, cmd));
             }
         } else if let Command::Mget(keys) = cmd {
             // Cross-shard MGET: dispatch the scatter now, gather after every other
@@ -12717,7 +12773,8 @@ async fn execute_commands_squashed(
     }
 
     // 2. Dispatch batched hops to all remote shards in parallel using pre-allocated channels
-    let mut pending = Vec::with_capacity(remote_batches.len());
+    let mut pending: smallvec::SmallVec<[&std::sync::Arc<crate::mailbox::BatchResponder>; 32]> =
+        smallvec::SmallVec::new();
     for (target_shard, items) in remote_batches.iter_mut().enumerate() {
         if !items.is_empty() {
             let responder = &responders[target_shard];

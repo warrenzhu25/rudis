@@ -522,34 +522,49 @@ pub fn run_shard_worker(
                         responder,
                         is_resp3,
                     } => {
-                        let r = cross_shard_router.clone();
-                        let aof_ref = cross_shard_aof.clone();
                         let has_tier_manager = cross_shard_db.borrow().tier_manager.is_some();
-                        let needs_async = has_tier_manager && items.iter().any(|(_, cmd)| {
+                        let needs_async = has_tier_manager && items.iter().any(|(_, _, cmd)| {
                             if let Command::Get(key) = cmd {
-                                r.local_db.borrow_mut().get(key).is_none()
-                                    && r.local_db.borrow_mut().table.is_tiered(key).is_some()
+                                cross_shard_db.borrow_mut().get(key).is_none()
+                                    && cross_shard_db.borrow_mut().table.is_tiered(key).is_some()
                             } else {
                                 false
                             }
                         });
 
                         if needs_async {
+                            let r = cross_shard_router.clone();
+                            let aof_ref = cross_shard_aof.clone();
                             monoio::spawn(async move {
                                 crate::connection::CURRENT_CLIENT_RESP3.set(is_resp3);
                                 results.clear();
-                                let mut temp_buf = Vec::with_capacity(128);
+                                let mut temp_buf = Vec::new();
                                 let mut has_writes = false;
-                                for (idx, cmd) in items.drain(..) {
+                                for (idx, key_hash, cmd) in items.drain(..) {
                                     temp_buf.clear();
                                     if let Command::Get(ref key) = cmd {
-                                        match r.local_db.borrow_mut().get_compact(key.as_ref()) {
+                                        let compact_res = r
+                                            .local_db
+                                            .borrow_mut()
+                                            .table
+                                            .get_compact_with_hash(key.as_ref(), key_hash);
+                                        match compact_res {
                                             Ok(Some(resp)) => {
                                                 results.push((idx, resp));
                                                 continue;
                                             }
                                             Ok(None) => {
-                                                results.push((idx, crate::shard::CompactResp::NULL));
+                                                let is_tiered = r.local_db.borrow().tier_manager.is_some()
+                                                    && r.local_db.borrow_mut().table.is_tiered(key).is_some();
+                                                if is_tiered {
+                                                    if let Some(v) = r.stream_cold_read_local(key).await {
+                                                        results.push((idx, crate::shard::CompactResp::Bulk(v)));
+                                                    } else {
+                                                        results.push((idx, crate::shard::CompactResp::NULL));
+                                                    }
+                                                } else {
+                                                    results.push((idx, crate::shard::CompactResp::NULL));
+                                                }
                                                 continue;
                                             }
                                             Err(err) => {
@@ -569,7 +584,7 @@ pub fn run_shard_worker(
                                         } = cmd
                                     {
                                         has_writes = true;
-                                        r.local_db.borrow_mut().table.set(key, value, expire_in);
+                                        r.local_db.borrow_mut().table.set_with_hash(key, key_hash, value, expire_in);
                                         results.push((idx, crate::shard::CompactResp::OK));
                                         continue;
                                     } else if aof_ref.is_none()
@@ -577,7 +592,7 @@ pub fn run_shard_worker(
                                         && let Command::IncrBy(ref key, delta) = cmd
                                     {
                                         has_writes = true;
-                                        match r.local_db.borrow_mut().table.incr_by_slice_fast(key, delta) {
+                                        match r.local_db.borrow_mut().table.incr_by_slice_with_hash(key, key_hash, delta) {
                                             Ok(val) => {
                                                 if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                     crate::connection::touch_watched_key(r.port, key.as_ref());
@@ -596,14 +611,14 @@ pub fn run_shard_worker(
                                             }
                                         }
                                     } else if let Command::Exists(ref keys) = cmd && keys.len() == 1 {
-                                        let exists = r.local_db.borrow_mut().table.exists(keys[0].as_ref());
+                                        let exists = r.local_db.borrow_mut().table.exists_with_hash(keys[0].as_ref(), key_hash);
                                         results.push((idx, if exists { crate::shard::CompactResp::INT_1 } else { crate::shard::CompactResp::INT_0 }));
                                         continue;
                                     } else if aof_ref.is_none()
                                         && !crate::replication::has_connected_replicas(r.port)
                                         && let Command::Del(ref keys) = cmd && keys.len() == 1
                                     {
-                                        let deleted = r.local_db.borrow_mut().del(keys[0].as_ref());
+                                        let deleted = r.local_db.borrow_mut().del_with_hash(keys[0].as_ref(), key_hash);
                                         if deleted {
                                             has_writes = true;
                                             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -615,7 +630,7 @@ pub fn run_shard_worker(
                                         }
                                         continue;
                                     } else if let Command::Hget { ref key, ref field } = cmd {
-                                        match r.local_db.borrow_mut().hget_compact(key.as_ref(), field.as_ref()) {
+                                        match r.local_db.borrow_mut().table.hget_compact_with_hash(key.as_ref(), key_hash, field.as_ref()) {
                                             Ok(resp) => {
                                                 results.push((idx, resp));
                                                 continue;
@@ -629,7 +644,7 @@ pub fn run_shard_worker(
                                         && let Command::Hset { ref key, ref fields } = cmd
                                     {
                                         has_writes = true;
-                                        match r.local_db.borrow_mut().table.hset_slice_fast(key, fields) {
+                                        match r.local_db.borrow_mut().table.hset_slice_with_hash(key, key_hash, fields) {
                                             Ok(count) => {
                                                 if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                     crate::connection::touch_watched_key(r.port, key.as_ref());
@@ -648,7 +663,7 @@ pub fn run_shard_worker(
                                             }
                                         }
                                     } else if let Command::Sismember { ref key, ref member } = cmd {
-                                        match r.local_db.borrow_mut().sismember_compact(key.as_ref(), member.as_ref()) {
+                                        match r.local_db.borrow_mut().table.sismember_compact_with_hash(key.as_ref(), key_hash, member.as_ref()) {
                                             Ok(resp) => {
                                                 results.push((idx, resp));
                                                 continue;
@@ -660,7 +675,7 @@ pub fn run_shard_worker(
                                         && let Command::Sadd { ref key, ref members } = cmd
                                     {
                                         has_writes = true;
-                                        match r.local_db.borrow_mut().table.sadd_slice_fast(key, members) {
+                                        match r.local_db.borrow_mut().table.sadd_slice_with_hash(key, key_hash, members) {
                                             Ok(count) => {
                                                 if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                     crate::connection::touch_watched_key(r.port, key.as_ref());
@@ -684,7 +699,7 @@ pub fn run_shard_worker(
                                         && let Command::Lpush { ref key, ref values } = cmd
                                     {
                                         has_writes = true;
-                                        match r.local_db.borrow_mut().table.lpush_slice_fast(key, values) {
+                                        match r.local_db.borrow_mut().table.lpush_slice_with_hash(key, key_hash, values) {
                                             Ok(len) => {
                                                 if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                     crate::connection::touch_watched_key(r.port, key.as_ref());
@@ -707,7 +722,7 @@ pub fn run_shard_worker(
                                         && let Command::Lpop { ref key, count } = cmd
                                     {
                                         if count.is_none() {
-                                            match r.local_db.borrow_mut().lpop_one(key.as_ref()) {
+                                            match r.local_db.borrow_mut().table.lpop_one_with_hash(key.as_ref(), key_hash) {
                                                 Ok(Some(v)) => {
                                                     has_writes = true;
                                                     if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -740,19 +755,27 @@ pub fn run_shard_worker(
                                             }
                                         }
                                     } else if let Command::Lrange { ref key, start, stop } = cmd {
-                                        if let Err(err) = r.local_db.borrow_mut().write_lrange_resp(key.as_ref(), start, stop, &mut temp_buf) {
-                                            crate::connection::write_resp_err(&mut temp_buf, err);
+                                        match r.local_db.borrow_mut().table.lrange_compact_with_hash(key.as_ref(), key_hash, start, stop, &mut temp_buf) {
+                                            Ok(resp) => {
+                                                results.push((idx, resp));
+                                                continue;
+                                            }
+                                            Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
                                         }
                                     } else if let Command::Zrange { ref key, ref opts } = cmd {
-                                        if let Err(err) = r.local_db.borrow_mut().write_zrange_resp(key.as_ref(), opts, is_resp3, &mut temp_buf) {
-                                            crate::connection::write_resp_err(&mut temp_buf, err);
+                                        match r.local_db.borrow_mut().table.zrange_compact_with_hash(key.as_ref(), key_hash, opts, is_resp3, &mut temp_buf) {
+                                            Ok(resp) => {
+                                                results.push((idx, resp));
+                                                continue;
+                                            }
+                                            Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
                                         }
                                     } else if aof_ref.is_none()
                                         && !crate::replication::has_connected_replicas(r.port)
                                         && let Command::Zadd { ref key, ref elements, flags } = cmd
                                     {
                                         has_writes = true;
-                                        match r.local_db.borrow_mut().zadd_slice_fast(key, elements, flags) {
+                                        match r.local_db.borrow_mut().table.zadd_slice_with_hash(key, key_hash, elements, flags) {
                                             Ok((count, incr_score)) => {
                                                 if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                     crate::connection::touch_watched_key(r.port, key.as_ref());
@@ -797,12 +820,12 @@ pub fn run_shard_worker(
                             let mut db = cross_shard_db.borrow_mut();
                             results.clear();
                             let aof_ref = cross_shard_aof.as_deref();
-                            let mut temp_buf = Vec::with_capacity(128);
+                            let mut temp_buf = Vec::new();
                             let mut has_writes = false;
-                            for (idx, cmd) in items.drain(..) {
+                            for (idx, key_hash, cmd) in items.drain(..) {
                                 temp_buf.clear();
                                 if let Command::Get(ref key) = cmd {
-                                    match db.get_compact(key.as_ref()) {
+                                    match db.table.get_compact_with_hash(key.as_ref(), key_hash) {
                                         Ok(Some(resp)) => {
                                             results.push((idx, resp));
                                             continue;
@@ -828,7 +851,7 @@ pub fn run_shard_worker(
                                     } = cmd
                                 {
                                     has_writes = true;
-                                    db.table.set(key, value, expire_in);
+                                    db.table.set_with_hash(key, key_hash, value, expire_in);
                                     results.push((idx, crate::shard::CompactResp::OK));
                                     continue;
                                 } else if aof_ref.is_none()
@@ -836,7 +859,7 @@ pub fn run_shard_worker(
                                     && let Command::IncrBy(ref key, delta) = cmd
                                 {
                                     has_writes = true;
-                                    match db.table.incr_by_slice_fast(key, delta) {
+                                    match db.table.incr_by_slice_with_hash(key, key_hash, delta) {
                                         Ok(val) => {
                                             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                 crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
@@ -855,14 +878,14 @@ pub fn run_shard_worker(
                                         }
                                     }
                                 } else if let Command::Exists(ref keys) = cmd && keys.len() == 1 {
-                                    let exists = db.table.exists(keys[0].as_ref());
+                                    let exists = db.table.exists_with_hash(keys[0].as_ref(), key_hash);
                                     results.push((idx, if exists { crate::shard::CompactResp::INT_1 } else { crate::shard::CompactResp::INT_0 }));
                                     continue;
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
                                     && let Command::Del(ref keys) = cmd && keys.len() == 1
                                 {
-                                    let deleted = db.del(keys[0].as_ref());
+                                    let deleted = db.del_with_hash(keys[0].as_ref(), key_hash);
                                     if deleted {
                                         has_writes = true;
                                         if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -874,7 +897,7 @@ pub fn run_shard_worker(
                                     }
                                     continue;
                                 } else if let Command::Hget { ref key, ref field } = cmd {
-                                    match db.hget_compact(key.as_ref(), field.as_ref()) {
+                                    match db.table.hget_compact_with_hash(key.as_ref(), key_hash, field.as_ref()) {
                                         Ok(resp) => {
                                             results.push((idx, resp));
                                             continue;
@@ -888,7 +911,7 @@ pub fn run_shard_worker(
                                     && let Command::Hset { ref key, ref fields } = cmd
                                 {
                                     has_writes = true;
-                                    match db.table.hset_slice_fast(key, fields) {
+                                    match db.table.hset_slice_with_hash(key, key_hash, fields) {
                                         Ok(count) => {
                                             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                 crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
@@ -907,7 +930,7 @@ pub fn run_shard_worker(
                                         }
                                     }
                                 } else if let Command::Sismember { ref key, ref member } = cmd {
-                                    match db.sismember_compact(key.as_ref(), member.as_ref()) {
+                                    match db.table.sismember_compact_with_hash(key.as_ref(), key_hash, member.as_ref()) {
                                         Ok(resp) => {
                                             results.push((idx, resp));
                                             continue;
@@ -919,7 +942,7 @@ pub fn run_shard_worker(
                                     && let Command::Sadd { ref key, ref members } = cmd
                                 {
                                     has_writes = true;
-                                    match db.table.sadd_slice_fast(key, members) {
+                                    match db.table.sadd_slice_with_hash(key, key_hash, members) {
                                         Ok(count) => {
                                             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                 crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
@@ -943,7 +966,7 @@ pub fn run_shard_worker(
                                     && let Command::Lpush { ref key, ref values } = cmd
                                 {
                                     has_writes = true;
-                                    match db.table.lpush_slice_fast(key, values) {
+                                    match db.table.lpush_slice_with_hash(key, key_hash, values) {
                                         Ok(len) => {
                                             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                 crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
@@ -966,7 +989,7 @@ pub fn run_shard_worker(
                                     && let Command::Lpop { ref key, count } = cmd
                                 {
                                     if count.is_none() {
-                                        match db.lpop_one(key.as_ref()) {
+                                        match db.table.lpop_one_with_hash(key.as_ref(), key_hash) {
                                             Ok(Some(v)) => {
                                                 has_writes = true;
                                                 if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -999,19 +1022,27 @@ pub fn run_shard_worker(
                                         }
                                     }
                                 } else if let Command::Lrange { ref key, start, stop } = cmd {
-                                    if let Err(err) = db.write_lrange_resp(key.as_ref(), start, stop, &mut temp_buf) {
-                                        crate::connection::write_resp_err(&mut temp_buf, err);
+                                    match db.table.lrange_compact_with_hash(key.as_ref(), key_hash, start, stop, &mut temp_buf) {
+                                        Ok(resp) => {
+                                            results.push((idx, resp));
+                                            continue;
+                                        }
+                                        Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
                                     }
                                 } else if let Command::Zrange { ref key, ref opts } = cmd {
-                                    if let Err(err) = db.write_zrange_resp(key.as_ref(), opts, is_resp3, &mut temp_buf) {
-                                        crate::connection::write_resp_err(&mut temp_buf, err);
+                                    match db.table.zrange_compact_with_hash(key.as_ref(), key_hash, opts, is_resp3, &mut temp_buf) {
+                                        Ok(resp) => {
+                                            results.push((idx, resp));
+                                            continue;
+                                        }
+                                        Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
                                     }
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
                                     && let Command::Zadd { ref key, ref elements, flags } = cmd
                                 {
                                     has_writes = true;
-                                    match db.zadd_slice_fast(key, elements, flags) {
+                                    match db.table.zadd_slice_with_hash(key, key_hash, elements, flags) {
                                         Ok((count, incr_score)) => {
                                             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                 crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());

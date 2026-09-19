@@ -247,7 +247,7 @@ pub struct BatchResponder {
     pub payload: CachePadded<
         UnsafeCell<
             Option<(
-                Vec<(usize, crate::resp::Command)>,
+                Vec<(usize, u64, crate::resp::Command)>,
                 Vec<(usize, crate::shard::CompactResp)>,
             )>,
         >,
@@ -273,7 +273,7 @@ impl BatchResponder {
     #[inline(always)]
     pub fn finish(
         &self,
-        items: Vec<(usize, crate::resp::Command)>,
+        items: Vec<(usize, u64, crate::resp::Command)>,
         results: Vec<(usize, crate::shard::CompactResp)>,
     ) {
         unsafe {
@@ -287,7 +287,7 @@ impl BatchResponder {
     pub fn try_take(
         &self,
     ) -> Option<(
-        Vec<(usize, crate::resp::Command)>,
+        Vec<(usize, u64, crate::resp::Command)>,
         Vec<(usize, crate::shard::CompactResp)>,
     )> {
         if self.ready.load(Ordering::Acquire) {

@@ -10,6 +10,7 @@ pub enum CompactResp {
     Small { len: u8, data: [u8; 30] },
     Big(Vec<u8>),
     Bulk(Bytes),
+    Array1Bulk(Bytes),
 }
 
 const DIGIT_PAIRS: &[u8; 200] = b"\
@@ -62,6 +63,14 @@ impl CompactResp {
         data: [
             b'$', b'-', b'1', b'\r', b'\n', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
             0, 0, 0, 0, 0, 0, 0,
+        ],
+    };
+
+    pub const EMPTY_ARRAY: Self = CompactResp::Small {
+        len: 4,
+        data: [
+            b'*', b'0', b'\r', b'\n', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0,
         ],
     };
 
@@ -223,6 +232,10 @@ impl CompactResp {
             CompactResp::Small { len, data } => out.extend_from_slice(&data[..*len as usize]),
             CompactResp::Big(vec) => out.extend_from_slice(vec),
             CompactResp::Bulk(bytes) => crate::connection::write_resp_bulk(out, bytes),
+            CompactResp::Array1Bulk(bytes) => {
+                out.extend_from_slice(b"*1\r\n");
+                crate::connection::write_resp_bulk(out, bytes);
+            }
         }
     }
 
@@ -231,7 +244,7 @@ impl CompactResp {
         match self {
             CompactResp::Small { len, data } => &data[..*len as usize],
             CompactResp::Big(vec) => vec.as_slice(),
-            CompactResp::Bulk(bytes) => bytes.as_ref(),
+            CompactResp::Bulk(bytes) | CompactResp::Array1Bulk(bytes) => bytes.as_ref(),
         }
     }
 
@@ -242,6 +255,12 @@ impl CompactResp {
             CompactResp::Big(vec) => vec,
             CompactResp::Bulk(bytes) => {
                 let mut v = Vec::with_capacity(bytes.len() + 16);
+                crate::connection::write_resp_bulk(&mut v, &bytes);
+                v
+            }
+            CompactResp::Array1Bulk(bytes) => {
+                let mut v = Vec::with_capacity(bytes.len() + 20);
+                v.extend_from_slice(b"*1\r\n");
                 crate::connection::write_resp_bulk(&mut v, &bytes);
                 v
             }
@@ -309,7 +328,7 @@ pub enum ShardMessage {
         responder: flume::Sender<String>,
     },
     Batch {
-        items: Vec<(usize, Command)>,
+        items: Vec<(usize, u64, Command)>,
         results: Vec<(usize, CompactResp)>,
         responder: std::sync::Arc<crate::mailbox::BatchResponder>,
         is_resp3: bool,
