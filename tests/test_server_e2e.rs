@@ -8802,3 +8802,29 @@ fn test_in_place_incr_single_pass_e2e() {
         "$1\r\n5\r\n"
     );
 }
+
+#[test]
+fn test_fast_integer_responses_e2e() {
+    let port = 16457;
+    start_test_server(port, 2);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    assert_eq!(send_and_read(&mut client, b"INCRBY count 7\r\n"), ":7\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"INCRBY count 35\r\n"),
+        ":42\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"INCRBY count 100\r\n"),
+        ":142\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"INCRBY count 1000\r\n"),
+        ":1142\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"INCRBY count -1150\r\n"),
+        ":-8\r\n"
+    );
+}

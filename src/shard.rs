@@ -12,6 +12,18 @@ pub enum CompactResp {
     Bulk(Bytes),
 }
 
+const DIGIT_PAIRS: &[u8; 200] = b"\
+00010203040506070809\
+10111213141516171819\
+20212223242526272829\
+30313233343536373839\
+40414243444546474849\
+50515253545556575859\
+60616263646566676869\
+70717273747576777879\
+80818283848586878889\
+90919293949596979899";
+
 impl CompactResp {
     #[inline(always)]
     pub const fn empty() -> Self {
@@ -102,6 +114,48 @@ impl CompactResp {
     pub fn from_integer(val: i64) -> Self {
         let mut data = [0u8; 30];
         data[0] = b':';
+
+        match val {
+            0 => return Self::INT_0,
+            1 => return Self::INT_1,
+            2..=9 => {
+                data[1] = b'0' + val as u8;
+                data[2] = b'\r';
+                data[3] = b'\n';
+                return CompactResp::Small { len: 4, data };
+            }
+            10..=99 => {
+                let p = (val as usize) * 2;
+                data[1] = DIGIT_PAIRS[p];
+                data[2] = DIGIT_PAIRS[p + 1];
+                data[3] = b'\r';
+                data[4] = b'\n';
+                return CompactResp::Small { len: 5, data };
+            }
+            100..=999 => {
+                let h = (val / 100) as u8;
+                let p = ((val % 100) as usize) * 2;
+                data[1] = b'0' + h;
+                data[2] = DIGIT_PAIRS[p];
+                data[3] = DIGIT_PAIRS[p + 1];
+                data[4] = b'\r';
+                data[5] = b'\n';
+                return CompactResp::Small { len: 6, data };
+            }
+            1000..=9999 => {
+                let p1 = ((val / 100) as usize) * 2;
+                let p2 = ((val % 100) as usize) * 2;
+                data[1] = DIGIT_PAIRS[p1];
+                data[2] = DIGIT_PAIRS[p1 + 1];
+                data[3] = DIGIT_PAIRS[p2];
+                data[4] = DIGIT_PAIRS[p2 + 1];
+                data[5] = b'\r';
+                data[6] = b'\n';
+                return CompactResp::Small { len: 7, data };
+            }
+            _ => {}
+        }
+
         let mut len = 1;
         let mut n = if val < 0 {
             data[1] = b'-';
@@ -110,21 +164,16 @@ impl CompactResp {
         } else {
             val as u64
         };
-        if n == 0 {
-            data[len] = b'0';
+        let mut rev = [0u8; 20];
+        let mut rev_len = 0;
+        while n > 0 {
+            rev[rev_len] = b'0' + (n % 10) as u8;
+            rev_len += 1;
+            n /= 10;
+        }
+        for i in (0..rev_len).rev() {
+            data[len] = rev[i];
             len += 1;
-        } else {
-            let mut rev = [0u8; 20];
-            let mut rev_len = 0;
-            while n > 0 {
-                rev[rev_len] = b'0' + (n % 10) as u8;
-                rev_len += 1;
-                n /= 10;
-            }
-            for i in (0..rev_len).rev() {
-                data[len] = rev[i];
-                len += 1;
-            }
         }
         data[len] = b'\r';
         data[len + 1] = b'\n';
@@ -2203,6 +2252,22 @@ impl ShardDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_fast_integer_formatting() {
+        for v in [
+            0, 1, 7, 10, 42, 99, 100, 123, 999, 1000, 1234, 9999, 10000, 123456, -1, -42,
+        ] {
+            let resp = CompactResp::from_integer(v);
+            let expected = format!(":{}\r\n", v);
+            assert_eq!(
+                resp.as_slice(),
+                expected.as_bytes(),
+                "Failed for integer {}",
+                v
+            );
+        }
+    }
 
     #[test]
     fn test_extended_rdb_save_and_restore() {
