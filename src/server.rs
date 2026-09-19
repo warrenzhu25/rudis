@@ -34,6 +34,15 @@ use crate::resp::Command;
 use crate::router::Router;
 use crate::shard::{ShardDb, ShardMessage};
 
+thread_local! {
+    /// Client id sequence for connections adopted from another shard.
+    ///
+    /// Seeded in `run_shard_worker` with bit 47 set so adopted ids can never
+    /// collide with the `(shard_id << 48) + n` ids minted by this shard's own
+    /// accept loop.
+    static ADOPTED_CLIENT_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 pub fn run_shard_worker(
     shard_id: usize,
     num_shards: usize,
@@ -48,6 +57,8 @@ pub fn run_shard_worker(
     if let Some(core) = core_id {
         core_affinity::set_for_current(core);
     }
+
+    ADOPTED_CLIENT_SEQ.with(|s| s.set(((shard_id as u64) << 48) | (1u64 << 47) | 1));
 
     let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
         .enable_timer()
@@ -312,6 +323,49 @@ pub fn run_shard_worker(
                 let mut burst = 0;
                 loop {
                     match msg {
+                    ShardMessage::AdoptConnection { fd, peer } => {
+                        // Take ownership of a connection handed over by an
+                        // overloaded shard. Safe: the sending shard released the
+                        // fd via into_raw_fd without closing it, and we are in
+                        // the same process, so the fd is valid in our table.
+                        let std_stream = unsafe {
+                            <std::net::TcpStream as std::os::unix::io::FromRawFd>::from_raw_fd(fd)
+                        };
+                        match monoio::net::TcpStream::from_std(std_stream) {
+                            Ok(stream) => {
+                                crate::conn_balance::register_conn(shard_id);
+                                let r = cross_shard_router.clone();
+                                let reg = cross_shard_clients.clone();
+                                let client_id = ADOPTED_CLIENT_SEQ.with(|s| {
+                                    let id = s.get();
+                                    s.set(id + 1);
+                                    id
+                                });
+                                monoio::spawn(async move {
+                                    let res = catch_unwind_async(async move {
+                                        handle_connection(stream, peer, client_id, reg, r).await;
+                                    })
+                                    .await;
+                                    crate::conn_balance::unregister_conn(shard_id);
+                                    if let Err(e) = res {
+                                        crate::connection::inc_isolated_panics();
+                                        tracing::error!(
+                                            client_id = client_id,
+                                            "Panic isolated in adopted connection: {:?}",
+                                            e
+                                        );
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    shard_id = shard_id,
+                                    "Failed to adopt handed-off connection: {}",
+                                    e
+                                );
+                            }
+                        }
+                    }
                     ShardMessage::Get { key, responder } => {
                         let val = cross_shard_db.borrow_mut().get(&key);
                         if let Some(v) = val {
@@ -1624,16 +1678,57 @@ pub fn run_shard_worker(
                     let client_id = next_client_id;
                     next_client_id += 1;
                     let reg = client_registry.clone();
-                    monoio::spawn(async move {
-                        let res = catch_unwind_async(async move {
-                            handle_connection(stream, client_addr, client_id, reg, r).await;
-                        })
-                        .await;
-                        if let Err(e) = res {
-                            crate::connection::inc_isolated_panics();
-                            tracing::error!(client_id = client_id, "Panic isolated in client connection: {:?}", e);
+
+                    // SO_REUSEPORT picked this shard by hashing the 4-tuple,
+                    // which is badly uneven (see crate::conn_balance). If we
+                    // already hold more connections than the least loaded
+                    // shard, hand this one over instead of compounding the
+                    // imbalance.
+                    //
+                    // Cluster mode is exempt: there each shard binds its own
+                    // port (base_port + shard_id) and the client picks the
+                    // shard on purpose to reach the slots it owns. Moving the
+                    // connection elsewhere would answer from the wrong shard
+                    // and break MOVED redirection. It also has nothing to fix,
+                    // since the distribution is client-chosen, not hashed.
+                    let plan = if cluster_enabled {
+                        None
+                    } else {
+                        crate::conn_balance::plan_handoff(shard_id, num_shards)
+                    };
+                    match plan {
+                        Some(target) => {
+                            // Release the fd without closing it; the target
+                            // shard adopts it. into_raw_fd consumes the stream
+                            // so no Drop runs and the fd stays valid.
+                            let fd = std::os::unix::io::IntoRawFd::into_raw_fd(stream);
+                            let handed = router.senders[target]
+                                .send(ShardMessage::AdoptConnection {
+                                    fd,
+                                    peer: client_addr,
+                                })
+                                .is_ok();
+                            if !handed {
+                                // Target mailbox is gone; we still own the fd,
+                                // so close it rather than leak it.
+                                unsafe { libc::close(fd) };
+                            }
                         }
-                    });
+                        None => {
+                            crate::conn_balance::register_conn(shard_id);
+                            monoio::spawn(async move {
+                                let res = catch_unwind_async(async move {
+                                    handle_connection(stream, client_addr, client_id, reg, r).await;
+                                })
+                                .await;
+                                crate::conn_balance::unregister_conn(shard_id);
+                                if let Err(e) = res {
+                                    crate::connection::inc_isolated_panics();
+                                    tracing::error!(client_id = client_id, "Panic isolated in client connection: {:?}", e);
+                                }
+                            });
+                        }
+                    }
                 }
                 Err(e) => {
                     eprintln!("[Shard {}] Accept error: {}", shard_id, e);

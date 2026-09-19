@@ -270,6 +270,18 @@ impl CompactResp {
 
 /// Messages passed across CPU cores to access or mutate a shard's data.
 pub enum ShardMessage {
+    /// Transfer an accepted connection to a less loaded shard.
+    ///
+    /// `SO_REUSEPORT` assigns connections by kernel 4-tuple hash, which is
+    /// uneven (see `crate::conn_balance`). The accepting shard hands the raw fd
+    /// to the least loaded shard instead of keeping it. All shards are threads
+    /// in one process sharing a single fd table, so passing the integer is
+    /// sufficient -- no `SCM_RIGHTS`. The sender relinquishes ownership without
+    /// closing; the receiver takes it over.
+    AdoptConnection {
+        fd: std::os::unix::io::RawFd,
+        peer: std::net::SocketAddr,
+    },
     Get {
         key: Bytes,
         responder: flume::Sender<Option<Bytes>>,

@@ -4100,12 +4100,19 @@ async fn execute_command(
                 let hub_arc = crate::block::get_block_hub_for_port(router.port);
                 hub_arc.lock().unwrap().blocked_clients_count()
             };
+            // Per-shard connection census. Exposes whether connections are
+            // evenly spread across shards; a skewed distribution caps
+            // throughput at the busiest shard. See crate::conn_balance.
+            let shard_conns: Vec<String> = (0..router.num_shards)
+                .map(|s| crate::conn_balance::conn_count(s).to_string())
+                .collect();
             let clients_str = format!(
-                "# Clients\r\nconnected_clients:{}\r\nmaxclients:{}\r\nblocked_clients:{}\r\ntracking_clients:0\r\nisolated_panics:{}\r\n",
+                "# Clients\r\nconnected_clients:{}\r\nmaxclients:{}\r\nblocked_clients:{}\r\ntracking_clients:0\r\nisolated_panics:{}\r\nshard_connections:{}\r\n",
                 get_active_clients(),
                 get_max_clients(),
                 blocked_clients_count,
-                get_isolated_panics()
+                get_isolated_panics(),
+                shard_conns.join(",")
             );
             let persistence_str = format!(
                 "# Persistence\r\nloading:0\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:0\r\nrdb_last_save_time:0\r\nrdb_last_bgsave_status:ok\r\n",

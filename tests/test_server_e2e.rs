@@ -9488,3 +9488,128 @@ fn test_overlapped_remote_dispatch_and_coordinator_recycle_e2e() {
     client2.read_exact(&mut buf).unwrap();
     assert_eq!(String::from_utf8_lossy(&buf), expected);
 }
+
+/// Reads the per-shard connection census from `INFO clients`.
+///
+/// This does not use `send_and_read` on purpose: that helper performs a single
+/// 1KB `read()`, while an INFO reply spans several KB and several TCP segments.
+/// A truncated read leaves the remainder queued in the socket, so a subsequent
+/// command on the same connection would observe the stale tail of this reply.
+/// Here we open a fresh connection, request only the `clients` section, and
+/// drain until the RESP bulk string (`$<len>\r\n<payload>\r\n`) is complete.
+fn read_shard_census(port: u16) -> Vec<usize> {
+    let mut s = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.write_all(b"INFO clients\r\n").unwrap();
+
+    let mut data = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = s.read(&mut chunk).unwrap();
+        assert!(n > 0, "server closed before the full INFO reply arrived");
+        data.extend_from_slice(&chunk[..n]);
+        if let Some(hdr_end) = data.windows(2).position(|w| w == b"\r\n") {
+            assert_eq!(data[0], b'$', "expected a RESP bulk string from INFO");
+            let len: usize = std::str::from_utf8(&data[1..hdr_end])
+                .unwrap()
+                .parse()
+                .unwrap();
+            if data.len() >= hdr_end + 2 + len + 2 {
+                break;
+            }
+        }
+    }
+
+    let text = String::from_utf8_lossy(&data).to_string();
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("shard_connections:"))
+        .unwrap_or_else(|| panic!("INFO clients missing shard_connections. Got:\n{}", text));
+    line.trim_start_matches("shard_connections:")
+        .trim()
+        .split(',')
+        .map(|v| v.parse::<usize>().unwrap())
+        .collect()
+}
+
+#[test]
+fn test_connection_balancing_across_shards_e2e() {
+    // SO_REUSEPORT assigns connections to shards by kernel 4-tuple hash. Over
+    // loopback only the client's ephemeral port varies, so the draw is random
+    // and badly uneven: with 64 connections over 16 shards the busiest shard
+    // gets ~8 while others get 1-2, and throughput is gated by that shard.
+    // crate::conn_balance rebalances each accepted connection to the least
+    // loaded shard. This test asserts the resulting distribution is even.
+    let port = 16790;
+    let num_shards = 8;
+    let num_conns = 32; // 4 per shard when balanced
+    start_test_server(port, num_shards);
+
+    let mut conns = Vec::new();
+    for _ in 0..num_conns {
+        let mut c = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        // Force the connection to be fully established and served before the
+        // next one, so the census is up to date when the next is balanced.
+        assert_eq!(send_and_read(&mut c, b"PING\r\n"), "+PONG\r\n");
+        conns.push(c);
+    }
+
+    // Read the per-shard census out of INFO.
+    let counts = read_shard_census(port);
+
+    assert_eq!(counts.len(), num_shards, "one census entry per shard");
+
+    let total: usize = counts.iter().sum();
+    assert!(
+        total >= num_conns,
+        "census {:?} totals {} but {} connections were opened",
+        counts,
+        total,
+        num_conns
+    );
+
+    // The point of the fix: no shard may hoard connections. Without balancing
+    // the max would routinely reach 8-10 out of 32 across 8 shards.
+    let max = *counts.iter().max().unwrap();
+    let min = *counts.iter().min().unwrap();
+    let ideal = total / num_shards;
+    assert!(
+        max - min <= 2,
+        "connections must be evenly distributed (ideal ~{} each), got {:?}",
+        ideal,
+        counts
+    );
+    assert!(
+        max <= ideal + 2,
+        "no shard may hoard connections (ideal ~{} each), got {:?}",
+        ideal,
+        counts
+    );
+
+    // Balanced connections must still work correctly, including ones that were
+    // handed off to a different shard than the kernel originally chose.
+    for (i, c) in conns.iter_mut().enumerate() {
+        let key = format!("balkey_{}", i);
+        let set = format!("SET {} v{}\r\n", key, i);
+        assert_eq!(send_and_read(c, set.as_bytes()), "+OK\r\n");
+    }
+    for (i, c) in conns.iter_mut().enumerate() {
+        let key = format!("balkey_{}", i);
+        let get = format!("GET {}\r\n", key);
+        let val = format!("v{}", i);
+        let want = format!("${}\r\n{}\r\n", val.len(), val);
+        assert_eq!(send_and_read(c, get.as_bytes()), want);
+    }
+
+    // Closing connections must decrement the census, not leak.
+    drop(conns);
+    std::thread::sleep(Duration::from_millis(500));
+    let after = read_shard_census(port);
+    let total_after: usize = after.iter().sum();
+    assert!(
+        total_after < total,
+        "census must decrease after closing connections: before {:?}, after {:?}",
+        counts,
+        after
+    );
+}
