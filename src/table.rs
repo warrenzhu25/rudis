@@ -2065,10 +2065,12 @@ impl RudisTable {
         delta: i64,
     ) -> Result<i64, &'static str> {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h)
+        let (existing, candidate_idx) = self.table.find_or_prepare_insert(key, h);
+        if let Some(idx) = existing
             && let Some(entry) = self.table.get_slot_mut(idx)
         {
-            if let Some(expire_at) = entry.expire_at
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -2101,7 +2103,6 @@ impl RudisTable {
             }
         }
 
-        let (_, candidate_idx) = self.table.find_or_prepare_insert(key, h);
         let new_val = delta;
         let entry = RudisEntry {
             key: key_bytes
@@ -2110,7 +2111,11 @@ impl RudisTable {
             val: RudisValue::Int(new_val),
             expire_at: None,
         };
-        self.table.insert_prepared(entry, h, candidate_idx);
+        if existing.is_none() {
+            self.table.insert_prepared(entry, h, candidate_idx);
+        } else {
+            self.table.insert(entry);
+        }
         self.used_memory += key.len() + 8 + 64;
         Ok(new_val)
     }
@@ -3091,10 +3096,9 @@ impl RudisTable {
         field: &[u8],
     ) -> Result<crate::shard::CompactResp, &'static str> {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h)
-            && let Some(entry) = self.table.get_slot(idx)
-        {
-            if let Some(expire_at) = entry.expire_at
+        if let Some((idx, entry)) = self.table.find_entry(key, h) {
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -3105,12 +3109,24 @@ impl RudisTable {
             match &entry.val {
                 RudisValue::SmallHash(pairs) => {
                     let f_len = field.len();
-                    for (k, v) in pairs {
-                        if k.len() == f_len && k.as_ref() == field {
-                            return Ok(crate::shard::CompactResp::from_bulk(v));
+                    match pairs.len() {
+                        0 => Ok(crate::shard::CompactResp::NULL),
+                        1 => {
+                            if pairs[0].0.len() == f_len && pairs[0].0.as_ref() == field {
+                                Ok(crate::shard::CompactResp::from_bulk(&pairs[0].1))
+                            } else {
+                                Ok(crate::shard::CompactResp::NULL)
+                            }
+                        }
+                        _ => {
+                            for (k, v) in pairs {
+                                if k.len() == f_len && k.as_ref() == field {
+                                    return Ok(crate::shard::CompactResp::from_bulk(v));
+                                }
+                            }
+                            Ok(crate::shard::CompactResp::NULL)
                         }
                     }
-                    Ok(crate::shard::CompactResp::NULL)
                 }
                 RudisValue::Hash(map) => {
                     if let Some(v) = map.get(field) {
@@ -3134,7 +3150,8 @@ impl RudisTable {
     ) -> Result<(), &'static str> {
         let h = hash_key(key);
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
-            if let Some(expire_at) = entry.expire_at
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -3773,7 +3790,8 @@ impl RudisTable {
         values: &[Bytes],
     ) -> Result<usize, &'static str> {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h) {
+        let (existing, insert_idx) = self.table.find_or_prepare_insert(key, h);
+        if let Some(idx) = existing {
             if self.check_expired_slot(idx) {
                 // Key was expired and removed
             } else if let Some(entry) = self.table.get_slot_mut(idx) {
@@ -3805,7 +3823,11 @@ impl RudisTable {
             val: RudisValue::List(deque),
             expire_at: None,
         };
-        self.table.insert(entry);
+        if existing.is_none() {
+            self.table.insert_prepared(entry, h, insert_idx);
+        } else {
+            self.table.insert(entry);
+        }
         Ok(len)
     }
 
@@ -9355,6 +9377,53 @@ mod tests {
         assert_eq!(zadd_res.0, 1);
         let zscore_res = table.zscore(b"z_key", b"zm1").unwrap();
         assert_eq!(zscore_res, Some(10.5));
+    }
+
+    #[test]
+    fn test_from_owned_bulk_and_single_pass_lpush_incr_hget() {
+        let mut table = RudisTable::new();
+
+        // Single-pass INCR on new and existing keys
+        let ik = Bytes::from_static(b"counter_1");
+        assert_eq!(table.incr_by_slice_fast(&ik, 5).unwrap(), 5);
+        assert_eq!(table.incr_by_slice_fast(&ik, 10).unwrap(), 15);
+
+        // Single-pass LPUSH + LPOP with from_owned_bulk (both <=20 bytes and >20 bytes)
+        let lk = Bytes::from_static(b"list_1");
+        let large_payload = Bytes::from_static(b"payload_longer_than_twenty_bytes_for_bulk_move");
+        let small_payload = Bytes::from_static(b"short_payload");
+        let pushed = table
+            .lpush_slice_fast(&lk, &[large_payload.clone(), small_payload.clone()])
+            .unwrap();
+        assert_eq!(pushed, 2);
+
+        let popped_small = table.lpop_one(b"list_1").unwrap().unwrap();
+        let resp_small = crate::shard::CompactResp::from_owned_bulk(popped_small);
+        assert!(matches!(
+            resp_small,
+            crate::shard::CompactResp::Small { .. }
+        ));
+
+        let popped_large = table.lpop_one(b"list_1").unwrap().unwrap();
+        let resp_large = crate::shard::CompactResp::from_owned_bulk(popped_large);
+        assert!(matches!(resp_large, crate::shard::CompactResp::Bulk(_)));
+
+        // HGET compact 1-field and multi-field fast path
+        let hk = Bytes::from_static(b"h_fast");
+        table
+            .hset_slice_fast(
+                &hk,
+                &[(Bytes::from_static(b"f1"), Bytes::from_static(b"val1"))],
+            )
+            .unwrap();
+        assert_eq!(
+            table.hget_compact(b"h_fast", b"f1").unwrap(),
+            crate::shard::CompactResp::from_bulk(&Bytes::from_static(b"val1"))
+        );
+        assert_eq!(
+            table.hget_compact(b"h_fast", b"f_missing").unwrap(),
+            crate::shard::CompactResp::NULL
+        );
     }
 
     #[test]

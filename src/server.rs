@@ -689,7 +689,14 @@ pub fn run_shard_worker(
                                                 if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                     crate::connection::touch_watched_key(r.port, key.as_ref());
                                                 }
-                                                crate::connection::write_resp_integer(&mut temp_buf, len as i64);
+                                                if len == 1 {
+                                                    results.push((idx, crate::shard::CompactResp::INT_1));
+                                                } else if len == 0 {
+                                                    results.push((idx, crate::shard::CompactResp::INT_0));
+                                                } else {
+                                                    results.push((idx, crate::shard::CompactResp::from_integer(len as i64)));
+                                                }
+                                                continue;
                                             }
                                             Err(err) => {
                                                 crate::connection::write_resp_err(&mut temp_buf, err);
@@ -706,7 +713,7 @@ pub fn run_shard_worker(
                                                     if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                         crate::connection::touch_watched_key(r.port, key.as_ref());
                                                     }
-                                                    results.push((idx, crate::shard::CompactResp::from_bulk(&v)));
+                                                    results.push((idx, crate::shard::CompactResp::from_owned_bulk(v)));
                                                     continue;
                                                 }
                                                 Ok(None) => {
@@ -965,7 +972,7 @@ pub fn run_shard_worker(
                                                 if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                     crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
                                                 }
-                                                results.push((idx, crate::shard::CompactResp::from_bulk(&v)));
+                                                results.push((idx, crate::shard::CompactResp::from_owned_bulk(v)));
                                                 continue;
                                             }
                                             Ok(None) => {

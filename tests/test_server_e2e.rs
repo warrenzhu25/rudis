@@ -9273,3 +9273,59 @@ fn test_pipelined_hset_hget_sismember_zadd_cross_shard_e2e() {
     client.read_exact(&mut buf).unwrap();
     assert_eq!(String::from_utf8_lossy(&buf), expected);
 }
+
+#[test]
+fn test_pipelined_lpush_lpop_large_bulk_and_incr_e2e() {
+    let port = 16474;
+    start_test_server(port, 4);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    // 1. Pipeline LPUSH with >20-byte payloads across shards
+    let mut pipeline = String::new();
+    let mut expected = String::new();
+    for i in 0..12 {
+        let k = format!("l_key_{}", i);
+        let v = format!("large_bulk_element_value_payload_{:04}", i);
+        pipeline.push_str(&format!(
+            "*3\r\n$5\r\nLPUSH\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+            k.len(),
+            k,
+            v.len(),
+            v
+        ));
+        expected.push_str(":1\r\n");
+    }
+    client.write_all(pipeline.as_bytes()).unwrap();
+    let mut buf = vec![0u8; expected.len()];
+    client.read_exact(&mut buf).unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf), expected);
+
+    // 2. Pipeline LPOP across shards (testing CompactResp::from_owned_bulk zero-copy move)
+    pipeline.clear();
+    expected.clear();
+    for i in 0..12 {
+        let k = format!("l_key_{}", i);
+        let v = format!("large_bulk_element_value_payload_{:04}", i);
+        pipeline.push_str(&format!("*2\r\n$4\r\nLPOP\r\n${}\r\n{}\r\n", k.len(), k));
+        expected.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
+    }
+    client.write_all(pipeline.as_bytes()).unwrap();
+    let mut buf = vec![0u8; expected.len()];
+    client.read_exact(&mut buf).unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf), expected);
+
+    // 3. Pipeline INCR across shards (new keys + existing keys)
+    pipeline.clear();
+    expected.clear();
+    for i in 0..12 {
+        let k = format!("incr_key_{}", i % 6);
+        pipeline.push_str(&format!("*2\r\n$4\r\nINCR\r\n${}\r\n{}\r\n", k.len(), k));
+        let exp_val = if i < 6 { 1 } else { 2 };
+        expected.push_str(&format!(":{}\r\n", exp_val));
+    }
+    client.write_all(pipeline.as_bytes()).unwrap();
+    let mut buf = vec![0u8; expected.len()];
+    client.read_exact(&mut buf).unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf), expected);
+}

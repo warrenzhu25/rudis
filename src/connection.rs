@@ -12570,7 +12570,7 @@ async fn execute_commands_squashed(
                                 if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                     touch_watched_key(router.port, key.as_ref());
                                 }
-                                responses[idx] = CompactResp::from_bulk(&v);
+                                responses[idx] = CompactResp::from_owned_bulk(v);
                                 continue;
                             }
                             Ok(None) => {

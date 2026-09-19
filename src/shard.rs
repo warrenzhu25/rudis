@@ -111,6 +111,16 @@ impl CompactResp {
     }
 
     #[inline(always)]
+    pub fn from_owned_bulk(bytes: Bytes) -> Self {
+        let n = bytes.len();
+        if n <= 20 {
+            Self::from_bulk(&bytes)
+        } else {
+            CompactResp::Bulk(bytes)
+        }
+    }
+
+    #[inline(always)]
     pub fn from_integer(val: i64) -> Self {
         let mut data = [0u8; 30];
         data[0] = b':';
