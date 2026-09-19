@@ -588,8 +588,11 @@ impl ShardDb {
         self.table.set_extended(key, value, expire_in, keepttl);
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn del(&mut self, key: &[u8]) -> bool {
+        if self.tier_manager.is_none() && self.sticky_keys.is_empty() {
+            return self.table.del(key);
+        }
         if let Some(tm) = &self.tier_manager {
             tm.op_manager.cancel_pending_stash(key);
         }
@@ -625,6 +628,14 @@ impl ShardDb {
             }
         }
         deleted
+    }
+
+    #[inline(always)]
+    pub fn del_with_hash(&mut self, key: &[u8], hash: u64) -> bool {
+        if self.tier_manager.is_none() && self.sticky_keys.is_empty() {
+            return self.table.del_with_hash(key, hash);
+        }
+        self.del(key)
     }
 
     #[inline]

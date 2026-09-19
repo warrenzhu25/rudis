@@ -824,6 +824,43 @@ impl RudisSet {
         }
     }
 
+    pub fn insert_slice(&mut self, member: &Bytes) -> bool {
+        match self {
+            RudisSet::Small(v) => {
+                let m_bytes = member.as_ref();
+                let m_hash = hash64(m_bytes);
+                let m_len = m_bytes.len();
+                for m in v.iter() {
+                    if m.hash == m_hash && m.member.len() == m_len && m.member.as_ref() == m_bytes {
+                        return false;
+                    }
+                }
+                v.push(SmallSetEntry {
+                    hash: m_hash,
+                    member: member.clone(),
+                });
+                if v.len() > SMALL_SET_LIMIT {
+                    let mut set = hashbrown::HashSet::with_capacity_and_hasher(
+                        v.len(),
+                        FxBuildHasher::default(),
+                    );
+                    for m in v.drain(..) {
+                        set.insert(m.member);
+                    }
+                    *self = RudisSet::Full(set);
+                }
+                true
+            }
+            RudisSet::Full(s) => {
+                if s.contains(member) {
+                    false
+                } else {
+                    s.insert(member.clone())
+                }
+            }
+        }
+    }
+
     pub fn remove(&mut self, member: &[u8]) -> bool {
         match self {
             RudisSet::Small(v) => {
@@ -1981,8 +2018,14 @@ impl RudisTable {
     #[inline(always)]
     pub fn del(&mut self, key: &[u8]) -> bool {
         let h = hash_key(key);
-        if let Some((idx, entry)) = self.table.find_entry(key, h) {
-            if let Some(expire_at) = entry.expire_at
+        self.del_with_hash(key, h)
+    }
+
+    #[inline(always)]
+    pub fn del_with_hash(&mut self, key: &[u8], hash: u64) -> bool {
+        if let Some((idx, entry)) = self.table.find_entry(key, hash) {
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -4620,10 +4663,7 @@ impl RudisTable {
                     RudisValue::Set(set) => {
                         let mut added = 0;
                         for m in members {
-                            if set.contains(m.as_ref()) {
-                                continue;
-                            }
-                            if set.insert(m.clone()) {
+                            if set.insert_slice(m) {
                                 added += 1;
                             }
                         }
@@ -4775,7 +4815,8 @@ impl RudisTable {
     ) -> Result<crate::shard::CompactResp, &'static str> {
         let h = hash_key(key);
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
-            if let Some(expire_at) = entry.expire_at
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -4807,7 +4848,8 @@ impl RudisTable {
     ) -> Result<(), &'static str> {
         let h = hash_key(key);
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
-            if let Some(expire_at) = entry.expire_at
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -9114,6 +9156,38 @@ mod tests {
         table.set(k.clone(), Bytes::from_static(b"str_val"), None);
         assert!(table.lpop_one(b"list_k").is_err());
         assert!(table.rpop_one(b"list_k").is_err());
+    }
+
+    #[test]
+    fn test_del_with_hash_and_sadd_single_pass() {
+        let mut table = RudisTable::new();
+        let k = Bytes::from_static(b"set_key");
+        let m1 = Bytes::from_static(b"m1");
+        let m2 = Bytes::from_static(b"m2");
+
+        let added = table
+            .sadd_slice_fast(&k, &[m1.clone(), m2.clone()])
+            .unwrap();
+        assert_eq!(added, 2);
+
+        // Inserting duplicates should return 0
+        let added_dup = table.sadd_slice_fast(&k, &[m1]).unwrap();
+        assert_eq!(added_dup, 0);
+
+        // sismember_compact checks
+        assert_eq!(
+            table.sismember_compact(b"set_key", b"m1").unwrap(),
+            crate::shard::CompactResp::INT_1
+        );
+        assert_eq!(
+            table.sismember_compact(b"set_key", b"m_missing").unwrap(),
+            crate::shard::CompactResp::INT_0
+        );
+
+        // del_with_hash
+        let h = hash_key(b"set_key");
+        assert!(table.del_with_hash(b"set_key", h));
+        assert!(!table.del_with_hash(b"set_key", h));
     }
 
     #[test]

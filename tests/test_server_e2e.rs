@@ -9097,3 +9097,64 @@ fn test_pipelined_lpop_cross_shard_e2e() {
     client.read_exact(&mut buf).unwrap();
     assert_eq!(String::from_utf8_lossy(&buf), expected);
 }
+
+#[test]
+fn test_pipelined_sadd_sismember_cross_shard_e2e() {
+    let port = 16472;
+    start_test_server(port, 4);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    // Pipeline SADD across shards
+    let mut pipeline = String::new();
+    let mut expected = String::new();
+    for i in 0..10 {
+        let k = format!("set_k{}", i);
+        let m = format!("m{}", i);
+        pipeline.push_str(&format!(
+            "*3\r\n$4\r\nSADD\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+            k.len(),
+            k,
+            m.len(),
+            m
+        ));
+        expected.push_str(":1\r\n");
+    }
+    client.write_all(pipeline.as_bytes()).unwrap();
+    let mut buf = vec![0u8; expected.len()];
+    client.read_exact(&mut buf).unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf), expected);
+
+    // Pipeline SISMEMBER across shards for present and absent members
+    pipeline.clear();
+    expected.clear();
+    for i in 0..20 {
+        if i % 2 == 0 {
+            let k = format!("set_k{}", i / 2);
+            let m = format!("m{}", i / 2);
+            pipeline.push_str(&format!(
+                "*3\r\n$9\r\nSISMEMBER\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                k.len(),
+                k,
+                m.len(),
+                m
+            ));
+            expected.push_str(":1\r\n");
+        } else {
+            let k = format!("set_k{}", i / 2);
+            let m = format!("missing_{}", i);
+            pipeline.push_str(&format!(
+                "*3\r\n$9\r\nSISMEMBER\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                k.len(),
+                k,
+                m.len(),
+                m
+            ));
+            expected.push_str(":0\r\n");
+        }
+    }
+    client.write_all(pipeline.as_bytes()).unwrap();
+    let mut buf = vec![0u8; expected.len()];
+    client.read_exact(&mut buf).unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf), expected);
+}
