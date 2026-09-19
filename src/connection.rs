@@ -12563,21 +12563,41 @@ async fn execute_commands_squashed(
                     && !crate::replication::has_connected_replicas(router.port)
                     && let Command::Lpop { ref key, count } = cmd
                 {
-                    match router.local_db.borrow_mut().write_lpop_resp(
-                        key.as_ref(),
-                        count,
-                        &mut local_buf,
-                    ) {
-                        Ok(has_pop) => {
-                            if has_pop {
+                    if count.is_none() {
+                        match router.local_db.borrow_mut().lpop_one(key.as_ref()) {
+                            Ok(Some(v)) => {
                                 has_local_writes = true;
                                 if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                     touch_watched_key(router.port, key.as_ref());
                                 }
+                                responses[idx] = CompactResp::from_bulk(&v);
+                                continue;
+                            }
+                            Ok(None) => {
+                                responses[idx] = crate::shard::CompactResp::NULL;
+                                continue;
+                            }
+                            Err(err) => {
+                                write_resp_err(&mut local_buf, err);
                             }
                         }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
+                    } else {
+                        match router.local_db.borrow_mut().write_lpop_resp(
+                            key.as_ref(),
+                            count,
+                            &mut local_buf,
+                        ) {
+                            Ok(has_pop) => {
+                                if has_pop {
+                                    has_local_writes = true;
+                                    if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                        touch_watched_key(router.port, key.as_ref());
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                write_resp_err(&mut local_buf, err);
+                            }
                         }
                     }
                 } else if let Command::Lrange {

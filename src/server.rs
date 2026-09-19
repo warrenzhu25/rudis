@@ -687,27 +687,37 @@ pub fn run_shard_worker(
                                         && !crate::replication::has_connected_replicas(r.port)
                                         && let Command::Lpop { ref key, count } = cmd
                                     {
-                                        match r.local_db.borrow_mut().table.lpop(key.as_ref(), count.unwrap_or(1)) {
-                                            Ok(vals) => {
-                                                if !vals.is_empty() {
+                                        if count.is_none() {
+                                            match r.local_db.borrow_mut().lpop_one(key.as_ref()) {
+                                                Ok(Some(v)) => {
                                                     has_writes = true;
                                                     if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                         crate::connection::touch_watched_key(r.port, key.as_ref());
                                                     }
+                                                    results.push((idx, crate::shard::CompactResp::from_bulk(&v)));
+                                                    continue;
                                                 }
-                                                if count.is_some() {
-                                                    crate::connection::write_resp_array_header(&mut temp_buf, vals.len());
-                                                    for v in &vals {
-                                                        crate::connection::write_resp_bulk(&mut temp_buf, v);
-                                                    }
-                                                } else if let Some(v) = vals.first() {
-                                                    crate::connection::write_resp_bulk(&mut temp_buf, v);
-                                                } else {
-                                                    crate::connection::write_resp_null(&mut temp_buf);
+                                                Ok(None) => {
+                                                    results.push((idx, crate::shard::CompactResp::NULL));
+                                                    continue;
+                                                }
+                                                Err(err) => {
+                                                    crate::connection::write_resp_err(&mut temp_buf, err);
                                                 }
                                             }
-                                            Err(err) => {
-                                                crate::connection::write_resp_err(&mut temp_buf, err);
+                                        } else {
+                                            match r.local_db.borrow_mut().write_lpop_resp(key.as_ref(), count, &mut temp_buf) {
+                                                Ok(has_pop) => {
+                                                    if has_pop {
+                                                        has_writes = true;
+                                                        if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                                            crate::connection::touch_watched_key(r.port, key.as_ref());
+                                                        }
+                                                    }
+                                                }
+                                                Err(err) => {
+                                                    crate::connection::write_resp_err(&mut temp_buf, err);
+                                                }
                                             }
                                         }
                                     } else if let Command::Lrange { ref key, start, stop } = cmd {
@@ -905,17 +915,37 @@ pub fn run_shard_worker(
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
                                     && let Command::Lpop { ref key, count } = cmd
                                 {
-                                    match db.write_lpop_resp(key.as_ref(), count, &mut temp_buf) {
-                                        Ok(has_pop) => {
-                                            if has_pop {
+                                    if count.is_none() {
+                                        match db.lpop_one(key.as_ref()) {
+                                            Ok(Some(v)) => {
                                                 has_writes = true;
                                                 if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                     crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
                                                 }
+                                                results.push((idx, crate::shard::CompactResp::from_bulk(&v)));
+                                                continue;
+                                            }
+                                            Ok(None) => {
+                                                results.push((idx, crate::shard::CompactResp::NULL));
+                                                continue;
+                                            }
+                                            Err(err) => {
+                                                crate::connection::write_resp_err(&mut temp_buf, err);
                                             }
                                         }
-                                        Err(err) => {
-                                            crate::connection::write_resp_err(&mut temp_buf, err);
+                                    } else {
+                                        match db.write_lpop_resp(key.as_ref(), count, &mut temp_buf) {
+                                            Ok(has_pop) => {
+                                                if has_pop {
+                                                    has_writes = true;
+                                                    if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                                        crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
+                                                    }
+                                                }
+                                            }
+                                            Err(err) => {
+                                                crate::connection::write_resp_err(&mut temp_buf, err);
+                                            }
                                         }
                                     }
                                 } else if let Command::Lrange { ref key, start, stop } = cmd {

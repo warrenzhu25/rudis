@@ -9051,3 +9051,49 @@ fn test_pipelined_exists_cross_shard_e2e() {
     client.read_exact(&mut buf).unwrap();
     assert_eq!(&buf[..], expected.as_bytes());
 }
+
+#[test]
+fn test_pipelined_lpop_cross_shard_e2e() {
+    let port = 16471;
+    start_test_server(port, 4);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    // Populate lists across shards
+    for i in 0..8 {
+        let k = format!("lpop_k{}", i);
+        let v = format!("v{}", i);
+        let cmd = format!(
+            "*3\r\n$5\r\nRPUSH\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+            k.len(),
+            k,
+            v.len(),
+            v
+        );
+        client.write_all(cmd.as_bytes()).unwrap();
+        let mut resp = [0u8; 4];
+        client.read_exact(&mut resp).unwrap();
+        assert_eq!(&resp, b":1\r\n");
+    }
+
+    // Pipeline LPOP for present lists and missing lists
+    let mut pipeline = String::new();
+    let mut expected = String::new();
+    for i in 0..16 {
+        if i % 2 == 0 {
+            let k = format!("lpop_k{}", i / 2);
+            let v = format!("v{}", i / 2);
+            pipeline.push_str(&format!("*2\r\n$4\r\nLPOP\r\n${}\r\n{}\r\n", k.len(), k));
+            expected.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
+        } else {
+            let k = format!("missing_l{}", i);
+            pipeline.push_str(&format!("*2\r\n$4\r\nLPOP\r\n${}\r\n{}\r\n", k.len(), k));
+            expected.push_str("$-1\r\n");
+        }
+    }
+    client.write_all(pipeline.as_bytes()).unwrap();
+
+    let mut buf = vec![0u8; expected.len()];
+    client.read_exact(&mut buf).unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf), expected);
+}

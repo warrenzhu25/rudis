@@ -3953,6 +3953,78 @@ impl RudisTable {
         }
     }
 
+    #[inline(always)]
+    pub fn lpop_one(&mut self, key: &[u8]) -> Result<Option<Bytes>, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(None);
+            }
+            let (popped, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::List(deque) => {
+                        let val = deque.pop_front();
+                        let empty = deque.is_empty();
+                        (val, empty)
+                    }
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
+                }
+            } else {
+                (None, false)
+            };
+
+            if is_empty && let Some(entry) = self.table.remove(idx) {
+                if entry.expire_at.is_some() {
+                    self.num_expires = self.num_expires.saturating_sub(1);
+                }
+                self.recycle_value(entry.val);
+            }
+            Ok(popped)
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[inline(always)]
+    pub fn rpop_one(&mut self, key: &[u8]) -> Result<Option<Bytes>, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Ok(None);
+            }
+            let (popped, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::List(deque) => {
+                        let val = deque.pop_back();
+                        let empty = deque.is_empty();
+                        (val, empty)
+                    }
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
+                }
+            } else {
+                (None, false)
+            };
+
+            if is_empty && let Some(entry) = self.table.remove(idx) {
+                if entry.expire_at.is_some() {
+                    self.num_expires = self.num_expires.saturating_sub(1);
+                }
+                self.recycle_value(entry.val);
+            }
+            Ok(popped)
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn lpop(&mut self, key: &[u8], count: usize) -> Result<Vec<Bytes>, &'static str> {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
@@ -9020,6 +9092,28 @@ mod tests {
         table.flushdb();
         assert_eq!(table.num_expires, 0);
         assert!(!table.exists(b"k1"));
+    }
+
+    #[test]
+    fn test_lpop_one_and_rpop_one_zero_alloc() {
+        let mut table = RudisTable::new();
+        let k = Bytes::from_static(b"list_k");
+        let v1 = Bytes::from_static(b"val1");
+        let v2 = Bytes::from_static(b"val2");
+
+        table
+            .lpush_slice_fast(&k, &[v1.clone(), v2.clone()])
+            .unwrap();
+
+        assert_eq!(table.lpop_one(b"list_k").unwrap(), Some(v2));
+        assert_eq!(table.rpop_one(b"list_k").unwrap(), Some(v1));
+        assert_eq!(table.lpop_one(b"list_k").unwrap(), None);
+        assert_eq!(table.rpop_one(b"list_k").unwrap(), None);
+        assert!(!table.exists(b"list_k"));
+
+        table.set(k.clone(), Bytes::from_static(b"str_val"), None);
+        assert!(table.lpop_one(b"list_k").is_err());
+        assert!(table.rpop_one(b"list_k").is_err());
     }
 
     #[test]

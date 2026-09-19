@@ -673,6 +673,16 @@ impl ShardDb {
     }
 
     #[inline(always)]
+    pub fn lpop_one(&mut self, key: &[u8]) -> Result<Option<Bytes>, &'static str> {
+        self.table.lpop_one(key)
+    }
+
+    #[inline(always)]
+    pub fn rpop_one(&mut self, key: &[u8]) -> Result<Option<Bytes>, &'static str> {
+        self.table.rpop_one(key)
+    }
+
+    #[inline(always)]
     pub fn get_compact(&mut self, key: &[u8]) -> Result<Option<CompactResp>, &'static str> {
         self.table.get_compact(key)
     }
