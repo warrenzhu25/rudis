@@ -8887,3 +8887,59 @@ fn test_sismember_pipeline_throughput_and_correctness_e2e() {
     client.read_exact(&mut response_buf).unwrap();
     assert_eq!(String::from_utf8_lossy(&response_buf), expected);
 }
+
+#[test]
+fn test_pipelined_cross_shard_mget_mset_e2e() {
+    let port = 16459;
+    start_test_server(port, 4);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    // 1. Pipelined cross-shard MSET
+    let mut mset_pipeline = Vec::new();
+    for p in 0..4 {
+        let mut cmd = "*11\r\n$4\r\nMSET\r\n".to_string();
+        for k in 0..5 {
+            let key = format!("cross_k_{}_{}", p, k);
+            let val = format!("val_{}_{}", p, k);
+            cmd.push_str(&format!(
+                "${}\r\n{}\r\n${}\r\n{}\r\n",
+                key.len(),
+                key,
+                val.len(),
+                val
+            ));
+        }
+        mset_pipeline.extend_from_slice(cmd.as_bytes());
+    }
+    client.write_all(&mset_pipeline).unwrap();
+
+    let mut mset_resp = vec![0u8; 5 * 4]; // +OK\r\n * 4 = 20 bytes
+    client.read_exact(&mut mset_resp).unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&mset_resp),
+        "+OK\r\n+OK\r\n+OK\r\n+OK\r\n"
+    );
+
+    // 2. Pipelined cross-shard MGET
+    let mut mget_pipeline = Vec::new();
+    for p in 0..4 {
+        let mut cmd = "*6\r\n$4\r\nMGET\r\n".to_string();
+        for k in 0..5 {
+            let key = format!("cross_k_{}_{}", p, k);
+            cmd.push_str(&format!("${}\r\n{}\r\n", key.len(), key));
+        }
+        mget_pipeline.extend_from_slice(cmd.as_bytes());
+    }
+    client.write_all(&mget_pipeline).unwrap();
+
+    // Read responses for 4 MGETs
+    let mut buf = [0u8; 2048];
+    let n = client.read(&mut buf).unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    for p in 0..4 {
+        for k in 0..5 {
+            assert!(resp.contains(&format!("val_{}_{}", p, k)));
+        }
+    }
+}

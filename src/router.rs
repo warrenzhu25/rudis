@@ -859,19 +859,27 @@ impl Router {
         notify: flume::Sender<()>,
     ) -> Arc<crate::mailbox::ScatterMgetDescriptor> {
         let mut pool = self.mget_desc_pool.borrow_mut();
+        let mut kept = Vec::new();
+        let mut chosen = None;
         while let Some(desc) = pool.pop() {
             if desc.results.len() >= total_keys && desc.recycled_keys.len() >= self.num_shards {
-                for _ in 0..16 {
+                for _ in 0..128 {
                     if Arc::strong_count(&desc) == 1 {
                         break;
                     }
                     std::hint::spin_loop();
                 }
                 if Arc::strong_count(&desc) == 1 {
-                    desc.reset(total_keys, pending_shards, notify);
-                    return desc;
+                    chosen = Some(desc);
+                    break;
                 }
             }
+            kept.push(desc);
+        }
+        pool.extend(kept);
+        if let Some(desc) = chosen {
+            desc.reset(total_keys, pending_shards, notify);
+            return desc;
         }
         Arc::new(crate::mailbox::ScatterMgetDescriptor::new(
             total_keys.max(64),
@@ -894,19 +902,27 @@ impl Router {
         notify: flume::Sender<()>,
     ) -> Arc<crate::mailbox::ScatterMsetDescriptor> {
         let mut pool = self.mset_desc_pool.borrow_mut();
+        let mut kept = Vec::new();
+        let mut chosen = None;
         while let Some(desc) = pool.pop() {
             if desc.recycled_pairs.len() >= self.num_shards {
-                for _ in 0..16 {
+                for _ in 0..128 {
                     if Arc::strong_count(&desc) == 1 {
                         break;
                     }
                     std::hint::spin_loop();
                 }
                 if Arc::strong_count(&desc) == 1 {
-                    desc.reset(pending_shards, notify);
-                    return desc;
+                    chosen = Some(desc);
+                    break;
                 }
             }
+            kept.push(desc);
+        }
+        pool.extend(kept);
+        if let Some(desc) = chosen {
+            desc.reset(pending_shards, notify);
+            return desc;
         }
         Arc::new(crate::mailbox::ScatterMsetDescriptor::new(
             self.num_shards,
@@ -1003,7 +1019,7 @@ impl Router {
 
         // Wait for all remote shards to complete their writes
         if descriptor.pending.load(Ordering::Acquire) != 0 {
-            for _ in 0..256 {
+            for _ in 0..64 {
                 std::hint::spin_loop();
                 if descriptor.pending.load(Ordering::Acquire) == 0 {
                     break;
@@ -1031,6 +1047,7 @@ impl Router {
         }
 
         let total_keys = keys.len();
+        out.reserve(total_keys * 140);
 
         if self.num_shards <= 1 {
             crate::connection::write_resp_array_header(out, total_keys);
@@ -1112,7 +1129,7 @@ impl Router {
 
         // Wait for all remote shards to complete their writes
         if descriptor.pending.load(Ordering::Acquire) != 0 {
-            for _ in 0..256 {
+            for _ in 0..64 {
                 std::hint::spin_loop();
                 if descriptor.pending.load(Ordering::Acquire) == 0 {
                     break;
@@ -1241,7 +1258,7 @@ impl Router {
         }
 
         if descriptor.pending.load(Ordering::Acquire) != 0 {
-            for _ in 0..256 {
+            for _ in 0..64 {
                 std::hint::spin_loop();
                 if descriptor.pending.load(Ordering::Acquire) == 0 {
                     break;
@@ -3485,5 +3502,38 @@ mod tests {
             assert!(!router.exists(k0).await);
             assert!(!router.exists(k1).await);
         });
+    }
+
+    #[test]
+    fn test_descriptor_pool_retention() {
+        let num_shards = 4;
+        let (mut senders_mesh, _receivers) = crate::mailbox::create_shard_mesh(num_shards);
+        let senders = senders_mesh.remove(0);
+        let db0 = Rc::new(RefCell::new(crate::shard::ShardDb::new(9999)));
+        let router = Router::new(
+            0,
+            num_shards,
+            9999,
+            db0,
+            senders,
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+        let (notify_tx, _notify_rx) = router.acquire_notify_channel();
+
+        // Acquire and release mget descriptors multiple times
+        let desc1 = router.acquire_mget_descriptor(8, 2, notify_tx.clone());
+        router.release_mget_descriptor(desc1);
+        let desc2 = router.acquire_mget_descriptor(8, 2, notify_tx.clone());
+        router.release_mget_descriptor(desc2);
+        assert_eq!(router.mget_desc_pool.borrow().len(), 1);
+
+        // Acquire and release mset descriptors multiple times
+        let desc_mset1 = router.acquire_mset_descriptor(2, notify_tx.clone());
+        router.release_mset_descriptor(desc_mset1);
+        let desc_mset2 = router.acquire_mset_descriptor(2, notify_tx);
+        router.release_mset_descriptor(desc_mset2);
+        assert_eq!(router.mset_desc_pool.borrow().len(), 1);
     }
 }

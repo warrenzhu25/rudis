@@ -12272,7 +12272,6 @@ async fn execute_commands_squashed(
             if target == router.shard_id {
                 local_buf.clear();
                 if let Command::Get(ref key) = cmd {
-                    let has_tiering = router.local_db.borrow().tier_manager.is_some();
                     let compact_res = router.local_db.borrow_mut().table.get_compact(key.as_ref());
                     match compact_res {
                         Ok(Some(resp)) => {
@@ -12280,7 +12279,7 @@ async fn execute_commands_squashed(
                             continue;
                         }
                         Ok(None) => {
-                            let is_tiered = has_tiering
+                            let is_tiered = router.local_db.borrow().tier_manager.is_some()
                                 && router.local_db.borrow_mut().table.is_tiered(key).is_some();
                             if is_tiered {
                                 if let Some(v) = router.stream_cold_read_local(key).await {
@@ -12602,7 +12601,7 @@ async fn execute_commands_squashed(
                         should_close = true;
                     }
                 }
-                responses[idx] = CompactResp::from_slice(&local_buf);
+                responses[idx] = CompactResp::from_vec(std::mem::take(&mut local_buf));
             } else {
                 remote_batches[target].push((idx, cmd));
             }
@@ -12629,7 +12628,7 @@ async fn execute_commands_squashed(
             {
                 should_close = true;
             }
-            responses[idx] = CompactResp::from_slice(&local_buf);
+            responses[idx] = CompactResp::from_vec(std::mem::take(&mut local_buf));
         } else {
             // Non-sharded simple commands (PING, QUIT, COMMAND DOCS) run locally
             local_buf.clear();
@@ -12641,7 +12640,7 @@ async fn execute_commands_squashed(
             ) {
                 should_close = true;
             }
-            responses[idx] = CompactResp::from_slice(&local_buf);
+            responses[idx] = CompactResp::from_vec(std::mem::take(&mut local_buf));
         }
     }
 

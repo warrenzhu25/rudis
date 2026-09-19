@@ -1040,19 +1040,19 @@ pub fn run_shard_worker(
                         descriptor,
                     } => {
                         let mut db = cross_shard_db.borrow_mut();
-                        let mut cold_keys = Vec::new();
-
                         let has_tiering = db.tier_manager.is_some();
+                        let mut cold_keys = None;
+
                         for (idx, key) in &keys {
                             let val = db.get(key);
                             if val.is_none() && has_tiering && db.table.is_tiered(key).is_some() {
-                                cold_keys.push((*idx, key.clone()));
+                                cold_keys.get_or_insert_with(Vec::new).push((*idx, key.clone()));
                             } else {
                                 descriptor.write_result(*idx, val);
                             }
                         }
 
-                        if !cold_keys.is_empty() {
+                        if let Some(cold_keys) = cold_keys {
                             drop(db);
                             let r = cross_shard_router.clone();
                             monoio::spawn(async move {
