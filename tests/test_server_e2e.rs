@@ -9006,3 +9006,48 @@ fn test_interleaved_pipeline_mget_mset_ordering_e2e() {
     client.read_exact(&mut response_buf).unwrap();
     assert_eq!(String::from_utf8_lossy(&response_buf), expected);
 }
+
+#[test]
+fn test_pipelined_exists_cross_shard_e2e() {
+    let port = 16470;
+    start_test_server(port, 4);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    // Populate keys across multiple shards
+    for i in 0..10 {
+        let k = format!("ex_k{}", i);
+        let v = format!("v{}", i);
+        let cmd = format!(
+            "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+            k.len(),
+            k,
+            v.len(),
+            v
+        );
+        client.write_all(cmd.as_bytes()).unwrap();
+        let mut resp = [0u8; 5];
+        client.read_exact(&mut resp).unwrap();
+        assert_eq!(&resp, b"+OK\r\n");
+    }
+
+    // Pipeline EXISTS for present and missing keys across shards
+    let mut pipeline = String::new();
+    let mut expected = String::new();
+    for i in 0..20 {
+        if i % 2 == 0 {
+            let k = format!("ex_k{}", i / 2);
+            pipeline.push_str(&format!("*2\r\n$6\r\nEXISTS\r\n${}\r\n{}\r\n", k.len(), k));
+            expected.push_str(":1\r\n");
+        } else {
+            let k = format!("missing_{}", i);
+            pipeline.push_str(&format!("*2\r\n$6\r\nEXISTS\r\n${}\r\n{}\r\n", k.len(), k));
+            expected.push_str(":0\r\n");
+        }
+    }
+    client.write_all(pipeline.as_bytes()).unwrap();
+
+    let mut buf = vec![0u8; expected.len()];
+    client.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf[..], expected.as_bytes());
+}

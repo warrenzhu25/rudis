@@ -595,7 +595,7 @@ pub fn run_shard_worker(
                                             }
                                         }
                                     } else if let Command::Exists(ref keys) = cmd && keys.len() == 1 {
-                                        let exists = r.local_db.borrow_mut().exists(keys[0].as_ref());
+                                        let exists = r.local_db.borrow_mut().table.exists(keys[0].as_ref());
                                         results.push((idx, if exists { crate::shard::CompactResp::INT_1 } else { crate::shard::CompactResp::INT_0 }));
                                         continue;
                                     } else if aof_ref.is_none()
@@ -795,7 +795,7 @@ pub fn run_shard_worker(
                                         }
                                     }
                                 } else if let Command::Exists(ref keys) = cmd && keys.len() == 1 {
-                                    let exists = db.exists(keys[0].as_ref());
+                                    let exists = db.table.exists(keys[0].as_ref());
                                     results.push((idx, if exists { crate::shard::CompactResp::INT_1 } else { crate::shard::CompactResp::INT_0 }));
                                     continue;
                                 } else if aof_ref.is_none()

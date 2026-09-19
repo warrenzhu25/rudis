@@ -52,6 +52,20 @@ pub fn target_shard(key: &[u8], num_shards: usize) -> usize {
     }
 }
 
+#[inline(always)]
+pub fn target_shard_and_hash(key: &[u8], num_shards: usize) -> (usize, u64) {
+    let tag = extract_hash_tag(key);
+    let h = crate::table::hash_key(tag);
+    if num_shards <= 1 {
+        (0, h)
+    } else if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
+        let slot = key_slot(key);
+        (slot_to_shard(slot, num_shards), h)
+    } else {
+        ((h as usize) % num_shards, h)
+    }
+}
+
 use std::sync::atomic::Ordering;
 
 /// Handle for a cross-shard MGET that has been dispatched but not yet gathered.
@@ -1581,9 +1595,9 @@ impl Router {
     }
 
     pub async fn exists(&self, key: Bytes) -> bool {
-        let target = target_shard(&key, self.num_shards);
+        let (target, hash) = target_shard_and_hash(&key, self.num_shards);
         if target == self.shard_id {
-            self.local_db.borrow_mut().exists(&key)
+            self.local_db.borrow_mut().exists_with_hash(&key, hash)
         } else {
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::Exists { key, responder: tx };

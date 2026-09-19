@@ -662,9 +662,14 @@ impl ShardDb {
         count
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn exists(&mut self, key: &[u8]) -> bool {
         self.table.exists(key)
+    }
+
+    #[inline(always)]
+    pub fn exists_with_hash(&mut self, key: &[u8], hash: u64) -> bool {
+        self.table.exists_with_hash(key, hash)
     }
 
     #[inline(always)]

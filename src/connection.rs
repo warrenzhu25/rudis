@@ -1740,6 +1740,8 @@ async fn run_master_replica_stream(
 
 pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
     match cmd {
+        Command::Exists(keys) => keys.first(),
+        Command::Del(keys) => keys.first(),
         Command::Get(key)
         | Command::Getex { key, .. }
         | Command::Set { key, .. }
@@ -1894,8 +1896,7 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         Command::Smove { source, .. }
         | Command::Lmove { source, .. }
         | Command::Blmove { source, .. } => Some(source),
-        Command::Touch(keys) | Command::Del(keys) | Command::Mget(keys) => keys.first(),
-        Command::Exists(keys) => keys.first(),
+        Command::Touch(keys) | Command::Mget(keys) => keys.first(),
         Command::Pfcount { keys } => keys.first(),
         Command::Xread { keys, .. } | Command::Xreadgroup { keys, .. } => keys.first(),
         Command::Blpop { keys, .. }
@@ -3826,6 +3827,20 @@ async fn execute_command(
             false
         }
         Command::Exists(keys) => {
+            if keys.len() == 1 {
+                let (target, hash) =
+                    crate::router::target_shard_and_hash(&keys[0], router.num_shards);
+                let exists = if target == router.shard_id {
+                    router
+                        .local_db
+                        .borrow_mut()
+                        .exists_with_hash(keys[0].as_ref(), hash)
+                } else {
+                    router.exists(keys[0].clone()).await
+                };
+                write_resp_integer(out, if exists { 1 } else { 0 });
+                return false;
+            }
             let mut count = 0usize;
             for key in keys {
                 if router.exists(key).await {
@@ -7841,6 +7856,8 @@ async fn execute_command(
 
 pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
     match cmd {
+        Command::Exists(keys) if keys.len() == 1 => Some(target_shard(&keys[0], num_shards)),
+        Command::Del(keys) if keys.len() == 1 => Some(target_shard(&keys[0], num_shards)),
         Command::Get(key)
         | Command::Getex { key, .. }
         | Command::Set { key, .. }
@@ -8047,10 +8064,7 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         {
             Some(target_shard(destkey, num_shards))
         }
-        Command::Touch(keys) | Command::Del(keys) if keys.len() == 1 => {
-            Some(target_shard(&keys[0], num_shards))
-        }
-        Command::Exists(keys) if keys.len() == 1 => Some(target_shard(&keys[0], num_shards)),
+        Command::Touch(keys) if keys.len() == 1 => Some(target_shard(&keys[0], num_shards)),
         Command::Mget(keys)
             if !keys.is_empty()
                 && keys
@@ -12352,7 +12366,7 @@ async fn execute_commands_squashed(
                 } else if let Command::Exists(ref keys) = cmd
                     && keys.len() == 1
                 {
-                    let exists = router.local_db.borrow_mut().exists(keys[0].as_ref());
+                    let exists = router.local_db.borrow_mut().table.exists(keys[0].as_ref());
                     responses[idx] = if exists {
                         crate::shard::CompactResp::INT_1
                     } else {
