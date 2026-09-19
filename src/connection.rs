@@ -844,7 +844,6 @@ pub async fn handle_connection(
     };
 
     let mut buf = BytesMut::with_capacity(131072);
-    let mut read_buf = vec![0u8; READ_BUFFER_SIZE];
     let mut out_buf = Vec::with_capacity(65536);
 
     // Pre-allocated reusable lock-free batch responders (1 per shard, 0 mutex contention in steady-state)
@@ -874,9 +873,14 @@ pub async fn handle_connection(
     let mut auth_user = "default".to_string();
 
     loop {
-        // Rent buffer to monoio's io_uring driver
-        let (res, returned_buf) = stream.read(read_buf).await;
-        read_buf = returned_buf;
+        if buf.capacity() - buf.len() < READ_BUFFER_SIZE {
+            buf.reserve(READ_BUFFER_SIZE);
+        }
+        let avail_before = buf.capacity() - buf.len();
+
+        // Rent BytesMut directly to monoio's io_uring driver (zero intermediate read_buf memcpy)
+        let (res, RecvBytesMut(returned_buf)) = stream.read(RecvBytesMut(buf)).await;
+        buf = returned_buf;
 
         match res {
             Ok(0) => {
@@ -884,22 +888,27 @@ pub async fn handle_connection(
                 break;
             }
             Ok(n) => {
-                buf.extend_from_slice(&read_buf[..n]);
-
-                // Drain any additional bytes waiting in kernel TCP socket buffer if read_buf was completely filled
-                if n == read_buf.len() {
+                // Drain any additional bytes waiting in kernel TCP socket buffer if spare capacity was completely filled
+                if n == avail_before {
                     loop {
+                        if buf.capacity() - buf.len() < READ_BUFFER_SIZE {
+                            buf.reserve(READ_BUFFER_SIZE);
+                        }
+                        let spare = buf.spare_capacity_mut();
+                        let spare_len = spare.len();
                         let drain_n = unsafe {
                             libc::recv(
                                 raw_fd,
-                                read_buf.as_mut_ptr() as *mut libc::c_void,
-                                read_buf.len(),
+                                spare.as_mut_ptr() as *mut libc::c_void,
+                                spare_len,
                                 libc::MSG_DONTWAIT,
                             )
                         };
                         if drain_n > 0 {
-                            buf.extend_from_slice(&read_buf[..drain_n as usize]);
-                            if (drain_n as usize) < read_buf.len() {
+                            unsafe {
+                                buf.set_len(buf.len() + drain_n as usize);
+                            }
+                            if (drain_n as usize) < spare_len {
                                 break;
                             }
                         } else {
@@ -922,16 +931,22 @@ pub async fn handle_connection(
                         }
                         Ok(None) => {
                             // Incomplete frame: check if remaining bytes just arrived in kernel buffer
+                            if buf.capacity() - buf.len() < READ_BUFFER_SIZE {
+                                buf.reserve(READ_BUFFER_SIZE);
+                            }
+                            let spare = buf.spare_capacity_mut();
                             let drain_n = unsafe {
                                 libc::recv(
                                     raw_fd,
-                                    read_buf.as_mut_ptr() as *mut libc::c_void,
-                                    read_buf.len(),
+                                    spare.as_mut_ptr() as *mut libc::c_void,
+                                    spare.len(),
                                     libc::MSG_DONTWAIT,
                                 )
                             };
                             if drain_n > 0 {
-                                buf.extend_from_slice(&read_buf[..drain_n as usize]);
+                                unsafe {
+                                    buf.set_len(buf.len() + drain_n as usize);
+                                }
                                 continue;
                             }
                             break;
@@ -12878,6 +12893,27 @@ async fn execute_commands_squashed(
     should_close
 }
 
+pub(crate) struct RecvBytesMut(pub BytesMut);
+
+unsafe impl monoio::buf::IoBufMut for RecvBytesMut {
+    #[inline(always)]
+    fn write_ptr(&mut self) -> *mut u8 {
+        unsafe { self.0.as_mut_ptr().add(self.0.len()) }
+    }
+
+    #[inline(always)]
+    fn bytes_total(&mut self) -> usize {
+        self.0.capacity() - self.0.len()
+    }
+
+    #[inline(always)]
+    unsafe fn set_init(&mut self, read_len: usize) {
+        unsafe {
+            self.0.set_len(self.0.len() + read_len);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -13257,5 +13293,24 @@ mod tests {
 
         let sinter = Command::Sinter(vec![Bytes::from("s1"), Bytes::from("s2")]);
         assert_eq!(cmd_keys(&sinter), vec![b"s1", b"s2"]);
+    }
+
+    #[test]
+    fn test_recv_bytes_mut_zero_copy_iobuf_mut() {
+        use monoio::buf::IoBufMut;
+
+        let mut b = BytesMut::with_capacity(64);
+        b.extend_from_slice(b"*2\r\n$3\r\nGET\r\n");
+        let mut recv_buf = RecvBytesMut(b);
+        assert_eq!(recv_buf.bytes_total(), 64 - 13);
+        let suffix = b"$4\r\nmyk1\r\n";
+        unsafe {
+            std::ptr::copy_nonoverlapping(suffix.as_ptr(), recv_buf.write_ptr(), suffix.len());
+            recv_buf.set_init(suffix.len());
+        }
+        let mut recovered = recv_buf.0;
+        let cmd = parse_command(&mut recovered).unwrap().unwrap();
+        assert_eq!(cmd, Command::Get(Bytes::from_static(b"myk1")));
+        assert!(recovered.is_empty());
     }
 }
