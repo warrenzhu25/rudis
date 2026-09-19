@@ -1742,6 +1742,13 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
     match cmd {
         Command::Exists(keys) => keys.first(),
         Command::Del(keys) => keys.first(),
+        Command::Sismember { key, .. } => Some(key),
+        Command::Sadd { key, .. } => Some(key),
+        Command::Hset { key, .. } => Some(key),
+        Command::Hget { key, .. } => Some(key),
+        Command::Lpop { key, .. } => Some(key),
+        Command::Lpush { key, .. } => Some(key),
+        Command::Zadd { key, .. } => Some(key),
         Command::Get(key)
         | Command::Getex { key, .. }
         | Command::Set { key, .. }
@@ -1749,10 +1756,8 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Expire(key, _)
         | Command::Persist(key)
         | Command::Ttl(key, _)
-        | Command::Hset { key, .. }
         | Command::Hsetnx { key, .. }
         | Command::Hmset { key, .. }
-        | Command::Hget { key, .. }
         | Command::Hmget { key, .. }
         | Command::Hdel { key, .. }
         | Command::Hexists { key, .. }
@@ -1762,22 +1767,17 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Hvals(key)
         | Command::Hstrlen { key, .. }
         | Command::Hgetdel { key, .. }
-        | Command::Lpush { key, .. }
         | Command::Rpush { key, .. }
         | Command::Lpushx { key, .. }
         | Command::Rpushx { key, .. }
-        | Command::Lpop { key, .. }
         | Command::Rpop { key, .. }
         | Command::Lrange { key, .. }
         | Command::Llen(key)
         | Command::Lindex { key, .. }
-        | Command::Sadd { key, .. }
         | Command::Srem { key, .. }
         | Command::Smembers(key)
-        | Command::Sismember { key, .. }
         | Command::Scard(key)
         | Command::Spop { key, .. }
-        | Command::Zadd { key, .. }
         | Command::Zrem { key, .. }
         | Command::Zscore { key, .. }
         | Command::Zcard(key)
@@ -7858,6 +7858,13 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
     match cmd {
         Command::Exists(keys) if keys.len() == 1 => Some(target_shard(&keys[0], num_shards)),
         Command::Del(keys) if keys.len() == 1 => Some(target_shard(&keys[0], num_shards)),
+        Command::Sismember { key, .. } => Some(target_shard(key, num_shards)),
+        Command::Sadd { key, .. } => Some(target_shard(key, num_shards)),
+        Command::Hset { key, .. } => Some(target_shard(key, num_shards)),
+        Command::Hget { key, .. } => Some(target_shard(key, num_shards)),
+        Command::Lpop { key, .. } => Some(target_shard(key, num_shards)),
+        Command::Lpush { key, .. } => Some(target_shard(key, num_shards)),
+        Command::Zadd { key, .. } => Some(target_shard(key, num_shards)),
         Command::Get(key)
         | Command::Getex { key, .. }
         | Command::Set { key, .. }
@@ -7866,10 +7873,8 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Expire(key, _)
         | Command::Persist(key)
         | Command::Ttl(key, _)
-        | Command::Hset { key, .. }
         | Command::Hsetnx { key, .. }
         | Command::Hmset { key, .. }
-        | Command::Hget { key, .. }
         | Command::Hmget { key, .. }
         | Command::Hdel { key, .. }
         | Command::Hexists { key, .. }
@@ -7879,22 +7884,17 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Hvals(key)
         | Command::Hstrlen { key, .. }
         | Command::Hgetdel { key, .. }
-        | Command::Lpush { key, .. }
         | Command::Rpush { key, .. }
         | Command::Lpushx { key, .. }
         | Command::Rpushx { key, .. }
-        | Command::Lpop { key, .. }
         | Command::Rpop { key, .. }
         | Command::Lrange { key, .. }
         | Command::Llen(key)
         | Command::Lindex { key, .. }
-        | Command::Sadd { key, .. }
         | Command::Srem { key, .. }
         | Command::Smembers(key)
-        | Command::Sismember { key, .. }
         | Command::Scard(key)
         | Command::Spop { key, .. }
-        | Command::Zadd { key, .. }
         | Command::Zrem { key, .. }
         | Command::Zscore { key, .. }
         | Command::Zcard(key)

@@ -9158,3 +9158,118 @@ fn test_pipelined_sadd_sismember_cross_shard_e2e() {
     client.read_exact(&mut buf).unwrap();
     assert_eq!(String::from_utf8_lossy(&buf), expected);
 }
+
+#[test]
+fn test_pipelined_hset_hget_sismember_zadd_cross_shard_e2e() {
+    let port = 16473;
+    start_test_server(port, 4);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    // 1. Pipeline HSET across shards
+    let mut pipeline = String::new();
+    let mut expected = String::new();
+    for i in 0..12 {
+        let k = format!("hash_key_{}", i);
+        let f = format!("field_{}", i);
+        let v = format!("val_{}", i);
+        pipeline.push_str(&format!(
+            "*4\r\n$4\r\nHSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+            k.len(),
+            k,
+            f.len(),
+            f,
+            v.len(),
+            v
+        ));
+        expected.push_str(":1\r\n");
+    }
+    client.write_all(pipeline.as_bytes()).unwrap();
+    let mut buf = vec![0u8; expected.len()];
+    client.read_exact(&mut buf).unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf), expected);
+
+    // 2. Pipeline HGET across shards
+    pipeline.clear();
+    expected.clear();
+    for i in 0..12 {
+        let k = format!("hash_key_{}", i);
+        let f = format!("field_{}", i);
+        let v = format!("val_{}", i);
+        pipeline.push_str(&format!(
+            "*3\r\n$4\r\nHGET\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+            k.len(),
+            k,
+            f.len(),
+            f
+        ));
+        expected.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
+    }
+    client.write_all(pipeline.as_bytes()).unwrap();
+    let mut buf = vec![0u8; expected.len()];
+    client.read_exact(&mut buf).unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf), expected);
+
+    // 3. Pipeline ZADD across shards
+    pipeline.clear();
+    expected.clear();
+    for i in 0..12 {
+        let k = format!("zset_key_{}", i);
+        let score = (i * 10) as f64;
+        let m = format!("zmember_{}", i);
+        let score_str = score.to_string();
+        pipeline.push_str(&format!(
+            "*4\r\n$4\r\nZADD\r\n${}\r\n{}\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+            k.len(),
+            k,
+            score_str.len(),
+            score_str,
+            m.len(),
+            m
+        ));
+        expected.push_str(":1\r\n");
+    }
+    client.write_all(pipeline.as_bytes()).unwrap();
+    let mut buf = vec![0u8; expected.len()];
+    client.read_exact(&mut buf).unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf), expected);
+
+    // 4. Pipeline SADD & SISMEMBER across shards
+    pipeline.clear();
+    expected.clear();
+    for i in 0..12 {
+        let k = format!("set_key_{}", i);
+        let m = format!("sm_{}", i);
+        pipeline.push_str(&format!(
+            "*3\r\n$4\r\nSADD\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+            k.len(),
+            k,
+            m.len(),
+            m
+        ));
+        expected.push_str(":1\r\n");
+    }
+    client.write_all(pipeline.as_bytes()).unwrap();
+    let mut buf = vec![0u8; expected.len()];
+    client.read_exact(&mut buf).unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf), expected);
+
+    pipeline.clear();
+    expected.clear();
+    for i in 0..12 {
+        let k = format!("set_key_{}", i);
+        let m = format!("sm_{}", i);
+        pipeline.push_str(&format!(
+            "*3\r\n$9\r\nSISMEMBER\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+            k.len(),
+            k,
+            m.len(),
+            m
+        ));
+        expected.push_str(":1\r\n");
+    }
+    client.write_all(pipeline.as_bytes()).unwrap();
+    let mut buf = vec![0u8; expected.len()];
+    client.read_exact(&mut buf).unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf), expected);
+}

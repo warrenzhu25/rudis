@@ -734,49 +734,27 @@ impl RudisSet {
     pub fn contains(&self, member: &[u8]) -> bool {
         match self {
             RudisSet::Small(v) => {
-                let m_hash = hash64(member);
                 let m_len = member.len();
                 match v.len() {
                     0 => false,
-                    1 => {
-                        v[0].hash == m_hash
-                            && v[0].member.len() == m_len
-                            && v[0].member.as_ref() == member
-                    }
+                    1 => v[0].member.len() == m_len && v[0].member.as_ref() == member,
                     2 => {
-                        (v[0].hash == m_hash
-                            && v[0].member.len() == m_len
-                            && v[0].member.as_ref() == member)
-                            || (v[1].hash == m_hash
-                                && v[1].member.len() == m_len
-                                && v[1].member.as_ref() == member)
+                        (v[0].member.len() == m_len && v[0].member.as_ref() == member)
+                            || (v[1].member.len() == m_len && v[1].member.as_ref() == member)
                     }
                     3 => {
-                        (v[0].hash == m_hash
-                            && v[0].member.len() == m_len
-                            && v[0].member.as_ref() == member)
-                            || (v[1].hash == m_hash
-                                && v[1].member.len() == m_len
-                                && v[1].member.as_ref() == member)
-                            || (v[2].hash == m_hash
-                                && v[2].member.len() == m_len
-                                && v[2].member.as_ref() == member)
+                        (v[0].member.len() == m_len && v[0].member.as_ref() == member)
+                            || (v[1].member.len() == m_len && v[1].member.as_ref() == member)
+                            || (v[2].member.len() == m_len && v[2].member.as_ref() == member)
                     }
                     4 => {
-                        (v[0].hash == m_hash
-                            && v[0].member.len() == m_len
-                            && v[0].member.as_ref() == member)
-                            || (v[1].hash == m_hash
-                                && v[1].member.len() == m_len
-                                && v[1].member.as_ref() == member)
-                            || (v[2].hash == m_hash
-                                && v[2].member.len() == m_len
-                                && v[2].member.as_ref() == member)
-                            || (v[3].hash == m_hash
-                                && v[3].member.len() == m_len
-                                && v[3].member.as_ref() == member)
+                        (v[0].member.len() == m_len && v[0].member.as_ref() == member)
+                            || (v[1].member.len() == m_len && v[1].member.as_ref() == member)
+                            || (v[2].member.len() == m_len && v[2].member.as_ref() == member)
+                            || (v[3].member.len() == m_len && v[3].member.as_ref() == member)
                     }
                     _ => {
+                        let m_hash = hash64(member);
                         for m in v {
                             if m.hash == m_hash
                                 && m.member.len() == m_len
@@ -2918,7 +2896,7 @@ impl RudisTable {
         let max_value =
             crate::connection::HASH_MAX_VALUE.load(std::sync::atomic::Ordering::Relaxed);
         let h = hash_key(key);
-        let (existing, _) = self.table.find_or_prepare_insert(key, h);
+        let (existing, insert_idx) = self.table.find_or_prepare_insert(key, h);
         if let Some(idx) = existing
             && !self.check_expired_slot(idx)
             && let Some(entry) = self.table.get_slot_mut(idx)
@@ -2967,15 +2945,21 @@ impl RudisTable {
                 .any(|(k, v)| k.len() > max_value || v.len() > max_value)
         {
             let mut pairs = self.arena.acquire_small_hash(fields.len());
-            let mut added = 0;
-            for (f, v) in fields {
-                if let Some(pos) = pairs.iter().position(|(k, _): &(Bytes, Bytes)| k == f) {
-                    pairs[pos].1 = v.clone();
-                } else {
-                    pairs.push((f.clone(), v.clone()));
-                    added += 1;
+            let added = if fields.len() == 1 {
+                pairs.push((fields[0].0.clone(), fields[0].1.clone()));
+                1
+            } else {
+                let mut a = 0;
+                for (f, v) in fields {
+                    if let Some(pos) = pairs.iter().position(|(k, _): &(Bytes, Bytes)| k == f) {
+                        pairs[pos].1 = v.clone();
+                    } else {
+                        pairs.push((f.clone(), v.clone()));
+                        a += 1;
+                    }
                 }
-            }
+                a
+            };
             (RudisValue::SmallHash(pairs), added)
         } else {
             let mut map = HashMap::with_capacity(fields.len());
@@ -2994,7 +2978,11 @@ impl RudisTable {
             val,
             expire_at: None,
         };
-        self.table.insert(entry);
+        if existing.is_none() {
+            self.table.insert_prepared(entry, h, insert_idx);
+        } else {
+            self.table.insert(entry);
+        }
         Ok(added)
     }
 
@@ -4655,7 +4643,8 @@ impl RudisTable {
         members: &[Bytes],
     ) -> Result<usize, &'static str> {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h) {
+        let (existing, insert_idx) = self.table.find_or_prepare_insert(key, h);
+        if let Some(idx) = existing {
             if self.check_expired_slot(idx) {
                 // Key was expired, re-create below
             } else if let Some(entry) = self.table.get_slot_mut(idx) {
@@ -4722,7 +4711,11 @@ impl RudisTable {
             val: RudisValue::Set(set),
             expire_at: None,
         };
-        self.table.insert(entry);
+        if existing.is_none() {
+            self.table.insert_prepared(entry, h, insert_idx);
+        } else {
+            self.table.insert(entry);
+        }
         Ok(added)
     }
 
@@ -4790,7 +4783,8 @@ impl RudisTable {
     pub fn sismember(&mut self, key: &[u8], member: &[u8]) -> Result<bool, &'static str> {
         let h = hash_key(key);
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
-            if let Some(expire_at) = entry.expire_at
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -5971,7 +5965,8 @@ impl RudisTable {
         flags: ZAddFlags,
     ) -> Result<(usize, Option<f64>), &'static str> {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h) {
+        let (existing, insert_idx) = self.table.find_or_prepare_insert(key, h);
+        if let Some(idx) = existing {
             if self.check_expired_slot(idx) {
                 // Expired slot has been cleaned up, will insert as new below
             } else if let Some(entry) = self.table.get_slot_mut(idx) {
@@ -6068,7 +6063,11 @@ impl RudisTable {
             val: RudisValue::ZSet(zset),
             expire_at: None,
         };
-        self.table.insert(entry);
+        if existing.is_none() {
+            self.table.insert_prepared(entry, h, insert_idx);
+        } else {
+            self.table.insert(entry);
+        }
         Ok((added_count, new_score_incr))
     }
 
@@ -9297,6 +9296,65 @@ mod tests {
             table.sismember_compact(b"no_such_set", b"any").unwrap(),
             crate::shard::CompactResp::INT_0
         );
+    }
+
+    #[test]
+    fn test_small_set_contains_and_prepared_insert() {
+        // Test RudisSet::contains fast paths
+        let mut set = RudisSet::new();
+        assert!(!set.contains(b"item1"));
+
+        set.insert(Bytes::from_static(b"member_alpha"));
+        assert!(set.contains(b"member_alpha"));
+        assert!(!set.contains(b"member_beta"));
+        assert!(!set.contains(b"diff_len"));
+
+        set.insert(Bytes::from_static(b"member_beta"));
+        assert!(set.contains(b"member_alpha"));
+        assert!(set.contains(b"member_beta"));
+        assert!(!set.contains(b"member_gamma"));
+
+        set.insert(Bytes::from_static(b"member_gamma"));
+        set.insert(Bytes::from_static(b"member_delta"));
+        assert_eq!(set.len(), 4);
+        assert!(set.contains(b"member_alpha"));
+        assert!(set.contains(b"member_beta"));
+        assert!(set.contains(b"member_gamma"));
+        assert!(set.contains(b"member_delta"));
+        assert!(!set.contains(b"member_omega"));
+
+        set.insert(Bytes::from_static(b"member_5"));
+        assert_eq!(set.len(), 5);
+        assert!(set.contains(b"member_5"));
+        assert!(!set.contains(b"missing"));
+
+        // Test insert_prepared execution for HSET, SADD, and ZADD on new keys
+        let mut table = RudisTable::new();
+        let hk = Bytes::from_static(b"h_key");
+        let fields = vec![(Bytes::from_static(b"f1"), Bytes::from_static(b"v1"))];
+        let hset_res = table.hset_slice_fast(&hk, &fields).unwrap();
+        assert_eq!(hset_res, 1);
+        let hget_res = table.hget_compact(b"h_key", b"f1").unwrap();
+        assert_eq!(
+            hget_res,
+            crate::shard::CompactResp::from_bulk(&Bytes::from_static(b"v1"))
+        );
+
+        let sk = Bytes::from_static(b"s_key");
+        let members = vec![Bytes::from_static(b"sm1")];
+        let sadd_res = table.sadd_slice_fast(&sk, &members).unwrap();
+        assert_eq!(sadd_res, 1);
+        let sism_res = table.sismember_compact(b"s_key", b"sm1").unwrap();
+        assert_eq!(sism_res, crate::shard::CompactResp::INT_1);
+
+        let zk = Bytes::from_static(b"z_key");
+        let zelems = vec![(10.5, Bytes::from_static(b"zm1"))];
+        let zadd_res = table
+            .zadd_slice_fast(&zk, &zelems, ZAddFlags::default())
+            .unwrap();
+        assert_eq!(zadd_res.0, 1);
+        let zscore_res = table.zscore(b"z_key", b"zm1").unwrap();
+        assert_eq!(zscore_res, Some(10.5));
     }
 
     #[test]
