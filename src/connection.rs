@@ -12260,6 +12260,11 @@ async fn execute_commands_squashed(
     responses.resize(n, CompactResp::empty());
     let mut local_buf = Vec::with_capacity(128);
     let mut should_close = false;
+    // Cross-shard MGET/MSET are dispatched without awaiting so that every command in
+    // the pipeline is in flight before we pay a single round-trip stall. These hold
+    // the handles until the gather phase below.
+    let mut inflight_mgets: Vec<(usize, crate::router::MgetInFlight)> = Vec::new();
+    let mut inflight_msets: Vec<(usize, crate::router::MsetInFlight)> = Vec::new();
 
     for batch in remote_batches.iter_mut() {
         batch.clear();
@@ -12605,6 +12610,35 @@ async fn execute_commands_squashed(
             } else {
                 remote_batches[target].push((idx, cmd));
             }
+        } else if let Command::Mget(keys) = cmd {
+            // Cross-shard MGET: dispatch the scatter now, gather after every other
+            // command in this pipeline has also been dispatched.
+            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                for key in &keys {
+                    record_client_read(router.port, client_id, key.as_ref());
+                }
+            }
+            local_buf.clear();
+            match router.begin_mget_resp(keys, &mut local_buf).await {
+                Some(inflight) => inflight_mgets.push((idx, inflight)),
+                None => responses[idx] = CompactResp::from_vec(std::mem::take(&mut local_buf)),
+            }
+        } else if let Command::Mset(pairs) = cmd {
+            // Cross-shard MSET: same deferred-gather treatment as MGET.
+            if crate::replication::has_connected_replicas(router.port)
+                && let Some(bytes) = crate::aof::command_to_resp(&Command::Mset(pairs.clone()))
+            {
+                crate::replication::propagate_bytes(router.port, &bytes);
+            }
+            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                for (key, _) in &pairs {
+                    notify_key_invalidation(router.port, key.as_ref(), client_id);
+                }
+            }
+            match router.begin_mset(pairs) {
+                Some(inflight) => inflight_msets.push((idx, inflight)),
+                None => responses[idx] = crate::shard::CompactResp::OK,
+            }
         } else if !matches!(
             cmd,
             Command::Ping(_)
@@ -12706,7 +12740,23 @@ async fn execute_commands_squashed(
         }
     }
 
-    // 4. Append responses in exact FIFO pipeline order
+    // 4. Gather the cross-shard MGET/MSET replies that were dispatched in step 1.
+    //    They ran concurrently with each other and with the shard batch hops above.
+    if !inflight_mgets.is_empty() {
+        for (idx, inflight) in inflight_mgets.drain(..) {
+            local_buf.clear();
+            router.finish_mget_resp(inflight, &mut local_buf).await;
+            responses[idx] = CompactResp::from_vec(std::mem::take(&mut local_buf));
+        }
+    }
+    if !inflight_msets.is_empty() {
+        for (idx, inflight) in inflight_msets.drain(..) {
+            router.finish_mset(inflight).await;
+            responses[idx] = crate::shard::CompactResp::OK;
+        }
+    }
+
+    // 5. Append responses in exact FIFO pipeline order
     for resp in responses.iter() {
         resp.write_to(out);
     }

@@ -8943,3 +8943,66 @@ fn test_pipelined_cross_shard_mget_mset_e2e() {
         }
     }
 }
+
+/// A pipeline that interleaves cross-shard MGET/MSET with other commands must still
+/// answer in strict FIFO order, and an MGET must observe an MSET issued earlier in
+/// the very same pipeline even though both are dispatched before either is gathered.
+#[test]
+fn test_interleaved_pipeline_mget_mset_ordering_e2e() {
+    let port = 16460;
+    start_test_server(port, 4);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    let mut pipeline = String::new();
+
+    // 1. MSET of 5 keys spread across shards.
+    pipeline.push_str("*11\r\n$4\r\nMSET\r\n");
+    for k in 0..5 {
+        let key = format!("ord_a_{k}");
+        let val = format!("av{k}");
+        pipeline.push_str(&format!(
+            "${}\r\n{}\r\n${}\r\n{}\r\n",
+            key.len(),
+            key,
+            val.len(),
+            val
+        ));
+    }
+    // 2. MGET of the keys just written by the previous command in this pipeline.
+    pipeline.push_str("*6\r\n$4\r\nMGET\r\n");
+    for k in 0..5 {
+        let key = format!("ord_a_{k}");
+        pipeline.push_str(&format!("${}\r\n{}\r\n", key.len(), key));
+    }
+    // 3. A non-sharded command between two scatter commands.
+    pipeline.push_str("*1\r\n$4\r\nPING\r\n");
+    // 4. MGET with a hole in the middle.
+    pipeline
+        .push_str("*4\r\n$4\r\nMGET\r\n$7\r\nord_a_0\r\n$13\r\nord_a_missing\r\n$7\r\nord_a_2\r\n");
+    // 5. A single-key SET, then a second MSET, then a GET of the single key.
+    pipeline.push_str("*3\r\n$3\r\nSET\r\n$8\r\nord_solo\r\n$2\r\nsv\r\n");
+    pipeline.push_str(
+        "*5\r\n$4\r\nMSET\r\n$7\r\nord_b_0\r\n$3\r\nbv0\r\n$7\r\nord_b_1\r\n$3\r\nbv1\r\n",
+    );
+    pipeline.push_str("*2\r\n$3\r\nGET\r\n$8\r\nord_solo\r\n");
+    // 6. MGET of the keys written by command 5.
+    pipeline.push_str("*3\r\n$4\r\nMGET\r\n$7\r\nord_b_0\r\n$7\r\nord_b_1\r\n");
+
+    client.write_all(pipeline.as_bytes()).unwrap();
+
+    let expected = concat!(
+        "+OK\r\n",
+        "*5\r\n$3\r\nav0\r\n$3\r\nav1\r\n$3\r\nav2\r\n$3\r\nav3\r\n$3\r\nav4\r\n",
+        "+PONG\r\n",
+        "*3\r\n$3\r\nav0\r\n$-1\r\n$3\r\nav2\r\n",
+        "+OK\r\n",
+        "+OK\r\n",
+        "$2\r\nsv\r\n",
+        "*2\r\n$3\r\nbv0\r\n$3\r\nbv1\r\n",
+    );
+
+    let mut response_buf = vec![0u8; expected.len()];
+    client.read_exact(&mut response_buf).unwrap();
+    assert_eq!(String::from_utf8_lossy(&response_buf), expected);
+}

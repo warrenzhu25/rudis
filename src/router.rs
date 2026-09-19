@@ -54,6 +54,27 @@ pub fn target_shard(key: &[u8], num_shards: usize) -> usize {
 
 use std::sync::atomic::Ordering;
 
+/// Handle for a cross-shard MGET that has been dispatched but not yet gathered.
+///
+/// Created by [`Router::begin_mget_resp`] and consumed by [`Router::finish_mget_resp`].
+/// Keeping the dispatch and the wait separate lets a pipelined batch start several
+/// MGETs before stalling on the first one.
+pub struct MgetInFlight {
+    descriptor: Arc<crate::mailbox::ScatterMgetDescriptor>,
+    notify_tx: flume::Sender<()>,
+    notify_rx: flume::Receiver<()>,
+    total_keys: usize,
+}
+
+/// Handle for a cross-shard MSET that has been dispatched but not yet acknowledged.
+///
+/// Created by [`Router::begin_mset`] and consumed by [`Router::finish_mset`].
+pub struct MsetInFlight {
+    descriptor: Arc<crate::mailbox::ScatterMsetDescriptor>,
+    notify_tx: flume::Sender<()>,
+    notify_rx: flume::Receiver<()>,
+}
+
 /// The router handles dispatching operations.
 /// If the key belongs to the current shard, it directly touches `local_db` without locking.
 /// If the key belongs to a peer shard, it routes the message across cores via the mesh.
@@ -1040,10 +1061,23 @@ impl Router {
         results
     }
 
-    pub async fn write_mget_resp(&self, keys: Vec<Bytes>, out: &mut Vec<u8>) {
+    /// Dispatch phase of a cross-shard MGET.
+    ///
+    /// Buckets the keys per shard, fires the `ScatterMget` messages and serves the
+    /// local keys, all **without awaiting** the remote shards. Returns `None` when
+    /// the command was fully satisfied inline (single shard, or every key owned by
+    /// this shard), in which case the RESP reply is already written into `out`.
+    ///
+    /// Handing back an in-flight handle instead of blocking lets a pipelined batch
+    /// put several MGETs on the wire before paying a single round-trip stall.
+    pub async fn begin_mget_resp(
+        &self,
+        keys: Vec<Bytes>,
+        out: &mut Vec<u8>,
+    ) -> Option<MgetInFlight> {
         if keys.is_empty() {
             crate::connection::write_resp_array_header(out, 0);
-            return;
+            return None;
         }
 
         let total_keys = keys.len();
@@ -1058,7 +1092,7 @@ impl Router {
                     crate::connection::write_resp_null(out);
                 }
             }
-            return;
+            return None;
         }
 
         let mut remote_batches = self
@@ -1097,7 +1131,7 @@ impl Router {
                 }
             }
             self.mget_batch_pool.borrow_mut().push(remote_batches);
-            return;
+            return None;
         }
 
         let (notify_tx, notify_rx) = self.acquire_notify_channel();
@@ -1127,6 +1161,24 @@ impl Router {
             }
         }
 
+        Some(MgetInFlight {
+            descriptor,
+            notify_tx,
+            notify_rx,
+            total_keys,
+        })
+    }
+
+    /// Completion phase of a cross-shard MGET: wait for every shard to publish its
+    /// slots, then serialize the gathered values into `out`.
+    pub async fn finish_mget_resp(&self, inflight: MgetInFlight, out: &mut Vec<u8>) {
+        let MgetInFlight {
+            descriptor,
+            notify_tx,
+            notify_rx,
+            total_keys,
+        } = inflight;
+
         // Wait for all remote shards to complete their writes
         if descriptor.pending.load(Ordering::Acquire) != 0 {
             for _ in 0..64 {
@@ -1145,6 +1197,7 @@ impl Router {
         self.mget_batch_pool.borrow_mut().push(recycled);
         self.release_notify_channel(notify_tx, notify_rx);
 
+        out.reserve(total_keys * 140);
         crate::connection::write_resp_array_header(out, total_keys);
         unsafe {
             for i in 0..total_keys {
@@ -1158,9 +1211,19 @@ impl Router {
         self.release_mget_descriptor(descriptor);
     }
 
-    pub async fn mset(&self, pairs: Vec<(Bytes, Bytes)>) {
+    pub async fn write_mget_resp(&self, keys: Vec<Bytes>, out: &mut Vec<u8>) {
+        if let Some(inflight) = self.begin_mget_resp(keys, out).await {
+            self.finish_mget_resp(inflight, out).await;
+        }
+    }
+
+    /// Dispatch phase of a cross-shard MSET. See [`Router::begin_mget_resp`].
+    ///
+    /// Applies the locally-owned pairs and fires `ScatterMset` to the other shards
+    /// without awaiting. Returns `None` when no remote shard is involved.
+    pub fn begin_mset(&self, pairs: Vec<(Bytes, Bytes)>) -> Option<MsetInFlight> {
         if pairs.is_empty() {
-            return;
+            return None;
         }
 
         if self.num_shards <= 1 {
@@ -1176,7 +1239,7 @@ impl Router {
                 aof.borrow_mut().append(&bytes);
             }
             self.check_auto_tier_after_write();
-            return;
+            return None;
         }
 
         let mut remote_batches = self
@@ -1220,7 +1283,7 @@ impl Router {
                 self.check_auto_tier_after_write();
             }
             self.mset_batch_pool.borrow_mut().push(remote_batches);
-            return;
+            return None;
         }
 
         let (notify_tx, notify_rx) = self.acquire_notify_channel();
@@ -1257,6 +1320,21 @@ impl Router {
             self.check_auto_tier_after_write();
         }
 
+        Some(MsetInFlight {
+            descriptor,
+            notify_tx,
+            notify_rx,
+        })
+    }
+
+    /// Completion phase of a cross-shard MSET: wait until every shard applied its slice.
+    pub async fn finish_mset(&self, inflight: MsetInFlight) {
+        let MsetInFlight {
+            descriptor,
+            notify_tx,
+            notify_rx,
+        } = inflight;
+
         if descriptor.pending.load(Ordering::Acquire) != 0 {
             for _ in 0..64 {
                 std::hint::spin_loop();
@@ -1274,6 +1352,12 @@ impl Router {
         self.mset_batch_pool.borrow_mut().push(recycled);
         self.release_notify_channel(notify_tx, notify_rx);
         self.release_mset_descriptor(descriptor);
+    }
+
+    pub async fn mset(&self, pairs: Vec<(Bytes, Bytes)>) {
+        if let Some(inflight) = self.begin_mset(pairs) {
+            self.finish_mset(inflight).await;
+        }
     }
 
     pub async fn json_mget(&self, keys: Vec<Bytes>, path: &str) -> Vec<Option<String>> {
@@ -3535,5 +3619,80 @@ mod tests {
         let desc_mset2 = router.acquire_mset_descriptor(2, notify_tx);
         router.release_mset_descriptor(desc_mset2);
         assert_eq!(router.mset_desc_pool.borrow().len(), 1);
+    }
+
+    #[test]
+    fn test_begin_mget_mset_dispatch_without_blocking() {
+        let num_shards = 4;
+        let (mut senders_mesh, _receivers) = crate::mailbox::create_shard_mesh(num_shards);
+        let senders = senders_mesh.remove(0);
+        let db0 = Rc::new(RefCell::new(crate::shard::ShardDb::new(9997)));
+        let router = Router::new(
+            0,
+            num_shards,
+            9997,
+            db0,
+            senders,
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+
+        // Pick one key owned by this shard and one owned by a peer shard.
+        let mut local_key = None;
+        let mut remote_key = None;
+        for i in 0..1000 {
+            let k = Bytes::from(format!("split_k_{i}"));
+            if router.target_shard(&k) == 0 {
+                if local_key.is_none() {
+                    local_key = Some(k);
+                }
+            } else if remote_key.is_none() {
+                remote_key = Some(k);
+            }
+            if local_key.is_some() && remote_key.is_some() {
+                break;
+            }
+        }
+        let local_key = local_key.expect("no key hashed to shard 0");
+        let remote_key = remote_key.expect("no key hashed to a peer shard");
+
+        router
+            .local_db
+            .borrow_mut()
+            .set(local_key.clone(), Bytes::from_static(b"v1"), None);
+
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async move {
+            // All keys local: served inline, no in-flight handle, reply already written.
+            let mut out = Vec::new();
+            let inflight = router
+                .begin_mget_resp(vec![local_key.clone()], &mut out)
+                .await;
+            assert!(inflight.is_none());
+            assert_eq!(out, b"*1\r\n$2\r\nv1\r\n".to_vec());
+
+            // Cross-shard: dispatch returns immediately with a pending shard and
+            // writes nothing, leaving serialization to the gather phase.
+            let mut out = Vec::new();
+            let inflight = router
+                .begin_mget_resp(vec![local_key, remote_key.clone()], &mut out)
+                .await
+                .expect("cross-shard mget must yield an in-flight handle");
+            assert!(out.is_empty());
+            assert_eq!(inflight.descriptor.pending.load(Ordering::Acquire), 1);
+            assert_eq!(inflight.total_keys, 2);
+            drop(inflight);
+
+            // MSET dispatches the same way.
+            let inflight = router
+                .begin_mset(vec![(remote_key, Bytes::from_static(b"v2"))])
+                .expect("cross-shard mset must yield an in-flight handle");
+            assert_eq!(inflight.descriptor.pending.load(Ordering::Acquire), 1);
+        });
     }
 }
