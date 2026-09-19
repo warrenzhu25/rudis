@@ -9747,3 +9747,28 @@ fn test_pipelined_lpop_rpop_e2e() {
         assert_eq!(send_and_read(&mut conn, rpop_cmd.as_bytes()), "$-1\r\n");
     }
 }
+
+#[test]
+fn test_pipelined_sismember_sadd_e2e() {
+    let port = 16799;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut conn = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // SADD members into multiple sets
+    for set_idx in 0..10 {
+        let sadd_cmd = format!("SADD sm_set_{} m1 m2 m3 m4 m5\r\n", set_idx);
+        assert_eq!(send_and_read(&mut conn, sadd_cmd.as_bytes()), ":5\r\n");
+    }
+
+    // Verify SISMEMBER returns 1 for present members, 0 for absent
+    for set_idx in 0..10 {
+        for m in 1..=5 {
+            let sismember_cmd = format!("SISMEMBER sm_set_{} m{}\r\n", set_idx, m);
+            assert_eq!(send_and_read(&mut conn, sismember_cmd.as_bytes()), ":1\r\n");
+        }
+        let sismember_cmd = format!("SISMEMBER sm_set_{} m999\r\n", set_idx);
+        assert_eq!(send_and_read(&mut conn, sismember_cmd.as_bytes()), ":0\r\n");
+    }
+}

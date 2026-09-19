@@ -735,37 +735,12 @@ impl RudisSet {
         match self {
             RudisSet::Small(v) => {
                 let m_len = member.len();
-                match v.len() {
-                    0 => false,
-                    1 => v[0].member.len() == m_len && v[0].member.as_ref() == member,
-                    2 => {
-                        (v[0].member.len() == m_len && v[0].member.as_ref() == member)
-                            || (v[1].member.len() == m_len && v[1].member.as_ref() == member)
-                    }
-                    3 => {
-                        (v[0].member.len() == m_len && v[0].member.as_ref() == member)
-                            || (v[1].member.len() == m_len && v[1].member.as_ref() == member)
-                            || (v[2].member.len() == m_len && v[2].member.as_ref() == member)
-                    }
-                    4 => {
-                        (v[0].member.len() == m_len && v[0].member.as_ref() == member)
-                            || (v[1].member.len() == m_len && v[1].member.as_ref() == member)
-                            || (v[2].member.len() == m_len && v[2].member.as_ref() == member)
-                            || (v[3].member.len() == m_len && v[3].member.as_ref() == member)
-                    }
-                    _ => {
-                        let m_hash = hash64(member);
-                        for m in v {
-                            if m.hash == m_hash
-                                && m.member.len() == m_len
-                                && m.member.as_ref() == member
-                            {
-                                return true;
-                            }
-                        }
-                        false
+                for m in v {
+                    if m.member.len() == m_len && m.member.as_ref() == member {
+                        return true;
                     }
                 }
+                false
             }
             RudisSet::Full(s) => s.contains(member),
         }
@@ -10715,5 +10690,48 @@ mod tests {
         assert_eq!(table.lpop_one_with_hash(key.as_ref(), h), Ok(None));
         assert_eq!(table.rpop_one(key.as_ref()), Ok(None));
         assert!(!table.exists(key.as_ref()));
+    }
+
+    #[test]
+    fn test_sismember_compact_fast_path() {
+        let mut table = RudisTable::new();
+        let key = Bytes::from("set_bench");
+        let h = hash_key(key.as_ref());
+
+        // Non-existent set returns INT_0
+        assert_eq!(
+            table.sismember_compact_with_hash(key.as_ref(), h, b"mem1"),
+            Ok(crate::shard::CompactResp::INT_0)
+        );
+
+        // Add 3 members
+        table
+            .sadd(
+                key.clone(),
+                vec![
+                    Bytes::from("mem1"),
+                    Bytes::from("mem2"),
+                    Bytes::from("mem3"),
+                ],
+            )
+            .unwrap();
+
+        // Check members
+        assert_eq!(
+            table.sismember_compact_with_hash(key.as_ref(), h, b"mem1"),
+            Ok(crate::shard::CompactResp::INT_1)
+        );
+        assert_eq!(
+            table.sismember_compact_with_hash(key.as_ref(), h, b"mem2"),
+            Ok(crate::shard::CompactResp::INT_1)
+        );
+        assert_eq!(
+            table.sismember_compact_with_hash(key.as_ref(), h, b"mem3"),
+            Ok(crate::shard::CompactResp::INT_1)
+        );
+        assert_eq!(
+            table.sismember_compact_with_hash(key.as_ref(), h, b"mem4"),
+            Ok(crate::shard::CompactResp::INT_0)
+        );
     }
 }

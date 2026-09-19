@@ -540,7 +540,8 @@ def benchmark_at_core_count(cores):
         "--port", "6379",
         "--threads", str(cores),
     ]
-    rudis_proc = subprocess.Popen(rudis_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    rudis_log = open("/tmp/rudis_bench.log", "w")
+    rudis_proc = subprocess.Popen(rudis_cmd, stdout=rudis_log, stderr=subprocess.STDOUT)
     if not wait_ping(6379):
         print("Failed to start Rudis on port 6379")
         rudis_proc.kill()
