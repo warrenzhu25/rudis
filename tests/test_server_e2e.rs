@@ -9946,3 +9946,56 @@ fn test_pipelined_incr_and_rpop_e2e() {
     // List should be empty now -> RPOP returns nil
     assert_eq!(send_and_read(&mut conn, b"RPOP list_k\r\n"), "$-1\r\n");
 }
+
+#[test]
+fn test_mutations_find_entry_mut_e2e() {
+    let port = 16910;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut conn = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // Pipelined mixed mutation commands on the same keys to exercise find_entry_mut fast path
+    let mut pipe = String::new();
+    for i in 0..10 {
+        pipe.push_str(&format!("HSET mut_hash f{} v{}\r\n", i, i));
+        pipe.push_str(&format!("LPUSH mut_list v{}\r\n", i));
+        pipe.push_str(&format!("RPUSH mut_rlist v{}\r\n", i));
+        pipe.push_str(&format!("SADD mut_set m{}\r\n", i));
+        pipe.push_str(&format!("ZADD mut_zset {} zm{}\r\n", i * 10, i));
+    }
+    use std::io::{Read, Write};
+    conn.write_all(pipe.as_bytes()).unwrap();
+
+    // Now update existing fields/members in pipeline
+    let mut pipe_update = String::new();
+    for i in 0..10 {
+        pipe_update.push_str(&format!("HSET mut_hash f{} v{}_updated\r\n", i, i));
+        pipe_update.push_str(&format!("SADD mut_set m{}\r\n", i)); // dedup -> :0
+        pipe_update.push_str(&format!("ZADD mut_zset {} zm{}\r\n", i * 10 + 5, i)); // update score -> :0
+    }
+    conn.write_all(pipe_update.as_bytes()).unwrap();
+
+    // Drain all 50 + 30 = 80 responses from pipeline
+    let mut buf = [0u8; 1024];
+    let mut read_buf = Vec::new();
+    while read_buf.windows(2).filter(|w| *w == b"\r\n").count() < 80 {
+        let n = conn.read(&mut buf).unwrap();
+        read_buf.extend_from_slice(&buf[..n]);
+    }
+
+    // Check values
+    assert_eq!(send_and_read(&mut conn, b"HLEN mut_hash\r\n"), ":10\r\n");
+    assert_eq!(
+        send_and_read(&mut conn, b"HGET mut_hash f0\r\n"),
+        "$10\r\nv0_updated\r\n"
+    );
+    assert_eq!(send_and_read(&mut conn, b"LLEN mut_list\r\n"), ":10\r\n");
+    assert_eq!(send_and_read(&mut conn, b"LLEN mut_rlist\r\n"), ":10\r\n");
+    assert_eq!(send_and_read(&mut conn, b"SCARD mut_set\r\n"), ":10\r\n");
+    assert_eq!(send_and_read(&mut conn, b"ZCARD mut_zset\r\n"), ":10\r\n");
+    assert_eq!(
+        send_and_read(&mut conn, b"ZSCORE mut_zset zm0\r\n"),
+        "$1\r\n5\r\n"
+    );
+}

@@ -3002,79 +3002,85 @@ impl RudisTable {
             crate::connection::HASH_MAX_ENTRIES.load(std::sync::atomic::Ordering::Relaxed);
         let max_value =
             crate::connection::HASH_MAX_VALUE.load(std::sync::atomic::Ordering::Relaxed);
-        let (existing, insert_idx) = self.table.find_or_prepare_insert(key, h);
-        if let Some(idx) = existing
-            && (self.num_expires == 0 || !self.check_expired_slot(idx))
-            && let Some(entry) = self.table.get_slot_mut(idx)
-        {
-            match &mut entry.val {
-                RudisValue::SmallHash(pairs) => {
-                    let mut added = 0;
-                    if fields.len() == 1 {
-                        let (f, v) = &fields[0];
-                        if pairs.len() == 1 && pairs[0].0 == *f {
-                            pairs[0].1 = v.clone();
-                            if v.len() > max_value {
-                                let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
-                                entry.val = RudisValue::Hash(map);
+        if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+            } else {
+                match &mut entry.val {
+                    RudisValue::SmallHash(pairs) => {
+                        let mut added = 0;
+                        if fields.len() == 1 {
+                            let (f, v) = &fields[0];
+                            if pairs.len() == 1 && pairs[0].0 == *f {
+                                pairs[0].1 = v.clone();
+                                if v.len() > max_value {
+                                    let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
+                                    entry.val = RudisValue::Hash(map);
+                                }
+                                return Ok(0);
                             }
-                            return Ok(0);
-                        }
-                        if let Some(pos) = pairs.iter().position(|(k, _)| k == f) {
-                            pairs[pos].1 = v.clone();
-                            if v.len() > max_value {
-                                let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
-                                entry.val = RudisValue::Hash(map);
+                            if let Some(pos) = pairs.iter().position(|(k, _)| k == f) {
+                                pairs[pos].1 = v.clone();
+                                if v.len() > max_value {
+                                    let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
+                                    entry.val = RudisValue::Hash(map);
+                                }
+                            } else {
+                                pairs.push((f.clone(), v.clone()));
+                                if pairs.len() > max_entries
+                                    || f.len() > max_value
+                                    || v.len() > max_value
+                                {
+                                    let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
+                                    entry.val = RudisValue::Hash(map);
+                                }
+                                added = 1;
                             }
+                            return Ok(added);
                         } else {
-                            pairs.push((f.clone(), v.clone()));
+                            for (f, v) in fields {
+                                if let Some(pos) = pairs.iter().position(|(k, _)| k == f) {
+                                    pairs[pos].1 = v.clone();
+                                } else {
+                                    pairs.push((f.clone(), v.clone()));
+                                    added += 1;
+                                }
+                            }
                             if pairs.len() > max_entries
-                                || f.len() > max_value
-                                || v.len() > max_value
+                                || fields
+                                    .iter()
+                                    .any(|(k, v)| k.len() > max_value || v.len() > max_value)
                             {
                                 let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
                                 entry.val = RudisValue::Hash(map);
                             }
-                            added = 1;
+                            return Ok(added);
                         }
-                        return Ok(added);
-                    } else {
+                    }
+                    RudisValue::Hash(map) => {
+                        let mut added = 0;
                         for (f, v) in fields {
-                            if let Some(pos) = pairs.iter().position(|(k, _)| k == f) {
-                                pairs[pos].1 = v.clone();
-                            } else {
-                                pairs.push((f.clone(), v.clone()));
+                            if map.insert(f.clone(), v.clone()).is_none() {
                                 added += 1;
                             }
                         }
-                        if pairs.len() > max_entries
-                            || fields
-                                .iter()
-                                .any(|(k, v)| k.len() > max_value || v.len() > max_value)
-                        {
-                            let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
-                            entry.val = RudisValue::Hash(map);
-                        }
                         return Ok(added);
                     }
-                }
-                RudisValue::Hash(map) => {
-                    let mut added = 0;
-                    for (f, v) in fields {
-                        if map.insert(f.clone(), v.clone()).is_none() {
-                            added += 1;
-                        }
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
                     }
-                    return Ok(added);
-                }
-                _ => {
-                    return Err(
-                        "WRONGTYPE Operation against a key holding the wrong kind of value",
-                    );
                 }
             }
         }
 
+        let (_, insert_idx) = self.table.find_or_prepare_insert(key, h);
         let (val, added) = if fields.len() <= max_entries
             && (if fields.len() == 1 {
                 fields[0].0.len() <= max_value && fields[0].1.len() <= max_value
@@ -3117,11 +3123,7 @@ impl RudisTable {
             val,
             expire_at: None,
         };
-        if existing.is_none() {
-            self.table.insert_prepared(entry, h, insert_idx);
-        } else {
-            self.table.insert(entry);
-        }
+        self.table.insert_prepared(entry, h, insert_idx);
         Ok(added)
     }
 
@@ -3961,11 +3963,15 @@ impl RudisTable {
         key_bytes: Option<&Bytes>,
         values: &[Bytes],
     ) -> Result<usize, &'static str> {
-        let (existing, insert_idx) = self.table.find_or_prepare_insert(key, h);
-        if let Some(idx) = existing {
-            if self.num_expires > 0 && self.check_expired_slot(idx) {
-                // Key was expired and removed
-            } else if let Some(entry) = self.table.get_slot_mut(idx) {
+        if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+            } else {
                 match &mut entry.val {
                     RudisValue::List(deque) => {
                         for v in values {
@@ -3982,6 +3988,7 @@ impl RudisTable {
             }
         }
 
+        let (_, insert_idx) = self.table.find_or_prepare_insert(key, h);
         let mut deque = self.arena.acquire_list(values.len());
         for v in values {
             deque.push_front(v.clone());
@@ -3994,11 +4001,7 @@ impl RudisTable {
             val: RudisValue::List(deque),
             expire_at: None,
         };
-        if existing.is_none() {
-            self.table.insert_prepared(entry, h, insert_idx);
-        } else {
-            self.table.insert(entry);
-        }
+        self.table.insert_prepared(entry, h, insert_idx);
         Ok(len)
     }
 
@@ -4030,11 +4033,15 @@ impl RudisTable {
         key_bytes: Option<&Bytes>,
         values: &[Bytes],
     ) -> Result<usize, &'static str> {
-        let (existing, insert_idx) = self.table.find_or_prepare_insert(key, h);
-        if let Some(idx) = existing {
-            if self.num_expires > 0 && self.check_expired_slot(idx) {
-                // Key was expired and removed
-            } else if let Some(entry) = self.table.get_slot_mut(idx) {
+        if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+            } else {
                 match &mut entry.val {
                     RudisValue::List(deque) => {
                         for v in values {
@@ -4051,6 +4058,7 @@ impl RudisTable {
             }
         }
 
+        let (_, insert_idx) = self.table.find_or_prepare_insert(key, h);
         let mut deque = self.arena.acquire_list(values.len());
         for v in values {
             deque.push_back(v.clone());
@@ -4063,11 +4071,7 @@ impl RudisTable {
             val: RudisValue::List(deque),
             expire_at: None,
         };
-        if existing.is_none() {
-            self.table.insert_prepared(entry, h, insert_idx);
-        } else {
-            self.table.insert(entry);
-        }
+        self.table.insert_prepared(entry, h, insert_idx);
         Ok(len)
     }
 
@@ -5030,11 +5034,15 @@ impl RudisTable {
         key_bytes: Option<&Bytes>,
         members: &[Bytes],
     ) -> Result<usize, &'static str> {
-        let (existing, insert_idx) = self.table.find_or_prepare_insert(key, h);
-        if let Some(idx) = existing {
-            if self.num_expires > 0 && self.check_expired_slot(idx) {
-                // Key was expired, re-create below
-            } else if let Some(entry) = self.table.get_slot_mut(idx) {
+        if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+            } else {
                 match &mut entry.val {
                     RudisValue::Set(set) => {
                         if members.len() == 1 {
@@ -5058,6 +5066,7 @@ impl RudisTable {
             }
         }
 
+        let (_, insert_idx) = self.table.find_or_prepare_insert(key, h);
         let set = if members.len() <= SMALL_SET_LIMIT {
             let mut v = self.arena.acquire_small_set(members.len());
             if members.len() == 1 {
@@ -5102,11 +5111,7 @@ impl RudisTable {
             val: RudisValue::Set(set),
             expire_at: None,
         };
-        if existing.is_none() {
-            self.table.insert_prepared(entry, h, insert_idx);
-        } else {
-            self.table.insert(entry);
-        }
+        self.table.insert_prepared(entry, h, insert_idx);
         Ok(added)
     }
 
@@ -6380,11 +6385,15 @@ impl RudisTable {
         elements: &[(f64, Bytes)],
         flags: ZAddFlags,
     ) -> Result<(usize, Option<f64>), &'static str> {
-        let (existing, insert_idx) = self.table.find_or_prepare_insert(key, h);
-        if let Some(idx) = existing {
-            if self.num_expires > 0 && self.check_expired_slot(idx) {
-                // Expired slot has been cleaned up, will insert as new below
-            } else if let Some(entry) = self.table.get_slot_mut(idx) {
+        if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+            } else {
                 match &mut entry.val {
                     RudisValue::ZSet(zset) => {
                         let mut added_count = 0usize;
@@ -6451,6 +6460,7 @@ impl RudisTable {
             return Ok((0, None));
         }
 
+        let (_, insert_idx) = self.table.find_or_prepare_insert(key, h);
         let mut zset = if elements.len() <= SMALL_ZSET_LIMIT {
             let v = self.arena.acquire_small_zset(elements.len());
             RudisZSet::Small(v)
@@ -6478,11 +6488,7 @@ impl RudisTable {
             val: RudisValue::ZSet(zset),
             expire_at: None,
         };
-        if existing.is_none() {
-            self.table.insert_prepared(entry, h, insert_idx);
-        } else {
-            self.table.insert(entry);
-        }
+        self.table.insert_prepared(entry, h, insert_idx);
         Ok((added_count, new_score_incr))
     }
 
@@ -11063,5 +11069,57 @@ mod tests {
             table.write_rpop_resp(key.as_ref(), None, &mut out),
             Err("WRONGTYPE Operation against a key holding the wrong kind of value")
         );
+    }
+
+    #[test]
+    fn test_mutation_methods_find_entry_mut_fast_path() {
+        let mut table = RudisTable::new();
+
+        // 1. HSET: insert new, update existing, add second
+        let hkey = Bytes::from("hash_key_1");
+        assert_eq!(
+            table.hset_slice_fast(&hkey, &[(Bytes::from("f1"), Bytes::from("v1"))]),
+            Ok(1)
+        );
+        assert_eq!(
+            table.hset_slice_fast(&hkey, &[(Bytes::from("f1"), Bytes::from("v1_mod"))]),
+            Ok(0)
+        );
+        assert_eq!(
+            table.hset_slice_fast(&hkey, &[(Bytes::from("f2"), Bytes::from("v2"))]),
+            Ok(1)
+        );
+        assert_eq!(table.hlen(hkey.as_ref()), Ok(2));
+
+        // 2. LPUSH & RPUSH: insert new, push onto existing
+        let lkey = Bytes::from("list_key_1");
+        assert_eq!(table.lpush_slice_fast(&lkey, &[Bytes::from("e1")]), Ok(1));
+        assert_eq!(table.lpush_slice_fast(&lkey, &[Bytes::from("e0")]), Ok(2));
+        assert_eq!(table.rpush_slice_fast(&lkey, &[Bytes::from("e2")]), Ok(3));
+        assert_eq!(table.llen(lkey.as_ref()), Ok(3));
+
+        // 3. SADD: insert new, add to existing, dedup
+        let skey = Bytes::from("set_key_1");
+        assert_eq!(table.sadd_slice_fast(&skey, &[Bytes::from("m1")]), Ok(1));
+        assert_eq!(table.sadd_slice_fast(&skey, &[Bytes::from("m1")]), Ok(0));
+        assert_eq!(table.sadd_slice_fast(&skey, &[Bytes::from("m2")]), Ok(1));
+        assert_eq!(table.scard(skey.as_ref()), Ok(2));
+
+        // 4. ZADD: insert new, update score, add second
+        let zkey = Bytes::from("zset_key_1");
+        let flags = ZAddFlags::default();
+        assert_eq!(
+            table.zadd_slice_fast(&zkey, &[(10.0, Bytes::from("m1"))], flags),
+            Ok((1, None))
+        );
+        assert_eq!(
+            table.zadd_slice_fast(&zkey, &[(20.0, Bytes::from("m1"))], flags),
+            Ok((0, None))
+        );
+        assert_eq!(
+            table.zadd_slice_fast(&zkey, &[(30.0, Bytes::from("m2"))], flags),
+            Ok((1, None))
+        );
+        assert_eq!(table.zcard(zkey.as_ref()), Ok(2));
     }
 }
