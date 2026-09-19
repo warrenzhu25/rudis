@@ -556,20 +556,50 @@ pub fn write_resp_integer(out: &mut Vec<u8>, val: i64) {
 
 #[inline(always)]
 pub fn write_resp_bulk(out: &mut Vec<u8>, val: &[u8]) {
+    let v_len = val.len();
+    out.reserve(v_len + 16);
     out.push(b'$');
-    let mut buf = [0u8; 20];
-    let mut i = buf.len();
-    let mut uval = val.len();
-    if uval == 0 {
-        out.extend_from_slice(b"0\r\n");
-    } else {
-        while uval > 0 {
-            i -= 1;
-            buf[i] = b'0' + (uval % 10) as u8;
-            uval /= 10;
+    match v_len {
+        0 => out.extend_from_slice(b"0\r\n"),
+        1..=9 => {
+            out.push(b'0' + v_len as u8);
+            out.extend_from_slice(b"\r\n");
         }
-        out.extend_from_slice(&buf[i..]);
-        out.extend_from_slice(b"\r\n");
+        10..=99 => {
+            let p = v_len * 2;
+            out.push(crate::shard::DIGIT_PAIRS[p]);
+            out.push(crate::shard::DIGIT_PAIRS[p + 1]);
+            out.extend_from_slice(b"\r\n");
+        }
+        100..=999 => {
+            let h = (v_len / 100) as u8;
+            let p = (v_len % 100) * 2;
+            out.push(b'0' + h);
+            out.push(crate::shard::DIGIT_PAIRS[p]);
+            out.push(crate::shard::DIGIT_PAIRS[p + 1]);
+            out.extend_from_slice(b"\r\n");
+        }
+        1000..=9999 => {
+            let p1 = (v_len / 100) * 2;
+            let p2 = (v_len % 100) * 2;
+            out.push(crate::shard::DIGIT_PAIRS[p1]);
+            out.push(crate::shard::DIGIT_PAIRS[p1 + 1]);
+            out.push(crate::shard::DIGIT_PAIRS[p2]);
+            out.push(crate::shard::DIGIT_PAIRS[p2 + 1]);
+            out.extend_from_slice(b"\r\n");
+        }
+        _ => {
+            let mut buf = [0u8; 20];
+            let mut i = buf.len();
+            let mut uval = v_len;
+            while uval > 0 {
+                i -= 1;
+                buf[i] = b'0' + (uval % 10) as u8;
+                uval /= 10;
+            }
+            out.extend_from_slice(&buf[i..]);
+            out.extend_from_slice(b"\r\n");
+        }
     }
     out.extend_from_slice(val);
     out.extend_from_slice(b"\r\n");
@@ -578,19 +608,38 @@ pub fn write_resp_bulk(out: &mut Vec<u8>, val: &[u8]) {
 #[inline(always)]
 pub fn write_resp_array_header(out: &mut Vec<u8>, len: usize) {
     out.push(b'*');
-    let mut buf = [0u8; 20];
-    let mut i = buf.len();
-    let mut uval = len;
-    if uval == 0 {
-        out.extend_from_slice(b"0\r\n");
-    } else {
-        while uval > 0 {
-            i -= 1;
-            buf[i] = b'0' + (uval % 10) as u8;
-            uval /= 10;
+    match len {
+        0 => out.extend_from_slice(b"0\r\n"),
+        1..=9 => {
+            out.push(b'0' + len as u8);
+            out.extend_from_slice(b"\r\n");
         }
-        out.extend_from_slice(&buf[i..]);
-        out.extend_from_slice(b"\r\n");
+        10..=99 => {
+            let p = len * 2;
+            out.push(crate::shard::DIGIT_PAIRS[p]);
+            out.push(crate::shard::DIGIT_PAIRS[p + 1]);
+            out.extend_from_slice(b"\r\n");
+        }
+        100..=999 => {
+            let h = (len / 100) as u8;
+            let p = (len % 100) * 2;
+            out.push(b'0' + h);
+            out.push(crate::shard::DIGIT_PAIRS[p]);
+            out.push(crate::shard::DIGIT_PAIRS[p + 1]);
+            out.extend_from_slice(b"\r\n");
+        }
+        _ => {
+            let mut buf = [0u8; 20];
+            let mut i = buf.len();
+            let mut uval = len;
+            while uval > 0 {
+                i -= 1;
+                buf[i] = b'0' + (uval % 10) as u8;
+                uval /= 10;
+            }
+            out.extend_from_slice(&buf[i..]);
+            out.extend_from_slice(b"\r\n");
+        }
     }
 }
 

@@ -13,7 +13,7 @@ pub enum CompactResp {
     Array1Bulk(Bytes),
 }
 
-const DIGIT_PAIRS: &[u8; 200] = b"\
+pub const DIGIT_PAIRS: &[u8; 200] = b"\
 00010203040506070809\
 10111213141516171819\
 20212223242526272829\
