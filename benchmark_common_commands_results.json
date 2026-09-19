@@ -2,166 +2,166 @@
   "16_cores": {
     "Dragonfly": {
       "SET": {
-        "ops_sec_mean": 1702124.0350000001,
-        "avg_latency_mean": 0.583,
-        "p99_latency_mean": 0.583
+        "ops_sec_mean": 1521081.31,
+        "avg_latency_mean": 0.6635,
+        "p99_latency_mean": 0.6635
       },
       "GET": {
-        "ops_sec_mean": 2439149.88,
-        "avg_latency_mean": 0.469,
-        "p99_latency_mean": 0.469
-      },
-      "INCR": {
-        "ops_sec_mean": 2605821.77,
-        "avg_latency_mean": 0.4145,
-        "p99_latency_mean": 0.4145
-      },
-      "MSET_5K": {
-        "ops_sec_mean": 321620.04500000004,
-        "avg_latency_mean": 0.8135,
-        "p99_latency_mean": 0.8135
-      },
-      "MGET_5K": {
-        "ops_sec_mean": 541197.34,
-        "avg_latency_mean": 0.4665,
-        "p99_latency_mean": 0.4665
-      },
-      "HSET": {
-        "ops_sec_mean": 1988421.02,
-        "avg_latency_mean": 0.45299999999999996,
-        "p99_latency_mean": 0.45299999999999996
-      },
-      "HGET": {
-        "ops_sec_mean": 2406359.145,
-        "avg_latency_mean": 0.398,
-        "p99_latency_mean": 0.398
-      },
-      "LPUSH": {
-        "ops_sec_mean": 2002290.27,
-        "avg_latency_mean": 0.49150000000000005,
-        "p99_latency_mean": 0.49150000000000005
-      },
-      "LPOP": {
-        "ops_sec_mean": 2535743.05,
-        "avg_latency_mean": 0.412,
-        "p99_latency_mean": 0.412
-      },
-      "LRANGE": {
-        "ops_sec_mean": 1438568.4249999998,
-        "avg_latency_mean": 0.7645,
-        "p99_latency_mean": 0.7645
-      },
-      "SADD": {
-        "ops_sec_mean": 2886847.375,
+        "ops_sec_mean": 2474211.56,
         "avg_latency_mean": 0.41000000000000003,
         "p99_latency_mean": 0.41000000000000003
       },
+      "INCR": {
+        "ops_sec_mean": 2637953.55,
+        "avg_latency_mean": 0.3855,
+        "p99_latency_mean": 0.3855
+      },
+      "MSET_5K": {
+        "ops_sec_mean": 344401.395,
+        "avg_latency_mean": 0.718,
+        "p99_latency_mean": 0.718
+      },
+      "MGET_5K": {
+        "ops_sec_mean": 530519.705,
+        "avg_latency_mean": 0.48450000000000004,
+        "p99_latency_mean": 0.48450000000000004
+      },
+      "HSET": {
+        "ops_sec_mean": 2224250.8,
+        "avg_latency_mean": 0.4475,
+        "p99_latency_mean": 0.4475
+      },
+      "HGET": {
+        "ops_sec_mean": 2624178.135,
+        "avg_latency_mean": 0.39549999999999996,
+        "p99_latency_mean": 0.39549999999999996
+      },
+      "LPUSH": {
+        "ops_sec_mean": 2049886.2400000002,
+        "avg_latency_mean": 0.5115000000000001,
+        "p99_latency_mean": 0.5115000000000001
+      },
+      "LPOP": {
+        "ops_sec_mean": 2757426.96,
+        "avg_latency_mean": 0.39749999999999996,
+        "p99_latency_mean": 0.39749999999999996
+      },
+      "LRANGE": {
+        "ops_sec_mean": 1415024.26,
+        "avg_latency_mean": 0.7415,
+        "p99_latency_mean": 0.7415
+      },
+      "SADD": {
+        "ops_sec_mean": 2818669.815,
+        "avg_latency_mean": 0.39849999999999997,
+        "p99_latency_mean": 0.39849999999999997
+      },
       "SISMEMBER": {
-        "ops_sec_mean": 2667067.9349999996,
-        "avg_latency_mean": 0.4195,
-        "p99_latency_mean": 0.4195
-      },
-      "ZADD": {
-        "ops_sec_mean": 2438814.695,
-        "avg_latency_mean": 0.4295,
-        "p99_latency_mean": 0.4295
-      },
-      "ZRANGE": {
-        "ops_sec_mean": 1981694.815,
-        "avg_latency_mean": 0.49650000000000005,
-        "p99_latency_mean": 0.49650000000000005
-      },
-      "DEL": {
-        "ops_sec_mean": 2530466.8899999997,
-        "avg_latency_mean": 0.379,
-        "p99_latency_mean": 0.379
-      },
-      "EXISTS": {
-        "ops_sec_mean": 2345576.675,
+        "ops_sec_mean": 2510706.645,
         "avg_latency_mean": 0.432,
         "p99_latency_mean": 0.432
+      },
+      "ZADD": {
+        "ops_sec_mean": 2142316.09,
+        "avg_latency_mean": 0.465,
+        "p99_latency_mean": 0.465
+      },
+      "ZRANGE": {
+        "ops_sec_mean": 2026174.28,
+        "avg_latency_mean": 0.497,
+        "p99_latency_mean": 0.497
+      },
+      "DEL": {
+        "ops_sec_mean": 2346140.4000000004,
+        "avg_latency_mean": 0.4085,
+        "p99_latency_mean": 0.4085
+      },
+      "EXISTS": {
+        "ops_sec_mean": 2101422.555,
+        "avg_latency_mean": 0.46299999999999997,
+        "p99_latency_mean": 0.46299999999999997
       }
     },
     "Rudis": {
       "SET": {
-        "ops_sec_mean": 1896885.9,
-        "avg_latency_mean": 0.5085,
-        "p99_latency_mean": 0.5085
+        "ops_sec_mean": 1522985.0,
+        "avg_latency_mean": 0.6995,
+        "p99_latency_mean": 0.6995
       },
       "GET": {
-        "ops_sec_mean": 1914780.6149999998,
-        "avg_latency_mean": 0.5495,
-        "p99_latency_mean": 0.5495
+        "ops_sec_mean": 2046177.855,
+        "avg_latency_mean": 0.5565,
+        "p99_latency_mean": 0.5565
       },
       "INCR": {
-        "ops_sec_mean": 1993452.0350000001,
-        "avg_latency_mean": 0.5465,
-        "p99_latency_mean": 0.5465
+        "ops_sec_mean": 2027142.36,
+        "avg_latency_mean": 0.5395,
+        "p99_latency_mean": 0.5395
       },
       "MSET_5K": {
-        "ops_sec_mean": 253746.95,
-        "avg_latency_mean": 1.011,
-        "p99_latency_mean": 1.011
+        "ops_sec_mean": 288332.54,
+        "avg_latency_mean": 0.9395,
+        "p99_latency_mean": 0.9395
       },
       "MGET_5K": {
-        "ops_sec_mean": 293391.5,
-        "avg_latency_mean": 0.788,
-        "p99_latency_mean": 0.788
+        "ops_sec_mean": 293380.65499999997,
+        "avg_latency_mean": 1.022,
+        "p99_latency_mean": 1.022
       },
       "HSET": {
-        "ops_sec_mean": 1952498.455,
-        "avg_latency_mean": 0.563,
-        "p99_latency_mean": 0.563
+        "ops_sec_mean": 1865956.9,
+        "avg_latency_mean": 0.6125,
+        "p99_latency_mean": 0.6125
       },
       "HGET": {
-        "ops_sec_mean": 2018412.8650000002,
-        "avg_latency_mean": 0.5409999999999999,
-        "p99_latency_mean": 0.5409999999999999
+        "ops_sec_mean": 1880718.5,
+        "avg_latency_mean": 0.5295,
+        "p99_latency_mean": 0.5295
       },
       "LPUSH": {
-        "ops_sec_mean": 1833661.6349999998,
-        "avg_latency_mean": 0.5555,
-        "p99_latency_mean": 0.5555
+        "ops_sec_mean": 1575988.0150000001,
+        "avg_latency_mean": 0.605,
+        "p99_latency_mean": 0.605
       },
       "LPOP": {
-        "ops_sec_mean": 1914669.77,
-        "avg_latency_mean": 0.553,
-        "p99_latency_mean": 0.553
+        "ops_sec_mean": 2167438.86,
+        "avg_latency_mean": 0.4645,
+        "p99_latency_mean": 0.4645
       },
       "LRANGE": {
-        "ops_sec_mean": 1597585.875,
-        "avg_latency_mean": 0.664,
-        "p99_latency_mean": 0.664
+        "ops_sec_mean": 1684795.7149999999,
+        "avg_latency_mean": 0.5920000000000001,
+        "p99_latency_mean": 0.5920000000000001
       },
       "SADD": {
-        "ops_sec_mean": 2020320.8900000001,
-        "avg_latency_mean": 0.5545,
-        "p99_latency_mean": 0.5545
+        "ops_sec_mean": 2031929.795,
+        "avg_latency_mean": 0.511,
+        "p99_latency_mean": 0.511
       },
       "SISMEMBER": {
-        "ops_sec_mean": 1665162.235,
-        "avg_latency_mean": 0.611,
-        "p99_latency_mean": 0.611
+        "ops_sec_mean": 2140968.19,
+        "avg_latency_mean": 0.4965,
+        "p99_latency_mean": 0.4965
       },
       "ZADD": {
-        "ops_sec_mean": 2005369.0699999998,
-        "avg_latency_mean": 0.5335,
-        "p99_latency_mean": 0.5335
+        "ops_sec_mean": 2163686.6100000003,
+        "avg_latency_mean": 0.48750000000000004,
+        "p99_latency_mean": 0.48750000000000004
       },
       "ZRANGE": {
-        "ops_sec_mean": 1992839.705,
-        "avg_latency_mean": 0.5605,
-        "p99_latency_mean": 0.5605
+        "ops_sec_mean": 1713410.4100000001,
+        "avg_latency_mean": 0.5785,
+        "p99_latency_mean": 0.5785
       },
       "DEL": {
-        "ops_sec_mean": 2446374.335,
-        "avg_latency_mean": 0.4905,
-        "p99_latency_mean": 0.4905
+        "ops_sec_mean": 1669051.645,
+        "avg_latency_mean": 0.5449999999999999,
+        "p99_latency_mean": 0.5449999999999999
       },
       "EXISTS": {
-        "ops_sec_mean": 1878640.245,
-        "avg_latency_mean": 0.476,
-        "p99_latency_mean": 0.476
+        "ops_sec_mean": 2074644.905,
+        "avg_latency_mean": 0.5565,
+        "p99_latency_mean": 0.5565
       }
     }
   },
