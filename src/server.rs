@@ -822,9 +822,9 @@ pub fn run_shard_worker(
                             let aof_ref = cross_shard_aof.as_deref();
                             let mut temp_buf = Vec::new();
                             let mut has_writes = false;
-                            for &mut (idx, key_hash, ref mut cmd) in items.iter_mut() {
+                            for (idx, key_hash, cmd) in items.drain(..) {
                                 temp_buf.clear();
-                                if let Command::Get(ref key) = *cmd {
+                                if let Command::Get(ref key) = cmd {
                                     match db.table.get_compact_with_hash(key.as_ref(), key_hash) {
                                         Ok(Some(resp)) => {
                                             results.push((idx, resp));
@@ -841,27 +841,22 @@ pub fn run_shard_worker(
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
                                     && let Command::Set {
-                                        ref mut key,
-                                        ref mut value,
+                                        key,
+                                        value,
                                         expire_in,
                                         condition: crate::resp::SetCondition::None,
                                         get: false,
                                         keepttl: false,
                                         past_expired: false,
-                                    } = *cmd
+                                    } = cmd
                                 {
                                     has_writes = true;
-                                    db.table.set_with_hash(
-                                        std::mem::take(key),
-                                        key_hash,
-                                        std::mem::take(value),
-                                        expire_in,
-                                    );
+                                    db.table.set_with_hash(key, key_hash, value, expire_in);
                                     results.push((idx, crate::shard::CompactResp::OK));
                                     continue;
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
-                                    && let Command::IncrBy(ref key, delta) = *cmd
+                                    && let Command::IncrBy(ref key, delta) = cmd
                                 {
                                     has_writes = true;
                                     match db.table.incr_by_slice_with_hash(key, key_hash, delta) {
@@ -882,13 +877,13 @@ pub fn run_shard_worker(
                                             crate::connection::write_resp_err(&mut temp_buf, err);
                                         }
                                     }
-                                } else if let Command::Exists(ref keys) = *cmd && keys.len() == 1 {
+                                } else if let Command::Exists(ref keys) = cmd && keys.len() == 1 {
                                     let exists = db.table.exists_with_hash(keys[0].as_ref(), key_hash);
                                     results.push((idx, if exists { crate::shard::CompactResp::INT_1 } else { crate::shard::CompactResp::INT_0 }));
                                     continue;
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
-                                    && let Command::Del(ref keys) = *cmd && keys.len() == 1
+                                    && let Command::Del(ref keys) = cmd && keys.len() == 1
                                 {
                                     let deleted = db.del_with_hash(keys[0].as_ref(), key_hash);
                                     if deleted {
@@ -901,7 +896,7 @@ pub fn run_shard_worker(
                                         results.push((idx, crate::shard::CompactResp::INT_0));
                                     }
                                     continue;
-                                } else if let Command::Hget { ref key, ref field } = *cmd {
+                                } else if let Command::Hget { ref key, ref field } = cmd {
                                     match db.table.hget_compact_with_hash(key.as_ref(), key_hash, field.as_ref()) {
                                         Ok(resp) => {
                                             results.push((idx, resp));
@@ -913,7 +908,7 @@ pub fn run_shard_worker(
                                     }
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
-                                    && let Command::Hset { ref key, ref fields } = *cmd
+                                    && let Command::Hset { ref key, ref fields } = cmd
                                 {
                                     has_writes = true;
                                     match db.table.hset_slice_with_hash(key, key_hash, fields) {
@@ -934,7 +929,7 @@ pub fn run_shard_worker(
                                             crate::connection::write_resp_err(&mut temp_buf, err);
                                         }
                                     }
-                                } else if let Command::Sismember { ref key, ref member } = *cmd {
+                                } else if let Command::Sismember { ref key, ref member } = cmd {
                                     match db.table.sismember_compact_with_hash(key.as_ref(), key_hash, member.as_ref()) {
                                         Ok(resp) => {
                                             results.push((idx, resp));
@@ -944,7 +939,7 @@ pub fn run_shard_worker(
                                     }
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
-                                    && let Command::Sadd { ref key, ref members } = *cmd
+                                    && let Command::Sadd { ref key, ref members } = cmd
                                 {
                                     has_writes = true;
                                     match db.table.sadd_slice_with_hash(key, key_hash, members) {
@@ -968,7 +963,7 @@ pub fn run_shard_worker(
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
                                     && !crate::block::has_blocked_waiters(cross_shard_router.port)
-                                    && let Command::Lpush { ref key, ref values } = *cmd
+                                    && let Command::Lpush { ref key, ref values } = cmd
                                 {
                                     has_writes = true;
                                     match db.table.lpush_slice_with_hash(key, key_hash, values) {
@@ -991,7 +986,7 @@ pub fn run_shard_worker(
                                     }
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
-                                    && let Command::Lpop { ref key, count } = *cmd
+                                    && let Command::Lpop { ref key, count } = cmd
                                 {
                                     if count.is_none() {
                                         match db.table.lpop_one_with_hash(key.as_ref(), key_hash) {
@@ -1026,7 +1021,7 @@ pub fn run_shard_worker(
                                             }
                                         }
                                     }
-                                } else if let Command::Lrange { ref key, start, stop } = *cmd {
+                                } else if let Command::Lrange { ref key, start, stop } = cmd {
                                     match db.table.lrange_compact_with_hash(key.as_ref(), key_hash, start, stop, &mut temp_buf) {
                                         Ok(resp) => {
                                             results.push((idx, resp));
@@ -1034,7 +1029,7 @@ pub fn run_shard_worker(
                                         }
                                         Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
                                     }
-                                } else if let Command::Zrange { ref key, ref opts } = *cmd {
+                                } else if let Command::Zrange { ref key, ref opts } = cmd {
                                     match db.table.zrange_compact_with_hash(key.as_ref(), key_hash, opts, is_resp3, &mut temp_buf) {
                                         Ok(resp) => {
                                             results.push((idx, resp));
@@ -1044,7 +1039,7 @@ pub fn run_shard_worker(
                                     }
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
-                                    && let Command::Zadd { ref key, ref elements, flags } = *cmd
+                                    && let Command::Zadd { ref key, ref elements, flags } = cmd
                                 {
                                     has_writes = true;
                                     match db.table.zadd_slice_with_hash(key, key_hash, elements, flags) {
@@ -1074,10 +1069,10 @@ pub fn run_shard_worker(
                                         }
                                     }
                                 } else {
-                                    if matches!(*cmd, Command::Set { .. } | Command::Del(_) | Command::IncrBy { .. }) {
+                                    if matches!(cmd, Command::Set { .. } | Command::Del(_) | Command::IncrBy { .. }) {
                                         has_writes = true;
                                     }
-                                    let _ = execute_local_command(cmd, &mut db, &mut temp_buf, aof_ref);
+                                    let _ = execute_local_command(&cmd, &mut db, &mut temp_buf, aof_ref);
                                 }
                                 results.push((idx, crate::shard::CompactResp::from_slice(&temp_buf)));
                             }
