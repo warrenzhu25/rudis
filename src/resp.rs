@@ -207,7 +207,7 @@ pub enum Command {
         with_match_len: bool,
     },
     Digest(Bytes),
-    Del(SmallVec<[Bytes; 1]>),
+    Del(Vec<Bytes>),
     Exists(SmallVec<[Bytes; 1]>),
     IncrBy(Bytes, i64),
     Expire(Bytes, Duration),
@@ -228,7 +228,7 @@ pub enum Command {
     },
     Hset {
         key: Bytes,
-        fields: SmallVec<[(Bytes, Bytes); 1]>,
+        fields: Vec<(Bytes, Bytes)>,
     },
     Hsetnx {
         key: Bytes,
@@ -237,7 +237,7 @@ pub enum Command {
     },
     Hmset {
         key: Bytes,
-        fields: SmallVec<[(Bytes, Bytes); 1]>,
+        fields: Vec<(Bytes, Bytes)>,
     },
     Hget {
         key: Bytes,
@@ -270,7 +270,7 @@ pub enum Command {
     // LIST COMMANDS
     Lpush {
         key: Bytes,
-        values: SmallVec<[Bytes; 1]>,
+        values: Vec<Bytes>,
     },
     Rpush {
         key: Bytes,
@@ -359,7 +359,7 @@ pub enum Command {
     // ZSET COMMANDS
     Zadd {
         key: Bytes,
-        elements: SmallVec<[(f64, Bytes); 1]>,
+        elements: Vec<(f64, Bytes)>,
         flags: crate::table::ZAddFlags,
     },
     Zrem {
@@ -1420,29 +1420,22 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
     }
 
     if is_small {
+        let frame = buf.split_to(scan_cursor).freeze();
         if num_args > 0 {
             let (cmd_start, cmd_len) = offsets[0];
-            let cmd_bytes = &buf[cmd_start..cmd_start + cmd_len];
+            let cmd_bytes = &frame[cmd_start..cmd_start + cmd_len];
             match cmd_len {
                 3 => {
                     if cmd_bytes.eq_ignore_ascii_case(b"GET") && num_args == 2 {
                         let (k_start, k_len) = offsets[1];
-                        buf.advance(k_start);
-                        let key = buf.split_to(k_len).freeze();
-                        buf.advance(scan_cursor - (k_start + k_len));
-                        return Ok(Some(Command::Get(key)));
+                        return Ok(Some(Command::Get(frame.slice(k_start..k_start + k_len))));
                     }
                     if cmd_bytes.eq_ignore_ascii_case(b"SET") && num_args == 3 {
                         let (k_start, k_len) = offsets[1];
                         let (v_start, v_len) = offsets[2];
-                        buf.advance(k_start);
-                        let key = buf.split_to(k_len).freeze();
-                        buf.advance(v_start - (k_start + k_len));
-                        let value = buf.split_to(v_len).freeze();
-                        buf.advance(scan_cursor - (v_start + v_len));
                         return Ok(Some(Command::Set {
-                            key,
-                            value,
+                            key: frame.slice(k_start..k_start + k_len),
+                            value: frame.slice(v_start..v_start + v_len),
                             expire_in: None,
                             condition: SetCondition::None,
                             get: false,
@@ -1452,94 +1445,69 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
                     }
                     if cmd_bytes.eq_ignore_ascii_case(b"DEL") && num_args == 2 {
                         let (k_start, k_len) = offsets[1];
-                        buf.advance(k_start);
-                        let key = buf.split_to(k_len).freeze();
-                        buf.advance(scan_cursor - (k_start + k_len));
-                        return Ok(Some(Command::Del(smallvec![key])));
+                        return Ok(Some(Command::Del(vec![
+                            frame.slice(k_start..k_start + k_len),
+                        ])));
                     }
                 }
                 4 => {
                     if cmd_bytes.eq_ignore_ascii_case(b"INCR") && num_args == 2 {
                         let (k_start, k_len) = offsets[1];
-                        buf.advance(k_start);
-                        let key = buf.split_to(k_len).freeze();
-                        buf.advance(scan_cursor - (k_start + k_len));
-                        return Ok(Some(Command::IncrBy(key, 1)));
+                        return Ok(Some(Command::IncrBy(
+                            frame.slice(k_start..k_start + k_len),
+                            1,
+                        )));
                     }
                     if cmd_bytes.eq_ignore_ascii_case(b"HGET") && num_args == 3 {
                         let (k_start, k_len) = offsets[1];
                         let (f_start, f_len) = offsets[2];
-                        buf.advance(k_start);
-                        let key = buf.split_to(k_len).freeze();
-                        buf.advance(f_start - (k_start + k_len));
-                        let field = buf.split_to(f_len).freeze();
-                        buf.advance(scan_cursor - (f_start + f_len));
-                        return Ok(Some(Command::Hget { key, field }));
+                        return Ok(Some(Command::Hget {
+                            key: frame.slice(k_start..k_start + k_len),
+                            field: frame.slice(f_start..f_start + f_len),
+                        }));
                     }
                     if cmd_bytes.eq_ignore_ascii_case(b"HSET") && num_args == 4 {
                         let (k_start, k_len) = offsets[1];
                         let (f_start, f_len) = offsets[2];
                         let (v_start, v_len) = offsets[3];
-                        buf.advance(k_start);
-                        let key = buf.split_to(k_len).freeze();
-                        buf.advance(f_start - (k_start + k_len));
-                        let field = buf.split_to(f_len).freeze();
-                        buf.advance(v_start - (f_start + f_len));
-                        let val = buf.split_to(v_len).freeze();
-                        buf.advance(scan_cursor - (v_start + v_len));
                         return Ok(Some(Command::Hset {
-                            key,
-                            fields: smallvec![(field, val)],
+                            key: frame.slice(k_start..k_start + k_len),
+                            fields: vec![(
+                                frame.slice(f_start..f_start + f_len),
+                                frame.slice(v_start..v_start + v_len),
+                            )],
                         }));
                     }
                     if cmd_bytes.eq_ignore_ascii_case(b"SADD") && num_args == 3 {
                         let (k_start, k_len) = offsets[1];
                         let (m_start, m_len) = offsets[2];
-                        buf.advance(k_start);
-                        let key = buf.split_to(k_len).freeze();
-                        buf.advance(m_start - (k_start + k_len));
-                        let member = buf.split_to(m_len).freeze();
-                        buf.advance(scan_cursor - (m_start + m_len));
                         return Ok(Some(Command::Sadd {
-                            key,
-                            members: smallvec![member],
+                            key: frame.slice(k_start..k_start + k_len),
+                            members: smallvec![frame.slice(m_start..m_start + m_len)],
                         }));
                     }
                     if cmd_bytes.eq_ignore_ascii_case(b"LPOP") && num_args == 2 {
                         let (k_start, k_len) = offsets[1];
-                        buf.advance(k_start);
-                        let key = buf.split_to(k_len).freeze();
-                        buf.advance(scan_cursor - (k_start + k_len));
-                        return Ok(Some(Command::Lpop { key, count: None }));
+                        return Ok(Some(Command::Lpop {
+                            key: frame.slice(k_start..k_start + k_len),
+                            count: None,
+                        }));
                     }
                     if cmd_bytes.eq_ignore_ascii_case(b"ZADD") && num_args == 4 {
                         let (k_start, k_len) = offsets[1];
                         let (s_start, s_len) = offsets[2];
                         let (m_start, m_len) = offsets[3];
-                        let s_bytes = &buf[s_start..s_start + s_len];
-                        let score_opt =
-                            if let Some(iv) = crate::table::RudisTable::parse_i64_bytes(s_bytes) {
-                                Some(iv as f64)
-                            } else {
-                                std::str::from_utf8(s_bytes)
-                                    .ok()
-                                    .and_then(|s| s.parse::<f64>().ok())
-                            };
-                        if let Some(score) = score_opt {
-                            buf.advance(k_start);
-                            let key = buf.split_to(k_len).freeze();
-                            buf.advance(m_start - (k_start + k_len));
-                            let member = buf.split_to(m_len).freeze();
-                            buf.advance(scan_cursor - (m_start + m_len));
+                        if let Ok(score_str) = std::str::from_utf8(&frame[s_start..s_start + s_len])
+                            && let Ok(score) = score_str.parse::<f64>()
+                        {
                             return Ok(Some(Command::Zadd {
-                                key,
-                                elements: smallvec![(score, member)],
+                                key: frame.slice(k_start..k_start + k_len),
+                                elements: vec![(score, frame.slice(m_start..m_start + m_len))],
                                 flags: crate::table::ZAddFlags::default(),
                             }));
                         }
                     }
                     if cmd_bytes.eq_ignore_ascii_case(b"PING") && num_args == 1 {
-                        buf.advance(scan_cursor);
                         return Ok(Some(Command::Ping(None)));
                     }
                 }
@@ -1547,59 +1515,51 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
                     if cmd_bytes.eq_ignore_ascii_case(b"LPUSH") && num_args == 3 {
                         let (k_start, k_len) = offsets[1];
                         let (v_start, v_len) = offsets[2];
-                        buf.advance(k_start);
-                        let key = buf.split_to(k_len).freeze();
-                        buf.advance(v_start - (k_start + k_len));
-                        let val = buf.split_to(v_len).freeze();
-                        buf.advance(scan_cursor - (v_start + v_len));
                         return Ok(Some(Command::Lpush {
-                            key,
-                            values: smallvec![val],
+                            key: frame.slice(k_start..k_start + k_len),
+                            values: vec![frame.slice(v_start..v_start + v_len)],
                         }));
                     }
                 }
                 6 => {
                     if cmd_bytes.eq_ignore_ascii_case(b"EXISTS") && num_args == 2 {
                         let (k_start, k_len) = offsets[1];
-                        buf.advance(k_start);
-                        let key = buf.split_to(k_len).freeze();
-                        buf.advance(scan_cursor - (k_start + k_len));
-                        return Ok(Some(Command::Exists(smallvec![key])));
+                        return Ok(Some(Command::Exists(smallvec![
+                            frame.slice(k_start..k_start + k_len),
+                        ])));
                     }
                     if cmd_bytes.eq_ignore_ascii_case(b"LRANGE")
                         && num_args == 4
                         && let (Some(start), Some(stop)) = (
                             crate::table::RudisTable::parse_i64_bytes(
-                                &buf[offsets[2].0..offsets[2].0 + offsets[2].1],
+                                &frame[offsets[2].0..offsets[2].0 + offsets[2].1],
                             ),
                             crate::table::RudisTable::parse_i64_bytes(
-                                &buf[offsets[3].0..offsets[3].0 + offsets[3].1],
+                                &frame[offsets[3].0..offsets[3].0 + offsets[3].1],
                             ),
                         )
                     {
                         let (k_start, k_len) = offsets[1];
-                        buf.advance(k_start);
-                        let key = buf.split_to(k_len).freeze();
-                        buf.advance(scan_cursor - (k_start + k_len));
-                        return Ok(Some(Command::Lrange { key, start, stop }));
+                        return Ok(Some(Command::Lrange {
+                            key: frame.slice(k_start..k_start + k_len),
+                            start,
+                            stop,
+                        }));
                     }
                     if cmd_bytes.eq_ignore_ascii_case(b"ZRANGE")
                         && num_args == 4
                         && let (Some(start), Some(stop)) = (
                             crate::table::RudisTable::parse_i64_bytes(
-                                &buf[offsets[2].0..offsets[2].0 + offsets[2].1],
+                                &frame[offsets[2].0..offsets[2].0 + offsets[2].1],
                             ),
                             crate::table::RudisTable::parse_i64_bytes(
-                                &buf[offsets[3].0..offsets[3].0 + offsets[3].1],
+                                &frame[offsets[3].0..offsets[3].0 + offsets[3].1],
                             ),
                         )
                     {
                         let (k_start, k_len) = offsets[1];
-                        buf.advance(k_start);
-                        let key = buf.split_to(k_len).freeze();
-                        buf.advance(scan_cursor - (k_start + k_len));
                         return Ok(Some(Command::Zrange {
-                            key,
+                            key: frame.slice(k_start..k_start + k_len),
                             opts: crate::table::ZRangeOpts {
                                 start,
                                 stop,
@@ -1611,17 +1571,14 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
                 9 if cmd_bytes.eq_ignore_ascii_case(b"SISMEMBER") && num_args == 3 => {
                     let (k_start, k_len) = offsets[1];
                     let (m_start, m_len) = offsets[2];
-                    buf.advance(k_start);
-                    let key = buf.split_to(k_len).freeze();
-                    buf.advance(m_start - (k_start + k_len));
-                    let member = buf.split_to(m_len).freeze();
-                    buf.advance(scan_cursor - (m_start + m_len));
-                    return Ok(Some(Command::Sismember { key, member }));
+                    return Ok(Some(Command::Sismember {
+                        key: frame.slice(k_start..k_start + k_len),
+                        member: frame.slice(m_start..m_start + m_len),
+                    }));
                 }
                 _ => {}
             }
         }
-        let frame = buf.split_to(scan_cursor).freeze();
         let mut args = Vec::with_capacity(num_args);
         for &(start, len) in offsets.iter().take(num_args) {
             args.push(frame.slice(start..start + len));
@@ -2237,7 +2194,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }))
             } else {
                 args.remove(0);
-                Ok(Some(Command::Del(SmallVec::from_vec(args))))
+                Ok(Some(Command::Del(args)))
             }
         }
         "EXISTS" => {
@@ -2904,7 +2861,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'hset' command".to_string());
             }
             let key = args[1].clone();
-            let mut fields = SmallVec::with_capacity((args.len() - 2) / 2);
+            let mut fields = Vec::with_capacity((args.len() - 2) / 2);
             let mut i = 2;
             while i < args.len() {
                 fields.push((args[i].clone(), args[i + 1].clone()));
@@ -2927,7 +2884,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'hmset' command".to_string());
             }
             let key = args[1].clone();
-            let mut fields = SmallVec::with_capacity((args.len() - 2) / 2);
+            let mut fields = Vec::with_capacity((args.len() - 2) / 2);
             let mut i = 2;
             while i < args.len() {
                 fields.push((args[i].clone(), args[i + 1].clone()));
@@ -3036,7 +2993,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             Ok(Some(Command::Lpush {
                 key: args[1].clone(),
-                values: SmallVec::from(&args[2..]),
+                values: args[2..].to_vec(),
             }))
         }
         "RPUSH" => {
@@ -3504,7 +3461,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if flags.incr && remaining.len() != 2 {
                 return Err("INCR option supports a single increment-element pair".to_string());
             }
-            let mut elements = SmallVec::with_capacity(remaining.len() / 2);
+            let mut elements = Vec::with_capacity(remaining.len() / 2);
             let mut j = 0;
             while j < remaining.len() {
                 let score_str =
@@ -8070,7 +8027,7 @@ mod tests {
             cmd,
             Command::Hset {
                 key: Bytes::from_static(b"myhash"),
-                fields: smallvec![
+                fields: vec![
                     (Bytes::from_static(b"f1"), Bytes::from_static(b"v1")),
                     (Bytes::from_static(b"f2"), Bytes::from_static(b"v2")),
                 ],
@@ -8748,72 +8705,7 @@ mod tests {
     }
 
     #[test]
-    fn test_resp_zero_alloc_smallvec_and_lrange_zrange_fast_path() {
-        // Single-key DEL uses inline SmallVec without heap spill
-        let mut buf = BytesMut::from("*2\r\n$3\r\nDEL\r\n$4\r\nmyk1\r\n");
-        let cmd = parse_command(&mut buf).unwrap().unwrap();
-        assert!(buf.is_empty());
-        match cmd {
-            Command::Del(keys) => {
-                assert_eq!(keys.len(), 1);
-                assert!(!keys.spilled());
-                assert_eq!(keys[0], Bytes::from_static(b"myk1"));
-            }
-            _ => panic!("Expected Del command"),
-        }
-
-        // Single-field HSET uses inline SmallVec without heap spill
-        let mut buf = BytesMut::from("*4\r\n$4\r\nHSET\r\n$4\r\nmyh1\r\n$2\r\nf1\r\n$2\r\nv1\r\n");
-        let cmd = parse_command(&mut buf).unwrap().unwrap();
-        assert!(buf.is_empty());
-        match cmd {
-            Command::Hset { key, fields } => {
-                assert_eq!(key, Bytes::from_static(b"myh1"));
-                assert_eq!(fields.len(), 1);
-                assert!(!fields.spilled());
-                assert_eq!(
-                    fields[0],
-                    (Bytes::from_static(b"f1"), Bytes::from_static(b"v1"))
-                );
-            }
-            _ => panic!("Expected Hset command"),
-        }
-
-        // Single-value LPUSH uses inline SmallVec without heap spill
-        let mut buf = BytesMut::from("*3\r\n$5\r\nLPUSH\r\n$4\r\nmyl1\r\n$4\r\nval1\r\n");
-        let cmd = parse_command(&mut buf).unwrap().unwrap();
-        assert!(buf.is_empty());
-        match cmd {
-            Command::Lpush { key, values } => {
-                assert_eq!(key, Bytes::from_static(b"myl1"));
-                assert_eq!(values.len(), 1);
-                assert!(!values.spilled());
-                assert_eq!(values[0], Bytes::from_static(b"val1"));
-            }
-            _ => panic!("Expected Lpush command"),
-        }
-
-        // Single-element ZADD uses inline SmallVec without heap spill
-        let mut buf =
-            BytesMut::from("*4\r\n$4\r\nZADD\r\n$4\r\nmyz1\r\n$3\r\n1.5\r\n$4\r\nmbr1\r\n");
-        let cmd = parse_command(&mut buf).unwrap().unwrap();
-        assert!(buf.is_empty());
-        match cmd {
-            Command::Zadd {
-                key,
-                elements,
-                flags,
-            } => {
-                assert_eq!(key, Bytes::from_static(b"myz1"));
-                assert_eq!(elements.len(), 1);
-                assert!(!elements.spilled());
-                assert_eq!(elements[0], (1.5, Bytes::from_static(b"mbr1")));
-                assert_eq!(flags, crate::table::ZAddFlags::default());
-            }
-            _ => panic!("Expected Zadd command"),
-        }
-
-        // Fast-path LRANGE and ZRANGE
+    fn test_resp_lrange_zrange_fast_slice_parser() {
         let mut buf = BytesMut::from(
             "*4\r\n$6\r\nLRANGE\r\n$4\r\nmyl1\r\n$1\r\n0\r\n$2\r\n10\r\n*4\r\n$6\r\nZRANGE\r\n$4\r\nmyz1\r\n$1\r\n0\r\n$2\r\n-1\r\n",
         );

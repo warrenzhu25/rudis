@@ -1460,8 +1460,7 @@ impl Router {
             let deleted = self.local_db.borrow_mut().del(&key);
             if deleted
                 && let Some(aof) = &self.aof
-                && let Some(bytes) =
-                    crate::aof::command_to_resp(&Command::Del(smallvec::smallvec![key]))
+                && let Some(bytes) = crate::aof::command_to_resp(&Command::Del(vec![key]))
             {
                 aof.borrow_mut().append(&bytes);
             }
@@ -1477,7 +1476,7 @@ impl Router {
         }
     }
 
-    pub async fn del_keys(&self, mut keys: smallvec::SmallVec<[Bytes; 1]>) -> usize {
+    pub async fn del_keys(&self, mut keys: Vec<Bytes>) -> usize {
         if keys.is_empty() {
             return 0;
         }
@@ -1492,7 +1491,7 @@ impl Router {
 
         if self.num_shards <= 1 {
             let mut count = 0;
-            let mut deleted_keys = smallvec::SmallVec::with_capacity(keys.len());
+            let mut deleted_keys = Vec::with_capacity(keys.len());
             {
                 let mut db = self.local_db.borrow_mut();
                 for k in keys {
@@ -1529,7 +1528,7 @@ impl Router {
         // 1. Delete all local keys directly in-place
         let mut total_deleted = 0;
         if !local_keys.is_empty() {
-            let mut deleted_local = smallvec::SmallVec::with_capacity(local_keys.len());
+            let mut deleted_local = Vec::with_capacity(local_keys.len());
             {
                 let mut db = self.local_db.borrow_mut();
                 for k in local_keys {
@@ -3602,11 +3601,7 @@ mod tests {
 
             // Delete both keys in parallel plus a non-existent key
             let deleted = router
-                .del_keys(smallvec::smallvec![
-                    k0.clone(),
-                    k1.clone(),
-                    Bytes::from("missing")
-                ])
+                .del_keys(vec![k0.clone(), k1.clone(), Bytes::from("missing")])
                 .await;
             assert_eq!(deleted, 2);
 

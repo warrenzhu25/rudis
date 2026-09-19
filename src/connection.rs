@@ -911,9 +911,13 @@ pub async fn handle_connection(
                 // 1. Parse all complete commands currently in the buffer
                 commands.clear();
                 let mut should_quit = false;
+                let mut has_special = in_multi;
                 while !buf.is_empty() {
                     match parse_command(&mut buf) {
                         Ok(Some(cmd)) => {
+                            if !has_special && is_special_pipeline_cmd(&cmd) {
+                                has_special = true;
+                            }
                             commands.push(cmd);
                         }
                         Ok(None) => {
@@ -942,9 +946,10 @@ pub async fn handle_connection(
                 }
 
                 // 2. Transition to Pub/Sub mode if SUBSCRIBE or PSUBSCRIBE is received
-                if let Some(sub_idx) = commands
-                    .iter()
-                    .position(|c| matches!(c, Command::Subscribe(_) | Command::Psubscribe(_)))
+                if has_special
+                    && let Some(sub_idx) = commands
+                        .iter()
+                        .position(|c| matches!(c, Command::Subscribe(_) | Command::Psubscribe(_)))
                 {
                     for c in commands.drain(..sub_idx) {
                         let _ = execute_command(
@@ -978,9 +983,10 @@ pub async fn handle_connection(
                 }
 
                 // 2.5 Transition to Replica Stream mode if PSYNC is received
-                if let Some(psync_idx) = commands
-                    .iter()
-                    .position(|c| matches!(c, Command::Psync { .. }))
+                if has_special
+                    && let Some(psync_idx) = commands
+                        .iter()
+                        .position(|c| matches!(c, Command::Psync { .. }))
                 {
                     for c in commands.drain(..psync_idx) {
                         let _ = execute_command(
@@ -1013,17 +1019,18 @@ pub async fn handle_connection(
 
                 // 3. Execute parsed commands with transaction support and pipeline squashing
                 if !commands.is_empty() {
-                    let has_tx = in_multi
-                        || commands.iter().any(|c| {
-                            matches!(
-                                c,
-                                Command::Multi
-                                    | Command::Exec
-                                    | Command::Discard
-                                    | Command::Watch(_)
-                                    | Command::Unwatch
-                            )
-                        });
+                    let has_tx = has_special
+                        && (in_multi
+                            || commands.iter().any(|c| {
+                                matches!(
+                                    c,
+                                    Command::Multi
+                                        | Command::Exec
+                                        | Command::Discard
+                                        | Command::Watch(_)
+                                        | Command::Unwatch
+                                )
+                            }));
 
                     if has_tx {
                         for cmd in commands.drain(..) {
@@ -1233,26 +1240,28 @@ pub async fn handle_connection(
                                 }
                             }
                         }
-                    } else if commands.iter().any(|c| {
-                        matches!(
-                            c,
-                            Command::Blpop { .. }
-                                | Command::Brpop { .. }
-                                | Command::Blmove { .. }
-                                | Command::Blmpop { .. }
-                                | Command::Bzpopmin { .. }
-                                | Command::Bzpopmax { .. }
-                                | Command::Bzmpop { .. }
-                                | Command::Xread {
-                                    block_ms: Some(_),
-                                    ..
-                                }
-                                | Command::Xreadgroup {
-                                    block_ms: Some(_),
-                                    ..
-                                }
-                        )
-                    }) {
+                    } else if has_special
+                        && commands.iter().any(|c| {
+                            matches!(
+                                c,
+                                Command::Blpop { .. }
+                                    | Command::Brpop { .. }
+                                    | Command::Blmove { .. }
+                                    | Command::Blmpop { .. }
+                                    | Command::Bzpopmin { .. }
+                                    | Command::Bzpopmax { .. }
+                                    | Command::Bzmpop { .. }
+                                    | Command::Xread {
+                                        block_ms: Some(_),
+                                        ..
+                                    }
+                                    | Command::Xreadgroup {
+                                        block_ms: Some(_),
+                                        ..
+                                    }
+                            )
+                        })
+                    {
                         for cmd in commands.drain(..) {
                             if matches!(
                                 cmd,
@@ -1325,6 +1334,7 @@ pub async fn handle_connection(
                     } else {
                         let quit = execute_commands_squashed(
                             &mut commands,
+                            has_special,
                             &router,
                             &responders,
                             &mut remote_batches,
@@ -2108,12 +2118,12 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
             }
         }
 
-        Command::Mget(keys) | Command::Touch(keys) => {
+        Command::Mget(keys) | Command::Del(keys) | Command::Touch(keys) => {
             for k in keys {
                 f(k.as_ref());
             }
         }
-        Command::Del(keys) | Command::Exists(keys) => {
+        Command::Exists(keys) => {
             for k in keys {
                 f(k.as_ref());
             }
@@ -3526,9 +3536,7 @@ async fn execute_command(
                         db.del(&key);
                         if let Some(aof) = &router.aof
                             && let Some(bytes) =
-                                crate::aof::command_to_resp(&Command::Del(smallvec::smallvec![
-                                    key.clone()
-                                ]))
+                                crate::aof::command_to_resp(&Command::Del(vec![key.clone()]))
                         {
                             aof.borrow_mut().append(&bytes);
                         }
@@ -12133,8 +12141,53 @@ pub fn execute_local_command(
     }
 }
 
+#[inline(always)]
+fn is_special_pipeline_cmd(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Subscribe(_)
+            | Command::Psubscribe(_)
+            | Command::Psync { .. }
+            | Command::Multi
+            | Command::Exec
+            | Command::Discard
+            | Command::Watch(_)
+            | Command::Unwatch
+            | Command::Blpop { .. }
+            | Command::Brpop { .. }
+            | Command::Blmove { .. }
+            | Command::Blmpop { .. }
+            | Command::Bzpopmin { .. }
+            | Command::Bzpopmax { .. }
+            | Command::Bzmpop { .. }
+            | Command::Hello { .. }
+            | Command::Reset
+            | Command::Auth { .. }
+            | Command::Acl(_)
+            | Command::Tier(_)
+            | Command::ConfigGet(_)
+            | Command::ConfigSet(_, _)
+            | Command::Xread {
+                block_ms: Some(_),
+                ..
+            }
+            | Command::Xreadgroup {
+                block_ms: Some(_),
+                ..
+            }
+            | Command::DflyCluster(_)
+            | Command::DflyMigrate(_)
+            | Command::Stick(_)
+            | Command::Unstick(_)
+            | Command::MemcachedStats
+            | Command::MemcachedVersion
+            | Command::MemcachedQuit
+    )
+}
+
 async fn execute_commands_squashed(
     commands: &mut Vec<Command>,
+    has_special: bool,
     router: &Router,
     responders: &[std::sync::Arc<crate::mailbox::BatchResponder>],
     remote_batches: &mut [Vec<(usize, u64, Command)>],
@@ -12178,100 +12231,73 @@ async fn execute_commands_squashed(
             None
         };
         let my_slots_guard = hub.as_ref().map(|h| h.my_slots.read().unwrap());
-        for cmd in commands.iter() {
-            if matches!(
-                cmd,
-                Command::Blpop { .. }
-                    | Command::Brpop { .. }
-                    | Command::Blmove { .. }
-                    | Command::Blmpop { .. }
-                    | Command::Hello { .. }
-                    | Command::Reset
-                    | Command::Auth { .. }
-                    | Command::Acl(_)
-                    | Command::Tier(_)
-                    | Command::ConfigGet(_)
-                    | Command::ConfigSet(_, _)
-                    | Command::Xread {
-                        block_ms: Some(_),
-                        ..
-                    }
-                    | Command::Xreadgroup {
-                        block_ms: Some(_),
-                        ..
-                    }
-                    | Command::DflyCluster(_)
-                    | Command::DflyMigrate(_)
-                    | Command::Stick(_)
-                    | Command::Unstick(_)
-                    | Command::MemcachedStats
-                    | Command::MemcachedVersion
-                    | Command::MemcachedQuit
-                    | Command::Watch(_)
-                    | Command::Unwatch
-            ) {
-                can_squash = false;
-                break;
-            }
-            if let Some(user) = &user {
-                let cmd_name = get_cmd_name(cmd);
-                if !user.can_execute_command(cmd_name) {
+        let is_cluster = router.cluster_enabled || my_slots_guard.is_some();
+        if has_special || user.is_some() || is_cluster {
+            for cmd in commands.iter() {
+                if is_special_pipeline_cmd(cmd) {
                     can_squash = false;
                     break;
                 }
-                let mut forbidden = false;
-                for_each_cmd_key(cmd, |k| {
-                    if !user.can_access_key(k) {
-                        forbidden = true;
+                if let Some(user) = &user {
+                    let cmd_name = get_cmd_name(cmd);
+                    if !user.can_execute_command(cmd_name) {
+                        can_squash = false;
+                        break;
                     }
-                });
-                if forbidden {
-                    can_squash = false;
-                    break;
+                    let mut forbidden = false;
+                    for_each_cmd_key(cmd, |k| {
+                        if !user.can_access_key(k) {
+                            forbidden = true;
+                        }
+                    });
+                    if forbidden {
+                        can_squash = false;
+                        break;
+                    }
                 }
-            }
-            let is_cluster = router.cluster_enabled || my_slots_guard.is_some();
-            if is_cluster {
-                let mut first_slot: Option<u16> = None;
-                let mut invalid_slot = false;
-                let mut has_keys = false;
-                for_each_cmd_key(cmd, |k| {
-                    has_keys = true;
-                    let slot = key_slot(k);
-                    if let Some(fs) = first_slot {
-                        if fs != slot {
+                if is_cluster {
+                    let mut first_slot: Option<u16> = None;
+                    let mut invalid_slot = false;
+                    let mut has_keys = false;
+                    for_each_cmd_key(cmd, |k| {
+                        has_keys = true;
+                        let slot = key_slot(k);
+                        if let Some(fs) = first_slot {
+                            if fs != slot {
+                                invalid_slot = true;
+                            }
+                        } else {
+                            first_slot = Some(slot);
+                        }
+                        if router.slot_states.borrow()[slot as usize]
+                            != crate::shard::SlotState::Stable
+                        {
                             invalid_slot = true;
                         }
-                    } else {
-                        first_slot = Some(slot);
+                        if let Some(my_slots) = &my_slots_guard {
+                            let owns_slot = my_slots.iter().any(|&(s, e)| slot >= s && slot <= e);
+                            if !owns_slot {
+                                invalid_slot = true;
+                            }
+                        }
+                    });
+                    if invalid_slot {
+                        can_squash = false;
+                        break;
                     }
-                    if router.slot_states.borrow()[slot as usize] != crate::shard::SlotState::Stable
+                    if !has_keys
+                        && !matches!(
+                            cmd,
+                            Command::Ping(_)
+                                | Command::CommandDocs
+                                | Command::Quit
+                                | Command::Time
+                                | Command::Echo(_)
+                        )
                     {
-                        invalid_slot = true;
+                        can_squash = false;
+                        break;
                     }
-                    if let Some(my_slots) = &my_slots_guard {
-                        let owns_slot = my_slots.iter().any(|&(s, e)| slot >= s && slot <= e);
-                        if !owns_slot {
-                            invalid_slot = true;
-                        }
-                    }
-                });
-                if invalid_slot {
-                    can_squash = false;
-                    break;
-                }
-                if !has_keys
-                    && !matches!(
-                        cmd,
-                        Command::Ping(_)
-                            | Command::CommandDocs
-                            | Command::Quit
-                            | Command::Time
-                            | Command::Echo(_)
-                    )
-                {
-                    can_squash = false;
-                    break;
                 }
             }
         }
@@ -12315,396 +12341,13 @@ async fn execute_commands_squashed(
         batch.clear();
     }
 
-    // 1. Process local shard commands immediately; bucket remote commands by shard
-    let mut has_local_writes = false;
+    // 1. Bucket sharded commands by target shard (including local shard) so remote batches
+    //    can be dispatched BEFORE executing local shard commands, overlapping 100% of local
+    //    shard work with parallel remote shard execution.
     for (idx, cmd) in commands.drain(..).enumerate() {
         if let Some((target, key_hash)) = target_shard_and_hash_of_cmd(&cmd, router.num_shards) {
-            if target == router.shard_id {
-                local_buf.clear();
-                if let Command::Get(ref key) = cmd {
-                    let compact_res = router
-                        .local_db
-                        .borrow_mut()
-                        .table
-                        .get_compact_with_hash(key.as_ref(), key_hash);
-                    match compact_res {
-                        Ok(Some(resp)) => {
-                            responses[idx] = resp;
-                            continue;
-                        }
-                        Ok(None) => {
-                            let is_tiered = router.local_db.borrow().tier_manager.is_some()
-                                && router.local_db.borrow_mut().table.is_tiered(key).is_some();
-                            if is_tiered {
-                                if let Some(v) = router.stream_cold_read_local(key).await {
-                                    responses[idx] = CompactResp::Bulk(v);
-                                } else {
-                                    responses[idx] = crate::shard::CompactResp::NULL;
-                                }
-                            } else {
-                                responses[idx] = crate::shard::CompactResp::NULL;
-                            }
-                            continue;
-                        }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
-                        }
-                    }
-                } else if router.aof.is_none()
-                    && !crate::replication::has_connected_replicas(router.port)
-                    && let Command::Set {
-                        key,
-                        value,
-                        expire_in,
-                        condition: crate::resp::SetCondition::None,
-                        get: false,
-                        keepttl: false,
-                        past_expired: false,
-                    } = cmd
-                {
-                    has_local_writes = true;
-                    router
-                        .local_db
-                        .borrow_mut()
-                        .table
-                        .set_with_hash(key, key_hash, value, expire_in);
-                    responses[idx] = crate::shard::CompactResp::OK;
-                    continue;
-                } else if router.aof.is_none()
-                    && !crate::replication::has_connected_replicas(router.port)
-                    && let Command::IncrBy(ref key, delta) = cmd
-                {
-                    has_local_writes = true;
-                    match router
-                        .local_db
-                        .borrow_mut()
-                        .table
-                        .incr_by_slice_with_hash(key, key_hash, delta)
-                    {
-                        Ok(val) => {
-                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                                touch_watched_key(router.port, key.as_ref());
-                            }
-                            if val == 1 {
-                                responses[idx] = crate::shard::CompactResp::INT_1;
-                            } else if val == 0 {
-                                responses[idx] = crate::shard::CompactResp::INT_0;
-                            } else {
-                                responses[idx] = crate::shard::CompactResp::from_integer(val);
-                            }
-                            continue;
-                        }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
-                        }
-                    }
-                } else if let Command::Exists(ref keys) = cmd
-                    && keys.len() == 1
-                {
-                    let exists = router
-                        .local_db
-                        .borrow_mut()
-                        .table
-                        .exists_with_hash(keys[0].as_ref(), key_hash);
-                    responses[idx] = if exists {
-                        crate::shard::CompactResp::INT_1
-                    } else {
-                        crate::shard::CompactResp::INT_0
-                    };
-                    continue;
-                } else if router.aof.is_none()
-                    && !crate::replication::has_connected_replicas(router.port)
-                    && let Command::Del(ref keys) = cmd
-                    && keys.len() == 1
-                {
-                    let deleted = router
-                        .local_db
-                        .borrow_mut()
-                        .del_with_hash(keys[0].as_ref(), key_hash);
-                    if deleted {
-                        has_local_writes = true;
-                        if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                            touch_watched_key(router.port, keys[0].as_ref());
-                        }
-                        responses[idx] = crate::shard::CompactResp::INT_1;
-                    } else {
-                        responses[idx] = crate::shard::CompactResp::INT_0;
-                    }
-                    continue;
-                } else if let Command::Hget { ref key, ref field } = cmd {
-                    match router.local_db.borrow_mut().table.hget_compact_with_hash(
-                        key.as_ref(),
-                        key_hash,
-                        field.as_ref(),
-                    ) {
-                        Ok(resp) => {
-                            responses[idx] = resp;
-                            continue;
-                        }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
-                        }
-                    }
-                } else if router.aof.is_none()
-                    && !crate::replication::has_connected_replicas(router.port)
-                    && let Command::Hset {
-                        ref key,
-                        ref fields,
-                    } = cmd
-                {
-                    has_local_writes = true;
-                    match router
-                        .local_db
-                        .borrow_mut()
-                        .table
-                        .hset_slice_with_hash(key, key_hash, fields)
-                    {
-                        Ok(count) => {
-                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                                touch_watched_key(router.port, key.as_ref());
-                            }
-                            if count == 1 {
-                                responses[idx] = crate::shard::CompactResp::INT_1;
-                            } else if count == 0 {
-                                responses[idx] = crate::shard::CompactResp::INT_0;
-                            } else {
-                                responses[idx] =
-                                    crate::shard::CompactResp::from_integer(count as i64);
-                            }
-                            continue;
-                        }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
-                        }
-                    }
-                } else if let Command::Sismember {
-                    ref key,
-                    ref member,
-                } = cmd
-                {
-                    match router
-                        .local_db
-                        .borrow_mut()
-                        .table
-                        .sismember_compact_with_hash(key.as_ref(), key_hash, member.as_ref())
-                    {
-                        Ok(resp) => {
-                            responses[idx] = resp;
-                            continue;
-                        }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
-                        }
-                    }
-                } else if router.aof.is_none()
-                    && !crate::replication::has_connected_replicas(router.port)
-                    && let Command::Sadd {
-                        ref key,
-                        ref members,
-                    } = cmd
-                {
-                    has_local_writes = true;
-                    match router
-                        .local_db
-                        .borrow_mut()
-                        .table
-                        .sadd_slice_with_hash(key, key_hash, members)
-                    {
-                        Ok(count) => {
-                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                                touch_watched_key(router.port, key.as_ref());
-                            }
-                            if count == 1 {
-                                responses[idx] = crate::shard::CompactResp::INT_1;
-                            } else if count == 0 {
-                                responses[idx] = crate::shard::CompactResp::INT_0;
-                            } else {
-                                responses[idx] =
-                                    crate::shard::CompactResp::from_integer(count as i64);
-                            }
-                            continue;
-                        }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
-                        }
-                    }
-                } else if router.aof.is_none()
-                    && !crate::replication::has_connected_replicas(router.port)
-                    && let Command::Zadd {
-                        ref key,
-                        ref elements,
-                        flags,
-                    } = cmd
-                {
-                    has_local_writes = true;
-                    match router
-                        .local_db
-                        .borrow_mut()
-                        .table
-                        .zadd_slice_with_hash(key, key_hash, elements, flags)
-                    {
-                        Ok((count, incr_score)) => {
-                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                                touch_watched_key(router.port, key.as_ref());
-                            }
-                            if flags.incr {
-                                local_buf.clear();
-                                if let Some(score) = incr_score {
-                                    write_resp_score(&mut local_buf, score);
-                                } else {
-                                    write_resp_null(&mut local_buf);
-                                }
-                                responses[idx] = CompactResp::from_slice(&local_buf);
-                            } else if count == 1 {
-                                responses[idx] = crate::shard::CompactResp::INT_1;
-                            } else if count == 0 {
-                                responses[idx] = crate::shard::CompactResp::INT_0;
-                            } else {
-                                responses[idx] =
-                                    crate::shard::CompactResp::from_integer(count as i64);
-                            }
-                            continue;
-                        }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
-                        }
-                    }
-                } else if router.aof.is_none()
-                    && !crate::replication::has_connected_replicas(router.port)
-                    && !crate::block::has_blocked_waiters(router.port)
-                    && let Command::Lpush {
-                        ref key,
-                        ref values,
-                    } = cmd
-                {
-                    has_local_writes = true;
-                    match router
-                        .local_db
-                        .borrow_mut()
-                        .table
-                        .lpush_slice_with_hash(key, key_hash, values)
-                    {
-                        Ok(len) => {
-                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                                touch_watched_key(router.port, key.as_ref());
-                            }
-                            if len == 1 {
-                                responses[idx] = crate::shard::CompactResp::INT_1;
-                            } else if len == 0 {
-                                responses[idx] = crate::shard::CompactResp::INT_0;
-                            } else {
-                                responses[idx] =
-                                    crate::shard::CompactResp::from_integer(len as i64);
-                            }
-                            continue;
-                        }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
-                        }
-                    }
-                } else if router.aof.is_none()
-                    && !crate::replication::has_connected_replicas(router.port)
-                    && let Command::Lpop { ref key, count } = cmd
-                {
-                    if count.is_none() {
-                        match router
-                            .local_db
-                            .borrow_mut()
-                            .table
-                            .lpop_one_with_hash(key.as_ref(), key_hash)
-                        {
-                            Ok(Some(v)) => {
-                                has_local_writes = true;
-                                if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                                    touch_watched_key(router.port, key.as_ref());
-                                }
-                                responses[idx] = CompactResp::from_owned_bulk(v);
-                                continue;
-                            }
-                            Ok(None) => {
-                                responses[idx] = crate::shard::CompactResp::NULL;
-                                continue;
-                            }
-                            Err(err) => {
-                                write_resp_err(&mut local_buf, err);
-                            }
-                        }
-                    } else {
-                        match router.local_db.borrow_mut().write_lpop_resp(
-                            key.as_ref(),
-                            count,
-                            &mut local_buf,
-                        ) {
-                            Ok(has_pop) => {
-                                if has_pop {
-                                    has_local_writes = true;
-                                    if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                                        touch_watched_key(router.port, key.as_ref());
-                                    }
-                                }
-                            }
-                            Err(err) => {
-                                write_resp_err(&mut local_buf, err);
-                            }
-                        }
-                    }
-                } else if let Command::Lrange {
-                    ref key,
-                    start,
-                    stop,
-                } = cmd
-                {
-                    match router.local_db.borrow_mut().table.lrange_compact_with_hash(
-                        key.as_ref(),
-                        key_hash,
-                        start,
-                        stop,
-                        &mut local_buf,
-                    ) {
-                        Ok(resp) => {
-                            responses[idx] = resp;
-                            continue;
-                        }
-                        Err(err) => write_resp_err(&mut local_buf, err),
-                    }
-                } else if let Command::Zrange { ref key, ref opts } = cmd {
-                    let is_resp3 = CURRENT_CLIENT_RESP3.get();
-                    match router.local_db.borrow_mut().table.zrange_compact_with_hash(
-                        key.as_ref(),
-                        key_hash,
-                        opts,
-                        is_resp3,
-                        &mut local_buf,
-                    ) {
-                        Ok(resp) => {
-                            responses[idx] = resp;
-                            continue;
-                        }
-                        Err(err) => write_resp_err(&mut local_buf, err),
-                    }
-                } else {
-                    if matches!(
-                        cmd,
-                        Command::Set { .. } | Command::Del(_) | Command::IncrBy { .. }
-                    ) {
-                        has_local_writes = true;
-                    }
-                    if execute_local_command(
-                        &cmd,
-                        &mut router.local_db.borrow_mut(),
-                        &mut local_buf,
-                        router.aof.as_deref(),
-                    ) {
-                        should_close = true;
-                    }
-                }
-                responses[idx] = CompactResp::from_vec(std::mem::take(&mut local_buf));
-            } else {
-                remote_batches[target].push((idx, key_hash, cmd));
-            }
+            remote_batches[target].push((idx, key_hash, cmd));
         } else if let Command::Mget(keys) = cmd {
-            // Cross-shard MGET: dispatch the scatter now, gather after every other
-            // command in this pipeline has also been dispatched.
             if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
                 for key in &keys {
                     record_client_read(router.port, client_id, key.as_ref());
@@ -12716,7 +12359,6 @@ async fn execute_commands_squashed(
                 None => responses[idx] = CompactResp::from_vec(std::mem::take(&mut local_buf)),
             }
         } else if let Command::Mset(pairs) = cmd {
-            // Cross-shard MSET: same deferred-gather treatment as MGET.
             if crate::replication::has_connected_replicas(router.port)
                 && let Some(bytes) = crate::aof::command_to_resp(&Command::Mset(pairs.clone()))
             {
@@ -12756,7 +12398,6 @@ async fn execute_commands_squashed(
             }
             responses[idx] = CompactResp::from_vec(std::mem::take(&mut local_buf));
         } else {
-            // Non-sharded simple commands (PING, QUIT, COMMAND DOCS) run locally
             local_buf.clear();
             if execute_local_command(
                 &cmd,
@@ -12770,17 +12411,13 @@ async fn execute_commands_squashed(
         }
     }
 
-    if has_local_writes {
-        router.check_auto_tier_after_write();
-    }
-
-    // 2. Dispatch batched hops to all remote shards in parallel using pre-allocated channels
+    // 2. Dispatch batched hops to all remote shards FIRST so remote CPU cores start immediately
     let mut pending: smallvec::SmallVec<[&std::sync::Arc<crate::mailbox::BatchResponder>; 32]> =
         smallvec::SmallVec::new();
+    let is_resp3 = CURRENT_CLIENT_RESP3.get();
     for (target_shard, items) in remote_batches.iter_mut().enumerate() {
-        if !items.is_empty() {
+        if target_shard != router.shard_id && !items.is_empty() {
             let responder = &responders[target_shard];
-            let is_resp3 = CURRENT_CLIENT_RESP3.get();
             let next_items = items_pool.pop().unwrap_or_else(|| Vec::with_capacity(64));
             let results = results_pool.pop().unwrap_or_else(|| Vec::with_capacity(64));
             let msg = ShardMessage::Batch {
@@ -12795,16 +12432,403 @@ async fn execute_commands_squashed(
         }
     }
 
-    // 3. Await parallel responses from all remote shards with lock-free spin-wait before async yield
+    // 2.5 Execute local shard commands concurrently while remote shards process their batches
+    let mut has_local_writes = false;
+    let local_items = &mut remote_batches[router.shard_id];
+    for (idx, key_hash, cmd) in local_items.drain(..) {
+        local_buf.clear();
+        if let Command::Get(ref key) = cmd {
+            let compact_res = router
+                .local_db
+                .borrow_mut()
+                .table
+                .get_compact_with_hash(key.as_ref(), key_hash);
+            match compact_res {
+                Ok(Some(resp)) => {
+                    responses[idx] = resp;
+                    continue;
+                }
+                Ok(None) => {
+                    let is_tiered = router.local_db.borrow().tier_manager.is_some()
+                        && router.local_db.borrow_mut().table.is_tiered(key).is_some();
+                    if is_tiered {
+                        if let Some(v) = router.stream_cold_read_local(key).await {
+                            responses[idx] = CompactResp::Bulk(v);
+                        } else {
+                            responses[idx] = crate::shard::CompactResp::NULL;
+                        }
+                    } else {
+                        responses[idx] = crate::shard::CompactResp::NULL;
+                    }
+                    continue;
+                }
+                Err(err) => {
+                    write_resp_err(&mut local_buf, err);
+                }
+            }
+        } else if router.aof.is_none()
+            && !crate::replication::has_connected_replicas(router.port)
+            && let Command::Set {
+                key,
+                value,
+                expire_in,
+                condition: crate::resp::SetCondition::None,
+                get: false,
+                keepttl: false,
+                past_expired: false,
+            } = cmd
+        {
+            has_local_writes = true;
+            router
+                .local_db
+                .borrow_mut()
+                .table
+                .set_with_hash(key, key_hash, value, expire_in);
+            responses[idx] = crate::shard::CompactResp::OK;
+            continue;
+        } else if router.aof.is_none()
+            && !crate::replication::has_connected_replicas(router.port)
+            && let Command::IncrBy(ref key, delta) = cmd
+        {
+            has_local_writes = true;
+            match router
+                .local_db
+                .borrow_mut()
+                .table
+                .incr_by_slice_with_hash(key, key_hash, delta)
+            {
+                Ok(val) => {
+                    if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                        touch_watched_key(router.port, key.as_ref());
+                    }
+                    if val == 1 {
+                        responses[idx] = crate::shard::CompactResp::INT_1;
+                    } else if val == 0 {
+                        responses[idx] = crate::shard::CompactResp::INT_0;
+                    } else {
+                        responses[idx] = crate::shard::CompactResp::from_integer(val);
+                    }
+                    continue;
+                }
+                Err(err) => {
+                    write_resp_err(&mut local_buf, err);
+                }
+            }
+        } else if let Command::Exists(ref keys) = cmd
+            && keys.len() == 1
+        {
+            let exists = router
+                .local_db
+                .borrow_mut()
+                .table
+                .exists_with_hash(keys[0].as_ref(), key_hash);
+            responses[idx] = if exists {
+                crate::shard::CompactResp::INT_1
+            } else {
+                crate::shard::CompactResp::INT_0
+            };
+            continue;
+        } else if router.aof.is_none()
+            && !crate::replication::has_connected_replicas(router.port)
+            && let Command::Del(ref keys) = cmd
+            && keys.len() == 1
+        {
+            let deleted = router
+                .local_db
+                .borrow_mut()
+                .del_with_hash(keys[0].as_ref(), key_hash);
+            if deleted {
+                has_local_writes = true;
+                if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                    touch_watched_key(router.port, keys[0].as_ref());
+                }
+                responses[idx] = crate::shard::CompactResp::INT_1;
+            } else {
+                responses[idx] = crate::shard::CompactResp::INT_0;
+            }
+            continue;
+        } else if let Command::Hget { ref key, ref field } = cmd {
+            match router.local_db.borrow_mut().table.hget_compact_with_hash(
+                key.as_ref(),
+                key_hash,
+                field.as_ref(),
+            ) {
+                Ok(resp) => {
+                    responses[idx] = resp;
+                    continue;
+                }
+                Err(err) => {
+                    write_resp_err(&mut local_buf, err);
+                }
+            }
+        } else if router.aof.is_none()
+            && !crate::replication::has_connected_replicas(router.port)
+            && let Command::Hset {
+                ref key,
+                ref fields,
+            } = cmd
+        {
+            has_local_writes = true;
+            match router
+                .local_db
+                .borrow_mut()
+                .table
+                .hset_slice_with_hash(key, key_hash, fields)
+            {
+                Ok(count) => {
+                    if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                        touch_watched_key(router.port, key.as_ref());
+                    }
+                    if count == 1 {
+                        responses[idx] = crate::shard::CompactResp::INT_1;
+                    } else if count == 0 {
+                        responses[idx] = crate::shard::CompactResp::INT_0;
+                    } else {
+                        responses[idx] = crate::shard::CompactResp::from_integer(count as i64);
+                    }
+                    continue;
+                }
+                Err(err) => {
+                    write_resp_err(&mut local_buf, err);
+                }
+            }
+        } else if let Command::Sismember {
+            ref key,
+            ref member,
+        } = cmd
+        {
+            match router
+                .local_db
+                .borrow_mut()
+                .table
+                .sismember_compact_with_hash(key.as_ref(), key_hash, member.as_ref())
+            {
+                Ok(resp) => {
+                    responses[idx] = resp;
+                    continue;
+                }
+                Err(err) => {
+                    write_resp_err(&mut local_buf, err);
+                }
+            }
+        } else if router.aof.is_none()
+            && !crate::replication::has_connected_replicas(router.port)
+            && let Command::Sadd {
+                ref key,
+                ref members,
+            } = cmd
+        {
+            has_local_writes = true;
+            match router
+                .local_db
+                .borrow_mut()
+                .table
+                .sadd_slice_with_hash(key, key_hash, members)
+            {
+                Ok(count) => {
+                    if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                        touch_watched_key(router.port, key.as_ref());
+                    }
+                    if count == 1 {
+                        responses[idx] = crate::shard::CompactResp::INT_1;
+                    } else if count == 0 {
+                        responses[idx] = crate::shard::CompactResp::INT_0;
+                    } else {
+                        responses[idx] = crate::shard::CompactResp::from_integer(count as i64);
+                    }
+                    continue;
+                }
+                Err(err) => {
+                    write_resp_err(&mut local_buf, err);
+                }
+            }
+        } else if router.aof.is_none()
+            && !crate::replication::has_connected_replicas(router.port)
+            && let Command::Zadd {
+                ref key,
+                ref elements,
+                flags,
+            } = cmd
+        {
+            has_local_writes = true;
+            match router
+                .local_db
+                .borrow_mut()
+                .table
+                .zadd_slice_with_hash(key, key_hash, elements, flags)
+            {
+                Ok((count, incr_score)) => {
+                    if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                        touch_watched_key(router.port, key.as_ref());
+                    }
+                    if flags.incr {
+                        local_buf.clear();
+                        if let Some(score) = incr_score {
+                            write_resp_score(&mut local_buf, score);
+                        } else {
+                            write_resp_null(&mut local_buf);
+                        }
+                        responses[idx] = CompactResp::from_slice(&local_buf);
+                    } else if count == 1 {
+                        responses[idx] = crate::shard::CompactResp::INT_1;
+                    } else if count == 0 {
+                        responses[idx] = crate::shard::CompactResp::INT_0;
+                    } else {
+                        responses[idx] = crate::shard::CompactResp::from_integer(count as i64);
+                    }
+                    continue;
+                }
+                Err(err) => {
+                    write_resp_err(&mut local_buf, err);
+                }
+            }
+        } else if router.aof.is_none()
+            && !crate::replication::has_connected_replicas(router.port)
+            && !crate::block::has_blocked_waiters(router.port)
+            && let Command::Lpush {
+                ref key,
+                ref values,
+            } = cmd
+        {
+            has_local_writes = true;
+            match router
+                .local_db
+                .borrow_mut()
+                .table
+                .lpush_slice_with_hash(key, key_hash, values)
+            {
+                Ok(len) => {
+                    if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                        touch_watched_key(router.port, key.as_ref());
+                    }
+                    if len == 1 {
+                        responses[idx] = crate::shard::CompactResp::INT_1;
+                    } else if len == 0 {
+                        responses[idx] = crate::shard::CompactResp::INT_0;
+                    } else {
+                        responses[idx] = crate::shard::CompactResp::from_integer(len as i64);
+                    }
+                    continue;
+                }
+                Err(err) => {
+                    write_resp_err(&mut local_buf, err);
+                }
+            }
+        } else if router.aof.is_none()
+            && !crate::replication::has_connected_replicas(router.port)
+            && let Command::Lpop { ref key, count } = cmd
+        {
+            if count.is_none() {
+                match router
+                    .local_db
+                    .borrow_mut()
+                    .table
+                    .lpop_one_with_hash(key.as_ref(), key_hash)
+                {
+                    Ok(Some(v)) => {
+                        has_local_writes = true;
+                        if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                            touch_watched_key(router.port, key.as_ref());
+                        }
+                        responses[idx] = CompactResp::from_owned_bulk(v);
+                        continue;
+                    }
+                    Ok(None) => {
+                        responses[idx] = crate::shard::CompactResp::NULL;
+                        continue;
+                    }
+                    Err(err) => {
+                        write_resp_err(&mut local_buf, err);
+                    }
+                }
+            } else {
+                match router.local_db.borrow_mut().write_lpop_resp(
+                    key.as_ref(),
+                    count,
+                    &mut local_buf,
+                ) {
+                    Ok(has_pop) => {
+                        if has_pop {
+                            has_local_writes = true;
+                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                touch_watched_key(router.port, key.as_ref());
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        write_resp_err(&mut local_buf, err);
+                    }
+                }
+            }
+        } else if let Command::Lrange {
+            ref key,
+            start,
+            stop,
+        } = cmd
+        {
+            match router.local_db.borrow_mut().table.lrange_compact_with_hash(
+                key.as_ref(),
+                key_hash,
+                start,
+                stop,
+                &mut local_buf,
+            ) {
+                Ok(resp) => {
+                    responses[idx] = resp;
+                    continue;
+                }
+                Err(err) => write_resp_err(&mut local_buf, err),
+            }
+        } else if let Command::Zrange { ref key, ref opts } = cmd {
+            match router.local_db.borrow_mut().table.zrange_compact_with_hash(
+                key.as_ref(),
+                key_hash,
+                opts,
+                is_resp3,
+                &mut local_buf,
+            ) {
+                Ok(resp) => {
+                    responses[idx] = resp;
+                    continue;
+                }
+                Err(err) => write_resp_err(&mut local_buf, err),
+            }
+        } else {
+            if matches!(
+                cmd,
+                Command::Set { .. } | Command::Del(_) | Command::IncrBy { .. }
+            ) {
+                has_local_writes = true;
+            }
+            if execute_local_command(
+                &cmd,
+                &mut router.local_db.borrow_mut(),
+                &mut local_buf,
+                router.aof.as_deref(),
+            ) {
+                should_close = true;
+            }
+        }
+        responses[idx] = CompactResp::from_vec(std::mem::take(&mut local_buf));
+    }
+
+    if has_local_writes {
+        router.check_auto_tier_after_write();
+    }
+
+    // 3. Await parallel responses from all remote shards with lock-free spin-wait before async yield.
+    //    Clear recycled_items on THIS coordinator core so all Bytes refcount decrements and Vec
+    //    deallocations hit the originating core's L1 cache and thread-local jemalloc tcache.
     for _spin in 0..64 {
         if pending.is_empty() {
             break;
         }
         pending.retain(|responder| {
-            if let Some((recycled_items, mut results)) = responder.try_take() {
+            if let Some((mut recycled_items, mut results)) = responder.try_take() {
                 for (idx, resp) in results.drain(..) {
                     responses[idx] = resp;
                 }
+                recycled_items.clear();
                 items_pool.push(recycled_items);
                 results_pool.push(results);
                 false
@@ -12819,10 +12843,11 @@ async fn execute_commands_squashed(
     }
     for responder in pending {
         loop {
-            if let Some((recycled_items, mut results)) = responder.try_take() {
+            if let Some((mut recycled_items, mut results)) = responder.try_take() {
                 for (idx, resp) in results.drain(..) {
                     responses[idx] = resp;
                 }
+                recycled_items.clear();
                 items_pool.push(recycled_items);
                 results_pool.push(results);
                 break;
@@ -13231,7 +13256,7 @@ mod tests {
         ]);
         assert_eq!(cmd_keys(&mset), vec![b"k1", b"k2"]);
 
-        let del = Command::Del(smallvec::smallvec![Bytes::from("d1"), Bytes::from("d2")]);
+        let del = Command::Del(vec![Bytes::from("d1"), Bytes::from("d2")]);
         assert_eq!(cmd_keys(&del), vec![b"d1", b"d2"]);
 
         let sinter = Command::Sinter(vec![Bytes::from("s1"), Bytes::from("s2")]);
