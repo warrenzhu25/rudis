@@ -5,7 +5,7 @@ use crate::resp::Command;
 
 /// Inline compact representation of Redis responses for cross-core batch transfers.
 /// Avoids heap allocations for responses up to 30 bytes (integers, OK, simple errors, small bulk strings).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompactResp {
     Small { len: u8, data: [u8; 30] },
     Big(Vec<u8>),

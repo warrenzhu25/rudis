@@ -1139,10 +1139,7 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
                 count += 1;
             }
             crate::table::RudisValue::Set(set) if !set.is_empty() => {
-                let members: Vec<bytes::Bytes> = match set {
-                    crate::table::RudisSet::Small(v) => v.clone(),
-                    crate::table::RudisSet::Full(s) => s.iter().cloned().collect(),
-                };
+                let members: Vec<bytes::Bytes> = set.to_vec();
                 buf.extend_from_slice(
                     format!("*{}\r\n$4\r\nSADD\r\n${}\r\n", members.len() + 2, k.len()).as_bytes(),
                 );

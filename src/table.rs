@@ -643,9 +643,15 @@ impl Eq for RudisZSet {}
 
 const SMALL_SET_LIMIT: usize = 64;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SmallSetEntry {
+    pub hash: u64,
+    pub member: Bytes,
+}
+
 #[derive(Clone, Debug)]
 pub enum RudisSet {
-    Small(Vec<Bytes>),
+    Small(Vec<SmallSetEntry>),
     Full(hashbrown::HashSet<Bytes, FxBuildHasher>),
 }
 
@@ -656,7 +662,7 @@ impl Default for RudisSet {
 }
 
 pub enum RudisSetIter<'a> {
-    Small(std::slice::Iter<'a, Bytes>),
+    Small(std::slice::Iter<'a, SmallSetEntry>),
     Full(hashbrown::hash_set::Iter<'a, Bytes>),
 }
 
@@ -665,7 +671,7 @@ impl<'a> Iterator for RudisSetIter<'a> {
     #[inline(always)]
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            RudisSetIter::Small(it) => it.next(),
+            RudisSetIter::Small(it) => it.next().map(|e| &e.member),
             RudisSetIter::Full(it) => it.next(),
         }
     }
@@ -728,28 +734,54 @@ impl RudisSet {
     pub fn contains(&self, member: &[u8]) -> bool {
         match self {
             RudisSet::Small(v) => {
+                let m_hash = hash64(member);
                 let m_len = member.len();
                 match v.len() {
                     0 => false,
-                    1 => v[0].len() == m_len && v[0].as_ref() == member,
+                    1 => {
+                        v[0].hash == m_hash
+                            && v[0].member.len() == m_len
+                            && v[0].member.as_ref() == member
+                    }
                     2 => {
-                        (v[0].len() == m_len && v[0].as_ref() == member)
-                            || (v[1].len() == m_len && v[1].as_ref() == member)
+                        (v[0].hash == m_hash
+                            && v[0].member.len() == m_len
+                            && v[0].member.as_ref() == member)
+                            || (v[1].hash == m_hash
+                                && v[1].member.len() == m_len
+                                && v[1].member.as_ref() == member)
                     }
                     3 => {
-                        (v[0].len() == m_len && v[0].as_ref() == member)
-                            || (v[1].len() == m_len && v[1].as_ref() == member)
-                            || (v[2].len() == m_len && v[2].as_ref() == member)
+                        (v[0].hash == m_hash
+                            && v[0].member.len() == m_len
+                            && v[0].member.as_ref() == member)
+                            || (v[1].hash == m_hash
+                                && v[1].member.len() == m_len
+                                && v[1].member.as_ref() == member)
+                            || (v[2].hash == m_hash
+                                && v[2].member.len() == m_len
+                                && v[2].member.as_ref() == member)
                     }
                     4 => {
-                        (v[0].len() == m_len && v[0].as_ref() == member)
-                            || (v[1].len() == m_len && v[1].as_ref() == member)
-                            || (v[2].len() == m_len && v[2].as_ref() == member)
-                            || (v[3].len() == m_len && v[3].as_ref() == member)
+                        (v[0].hash == m_hash
+                            && v[0].member.len() == m_len
+                            && v[0].member.as_ref() == member)
+                            || (v[1].hash == m_hash
+                                && v[1].member.len() == m_len
+                                && v[1].member.as_ref() == member)
+                            || (v[2].hash == m_hash
+                                && v[2].member.len() == m_len
+                                && v[2].member.as_ref() == member)
+                            || (v[3].hash == m_hash
+                                && v[3].member.len() == m_len
+                                && v[3].member.as_ref() == member)
                     }
                     _ => {
                         for m in v {
-                            if m.len() == m_len && m.as_ref() == member {
+                            if m.hash == m_hash
+                                && m.member.len() == m_len
+                                && m.member.as_ref() == member
+                            {
                                 return true;
                             }
                         }
@@ -765,20 +797,24 @@ impl RudisSet {
         match self {
             RudisSet::Small(v) => {
                 let m_bytes = member.as_ref();
+                let m_hash = hash64(m_bytes);
                 let m_len = m_bytes.len();
                 for m in v.iter() {
-                    if m.len() == m_len && m.as_ref() == m_bytes {
+                    if m.hash == m_hash && m.member.len() == m_len && m.member.as_ref() == m_bytes {
                         return false;
                     }
                 }
-                v.push(member);
+                v.push(SmallSetEntry {
+                    hash: m_hash,
+                    member,
+                });
                 if v.len() > SMALL_SET_LIMIT {
                     let mut set = hashbrown::HashSet::with_capacity_and_hasher(
                         v.len(),
                         FxBuildHasher::default(),
                     );
                     for m in v.drain(..) {
-                        set.insert(m);
+                        set.insert(m.member);
                     }
                     *self = RudisSet::Full(set);
                 }
@@ -791,7 +827,11 @@ impl RudisSet {
     pub fn remove(&mut self, member: &[u8]) -> bool {
         match self {
             RudisSet::Small(v) => {
-                if let Some(pos) = v.iter().position(|m| m.as_ref() == member) {
+                let m_hash = hash64(member);
+                let m_len = member.len();
+                if let Some(pos) = v.iter().position(|m| {
+                    m.hash == m_hash && m.member.len() == m_len && m.member.as_ref() == member
+                }) {
                     v.swap_remove(pos);
                     true
                 } else {
@@ -804,14 +844,14 @@ impl RudisSet {
 
     pub fn to_vec(&self) -> Vec<Bytes> {
         match self {
-            RudisSet::Small(v) => v.clone(),
+            RudisSet::Small(v) => v.iter().map(|e| e.member.clone()).collect(),
             RudisSet::Full(s) => s.iter().cloned().collect(),
         }
     }
 
     pub fn pop(&mut self) -> Option<Bytes> {
         match self {
-            RudisSet::Small(v) => v.pop(),
+            RudisSet::Small(v) => v.pop().map(|e| e.member),
             RudisSet::Full(s) => {
                 if let Some(elem) = s.iter().next().cloned() {
                     s.remove(&elem);
@@ -838,7 +878,9 @@ impl PartialEq for RudisSet {
             return false;
         }
         match (self, other) {
-            (RudisSet::Small(a), RudisSet::Small(b)) => a.iter().all(|m| b.iter().any(|x| x == m)),
+            (RudisSet::Small(a), RudisSet::Small(b)) => a
+                .iter()
+                .all(|m| b.iter().any(|x| x.hash == m.hash && x.member == m.member)),
             (RudisSet::Full(a), RudisSet::Full(b)) => a == b,
             _ => {
                 for m in self.iter() {
@@ -4430,9 +4472,6 @@ impl RudisTable {
                     RudisValue::Set(set) => {
                         let mut added = 0;
                         for m in members {
-                            if set.contains(m.as_ref()) {
-                                continue;
-                            }
                             if set.insert(m.clone()) {
                                 added += 1;
                             }
@@ -4452,8 +4491,15 @@ impl RudisTable {
             let mut v = self.arena.acquire_small_set(members.len());
             for m in members {
                 let m_bytes = m.as_ref();
-                if !v.iter().any(|x| x.as_ref() == m_bytes) {
-                    v.push(m.clone());
+                let m_hash = hash64(m_bytes);
+                let m_len = m_bytes.len();
+                if !v.iter().any(|x| {
+                    x.hash == m_hash && x.member.len() == m_len && x.member.as_ref() == m_bytes
+                }) {
+                    v.push(SmallSetEntry {
+                        hash: m_hash,
+                        member: m.clone(),
+                    });
                 }
             }
             RudisSet::Small(v)
@@ -4542,9 +4588,7 @@ impl RudisTable {
 
     pub fn sismember(&mut self, key: &[u8], member: &[u8]) -> Result<bool, &'static str> {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h)
-            && let Some(entry) = self.table.get_slot(idx)
-        {
+        if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if let Some(expire_at) = entry.expire_at
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
@@ -8826,6 +8870,90 @@ mod tests {
         assert!(set.contains(b"foo"));
         assert!(!set.contains(b"bar"));
         assert_eq!(set.len(), 1);
+    }
+
+    #[test]
+    fn test_rudis_set_small_cached_hash_and_rejection() {
+        let mut set = RudisSet::with_capacity(16);
+        assert!(matches!(set, RudisSet::Small(_)));
+
+        // Test insertion and deduplication
+        assert!(set.insert(Bytes::from_static(b"member_alpha")));
+        assert!(!set.insert(Bytes::from_static(b"member_alpha")));
+        assert!(set.insert(Bytes::from_static(b"member_bravo")));
+        assert_eq!(set.len(), 2);
+
+        // Positive lookups
+        assert!(set.contains(b"member_alpha"));
+        assert!(set.contains(b"member_bravo"));
+
+        // Negative lookups (same length as alpha/bravo: 12 bytes)
+        assert!(!set.contains(b"member_charl"));
+        // Negative lookups (different lengths)
+        assert!(!set.contains(b"short"));
+        assert!(!set.contains(b"very_long_member_name_that_does_not_exist"));
+
+        // Removal
+        assert!(set.remove(b"member_alpha"));
+        assert!(!set.contains(b"member_alpha"));
+        assert_eq!(set.len(), 1);
+        assert!(!set.remove(b"member_alpha"));
+
+        // Table level SISMEMBER and SISMEMBER_COMPACT
+        let mut table = RudisTable::new();
+        table
+            .sadd_slice_fast(
+                &Bytes::from_static(b"set:test"),
+                &[Bytes::from_static(
+                    b"payload64bytes__________________________________________________",
+                )],
+            )
+            .unwrap();
+
+        // Hit
+        assert!(
+            table
+                .sismember(
+                    b"set:test",
+                    b"payload64bytes__________________________________________________"
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            table
+                .sismember_compact(
+                    b"set:test",
+                    b"payload64bytes__________________________________________________"
+                )
+                .unwrap(),
+            crate::shard::CompactResp::INT_1
+        );
+
+        // Miss with exact same length
+        assert!(
+            !table
+                .sismember(
+                    b"set:test",
+                    b"diffload64bytes__________________________________________________"
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            table
+                .sismember_compact(
+                    b"set:test",
+                    b"diffload64bytes__________________________________________________"
+                )
+                .unwrap(),
+            crate::shard::CompactResp::INT_0
+        );
+
+        // Non-existent key
+        assert!(!table.sismember(b"no_such_set", b"any").unwrap());
+        assert_eq!(
+            table.sismember_compact(b"no_such_set", b"any").unwrap(),
+            crate::shard::CompactResp::INT_0
+        );
     }
 
     #[test]

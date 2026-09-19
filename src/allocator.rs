@@ -100,7 +100,7 @@ pub const MAX_ARENA_POOLED: usize = 1024;
 pub struct SmallCollectionArena {
     list_pool: Vec<VecDeque<Bytes>>,
     hash_pool: Vec<Vec<(Bytes, Bytes)>>,
-    set_pool: Vec<Vec<Bytes>>,
+    set_pool: Vec<Vec<crate::table::SmallSetEntry>>,
     zset_pool: Vec<Vec<(crate::table::OrderedScore, Bytes)>>,
     pub allocations_saved: u64,
     pub recycles_count: u64,
@@ -163,7 +163,7 @@ impl SmallCollectionArena {
     }
 
     #[inline(always)]
-    pub fn acquire_small_set(&mut self, min_cap: usize) -> Vec<Bytes> {
+    pub fn acquire_small_set(&mut self, min_cap: usize) -> Vec<crate::table::SmallSetEntry> {
         if let Some(mut v) = self.set_pool.pop() {
             self.allocations_saved += 1;
             if v.capacity() < min_cap {
@@ -176,7 +176,7 @@ impl SmallCollectionArena {
     }
 
     #[inline(always)]
-    pub fn recycle_small_set(&mut self, mut v: Vec<Bytes>) {
+    pub fn recycle_small_set(&mut self, mut v: Vec<crate::table::SmallSetEntry>) {
         v.clear();
         if v.capacity() <= 512 && self.set_pool.len() < MAX_ARENA_POOLED {
             self.recycles_count += 1;
@@ -259,7 +259,10 @@ mod tests {
 
         // 3. Set pool
         let mut s = arena.acquire_small_set(8);
-        s.push(Bytes::from_static(b"m1"));
+        s.push(crate::table::SmallSetEntry {
+            hash: fxhash::hash64(b"m1"),
+            member: Bytes::from_static(b"m1"),
+        });
         arena.recycle_small_set(s);
         assert_eq!(arena.recycles_count, 3);
         assert_eq!(arena.pool_stats().2, 1);

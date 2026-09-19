@@ -8828,3 +8828,62 @@ fn test_fast_integer_responses_e2e() {
         ":-8\r\n"
     );
 }
+
+#[test]
+fn test_sismember_pipeline_throughput_and_correctness_e2e() {
+    let port = 16458;
+    start_test_server(port, 4);
+
+    let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    // Populate 20 single-member and multi-member sets
+    for i in 0..20 {
+        let cmd = format!(
+            "SADD myset_{} member_{}_val64bytes___________________________________\r\n",
+            i, i
+        );
+        assert_eq!(send_and_read(&mut client, cmd.as_bytes()), ":1\r\n");
+    }
+
+    // Pipelined SISMEMBER queries mixing hits and misses
+    let mut pipeline = Vec::new();
+    for i in 0..20 {
+        let key = format!("myset_{}", i);
+        let hit_member = format!("member_{}_val64bytes___________________________________", i);
+        let miss_member = format!("nomatch_{}_val64bytes__________________________________", i);
+
+        // Hit
+        pipeline.extend_from_slice(
+            format!(
+                "*3\r\n$9\r\nSISMEMBER\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                key.len(),
+                key,
+                hit_member.len(),
+                hit_member
+            )
+            .as_bytes(),
+        );
+        // Miss with same length
+        pipeline.extend_from_slice(
+            format!(
+                "*3\r\n$9\r\nSISMEMBER\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                key.len(),
+                key,
+                miss_member.len(),
+                miss_member
+            )
+            .as_bytes(),
+        );
+    }
+
+    client.write_all(&pipeline).unwrap();
+
+    let mut expected = String::new();
+    for _ in 0..20 {
+        expected.push_str(":1\r\n:0\r\n");
+    }
+
+    let mut response_buf = vec![0u8; expected.len()];
+    client.read_exact(&mut response_buf).unwrap();
+    assert_eq!(String::from_utf8_lossy(&response_buf), expected);
+}
