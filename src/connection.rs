@@ -3475,11 +3475,11 @@ async fn execute_command(
                     crate::resp::SetCondition::Nx => !exists,
                     crate::resp::SetCondition::Xx => exists,
                     crate::resp::SetCondition::Ifeq(expected) => {
-                        current_val.as_ref() == Some(&**expected)
+                        current_val.as_ref() == Some(expected)
                     }
                     crate::resp::SetCondition::Ifne(expected) => match &current_val {
                         None => true,
-                        Some(val) => val != &**expected,
+                        Some(val) => val != expected,
                     },
                     crate::resp::SetCondition::Ifdeq(expected_digest) => match &current_val {
                         None => false,
@@ -8268,12 +8268,10 @@ pub fn execute_local_command(
                 crate::resp::SetCondition::None => true,
                 crate::resp::SetCondition::Nx => !exists,
                 crate::resp::SetCondition::Xx => exists,
-                crate::resp::SetCondition::Ifeq(expected) => {
-                    current_val.as_ref() == Some(&**expected)
-                }
+                crate::resp::SetCondition::Ifeq(expected) => current_val.as_ref() == Some(expected),
                 crate::resp::SetCondition::Ifne(expected) => match &current_val {
                     None => true,
-                    Some(val) => val != &**expected,
+                    Some(val) => val != expected,
                 },
                 crate::resp::SetCondition::Ifdeq(expected_digest) => match &current_val {
                     None => false,
@@ -12166,7 +12164,6 @@ fn is_special_pipeline_cmd(cmd: &Command) -> bool {
             | Command::Reset
             | Command::Auth { .. }
             | Command::Acl(_)
-            | Command::Client(_)
             | Command::Tier(_)
             | Command::ConfigGet(_)
             | Command::ConfigSet(_, _)
@@ -12204,7 +12201,7 @@ async fn execute_commands_squashed(
     authenticated: &mut bool,
     auth_user: &mut String,
 ) -> bool {
-    if has_special && let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+    if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
         CURRENT_CLIENT_RESP3.set(c.is_resp3);
         c.last_active = Instant::now();
         if let Some(last_cmd) = commands.last() {
