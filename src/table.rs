@@ -1329,6 +1329,42 @@ impl RudisFlatTable {
         }
     }
 
+    /// Finds the index and mutable entry reference of a matching key, if present.
+    #[inline(always)]
+    pub fn find_entry_mut(&mut self, key: &[u8], hash: u64) -> Option<(usize, &mut RudisEntry)> {
+        let tag = fingerprint(hash);
+        let mut idx = (hash as usize) & self.mask;
+        let mut step = 0;
+
+        loop {
+            let (match_mask, empty_mask) =
+                unsafe { probe_group_match_or_empty(self.ctrl.as_ptr().add(idx), tag) };
+            let mut bits = match_mask;
+            while bits != 0 {
+                let offset = bits.trailing_zeros() as usize;
+                let slot_idx = (idx + offset) & self.mask;
+                // SAFETY: slot_idx is masked with self.mask where self.slots.len() == self.capacity == self.mask + 1.
+                if let Some(entry) = unsafe { self.slots.get_unchecked(slot_idx) }
+                    && entry.key.len() == key.len()
+                    && entry.key.as_ref() == key
+                {
+                    // SAFETY: slot_idx is valid and within bounds
+                    let entry_mut =
+                        unsafe { self.slots.get_unchecked_mut(slot_idx).as_mut().unwrap() };
+                    return Some((slot_idx, entry_mut));
+                }
+                bits &= bits - 1;
+            }
+
+            if empty_mask != 0 {
+                return None;
+            }
+
+            step += GROUP_SIZE;
+            idx = (idx + step) & self.mask;
+        }
+    }
+
     /// Finds the index of a matching key, if present.
     #[inline(always)]
     pub fn find(&self, key: &[u8], hash: u64) -> Option<usize> {
@@ -4096,29 +4132,31 @@ impl RudisTable {
         key: &[u8],
         h: u64,
     ) -> Result<Option<Bytes>, &'static str> {
-        if let Some(idx) = self.table.find(key, h) {
-            if self.check_expired_slot(idx) {
+        if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
                 return Ok(None);
             }
-            let (popped, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
-                match &mut entry.val {
-                    RudisValue::List(deque) => {
-                        let val = deque.pop_front();
-                        let empty = deque.is_empty();
-                        (val, empty)
-                    }
-                    _ => {
-                        return Err(
-                            "WRONGTYPE Operation against a key holding the wrong kind of value",
-                        );
-                    }
+            let (popped, is_empty) = match &mut entry.val {
+                RudisValue::List(deque) => {
+                    let val = deque.pop_front();
+                    let empty = deque.is_empty();
+                    (val, empty)
                 }
-            } else {
-                (None, false)
+                _ => {
+                    return Err(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
+                }
             };
 
             if is_empty && let Some(entry) = self.table.remove(idx) {
-                if entry.expire_at.is_some() {
+                if self.num_expires > 0 && entry.expire_at.is_some() {
                     self.num_expires = self.num_expires.saturating_sub(1);
                 }
                 self.recycle_value(entry.val);
@@ -4132,29 +4170,31 @@ impl RudisTable {
     #[inline(always)]
     pub fn rpop_one(&mut self, key: &[u8]) -> Result<Option<Bytes>, &'static str> {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h) {
-            if self.check_expired_slot(idx) {
+        if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
                 return Ok(None);
             }
-            let (popped, is_empty) = if let Some(entry) = self.table.get_slot_mut(idx) {
-                match &mut entry.val {
-                    RudisValue::List(deque) => {
-                        let val = deque.pop_back();
-                        let empty = deque.is_empty();
-                        (val, empty)
-                    }
-                    _ => {
-                        return Err(
-                            "WRONGTYPE Operation against a key holding the wrong kind of value",
-                        );
-                    }
+            let (popped, is_empty) = match &mut entry.val {
+                RudisValue::List(deque) => {
+                    let val = deque.pop_back();
+                    let empty = deque.is_empty();
+                    (val, empty)
                 }
-            } else {
-                (None, false)
+                _ => {
+                    return Err(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
+                }
             };
 
             if is_empty && let Some(entry) = self.table.remove(idx) {
-                if entry.expire_at.is_some() {
+                if self.num_expires > 0 && entry.expire_at.is_some() {
                     self.num_expires = self.num_expires.saturating_sub(1);
                 }
                 self.recycle_value(entry.val);
@@ -10631,5 +10671,49 @@ mod tests {
         assert!(table.del_with_hash(key.as_ref(), h));
         assert!(!table.exists_with_hash(key.as_ref(), h));
         assert!(!table.del_with_hash(key.as_ref(), h));
+    }
+
+    #[test]
+    fn test_lpop_rpop_one_fast_path() {
+        let mut table = RudisTable::new();
+        let key = Bytes::from("list_bench");
+        let h = hash_key(key.as_ref());
+
+        // Lpop on non-existent key returns None
+        assert_eq!(table.lpop_one_with_hash(key.as_ref(), h), Ok(None));
+        assert_eq!(table.rpop_one(key.as_ref()), Ok(None));
+
+        // Push 3 items
+        table
+            .lpush(
+                key.clone(),
+                vec![
+                    Bytes::from("item1"),
+                    Bytes::from("item2"),
+                    Bytes::from("item3"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(table.num_expires, 0);
+
+        // Lpop should pop from front: item3
+        assert_eq!(
+            table.lpop_one_with_hash(key.as_ref(), h),
+            Ok(Some(Bytes::from("item3")))
+        );
+
+        // Rpop should pop from back: item1
+        assert_eq!(table.rpop_one(key.as_ref()), Ok(Some(Bytes::from("item1"))));
+
+        // Lpop last item: item2, which empties the list and removes the key
+        assert_eq!(
+            table.lpop_one_with_hash(key.as_ref(), h),
+            Ok(Some(Bytes::from("item2")))
+        );
+
+        // List is now empty and removed from table
+        assert_eq!(table.lpop_one_with_hash(key.as_ref(), h), Ok(None));
+        assert_eq!(table.rpop_one(key.as_ref()), Ok(None));
+        assert!(!table.exists(key.as_ref()));
     }
 }

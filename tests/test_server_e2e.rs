@@ -9700,3 +9700,50 @@ fn test_pipelined_del_exists_e2e() {
         assert_eq!(send_and_read(&mut conn, del_cmd.as_bytes()), ":0\r\n");
     }
 }
+
+#[test]
+fn test_pipelined_lpop_rpop_e2e() {
+    let port = 16797;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut conn = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // Populate lists with 10 elements each
+    for list_idx in 0..20 {
+        let push_cmd = format!("LPUSH lr_key_{} v1 v2 v3 v4 v5\r\n", list_idx);
+        assert_eq!(send_and_read(&mut conn, push_cmd.as_bytes()), ":5\r\n");
+    }
+
+    // LPOP all elements from first 10 lists
+    for list_idx in 0..10 {
+        for _ in 0..5 {
+            let lpop_cmd = format!("LPOP lr_key_{}\r\n", list_idx);
+            let resp = send_and_read(&mut conn, lpop_cmd.as_bytes());
+            assert!(
+                resp.starts_with('$'),
+                "LPOP should return bulk string: {}",
+                resp
+            );
+        }
+        // Now empty, next LPOP returns nil
+        let lpop_cmd = format!("LPOP lr_key_{}\r\n", list_idx);
+        assert_eq!(send_and_read(&mut conn, lpop_cmd.as_bytes()), "$-1\r\n");
+    }
+
+    // RPOP all elements from remaining 10 lists
+    for list_idx in 10..20 {
+        for _ in 0..5 {
+            let rpop_cmd = format!("RPOP lr_key_{}\r\n", list_idx);
+            let resp = send_and_read(&mut conn, rpop_cmd.as_bytes());
+            assert!(
+                resp.starts_with('$'),
+                "RPOP should return bulk string: {}",
+                resp
+            );
+        }
+        // Now empty, next RPOP returns nil
+        let rpop_cmd = format!("RPOP lr_key_{}\r\n", list_idx);
+        assert_eq!(send_and_read(&mut conn, rpop_cmd.as_bytes()), "$-1\r\n");
+    }
+}
