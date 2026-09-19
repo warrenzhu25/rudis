@@ -54,15 +54,20 @@ pub fn target_shard(key: &[u8], num_shards: usize) -> usize {
 
 #[inline(always)]
 pub fn target_shard_and_hash(key: &[u8], num_shards: usize) -> (usize, u64) {
-    let tag = extract_hash_tag(key);
-    let h = crate::table::hash_key(tag);
+    let key_hash = crate::table::hash_key(key);
     if num_shards <= 1 {
-        (0, h)
+        (0, key_hash)
     } else if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
         let slot = key_slot(key);
-        (slot_to_shard(slot, num_shards), h)
+        (slot_to_shard(slot, num_shards), key_hash)
     } else {
-        ((h as usize) % num_shards, h)
+        let tag = extract_hash_tag(key);
+        let shard_hash = if tag.len() == key.len() {
+            key_hash
+        } else {
+            crate::table::hash_key(tag)
+        };
+        ((shard_hash as usize) % num_shards, key_hash)
     }
 }
 
