@@ -22,11 +22,56 @@ RUDIS_BIN = "/usr/local/google/home/warrenzhu/github/rudis/target/release/rudis"
 DRAGONFLY_BIN = "/usr/local/google/home/warrenzhu/dragonfly"
 MEMTIER_BIN = "/usr/local/google/home/warrenzhu/memtier_benchmark/memtier_benchmark"
 
-CLIENT_CPUS = "32-63"
+# ---------------------------------------------------------------------------
+# CPU pinning.
+#
+# Host is an AMD EPYC 7B13: 32 physical cores / 64 threads, SMT sibling pairs
+# are (N, N+32) -- i.e. logical CPU 32 is the second thread of physical core 0.
+#
+# The previous layout (server 0-15, client 32-63) put the load generator on the
+# *SMT siblings of the server's own cores*, so memtier threads stole execution
+# units from the shard threads they were measuring. How many collided was
+# re-decided by the scheduler every run, which drove run-to-run swings of up to
+# 2.05x (median CV 15.5%).
+#
+# New layout uses disjoint physical cores and leaves every sibling idle:
+#   server -> logical 16-31  (physical cores 16-31)
+#   client -> logical 0-15   (physical cores 0-15)
+#   idle   -> logical 32-63  (all siblings of the above)
+#
+# The server takes 16-31 specifically because cpu0 carries ~120x the softirq
+# load of cpu15 (loopback NET_RX + device IRQs). Cores 16-31 measure 5k-88k
+# softirq ticks vs cpu0's 3.4M, and are uniform among themselves. Putting the
+# client on 0-15 makes the load generator absorb that interrupt burden instead
+# of handicapping shard 0.
+SERVER_CPU_BASE = 16
+CLIENT_CPU_BASE = 0
+TOTAL_PHYSICAL_CORES = 32
+
 CLIENT_THREADS = 16
-CLIENT_CONNS = 4  # 64 concurrent connections total
-ITERATIONS = 2
+CLIENT_CONNS = int(os.environ.get("BENCH_CONNS", "4"))  # x threads = total connections
+
+# Time-based steady-state window. Count-based runs (-n 2000) completed in ~64ms,
+# so TCP slow-start, allocator warmup, hashbrown growth and page faults all
+# landed inside the measurement. Seconds of steady state instead.
+TEST_TIME_SECS = int(os.environ.get("BENCH_TEST_TIME", "5"))
+WARMUP_RUNS = int(os.environ.get("BENCH_WARMUP", "1"))
+ITERATIONS = int(os.environ.get("BENCH_ITERATIONS", "3"))
+
+# Workloads whose measured coefficient of variation exceeds this are reported as
+# inconclusive rather than as a ratio.
+CV_INCONCLUSIVE_PCT = 5.0
+
 KEY_MAX = 64000
+
+# Set per core-count by benchmark_at_core_count().
+CLIENT_CPUS_ACTIVE = f"{CLIENT_CPU_BASE}-{CLIENT_CPU_BASE + CLIENT_THREADS - 1}"
+
+# Optional comma-separated workload id filter, e.g. BENCH_WORKLOADS=SET,GET,INCR
+WORKLOAD_FILTER = [
+    w.strip() for w in os.environ.get("BENCH_WORKLOADS", "").split(",") if w.strip()
+]
+
 
 WORKLOADS = [
     # 1. Strings
@@ -218,6 +263,11 @@ WORKLOADS = [
     },
 ]
 
+if WORKLOAD_FILTER:
+    WORKLOADS = [w for w in WORKLOADS if w["id"] in WORKLOAD_FILTER]
+    if not WORKLOADS:
+        raise SystemExit(f"BENCH_WORKLOADS matched no workloads: {WORKLOAD_FILTER}")
+
 def wait_ping(port, timeout=8.0):
     start = time.time()
     while time.time() - start < timeout:
@@ -247,7 +297,7 @@ def populate(port, pop_type):
 
     json_tmp = f"/tmp/pop_{port}_{pop_type}.json"
     cmd = [
-        "taskset", "-c", CLIENT_CPUS,
+        "taskset", "-c", CLIENT_CPUS_ACTIVE,
         MEMTIER_BIN,
         "-s", "127.0.0.1",
         "-p", str(port),
@@ -301,13 +351,13 @@ def run_single_memtier(port, workload, run_idx):
         os.remove(json_path)
 
     cmd = [
-        "taskset", "-c", CLIENT_CPUS,
+        "taskset", "-c", CLIENT_CPUS_ACTIVE,
         MEMTIER_BIN,
         "-s", "127.0.0.1",
         "-p", str(port),
         "-t", str(CLIENT_THREADS),
         "-c", str(CLIENT_CONNS),
-        "-n", str(workload["requests"]),
+        "--test-time", str(TEST_TIME_SECS),
         "--pipeline", str(workload["pipeline"]),
         "--hide-histogram",
         "--json-out-file", json_path,
@@ -353,17 +403,25 @@ def run_single_memtier(port, workload, run_idx):
 
 def run_workload_benchmark(engine_name, port, workload):
     runs = []
-    for r in range(ITERATIONS):
+    total = WARMUP_RUNS + ITERATIONS
+    for r in range(total):
+        is_warmup = r < WARMUP_RUNS
         flushall(port)
         if workload.get("populate_type"):
             populate(port, workload["populate_type"])
         time.sleep(0.2)
 
         metrics = run_single_memtier(port, workload, r)
-        if metrics:
-            runs.append(metrics)
-            print(f"      Run {r+1}/{ITERATIONS}: {metrics['ops_sec']:,.0f} ops/sec, "
-                  f"avg: {metrics['avg_latency']:.2f}ms, p99: {metrics['p99']:.2f}ms")
+        if not metrics:
+            continue
+        if is_warmup:
+            # Discarded: absorbs TCP slow-start, allocator arena warmup,
+            # hashbrown growth and first-touch page faults.
+            print(f"      Warmup {r+1}/{WARMUP_RUNS}: {metrics['ops_sec']:,.0f} ops/sec (discarded)")
+            continue
+        runs.append(metrics)
+        print(f"      Run {r-WARMUP_RUNS+1}/{ITERATIONS}: {metrics['ops_sec']:,.0f} ops/sec, "
+              f"avg: {metrics['avg_latency']:.2f}ms, p99: {metrics['p99']:.2f}ms")
 
     if not runs:
         return None
@@ -372,17 +430,49 @@ def run_workload_benchmark(engine_name, port, workload):
     avg_lat_list = [x["avg_latency"] for x in runs]
     p99_list = [x["p99"] for x in runs]
 
+    median_ops = statistics.median(ops_list)
+    stdev_ops = statistics.stdev(ops_list) if len(ops_list) > 1 else 0.0
+    cv_pct = (stdev_ops / median_ops * 100) if median_ops else 0.0
+    if cv_pct > CV_INCONCLUSIVE_PCT:
+        print(f"      [!] CV {cv_pct:.1f}% exceeds {CV_INCONCLUSIVE_PCT:.0f}% -- result is noise-dominated")
+
     return {
+        # Median is the headline statistic: unlike the mean it is not dragged by
+        # a single outlier run.
+        "ops_sec_median": median_ops,
         "ops_sec_mean": statistics.mean(ops_list),
-        "avg_latency_mean": statistics.mean(avg_lat_list),
-        "p99_latency_mean": statistics.mean(p99_list),
+        "ops_sec_min": min(ops_list),
+        "ops_sec_max": max(ops_list),
+        "ops_sec_cv_pct": cv_pct,
+        "avg_latency_median": statistics.median(avg_lat_list),
+        "p99_latency_median": statistics.median(p99_list),
+        "runs": ops_list,
     }
 
 def benchmark_at_core_count(cores):
-    server_cpus = f"0-{cores-1}"
+    global CLIENT_CPUS_ACTIVE
+
+    server_cpus = f"{SERVER_CPU_BASE}-{SERVER_CPU_BASE + cores - 1}"
+    client_cores = min(cores, CLIENT_THREADS)
+    CLIENT_CPUS_ACTIVE = f"{CLIENT_CPU_BASE}-{CLIENT_CPU_BASE + client_cores - 1}"
+
+    oversubscribed = (
+        SERVER_CPU_BASE + cores > TOTAL_PHYSICAL_CORES
+        or CLIENT_CPU_BASE + client_cores > SERVER_CPU_BASE
+    )
+
     print(f"\n=================================================================")
-    print(f"       BENCHMARKING ON {cores} CORES (CPUs {server_cpus})       ")
+    print(f"       BENCHMARKING ON {cores} CORES       ")
     print(f"=================================================================")
+    print(f"  server CPUs : {server_cpus}   (physical cores, SMT siblings idle)")
+    print(f"  client CPUs : {CLIENT_CPUS_ACTIVE}   (disjoint physical cores)")
+    print(f"  window      : {TEST_TIME_SECS}s x {ITERATIONS} runs "
+          f"(+{WARMUP_RUNS} discarded warmup)")
+    if oversubscribed:
+        print(f"  [!] WARNING: {cores} server + {client_cores} client cores exceed the "
+              f"{TOTAL_PHYSICAL_CORES} physical cores available.")
+        print(f"  [!] Server and client will share physical cores via SMT; "
+              f"results will be noise-dominated.")
 
     results = {"Dragonfly": {}, "Rudis": {}}
 
@@ -439,22 +529,41 @@ def benchmark_at_core_count(cores):
             rudis_proc.kill()
 
     # Print summary table for this core count
-    print(f"\n-------------------------------------------------------------------------------------------------------------")
-    print(f"                                   SUMMARY: {cores} CORES HEAD-TO-HEAD                                      ")
-    print(f"-------------------------------------------------------------------------------------------------------------")
-    print(f"{'Command / Workload':<28} | {'Dragonfly (ops/s)':<18} | {'Rudis (ops/s)':<18} | {'Rudis vs DF':<14} | {'p99 Latency (DF / Rudis)'}")
-    print(f"-----------------------------+--------------------+--------------------+----------------+-------------------------")
+    print(f"\n----------------------------------------------------------------------------------------------------------------------")
+    print(f"                                   SUMMARY: {cores} CORES HEAD-TO-HEAD (median of {ITERATIONS})                        ")
+    print(f"----------------------------------------------------------------------------------------------------------------------")
+    print(f"{'Command / Workload':<28} | {'Dragonfly (ops/s)':>19} {'CV':>6} | {'Rudis (ops/s)':>19} {'CV':>6} | {'Rudis vs DF':<20} | {'p99 (DF/Rudis)'}")
+    print(f"-----------------------------+---------------------------+---------------------------+----------------------+----------------")
+    inconclusive = 0
     for wl in WORKLOADS:
         wl_id = wl["id"]
         df_res = results["Dragonfly"].get(wl_id)
         ru_res = results["Rudis"].get(wl_id)
-        if df_res and ru_res:
-            ratio = ru_res["ops_sec_mean"] / df_res["ops_sec_mean"]
-            diff_pct = (ratio - 1.0) * 100
+        if not (df_res and ru_res):
+            continue
+        df_ops = df_res["ops_sec_median"]
+        ru_ops = ru_res["ops_sec_median"]
+        df_cv = df_res["ops_sec_cv_pct"]
+        ru_cv = ru_res["ops_sec_cv_pct"]
+        ratio = ru_ops / df_ops
+        diff_pct = (ratio - 1.0) * 100
+
+        # If either engine's run-to-run noise is comparable to the measured gap,
+        # the ratio is not evidence of anything.
+        noise = max(df_cv, ru_cv)
+        if noise > CV_INCONCLUSIVE_PCT and abs(diff_pct) < 2 * noise:
+            diff_str = f"{ratio:.2f}x INCONCLUSIVE"
+            inconclusive += 1
+        else:
             diff_str = f"{ratio:.2f}x ({diff_pct:+.1f}%)"
-            p99_str = f"{df_res['p99_latency_mean']:.2f}ms / {ru_res['p99_latency_mean']:.2f}ms"
-            print(f"{wl['name']:<28} | {df_res['ops_sec_mean']:>15,.0f} ops/s | {ru_res['ops_sec_mean']:>15,.0f} ops/s | {diff_str:<14} | {p99_str}")
-    print(f"-------------------------------------------------------------------------------------------------------------\n")
+
+        p99_str = f"{df_res['p99_latency_median']:.2f}/{ru_res['p99_latency_median']:.2f}ms"
+        print(f"{wl['name']:<28} | {df_ops:>15,.0f} ops/s {df_cv:>5.1f}% | "
+              f"{ru_ops:>15,.0f} ops/s {ru_cv:>5.1f}% | {diff_str:<20} | {p99_str}")
+    print(f"----------------------------------------------------------------------------------------------------------------------")
+    if inconclusive:
+        print(f"  [!] {inconclusive} workload(s) inconclusive: run-to-run noise exceeds the measured difference.")
+    print()
 
     return results
 
