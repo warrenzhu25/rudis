@@ -176,10 +176,18 @@ impl RudisZSet {
     #[inline]
     pub fn get_score(&self, member: &[u8]) -> Option<f64> {
         match self {
-            RudisZSet::Small(v) => v
-                .iter()
-                .find(|(_, m)| m.as_ref() == member)
-                .map(|(s, _)| s.0),
+            RudisZSet::Small(v) => {
+                let m_len = member.len();
+                if v.len() == 1 {
+                    if v[0].1.len() == m_len && v[0].1.as_ref() == member {
+                        return Some(v[0].0.0);
+                    }
+                    return None;
+                }
+                v.iter()
+                    .find(|(_, m)| m.len() == m_len && m.as_ref() == member)
+                    .map(|(s, _)| s.0)
+            }
             RudisZSet::Full { dict, .. } => dict.get(member).copied(),
         }
     }
@@ -187,6 +195,14 @@ impl RudisZSet {
     pub fn insert(&mut self, score: f64, member: Bytes) {
         match self {
             RudisZSet::Small(v) => {
+                if v.is_empty() {
+                    v.push((OrderedScore(score), member));
+                    return;
+                }
+                if v.len() == 1 && v[0].1 == member {
+                    v[0].0 = OrderedScore(score);
+                    return;
+                }
                 if let Some(pos) = v.iter().position(|(_, m)| m == &member) {
                     v.remove(pos);
                 }
@@ -735,12 +751,18 @@ impl RudisSet {
         match self {
             RudisSet::Small(v) => {
                 let m_len = member.len();
-                for m in v {
-                    if m.member.len() == m_len && m.member.as_ref() == member {
-                        return true;
+                match v.len() {
+                    0 => false,
+                    1 => v[0].member.len() == m_len && v[0].member.as_ref() == member,
+                    _ => {
+                        for m in v {
+                            if m.member.len() == m_len && m.member.as_ref() == member {
+                                return true;
+                            }
+                        }
+                        false
                     }
                 }
-                false
             }
             RudisSet::Full(s) => s.contains(member),
         }
@@ -4190,6 +4212,75 @@ impl RudisTable {
     }
 
     #[inline(always)]
+    pub fn write_rpop_resp(
+        &mut self,
+        key: &[u8],
+        count: Option<usize>,
+        out: &mut Vec<u8>,
+    ) -> Result<bool, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if let Some(entry) = self.table.get_slot(idx)
+                && let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+                if count.is_some() {
+                    crate::connection::write_resp_array_header(out, 0);
+                } else {
+                    crate::connection::write_resp_null(out);
+                }
+                return Ok(false);
+            }
+
+            let mut has_written = false;
+            let is_empty = if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::List(deque) => {
+                        if let Some(cnt) = count {
+                            let n = cnt.min(deque.len());
+                            crate::connection::write_resp_array_header(out, n);
+                            for _ in 0..n {
+                                if let Some(val) = deque.pop_back() {
+                                    has_written = true;
+                                    crate::connection::write_resp_bulk(out, &val);
+                                }
+                            }
+                        } else if let Some(val) = deque.pop_back() {
+                            has_written = true;
+                            crate::connection::write_resp_bulk(out, &val);
+                        } else {
+                            crate::connection::write_resp_null(out);
+                        }
+                        deque.is_empty()
+                    }
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
+                }
+            } else {
+                false
+            };
+
+            if is_empty && let Some(entry) = self.table.remove(idx) {
+                self.recycle_value(entry.val);
+            }
+            Ok(has_written)
+        } else {
+            if count.is_some() {
+                crate::connection::write_resp_array_header(out, 0);
+            } else {
+                crate::connection::write_resp_null(out);
+            }
+            Ok(false)
+        }
+    }
+
+    #[inline(always)]
     pub fn lpop_one(&mut self, key: &[u8]) -> Result<Option<Bytes>, &'static str> {
         let h = hash_key(key);
         self.lpop_one_with_hash(key, h)
@@ -4240,6 +4331,15 @@ impl RudisTable {
     #[inline(always)]
     pub fn rpop_one(&mut self, key: &[u8]) -> Result<Option<Bytes>, &'static str> {
         let h = hash_key(key);
+        self.rpop_one_with_hash(key, h)
+    }
+
+    #[inline(always)]
+    pub fn rpop_one_with_hash(
+        &mut self,
+        key: &[u8],
+        h: u64,
+    ) -> Result<Option<Bytes>, &'static str> {
         if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at
@@ -10899,5 +10999,75 @@ mod tests {
             Ok(())
         );
         assert_eq!(out, b"$-1\r\n");
+    }
+
+    #[test]
+    fn test_rpop_one_and_write_rpop_resp() {
+        let mut table = RudisTable::new();
+        let key = Bytes::from("my_list_key");
+        let h = hash_key(key.as_ref());
+
+        // Test non-existent key
+        assert_eq!(table.rpop_one_with_hash(key.as_ref(), h), Ok(None));
+        let mut out = Vec::new();
+        assert_eq!(
+            table.write_rpop_resp(key.as_ref(), None, &mut out),
+            Ok(false)
+        );
+        assert_eq!(out, b"$-1\r\n");
+
+        out.clear();
+        assert_eq!(
+            table.write_rpop_resp(key.as_ref(), Some(2), &mut out),
+            Ok(false)
+        );
+        assert_eq!(out, b"*0\r\n");
+
+        // Push 3 elements: [v1, v2, v3]
+        table
+            .rpush_slice_fast(
+                &key,
+                &[Bytes::from("v1"), Bytes::from("v2"), Bytes::from("v3")],
+            )
+            .unwrap();
+        assert_eq!(table.llen(key.as_ref()), Ok(3));
+
+        // Pop 1 element with rpop_one_with_hash -> v3
+        assert_eq!(
+            table.rpop_one_with_hash(key.as_ref(), h),
+            Ok(Some(Bytes::from("v3")))
+        );
+        assert_eq!(table.llen(key.as_ref()), Ok(2));
+
+        // Pop with write_rpop_resp without count -> v2
+        out.clear();
+        assert_eq!(
+            table.write_rpop_resp(key.as_ref(), None, &mut out),
+            Ok(true)
+        );
+        assert_eq!(out, b"$2\r\nv2\r\n");
+        assert_eq!(table.llen(key.as_ref()), Ok(1));
+
+        // Pop with write_rpop_resp with count 5 -> array of [v1]
+        out.clear();
+        assert_eq!(
+            table.write_rpop_resp(key.as_ref(), Some(5), &mut out),
+            Ok(true)
+        );
+        assert_eq!(out, b"*1\r\n$2\r\nv1\r\n");
+        assert_eq!(table.llen(key.as_ref()), Ok(0));
+        assert!(!table.exists_with_hash(key.as_ref(), h));
+
+        // Wrong type test
+        table.set(key.clone(), Bytes::from("string_val"), None);
+        assert_eq!(
+            table.rpop_one_with_hash(key.as_ref(), h),
+            Err("WRONGTYPE Operation against a key holding the wrong kind of value")
+        );
+        out.clear();
+        assert_eq!(
+            table.write_rpop_resp(key.as_ref(), None, &mut out),
+            Err("WRONGTYPE Operation against a key holding the wrong kind of value")
+        );
     }
 }

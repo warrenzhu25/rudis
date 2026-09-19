@@ -8999,31 +8999,36 @@ pub fn execute_local_command(
             false
         }
         Command::Lpop { key, count } => {
+            if count.is_none() {
+                match db.lpop_one(key.as_ref()) {
+                    Ok(Some(v)) => {
+                        record_change!(cmd);
+                        write_resp_bulk(out, &v);
+                    }
+                    Ok(None) => {
+                        write_resp_null(out);
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                return false;
+            }
             let n = count.unwrap_or(1);
             match db.lpop(key, n) {
                 Ok(popped) => {
                     if !popped.is_empty() {
                         record_change!(cmd);
                     }
-                    if count.is_some() {
-                        if !popped.is_empty() {
-                            out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
-                            for v in popped {
-                                out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                                out.extend_from_slice(&v);
-                                out.extend_from_slice(b"\r\n");
-                            }
-                        } else if *count == Some(0) && db.exists(key) {
-                            out.extend_from_slice(b"*0\r\n");
-                        } else {
-                            write_resp_null_array(out);
+                    if !popped.is_empty() {
+                        out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
+                        for v in popped {
+                            write_resp_bulk(out, &v);
                         }
-                    } else if let Some(first) = popped.into_iter().next() {
-                        out.extend_from_slice(format!("${}\r\n", first.len()).as_bytes());
-                        out.extend_from_slice(&first);
-                        out.extend_from_slice(b"\r\n");
+                    } else if *count == Some(0) && db.exists(key) {
+                        out.extend_from_slice(b"*0\r\n");
                     } else {
-                        write_resp_null(out);
+                        write_resp_null_array(out);
                     }
                 }
                 Err(err) => {
@@ -9033,31 +9038,36 @@ pub fn execute_local_command(
             false
         }
         Command::Rpop { key, count } => {
+            if count.is_none() {
+                match db.rpop_one(key.as_ref()) {
+                    Ok(Some(v)) => {
+                        record_change!(cmd);
+                        write_resp_bulk(out, &v);
+                    }
+                    Ok(None) => {
+                        write_resp_null(out);
+                    }
+                    Err(err) => {
+                        write_resp_err(out, err);
+                    }
+                }
+                return false;
+            }
             let n = count.unwrap_or(1);
             match db.rpop(key, n) {
                 Ok(popped) => {
                     if !popped.is_empty() {
                         record_change!(cmd);
                     }
-                    if count.is_some() {
-                        if !popped.is_empty() {
-                            out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
-                            for v in popped {
-                                out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                                out.extend_from_slice(&v);
-                                out.extend_from_slice(b"\r\n");
-                            }
-                        } else if *count == Some(0) && db.exists(key) {
-                            out.extend_from_slice(b"*0\r\n");
-                        } else {
-                            write_resp_null_array(out);
+                    if !popped.is_empty() {
+                        out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
+                        for v in popped {
+                            write_resp_bulk(out, &v);
                         }
-                    } else if let Some(first) = popped.into_iter().next() {
-                        out.extend_from_slice(format!("${}\r\n", first.len()).as_bytes());
-                        out.extend_from_slice(&first);
-                        out.extend_from_slice(b"\r\n");
+                    } else if *count == Some(0) && db.exists(key) {
+                        out.extend_from_slice(b"*0\r\n");
                     } else {
-                        write_resp_null(out);
+                        write_resp_null_array(out);
                     }
                 }
                 Err(err) => {
@@ -12835,6 +12845,74 @@ async fn execute_commands_squashed(
                             continue;
                         }
                         Err(err) => write_resp_err(&mut local_buf, err),
+                    }
+                } else if router.aof.is_none()
+                    && !crate::replication::has_connected_replicas(router.port)
+                    && let Command::IncrBy(ref key, delta) = cmd
+                {
+                    match router
+                        .local_db
+                        .borrow_mut()
+                        .table
+                        .incr_by_slice_with_hash(key, key_hash, delta)
+                    {
+                        Ok(val) => {
+                            has_local_writes = true;
+                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                touch_watched_key(router.port, key.as_ref());
+                            }
+                            responses[idx] = CompactResp::from_integer(val);
+                            continue;
+                        }
+                        Err(err) => {
+                            write_resp_err(&mut local_buf, err);
+                        }
+                    }
+                } else if router.aof.is_none()
+                    && !crate::replication::has_connected_replicas(router.port)
+                    && let Command::Rpop { ref key, count } = cmd
+                {
+                    if count.is_none() {
+                        match router
+                            .local_db
+                            .borrow_mut()
+                            .table
+                            .rpop_one_with_hash(key.as_ref(), key_hash)
+                        {
+                            Ok(Some(v)) => {
+                                has_local_writes = true;
+                                if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                    touch_watched_key(router.port, key.as_ref());
+                                }
+                                responses[idx] = CompactResp::from_owned_bulk(v);
+                                continue;
+                            }
+                            Ok(None) => {
+                                responses[idx] = crate::shard::CompactResp::NULL;
+                                continue;
+                            }
+                            Err(err) => {
+                                write_resp_err(&mut local_buf, err);
+                            }
+                        }
+                    } else {
+                        match router.local_db.borrow_mut().write_rpop_resp(
+                            key.as_ref(),
+                            count,
+                            &mut local_buf,
+                        ) {
+                            Ok(has_pop) => {
+                                if has_pop {
+                                    has_local_writes = true;
+                                    if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                        touch_watched_key(router.port, key.as_ref());
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                write_resp_err(&mut local_buf, err);
+                            }
+                        }
                     }
                 } else {
                     if matches!(

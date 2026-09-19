@@ -995,6 +995,16 @@ impl ShardDb {
         self.table.rpop(key, count)
     }
 
+    #[inline(always)]
+    pub fn write_rpop_resp(
+        &mut self,
+        key: &[u8],
+        count: Option<usize>,
+        out: &mut Vec<u8>,
+    ) -> Result<bool, &'static str> {
+        self.table.write_rpop_resp(key, count, out)
+    }
+
     #[inline]
     pub fn llen(&mut self, key: &[u8]) -> Result<usize, &'static str> {
         self.table.llen(key)

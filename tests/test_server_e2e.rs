@@ -9878,3 +9878,71 @@ fn test_smallvec_del_and_hset_e2e() {
         assert_eq!(send_and_read(&mut conn, cmd.as_bytes()), ":0\r\n");
     }
 }
+
+#[test]
+fn test_pipelined_incr_and_rpop_e2e() {
+    let port = 16900;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut conn = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    use std::io::{Read, Write};
+
+    // 1. Pipelined INCR on same and different keys
+    let mut pipe = String::new();
+    for i in 0..10 {
+        pipe.push_str(&format!("INCR test_counter_{}\r\n", i));
+    }
+    for i in 0..10 {
+        pipe.push_str(&format!("INCRBY test_counter_{} 5\r\n", i));
+    }
+    conn.write_all(pipe.as_bytes()).unwrap();
+
+    let mut expected = String::new();
+    for _ in 0..10 {
+        expected.push_str(":1\r\n");
+    }
+    for _ in 0..10 {
+        expected.push_str(":6\r\n");
+    }
+    let mut response = vec![0u8; expected.len()];
+    conn.read_exact(&mut response).unwrap();
+    assert_eq!(std::str::from_utf8(&response).unwrap(), expected.as_str());
+
+    // 2. Pipelined RPUSH and RPOP
+    let mut pipe = String::new();
+    for i in 0..20 {
+        pipe.push_str(&format!("RPUSH list_k val_{}\r\n", i));
+    }
+    conn.write_all(pipe.as_bytes()).unwrap();
+    // Read RPUSH responses
+    let mut read_buf = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !read_buf.windows(5).any(|w| w == b":20\r\n") {
+        let n = conn.read(&mut buf).unwrap();
+        read_buf.extend_from_slice(&buf[..n]);
+    }
+
+    // Now pipeline 20 RPOPs
+    let mut pipe = String::new();
+    for _ in 0..20 {
+        pipe.push_str("RPOP list_k\r\n");
+    }
+    conn.write_all(pipe.as_bytes()).unwrap();
+
+    let mut rpop_resp = Vec::new();
+    // In LIFO order of RPOP, val_19 down to val_0
+    let mut expected_rpop = Vec::new();
+    for i in (0..20).rev() {
+        let val = format!("val_{}", i);
+        expected_rpop.extend_from_slice(format!("${}\r\n{}\r\n", val.len(), val).as_bytes());
+    }
+    while rpop_resp.len() < expected_rpop.len() {
+        let n = conn.read(&mut buf).unwrap();
+        rpop_resp.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(rpop_resp, expected_rpop);
+
+    // List should be empty now -> RPOP returns nil
+    assert_eq!(send_and_read(&mut conn, b"RPOP list_k\r\n"), "$-1\r\n");
+}
