@@ -291,6 +291,7 @@ impl BatchResponder {
     )> {
         if self.ready.load(Ordering::Acquire) {
             self.ready.store(false, Ordering::Relaxed);
+            let _ = self.notify_rx.try_recv();
             unsafe { (*self.payload.get()).take() }
         } else {
             None

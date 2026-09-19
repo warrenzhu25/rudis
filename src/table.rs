@@ -2159,10 +2159,7 @@ impl RudisTable {
         key_bytes: Option<&Bytes>,
         delta: i64,
     ) -> Result<i64, &'static str> {
-        let (existing, candidate_idx) = self.table.find_or_prepare_insert(key, h);
-        if let Some(idx) = existing
-            && let Some(entry) = self.table.get_slot_mut(idx)
-        {
+        if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
@@ -2197,6 +2194,7 @@ impl RudisTable {
             }
         }
 
+        let (_, candidate_idx) = self.table.find_or_prepare_insert(key, h);
         let new_val = delta;
         let entry = RudisEntry {
             key: key_bytes
@@ -2205,11 +2203,7 @@ impl RudisTable {
             val: RudisValue::Int(new_val),
             expire_at: None,
         };
-        if existing.is_none() {
-            self.table.insert_prepared(entry, h, candidate_idx);
-        } else {
-            self.table.insert(entry);
-        }
+        self.table.insert_prepared(entry, h, candidate_idx);
         self.used_memory += key.len() + 8 + 64;
         Ok(new_val)
     }

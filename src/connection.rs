@@ -13023,7 +13023,7 @@ async fn execute_commands_squashed(
     }
 
     // 3. Await parallel responses from all remote shards with lock-free spin-wait before async yield
-    for _spin in 0..64 {
+    for _spin in 0..256 {
         if pending.is_empty() {
             break;
         }
