@@ -8701,7 +8701,7 @@ pub fn execute_local_command(
             false
         }
         Command::Hset { key, fields } => {
-            match db.hset_slice(key.as_ref(), fields) {
+            match db.hset_slice_fast(key, fields) {
                 Ok(count) => {
                     record_change!(cmd);
                     if crate::search::has_active_search_indices() {
@@ -8742,7 +8742,7 @@ pub fn execute_local_command(
             false
         }
         Command::Hmset { key, fields } => {
-            match db.hset_slice(key.as_ref(), fields) {
+            match db.hset_slice_fast(key, fields) {
                 Ok(_) => {
                     record_change!(cmd);
                     if crate::search::has_active_search_indices() {

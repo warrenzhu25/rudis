@@ -9803,3 +9803,44 @@ fn test_concurrent_multikey_del_e2e() {
     let del_batch = "DEL cdel_30 cdel_31 cdel_32 cdel_33 cdel_34\r\n";
     assert_eq!(send_and_read(&mut conn, del_batch.as_bytes()), ":5\r\n");
 }
+
+#[test]
+fn test_hset_hget_e2e_pipelined_and_single() {
+    let port = 16810;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut conn = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Single field insert
+    for i in 0..20 {
+        let cmd = format!("HSET hash_test_{} f1 v{}\r\n", i, i);
+        assert_eq!(send_and_read(&mut conn, cmd.as_bytes()), ":1\r\n");
+    }
+
+    // 2. Read back
+    for i in 0..20 {
+        let cmd = format!("HGET hash_test_{} f1\r\n", i);
+        let expected = format!("${}\r\nv{}\r\n", format!("v{}", i).len(), i);
+        assert_eq!(send_and_read(&mut conn, cmd.as_bytes()), expected);
+    }
+
+    // 3. Single field update (returns :0)
+    for i in 0..20 {
+        let cmd = format!("HSET hash_test_{} f1 updated_{}\r\n", i, i);
+        assert_eq!(send_and_read(&mut conn, cmd.as_bytes()), ":0\r\n");
+    }
+
+    // 4. Verify updated value
+    for i in 0..20 {
+        let cmd = format!("HGET hash_test_{} f1\r\n", i);
+        let expected = format!("${}\r\nupdated_{}\r\n", format!("updated_{}", i).len(), i);
+        assert_eq!(send_and_read(&mut conn, cmd.as_bytes()), expected);
+    }
+
+    // 5. Non-existent field returns nil
+    assert_eq!(
+        send_and_read(&mut conn, b"HGET hash_test_0 nofield\r\n"),
+        "$-1\r\n"
+    );
+}
