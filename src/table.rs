@@ -1,6 +1,8 @@
 use bytes::Bytes;
 use fxhash::{FxBuildHasher, hash64};
 use hashbrown::HashMap;
+
+pub type RudisHashMap = HashMap<Bytes, Bytes, FxBuildHasher>;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const GROUP_SIZE: usize = 16;
@@ -1095,7 +1097,7 @@ pub enum RudisValue {
     String(Bytes),
     Int(i64),
     SmallHash(Vec<(Bytes, Bytes)>),
-    Hash(HashMap<Bytes, Bytes>),
+    Hash(RudisHashMap),
     List(std::collections::VecDeque<Bytes>),
     Set(RudisSet),
     ZSet(RudisZSet),
@@ -3039,7 +3041,7 @@ impl RudisTable {
                             if pairs.len() == 1 && pairs[0].0 == *f {
                                 pairs[0].1 = v.clone();
                                 if v.len() > max_value {
-                                    let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
+                                    let map: RudisHashMap = pairs.drain(..).collect();
                                     entry.val = RudisValue::Hash(map);
                                 }
                                 return Ok(0);
@@ -3047,7 +3049,7 @@ impl RudisTable {
                             if let Some(pos) = pairs.iter().position(|(k, _)| k == f) {
                                 pairs[pos].1 = v.clone();
                                 if v.len() > max_value {
-                                    let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
+                                    let map: RudisHashMap = pairs.drain(..).collect();
                                     entry.val = RudisValue::Hash(map);
                                 }
                             } else {
@@ -3056,7 +3058,7 @@ impl RudisTable {
                                     || f.len() > max_value
                                     || v.len() > max_value
                                 {
-                                    let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
+                                    let map: RudisHashMap = pairs.drain(..).collect();
                                     entry.val = RudisValue::Hash(map);
                                 }
                                 added = 1;
@@ -3076,7 +3078,7 @@ impl RudisTable {
                                     .iter()
                                     .any(|(k, v)| k.len() > max_value || v.len() > max_value)
                             {
-                                let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
+                                let map: RudisHashMap = pairs.drain(..).collect();
                                 entry.val = RudisValue::Hash(map);
                             }
                             return Ok(added);
@@ -3084,8 +3086,20 @@ impl RudisTable {
                     }
                     RudisValue::Hash(map) => {
                         let mut added = 0;
+                        if fields.len() == 1 {
+                            let (f, v) = &fields[0];
+                            if let Some(existing_val) = map.get_mut(f) {
+                                *existing_val = v.clone();
+                                return Ok(0);
+                            }
+                            map.insert(f.clone(), v.clone());
+                            return Ok(1);
+                        }
                         for (f, v) in fields {
-                            if map.insert(f.clone(), v.clone()).is_none() {
+                            if let Some(existing_val) = map.get_mut(f) {
+                                *existing_val = v.clone();
+                            } else {
+                                map.insert(f.clone(), v.clone());
                                 added += 1;
                             }
                         }
@@ -3127,7 +3141,8 @@ impl RudisTable {
             };
             (RudisValue::SmallHash(pairs), added)
         } else {
-            let mut map = HashMap::with_capacity(fields.len());
+            let mut map =
+                RudisHashMap::with_capacity_and_hasher(fields.len(), FxBuildHasher::default());
             let mut added = 0;
             for (f, v) in fields {
                 if map.insert(f.clone(), v.clone()).is_none() {
@@ -3178,7 +3193,7 @@ impl RudisTable {
                         || value.len() > max_value;
                     pairs.push((field, value));
                     if should_promote {
-                        let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
+                        let map: RudisHashMap = pairs.drain(..).collect();
                         entry.val = RudisValue::Hash(map);
                     }
                     return Ok(1);
@@ -3199,7 +3214,7 @@ impl RudisTable {
         }
 
         let val = if field.len() > max_value || value.len() > max_value {
-            let mut map = HashMap::new();
+            let mut map = RudisHashMap::default();
             map.insert(field, value);
             RudisValue::Hash(map)
         } else {
@@ -3707,7 +3722,7 @@ impl RudisTable {
                                 .iter()
                                 .any(|(k, v)| k.len() > max_value || v.len() > max_value)
                         {
-                            let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
+                            let map: RudisHashMap = pairs.drain(..).collect();
                             entry.val = RudisValue::Hash(map);
                         }
                     }
@@ -3726,7 +3741,11 @@ impl RudisTable {
                         .checked_add(delta)
                         .ok_or("ERR increment or decrement would overflow")?;
                     let new_bytes = Bytes::from(new_val.to_string());
-                    map.insert(field, new_bytes);
+                    if let Some(existing_val) = map.get_mut(&field) {
+                        *existing_val = new_bytes;
+                    } else {
+                        map.insert(field, new_bytes);
+                    }
                     return Ok(new_val);
                 }
                 _ => {
@@ -3786,7 +3805,7 @@ impl RudisTable {
                                 .iter()
                                 .any(|(k, v)| k.len() > max_value || v.len() > max_value)
                         {
-                            let map: HashMap<Bytes, Bytes> = pairs.drain(..).collect();
+                            let map: RudisHashMap = pairs.drain(..).collect();
                             entry.val = RudisValue::Hash(map);
                         }
                     }
@@ -3806,7 +3825,11 @@ impl RudisTable {
                         return Err("ERR increment would produce NaN or Infinity");
                     }
                     let new_bytes = Bytes::from(new_val.to_string());
-                    map.insert(field, new_bytes);
+                    if let Some(existing_val) = map.get_mut(&field) {
+                        *existing_val = new_bytes;
+                    } else {
+                        map.insert(field, new_bytes);
+                    }
                     return Ok(new_val);
                 }
                 _ => {
@@ -8520,7 +8543,8 @@ impl RudisTable {
                     }
                     RudisValue::SmallHash(pairs)
                 } else {
-                    let mut hash = hashbrown::HashMap::with_capacity(count);
+                    let mut hash =
+                        RudisHashMap::with_capacity_and_hasher(count, FxBuildHasher::default());
                     for _ in 0..count {
                         if cursor + 4 > data.len() {
                             return Err("DUMP payload version or checksum are wrong");
