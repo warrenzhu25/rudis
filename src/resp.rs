@@ -91,10 +91,10 @@ pub enum SetCondition {
     None,
     Nx,
     Xx,
-    Ifeq(Bytes),
-    Ifne(Bytes),
-    Ifdeq(Bytes),
-    Ifdne(Bytes),
+    Ifeq(Box<Bytes>),
+    Ifne(Box<Bytes>),
+    Ifdeq(Box<Bytes>),
+    Ifdne(Box<Bytes>),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -400,7 +400,7 @@ pub enum Command {
     Zrangestore {
         dst: Bytes,
         src: Bytes,
-        opts: crate::table::ZRangeOpts,
+        opts: Box<crate::table::ZRangeOpts>,
     },
     Zpopmin {
         key: Bytes,
@@ -1838,28 +1838,28 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         if condition != SetCondition::None || i + 1 >= args.len() {
                             return Err("syntax error".to_string());
                         }
-                        condition = SetCondition::Ifeq(args[i + 1].clone());
+                        condition = SetCondition::Ifeq(Box::new(args[i + 1].clone()));
                         i += 2;
                     }
                     "IFNE" => {
                         if condition != SetCondition::None || i + 1 >= args.len() {
                             return Err("syntax error".to_string());
                         }
-                        condition = SetCondition::Ifne(args[i + 1].clone());
+                        condition = SetCondition::Ifne(Box::new(args[i + 1].clone()));
                         i += 2;
                     }
                     "IFDEQ" => {
                         if condition != SetCondition::None || i + 1 >= args.len() {
                             return Err("syntax error".to_string());
                         }
-                        condition = SetCondition::Ifdeq(args[i + 1].clone());
+                        condition = SetCondition::Ifdeq(Box::new(args[i + 1].clone()));
                         i += 2;
                     }
                     "IFDNE" => {
                         if condition != SetCondition::None || i + 1 >= args.len() {
                             return Err("syntax error".to_string());
                         }
-                        condition = SetCondition::Ifdne(args[i + 1].clone());
+                        condition = SetCondition::Ifdne(Box::new(args[i + 1].clone()));
                         i += 2;
                     }
                     "GET" => {
@@ -3988,7 +3988,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::Zrangestore {
                 dst: args[1].clone(),
                 src: args[2].clone(),
-                opts,
+                opts: Box::new(opts),
             }))
         }
         "ZPOPMIN" | "ZPOPMAX" => {
@@ -8498,8 +8498,8 @@ mod tests {
             parse_command(&mut buf).unwrap().unwrap(),
             Command::Zremrangebylex {
                 key: Bytes::from_static(b"z"),
-                min: crate::table::LexBound::Inclusive(Bytes::from_static(b"a")),
-                max: crate::table::LexBound::Exclusive(Bytes::from_static(b"c"))
+                min: crate::table::LexBound::Inclusive(Box::new(Bytes::from_static(b"a"))),
+                max: crate::table::LexBound::Exclusive(Box::new(Bytes::from_static(b"c")))
             }
         );
         let mut buf = BytesMut::from("ZLEXCOUNT z - +\r\n");
@@ -8731,5 +8731,7 @@ mod tests {
                 },
             }
         );
+        assert_eq!(std::mem::size_of::<SetCondition>(), 16);
+        assert_eq!(std::mem::size_of::<crate::table::LexBound>(), 16);
     }
 }

@@ -40,8 +40,8 @@ pub struct ZAddFlags {
 pub enum LexBound {
     UnboundedMin,
     UnboundedMax,
-    Inclusive(Bytes),
-    Exclusive(Bytes),
+    Inclusive(Box<Bytes>),
+    Exclusive(Box<Bytes>),
 }
 
 impl LexBound {
@@ -51,16 +51,16 @@ impl LexBound {
             LexBound::UnboundedMax => !is_min,
             LexBound::Inclusive(b) => {
                 if is_min {
-                    val >= b.as_ref()
+                    val >= (**b).as_ref()
                 } else {
-                    val <= b.as_ref()
+                    val <= (**b).as_ref()
                 }
             }
             LexBound::Exclusive(b) => {
                 if is_min {
-                    val > b.as_ref()
+                    val > (**b).as_ref()
                 } else {
-                    val < b.as_ref()
+                    val < (**b).as_ref()
                 }
             }
         }
@@ -76,9 +76,13 @@ pub fn parse_lex_bound(s: &[u8]) -> Result<LexBound, &'static str> {
     } else if s == b"+" {
         Ok(LexBound::UnboundedMax)
     } else if s[0] == b'[' {
-        Ok(LexBound::Inclusive(Bytes::copy_from_slice(&s[1..])))
+        Ok(LexBound::Inclusive(Box::new(Bytes::copy_from_slice(
+            &s[1..],
+        ))))
     } else if s[0] == b'(' {
-        Ok(LexBound::Exclusive(Bytes::copy_from_slice(&s[1..])))
+        Ok(LexBound::Exclusive(Box::new(Bytes::copy_from_slice(
+            &s[1..],
+        ))))
     } else {
         Err("min or max not valid string range item")
     }
