@@ -12844,8 +12844,9 @@ async fn execute_commands_squashed(
                             }
                         }
                     } else {
-                        match router.local_db.borrow_mut().write_lpop_resp(
+                        match router.local_db.borrow_mut().write_lpop_resp_with_hash(
                             key.as_ref(),
+                            key_hash,
                             count,
                             &mut local_buf,
                         ) {
@@ -12945,8 +12946,9 @@ async fn execute_commands_squashed(
                             }
                         }
                     } else {
-                        match router.local_db.borrow_mut().write_rpop_resp(
+                        match router.local_db.borrow_mut().write_rpop_resp_with_hash(
                             key.as_ref(),
+                            key_hash,
                             count,
                             &mut local_buf,
                         ) {

@@ -803,7 +803,7 @@ pub fn run_shard_worker(
                                                 }
                                             }
                                         } else {
-                                            match r.local_db.borrow_mut().write_lpop_resp(key.as_ref(), count, &mut temp_buf) {
+                                            match r.local_db.borrow_mut().table.write_lpop_resp_with_hash(key.as_ref(), key_hash, count, &mut temp_buf) {
                                                 Ok(has_pop) => {
                                                     if has_pop {
                                                         has_writes = true;
@@ -840,7 +840,7 @@ pub fn run_shard_worker(
                                                 }
                                             }
                                         } else {
-                                            match r.local_db.borrow_mut().write_rpop_resp(key.as_ref(), count, &mut temp_buf) {
+                                            match r.local_db.borrow_mut().table.write_rpop_resp_with_hash(key.as_ref(), key_hash, count, &mut temp_buf) {
                                                 Ok(has_pop) => {
                                                     if has_pop {
                                                         has_writes = true;
@@ -1107,7 +1107,44 @@ pub fn run_shard_worker(
                                             }
                                         }
                                     } else {
-                                        match db.write_lpop_resp(key.as_ref(), count, &mut temp_buf) {
+                                        match db.table.write_lpop_resp_with_hash(key.as_ref(), key_hash, count, &mut temp_buf) {
+                                            Ok(has_pop) => {
+                                                if has_pop {
+                                                    has_writes = true;
+                                                    if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                                        crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
+                                                    }
+                                                }
+                                            }
+                                            Err(err) => {
+                                                crate::connection::write_resp_err(&mut temp_buf, err);
+                                            }
+                                        }
+                                    }
+                                } else if aof_ref.is_none()
+                                    && !crate::replication::has_connected_replicas(cross_shard_router.port)
+                                    && let Command::Rpop { ref key, count } = cmd
+                                {
+                                    if count.is_none() {
+                                        match db.table.rpop_one_with_hash(key.as_ref(), key_hash) {
+                                            Ok(Some(v)) => {
+                                                has_writes = true;
+                                                if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                                    crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
+                                                }
+                                                results.push((idx, crate::shard::CompactResp::from_owned_bulk(v)));
+                                                continue;
+                                            }
+                                            Ok(None) => {
+                                                results.push((idx, crate::shard::CompactResp::NULL));
+                                                continue;
+                                            }
+                                            Err(err) => {
+                                                crate::connection::write_resp_err(&mut temp_buf, err);
+                                            }
+                                        }
+                                    } else {
+                                        match db.table.write_rpop_resp_with_hash(key.as_ref(), key_hash, count, &mut temp_buf) {
                                             Ok(has_pop) => {
                                                 if has_pop {
                                                     has_writes = true;

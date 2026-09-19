@@ -1263,6 +1263,9 @@ impl RudisFlatTable {
     /// Finds the index and entry reference of a matching key, if present.
     #[inline(always)]
     pub fn find_entry(&self, key: &[u8], hash: u64) -> Option<(usize, &RudisEntry)> {
+        if self.items == 0 {
+            return None;
+        }
         let tag = fingerprint(hash);
         let mut idx = (hash as usize) & self.mask;
         let mut step = 0;
@@ -1296,6 +1299,9 @@ impl RudisFlatTable {
     /// Checks whether a key exists in the flat table without returning the entry reference.
     #[inline(always)]
     pub fn contains(&self, key: &[u8], hash: u64) -> bool {
+        if self.items == 0 {
+            return false;
+        }
         let tag = fingerprint(hash);
         let mut idx = (hash as usize) & self.mask;
         let mut step = 0;
@@ -1329,6 +1335,9 @@ impl RudisFlatTable {
     /// Finds the index and mutable entry reference of a matching key, if present.
     #[inline(always)]
     pub fn find_entry_mut(&mut self, key: &[u8], hash: u64) -> Option<(usize, &mut RudisEntry)> {
+        if self.items == 0 {
+            return None;
+        }
         let tag = fingerprint(hash);
         let mut idx = (hash as usize) & self.mask;
         let mut step = 0;
@@ -1371,6 +1380,9 @@ impl RudisFlatTable {
     /// Searches for key and returns either `(Some(existing_slot_idx), candidate_insert_idx)`
     /// or `(None, candidate_insert_idx)`.
     fn find_or_prepare_insert(&self, key: &[u8], hash: u64) -> (Option<usize>, usize) {
+        if self.items == 0 {
+            return (None, (hash as usize) & self.mask);
+        }
         let tag = fingerprint(hash);
         let mut idx = (hash as usize) & self.mask;
         let mut step = 0;
@@ -1478,6 +1490,10 @@ impl RudisFlatTable {
     pub fn remove(&mut self, slot_idx: usize) -> Option<RudisEntry> {
         self.set_ctrl(slot_idx, DELETED);
         self.items -= 1;
+        if self.items == 0 {
+            self.ctrl.fill(EMPTY);
+            self.growth_left = self.capacity * 7 / 8;
+        }
         let entry = self.slots[slot_idx].take();
         if let Some(ref e) = entry
             && crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed)
@@ -1494,6 +1510,10 @@ impl RudisFlatTable {
     pub fn remove_present(&mut self, slot_idx: usize) -> RudisEntry {
         self.set_ctrl(slot_idx, DELETED);
         self.items -= 1;
+        if self.items == 0 {
+            self.ctrl.fill(EMPTY);
+            self.growth_left = self.capacity * 7 / 8;
+        }
         // SAFETY: Caller verified presence via find_entry
         let entry = unsafe {
             self.slots
@@ -4141,15 +4161,15 @@ impl RudisTable {
     }
 
     #[inline(always)]
-    pub fn write_lpop_resp(
+    pub fn write_lpop_resp_with_hash(
         &mut self,
         key: &[u8],
+        h: u64,
         count: Option<usize>,
         out: &mut Vec<u8>,
     ) -> Result<bool, &'static str> {
-        let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h) {
-            if let Some(entry) = self.table.get_slot(idx)
+        if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
+            if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
@@ -4165,37 +4185,117 @@ impl RudisTable {
             }
 
             let mut has_written = false;
-            let is_empty = if let Some(entry) = self.table.get_slot_mut(idx) {
-                match &mut entry.val {
-                    RudisValue::List(deque) => {
-                        if let Some(cnt) = count {
-                            let n = cnt.min(deque.len());
-                            crate::connection::write_resp_array_header(out, n);
-                            for _ in 0..n {
-                                if let Some(val) = deque.pop_front() {
-                                    has_written = true;
-                                    crate::connection::write_resp_bulk(out, &val);
-                                }
+            let is_empty = match &mut entry.val {
+                RudisValue::List(deque) => {
+                    if let Some(cnt) = count {
+                        let n = cnt.min(deque.len());
+                        crate::connection::write_resp_array_header(out, n);
+                        for _ in 0..n {
+                            if let Some(val) = deque.pop_front() {
+                                has_written = true;
+                                crate::connection::write_resp_bulk(out, &val);
                             }
-                        } else if let Some(val) = deque.pop_front() {
-                            has_written = true;
-                            crate::connection::write_resp_bulk(out, &val);
-                        } else {
-                            crate::connection::write_resp_null(out);
                         }
-                        deque.is_empty()
+                    } else if let Some(val) = deque.pop_front() {
+                        has_written = true;
+                        crate::connection::write_resp_bulk(out, &val);
+                    } else {
+                        crate::connection::write_resp_null(out);
                     }
-                    _ => {
-                        return Err(
-                            "WRONGTYPE Operation against a key holding the wrong kind of value",
-                        );
-                    }
+                    deque.is_empty()
                 }
-            } else {
-                false
+                _ => {
+                    return Err(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
+                }
             };
 
-            if is_empty && let Some(entry) = self.table.remove(idx) {
+            if is_empty {
+                let entry = self.table.remove_present(idx);
+                if self.num_expires > 0 && entry.expire_at.is_some() {
+                    self.num_expires = self.num_expires.saturating_sub(1);
+                }
+                self.recycle_value(entry.val);
+            }
+            Ok(has_written)
+        } else {
+            if count.is_some() {
+                crate::connection::write_resp_array_header(out, 0);
+            } else {
+                crate::connection::write_resp_null(out);
+            }
+            Ok(false)
+        }
+    }
+
+    #[inline(always)]
+    pub fn write_lpop_resp(
+        &mut self,
+        key: &[u8],
+        count: Option<usize>,
+        out: &mut Vec<u8>,
+    ) -> Result<bool, &'static str> {
+        let h = hash_key(key);
+        self.write_lpop_resp_with_hash(key, h, count, out)
+    }
+
+    #[inline(always)]
+    pub fn write_rpop_resp_with_hash(
+        &mut self,
+        key: &[u8],
+        h: u64,
+        count: Option<usize>,
+        out: &mut Vec<u8>,
+    ) -> Result<bool, &'static str> {
+        if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+                if count.is_some() {
+                    crate::connection::write_resp_array_header(out, 0);
+                } else {
+                    crate::connection::write_resp_null(out);
+                }
+                return Ok(false);
+            }
+
+            let mut has_written = false;
+            let is_empty = match &mut entry.val {
+                RudisValue::List(deque) => {
+                    if let Some(cnt) = count {
+                        let n = cnt.min(deque.len());
+                        crate::connection::write_resp_array_header(out, n);
+                        for _ in 0..n {
+                            if let Some(val) = deque.pop_back() {
+                                has_written = true;
+                                crate::connection::write_resp_bulk(out, &val);
+                            }
+                        }
+                    } else if let Some(val) = deque.pop_back() {
+                        has_written = true;
+                        crate::connection::write_resp_bulk(out, &val);
+                    } else {
+                        crate::connection::write_resp_null(out);
+                    }
+                    deque.is_empty()
+                }
+                _ => {
+                    return Err(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
+                }
+            };
+
+            if is_empty {
+                let entry = self.table.remove_present(idx);
+                if self.num_expires > 0 && entry.expire_at.is_some() {
+                    self.num_expires = self.num_expires.saturating_sub(1);
+                }
                 self.recycle_value(entry.val);
             }
             Ok(has_written)
@@ -4217,65 +4317,7 @@ impl RudisTable {
         out: &mut Vec<u8>,
     ) -> Result<bool, &'static str> {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h) {
-            if let Some(entry) = self.table.get_slot(idx)
-                && let Some(expire_at) = entry.expire_at
-                && !crate::connection::ALLOW_ACCESS_EXPIRED
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                && Instant::now() >= expire_at
-            {
-                self.expire_slot(idx);
-                if count.is_some() {
-                    crate::connection::write_resp_array_header(out, 0);
-                } else {
-                    crate::connection::write_resp_null(out);
-                }
-                return Ok(false);
-            }
-
-            let mut has_written = false;
-            let is_empty = if let Some(entry) = self.table.get_slot_mut(idx) {
-                match &mut entry.val {
-                    RudisValue::List(deque) => {
-                        if let Some(cnt) = count {
-                            let n = cnt.min(deque.len());
-                            crate::connection::write_resp_array_header(out, n);
-                            for _ in 0..n {
-                                if let Some(val) = deque.pop_back() {
-                                    has_written = true;
-                                    crate::connection::write_resp_bulk(out, &val);
-                                }
-                            }
-                        } else if let Some(val) = deque.pop_back() {
-                            has_written = true;
-                            crate::connection::write_resp_bulk(out, &val);
-                        } else {
-                            crate::connection::write_resp_null(out);
-                        }
-                        deque.is_empty()
-                    }
-                    _ => {
-                        return Err(
-                            "WRONGTYPE Operation against a key holding the wrong kind of value",
-                        );
-                    }
-                }
-            } else {
-                false
-            };
-
-            if is_empty && let Some(entry) = self.table.remove(idx) {
-                self.recycle_value(entry.val);
-            }
-            Ok(has_written)
-        } else {
-            if count.is_some() {
-                crate::connection::write_resp_array_header(out, 0);
-            } else {
-                crate::connection::write_resp_null(out);
-            }
-            Ok(false)
-        }
+        self.write_rpop_resp_with_hash(key, h, count, out)
     }
 
     #[inline(always)]
@@ -11121,5 +11163,60 @@ mod tests {
             Ok((1, None))
         );
         assert_eq!(table.zcard(zkey.as_ref()), Ok(2));
+    }
+
+    #[test]
+    fn test_empty_table_bypass_and_tombstone_reset() {
+        let mut table = RudisTable::new();
+
+        // 1. In an empty table, lookups bypass SIMD search
+        let key = Bytes::from("any_key");
+        let h = hash_key(key.as_ref());
+        assert!(!table.exists_with_hash(key.as_ref(), h));
+        assert!(table.table.find_entry(key.as_ref(), h).is_none());
+        assert!(!table.table.contains(key.as_ref(), h));
+
+        // 2. Insert items and verify removal resets tombstones when items == 0
+        for i in 0..50 {
+            table.set(Bytes::from(format!("k_{}", i)), Bytes::from("v"), None);
+        }
+        assert_eq!(table.len(), 50);
+
+        // Delete all items
+        for i in 0..50 {
+            assert!(table.del(&Bytes::from(format!("k_{}", i))));
+        }
+        assert_eq!(table.len(), 0);
+        // Verify all ctrl bytes were reset to EMPTY (no DELETED tombstones remain)
+        assert!(!table.table.ctrl.contains(&DELETED));
+
+        // 3. Test write_lpop_resp_with_hash on empty and populated lists
+        let list_k = Bytes::from("test_list");
+        let list_h = hash_key(list_k.as_ref());
+        let mut out = Vec::new();
+        assert_eq!(
+            table.write_lpop_resp_with_hash(list_k.as_ref(), list_h, None, &mut out),
+            Ok(false)
+        );
+        assert_eq!(out, b"$-1\r\n");
+
+        table
+            .rpush_slice_fast(&list_k, &[Bytes::from("a"), Bytes::from("b")])
+            .unwrap();
+        out.clear();
+        assert_eq!(
+            table.write_lpop_resp_with_hash(list_k.as_ref(), list_h, None, &mut out),
+            Ok(true)
+        );
+        assert_eq!(out, b"$1\r\na\r\n");
+
+        out.clear();
+        assert_eq!(
+            table.write_lpop_resp_with_hash(list_k.as_ref(), list_h, None, &mut out),
+            Ok(true)
+        );
+        assert_eq!(out, b"$1\r\nb\r\n");
+        assert_eq!(table.len(), 0);
+        assert!(!table.table.ctrl.contains(&DELETED));
     }
 }

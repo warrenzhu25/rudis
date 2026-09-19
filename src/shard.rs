@@ -990,6 +990,17 @@ impl ShardDb {
         self.table.write_lpop_resp(key, count, out)
     }
 
+    #[inline(always)]
+    pub fn write_lpop_resp_with_hash(
+        &mut self,
+        key: &[u8],
+        h: u64,
+        count: Option<usize>,
+        out: &mut Vec<u8>,
+    ) -> Result<bool, &'static str> {
+        self.table.write_lpop_resp_with_hash(key, h, count, out)
+    }
+
     #[inline]
     pub fn rpop(&mut self, key: &[u8], count: usize) -> Result<Vec<Bytes>, &'static str> {
         self.table.rpop(key, count)
@@ -1003,6 +1014,17 @@ impl ShardDb {
         out: &mut Vec<u8>,
     ) -> Result<bool, &'static str> {
         self.table.write_rpop_resp(key, count, out)
+    }
+
+    #[inline(always)]
+    pub fn write_rpop_resp_with_hash(
+        &mut self,
+        key: &[u8],
+        h: u64,
+        count: Option<usize>,
+        out: &mut Vec<u8>,
+    ) -> Result<bool, &'static str> {
+        self.table.write_rpop_resp_with_hash(key, h, count, out)
     }
 
     #[inline]
