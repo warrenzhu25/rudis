@@ -1466,6 +1466,26 @@ impl RudisFlatTable {
         entry
     }
 
+    /// Optimized removal when the caller already verified `self.slots[slot_idx]` is `Some`.
+    /// Avoids outer Option checks and inlines cleanly into `del_with_hash`.
+    #[inline(always)]
+    pub fn remove_present(&mut self, slot_idx: usize) -> RudisEntry {
+        self.set_ctrl(slot_idx, DELETED);
+        self.items -= 1;
+        // SAFETY: Caller verified presence via find_entry
+        let entry = unsafe {
+            self.slots
+                .get_unchecked_mut(slot_idx)
+                .take()
+                .unwrap_unchecked()
+        };
+        if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
+            let slot = crate::router::key_slot(&entry.key) as usize;
+            self.slot_counts[slot] = self.slot_counts[slot].saturating_sub(1);
+        }
+        entry
+    }
+
     #[inline(always)]
     pub fn get_slot(&self, idx: usize) -> Option<&RudisEntry> {
         self.slots[idx].as_ref()
@@ -2051,15 +2071,14 @@ impl RudisTable {
                 self.expire_slot(idx);
                 return false;
             }
-            if let Some(entry) = self.table.remove(idx) {
-                if self.num_expires > 0 && entry.expire_at.is_some() {
-                    self.num_expires = self.num_expires.saturating_sub(1);
-                }
-                let freed = entry.key.len() + entry.val.approx_bytes() + 64;
-                self.used_memory = self.used_memory.saturating_sub(freed);
-                self.recycle_value(entry.val);
-                return true;
+            let entry = self.table.remove_present(idx);
+            if self.num_expires > 0 && entry.expire_at.is_some() {
+                self.num_expires = self.num_expires.saturating_sub(1);
             }
+            let freed = entry.key.len() + entry.val.approx_bytes() + 64;
+            self.used_memory = self.used_memory.saturating_sub(freed);
+            self.recycle_value(entry.val);
+            return true;
         }
         false
     }
@@ -4130,7 +4149,8 @@ impl RudisTable {
                 }
             };
 
-            if is_empty && let Some(entry) = self.table.remove(idx) {
+            if is_empty {
+                let entry = self.table.remove_present(idx);
                 if self.num_expires > 0 && entry.expire_at.is_some() {
                     self.num_expires = self.num_expires.saturating_sub(1);
                 }
@@ -4168,7 +4188,8 @@ impl RudisTable {
                 }
             };
 
-            if is_empty && let Some(entry) = self.table.remove(idx) {
+            if is_empty {
+                let entry = self.table.remove_present(idx);
                 if self.num_expires > 0 && entry.expire_at.is_some() {
                     self.num_expires = self.num_expires.saturating_sub(1);
                 }
@@ -10733,5 +10754,20 @@ mod tests {
             table.sismember_compact_with_hash(key.as_ref(), h, b"mem4"),
             Ok(crate::shard::CompactResp::INT_0)
         );
+    }
+
+    #[test]
+    fn test_flat_table_remove_present() {
+        let mut table = RudisTable::new();
+        let key = Bytes::from("del_present_key");
+        let h = hash_key(key.as_ref());
+
+        table.set(key.clone(), Bytes::from("val"), None);
+        assert!(table.exists_with_hash(key.as_ref(), h));
+
+        // Delete using del_with_hash which calls remove_present internally
+        assert!(table.del_with_hash(key.as_ref(), h));
+        assert!(!table.exists_with_hash(key.as_ref(), h));
+        assert_eq!(table.len(), 0);
     }
 }

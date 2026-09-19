@@ -9772,3 +9772,34 @@ fn test_pipelined_sismember_sadd_e2e() {
         assert_eq!(send_and_read(&mut conn, sismember_cmd.as_bytes()), ":0\r\n");
     }
 }
+
+#[test]
+fn test_concurrent_multikey_del_e2e() {
+    let port = 16800;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut conn = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // Populate keys
+    for i in 0..60 {
+        let set_cmd = format!("SET cdel_{} val_{}\r\n", i, i);
+        assert_eq!(send_and_read(&mut conn, set_cmd.as_bytes()), "+OK\r\n");
+    }
+
+    // Delete single keys in a pipeline
+    for i in 0..30 {
+        let del_cmd = format!("DEL cdel_{}\r\n", i);
+        assert_eq!(send_and_read(&mut conn, del_cmd.as_bytes()), ":1\r\n");
+    }
+
+    // Second DEL returns 0
+    for i in 0..30 {
+        let del_cmd = format!("DEL cdel_{}\r\n", i);
+        assert_eq!(send_and_read(&mut conn, del_cmd.as_bytes()), ":0\r\n");
+    }
+
+    // Delete remaining keys in batches
+    let del_batch = "DEL cdel_30 cdel_31 cdel_32 cdel_33 cdel_34\r\n";
+    assert_eq!(send_and_read(&mut conn, del_batch.as_bytes()), ":5\r\n");
+}
