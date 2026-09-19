@@ -533,6 +533,12 @@ def benchmark_at_core_count(cores):
     time.sleep(1.0)
 
     # 2. Rudis
+    cargo_bin = os.path.expanduser("~/.cargo/bin/cargo")
+    if os.path.exists(cargo_bin):
+        repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        print(f"[*] Ensuring latest release build via {cargo_bin} build --release...")
+        subprocess.run([cargo_bin, "build", "--release"], check=True, cwd=repo_dir)
+
     print(f"\n>>> Launching Rudis ({cores} threads)...")
     rudis_cmd = [
         "taskset", "-c", server_cpus,
