@@ -8623,7 +8623,7 @@ fn test_small_collection_arena_and_slice_dispatch_e2e() {
 
 #[test]
 fn test_pipelined_cross_shard_sadd_compact_resp_e2e() {
-    let port = 16450;
+    let port = 16830;
     start_test_server(port, 4);
 
     let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -8949,7 +8949,7 @@ fn test_pipelined_cross_shard_mget_mset_e2e() {
 /// the very same pipeline even though both are dispatched before either is gathered.
 #[test]
 fn test_interleaved_pipeline_mget_mset_ordering_e2e() {
-    let port = 16460;
+    let port = 16840;
     start_test_server(port, 4);
 
     let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -9009,7 +9009,7 @@ fn test_interleaved_pipeline_mget_mset_ordering_e2e() {
 
 #[test]
 fn test_pipelined_exists_cross_shard_e2e() {
-    let port = 16470;
+    let port = 16850;
     start_test_server(port, 4);
 
     let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -9054,7 +9054,7 @@ fn test_pipelined_exists_cross_shard_e2e() {
 
 #[test]
 fn test_pipelined_lpop_cross_shard_e2e() {
-    let port = 16471;
+    let port = 16860;
     start_test_server(port, 4);
 
     let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -9100,7 +9100,7 @@ fn test_pipelined_lpop_cross_shard_e2e() {
 
 #[test]
 fn test_pipelined_sadd_sismember_cross_shard_e2e() {
-    let port = 16472;
+    let port = 16870;
     start_test_server(port, 4);
 
     let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -9161,7 +9161,7 @@ fn test_pipelined_sadd_sismember_cross_shard_e2e() {
 
 #[test]
 fn test_pipelined_hset_hget_sismember_zadd_cross_shard_e2e() {
-    let port = 16473;
+    let port = 16880;
     start_test_server(port, 4);
 
     let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -9276,7 +9276,7 @@ fn test_pipelined_hset_hget_sismember_zadd_cross_shard_e2e() {
 
 #[test]
 fn test_pipelined_lpush_lpop_large_bulk_and_incr_e2e() {
-    let port = 16474;
+    let port = 16890;
     start_test_server(port, 4);
 
     let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -9843,4 +9843,38 @@ fn test_hset_hget_e2e_pipelined_and_single() {
         send_and_read(&mut conn, b"HGET hash_test_0 nofield\r\n"),
         "$-1\r\n"
     );
+}
+
+#[test]
+fn test_smallvec_del_and_hset_e2e() {
+    let port = 16820;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut conn = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Single-key DEL and HSET mixed pipeline
+    let mut pipe = String::new();
+    for i in 0..50 {
+        pipe.push_str(&format!("HSET smh_{} f v\r\n", i));
+    }
+    for i in 0..50 {
+        pipe.push_str(&format!("DEL smh_{}\r\n", i));
+    }
+
+    use std::io::{Read, Write};
+    conn.write_all(pipe.as_bytes()).unwrap();
+
+    let mut response = vec![0u8; 100 * 4];
+    conn.read_exact(&mut response).unwrap();
+
+    // Verify 50 times ":1\r\n" for HSET and 50 times ":1\r\n" for DEL
+    let expected = ":1\r\n".repeat(100);
+    assert_eq!(response, expected.as_bytes());
+
+    // Verify all keys deleted
+    for i in 0..50 {
+        let cmd = format!("EXISTS smh_{}\r\n", i);
+        assert_eq!(send_and_read(&mut conn, cmd.as_bytes()), ":0\r\n");
+    }
 }

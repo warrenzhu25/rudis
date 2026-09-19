@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use smallvec::{SmallVec, smallvec};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -1460,7 +1461,7 @@ impl Router {
             let deleted = self.local_db.borrow_mut().del(&key);
             if deleted
                 && let Some(aof) = &self.aof
-                && let Some(bytes) = crate::aof::command_to_resp(&Command::Del(vec![key]))
+                && let Some(bytes) = crate::aof::command_to_resp(&Command::Del(smallvec![key]))
             {
                 aof.borrow_mut().append(&bytes);
             }
@@ -1503,7 +1504,8 @@ impl Router {
             }
             if count > 0
                 && let Some(aof) = &self.aof
-                && let Some(bytes) = crate::aof::command_to_resp(&Command::Del(deleted_keys))
+                && let Some(bytes) =
+                    crate::aof::command_to_resp(&Command::Del(SmallVec::from_vec(deleted_keys)))
             {
                 aof.borrow_mut().append(&bytes);
             }
@@ -1540,7 +1542,8 @@ impl Router {
             }
             if !deleted_local.is_empty()
                 && let Some(aof) = &self.aof
-                && let Some(bytes) = crate::aof::command_to_resp(&Command::Del(deleted_local))
+                && let Some(bytes) =
+                    crate::aof::command_to_resp(&Command::Del(SmallVec::from_vec(deleted_local)))
             {
                 aof.borrow_mut().append(&bytes);
             }

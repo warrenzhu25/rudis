@@ -1,6 +1,7 @@
 use bytes::{Bytes, BytesMut};
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt, Splitable};
 use monoio::net::TcpStream;
+use smallvec::smallvec;
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -2233,12 +2234,12 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
             }
         }
 
-        Command::Mget(keys) | Command::Del(keys) | Command::Touch(keys) => {
+        Command::Mget(keys) | Command::Touch(keys) => {
             for k in keys {
                 f(k.as_ref());
             }
         }
-        Command::Exists(keys) => {
+        Command::Del(keys) | Command::Exists(keys) => {
             for k in keys {
                 f(k.as_ref());
             }
@@ -3651,7 +3652,7 @@ async fn execute_command(
                         db.del(&key);
                         if let Some(aof) = &router.aof
                             && let Some(bytes) =
-                                crate::aof::command_to_resp(&Command::Del(vec![key.clone()]))
+                                crate::aof::command_to_resp(&Command::Del(smallvec![key.clone()]))
                         {
                             aof.borrow_mut().append(&bytes);
                         }
@@ -3937,7 +3938,12 @@ async fn execute_command(
             for key in &keys {
                 notify_key_invalidation(router.port, key.as_ref(), client_id);
             }
-            let count = router.del_keys(keys.clone()).await;
+            let count = if keys.len() == 1 {
+                let deleted = router.del(keys[0].clone()).await;
+                if deleted { 1 } else { 0 }
+            } else {
+                router.del_keys(keys.to_vec()).await
+            };
             if count > 0 {
                 for key in &keys {
                     crate::search::delete_document_hook(&String::from_utf8_lossy(key));
@@ -13395,7 +13401,7 @@ mod tests {
         ]);
         assert_eq!(cmd_keys(&mset), vec![b"k1", b"k2"]);
 
-        let del = Command::Del(vec![Bytes::from("d1"), Bytes::from("d2")]);
+        let del = Command::Del(smallvec![Bytes::from("d1"), Bytes::from("d2")]);
         assert_eq!(cmd_keys(&del), vec![b"d1", b"d2"]);
 
         let sinter = Command::Sinter(vec![Bytes::from("s1"), Bytes::from("s2")]);

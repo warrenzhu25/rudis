@@ -207,7 +207,7 @@ pub enum Command {
         with_match_len: bool,
     },
     Digest(Bytes),
-    Del(Vec<Bytes>),
+    Del(SmallVec<[Bytes; 1]>),
     Exists(SmallVec<[Bytes; 1]>),
     IncrBy(Bytes, i64),
     Expire(Bytes, Duration),
@@ -228,7 +228,7 @@ pub enum Command {
     },
     Hset {
         key: Bytes,
-        fields: Vec<(Bytes, Bytes)>,
+        fields: SmallVec<[(Bytes, Bytes); 1]>,
     },
     Hsetnx {
         key: Bytes,
@@ -237,7 +237,7 @@ pub enum Command {
     },
     Hmset {
         key: Bytes,
-        fields: Vec<(Bytes, Bytes)>,
+        fields: SmallVec<[(Bytes, Bytes); 1]>,
     },
     Hget {
         key: Bytes,
@@ -1445,7 +1445,7 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
                     }
                     if cmd_bytes.eq_ignore_ascii_case(b"DEL") && num_args == 2 {
                         let (k_start, k_len) = offsets[1];
-                        return Ok(Some(Command::Del(vec![
+                        return Ok(Some(Command::Del(smallvec![
                             frame.slice(k_start..k_start + k_len),
                         ])));
                     }
@@ -1472,7 +1472,7 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
                         let (v_start, v_len) = offsets[3];
                         return Ok(Some(Command::Hset {
                             key: frame.slice(k_start..k_start + k_len),
-                            fields: vec![(
+                            fields: smallvec![(
                                 frame.slice(f_start..f_start + f_len),
                                 frame.slice(v_start..v_start + v_len),
                             )],
@@ -2194,7 +2194,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }))
             } else {
                 args.remove(0);
-                Ok(Some(Command::Del(args)))
+                Ok(Some(Command::Del(SmallVec::from_vec(args))))
             }
         }
         "EXISTS" => {
@@ -2861,7 +2861,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'hset' command".to_string());
             }
             let key = args[1].clone();
-            let mut fields = Vec::with_capacity((args.len() - 2) / 2);
+            let mut fields = SmallVec::with_capacity((args.len() - 2) / 2);
             let mut i = 2;
             while i < args.len() {
                 fields.push((args[i].clone(), args[i + 1].clone()));
@@ -2884,7 +2884,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'hmset' command".to_string());
             }
             let key = args[1].clone();
-            let mut fields = Vec::with_capacity((args.len() - 2) / 2);
+            let mut fields = SmallVec::with_capacity((args.len() - 2) / 2);
             let mut i = 2;
             while i < args.len() {
                 fields.push((args[i].clone(), args[i + 1].clone()));
@@ -8027,7 +8027,7 @@ mod tests {
             cmd,
             Command::Hset {
                 key: Bytes::from_static(b"myhash"),
-                fields: vec![
+                fields: smallvec![
                     (Bytes::from_static(b"f1"), Bytes::from_static(b"v1")),
                     (Bytes::from_static(b"f2"), Bytes::from_static(b"v2")),
                 ],
@@ -8731,5 +8731,47 @@ mod tests {
                 },
             }
         );
+    }
+
+    #[test]
+    fn test_smallvec_del_and_hset_parsing() {
+        // Single-key DEL: not spilled
+        let mut buf = BytesMut::from("*2\r\n$3\r\nDEL\r\n$4\r\nmyk1\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        match cmd {
+            Command::Del(keys) => {
+                assert_eq!(keys.len(), 1);
+                assert!(!keys.spilled());
+                assert_eq!(keys[0], Bytes::from_static(b"myk1"));
+            }
+            _ => panic!("Expected Del command"),
+        }
+
+        // Single-field HSET: not spilled
+        let mut buf = BytesMut::from("*4\r\n$4\r\nHSET\r\n$4\r\nmyh1\r\n$2\r\nf1\r\n$2\r\nv1\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        match cmd {
+            Command::Hset { key, fields } => {
+                assert_eq!(key, Bytes::from_static(b"myh1"));
+                assert_eq!(fields.len(), 1);
+                assert!(!fields.spilled());
+                assert_eq!(fields[0].0, Bytes::from_static(b"f1"));
+                assert_eq!(fields[0].1, Bytes::from_static(b"v1"));
+            }
+            _ => panic!("Expected Hset command"),
+        }
+
+        // Multi-key DEL: spilled
+        let mut buf = BytesMut::from("*3\r\n$3\r\nDEL\r\n$2\r\nk1\r\n$2\r\nk2\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        match cmd {
+            Command::Del(keys) => {
+                assert_eq!(keys.len(), 2);
+                assert!(keys.spilled());
+                assert_eq!(keys[0], Bytes::from_static(b"k1"));
+                assert_eq!(keys[1], Bytes::from_static(b"k2"));
+            }
+            _ => panic!("Expected Del command"),
+        }
     }
 }

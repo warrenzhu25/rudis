@@ -1,3 +1,4 @@
+use smallvec::{SmallVec, smallvec};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::cell::RefCell;
 use std::future::Future;
@@ -454,7 +455,7 @@ pub fn run_shard_worker(
                         if deleted
                             && let Some(aof) = &cross_shard_aof
                                 && let Some(bytes) =
-                                    crate::aof::command_to_resp(&crate::resp::Command::Del(vec![
+                                    crate::aof::command_to_resp(&crate::resp::Command::Del(smallvec![
                                         key,
                                     ]))
                                 {
@@ -477,7 +478,7 @@ pub fn run_shard_worker(
                         if count > 0
                             && let Some(aof) = &cross_shard_aof
                             && let Some(bytes) =
-                                crate::aof::command_to_resp(&crate::resp::Command::Del(deleted_keys))
+                                crate::aof::command_to_resp(&crate::resp::Command::Del(SmallVec::from_vec(deleted_keys)))
                         {
                             aof.borrow_mut().append(&bytes);
                         }
