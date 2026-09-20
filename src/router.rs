@@ -1125,9 +1125,9 @@ impl Router {
         let mut num_remote_shards = 0;
 
         for (idx, key) in keys.into_iter().enumerate() {
-            let target = self.target_shard(&key);
+            let (target, key_hash) = target_shard_and_hash(key.as_ref(), self.num_shards);
             if target == self.shard_id {
-                local_keys.push((idx, key));
+                local_keys.push((idx, key, key_hash));
             } else {
                 has_remote = true;
                 if remote_batches[target].is_empty() {
@@ -1142,8 +1142,8 @@ impl Router {
             crate::connection::write_resp_array_header(out, total_keys);
             {
                 let mut db = self.local_db.borrow_mut();
-                for (_, key) in local_keys {
-                    if let Some(v) = db.get(&key) {
+                for (_, key, key_hash) in local_keys {
+                    if let Some(v) = db.get_with_hash(key.as_ref(), key_hash) {
                         crate::connection::write_resp_bulk(out, &v);
                     } else {
                         crate::connection::write_resp_null(out);
@@ -1175,8 +1175,8 @@ impl Router {
         // Execute local keys CONCURRENTLY while remote shards process their batches
         if !local_keys.is_empty() {
             let mut db = self.local_db.borrow_mut();
-            for (idx, key) in local_keys {
-                let val = db.get(&key);
+            for (idx, key, key_hash) in local_keys {
+                let val = db.get_with_hash(key.as_ref(), key_hash);
                 descriptor.write_result(idx, val);
             }
         }
@@ -1199,9 +1199,9 @@ impl Router {
             total_keys,
         } = inflight;
 
-        // Wait for all remote shards to complete their writes
+        // Wait for all remote shards to complete their writes with spin loop first
         if descriptor.pending.load(Ordering::Acquire) != 0 {
-            for _ in 0..64 {
+            for _ in 0..256 {
                 std::hint::spin_loop();
                 if descriptor.pending.load(Ordering::Acquire) == 0 {
                     break;
@@ -1217,13 +1217,23 @@ impl Router {
         self.mget_batch_pool.borrow_mut().push(recycled);
         self.release_notify_channel(notify_tx, notify_rx);
 
-        out.reserve(total_keys * 140);
+        let mut total_bytes = 16;
+        unsafe {
+            for i in 0..total_keys {
+                if let Some(v) = &*descriptor.results[i].get() {
+                    total_bytes += v.len() + 16;
+                } else {
+                    total_bytes += 5;
+                }
+            }
+        }
+        out.reserve(total_bytes);
         crate::connection::write_resp_array_header(out, total_keys);
         unsafe {
             for i in 0..total_keys {
-                let slot = &*descriptor.results[i].get();
+                let slot = (*descriptor.results[i].get()).take();
                 match slot {
-                    Some(v) => crate::connection::write_resp_bulk(out, v),
+                    Some(ref v) => crate::connection::write_resp_bulk(out, v),
                     None => crate::connection::write_resp_null(out),
                 }
             }

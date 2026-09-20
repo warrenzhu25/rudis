@@ -1313,12 +1313,22 @@ pub fn run_shard_worker(
                         let has_tiering = db.tier_manager.is_some();
                         let mut cold_keys = None;
 
-                        for (idx, key) in &keys {
+                        if keys.len() == 1 {
+                            let (idx, ref key) = keys[0];
                             let val = db.get(key);
                             if val.is_none() && has_tiering && db.table.is_tiered(key).is_some() {
-                                cold_keys.get_or_insert_with(Vec::new).push((*idx, key.clone()));
+                                cold_keys = Some(vec![(idx, key.clone())]);
                             } else {
-                                descriptor.write_result(*idx, val);
+                                descriptor.write_result(idx, val);
+                            }
+                        } else {
+                            for (idx, key) in &keys {
+                                let val = db.get(key);
+                                if val.is_none() && has_tiering && db.table.is_tiered(key).is_some() {
+                                    cold_keys.get_or_insert_with(Vec::new).push((*idx, key.clone()));
+                                } else {
+                                    descriptor.write_result(*idx, val);
+                                }
                             }
                         }
 

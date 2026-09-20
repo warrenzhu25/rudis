@@ -555,9 +555,14 @@ impl ShardDb {
         self.table.get_entry(key)
     }
 
-    #[inline]
+    #[inline(always)]
     pub fn get(&mut self, key: &[u8]) -> Option<Bytes> {
         self.table.get(key).ok().flatten()
+    }
+
+    #[inline(always)]
+    pub fn get_with_hash(&mut self, key: &[u8], h: u64) -> Option<Bytes> {
+        self.table.get_with_hash(key, h).ok().flatten()
     }
 
     #[inline(always)]

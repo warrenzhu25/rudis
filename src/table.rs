@@ -1807,12 +1807,17 @@ impl RudisTable {
         }
     }
 
+    #[inline(always)]
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Bytes>, &'static str> {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h)
-            && let Some(entry) = self.table.get_slot(idx)
-        {
-            if let Some(expire_at) = entry.expire_at
+        self.get_with_hash(key, h)
+    }
+
+    #[inline(always)]
+    pub fn get_with_hash(&mut self, key: &[u8], h: u64) -> Result<Option<Bytes>, &'static str> {
+        if let Some((idx, entry)) = self.table.find_entry(key, h) {
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -11463,5 +11468,31 @@ mod tests {
                 .is_err()
         );
         assert!(table.sadd_single_member_with_hash(&hk, hh, &m1).is_err());
+    }
+
+    #[test]
+    fn test_get_with_hash() {
+        let mut table = RudisTable::new();
+        let k = Bytes::from("mykey");
+        let h = hash_key(k.as_ref());
+        let val = Bytes::from("myval");
+
+        // Key not found
+        assert_eq!(table.get_with_hash(k.as_ref(), h), Ok(None));
+
+        // Insert and verify get_with_hash
+        table.set(k.clone(), val.clone(), None);
+        assert_eq!(table.get_with_hash(k.as_ref(), h), Ok(Some(val)));
+
+        // Expired key
+        let exp_k = Bytes::from("exp_key");
+        let exp_h = hash_key(exp_k.as_ref());
+        table.set(
+            exp_k.clone(),
+            Bytes::from("exp_val"),
+            Some(Duration::from_millis(1)),
+        );
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(table.get_with_hash(exp_k.as_ref(), exp_h), Ok(None));
     }
 }

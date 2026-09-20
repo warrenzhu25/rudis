@@ -10051,3 +10051,34 @@ fn test_single_item_hset_sadd_e2e() {
         ":2\r\n"
     );
 }
+
+#[test]
+fn test_mget_scatter_gather_e2e() {
+    let port = 16930;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut conn = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // Set 5 keys across shards
+    for i in 0..5 {
+        let cmd = format!("SET mget_k{} mget_val{}\r\n", i, i);
+        assert_eq!(send_and_read(&mut conn, cmd.as_bytes()), "+OK\r\n");
+    }
+
+    // MGET 5 existing keys
+    let mget_cmd = b"MGET mget_k0 mget_k1 mget_k2 mget_k3 mget_k4\r\n";
+    let resp = send_and_read(&mut conn, mget_cmd);
+    assert!(resp.starts_with("*5\r\n"));
+    for i in 0..5 {
+        assert!(resp.contains(&format!("$9\r\nmget_val{}", i)));
+    }
+
+    // MGET with some missing keys
+    let mget_mixed = b"MGET mget_k0 missing_key mget_k2\r\n";
+    let resp_mixed = send_and_read(&mut conn, mget_mixed);
+    assert_eq!(
+        resp_mixed,
+        "*3\r\n$9\r\nmget_val0\r\n$-1\r\n$9\r\nmget_val2\r\n"
+    );
+}

@@ -13132,9 +13132,9 @@ async fn execute_commands_squashed(
     //    They ran concurrently with each other and with the shard batch hops above.
     if !inflight_mgets.is_empty() {
         for (idx, inflight) in inflight_mgets.drain(..) {
-            local_buf.clear();
-            router.finish_mget_resp(inflight, &mut local_buf).await;
-            responses[idx] = CompactResp::from_vec(std::mem::take(&mut local_buf));
+            let mut mget_buf = Vec::new();
+            router.finish_mget_resp(inflight, &mut mget_buf).await;
+            responses[idx] = CompactResp::from_vec(mget_buf);
         }
     }
     if !inflight_msets.is_empty() {
