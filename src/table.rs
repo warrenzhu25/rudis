@@ -2091,7 +2091,7 @@ impl RudisTable {
         let val = if let Some(int_val) = Self::parse_i64_bytes(&value) {
             RudisValue::Int(int_val)
         } else {
-            RudisValue::String(value)
+            RudisValue::String(Bytes::copy_from_slice(&value))
         };
         let val_bytes = val.approx_bytes();
         let (existing, candidate_idx) = self.table.find_or_prepare_insert(&key, h);
@@ -2124,7 +2124,7 @@ impl RudisTable {
         }
         let entry_mem = key.len() + val_bytes + 64;
         let entry = RudisEntry {
-            key,
+            key: Bytes::copy_from_slice(&key),
             val,
             expire_at,
         };
