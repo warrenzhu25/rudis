@@ -1897,7 +1897,48 @@ impl ShardDb {
 
     #[inline]
     pub fn save_rdb_chunk(&mut self, buf: &mut Vec<u8>) {
-        self.table.save_rdb_chunk(buf);
+        let now = std::time::Instant::now();
+        let unix_now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        for entry in self.table.entries() {
+            if let Some(exp) = entry.expire_at {
+                if exp <= now {
+                    continue;
+                }
+                let rem_ms = exp.duration_since(now).as_millis() as u64;
+                let expire_unix_ms = unix_now + rem_ms;
+                buf.push(0xFC);
+                buf.extend_from_slice(&expire_unix_ms.to_le_bytes());
+            }
+            match &entry.val {
+                crate::table::RudisValue::Tiered(ptr) => {
+                    if let Some(ref tm) = self.tier_manager
+                        && let Ok((_, raw)) = tm.read_ptr_sync(*ptr)
+                    {
+                        buf.extend_from_slice(&(entry.key.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(&entry.key);
+                        crate::table::RudisTable::serialize_val_payload(
+                            &crate::table::RudisValue::String(bytes::Bytes::from(raw)),
+                            buf,
+                        );
+                    }
+                }
+                crate::table::RudisValue::Cooled { val, .. } => {
+                    buf.extend_from_slice(&(entry.key.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(&entry.key);
+                    crate::table::RudisTable::serialize_val_payload(val, buf);
+                }
+                other => {
+                    buf.extend_from_slice(&(entry.key.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(&entry.key);
+                    crate::table::RudisTable::serialize_val_payload(other, buf);
+                }
+            }
+        }
+
         self.save_extended_rdb_chunk(buf);
     }
 
@@ -2579,6 +2620,9 @@ mod tests {
         )
         .unwrap();
 
+        // 8. Add standard entry
+        db.set(Bytes::from("regular_key"), Bytes::from("regular_val"), None);
+
         // Serialize to RDB chunk
         let mut chunk = Vec::new();
         db.save_rdb_chunk(&mut chunk);
@@ -2589,6 +2633,12 @@ mod tests {
         new_db
             .restore_rdb_chunk(&chunk)
             .expect("restore_rdb_chunk should succeed");
+
+        // Verify standard key
+        assert_eq!(
+            new_db.get(b"regular_key").unwrap(),
+            Bytes::from("regular_val")
+        );
 
         // Verify JSON
         let json_val = new_db

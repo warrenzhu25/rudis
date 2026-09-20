@@ -700,6 +700,31 @@ impl ShardTierManager {
             Self::punch_hole(&self.file, ptr.offset, aligned_len as u64, &self.stats);
         }
     }
+
+    pub fn read_ptr_sync(&self, ptr: TieredPointer) -> io::Result<(Bytes, Vec<u8>)> {
+        let len = ptr.length as usize;
+        let offset_in_page = (ptr.offset % PAGE_SIZE as u64) as usize;
+        let page_idx = ptr.offset / PAGE_SIZE as u64;
+
+        if let Ok(sb) = self.small_bins.try_borrow()
+            && let Some(ab) = &sb.active_bin
+            && ab.page_index == page_idx
+            && ab.buffer.len() >= offset_in_page + len
+        {
+            let slice = &ab.buffer[offset_in_page..offset_in_page + len];
+            return decode_tiered_record(slice, ptr.value_type);
+        }
+
+        read_tiered_record_sync(&self.path, ptr)
+    }
+}
+
+pub fn read_tiered_record_sync(path: &Path, ptr: TieredPointer) -> io::Result<(Bytes, Vec<u8>)> {
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; ptr.length as usize];
+    file.read_exact_at(&mut buf, ptr.offset)?;
+    decode_tiered_record(&buf, ptr.value_type)
 }
 
 pub fn encode_tiered_record(key: &[u8], val_payload: &[u8], val_type: u8) -> Vec<u8> {

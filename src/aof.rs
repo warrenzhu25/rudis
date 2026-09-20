@@ -1116,8 +1116,19 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
             continue;
         }
         let k = entry.key.as_ref();
+        let hydrated_val;
         let val_ref = match &entry.val {
             crate::table::RudisValue::Cooled { val, .. } => val.as_ref(),
+            crate::table::RudisValue::Tiered(ptr) => {
+                if let Some(ref tm) = db.tier_manager
+                    && let Ok((_, raw)) = tm.read_ptr_sync(*ptr)
+                {
+                    hydrated_val = crate::table::RudisValue::String(bytes::Bytes::from(raw));
+                    &hydrated_val
+                } else {
+                    continue;
+                }
+            }
             other => other,
         };
         match val_ref {
