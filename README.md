@@ -299,10 +299,14 @@ Rudis avoids the global lock contention of single-threaded stores and the mutex 
 ## Documentation & Contributor Guides
 
 For deep technical walkthroughs, internal architecture specifications, and benchmarks:
-* [**Rudis Internals & Architecture Guide**](docs/rudis_internals_guide.md): Comprehensive walkthrough of the thread-per-core engine, memory layout, and lock-free routing mesh.
-* [**Component Architecture Documentation**](docs/components.md): Specifications for all 19 subsystems (`RudisTable`, `BlockHub`, Tiering, Vector, Search, XDP, CRDTs, JSON, Pub/Sub, etc.).
-* [**Comprehensive Performance Guide & Benchmark Whitepaper**](docs/benchmarks/comprehensive_performance_guide.md): In-depth performance evaluation across payloads, pipeline depths, and multi-core scaling.
-* [**Benchmark Directory & Reproduction Scripts**](docs/benchmarks/README.md): Catalog of reproduction scripts comparing Rudis against Redis, Dragonfly, and Valkey.
+* [**Documentation Hub**](docs/README.md): Central index of all architecture and subsystem specifications.
+* [**Architecture & Threading Model**](docs/architecture.md): Shared-nothing thread-per-core engine, Linux `io_uring` Monoio runtime, and request lifecycle.
+* [**Per-Shard Parallel Replication**](docs/replication.md): Dragonfly-compatible multi-flow parallel TCP replication (`DFLY FLOW`).
+* [**Pub/Sub Messaging Architecture**](docs/pub-sub.md): Striped shard presence bitmask and Redis 7 slot-bound sharded pub/sub (`SPUBLISH`).
+* [**Fork-less io_uring Snapshots & Reflinks**](docs/rdbsave.md): Fork-less streaming persistence and sub-millisecond `ioctl(FICLONE)` reflink checkpoints.
+* [**Differences with Redis & Dragonfly**](docs/differences.md): Semantic and architectural comparison across memory, limits, and networking.
+* [**Component Architecture Specifications**](docs/components.md): Specifications for all 19 subsystems (`RudisTable`, `BlockHub`, Tiering, Vector, Search, XDP, CRDTs, JSON, etc.).
+* [**Comprehensive Performance Guide**](docs/benchmarks/comprehensive_performance_guide.md): 16-core benchmark telemetry, latency distributions, and reproduction scripts.
 
 ---
 
