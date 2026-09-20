@@ -11244,3 +11244,61 @@ fn test_resp3_hello_negotiation_and_noproto_e2e() {
         .store(false, std::sync::atomic::Ordering::Release);
     rudis::replication::HAS_SLAVE_INSTANCE.store(false, std::sync::atomic::Ordering::Release);
 }
+
+#[test]
+fn test_requirepass_and_sha256_acl_enforcement_e2e() {
+    let port = 19996;
+    start_test_server(port, 2);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Unauthenticated ping succeeds when no password is set
+    assert_eq!(send_and_read(&mut client, b"PING\r\n"), "+PONG\r\n");
+
+    // 2. Set requirepass via CONFIG SET
+    assert_eq!(
+        send_and_read(&mut client, b"CONFIG SET requirepass secret123\r\n"),
+        "+OK\r\n"
+    );
+
+    // 3. New connection must be blocked until authenticated
+    let mut fresh_client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let noauth_resp = send_and_read(&mut fresh_client, b"PING\r\n");
+    assert_eq!(noauth_resp, "-NOAUTH Authentication required.\r\n");
+
+    // Wrong password fails
+    let wrong_resp = send_and_read(&mut fresh_client, b"AUTH bad_pass\r\n");
+    assert!(wrong_resp.starts_with("-WRONGPASS"));
+
+    // Correct password succeeds
+    assert_eq!(
+        send_and_read(&mut fresh_client, b"AUTH secret123\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(send_and_read(&mut fresh_client, b"PING\r\n"), "+PONG\r\n");
+
+    // 4. SHA-256 ACL hash authentication
+    // SHA256("alice_pwd") = "4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a"
+    let sha256_hash = rudis::acl::hash_password_sha256("alice_pwd");
+    assert!(sha256_hash.starts_with('#'));
+    let setuser_cmd = format!("ACL SETUSER alice on {} +@all ~*\r\n", sha256_hash);
+    assert_eq!(
+        send_and_read(&mut fresh_client, setuser_cmd.as_bytes()),
+        "+OK\r\n"
+    );
+
+    // Authenticate as alice using plaintext matching the SHA-256 hash
+    let mut alice_client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    assert_eq!(
+        send_and_read(&mut alice_client, b"AUTH alice alice_pwd\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(send_and_read(&mut alice_client, b"PING\r\n"), "+PONG\r\n");
+
+    // Clean up requirepass
+    assert_eq!(
+        send_and_read(&mut fresh_client, b"CONFIG SET requirepass \"\"\r\n"),
+        "+OK\r\n"
+    );
+    let mut unauth_client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    assert_eq!(send_and_read(&mut unauth_client, b"PING\r\n"), "+PONG\r\n");
+}

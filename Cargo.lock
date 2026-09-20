@@ -1014,6 +1014,7 @@ dependencies = [
  "mlua",
  "monoio",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pki-types",
  "serde",

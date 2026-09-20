@@ -903,11 +903,10 @@ pub async fn handle_tls_connection(
     let mut out_buf = Vec::with_capacity(65536);
 
     let mut asking = false;
-    let mut authenticated = !crate::acl::HAS_CUSTOM_ACL.load(std::sync::atomic::Ordering::Relaxed)
-        || !crate::acl::get_acl_for_port(router.port)
-            .read()
-            .unwrap()
-            .is_auth_required_for_default();
+    let mut authenticated = !crate::acl::get_acl_for_port(router.port)
+        .read()
+        .unwrap()
+        .is_auth_required_for_default();
     let mut auth_user = "default".to_string();
 
     loop {
@@ -1054,11 +1053,10 @@ pub async fn handle_connection(
     let mut in_multi = false;
     let mut tx_queue: Vec<Command> = Vec::new();
     let mut tx_has_error = false;
-    let mut authenticated = !crate::acl::HAS_CUSTOM_ACL.load(std::sync::atomic::Ordering::Relaxed)
-        || !crate::acl::get_acl_for_port(router.port)
-            .read()
-            .unwrap()
-            .is_auth_required_for_default();
+    let mut authenticated = !crate::acl::get_acl_for_port(router.port)
+        .read()
+        .unwrap()
+        .is_auth_required_for_default();
     let mut auth_user = "default".to_string();
     let mut soft_limit_start: Option<Instant> = None;
 
@@ -5211,8 +5209,16 @@ async fn execute_command(
                 let mut acl_guard = acl.write().unwrap();
                 if let Some(user) = acl_guard.get_user_mut("default") {
                     user.passwords.clear();
+                    user.password_hashes.clear();
                     if !val_str.is_empty() {
                         user.passwords.push(val_str.to_string());
+                        let h = crate::acl::hash_password_sha256(&val_str);
+                        user.password_hashes.push(h);
+                        user.nopass = false;
+                        crate::acl::HAS_CUSTOM_ACL
+                            .store(true, std::sync::atomic::Ordering::Release);
+                    } else {
+                        user.nopass = true;
                     }
                 }
                 out.extend_from_slice(b"+OK\r\n");
@@ -7044,12 +7050,7 @@ async fn execute_command(
             }
 
             let acl = crate::acl::get_acl_for_port(router.port);
-            let default_requires_auth = acl
-                .read()
-                .unwrap()
-                .get_user("default")
-                .map(|u| !u.passwords.is_empty())
-                .unwrap_or(false);
+            let default_requires_auth = acl.read().unwrap().is_auth_required_for_default();
 
             if let Some((uname, pass)) = auth {
                 if let Ok(user) = acl.read().unwrap().check_auth(Some(uname), pass) {

@@ -111,6 +111,24 @@ fn main() {
     rudis::connection::set_max_clients(server_config.maxclients);
     rudis::connection::set_max_memory_policy(&server_config.maxmemory_policy);
 
+    if let Some(ref pass) = server_config.requirepass {
+        let acl = rudis::acl::get_acl_for_port(port);
+        let mut acl_guard = acl.write().unwrap();
+        if let Some(user) = acl_guard.get_user_mut("default") {
+            user.passwords.clear();
+            user.password_hashes.clear();
+            if !pass.is_empty() {
+                user.passwords.push(pass.clone());
+                let h = rudis::acl::hash_password_sha256(pass);
+                user.password_hashes.push(h);
+                user.nopass = false;
+                rudis::acl::HAS_CUSTOM_ACL.store(true, std::sync::atomic::Ordering::Release);
+            } else {
+                user.nopass = true;
+            }
+        }
+    }
+
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
     let num_cores = if !core_ids.is_empty() {
         core_ids.len()

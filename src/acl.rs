@@ -29,6 +29,34 @@ pub fn hash_password(password: &str) -> String {
     s
 }
 
+/// Standard Redis SHA-256 hash (#<64-hex>)
+pub fn hash_password_sha256(password: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, password.as_bytes());
+    let mut s = String::with_capacity(65);
+    s.push('#');
+    for b in digest.as_ref() {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{:02x}", b);
+    }
+    s
+}
+
+/// Modern per-user salted SHA-256 password hash
+pub fn hash_password_salted(username: &str, password: &str) -> String {
+    let mut input = Vec::with_capacity(username.len() + 1 + password.len());
+    input.extend_from_slice(username.as_bytes());
+    input.push(b':');
+    input.extend_from_slice(password.as_bytes());
+    let digest = ring::digest::digest(&ring::digest::SHA256, &input);
+    let mut s = String::with_capacity(65);
+    s.push('#');
+    for b in digest.as_ref() {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{:02x}", b);
+    }
+    s
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AclUser {
     pub name: String,
@@ -180,13 +208,20 @@ impl AclManager {
             if !user.enabled {
                 return Err("WRONGPASS User is disabled");
             }
-            let hashed = hash_password(password);
-            if user.nopass
-                || user.passwords.iter().any(|p| p == password)
-                || user
-                    .password_hashes
-                    .iter()
-                    .any(|h| h == &hashed || h == password)
+            if user.nopass {
+                return Ok(user_name.to_string());
+            }
+            let legacy_sha1 = hash_password(password);
+            let sha256 = hash_password_sha256(password);
+            let salted = hash_password_salted(user_name, password);
+            if user.passwords.iter().any(|p| p == password)
+                || user.password_hashes.iter().any(|h| {
+                    h == &sha256
+                        || h == &salted
+                        || h == &legacy_sha1
+                        || (h.starts_with('#') && h[1..] == sha256[1..])
+                        || h == password
+                })
             {
                 Ok(user_name.to_string())
             } else {
@@ -261,6 +296,10 @@ impl AclManager {
                 user.nopass = false;
                 if !user.passwords.contains(&p.to_string()) {
                     user.passwords.push(p.to_string());
+                }
+                let h256 = hash_password_sha256(p);
+                if !user.password_hashes.contains(&h256) {
+                    user.password_hashes.push(h256);
                 }
                 let h = hash_password(p);
                 if !user.password_hashes.contains(&h) {
