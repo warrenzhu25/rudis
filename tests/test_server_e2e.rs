@@ -10117,3 +10117,36 @@ fn test_pipeline_write_buffering_and_sigpipe_resilience_e2e() {
     // Verify server remains alive and responsive
     assert_eq!(send_and_read(&mut conn, b"PING\r\n"), "+PONG\r\n");
 }
+
+#[test]
+fn test_consolidated_batch_borrowing_e2e() {
+    let port = 16950;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut conn = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // Pipelined mixed operations: SET, GET, EXISTS, INCR, DEL, EXISTS
+    let mut pipe = String::new();
+    for i in 0..10 {
+        pipe.push_str(&format!("SET bkey{} bval{}\r\n", i, i));
+        pipe.push_str(&format!("EXISTS bkey{}\r\n", i));
+        pipe.push_str(&format!("GET bkey{}\r\n", i));
+        pipe.push_str(&format!("DEL bkey{}\r\n", i));
+        pipe.push_str(&format!("EXISTS bkey{}\r\n", i));
+    }
+    use std::io::{Read, Write};
+    conn.write_all(pipe.as_bytes()).unwrap();
+
+    let mut buf = [0u8; 1024];
+    let mut read_buf = Vec::new();
+    // 10 iterations * (1 + 1 + 2 + 1 + 1) = 60 CRLFs
+    while read_buf.windows(2).filter(|w| *w == b"\r\n").count() < 60 {
+        let n = conn.read(&mut buf).unwrap();
+        read_buf.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(read_buf.windows(2).filter(|w| *w == b"\r\n").count(), 60);
+
+    // Verify final state
+    assert_eq!(send_and_read(&mut conn, b"DBSIZE\r\n"), ":0\r\n");
+}

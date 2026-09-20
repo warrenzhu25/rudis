@@ -12372,6 +12372,7 @@ fn is_special_pipeline_cmd(cmd: &Command) -> bool {
     )
 }
 
+#[allow(clippy::await_holding_refcell_ref)]
 async fn execute_commands_squashed(
     commands: &mut Vec<Command>,
     has_special: bool,
@@ -12531,30 +12532,29 @@ async fn execute_commands_squashed(
     // 1. Process local shard commands immediately in-place; bucket remote commands by shard
     let mut has_local_writes = false;
     let is_resp3 = CURRENT_CLIENT_RESP3.get();
+    let mut local_db = router.local_db.borrow_mut();
     for (idx, cmd) in commands.drain(..).enumerate() {
         if let Some((target, key_hash)) = target_shard_and_hash_of_cmd(&cmd, router.num_shards) {
             if target == router.shard_id {
                 local_buf.clear();
                 if let Command::Get(ref key) = cmd {
-                    let compact_res = router
-                        .local_db
-                        .borrow_mut()
-                        .table
-                        .get_compact_with_hash(key.as_ref(), key_hash);
+                    let compact_res = local_db.table.get_compact_with_hash(key.as_ref(), key_hash);
                     match compact_res {
                         Ok(Some(resp)) => {
                             responses[idx] = resp;
                             continue;
                         }
                         Ok(None) => {
-                            let is_tiered = router.local_db.borrow().tier_manager.is_some()
-                                && router.local_db.borrow_mut().table.is_tiered(key).is_some();
+                            let is_tiered = local_db.tier_manager.is_some()
+                                && local_db.table.is_tiered(key).is_some();
                             if is_tiered {
+                                drop(local_db);
                                 if let Some(v) = router.stream_cold_read_local(key).await {
                                     responses[idx] = CompactResp::Bulk(v);
                                 } else {
                                     responses[idx] = crate::shard::CompactResp::NULL;
                                 }
+                                local_db = router.local_db.borrow_mut();
                             } else {
                                 responses[idx] = crate::shard::CompactResp::NULL;
                             }
@@ -12577,9 +12577,7 @@ async fn execute_commands_squashed(
                     } = cmd
                 {
                     has_local_writes = true;
-                    router
-                        .local_db
-                        .borrow_mut()
+                    local_db
                         .table
                         .set_with_hash(key, key_hash, value, expire_in);
                     responses[idx] = crate::shard::CompactResp::OK;
@@ -12589,12 +12587,7 @@ async fn execute_commands_squashed(
                     && let Command::IncrBy(ref key, delta) = cmd
                 {
                     has_local_writes = true;
-                    match router
-                        .local_db
-                        .borrow_mut()
-                        .table
-                        .incr_by_slice_with_hash(key, key_hash, delta)
-                    {
+                    match local_db.table.incr_by_slice_with_hash(key, key_hash, delta) {
                         Ok(val) => {
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                 touch_watched_key(router.port, key.as_ref());
@@ -12615,11 +12608,7 @@ async fn execute_commands_squashed(
                 } else if let Command::Exists(ref keys) = cmd
                     && keys.len() == 1
                 {
-                    let exists = router
-                        .local_db
-                        .borrow_mut()
-                        .table
-                        .exists_with_hash(keys[0].as_ref(), key_hash);
+                    let exists = local_db.table.exists_with_hash(keys[0].as_ref(), key_hash);
                     responses[idx] = if exists {
                         crate::shard::CompactResp::INT_1
                     } else {
@@ -12631,10 +12620,7 @@ async fn execute_commands_squashed(
                     && let Command::Del(ref keys) = cmd
                     && keys.len() == 1
                 {
-                    let deleted = router
-                        .local_db
-                        .borrow_mut()
-                        .del_with_hash(keys[0].as_ref(), key_hash);
+                    let deleted = local_db.del_with_hash(keys[0].as_ref(), key_hash);
                     if deleted {
                         has_local_writes = true;
                         if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -12646,7 +12632,7 @@ async fn execute_commands_squashed(
                     }
                     continue;
                 } else if let Command::Hget { ref key, ref field } = cmd {
-                    match router.local_db.borrow_mut().table.hget_compact_with_hash(
+                    match local_db.table.hget_compact_with_hash(
                         key.as_ref(),
                         key_hash,
                         field.as_ref(),
@@ -12669,17 +12655,11 @@ async fn execute_commands_squashed(
                     has_local_writes = true;
                     let res = if fields.len() == 1 {
                         let (ref f, ref v) = fields[0];
-                        router
-                            .local_db
-                            .borrow_mut()
+                        local_db
                             .table
                             .hset_single_field_with_hash(key, key_hash, f, v)
                     } else {
-                        router
-                            .local_db
-                            .borrow_mut()
-                            .table
-                            .hset_slice_with_hash(key, key_hash, fields)
+                        local_db.table.hset_slice_with_hash(key, key_hash, fields)
                     };
                     match res {
                         Ok(count) => {
@@ -12705,12 +12685,11 @@ async fn execute_commands_squashed(
                     ref member,
                 } = cmd
                 {
-                    match router
-                        .local_db
-                        .borrow_mut()
-                        .table
-                        .sismember_compact_with_hash(key.as_ref(), key_hash, member.as_ref())
-                    {
+                    match local_db.table.sismember_compact_with_hash(
+                        key.as_ref(),
+                        key_hash,
+                        member.as_ref(),
+                    ) {
                         Ok(resp) => {
                             responses[idx] = resp;
                             continue;
@@ -12728,17 +12707,11 @@ async fn execute_commands_squashed(
                 {
                     has_local_writes = true;
                     let res = if members.len() == 1 {
-                        router
-                            .local_db
-                            .borrow_mut()
+                        local_db
                             .table
                             .sadd_single_member_with_hash(key, key_hash, &members[0])
                     } else {
-                        router
-                            .local_db
-                            .borrow_mut()
-                            .table
-                            .sadd_slice_with_hash(key, key_hash, members)
+                        local_db.table.sadd_slice_with_hash(key, key_hash, members)
                     };
                     match res {
                         Ok(count) => {
@@ -12768,9 +12741,7 @@ async fn execute_commands_squashed(
                     } = cmd
                 {
                     has_local_writes = true;
-                    match router
-                        .local_db
-                        .borrow_mut()
+                    match local_db
                         .table
                         .zadd_slice_with_hash(key, key_hash, elements, flags)
                     {
@@ -12809,12 +12780,7 @@ async fn execute_commands_squashed(
                     } = cmd
                 {
                     has_local_writes = true;
-                    match router
-                        .local_db
-                        .borrow_mut()
-                        .table
-                        .lpush_slice_with_hash(key, key_hash, values)
-                    {
+                    match local_db.table.lpush_slice_with_hash(key, key_hash, values) {
                         Ok(len) => {
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                 touch_watched_key(router.port, key.as_ref());
@@ -12838,12 +12804,7 @@ async fn execute_commands_squashed(
                     && let Command::Lpop { ref key, count } = cmd
                 {
                     if count.is_none() {
-                        match router
-                            .local_db
-                            .borrow_mut()
-                            .table
-                            .lpop_one_with_hash(key.as_ref(), key_hash)
-                        {
+                        match local_db.table.lpop_one_with_hash(key.as_ref(), key_hash) {
                             Ok(Some(v)) => {
                                 has_local_writes = true;
                                 if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -12861,7 +12822,7 @@ async fn execute_commands_squashed(
                             }
                         }
                     } else {
-                        match router.local_db.borrow_mut().write_lpop_resp_with_hash(
+                        match local_db.write_lpop_resp_with_hash(
                             key.as_ref(),
                             key_hash,
                             count,
@@ -12886,7 +12847,7 @@ async fn execute_commands_squashed(
                     stop,
                 } = cmd
                 {
-                    match router.local_db.borrow_mut().table.lrange_compact_with_hash(
+                    match local_db.table.lrange_compact_with_hash(
                         key.as_ref(),
                         key_hash,
                         start,
@@ -12900,7 +12861,7 @@ async fn execute_commands_squashed(
                         Err(err) => write_resp_err(&mut local_buf, err),
                     }
                 } else if let Command::Zrange { ref key, ref opts } = cmd {
-                    match router.local_db.borrow_mut().table.zrange_compact_with_hash(
+                    match local_db.table.zrange_compact_with_hash(
                         key.as_ref(),
                         key_hash,
                         opts,
@@ -12917,12 +12878,7 @@ async fn execute_commands_squashed(
                     && !crate::replication::has_connected_replicas(router.port)
                     && let Command::IncrBy(ref key, delta) = cmd
                 {
-                    match router
-                        .local_db
-                        .borrow_mut()
-                        .table
-                        .incr_by_slice_with_hash(key, key_hash, delta)
-                    {
+                    match local_db.table.incr_by_slice_with_hash(key, key_hash, delta) {
                         Ok(val) => {
                             has_local_writes = true;
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -12940,12 +12896,7 @@ async fn execute_commands_squashed(
                     && let Command::Rpop { ref key, count } = cmd
                 {
                     if count.is_none() {
-                        match router
-                            .local_db
-                            .borrow_mut()
-                            .table
-                            .rpop_one_with_hash(key.as_ref(), key_hash)
-                        {
+                        match local_db.table.rpop_one_with_hash(key.as_ref(), key_hash) {
                             Ok(Some(v)) => {
                                 has_local_writes = true;
                                 if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -12963,7 +12914,7 @@ async fn execute_commands_squashed(
                             }
                         }
                     } else {
-                        match router.local_db.borrow_mut().write_rpop_resp_with_hash(
+                        match local_db.write_rpop_resp_with_hash(
                             key.as_ref(),
                             key_hash,
                             count,
@@ -12991,7 +12942,7 @@ async fn execute_commands_squashed(
                     }
                     if execute_local_command(
                         &cmd,
-                        &mut router.local_db.borrow_mut(),
+                        &mut local_db,
                         &mut local_buf,
                         router.aof.as_deref(),
                     ) {
@@ -13003,6 +12954,7 @@ async fn execute_commands_squashed(
                 remote_batches[target].push((idx, key_hash, cmd));
             }
         } else if let Command::Mget(keys) = cmd {
+            drop(local_db);
             if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
                 for key in &keys {
                     record_client_read(router.port, client_id, key.as_ref());
@@ -13013,7 +12965,9 @@ async fn execute_commands_squashed(
                 Some(inflight) => inflight_mgets.push((idx, inflight)),
                 None => responses[idx] = CompactResp::from_vec(std::mem::take(&mut local_buf)),
             }
+            local_db = router.local_db.borrow_mut();
         } else if let Command::Mset(pairs) = cmd {
+            drop(local_db);
             if crate::replication::has_connected_replicas(router.port)
                 && let Some(bytes) = crate::aof::command_to_resp(&Command::Mset(pairs.clone()))
             {
@@ -13028,6 +12982,7 @@ async fn execute_commands_squashed(
                 Some(inflight) => inflight_msets.push((idx, inflight)),
                 None => responses[idx] = crate::shard::CompactResp::OK,
             }
+            local_db = router.local_db.borrow_mut();
         } else if !matches!(
             cmd,
             Command::Ping(_)
@@ -13036,6 +12991,7 @@ async fn execute_commands_squashed(
                 | Command::Time
                 | Command::Echo(_)
         ) {
+            drop(local_db);
             local_buf.clear();
             if execute_command(
                 cmd,
@@ -13052,19 +13008,16 @@ async fn execute_commands_squashed(
                 should_close = true;
             }
             responses[idx] = CompactResp::from_vec(std::mem::take(&mut local_buf));
+            local_db = router.local_db.borrow_mut();
         } else {
             local_buf.clear();
-            if execute_local_command(
-                &cmd,
-                &mut router.local_db.borrow_mut(),
-                &mut local_buf,
-                None,
-            ) {
+            if execute_local_command(&cmd, &mut local_db, &mut local_buf, None) {
                 should_close = true;
             }
             responses[idx] = CompactResp::from_vec(std::mem::take(&mut local_buf));
         }
     }
+    drop(local_db);
 
     if has_local_writes {
         router.check_auto_tier_after_write();
@@ -13639,5 +13592,79 @@ mod tests {
         assert_eq!(other.responders.len(), 8);
         assert_eq!(other.remote_batches.len(), 8);
         recycle_conn_scratch(other);
+    }
+
+    #[monoio::test]
+    async fn test_consolidated_batch_borrowing() {
+        let dir = std::env::temp_dir().join(format!("rudis-batch-borrow-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let (senders_mesh, _) = crate::mailbox::create_shard_mesh(1);
+        let local_db = std::rc::Rc::new(std::cell::RefCell::new(crate::shard::ShardDb::new(6399)));
+        let router = Router::new(
+            0,
+            1,
+            6399,
+            local_db.clone(),
+            senders_mesh[0].clone(),
+            None,
+            std::rc::Rc::new(std::cell::RefCell::new(crate::pubsub::PubSubHub::new())),
+            dir,
+        );
+
+        let mut scratch = take_conn_scratch(1);
+        let client_registry = std::cell::RefCell::new(hashbrown::HashMap::new());
+        let mut out = Vec::new();
+        let mut asking = false;
+        let mut authenticated = true;
+        let mut auth_user = String::from("default");
+
+        // Execute batch of mixed mutation and read commands on local shard
+        scratch.commands.push(Command::Set {
+            key: Bytes::from("k1"),
+            value: Bytes::from("v1"),
+            expire_in: None,
+            condition: crate::resp::SetCondition::None,
+            get: false,
+            keepttl: false,
+            past_expired: false,
+        });
+        scratch.commands.push(Command::Get(Bytes::from("k1")));
+        scratch
+            .commands
+            .push(Command::Exists(smallvec::smallvec![Bytes::from("k1")]));
+        scratch
+            .commands
+            .push(Command::IncrBy(Bytes::from("cnt"), 5));
+        scratch
+            .commands
+            .push(Command::Del(smallvec::smallvec![Bytes::from("k1")]));
+        scratch
+            .commands
+            .push(Command::Exists(smallvec::smallvec![Bytes::from("k1")]));
+
+        let should_close = execute_commands_squashed(
+            &mut scratch.commands,
+            false,
+            &router,
+            &scratch.responders,
+            &mut scratch.remote_batches,
+            &mut scratch.items_pool,
+            &mut scratch.results_pool,
+            &mut scratch.squashed_responses,
+            1,
+            &client_registry,
+            &mut out,
+            &mut asking,
+            &mut authenticated,
+            &mut auth_user,
+        )
+        .await;
+
+        assert!(!should_close);
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            "+OK\r\n$2\r\nv1\r\n:1\r\n:5\r\n:1\r\n:0\r\n"
+        );
+        recycle_conn_scratch(scratch);
     }
 }
