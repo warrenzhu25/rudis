@@ -1243,6 +1243,8 @@ pub struct RudisFlatTable {
     items: usize,
     growth_left: usize,
     pub slot_counts: Box<[u32; 16384]>,
+    pub old_table: Option<Box<RudisFlatTable>>,
+    pub rehash_idx: usize,
 }
 
 impl RudisFlatTable {
@@ -1264,6 +1266,8 @@ impl RudisFlatTable {
             items: 0,
             growth_left: cap * 7 / 8,
             slot_counts: vec![0u32; 16384].into_boxed_slice().try_into().unwrap(),
+            old_table: None,
+            rehash_idx: 0,
         }
     }
 
@@ -1279,6 +1283,9 @@ impl RudisFlatTable {
     #[inline(always)]
     pub fn find_entry(&self, key: &[u8], hash: u64) -> Option<(usize, &RudisEntry)> {
         if self.items == 0 {
+            if let Some(ref old) = self.old_table {
+                return old.find_entry(key, hash);
+            }
             return None;
         }
         let tag = fingerprint(hash);
@@ -1306,6 +1313,9 @@ impl RudisFlatTable {
             }
 
             if empty_mask != 0 {
+                if let Some(ref old) = self.old_table {
+                    return old.find_entry(key, hash);
+                }
                 return None;
             }
 
@@ -1318,6 +1328,9 @@ impl RudisFlatTable {
     #[inline(always)]
     pub fn contains(&self, key: &[u8], hash: u64) -> bool {
         if self.items == 0 {
+            if let Some(ref old) = self.old_table {
+                return old.contains(key, hash);
+            }
             return false;
         }
         let tag = fingerprint(hash);
@@ -1345,6 +1358,9 @@ impl RudisFlatTable {
             }
 
             if empty_mask != 0 {
+                if let Some(ref old) = self.old_table {
+                    return old.contains(key, hash);
+                }
                 return false;
             }
 
@@ -1356,6 +1372,10 @@ impl RudisFlatTable {
     /// Finds the index and mutable entry reference of a matching key, if present.
     #[inline(always)]
     pub fn find_entry_mut(&mut self, key: &[u8], hash: u64) -> Option<(usize, &mut RudisEntry)> {
+        if self.is_rehashing() {
+            self.migrate_key_if_in_old(key, hash);
+            self.rehash_step(1);
+        }
         if self.items == 0 {
             return None;
         }
@@ -1401,7 +1421,11 @@ impl RudisFlatTable {
 
     /// Finds the index of a matching key, if present.
     #[inline(always)]
-    pub fn find(&self, key: &[u8], hash: u64) -> Option<usize> {
+    pub fn find(&mut self, key: &[u8], hash: u64) -> Option<usize> {
+        if self.is_rehashing() {
+            self.migrate_key_if_in_old(key, hash);
+            self.rehash_step(1);
+        }
         self.find_entry(key, hash).map(|(idx, _)| idx)
     }
 
@@ -1457,23 +1481,118 @@ impl RudisFlatTable {
         }
     }
 
-    fn resize(&mut self, new_cap: usize) {
-        let mut new_table = RudisFlatTable::new(new_cap);
-        for entry in self.slots.drain(..).flatten() {
-            let h = hash_key(&entry.key);
-            let (_, insert_idx) = new_table.find_or_prepare_insert(&entry.key, h);
-            let tag = fingerprint(h);
-            new_table.set_ctrl(insert_idx, tag);
-            new_table.slots[insert_idx] = Some(entry);
-            new_table.items += 1;
-            new_table.growth_left = new_table.growth_left.saturating_sub(1);
+    #[inline(always)]
+    pub fn is_rehashing(&self) -> bool {
+        self.old_table.is_some()
+    }
+
+    /// On-demand single-key migration: if `key` exists in `old_table`, moves it immediately to `self`.
+    pub fn migrate_key_if_in_old(&mut self, key: &[u8], hash: u64) {
+        let mut old = match self.old_table.take() {
+            Some(o) => o,
+            None => return,
+        };
+
+        if let Some((old_idx, _)) = old.find_entry(key, hash)
+            && let Some(entry) = old.slots[old_idx].take()
+        {
+            old.set_ctrl(old_idx, DELETED);
+            old.items -= 1;
+            let (existing, insert_idx) = self.find_or_prepare_insert(&entry.key, hash);
+            if existing.is_none() {
+                let tag = fingerprint(hash);
+                self.set_ctrl(insert_idx, tag);
+                self.slots[insert_idx] = Some(entry);
+                self.items += 1;
+                self.growth_left = self.growth_left.saturating_sub(1);
+            }
         }
-        new_table.slot_counts = self.slot_counts.clone();
-        *self = new_table;
+
+        if old.items == 0 || self.rehash_idx >= old.capacity {
+            self.old_table = None;
+            self.rehash_idx = 0;
+        } else {
+            self.old_table = Some(old);
+        }
+    }
+
+    /// Progressively migrates up to `n` buckets from `old_table` to `self`.
+    pub fn rehash_step(&mut self, n: usize) -> bool {
+        let mut old = match self.old_table.take() {
+            Some(o) => o,
+            None => return false,
+        };
+
+        let mut work = n;
+        let mut empty_limit = n * 10;
+        while work > 0 && empty_limit > 0 && self.rehash_idx < old.capacity {
+            if let Some(entry) = old.slots[self.rehash_idx].take() {
+                old.set_ctrl(self.rehash_idx, DELETED);
+                old.items -= 1;
+                let h = hash_key(&entry.key);
+                let (existing, insert_idx) = self.find_or_prepare_insert(&entry.key, h);
+                if existing.is_none() {
+                    let tag = fingerprint(h);
+                    self.set_ctrl(insert_idx, tag);
+                    self.slots[insert_idx] = Some(entry);
+                    self.items += 1;
+                    self.growth_left = self.growth_left.saturating_sub(1);
+                }
+                work -= 1;
+            } else {
+                empty_limit -= 1;
+            }
+            self.rehash_idx += 1;
+        }
+
+        if old.items == 0 || self.rehash_idx >= old.capacity {
+            self.old_table = None;
+            self.rehash_idx = 0;
+            false
+        } else {
+            self.old_table = Some(old);
+            true
+        }
+    }
+
+    pub fn finish_rehash(&mut self) {
+        while self.rehash_step(1024) {}
+    }
+
+    fn resize(&mut self, new_cap: usize) {
+        if self.capacity < 1024 {
+            let mut new_table = RudisFlatTable::new(new_cap);
+            for entry in self.slots.drain(..).flatten() {
+                let h = hash_key(&entry.key);
+                let (_, insert_idx) = new_table.find_or_prepare_insert(&entry.key, h);
+                let tag = fingerprint(h);
+                new_table.set_ctrl(insert_idx, tag);
+                new_table.slots[insert_idx] = Some(entry);
+                new_table.items += 1;
+                new_table.growth_left = new_table.growth_left.saturating_sub(1);
+            }
+            new_table.slot_counts = self.slot_counts.clone();
+            *self = new_table;
+        } else {
+            let mut new_table = RudisFlatTable::new(new_cap);
+            new_table.slot_counts = self.slot_counts.clone();
+            let old = std::mem::replace(self, new_table);
+            self.old_table = Some(Box::new(old));
+            self.rehash_idx = 0;
+            self.rehash_step(16);
+        }
     }
 
     pub fn insert(&mut self, entry: RudisEntry) -> Option<RudisEntry> {
+        let h = hash_key(&entry.key);
+        if self.is_rehashing() {
+            self.migrate_key_if_in_old(&entry.key, h);
+            self.rehash_step(16);
+        }
         if self.growth_left == 0 {
+            if self.is_rehashing() {
+                self.finish_rehash();
+            }
             let new_cap = if self.items * 2 < self.capacity && self.capacity > GROUP_SIZE {
                 self.capacity
             } else {
@@ -1482,7 +1601,6 @@ impl RudisFlatTable {
             self.resize(new_cap);
         }
 
-        let h = hash_key(&entry.key);
         let (existing, insert_idx) = self.find_or_prepare_insert(&entry.key, h);
 
         if let Some(idx) = existing {
@@ -1572,12 +1690,12 @@ impl RudisFlatTable {
 
     #[inline(always)]
     pub fn len(&self) -> usize {
-        self.items
+        self.items + self.old_table.as_ref().map_or(0, |o| o.items)
     }
 
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        self.items == 0
+        self.len() == 0
     }
 
     #[inline(always)]
@@ -1594,9 +1712,14 @@ impl RudisFlatTable {
         self.items = 0;
         self.growth_left = (cap * 7) / 8;
         self.slot_counts.fill(0);
+        self.old_table = None;
+        self.rehash_idx = 0;
     }
 
     pub fn defrag(&mut self) -> usize {
+        if self.is_rehashing() {
+            self.finish_rehash();
+        }
         let optimal_cap = (self.items * 2).next_power_of_two().max(GROUP_SIZE).max(64);
         let before_cap = self.capacity;
         let has_deleted = self.ctrl.contains(&DELETED);
@@ -1704,16 +1827,50 @@ impl RudisTable {
         self.table.insert(entry);
     }
 
+    #[inline(always)]
+    pub fn is_rehashing(&self) -> bool {
+        self.table.is_rehashing()
+    }
+
+    #[inline(always)]
+    pub fn rehash_step(&mut self, n: usize) -> bool {
+        self.table.rehash_step(n)
+    }
+
+    #[inline(always)]
+    pub fn finish_rehash(&mut self) {
+        self.table.finish_rehash();
+    }
+
     #[inline]
     pub fn entries(&self) -> impl Iterator<Item = &RudisEntry> {
-        self.table.slots.iter().flatten()
+        self.table.slots.iter().flatten().chain(
+            self.table
+                .old_table
+                .as_ref()
+                .into_iter()
+                .flat_map(|o| o.slots.iter().flatten()),
+        )
+    }
+
+    #[inline(always)]
+    pub fn prepare_key_lookup(&mut self, key: &[u8], hash: u64) {
+        if self.table.is_rehashing() {
+            self.table.migrate_key_if_in_old(key, hash);
+            self.table.rehash_step(1);
+        }
     }
 
     pub fn recalculate_used_memory(&mut self) -> usize {
         let mut total = self.table.capacity * std::mem::size_of::<Option<RudisEntry>>()
             + self.table.ctrl.len()
             + 16384 * 4;
-        for entry in self.table.slots.iter().flatten() {
+        if let Some(ref old) = self.table.old_table {
+            total += old.capacity * std::mem::size_of::<Option<RudisEntry>>()
+                + old.ctrl.len()
+                + 16384 * 4;
+        }
+        for entry in self.entries() {
             total += entry.key.len() + entry.val.approx_bytes() + 64;
         }
         self.used_memory = total;
@@ -7719,6 +7876,9 @@ impl RudisTable {
 
     /// Active sampling cycle: samples up to 20 slots starting from cursor and evicts expired keys.
     pub fn active_expire_cycle(&mut self) -> usize {
+        if self.table.is_rehashing() {
+            self.table.rehash_step(16);
+        }
         let cap = self.table.capacity();
         if cap == 0 || self.table.is_empty() {
             return 0;
@@ -11708,5 +11868,51 @@ mod tests {
             table.sismember_compact_with_hash(k.as_ref(), h, m3.as_ref()),
             Ok(crate::shard::CompactResp::INT_0)
         );
+    }
+
+    #[test]
+    fn test_progressive_incremental_rehashing() {
+        let mut table = RudisFlatTable::new(1024);
+        assert!(!table.is_rehashing());
+
+        // Fill table until progressive rehash is triggered
+        let mut i = 0;
+        while !table.is_rehashing() {
+            let key = Bytes::from(format!("key_{:04}", i));
+            let val = RudisValue::String(Bytes::from("val"));
+            table.insert(RudisEntry {
+                key,
+                val,
+                expire_at: None,
+            });
+            i += 1;
+        }
+
+        // Table reached capacity and transitioned to progressive rehash
+        assert!(table.is_rehashing());
+        assert!(table.old_table.is_some());
+        let total_inserted = i;
+
+        // Verify keys can be found during active rehashing
+        for k in 0..total_inserted {
+            let key = format!("key_{:04}", k);
+            let h = hash_key(key.as_bytes());
+            assert!(table.contains(key.as_bytes(), h));
+        }
+
+        // Advance rehash progressively
+        while table.is_rehashing() {
+            table.rehash_step(64);
+        }
+
+        assert!(!table.is_rehashing());
+        assert!(table.old_table.is_none());
+
+        // All keys still present after complete rehash
+        for k in 0..total_inserted {
+            let key = format!("key_{:04}", k);
+            let h = hash_key(key.as_bytes());
+            assert!(table.contains(key.as_bytes(), h));
+        }
     }
 }
