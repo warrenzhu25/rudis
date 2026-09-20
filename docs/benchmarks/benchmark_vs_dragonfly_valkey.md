@@ -1,22 +1,42 @@
-# Comparative Benchmark: Rudis vs. Dragonfly vs. Valkey
+# Comparative Benchmark: Rudis vs. Dragonfly (vs. Valkey, historical)
 
-This document provides a rigorous, reproducible benchmark comparing **Rudis v0.1.0** against the latest stable releases of **Dragonfly (v1.39.0)** and **Valkey (v8.1.9)** across core in-memory database workloads.
+This document compares Rudis against Dragonfly v1.39.0 across nine single- and multi-key workloads, using the
+data currently checked in at [`docs/benchmarks/benchmark_comparison_results.json`](benchmark_comparison_results.json).
+It is produced by [`scripts/benchmark_vs_dragonfly_valkey.py`](../../scripts/benchmark_vs_dragonfly_valkey.py).
+
+> **Data provenance notice.** The script supports a three-way comparison against Valkey 8.1.9 in addition to
+> Dragonfly, and an earlier revision of this document reported such a comparison. The committed result file
+> as of this revision, however, contains **only Dragonfly and Rudis** entries — the harness was last run with
+> its `--df-only` flag (added in commit `90898dd`), and no Valkey run has been recorded since commit
+> `ea22263`. Rudis and Dragonfly have both changed substantially since that commit (see `git log --oneline --
+> docs/benchmarks/benchmark_comparison_results.json`), so the old Valkey figures cannot be meaningfully
+> compared against current Rudis/Dragonfly numbers and are **not reproduced here**. Re-run
+> `python3 scripts/benchmark_vs_dragonfly_valkey.py` (omitting `--df-only`) to regenerate a current three-way
+> comparison; see Section 6.
 
 ---
 
-## 1. Executive Summary & Key Highlights
+## 1. Executive Summary
 
-* **Pipelined GET Throughput (`GET 100% Pipeline 16, 1KB`)**:
-  * **Rudis** achieves **1,477,870 ops/sec** (p99 tail latency **1.625 ms**), outperforming **Valkey 8.1.9** (**987,520 ops/sec**, p99 **1.885 ms**) by **+49.7%** and reaching **~90%** of **Dragonfly v1.39.0** (**1,649,760 ops/sec**, p99 **1.777 ms**).
-  * Rudis delivered the **lowest p99 tail latency** among all three engines (1.625 ms vs 1.777 ms for Dragonfly and 1.885 ms for Valkey).
-* **Co-Located Multi-Key Reads (`MGET 10 Keys {tag}`)**:
-  * **Rudis** achieves **199,879 ops/sec** (p99 **0.900 ms**), outperforming **Dragonfly v1.39.0** (**182,952 ops/sec**, p99 **1.081 ms**) by **+9.3%**, with lower tail latency.
-* **Scattered Multi-Key Fanout (`MGET 10 Keys Scattered`)**:
-  * Rudis achieves **140,743 ops/sec** (**1.41 million keys fetched/sec**) across 8 independent shards, with a p99 tail latency of **1.101 ms** (superior to Valkey's **1.188 ms**).
-* **Low Latency Single-Key Reads (`GET 100% Pipeline 1, 1KB`)**:
-  * Rudis delivers **230,785 ops/sec** with **0.256 ms** average latency and **0.548 ms** p99 latency (~81% of Dragonfly and Valkey).
-* **Statistical Rigor**:
-  * Every workload was executed **5 consecutive times** in an isolated environment with verified low host load (<1.5 on 64 vCPUs, >98% CPU idle). All reported metrics include mean, standard deviation, min, max, average latency, and p99 tail latency.
+Reading directly from the current result file, Rudis and Dragonfly split the nine workloads: Dragonfly leads
+on single-key, unpipelined operations and on both scattered multi-key workloads, while Rudis leads on
+pipelined throughput at depth 16 and on the co-located multi-key read.
+
+* **Pipelined SET (`SET 100% Pipeline 16, 1KB`)**: Rudis **1,485,688 ops/sec** vs. Dragonfly **1,207,022
+  ops/sec** — **+23.1%** for Rudis, with lower p99 tail latency (**1.411 ms** vs. **1.979 ms**).
+* **Pipelined Mixed 50:50 (`Pipeline 16, 1KB`)**: Rudis **1,423,247 ops/sec** vs. Dragonfly **1,006,959
+  ops/sec** — **+41.3%** for Rudis.
+* **Pipelined GET (`Pipeline 16, 1KB`)**: Rudis **1,498,605 ops/sec** vs. Dragonfly **1,527,352 ops/sec** —
+  within **2%**, effectively a statistical tie; this workload also carries the highest measurement noise in
+  the suite (Rudis run-to-run CV ≈ 36%, see Section 3), so the sign of this delta should not be over-read.
+* **Unpipelined single-key ops (`Pipeline 1, 1KB`)**: Dragonfly leads on all three — `SET` by 37.3%, `GET` by
+  25.8%, and `Mixed` by 34.8%. Unpipelined throughput at this payload size is dominated by per-request
+  round-trip and syscall overhead rather than by server-side processing, which favors Dragonfly's proactor
+  model in this configuration.
+* **Scattered multi-key fan-out (`MSET`/`MGET`, 10 keys)**: Dragonfly leads both — `MSET` by 12.3% and `MGET`
+  by 21.7%.
+* **Co-located multi-key read (`MGET 10 Keys {tag}`)**: Rudis **178,046 ops/sec** vs. Dragonfly **175,368
+  ops/sec** — a statistical tie (+1.5%).
 
 ---
 
@@ -37,7 +57,7 @@ This document provides a rigorous, reproducible benchmark comparing **Rudis v0.1
 | :--- | :--- | :--- | :--- |
 | **Rudis** | `v0.1.0` (`target/release/rudis`) | Shared-Nothing, Thread-per-Core (8 Monoio `io_uring` reactors) | `--threads 8 --port 6379` |
 | **Dragonfly** | `v1.39.0` (commit `699862e5da7c`) | Multi-threaded shared memory fiber proactor (8 threads) | `--proactor_threads=8 --cache_mode=false --dbfilename="" --port 6381` |
-| **Valkey** | `v8.1.9` GA (commit `a9245aaf3`, jemalloc 5.3.0) | Single main execution thread + 8 I/O read/write threads | `--io-threads 8 --io-threads-do-reads yes --protected-mode no --save "" --appendonly no --port 6380` |
+| **Valkey** *(historical only — see notice above)* | `v8.1.9` GA (commit `a9245aaf3`, jemalloc 5.3.0) | Single main execution thread + 8 I/O read/write threads | `--io-threads 8 --io-threads-do-reads yes --protected-mode no --save "" --appendonly no --port 6380` |
 | **Benchmark Tool** | `memtier_benchmark` v2.2.1 | 8 client threads, 8 connections/thread (64 concurrent connections) | `taskset -c 32-47 memtier_benchmark ...` |
 
 ---
@@ -66,133 +86,89 @@ uptime
 ### Step 3: Run the Automated 5-Iteration Benchmark Suite
 All benchmarks are orchestrated by `scripts/benchmark_vs_dragonfly_valkey.py`. To reproduce the exact tests:
 ```bash
+# Rudis + Dragonfly + Valkey (three-way; requires Valkey built per Step 1)
 python3 scripts/benchmark_vs_dragonfly_valkey.py
+
+# Rudis + Dragonfly only (skips Valkey; matches the data currently committed
+# in benchmark_comparison_results.json and reproduced in Section 4)
+python3 scripts/benchmark_vs_dragonfly_valkey.py --df-only
+
+# Rudis only, or a custom iteration count
+python3 scripts/benchmark_vs_dragonfly_valkey.py --rudis-only
+python3 scripts/benchmark_vs_dragonfly_valkey.py -i 10
 ```
 This script:
 1. Boots each engine sequentially on dedicated cores (`taskset -c 0-7`).
 2. Clears the keyspace (`FLUSHALL`) and pre-populates data for read workloads.
-3. Runs each workload **5 consecutive times**.
-4. Records raw metrics into `docs/benchmarks/benchmark_comparison_results.json`.
+3. Runs each workload **5 consecutive times** by default (`-i`/`--iterations` to override).
+4. Records mean/std/min/max ops-per-second and latency into `docs/benchmarks/benchmark_comparison_results.json`,
+   **overwriting** the previous contents of that file (it is not merged, unlike the common-commands suite).
 5. Shuts down each server cleanly before starting the next engine.
 
 ---
 
 ## 4. Benchmark Results
 
-### 4.1 Master Throughput & Latency Summary (5 Runs Average)
+### 4.1 Master Throughput & Latency Summary (5 Runs, Mean ± Std)
 
-| Workload | Rudis Ops/sec (Mean ± Std) | Dragonfly Ops/sec (Mean ± Std) | Valkey 8.1.9 Ops/sec (Mean ± Std) | Rudis p99 | Dragonfly p99 | Valkey p99 |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **SET 100% (Pipeline 1, 1KB)** | 246,574 ± 37,620 | **293,604 ± 52,120** | 283,667 ± 27,292 | 0.60 ms | **0.51 ms** | 0.75 ms |
-| **GET 100% (Pipeline 1, 1KB)** | 242,956 ± 28,735 | **303,573 ± 63,216** | 280,902 ± 38,934 | 0.59 ms | **0.50 ms** | 0.52 ms |
-| **Mixed 50:50 (Pipeline 1, 1KB)** | 228,105 ± 21,970 | **319,404 ± 55,194** | 273,059 ± 28,683 | 0.64 ms | **0.48 ms** | 0.50 ms |
-| **SET 100% (Pipeline 16, 1KB)** | **1,325,347 ± 94,092** | 1,187,244 ± 88,109 | 532,518 ± 31,440 | 2.58 ms | **2.28 ms** | 3.62 ms |
-| **GET 100% (Pipeline 16, 1KB)** | **1,784,040 ± 156,536** | 1,663,074 ± 166,716 | 1,007,646 ± 65,926 | **1.61 ms** | 1.89 ms | 2.26 ms |
-| **Mixed 50:50 (Pipeline 16, 1KB)** | **1,449,320 ± 241,684** | 1,264,446 ± 157,485 | 745,068 ± 60,876 | **2.11 ms** | 2.54 ms | 3.08 ms |
-| **MSET 10 Keys (Scattered)** | 123,325 ± 16,021 | **151,783 ± 12,404** | 128,982 ± 12,439 | 1.42 ms | **1.09 ms** | 1.10 ms |
-| **MGET 10 Keys (Scattered)** | 114,007 ± 10,243 | 205,236 ± 21,597 | **226,753 ± 12,627** | 1.43 ms | 0.79 ms | **0.63 ms** |
-| **MGET 10 Keys (Co-located `{tag}`)** | 158,132 ± 21,477 | 177,959 ± 6,401 | **249,965 ± 34,509** | 0.95 ms | 1.10 ms | **0.66 ms** |
+Source: `docs/benchmarks/benchmark_comparison_results.json`, `Dragonfly v1.39.0` and `Rudis (Thread-per-core)`
+entries. `Δ` is Rudis relative to Dragonfly.
 
----
+| Workload | Rudis Ops/sec (Mean ± Std) | Dragonfly Ops/sec (Mean ± Std) | Δ | Rudis p99 | Dragonfly p99 |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **SET 100% (Pipeline 1, 1KB)** | 204,822 ± 15,477 | **326,403 ± 31,606** | -37.3% | 0.691 ms | **0.575 ms** |
+| **GET 100% (Pipeline 1, 1KB)** | 238,117 ± 38,393 | **320,829 ± 22,718** | -25.8% | 0.731 ms | **0.719 ms** |
+| **Mixed 50:50 (Pipeline 1, 1KB)** | 224,679 ± 1,534 | **344,438 ± 11,351** | -34.8% | 0.667 ms | **0.487 ms** |
+| **SET 100% (Pipeline 16, 1KB)** | **1,485,688 ± 171,417** | 1,207,022 ± 120,635 | **+23.1%** | **1.411 ms** | 1.979 ms |
+| **GET 100% (Pipeline 16, 1KB)** | 1,498,605 ± 533,044\* | **1,527,352 ± 188,276** | -1.9% | 2.019 ms | **1.947 ms** |
+| **Mixed 50:50 (Pipeline 16, 1KB)** | **1,423,247 ± 96,270** | 1,006,959 ± 75,124 | **+41.3%** | 2.559 ms | **2.895 ms** |
+| **MSET 10 Keys (Scattered)** | 137,203 ± 26,160 | **156,405 ± 20,507** | -12.3% | 1.251 ms | **0.999 ms** |
+| **MGET 10 Keys (Scattered)** | 150,775 ± 18,048 | **192,658 ± 7,021** | -21.7% | 0.859 ms | **0.575 ms** |
+| **MGET 10 Keys (Co-located `{tag}`)** | **178,046 ± 11,759** | 175,368 ± 9,210 | +1.5% | **0.819 ms** | 0.939 ms |
 
-### 4.2 Detailed Per-Workload Analysis (All 5 Iterations)
+\* The Rudis `GET 100% (Pipeline 16, 1KB)` run carries a ±533,044 standard deviation on a 1,498,605 mean — a
+coefficient of variation of ~36%, by far the noisiest cell in this table. Treat the -1.9% delta on this row as
+inconclusive rather than a real regression; re-running with a higher iteration count (`-i 10` or more) is
+recommended before drawing a conclusion from this workload specifically.
 
-#### 1. Pipelined GET (`GET 100% Pipeline 16, 1KB`)
-* **Rudis**:
-  * Ops/sec: **Mean 1,906,202.0** (±426,314)
-  * Avg Latency: **0.528 ms**
-  * p99 Latency: **1.426 ms**
-* **Dragonfly v1.39.0**:
-  * Ops/sec: **Mean 1,748,391.5** (±146,841)
-  * Avg Latency: **0.589 ms**
-  * p99 Latency: **1.885 ms**
-* **Valkey 8.1.9**:
-  * Ops/sec: **Mean 927,262.9** (±111,524)
-  * Avg Latency: **1.104 ms**
-  * p99 Latency: **2.079 ms**
+### 4.2 Reading the Table
 
-> **Key Takeaway**: Rudis takes #1 position at **1.91M ops/sec**, outperforming Dragonfly (1.75M) by **+9.0%** and more than doubling Valkey 8.1.9 (**+105.6%**) with superior tail latency (**1.43 ms vs. 1.89 ms**).
-
----
-
-#### 2. Pipelined Mixed Workload (`Mixed 50:50 Pipeline 16, 1KB`)
-* **Rudis**:
-  * Ops/sec: **Mean 1,355,047.4** (±22,344)
-  * Avg Latency: **0.751 ms**
-  * p99 Latency: **2.148 ms**
-* **Dragonfly v1.39.0**:
-  * Ops/sec: **Mean 1,259,184.3** (±53,887)
-  * Avg Latency: **0.814 ms**
-  * p99 Latency: **2.540 ms**
-* **Valkey 8.1.9**:
-  * Ops/sec: **Mean 676,085.5** (±66,715)
-  * Avg Latency: **1.516 ms**
-  * p99 Latency: **2.652 ms**
-
-> **Key Takeaway**: Rudis takes #1 position at **1.36M ops/sec**, beating Dragonfly (+7.6%) and doubling Valkey (+100.4%). The zero-memmove circular ring buffer backlog and single-pass squashing allow 8 worker threads to process concurrent reads and writes at hardware line rate.
+* **Unpipelined workloads (Pipeline 1) favor Dragonfly** by 26-37%, with Dragonfly holding lower p99 latency
+  on `SET` and `Mixed`. At pipeline depth 1, each request is a full round trip, so the server's syscall and
+  scheduling overhead per request dominates; Dragonfly's fiber proactor model apparently amortizes that
+  better than Rudis's shared-nothing shard dispatch in this configuration.
+* **Pipelined workloads (Pipeline 16) mostly favor Rudis**: `SET` (+23.1%) and `Mixed` (+41.3%) both show
+  clear wins with lower tail latency; `GET` is a statistical tie once the noise in that cell (see note above)
+  is accounted for.
+* **Scattered multi-key commands favor Dragonfly**: fanning a single client command out across independently
+  owned shards and re-assembling the reply currently costs Rudis more than it costs Dragonfly for both
+  `MSET` and `MGET`.
+* **Co-located multi-key reads (`{tag}`) are a tie**: when all ten keys hash to the same shard, Rudis's
+  single-pass local lookup removes the cross-shard fan-out cost entirely, closing the gap seen in the
+  scattered case.
 
 ---
 
-#### 3. Pipelined SET (`SET 100% Pipeline 16, 1KB`)
-* **Rudis**:
-  * Ops/sec: **Mean 865,678.8** (±15,609)
-  * Avg Latency: **1.121 ms**
-  * p99 Latency: **3.420 ms**
-* **Dragonfly v1.39.0**:
-  * Ops/sec: **Mean 1,249,761.6** (±26,339)
-  * Avg Latency: **0.820 ms**
-  * p99 Latency: **2.313 ms**
-* **Valkey 8.1.9**:
-  * Ops/sec: **Mean 574,013.3** (±43,306)
-  * Avg Latency: **1.782 ms**
-  * p99 Latency: **3.273 ms**
+## 5. Architectural Notes
 
-> **Key Takeaway**: Rudis improved from 30.2k ops/s to **865.7k ops/s** (**28.7x speedup**), decisively outperforming Valkey 8.1.9 by **+50.8%**.
+### 5.1 Where Rudis Currently Leads
+1. **Thread-per-Core Shared-Nothing Isolation**: Rudis runs an independent Monoio event loop on every pinned
+   CPU core, so each core owns its subset of the keyspace and avoids lock contention entirely during reads.
+   Combined with pipelining, this shows up as the +23.1% (`SET`) and +41.3% (`Mixed`) advantages in Section 4.
+2. **`io_uring` Response Batching**: pipelined writes benefit from Monoio's submit-and-wait ring mechanics,
+   aggregating incoming command frames and coalescing outgoing responses into fewer network writes — the
+   likely reason pipelined workloads behave differently from unpipelined ones in this comparison.
+3. **Co-located multi-key reads**: when all keys in a batch hash to the same shard (the `{tag}` case),
+   Rudis's local-ownership fast path removes cross-shard fan-out entirely, turning what is otherwise a Rudis
+   deficit (see scattered `MGET`, Section 4.2) into a tie.
 
----
-
-#### 4. Co-Located Multi-Key Reads (`MGET 10 Keys {tag}`)
-* **Rudis**:
-  * Ops/sec: **Mean 207,516.8** (±22,534)
-  * Avg Latency: **0.312 ms**
-  * p99 Latency: **0.820 ms**
-* **Dragonfly v1.39.0**:
-  * Ops/sec: **Mean 186,102.8** (±16,001)
-  * Avg Latency: **0.348 ms**
-  * p99 Latency: **0.938 ms**
-* **Valkey 8.1.9**:
-  * Ops/sec: **Mean 234,778.8** (±32,460)
-  * Avg Latency: **0.275 ms**
-  * p99 Latency: **0.698 ms**
-
-> **Key Takeaway**: Rudis beats Dragonfly by **+11.5%** in throughput and achieves lower p99 tail latency (0.820 ms vs 0.938 ms). Because all keys share `{tag}`, Rudis's single-pass sharding router detects local ownership and reads directly from the local hash table.
-
----
-
-#### 5. Scattered Multi-Key Mutations (`MSET 10 Keys Scattered Across 8 Shards`)
-* **Rudis**: **122,925.4 ops/sec** (Equivalent: **1.23M keys/sec**), p99: **1.279 ms**
-* **Dragonfly v1.39.0**: **160,742.7 ops/sec** (Equivalent: **1.61M keys/sec**), p99: **0.852 ms**
-* **Valkey 8.1.9**: **156,188.6 ops/sec** (Equivalent: **1.56M keys/sec**), p99: **1.133 ms**
-
-> **Key Takeaway**: Scattered MSET improved from 2.1k ops/s to **122.9k ops/s** (**58.0x speedup**), bringing Rudis to ~79% of Dragonfly/Valkey.
-
----
-
-## 5. Architectural Deep-Dive & Performance Analysis
-
-### 5.1 Where Rudis Excels
-1. **Thread-per-Core Shared-Nothing Isolation**:
-   * Rudis runs an independent Monoio event loop on every pinned CPU core. Each core owns its subset of the keyspace, avoiding lock contention entirely during reads.
-   * This design allows pipelined reads to reach **1.91M ops/sec**, beating Dragonfly (**1.75M ops/sec**) and Valkey (**927K ops/sec**).
-2. **True Kernel-Bypassing Batching (`io_uring`)**:
-   * Reads and pipelined writes benefit from Monoio's submit-and-wait ring mechanisms, aggregating incoming command frames and batching outgoing responses into coalesced network packets.
-3. **Pipelined Mixed Mutation Dominance**:
-   * In 50:50 read/write pipelined workloads, Rudis achieves **1.36M ops/sec**, outperforming Dragonfly (1.26M) and more than doubling Valkey (676K).
-
----
-
-### 5.2 Root Causes of Prior Write Path Latency & Implemented Optimizations
-Prior to this optimization cycle, write workloads (`SET`, `Mixed`, `MSET`) lagged significantly behind Dragonfly and Valkey. Profiling with `perf record -g` revealed that **over 75% of total CPU time** was spent in `libc.so.6 [.] __memmove_avx_unaligned_erms` and `<std::sys::sync::rwlock::futex::RwLock>::write_contended`.
+### 5.2 Historical Write-Path Optimization (commit `2c80413`)
+The following bottlenecks were identified and fixed by commit `2c80413` (`perf(core): optimize write path
+throughput and latency via zero-copy backlog ring buffer and fast paths`), profiled with `perf record -g`
+against an earlier build in which write workloads (`SET`, `Mixed`, `MSET`) lagged well behind Dragonfly and
+Valkey. At the time, **over 75% of total CPU time** was spent in `libc.so.6 [.] __memmove_avx_unaligned_erms`
+and `<std::sys::sync::rwlock::futex::RwLock>::write_contended`. This section is retained as a historical
+record of what was fixed and why; the specific ops/sec figures it improved from are superseded by Section 4.
 
 #### Identified Bottlenecks & Fixes:
 1. **Replication Backlog 1MB `memmove` under Exclusive Mutex**:
@@ -218,14 +194,23 @@ Prior to this optimization cycle, write workloads (`SET`, `Mixed`, `MSET`) lagge
 
 ## 6. Summary of Architectural Comparison
 
-| Dimension | Rudis | Dragonfly | Valkey |
-| :--- | :--- | :--- | :--- |
-| **Execution Model** | Thread-per-core shared-nothing | Multi-threaded fiber proactor | Single main thread + I/O threads |
-| **I/O Engine** | Linux `io_uring` (Monoio) | Linux `epoll` / `io_uring` (Helio) | Linux `epoll` |
-| **Inter-Thread IPC** | Channel actor messages (`flume`) | Shared memory fibers & mutexes | Main thread task queues |
-| **Pipelined Reads (1KB)** | **1.91M ops/s** (Best p99: **1.43ms**) | 1.75M ops/s (p99: 1.89ms) | 927K ops/s (p99: 2.08ms) |
-| **Pipelined Mixed 50:50 (1KB)** | **1.36M ops/s** (Best p99: **2.15ms**) | 1.26M ops/s (p99: 2.54ms) | 676K ops/s (p99: 2.65ms) |
-| **Pipelined Writes (1KB)** | **866K ops/s** (p99: 3.42ms) | **1.25M ops/s** (p99: **2.31ms**) | 574K ops/s (p99: 3.27ms) |
-| **Co-located MGET (10k)** | **207.5K ops/s** (p99: 0.82ms) | 186.1K ops/s (p99: 0.94ms) | **234.8K ops/s** (p99: **0.70ms**) |
-| **Scattered MGET (10k)** | **1.27M keys/s** (p99: 1.21ms) | **2.04M keys/s** (p99: **0.82ms**) | **2.22M keys/s** (p99: 0.87ms) |
-| **Primary Strength** | Peak read and mixed pipelined throughput (#1 in GET & Mixed) | Peak raw write throughput & fiber scheduling | Single-thread memory locality & simplicity |
+This table reflects the current data in Section 4 (Rudis vs. Dragonfly only; see the data provenance notice
+at the top of this document regarding Valkey).
+
+| Dimension | Rudis | Dragonfly |
+| :--- | :--- | :--- |
+| **Execution Model** | Thread-per-core shared-nothing | Multi-threaded fiber proactor |
+| **I/O Engine** | Linux `io_uring` (Monoio) | Linux `epoll` / `io_uring` (Helio) |
+| **Inter-Thread IPC** | Channel actor messages (`flume`) | Shared memory fibers & mutexes |
+| **Unpipelined SET/GET/Mixed (P1, 1KB)** | 205-239K ops/s | **321-344K ops/s** (lower latency) |
+| **Pipelined SET (P16, 1KB)** | **1.49M ops/s** (p99 **1.41ms**) | 1.21M ops/s (p99 1.98ms) |
+| **Pipelined GET (P16, 1KB)** | 1.50M ops/s (p99 2.02ms)\* | 1.53M ops/s (p99 **1.95ms**)\* |
+| **Pipelined Mixed 50:50 (P16, 1KB)** | **1.42M ops/s** (p99 2.56ms) | 1.01M ops/s (p99 2.90ms) |
+| **Co-located MGET (10 keys, `{tag}`)** | 178K ops/s (p99 **0.82ms**) | 175K ops/s (p99 0.94ms) — statistical tie |
+| **Scattered MGET / MSET (10 keys)** | 137-151K ops/s | **156-193K ops/s** |
+| **Primary Strength** | Pipelined write and mixed throughput | Unpipelined single-key latency and scattered multi-key fan-out |
+
+\* Statistical tie; see the noise note in Section 4.1.
+
+Both engines have room for improvement highlighted directly by this data: Rudis on unpipelined single-key
+latency and scattered multi-key fan-out, Dragonfly on pipelined mixed-workload throughput.

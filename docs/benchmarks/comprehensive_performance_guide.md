@@ -1,9 +1,21 @@
 # Rudis Comprehensive Performance Guide & Benchmark Whitepaper
 
-> **Document Version**: 1.0  
+> **Document Version**: 1.1  
 > **Target Release**: Rudis v0.1.0  
 > **Tested Architecture**: Multi-threaded Shared-Nothing (Thread-per-Core) on Linux `io_uring` (Monoio)  
 > **Hardware**: AMD EPYC 7B13 64-Core Processor, 117 GiB RAM, Linux `7.1.6-1rodete1-amd64`  
+
+> **Data provenance.** Sections 3-5 (payload sweep, pipeline-depth sweep, specialized-engine suite) are
+> produced by [`scripts/benchmark_payload_pipeline.py`](../../scripts/benchmark_payload_pipeline.py) and
+> [`scripts/benchmark_specialized_engines.py`](../../scripts/benchmark_specialized_engines.py). Both scripts
+> write their raw JSON output to `benchmark_logs/`, a directory that is **not currently committed to this
+> repository**, so the figures in those sections cannot be independently re-verified against a checked-in
+> data file at review time — they are retained as a faithful transcription of a prior run's console output
+> and should be treated as **illustrative of methodology** rather than as continuously-tracked regression
+> data. Re-run the two scripts (Section 8) to regenerate current numbers. Section 6's competitive comparison,
+> by contrast, is cross-checked against `benchmark_common_commands_results.json` and
+> `benchmark_multicore_results.json`, both committed at the repository root, and has been corrected in this
+> revision where it previously disagreed with those files.
 
 ---
 
@@ -19,6 +31,9 @@ This comprehensive whitepaper presents verified empirical benchmarks across five
 5. **Tail Latency SLAs & Jitter**: Distribution analysis across $p50$, $p90$, $p95$, $p99$, and $p99.9$ demonstrating sub-millisecond median latencies and predictable predictability under load.
 
 ### Key Benchmark Takeaways
+
+*(Figures below are drawn from Sections 3-5; see the data-provenance notice above — treat as illustrative of
+the methodology and reproduce locally for current numbers.)*
 
 ```
                                   RUDIS THROUGHPUT HIGHLIGHTS (16 CORES)
@@ -206,18 +221,32 @@ Rudis natively integrates multiple modern sub-engines that execute concurrently 
 | **16** | **2,795,855.75 Ops/s** | 3,260,984.24 Ops/s | **1,401,317.02 Ops/s** | 1.91x |
 | **32** | 2,534,119.69 Ops/s | 3,278,615.38 Ops/s | 1,341,147.65 Ops/s | 1.92x |
 
-### Rudis vs. Dragonfly v1.39.0 (16 Threads)
+### Rudis vs. Dragonfly v1.39.0 — Common Commands (16 and 32 Physical Cores)
 
-| Workload | Payload | Rudis (Ops/sec) | Dragonfly (Ops/sec) | Performance Delta | Winner |
+*(Corrected in this revision. An earlier version of this table reported Rudis winning 7 of 8 sampled
+commands with deltas up to +534%; those figures came from `multi_command_results.json`, produced by a
+since-abandoned CPU layout that placed the memtier client on the SMT siblings of the server's own physical
+cores. That layout is known to have produced run-to-run swings of up to 2.05x and has been replaced. The
+table below reads current data from `benchmark_common_commands_results.json`; full methodology and the
+remaining eight measured commands are in
+[`multi_command_comparison.md`](multi_command_comparison.md).)*
+
+At 16 physical cores, Rudis leads Dragonfly on all sixteen measured common commands. At 32 physical cores,
+Dragonfly leads on all sixteen — a reproducible crossover, not a selection artifact (see
+`multi_command_comparison.md` Section 4 for discussion).
+
+| Workload | Payload | Rudis @16c (Ops/sec) | Dragonfly @16c (Ops/sec) | Δ @16c | Δ @32c |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **GET** | 1KB | **3,301,207** | 520,571 | **+534.2% (6.34x)** | **Rudis** |
-| **HGET** | 1KB | **2,892,417** | 525,713 | **+450.2% (5.50x)** | **Rudis** |
-| **SET/GET 1:1** | 1KB | **3,075,108** | 818,964 | **+275.5% (3.76x)** | **Rudis** |
-| **SET** | 1KB | **3,415,601** | 1,981,566 | **+72.4% (1.72x)** | **Rudis** |
-| **LPUSH** | 1KB | **2,774,462** | 1,658,130 | **+67.3% (1.67x)** | **Rudis** |
-| **HSET** | 1KB | **2,636,209** | 2,181,202 | **+20.9% (1.21x)** | **Rudis** |
-| **INCR** | Small | **4,175,571** | 3,998,671 | **+4.4% (1.04x)** | **Rudis** |
-| **ZADD** | Small | 3,468,035 | **3,849,669** | -9.9% (0.90x) | Dragonfly |
+| **GET** | 1KB | **2,067,300** | 730,007 | **+183.2%** | -18.1% |
+| **SET** | 1KB | **2,477,258** | 1,876,363 | **+32.0%** | -4.9% |
+| **HGET** | — | **2,999,483** | 2,331,842 | **+28.6%** | -34.4% |
+| **HSET** | — | **3,021,190** | 2,416,707 | **+25.0%** | -21.6% |
+| **INCR** | — | **3,223,111** | 2,748,865 | **+17.3%** | -19.3% |
+| **LPUSH** | — | **2,924,231** | 2,165,909 | **+35.0%** | -15.1% |
+| **ZADD** | — | **2,963,699** | 2,343,497 | **+26.5%** | -14.6% |
+
+Δ is Rudis relative to Dragonfly at each core count. See `multi_command_comparison.md` for all sixteen
+commands, per-run coefficient of variation, and full methodology (payloads, pipeline depth, warmup).
 
 ---
 
@@ -275,9 +304,17 @@ All benchmark automation scripts are checked into the repository under `scripts/
    ```bash
    python3 scripts/profile_and_benchmark.py
    ```
-   *Runs 1-32 core scaling and samples CPU instruction hotspots via Linux `perf`.*
+   *Runs 1-32 core scaling and samples CPU instruction hotspots via Linux `perf`. Writes the report directly
+   to `docs/benchmarks/scaling_and_profiling_report.md`.*
 
-4. **Vector Search & SQ8 Quantization**:
+4. **Rudis vs. Dragonfly, Common Commands (Section 6)**:
+   ```bash
+   python3 scripts/benchmark_common_commands_vs_dragonfly.py 16,32
+   ```
+   *Outputs merged results to `benchmark_common_commands_results.json` at the repository root. See
+   `multi_command_comparison.md` for full methodology.*
+
+5. **Vector Search & SQ8 Quantization**:
    ```bash
    cargo run --release --bin vector_bench
    ```

@@ -14,7 +14,7 @@
 
 ---
 
-### 3. Component Architecture & Data Structures
+### 2. Component Architecture & Data Structures
 
 ```
 BF.RESERVE myfilter 0.01 1000        CF.ADD mycuckoo item
@@ -60,9 +60,9 @@ by inspecting what's already stored under that key.
 
 ---
 
-### 4. Execution Algorithms & Code Logic
+### 3. Execution Algorithms & Code Logic
 
-#### 4.1 Bloom filter: bit array indexed by `h1 + i*h2 mod num_bits`
+#### 3.1 Bloom filter: bit array indexed by `h1 + i*h2 mod num_bits`
 
 ```rust
 pub fn add(&mut self, item: &[u8]) -> bool {
@@ -84,7 +84,7 @@ call. `add`'s return value (and the `count` increment) reflect whether the item 
 already present* (all bits already set) before this call — a real, if approximate,
 already-seen signal, not just "operation succeeded."
 
-#### 4.2 Cuckoo filter: two candidate buckets via XOR, eviction via random kicks
+#### 3.2 Cuckoo filter: two candidate buckets via XOR, eviction via random kicks
 
 ```rust
 fn indices(&self, item: &[u8], fp: u16) -> (usize, usize) {
@@ -104,7 +104,7 @@ fingerprint out of a full bucket, relocates it to its own alternate bucket, and 
 `MAX_KICKS = 500` times before giving up with `Err("ERR Cuckoo filter is full")` — real
 cuckoo-hashing eviction, not a stub.
 
-#### 4.3 Count-Min Sketch: `depth` independent hash rows, `min` across them as the estimate
+#### 3.3 Count-Min Sketch: `depth` independent hash rows, `min` across them as the estimate
 
 ```rust
 pub fn incr_by(&mut self, item: &[u8], delta: u64) -> u64 {
@@ -120,7 +120,7 @@ pub fn incr_by(&mut self, item: &[u8], delta: u64) -> u64 {
 }
 ```
 
-Same Kirsch-Mitzenmacher double-hash reuse as the Bloom filter (§4.1) to derive `depth`
+Same Kirsch-Mitzenmacher double-hash reuse as the Bloom filter (§3.1) to derive `depth`
 independent-enough row hashes from two real hash computations. Taking the **minimum** across
 rows after incrementing is the standard Count-Min Sketch estimator: any single row can only
 *overestimate* a true count (due to hash collisions with other items sharing that row's
@@ -128,7 +128,18 @@ column), so the minimum across independent rows is the tightest available overes
 `CMS.INITBYPROB`'s width/depth derivation (`from_prob`) uses the textbook formulas
 $w = \lceil e/\epsilon \rceil$, $d = \lceil \ln(1/(1-\delta)) \rceil$.
 
-#### 4.4 Top-K: Space-Saving eviction of the current minimum
+`incr_by` is the **standard (non-conservative) update rule**: every one of the `depth` row
+counters is unconditionally `saturating_add`-ed by `delta` on every call
+(`self.table[r][col] = self.table[r][col].saturating_add(delta)`), regardless of what the
+running minimum across rows is. This is a real, deliberate distinction from the
+*conservative update* variant of Count-Min Sketch (which only raises a row's counter up to
+`max(current, new_min_estimate)`, skipping rows whose counter is already at or above the
+post-update minimum) — conservative update tightens the sketch's over-estimation bound at the
+cost of extra per-row comparisons on every increment; this implementation does not do that
+extra work and accepts the correspondingly looser (but still correct, still one-sided)
+over-estimation bound of the textbook algorithm.
+
+#### 3.4 Top-K: Space-Saving eviction of the current minimum
 
 ```rust
 pub fn add(&mut self, item: Bytes, increment: u64) -> Option<Bytes> {
@@ -145,38 +156,46 @@ a larger-scale Space-Saving implementation would use.
 
 ---
 
-### 5. Cross-Component Interactions
+### 4. Cross-Component Interactions
 
 - **`src/connection.rs`** (Component 02): dispatches every `BF.*`/`CF.*`/`CMS.*`/`TOPK.*`
   command through the shared `target_shard_of_cmd`/local-vs-`execute_remote` fork (§1),
-  identical in shape to how `Json*`/`Geo*` commands are routed (Components 16/17).
+  identical in shape to how `Json*`/`Geo*` commands are routed (Components 16/17). The command
+  handlers themselves live in `src/table.rs` (e.g. `BF.RESERVE`'s handler inserts directly into
+  `db.probabilistic_store.bloom_filters`), not in `probabilistic.rs`, which contains only the
+  data structures and their pure algorithms.
 - **`src/resp.rs`** (Component 03): parses each command family's arguments (e.g.
   `BF.RESERVE`'s error-rate/capacity, `CMS.INITBYPROB`'s error/confidence, `TOPK.RESERVE`'s
   `k`) into the matching `Command::Bf*`/`Cf*`/`Cms*`/`Topk*` variants.
-- **`src/table.rs`**: no relationship — none of these four structures are `RudisValue`
-  variants; they live entirely in `ShardDb.probabilistic_store`, a separate per-shard map.
-- **RDB persistence: no relationship, verified** — same gap as `JsonStore` (Component 16 §5)
-  and vector indexes (Component 08 §7): none of `bloom_filters`/`cuckoo_filters`/
-  `cms_sketches`/`topk_trackers` are referenced anywhere in the RDB save/restore chunk logic,
-  so all four structure types are lost on restart.
+- **`src/table.rs`**: none of these four structures are `RudisValue` variants — they live
+  entirely in `ShardDb.probabilistic_store` (a `ProbabilisticStore`, a separate per-shard field
+  alongside `table: RudisTable`), not inside the main keyspace `RudisTable` itself.
+- **RDB persistence: real, verified.** `ShardDb::save_extended_rdb_chunk` (`src/shard.rs`)
+  serializes every entry of `bloom_filters` (type tag `8`), `cuckoo_filters` (tag `10`),
+  `cms_sketches` (tag `11`), and `topk_trackers` (tag `12`) into the RDB chunk stream —
+  capacity/error-rate/bit-array for Bloom, bucket table for Cuckoo, width/depth/table for CMS,
+  and the full `k`/item-count map for Top-K — and the matching branch in the RDB load path
+  (`src/shard.rs`) reconstructs each structure from those bytes and re-inserts it into
+  `probabilistic_store` on startup. A Bloom/Cuckoo/CMS/Top-K key survives `SAVE`/restart exactly
+  like an ordinary key; there is no persistence gap for this subsystem.
 
 ---
 
-### 7. Future Improvements
+### 5. Future Improvements
 
-- **Medium — include these four structures in RDB save/restore (§5)** — the same cross-cutting durability gap already flagged for `JsonStore` (Component 16) and vector indexes (Component 08): a restart silently discards all Bloom/Cuckoo/CMS/Top-K state with no warning.
-- **Low — replace Top-K's O(k) linear-scan eviction with a min-heap for O(log k) (§4.4)** — only matters if `TOPK.RESERVE` is used with a large `k`; negligible at the small-k values this structure is typically used for.
-- **Low — support counting Bloom filters or scalable/auto-expanding variants** (§2.5) if `BF.INSERT ... EXPANSION`-style auto-growth or deletion-capable Bloom semantics become a compatibility target — today, over-inserting a fixed-capacity Bloom filter just silently raises its real false-positive rate above the configured target with no signal to the caller.
-- **Low — document the false-positive-rate implications of Cuckoo filter fingerprint collisions explicitly** (§4.2) — `contains` can return a false positive if two different items hash to the same 16-bit fingerprint in the same bucket, same as any Cuckoo filter design; not a bug, but worth stating plainly given the structure's "no false negatives" framing can otherwise be read as "always exact."
+- **Low — replace Top-K's O(k) linear-scan eviction with a min-heap for O(log k) (§3.4)** — only matters if `TOPK.RESERVE` is used with a large `k`; negligible at the small-k values this structure is typically used for.
+- **Low — implement conservative update for the Count-Min Sketch (§3.3)** — the current `incr_by` always updates all `depth` rows unconditionally; switching to conservative update (only raising a row's counter up to the post-increment minimum) would tighten the sketch's over-estimation bound at a small extra per-increment cost, a well-known refinement of the base algorithm this implementation does not currently apply.
+- **Low — support counting Bloom filters or scalable/auto-expanding variants** if `BF.INSERT ... EXPANSION`-style auto-growth or deletion-capable Bloom semantics become a compatibility target — today, over-inserting a fixed-capacity Bloom filter just silently raises its real false-positive rate above the configured target with no signal to the caller.
+- **Low — document the false-positive-rate implications of Cuckoo filter fingerprint collisions explicitly** (§3.2) — `contains` can return a false positive if two different items hash to the same 16-bit fingerprint in the same bucket, same as any Cuckoo filter design; not a bug, but worth stating plainly given the structure's "no false negatives" framing can otherwise be read as "always exact."
 
 ---
 ---
 
 ## Contributor Gotchas, Invariants & Debugging Guide
 
-* **Gotcha 1**: Cuckoo filters use 4-slot bucket tables with fingerprint-based partial key cuckoo hashing.
-* **Gotcha 2**: Count-Min Sketch uses conservative update to minimize frequency over-estimation.
-* **Gotcha 3**: Top-K uses Space-Saving streaming algorithm with O(1) item updates.
+* **Gotcha 1**: Cuckoo filters use 4-slot bucket tables with fingerprint-based partial-key cuckoo hashing (§3.2); `MAX_KICKS = 500` bounds the eviction chain before `CF.ADD` fails with `"ERR Cuckoo filter is full"`.
+* **Gotcha 2**: The Count-Min Sketch uses the standard (non-conservative) update rule — every row is unconditionally incremented on `incr_by`, not just the rows needed to raise the minimum (§3.3).
+* **Gotcha 3**: Top-K's Space-Saving algorithm gives O(1) updates only for items already tracked; once at capacity, admitting a new distinct item costs an O(k) linear scan to find the current minimum to evict (§3.4).
 
 ### How to Verify Changes
 ```bash

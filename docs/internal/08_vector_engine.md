@@ -103,19 +103,39 @@ on the exact float vector still being present).
 ```rust
 pub fn dot_product(a: &[f32], b: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    { if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-        return unsafe { dot_product_avx2(a, b) };
-    } }
+    {
+        if is_x86_feature_detected!("avx512f") {
+            return unsafe { dot_product_avx512(a, b) };
+        }
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { dot_product_avx2(a, b) };
+        }
+    }
     dot_product_portable(a, b)
 }
 ```
 
-`dot_product_avx2`/`l2_distance_sq_avx2` process 16 floats per iteration (two accumulated
-`__m256` lanes via `_mm256_fmadd_ps`), with an 8-wide tail and a scalar remainder — real
-FMA-fused AVX2, not a placeholder. `dot_f32_u8_avx2`/`l2_f32_u8_avx2` do the same for a
-`f32` query against a `u8`-quantized vector (`_mm256_cvtepu8_epi32` widening + convert),
-used by `QuantizedVector::compute_distance` so SQ8-accelerated scoring is itself
-SIMD-accelerated, not just smaller.
+`dot_product`/`l2_distance_sq`/`cosine_distance` each dispatch through three runtime-selected
+tiers, checked in this order every call (no caching of the detected feature set):
+
+1. **AVX-512** (`dot_product_avx512`/`l2_distance_sq_avx512`/`cosine_distance_avx512`, gated on
+   `is_x86_feature_detected!("avx512f")`): two `__m512` accumulators (`acc0`/`acc1`), each
+   processing 16 lanes per `_mm512_fmadd_ps`, for 32 floats/iteration; an 16-wide tail and a
+   scalar remainder loop close out the rest. `hsum512_ps` reduces a `__m512` to a scalar by
+   folding down through `__m256`/`__m128` (delegates to `hsum256_ps`).
+2. **AVX2+FMA** (`dot_product_avx2`/`l2_distance_sq_avx2`/`cosine_distance_avx2`, gated on
+   `"avx2"` **and** `"fma"`): two `__m256` accumulators via `_mm256_fmadd_ps`, 16 floats/iteration,
+   with an 8-wide tail and scalar remainder.
+3. **Portable fallback** (`dot_product_portable`/`l2_distance_sq_portable`/
+   `cosine_distance_portable`): `a.as_chunks::<8>()` manual 8-lane unrolling, no `unsafe`, used
+   whenever neither x86_64 SIMD tier is available (including all non-x86_64 targets, since the
+   SIMD kernels are behind `#[cfg(target_arch = "x86_64")]`).
+
+`dot_f32_u8_avx2`/`l2_f32_u8_avx2` provide the AVX2-only equivalent for a `f32` query against a
+`u8`-quantized vector (`_mm256_cvtepu8_epi32` widening + `_mm256_cvtepi32_ps` convert), used by
+`QuantizedVector::compute_distance` so SQ8-accelerated scoring is itself SIMD-accelerated, not
+just smaller — **there is no AVX-512 tier for the `u8` path**; it stops at AVX2+FMA or the
+scalar loop in `dot_u8`/`l2_sq`.
 
 `compute_distance` unifies the three metrics into one "smaller is closer" scale:
 

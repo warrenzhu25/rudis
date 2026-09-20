@@ -112,7 +112,34 @@ clears the entire matched `Object`/`Array` in place (`map.clear()`/`arr.clear()`
 every removed entry — so `JSON.DEL key $.items[*]` empties the `items` array (leaving an empty
 array behind, not removing the array itself) rather than deleting each element one at a time.
 
-#### 4.5 `JSON.MGET`: sequential per-key, not fanned out — the same gap `MGET`/`MSET` had before their fix
+#### 4.5 `JSON.NUMMULTBY`: composed from two `json_numincrby` calls, not its own `JsonStore` method
+
+`JsonStore` has no `json_nummultby` method — `Command::JsonNumMultBy` is handled entirely in
+`src/connection.rs` by calling `json_numincrby(key, path, 0.0)` once to read the current numeric
+value(s), computing `new = cur * factor` in the caller, then calling `json_numincrby(key, path,
+new - cur)` a second time to apply the equivalent delta:
+
+```rust
+Command::JsonNumMultBy { key, path, factor } => {
+    match db.json_store.json_numincrby(key, path, 0.0) {
+        Ok(cur_str) => {
+            if let Ok(cur) = cur_str.parse::<f64>() {
+                let new_num = cur * factor;
+                let delta = new_num - cur;
+                let _ = db.json_store.json_numincrby(key, path, delta);
+                ...
+```
+
+This has a real, verifiable limitation: `json_numincrby` on a path that matches **more than one**
+node (e.g. a wildcard `$.items[*].price`) returns a bracketed multi-value string (`"[1,2,3]"`),
+which `cur_str.parse::<f64>()` cannot parse — so `JSON.NUMMULTBY` against a multi-match path
+silently returns `-ERR value at path is not a number` instead of multiplying each match, even
+though the equivalent `JSON.NUMINCRBY` on the same path works correctly across all matches. The
+two-call design is also not atomic in the sense of a single traversal — the path is parsed and
+walked twice per invocation — though no other command can interleave between the two calls since
+Rudis is single-threaded per shard.
+
+#### 4.6 `JSON.MGET`: sequential per-key, not fanned out — the same gap `MGET`/`MSET` had before their fix
 
 ```rust
 Command::JsonMget { keys, path } => {
@@ -137,7 +164,8 @@ plain `MGET`, `JsonMget` was never given the bucket-by-shard-then-fan-out treatm
 
 - **`src/connection.rs`** (Component 02): dispatches every single-key `Command::Json*` through
   the shared `target_shard_of_cmd`/local-vs-`execute_remote` fork (§1); `JsonMget` is a
-  standalone arm with its own sequential per-key loop (§4.5).
+  standalone arm with its own sequential per-key loop (§4.6); `JsonNumMultBy` composes two
+  `json_numincrby` calls rather than calling a dedicated `JsonStore` method (§4.5).
 - **`src/search.rs`** (Component 09): `JSON.SET` on the root path (`$`) triggers
   `index_document_hook` for auto-indexing after a successful write, flattening top-level
   scalar fields into the search engine's document representation — nested objects/arrays are
@@ -165,8 +193,12 @@ plain `MGET`, `JsonMget` was never given the bucket-by-shard-then-fan-out treatm
 ## Contributor Gotchas, Invariants & Debugging Guide
 
 * **Gotcha 1**: JSON numbers, strings, arrays, and objects mutate in-place in DRAM.
-* **Gotcha 2**: JSONPath queries support recursive descent ($..key) and bracket notation.
-* **Gotcha 3**: JSON documents can be indexed in RediSearch schema fields.
+* **Gotcha 2**: JSONPath queries support bracket notation and wildcards/slices, but **not**
+  recursive descent (`$..key`) or filter expressions (`?(@.price < N)`) — see §2.3, invariant 1.
+  A path using either of those silently matches nothing rather than erroring.
+* **Gotcha 3**: JSON documents can be indexed in RediSearch schema fields via `index_document_hook`
+  on a root-path (`$`) `JSON.SET`, but nested objects/arrays are stringified, not recursively
+  flattened into separate indexed fields.
 
 ### How to Verify Changes
 ```bash

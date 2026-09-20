@@ -1,6 +1,17 @@
 # Benchmark: Cross-Shard Pipeline Squashing vs. Dragonfly (16 Threads)
 
-This document records the benchmark results of `rudis` after implementing **cross-shard pipeline squashing**, **pre-allocated reusable connection responders**, and the **`mimalloc` global allocator**.
+This document records the 16-thread throughput of `rudis` after implementing **cross-shard pipeline
+squashing**, **pre-allocated reusable connection responders**, and the **`mimalloc` global allocator**,
+alongside a same-configuration comparison against Dragonfly. It is a 16-thread deep dive alongside the full
+1-32 thread sweep in [`squashed_scaling.md`](squashed_scaling.md); see that document's run-to-run variance
+note for why the two documents' 16-thread squashed figures (2,634,081 here vs. 2,904,558 there) differ by
+about 10% despite measuring the same build and configuration.
+
+**Why this benchmark matters**: pipeline squashing groups pipelined client requests by destination shard and
+dispatches each shard's batch concurrently, rather than serializing cross-shard hops one at a time. This
+represents the cross-shard batched-throughput ceiling of the shared-nothing architecture under heavy
+pipelining, and is the workload where Rudis's design has the most headroom to close on (or exceed) a
+single-address-space engine like Dragonfly.
 
 ---
 
@@ -11,6 +22,9 @@ This document records the benchmark results of `rudis` after implementing **cros
 * **Server**: 16 threads pinned to cores `0-15`
 * **Duration**: **60 seconds**
 * **Machine**: 64-core Linux system (`7.1.6-1rodete1-amd64`)
+* **Harness**: [`scripts/run_16t_benchmark.sh`](../../scripts/run_16t_benchmark.sh) for the Rudis figure;
+  the Dragonfly figure was captured with the equivalent `memtier_benchmark` invocation against
+  `--proactor_threads=16` on the same cores (no dedicated script — see Reproducing section below).
 
 ---
 

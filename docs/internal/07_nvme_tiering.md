@@ -79,11 +79,12 @@ pub struct OpManager {
 }
 ```
 
-`TieringStats` has 23 fields (`tiered_keys`, `cooled_keys`, `disk_reads`, `disk_writes`,
-`dead_bytes`, `ram_saved_bytes`, `coalesced_reads`, `gc_reclaimed_bytes`,
-`offload_threshold_pct` (default 60), `upload_threshold_pct` (default 80), ...) — all
-`AtomicU64`, updated from `router.rs`'s tiering methods (Component 04) and read by whatever
-reports tiering stats (`INFO`-style output, not shown in this file).
+`TieringStats` has 21 fields (`tiered_keys`, `tiered_bytes`, `ram_saved_bytes`, `disk_reads`,
+`disk_writes`, `dead_bytes`, `cooled_keys`, `decommit_count`, `max_memory`, `ram_hits`,
+`ram_misses`, `total_stashes`, `total_fetches`, `total_deletes`, `coalesced_reads`, `bin_pages`,
+`streaming_reads`, `gc_reclaimed_bytes`, `gc_cycles`, `offload_threshold_pct` (default 60),
+`upload_threshold_pct` (default 80)) — all `AtomicU64`, updated from `router.rs`'s tiering
+methods (Component 04) and read by the `TIER INFO` handler in `src/connection.rs`.
 
 ---
 
@@ -240,18 +241,39 @@ userspace round-trip) → a plain buffered `std::fs::copy`.
   records carry as their payload.
 - **`src/router.rs`** (Component 04): the actual orchestration layer —
   `spill_local`/`cool_local`/`load_local`/`stream_cold_read_local`/`decommit_local`/
-  `check_auto_tier` decide *when* to call into this file's `ShardTierManager`, using the real
-  `offload_threshold_pct`/`upload_threshold_pct` from `TieringStats` and `get_hot_keys_for_spill`
-  to pick candidates.
+  `check_auto_tier` decide *when* to call into this file's `ShardTierManager`. `check_auto_tier`
+  fires once a shard's `used_memory` exceeds its share of `maxmemory`
+  (`max_mem / num_shards`), first doing a zero-I/O `decommit_local(None)` pass (dropping the RAM
+  copy of every `Cooled` entry), then — if still over budget — spilling up to 256 hot keys per
+  call via `get_hot_keys_for_spill`, which walks `RudisTable`'s slots starting from a persistent
+  round-robin `spill_cursor` (not an LRU or access-frequency ranking) and collects the first
+  non-tiered/non-cooled keys it encounters. Separately, `is_memory_constrained` (checked from
+  `ensure_loaded`/read paths) uses **only** `offload_threshold_pct` (default 60%) to decide
+  whether a cold read should stream instead of promoting to RAM — `upload_threshold_pct` is
+  configured and reported via `TIER INFO`/`CONFIG` but is not read anywhere in `router.rs` (see
+  design doc §2.3, invariant 6).
 - **`src/shard.rs`**: `ShardDb.tier_manager: Option<Rc<ShardTierManager>>` — one manager
   instance per shard, created during shard startup (Component 01 §4.1 step 7).
 - **`src/connection.rs`** (Component 02): a `GET` on a key whose value is
   `RudisValue::Tiered`/`Cooled` falls through to `stream_cold_read_local`/`load_local` rather
   than being served directly from the table.
-- **`src/main.rs`** / **`src/server.rs`**: `RUDIS_DIRECT_IO` is read as a process environment
-  variable, not a CLI flag; `--maxmemory`/`--tiered-offload-threshold`/
-  `--tiered-upload-threshold` (Component 01) feed `set_max_memory`/`set_offload_threshold_pct`/
-  `set_upload_threshold_pct` in this file.
+- **`src/main.rs`** / **`src/server.rs`**: `RUDIS_DIRECT_IO` and `RUDIS_TIER_DIR` are read as
+  process environment variables, not CLI flags — every shard unconditionally opens a
+  `ShardTierManager` at startup (`RUDIS_TIER_DIR`, defaulting to
+  `$TMPDIR/rudis_tier_<port>` if unset), independent of whether `maxmemory` is configured;
+  `--maxmemory`/`--tiered-offload-threshold`/`--tiered-upload-threshold` (Component 01) feed
+  `set_max_memory`/`set_offload_threshold_pct`/`set_upload_threshold_pct` in this file. Auto-tiering
+  itself only activates once `maxmemory` is non-zero (`check_auto_tier` returns immediately if
+  `max_mem == 0`); with no `maxmemory` set, the tier file is opened but never written to via the
+  automatic path.
+- **`src/resp.rs`/`src/connection.rs`**: the operator-facing `TIER` command family
+  (`Command::Tier(TierSubcommand::*)`) exposes this subsystem directly: `TIER SPILL <key>`
+  (force-spill one key), `TIER LOAD <key>` / `TIER PROMOTE <key>` (force-load one key),
+  `TIER COOL <key>` (force-cool one key, keeping the RAM copy), `TIER DECOMMIT [key]`
+  (decommit one `Cooled` key, or all of them if no key is given), `TIER SPILLALL` (spill every
+  eligible key on the local shard), `TIER GC` (run one `run_gc` pass), `TIER SNAPSHOT <dir>` /
+  `TIER BACKUP <dir>` (call `ShardTierManager::snapshot`), and `TIER INFO` (the stats dump —
+  §3 above).
 
 ---
 
@@ -261,6 +283,7 @@ userspace round-trip) → a plain buffered `std::fs::copy`.
 - **Medium — support partial-page compaction, not just whole-page GC (§4.5).** `run_gc` can only reclaim a 4KB `SmallBins` page once every record on it has been deleted; a page with one long-lived survivor among many deleted neighbors stays fully allocated indefinitely. A periodic "read the survivors, repack into a fresh page, punch the old one" compaction pass (amortized, background, rate-limited like the existing 2s GC task) would bound worst-case `dead_bytes` growth under delete-heavy small-value workloads.
 - **Low — surface `O_DIRECT` fallback as a visible event, not just a silent retry (§4.1/§2.2).** An operator who sets `RUDIS_DIRECT_IO=1` expecting page-cache bypass has no way to discover the open silently fell back to buffered I/O (e.g. an unsupported filesystem) short of instrumenting the syscalls themselves. A one-time log line or a `TieringStats` flag would make this observable.
 - **Low — make the 16MB write-backpressure threshold and the 2KB SmallBins cutoff configurable** (§2.5/§4.2) rather than hardcoded constants, so tiering behavior can be tuned per deployment (fast NVMe vs. slower SSD, high-value-count vs. large-value-heavy workloads) without a rebuild.
+- **Low — either wire up `upload_threshold_pct` or remove it (§2.6/§5).** The field is fully plumbed through `CONFIG SET`/`CONFIG GET`/`TIER INFO` and defaults to 80, giving the operator every impression that it independently gates something beyond `offload_threshold_pct` (its own doc comment says as much). Today it does not — `router.rs` never reads it. Either give it a real second gate (e.g. a stricter "never promote" threshold above the existing 60% offload gate) or remove the config surface so it stops implying behavior that doesn't exist.
 
 ---
 ---

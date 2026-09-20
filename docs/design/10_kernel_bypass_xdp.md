@@ -1,78 +1,117 @@
-# Component 10: Kernel Bypass & Zero-Copy Networking (High-Level Design & Architecture Guide)
+# Component 10: Kernel Bypass & Zero-Copy Networking — Design & Architecture
 
-> **Subsystem Scope**: `src/xdp.rs, src/zerocopy.rs`  
-> **Implementation Reference**: [`docs/internal/10_kernel_bypass_xdp.md`](../internal/10_kernel_bypass_xdp.md)  
+> **Subsystem Scope**: `src/xdp.rs`, `src/zerocopy.rs`
+> **Implementation Reference**: [`docs/internal/10_kernel_bypass_xdp.md`](../internal/10_kernel_bypass_xdp.md)
 > **Consolidated Design Spec**: [`docs/design/components.md`](components.md)
 
 ---
 
-## 1. Executive Summary & Problem Statement
+## 1. Purpose and Current Status
 
-### 1.1 The Problem
-Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+`src/xdp.rs` and `src/zerocopy.rs` model two Linux kernel-bypass networking techniques —
+AF_XDP (`XSK`) zero-copy packet rings and `MSG_ZEROCOPY`/registered `io_uring` buffers — as a
+self-contained, pure-userspace subsystem, exposed to clients as an `XDP.*` command family.
 
-### 1.2 The Rudis Solution
-Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+**This subsystem does not perform real kernel bypass today, and is not on the server's live
+network path.** It is not gated behind a Cargo feature flag or a `#[cfg(...)]` attribute —
+`src/xdp.rs` and `src/zerocopy.rs` are unconditionally compiled into every build — but neither
+module makes an `AF_XDP` socket syscall, loads an eBPF program, or binds to a real network
+interface. Concretely:
 
----
+- **`src/xdp.rs`** implements the AF_XDP data structures (UMEM, fill/completion/Rx/Tx rings,
+  socket) entirely as in-process Rust collections (`Vec`, atomics, `RwLock`), and reaches them
+  only through explicit `XDP.*` admin commands or a background polling task (Component 01's
+  server loop) that drains a ring nothing external ever populates. The only way a real packet
+  payload enters this pipeline is a client explicitly calling `XDP.PACKET <bytes>` or
+  `XDP.INJECT <queue> <bytes>` — there is no code path from an actual NIC, raw socket, or a real
+  XDP/eBPF program into these rings.
+- **`src/zerocopy.rs`** (`RegisteredBufferPool`, `ZeroCopyEngine`) implements real, correct
+  low-level primitives — page-aligned buffer allocation, `SO_ZEROCOPY`/`MSG_ZEROCOPY` socket
+  send with fallback, and `io_uring::opcode::SendZc` entry construction — but nothing in the
+  codebase outside its own unit tests constructs a `ZeroCopyEngine` or calls `send_zc`. The
+  server's actual connection write path (`src/connection.rs`, built on `monoio`) does not use
+  this module.
 
-## 2. Contributor Mental Model & Architectural Principles
+The `XdpMode` a running instance reports (`Driver`, `Skb`, or `Simulated`) is cosmetic: the
+global engine picks `Skb` if `/sys/class/net` exists on the host and `Simulated` otherwise, but
+this only changes what `XDP.INFO` prints as a string — it does not attach to a real interface,
+does not change how `process_packet` behaves, and `Driver` mode is never actually selected by
+any code path (it exists as an enum variant with no constructor reaching it).
 
-### 2.1 The Mental Model
-Hardware kernel bypass for line-rate networking. Ingress network frames bypass standard kernel socket stacks using AF_XDP (XSK) driver UMEM rings, pre-registered io_uring fixed buffers, and Linux SO_ZEROCOPY.
+## 2. Why Kernel Bypass Exists as a Design Direction
 
-### 2.2 Design Rationale (The "Why")
-At millions of QPS, Linux kernel network stack overhead (sk_buff allocations, netfilter, page table walks) consumes up to 40% of CPU cycles. AF_XDP reads raw packets directly into userspace driver rings.
+### 2.1 The problem it targets
 
-### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
-1. **`XdpEngine` is a single global, not per-shard**: `get_xdp_engine()` returns a clone of an
-   `Arc<XdpEngine>` behind a process-wide `static GLOBAL_XDP_ENGINE: LazyLock<Arc<XdpEngine>>`
-   — every shard thread that calls `XDP.*` commands shares the exact same instance, coordinated
-   via `RwLock<Vec<XdpRule>>` and `RwLock<HashMap<u32, TokenBucket>>` (a real, if narrow,
-   exception to the shared-nothing model, similar in shape to `BlockHub` in Component 06).
-2. **`XdpMode` is cosmetic, not functional**: the global engine picks `XdpMode::Skb` if
-   `/sys/class/net` exists on the host, else `XdpMode::Simulated` — this only changes what
-   `XDP.INFO` reports as a string; it does not change `process_packet`'s behavior or attach
-   anything to a real interface in either mode.
-3. **`RegisteredBufferPool` owns raw allocated memory directly** (`alloc_zeroed`/`dealloc` via
-   `std::alloc`, not a `Vec`), page-aligned via `Layout::from_size_align(total_size, PAGE_SIZE)`,
-   with a manual `unsafe impl Send + Sync` — correct in isolation, but again: nothing in the
-   codebase actually constructs one outside its own test.
-4. **`ZeroCopyEngine::send_zc` degrades gracefully**: only applies `MSG_ZEROCOPY` for payloads
-   `>= PAGE_SIZE` (4KB, per a comment citing page-locking overhead for smaller sends), and on
-   `ENOBUFS` (kernel zero-copy completion queue full) or general zero-copy failure, retries once
-   with a plain blocking `send()` — this fallback logic is real and correct, it's just never
-   invoked by anything.
+Rudis's default networking path (Component 01) already uses Linux `io_uring` via `monoio` for
+asynchronous, batched I/O — a substantial improvement over classic blocking or `epoll`-based
+socket I/O. At sufficiently high packet rates, however, even `io_uring` still routes every
+packet through the kernel's general network stack: `sk_buff` allocation, netfilter hooks, and
+the TCP/IP stack's own processing overhead are paid per packet regardless of how efficiently
+userspace consumes the result. **AF_XDP** is Linux's mechanism for bypassing that stack
+entirely for a specific NIC queue: an eBPF program attached at the driver (or generic/`SKB`)
+layer redirects raw frames directly into a userspace-visible ring buffer (the UMEM), skipping
+`sk_buff` construction and the general stack for that traffic. **`MSG_ZEROCOPY`/registered
+buffers** address a related but distinct cost — avoiding a kernel-to-userspace memory copy on
+the *send* path by letting the kernel DMA directly from pinned/registered userspace buffers.
 
----
+### 2.2 The trade-off against the default `io_uring` path
 
-## 3. High-Level Architecture & Workflow Diagram
+Real AF_XDP kernel bypass is a substantially larger undertaking than the `io_uring` path Rudis
+already runs on, with real costs: it requires an eBPF program (typically via a crate such as
+`aya` or the `libbpf` C bindings), root or `CAP_NET_ADMIN`/`CAP_BPF` privileges, and depends on
+the NIC driver's own AF_XDP support (driver-mode bypass is not universally available; many
+deployments would fall back to slower `SKB`/generic mode, which re-enters much of the kernel
+stack it was meant to avoid). It also forgoes the kernel's own protocol handling — a raw AF_XDP
+consumer must parse Ethernet/IP/TCP framing itself and reimplement whatever the kernel would
+otherwise have done, which is real ongoing engineering surface, not a one-time cost.
+`io_uring`-based sockets, by contrast, still benefit from the kernel's TCP stack (congestion
+control, retransmission, connection state) while getting most of the syscall-batching and
+zero-copy-friendly buffer registration benefit `monoio` already exploits. The honest framing of
+this trade-off is: kernel bypass buys lower per-packet CPU cost at very high, sustained packet
+rates, at the price of reimplementing transport-layer concerns Rudis currently gets for free
+from the kernel, plus deployment requirements (root/capabilities, driver support) the default
+`io_uring` path does not have.
 
-```
-NIC Hardware ──► eBPF XDP Driver ──► AF_XDP UMEM Ring ──► Worker Thread
-       (Bypasses standard Linux kernel network stack & socket buffers)
-```
+### 2.3 Present state relative to that trade-off
 
----
+Because `src/xdp.rs` does not yet make the real AF_XDP syscalls or attach a real eBPF program,
+Rudis today has not actually made that trade — it has built and unit-tested the *userspace data
+structures and packet-classification logic* (CIDR allow/drop rules, per-source-IP token-bucket
+rate limiting, ring-buffer bookkeeping) that a real AF_XDP integration would eventually sit
+behind, exercised through an admin-command interface rather than live traffic. This should be
+read as a testable simulation and a foundation for a future integration, not as a currently
+available performance feature. Anyone evaluating Rudis for kernel-bypass networking should treat
+this subsystem as experimental/aspirational until it is wired to real `AF_XDP`/`XSK` sockets and
+a real network interface.
 
-## 4. Performance Guarantees & Theoretical Complexity
+## 3. What Is Real and Useful Today
 
-- **No measured network-layer performance benefit exists from either file.** `xdp.rs`'s cost is
-  whatever it costs to run `process_packet` once per `XDP.PACKET` command a client explicitly
-  sends — i.e., it's exercised at whatever rate a test or admin script chooses to call it, not
-  at line rate against real traffic. `zerocopy.rs` is entirely inert in the running server.
-- **The token-bucket rate limiter and CIDR rule table are real, correct, O(1)-per-packet
-  (rules are a linear scan, but the rule list is expected to be small) userspace logic** — useful
-  as a testable filter-policy engine, just not connected to anything that would make it a DDoS
-  defense in practice.
-- Any performance claims in the previous version of this document (100GbE line-rate, "28 million
-  packets/sec", "&lt;5% CPU utilization" for `MSG_ZEROCOPY`) were invented and have been removed;
-  none of it has ever been benchmarked because none of it runs on the real request path.
+Independent of the "kernel bypass" framing, the packet-classification logic itself is real,
+correct, and unit-tested userspace code:
 
----
+- A CIDR-based rule table (`XDP.RULE ADD/DEL/LIST`) supporting `DROP`/`PASS`/`REDIRECT`/`TX`
+  actions per source-IP prefix, evaluated as a linear scan (acceptable given rule tables are
+  expected to be small).
+- A per-source-IP token-bucket rate limiter, created lazily on first sight of an IP and never
+  evicted (see the internal doc for the resulting unbounded-growth characteristic).
+- Byte-accurate Ethernet/IPv4/TCP header parsing sufficient to extract a source IP and, for TCP,
+  a destination port, from either a raw Ethernet frame or a bare IPv4 packet.
 
-## 5. Implementation References & Contributor Guide
+These are genuinely useful as a standalone, testable packet-filtering/rate-limiting engine; they
+simply are not, today, interposed on real traffic.
 
-For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
-* [**`docs/internal/10_kernel_bypass_xdp.md`**](../internal/10_kernel_bypass_xdp.md): Low-level implementation and code reference.
-* **Source Files**: `src/xdp.rs, src/zerocopy.rs`
+## 4. No Performance Claims
+
+Because neither module is on the live network path, **no line-rate, packets-per-second, or CPU
+overhead numbers are claimed for this subsystem** — any such figures would necessarily be
+invented, since there is no real traffic flowing through it to measure. The only performance
+statement that can be made honestly is algorithmic: the CIDR rule scan and rate-limiter lookup
+are cheap, small-N operations, and the ring-buffer data structures are lock-free single-producer/
+single-consumer designs appropriate for a real AF_XDP integration if one is built — but their
+cost under real line-rate traffic has not been measured because they do not yet see any.
+
+## 5. Implementation Reference
+
+For concrete struct/field layouts, the packet-classification algorithm, the ring-buffer
+implementation, and exactly which code paths are and are not connected to anything, see
+[`docs/internal/10_kernel_bypass_xdp.md`](../internal/10_kernel_bypass_xdp.md).

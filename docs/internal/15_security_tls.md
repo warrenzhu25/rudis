@@ -16,10 +16,10 @@
 
 ---
 
-### 3. Component Architecture & Data Structures
+### 2. Component Architecture & Data Structures
 
 ```
-                 AUTH user pass  /  ACL SETUSER|GETUSER|LIST|USERS|DELUSER|WHOAMI
+                 AUTH user pass  /  ACL SETUSER|GETUSER|LIST|USERS|DELUSER|WHOAMI|CAT
                                      │
                      PORT_ACLS: Mutex<HashMap<port, Arc<RwLock<AclManager>>>>
                                      │
@@ -30,30 +30,31 @@
                                      │
                      sets `authenticated = true`, then on EVERY subsequent command:
                      user.can_execute_command(name) && user.can_access_key(key)?
-                     -NOPERM if either check fails (§2.2/§4.1) — real enforcement now
+                     -NOPERM if either check fails (§3.1)
 
 
-                 INFO command (memory section)                    (unchanged)
+                 INFO command (memory section)
                                      │
                      allocator::format_memory_info(used_mem, max_mem, ...)
                                      │
                      allocator::get_allocator_stats()  →  tikv_jemalloc_ctl::stats::*
 
 
-                 --tls-port listener (server.rs, new) ──► TlsSession::handshake_monoio
-                                                            (real rustls handshake)
-                                                                     │
-                                                            enable_ktls(TCP_ULP) "succeeds"
-                                                                     │
-                                                  is_ktls_active = true, NO key installed
-                                                                     │
-                                            ⚠️ read_plaintext/write_plaintext skip rustls
-                                               entirely and touch the raw socket — every
-                                               byte after the handshake is sent in the
-                                               clear (§2.4/§4.4)
+                 --tls-port listener (server.rs) ──► TlsSession::handshake_monoio
+                                                        (real rustls handshake, per shard)
+                                                                 │
+                                                        enable_ktls(TCP_ULP) attempted,
+                                                        result discarded
+                                                                 │
+                                                        is_ktls_active = false (always)
+                                                                 │
+                                            read_plaintext/write_plaintext always take the
+                                            real rustls encrypt/decrypt branch — the raw-
+                                            socket / kTLS branch exists but is unreachable
+                                            in the current build (§3.4)
 ```
 
-#### The real `AclUser` / `AclManager` (`src/acl.rs`, updated)
+#### The `AclUser` / `AclManager` structs (`src/acl.rs`)
 
 ```rust
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,9 +72,9 @@ pub struct AclUser {
 }
 ```
 
-`allowed_commands`/`disallowed_commands`/`allowed_key_patterns` now exist and are genuinely
-read by `can_execute_command`/`can_access_key` (§2.2/§4.1) — the old doc's "no such fields
-exist" finding no longer holds. `AclManager` is unchanged:
+`allowed_commands`/`disallowed_commands`/`allowed_key_patterns` are read directly by
+`can_execute_command`/`can_access_key` (§3.1) to enforce per-command and per-key-prefix
+restrictions. `AclManager` is a flat registry, one per listening port:
 
 ```rust
 pub struct AclManager {
@@ -81,7 +82,38 @@ pub struct AclManager {
 }
 ```
 
-#### The real allocator stats (`src/allocator.rs`)
+`AclManager::new()` seeds exactly one user, `"default"`, with `nopass: true`, `all_commands:
+true`, `all_keys: true` — an unauthenticated connection (or one that never issues `AUTH`)
+behaves as this fully-privileged default user unless a deployment explicitly restricts it via
+`ACL SETUSER default ...` (§3.2).
+
+**Verified gap: `requirepass` (config-file directive or `CONFIG SET requirepass`) does not by
+itself enforce authentication.** Per-connection gating is decided once, at connection accept
+time, by:
+
+```rust
+let mut authenticated = !crate::acl::HAS_CUSTOM_ACL.load(Ordering::Relaxed)
+    || !crate::acl::get_acl_for_port(router.port).read().unwrap().is_auth_required_for_default();
+```
+
+(`src/connection.rs`, both the plaintext and TLS connection entry points). `HAS_CUSTOM_ACL` is
+only ever set to `true` inside `AclManager::set_user`/`del_user` — i.e. only by a real `ACL
+SETUSER`/`ACL DELUSER` call. `CONFIG SET requirepass <pw>` (`src/connection.rs`) instead
+mutates the default user directly — `user.passwords.clear(); user.passwords.push(pw)` — without
+ever calling `set_user`, so it never sets `HAS_CUSTOM_ACL` and, just as importantly, never
+clears `user.nopass` (which stays `true`, its seeded default). `is_auth_required_for_default`
+is `!user.nopass && (!passwords.is_empty() || !password_hashes.is_empty())`, so with `nopass`
+still `true` it evaluates to `false` regardless of how many passwords are set. And the
+`requirepass` directive parsed from the config file at startup (`server_config.requirepass` in
+`src/config.rs`/`src/main.rs`) is not applied to the ACL system at all — `main.rs` never
+references `acl::` or `requirepass` when constructing the server. The net effect: setting
+`requirepass` via the config file, or via `CONFIG SET requirepass`, populates the default user's
+`passwords` list but leaves both `HAS_CUSTOM_ACL` and `nopass` in their permissive states, so
+new connections continue to start pre-authenticated. The only path that reliably enforces
+authentication today is an explicit `ACL SETUSER default ... >password` (or `off`), which goes
+through `set_user` and therefore both flips `nopass = false` and sets `HAS_CUSTOM_ACL = true`.
+
+#### Allocator statistics (`src/allocator.rs`)
 
 ```rust
 #[derive(Debug, Clone, Copy, Default)]

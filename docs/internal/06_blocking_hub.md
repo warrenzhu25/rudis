@@ -14,7 +14,7 @@
 
 ---
 
-### 3. Component Architecture & Data Structures
+### 2. Component Architecture & Data Structures
 
 ```
    BLPOP k1 k2 0 (both empty)                    LPUSH k1 "v"  (any shard)
@@ -77,7 +77,7 @@ pub struct BlockHub {
     stream_waiters: HashMap<Bytes, Vec<StreamWaiter>>,
     blocked_clients: HashMap<u64, Sender<BlockedListResult>>,      // for CLIENT UNBLOCK / CLIENT LIST's "b" flag
     blocked_zset_clients: HashMap<u64, Sender<BlockedZSetResult>>,
-    paused_count: usize,          // MULTI/EXEC deferral, see §4.4 — NOT CLIENT PAUSE
+    paused_count: usize,          // MULTI/EXEC deferral, see §3.4 — NOT CLIENT PAUSE
     pending_notifies: Vec<Bytes>,
 }
 ```
@@ -88,9 +88,9 @@ and channels are `flume::Sender`, not `oneshot::Sender`.
 
 ---
 
-### 4. Execution Algorithms & Code Logic
+### 3. Execution Algorithms & Code Logic
 
-#### 4.1 Registering a blocked client (`BLPOP`, in `src/connection.rs`)
+#### 3.1 Registering a blocked client (`BLPOP`, in `src/connection.rs`)
 
 ```rust
 let _guard = BlockedClientGuard { port: router.port, client_id };
@@ -113,7 +113,7 @@ One waiter is registered per key in the `BLPOP` argument list, all sharing the s
 every other key's queue. `BlockedClientGuard` is held across the whole `.await`, so if the
 future is ever dropped early (client disconnect, etc.) its `Drop` impl still unregisters.
 
-#### 4.2 `wait_for_blocked_result`: polling, not a pure channel await
+#### 3.2 `wait_for_blocked_result`: polling, not a pure channel await
 
 ```rust
 pub async fn wait_for_blocked_result<T>(
@@ -158,7 +158,7 @@ registered forever. Polling the raw fd every ≤20ms via `libc::poll` + a non-co
 `MSG_PEEK` recv is how Rudis detects that case without a dedicated epoll registration for
 blocked sockets.
 
-#### 4.3 Waking waiters: the pop happens *inside* `notify_list`/`notify_zset`, under the lock
+#### 3.3 Waking waiters: the pop happens *inside* `notify_list`/`notify_zset`, under the lock
 
 ```rust
 pub fn notify_list(&mut self, table: &mut crate::table::RudisTable, key: &Bytes) {
@@ -224,7 +224,7 @@ pub fn notify_stream(&mut self, key: &Bytes) {
 ```
 The blocked `XREAD` task is responsible for re-reading the stream itself once woken.
 
-#### 4.4 `pause()`/`resume()`: deferred notification across `MULTI`/`EXEC` — not `CLIENT PAUSE`
+#### 3.4 `pause()`/`resume()`: deferred notification across `MULTI`/`EXEC` — not `CLIENT PAUSE`
 
 ```rust
 // connection.rs, around EXEC:
@@ -268,7 +268,7 @@ ClientSubcommand::Pause(_) | ClientSubcommand::Unpause | ClientSubcommand::NoTou
 — an unconditional `+OK` with no effect. `CLIENT PAUSE` does not actually pause anything in
 Rudis today.
 
-#### 4.5 `CLIENT UNBLOCK` and the `CLIENT LIST`/`INFO` blocked flag
+#### 3.5 `CLIENT UNBLOCK` and the `CLIENT LIST`/`INFO` blocked flag
 
 ```rust
 let unblocked = hub.unblock_client(target_id, unblock_type);   // CLIENT UNBLOCK <id> [TIMEOUT|ERROR]
@@ -283,7 +283,7 @@ every key queue it was registered under.
 
 ---
 
-### 5. Cross-Component Interactions
+### 4. Cross-Component Interactions
 
 - **`src/server.rs`**: the cross-shard receiver's `ShardMessage::NotifyList { keys }` handler
   locks the port's hub once and, for every key in the batch, calls **both** `hub.notify_list`
@@ -302,21 +302,21 @@ every key queue it was registered under.
 
 ---
 
-### 7. Future Improvements
+### 5. Future Improvements
 
-- **Medium — replace `wait_for_blocked_result`'s active ≤20ms polling with real readiness notification (§4.2).** Polling `libc::poll`/`MSG_PEEK` every tick to detect a vanished client works but costs a syscall per blocked client per tick even when nothing has happened; since `monoio`'s `io_uring` driver already knows how to wait on fd readiness/hangup without polling, registering an explicit disconnect-watch operation on the ring (if `monoio` exposes one) would remove this cost and also lower worst-case disconnect-detection latency below the current 20ms cap.
-- **Medium — implement real `CLIENT PAUSE`/`CLIENT UNPAUSE` semantics (§4.4).** They're currently a no-op `+OK` stub, distinct from the real (but differently-purposed) `pause`/`resume` used internally for `MULTI`/`EXEC` deferral. Since that internal mechanism already exists and does almost the right thing (defer notifications, replay after), extending it to also gate new-command acceptance for `CLIENT PAUSE`'s actual contract (pause all commands, or just writes, for a duration) is a smaller lift than building the feature from scratch.
-- **Low — bound `pending_notifies`' growth during a very large `MULTI`/`EXEC`.** Every write inside a paused transaction appends to `pending_notifies` (§4.4) with no cap; a transaction touching an unusually large number of distinct keys could accumulate an unbounded `Vec` before `resume()` drains it. Unlikely to matter in practice (transaction size is bounded by client behavior), but worth a sanity cap if very large scripted transactions become common.
-- **Low — consider giving `notify_zset`'s duplicate-suppression check (§4.3) and `notify_list`'s equivalent logic a shared helper** rather than two structurally-identical-but-separately-implemented sweeps, purely to reduce the chance the two drift apart if one gets a bugfix the other doesn't.
+- **Medium — replace `wait_for_blocked_result`'s active ≤20ms polling with real readiness notification (§3.2).** Polling `libc::poll`/`MSG_PEEK` every tick to detect a vanished client works but costs a syscall per blocked client per tick even when nothing has happened; since `monoio`'s `io_uring` driver already knows how to wait on fd readiness/hangup without polling, registering an explicit disconnect-watch operation on the ring (if `monoio` exposes one) would remove this cost and also lower worst-case disconnect-detection latency below the current 20ms cap.
+- **Medium — implement real `CLIENT PAUSE`/`CLIENT UNPAUSE` semantics (§3.4).** They're currently a no-op `+OK` stub, distinct from the real (but differently-purposed) `pause`/`resume` used internally for `MULTI`/`EXEC` deferral. Since that internal mechanism already exists and does almost the right thing (defer notifications, replay after), extending it to also gate new-command acceptance for `CLIENT PAUSE`'s actual contract (pause all commands, or just writes, for a duration) is a smaller lift than building the feature from scratch.
+- **Low — bound `pending_notifies`' growth during a very large `MULTI`/`EXEC`.** Every write inside a paused transaction appends to `pending_notifies` (§3.4) with no cap; a transaction touching an unusually large number of distinct keys could accumulate an unbounded `Vec` before `resume()` drains it. Unlikely to matter in practice (transaction size is bounded by client behavior), but worth a sanity cap if very large scripted transactions become common.
+- **Low — consider giving `notify_zset`'s duplicate-suppression check (§3.3) and `notify_list`'s equivalent logic a shared helper** rather than two structurally-identical-but-separately-implemented sweeps, purely to reduce the chance the two drift apart if one gets a bugfix the other doesn't.
 
 ---
 ---
 
 ## Contributor Gotchas, Invariants & Debugging Guide
 
-* **Gotcha 1**: BlockHub is one of the few shared-mutex structures in Rudis, accessed only on blocking commands.
-* **Gotcha 2**: Client disconnects automatically cancel registered waiters to prevent leak.
-* **Gotcha 3**: Timeouts are managed via priority queues ordered by expiration instant.
+* **Gotcha 1**: `BlockHub` is one of the few shared-mutex structures in Rudis (Component 06 design doc §2.3); it is reached from any shard via `get_block_hub_for_port(port)`, and every critical section inside it is short and synchronous (never held across an `.await`).
+* **Gotcha 2**: Client disconnects do not automatically cancel registered waiters via any disconnect callback — they are caught in one of two ways: `BlockedClientGuard::drop` unregisters the waiter when the connection task's future is dropped, and, while the task is still parked in `wait_for_blocked_result`, `is_fd_closed` polls the raw fd (via `libc::poll`/`MSG_PEEK`) at most every 20ms to detect a peer that vanished without a clean FIN (§3.2).
+* **Gotcha 3**: There is no timeout priority queue. Each blocked task tracks its own deadline locally and `wait_for_blocked_result` re-checks it on every ≤20ms polling tick (§3.2) — timeouts are evaluated per-waiter on wakeup, not via a shared min-heap or scheduled timer structure.
 
 ### How to Verify Changes
 ```bash

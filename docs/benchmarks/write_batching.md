@@ -1,6 +1,19 @@
 # Benchmark: Write Batching & Pipelining Optimization
 
-This document records the benchmark results of `rudis` after implementing **response write-batching** and **zero-allocation response formatting** across 1, 2, 4, 8, 16, and 32 worker threads.
+This document records the throughput and latency of `rudis` after implementing **response write-batching**
+and **zero-allocation response formatting**, measured across 1, 2, 4, 8, 16, and 32 worker threads under the
+same workload and harness as [`baseline.md`](baseline.md). It is the second entry in the three-part
+optimization sequence: [`baseline.md`](baseline.md) (before) -> this document (write-batching) ->
+[`squashed_scaling.md`](squashed_scaling.md) (adds pipeline squashing on top of write-batching).
+
+**What changed**: before this optimization, every parsed pipelined command triggered its own
+`stream.write_all()` syscall/`io_uring` submission — with pipeline depth 100, that is up to 100 individual
+write completions per socket read batch (see `baseline.md` Analysis). Response write-batching coalesces all
+responses generated within one read cycle into a single `io_uring` write.
+
+**Why this benchmark matters**: it isolates the effect of one specific optimization (response coalescing)
+against an otherwise identical workload and harness, making the before/after comparison a controlled
+measurement rather than a description of aggregate improvement across many unrelated changes.
 
 ---
 
@@ -10,6 +23,9 @@ This document records the benchmark results of `rudis` after implementing **resp
 * **Client**: `memtier_benchmark` (32 client threads pinned to cores `32-63`, 1 connection per thread)
 * **Duration per test**: **60 seconds**
 * **Machine**: 64-core Linux system (`7.1.6-1rodete1-amd64`)
+* **Harness**: [`scripts/run_16t_benchmark.sh`](../../scripts/run_16t_benchmark.sh) for the 16-thread case;
+  the full 1-32 thread sweep follows the same `taskset`/`memtier_benchmark` invocation pattern as
+  [`scripts/benchmark_baseline.py`](../../scripts/benchmark_baseline.py) at `--test-time 60`.
 
 ---
 
@@ -51,4 +67,19 @@ This document records the benchmark results of `rudis` after implementing **resp
    - The next optimization phase will focus on:
      - Socket level tuning (`TCP_NODELAY`, `SO_RCVBUF`, `SO_SNDBUF`).
      - Zero-copy command parsing (`Bytes` slices).
+     - Cross-shard pipeline squashing — implemented and measured in
+       [`squashed_scaling.md`](squashed_scaling.md), which lifts 16-thread throughput a further 4.1x, from
+       705,995 to 2,904,558 ops/sec.
+
+---
+
+## Reproducing This Benchmark
+
+No script in `scripts/` is dedicated to this specific before/after write-batching comparison; the 1-32
+thread sweep in the tables above was produced with the same `taskset`/`memtier_benchmark` invocation pattern
+as [`scripts/benchmark_baseline.py`](../../scripts/benchmark_baseline.py), run at each thread count with
+`--test-time 60` against a build that includes response write-batching. See
+[`scripts/run_16t_benchmark.sh`](../../scripts/run_16t_benchmark.sh) for the equivalent single-thread-count
+(16T, 60s) invocation used in the later squashing comparison
+([`pipeline_squashing.md`](pipeline_squashing.md)).
      - Cross-shard request batching to eliminate per-command channel round-trips.

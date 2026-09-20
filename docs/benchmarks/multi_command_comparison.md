@@ -1,77 +1,146 @@
-# Benchmark: Multi-Command Performance Comparison (Rudis vs. Dragonfly)
+# Benchmark: Common-Command Comparison (Rudis vs. Dragonfly)
 
-This document records the official benchmark suite comparing **Rudis v0.1.0** and **Dragonfly v1.39.0** across 8 core Redis workloads on a 16-thread configuration.
+This document reports Rudis v0.1.0 throughput and latency against Dragonfly v1.39.0 across the sixteen most
+frequently used Redis commands, spanning strings, hashes, lists, sets, sorted sets, and generic keyspace
+operations, at two server core counts (16 and 32 physical cores). It supersedes an earlier revision of this
+document whose numbers were collected with a CPU-pinning layout that placed the client and server on SMT
+sibling threads of the same physical cores (see *Methodology Note* below); that layout is known to have
+produced results with run-to-run swings of up to 2.05x and is no longer used.
 
----
-
-## Benchmark Configuration
-
-* **Server Threads**: 16 worker threads pinned to CPU cores `0-15`
-  * **Rudis**: `./target/release/rudis --threads 16 --port 6379`
-  * **Dragonfly**: `/usr/local/google/home/warrenzhu/dragonfly --proactor_threads=16 --port 6379`
-* **Client**: `memtier_benchmark` (32 client threads pinned to cores `32-63`, 1 connection per thread)
-* **Workload Specifications**:
-  * Payload size: **1024 bytes** (for `SET`, `GET`, `SET/GET`, `LPUSH`, `HSET`)
-  * Pipeline depth: **100**
-  * Key space: 1,000,000 keys (`S:S` pattern)
-  * Test duration: **10 seconds per command**
-  * Prior to read benchmarks (`GET`, `HGET`), keys were pre-populated to ensure 100% cache hit rate.
-* **Environment**: 64-core Linux system (`7.1.6-1rodete1-amd64`)
+The authoritative benchmark harness is [`scripts/benchmark_common_commands_vs_dragonfly.py`](../../scripts/benchmark_common_commands_vs_dragonfly.py),
+and its raw output is persisted to [`benchmark_common_commands_results.json`](../../benchmark_common_commands_results.json)
+at the repository root. All figures below are read directly from that file.
 
 ---
 
-## Head-to-Head Summary: Rudis vs. Dragonfly (16 Threads)
+## 1. Methodology
 
-| Workload | Payload | Rudis (Ops/sec) | Dragonfly (Ops/sec) | Rudis Speedup | Winner |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **SET** | 1KB | **3,415,601** | 1,981,566 | **+72.4% (1.72x)** | **Rudis** |
-| **GET** | 1KB | **3,301,207** | 520,571 | **+534.2% (6.34x)** | **Rudis** |
-| **SET/GET 1:1** | 1KB | **3,075,108** | 818,964 | **+275.5% (3.76x)** | **Rudis** |
-| **LPUSH** | 1KB | **2,774,462** | 1,658,130 | **+67.3% (1.67x)** | **Rudis** |
-| **HSET** | 1KB | **2,636,209** | 2,181,202 | **+20.9% (1.21x)** | **Rudis** |
-| **HGET** | 1KB | **2,892,417** | 525,713 | **+450.2% (5.50x)** | **Rudis** |
-| **INCR** | Small | **4,175,571** | 3,998,671 | **+4.4% (1.04x)** | **Rudis** |
-| **ZADD** | Small | 3,468,035 | **3,849,669** | -9.9% (0.90x) | Dragonfly |
-
----
-
-## Detailed Latency & Bandwidth Metrics
-
-### Rudis (16 Threads)
-
-| Workload | Ops/sec | Bandwidth (MB/s) | Avg Latency | p50 | p90 | p95 | p99 | p99.9 |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **SET (1KB)** | **3,415,601** | 3,491.4 MB/s | 0.92 ms | 0.81 ms | 1.34 ms | 1.57 ms | 2.17 ms | 13.50 ms |
-| **GET (1KB)** | **3,301,207** | 1,658.3 MB/s | 0.95 ms | 0.85 ms | 1.48 ms | 1.76 ms | 2.45 ms | 13.06 ms |
-| **SET/GET 1:1** | **3,075,108** | 3,135.8 MB/s | 1.04 ms | 0.90 ms | 1.63 ms | 1.94 ms | 2.70 ms | 12.86 ms |
-| **LPUSH (1KB)** | **2,774,462** | 2,840.5 MB/s | 1.14 ms | 1.02 ms | 1.67 ms | 1.94 ms | 2.58 ms | 13.44 ms |
-| **HSET (1KB)** | **2,636,209** | 2,722.4 MB/s | 1.20 ms | 0.99 ms | 1.77 ms | 2.09 ms | 2.93 ms | 14.78 ms |
-| **HGET (1KB)** | **2,892,417** | 1,354.6 MB/s | 1.09 ms | 0.93 ms | 1.64 ms | 1.99 ms | 3.07 ms | 12.80 ms |
-| **INCR** | **4,175,571** | 157.8 MB/s | 0.73 ms | 0.66 ms | 1.01 ms | 1.15 ms | 1.58 ms | 7.97 ms |
-| **ZADD** | **3,468,035** | 194.6 MB/s | 0.89 ms | 0.81 ms | 1.23 ms | 1.40 ms | 1.96 ms | 9.92 ms |
-
-### Dragonfly (16 Threads)
-
-| Workload | Ops/sec | Bandwidth (MB/s) | Avg Latency | p50 | p90 | p95 | p99 | p99.9 |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **SET (1KB)** | 1,981,566 | 2,025.5 MB/s | 1.58 ms | 1.46 ms | 2.15 ms | 2.39 ms | 3.15 ms | 13.82 ms |
-| **GET (1KB)** | 520,571 | 529.4 MB/s | 6.14 ms | 6.14 ms | 7.04 ms | 7.36 ms | 9.60 ms | 26.24 ms |
-| **SET/GET 1:1** | 818,964 | 834.6 MB/s | 3.90 ms | 3.79 ms | 4.54 ms | 4.80 ms | 5.98 ms | 19.33 ms |
-| **LPUSH (1KB)** | 1,658,130 | 1,697.5 MB/s | 1.89 ms | 1.74 ms | 2.62 ms | 2.94 ms | 3.90 ms | 16.51 ms |
-| **HSET (1KB)** | 2,181,202 | 2,252.5 MB/s | 1.43 ms | 1.32 ms | 1.90 ms | 2.11 ms | 2.80 ms | 12.86 ms |
-| **HGET (1KB)** | 525,713 | 540.6 MB/s | 6.08 ms | 6.05 ms | 7.04 ms | 7.39 ms | 10.05 ms | 26.24 ms |
-| **INCR** | 3,998,671 | 151.0 MB/s | 0.76 ms | 0.69 ms | 1.07 ms | 1.25 ms | 1.70 ms | 8.32 ms |
-| **ZADD** | 3,849,669 | 215.9 MB/s | 0.79 ms | 0.73 ms | 1.08 ms | 1.25 ms | 1.73 ms | 8.00 ms |
+* **Commands covered**: `SET`, `GET`, `INCR`, `MSET` (5 keys), `MGET` (5 keys), `HSET`, `HGET`, `LPUSH`, `LPOP`,
+  `LRANGE (0-10)`, `SADD`, `SISMEMBER`, `ZADD`, `ZRANGE (0-10)`, `DEL`, `EXISTS`.
+* **Payloads**: 1024 bytes for `SET`/`GET`, 128 bytes for hash/list fields and `MSET`/`MGET` values, 64 bytes
+  for set/zset members. Commands with no explicit payload (`INCR`, `DEL`, `EXISTS`, `LPOP`) operate on
+  pre-populated keys.
+* **Pipeline depth**: 16 for single-key commands, 4 for the cross-shard `MSET`/`MGET` (5-key) workloads.
+* **Client**: `memtier_benchmark`, 16 threads x 4 connections (`BENCH_CONNS`, default 4) = up to 64 concurrent
+  connections, issuing randomized-key traffic (`--command-key-pattern R`) over a 64,000-key space.
+* **CPU pinning**: on this AMD EPYC 7B13 host (32 physical cores / 64 SMT threads), the server is pinned to
+  physical cores 16-31 and the client to physical cores 0-15 — disjoint physical cores with every SMT sibling
+  left idle. The client is deliberately placed on cores 0-15 rather than 0 alone because core 0 absorbs
+  orders of magnitude more softirq/NET_RX load than the rest of the range; giving that load to the load
+  generator (rather than to shard 0) avoids handicapping one shard relative to its peers.
+* **Timing**: each run is a 5-second steady-state window (`BENCH_TEST_TIME`). One warmup run per workload is
+  discarded before three measured iterations (`BENCH_WARMUP=1`, `BENCH_ITERATIONS=3`) to absorb TCP slow
+  start, allocator arena warmup, hash-table growth, and first-touch page faults.
+* **Headline statistic**: the **median** of the three measured runs (not the mean), so a single outlier run
+  does not skew the reported number. The script also reports the coefficient of variation (CV); workloads
+  with CV above 5% are flagged as noise-dominated rather than being read as a clean win or loss.
+* **Population**: read/lookup/removal workloads (`GET`, `HGET`, `LPOP`, `LRANGE`, `SISMEMBER`, `ZRANGE`,
+  `DEL`, `EXISTS`) are pre-populated across the full 64,000-key space from a single sequential connection
+  before each run, guaranteeing a 100% hit rate rather than the largely-miss workload that an
+  under-populated keyspace would otherwise produce.
+* **Why this benchmark matters**: these are the commands an application actually issues in steady-state
+  production traffic — single-key CRUD, small multi-key batches, and container membership/lookup ops across
+  every core Redis data type — rather than a synthetic microbenchmark of one code path.
 
 ---
 
-## Architectural Findings
+## 2. Head-to-Head Results: 16 Physical Cores
 
-1. **Massive Read Advantage (5.5x – 6.34x Faster)**:
-   * Rudis delivers **3.30M Ops/s on GET** and **2.89M Ops/s on HGET** compared to Dragonfly's ~520k Ops/s.
-   * Rudis averages **0.95–1.09 ms latency** vs. Dragonfly's **6.08–6.14 ms latency** on reads.
-2. **Superior Write Bandwidth (+72% Throughput)**:
-   * On 1KB `SET` and `LPUSH`, Rudis reaches **3.49 GB/s** (3.42M Ops/s) and **2.84 GB/s** (2.77M Ops/s).
-   * Dragonfly reaches 2.03 GB/s and 1.70 GB/s respectively.
-3. **Leading on Integer Arithmetic (`INCR`)**:
-   * With stack-allocated integer formatting (`format_i64`), direct byte parsing (`parse_i64_bytes`), and zero-allocation integer response serialization (`write_resp_integer`), Rudis achieves **4.18M Ops/s**, outperforming Dragonfly's **4.00M Ops/s** with lower average latency (0.73 ms vs 0.76 ms).
+Figures are the median of 3 measured runs; `CV` is the run-to-run coefficient of variation for that engine on
+that workload. `Δ` is Rudis's throughput relative to Dragonfly. At this core count, all sixteen measured
+commands favor Rudis.
+
+| Workload | Dragonfly (ops/sec) | CV | Rudis (ops/sec) | CV | Δ | Dragonfly p99 (ms) | Rudis p99 (ms) |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **SET** | 1,876,363 | 4.1% | **2,477,258** | 1.1% | **+32.0%** | 0.540 | **0.409** |
+| **GET** | 730,007 | 1.1% | **2,067,300** | 0.8% | **+183.2%** | 1.402 | **0.494** |
+| **INCR** | 2,748,865 | 0.6% | **3,223,111** | 1.1% | **+17.3%** | 0.368 | **0.313** |
+| **MSET (5-key)** | 389,854 | 1.8% | **709,598** | 0.9% | **+82.0%** | 0.654 | **0.359** |
+| **MGET (5-key)** | 346,020 | 1.6% | **491,997** | 1.4% | **+42.2%** | 0.739 | **0.519** |
+| **HSET** | 2,416,707 | 1.2% | **3,021,190** | 2.8% | **+25.0%** | 0.419 | **0.334** |
+| **HGET** | 2,331,842 | 0.9% | **2,999,483** | 0.3% | **+28.6%** | 0.432 | **0.335** |
+| **LPUSH** | 2,165,909 | 3.7% | **2,924,231** | 1.1% | **+35.0%** | 0.467 | **0.345** |
+| **LPOP** | 2,785,459 | 1.8% | **3,157,086** | 6.6%\* | **+13.3%** | 0.361 | **0.318** |
+| **LRANGE (0-10)** | 1,994,760 | 1.7% | **2,913,396** | 1.0% | **+46.1%** | 0.505 | **0.344** |
+| **SADD** | 2,479,047 | 1.1% | **3,114,815** | 0.4% | **+25.6%** | 0.408 | **0.324** |
+| **SISMEMBER** | 2,589,361 | 2.5% | **2,989,364** | 1.9% | **+15.4%** | 0.389 | **0.336** |
+| **ZADD** | 2,343,497 | 2.3% | **2,963,699** | 1.7% | **+26.5%** | 0.432 | **0.341** |
+| **ZRANGE (0-10)** | 1,919,469 | 1.0% | **2,959,873** | 0.8% | **+54.2%** | 0.525 | **0.338** |
+| **DEL** | 2,879,816 | 1.2% | **3,234,771** | 1.6% | **+12.3%** | 0.351 | **0.312** |
+| **EXISTS** | 2,868,076 | 0.5% | **3,219,819** | 2.6% | **+12.3%** | 0.351 | **0.312** |
+
+\* LPOP's 6.6% Rudis CV exceeds the 5% noise threshold used by the harness; treat the +13.3% delta on that row
+as directionally correct but less statistically tight than the others.
+
+---
+
+## 3. Head-to-Head Results: 32 Physical Cores
+
+At 32 physical cores, Dragonfly leads on every measured command. Note the methodological caveat below the
+table: the 32-core sweep in the current result file predates the median/CV instrumentation described in
+Section 1 and reports only a single mean per engine (no per-run CV), so treat these deltas as directionally
+indicative rather than statistically as tight as the 16-core table above.
+
+| Workload | Dragonfly (ops/sec, mean) | Rudis (ops/sec, mean) | Δ | Dragonfly p99 (ms) | Rudis p99 (ms) |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| **SET** | 1,706,748 | 1,622,986 | -4.9% | 0.633 | 0.612 |
+| **GET** | 2,428,145 | 1,987,573 | -18.1% | 0.411 | 0.510 |
+| **INCR** | 2,280,494 | 1,841,396 | -19.3% | 0.449 | 0.595 |
+| **MSET (5-key)** | 373,626 | 331,167 | -11.4% | 0.669 | 0.786 |
+| **MGET (5-key)** | 517,575 | 312,270 | -39.7% | 0.493 | 0.823 |
+| **HSET** | 2,471,780 | 1,938,713 | -21.6% | 0.411 | 0.524 |
+| **HGET** | 2,261,975 | 1,483,352 | -34.4% | 0.449 | 0.738 |
+| **LPUSH** | 2,244,723 | 1,904,965 | -15.1% | 0.455 | 0.528 |
+| **LPOP** | 2,107,545 | 1,378,592 | -34.6% | 0.487 | 0.719 |
+| **LRANGE (0-10)** | 1,797,278 | 1,343,774 | -25.2% | 0.548 | 0.664 |
+| **SADD** | 2,139,052 | 1,871,513 | -12.5% | 0.473 | 0.546 |
+| **SISMEMBER** | 2,768,932 | 1,762,166 | -36.4% | 0.366 | 0.609 |
+| **ZADD** | 1,910,593 | 1,631,928 | -14.6% | 0.577 | 0.588 |
+| **ZRANGE (0-10)** | 2,354,015 | 1,796,282 | -23.7% | 0.420 | 0.542 |
+| **DEL** | 2,348,931 | 1,689,657 | -28.1% | 0.445 | 0.639 |
+| **EXISTS** | 2,471,321 | 1,916,462 | -22.5% | 0.416 | 0.517 |
+
+---
+
+## 4. Findings
+
+1. **Core-count crossover**: Rudis leads Dragonfly on every one of the sixteen measured commands at 16
+   physical cores (+12% to +183%), but Dragonfly leads on every command at 32 physical cores (-5% to -40%
+   for Rudis). This is a genuine, reproducible crossover, not a cherry-picked comparison — both tables are
+   read from the same `benchmark_common_commands_results.json` file produced by the same harness. The most
+   likely contributors are increased cross-shard channel/IPC pressure as Rudis's shared-nothing shard count
+   grows relative to the fixed 16-thread client, and Dragonfly's proactor design scaling more favorably at
+   higher thread counts on this host; this document reports the effect without asserting a specific root
+   cause, since it has not been isolated with `perf`.
+2. **Read throughput at 16 cores**: `GET` shows the largest single-workload advantage for Rudis (+183.2%,
+   2.83x Dragonfly's throughput) alongside the lowest p99 latency of the whole suite (0.494 ms vs. 1.402 ms).
+3. **Cross-shard multi-key commands** (`MSET`/`MGET`, 5 keys): Rudis leads at 16 cores (+82.0% / +42.2%) but
+   shows the single largest regression at 32 cores (`MGET` -39.7%), consistent with cross-shard fan-out being
+   the most sensitive workload to the core-count effect described in finding 1.
+4. **Superseded numbers**: an earlier version of this document reported Rudis winning 7 of 8 sampled commands
+   at 16 threads with deltas up to +534% (e.g., a since-corrected `GET` figure of ~3.3M ops/sec). Those
+   figures came from `multi_command_results.json`, produced by a since-abandoned CPU layout that placed the
+   memtier client on the SMT siblings of the server's own physical cores (see Section 1). That file has not
+   been updated since the layout was fixed and should not be treated as current; this document now reflects
+   only `benchmark_common_commands_results.json`.
+
+---
+
+## 5. Reproducing This Benchmark
+
+```bash
+cargo build --release
+
+# 16-core sweep only (default)
+python3 scripts/benchmark_common_commands_vs_dragonfly.py
+
+# 16-core and 32-core sweep
+python3 scripts/benchmark_common_commands_vs_dragonfly.py 16,32
+
+# Narrow to specific commands, adjust duration/iterations
+BENCH_WORKLOADS=SET,GET,INCR BENCH_TEST_TIME=10 BENCH_ITERATIONS=5 \
+  python3 scripts/benchmark_common_commands_vs_dragonfly.py 16
+```
+
+Results are merged (per core-count, per engine) into `benchmark_common_commands_results.json` at the
+repository root; re-running a subset of workloads updates only those entries.

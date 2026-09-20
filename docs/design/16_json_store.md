@@ -56,6 +56,31 @@ External JSON modules in Redis require dynamic C loading. Rudis natively support
 Client ──► JSON.NUMINCRBY user:1 $.stats.views 1 ──► In-Place Mutation in ShardDb
 ```
 
+### 3.1 Supported Commands
+
+`JsonStore` is a separate per-shard map (`ShardDb.json_store`) alongside `RudisTable` — JSON
+documents are not a `RudisValue` variant and do not share key space validation with the primary
+string/hash/list/set/zset types beyond using the same `Bytes` key type.
+
+| Command | Path Argument | Notes |
+| :--- | :--- | :--- |
+| `JSON.SET key path value [NX\|XX]` | Required | Auto-vivifies intermediate objects/arrays; `NX`/`XX` are checked against target-path existence up front. |
+| `JSON.GET key [path...]` | Optional, multiple | No path returns `$`; one path returns the raw match(es); multiple paths return a JSON object mapping each path string to its matches. |
+| `JSON.DEL key [path]` / `JSON.FORGET` | Optional | No path (or `$`) deletes the whole key; a path deletes matching node(s), or clears a wildcard-matched container. |
+| `JSON.TYPE key [path]` | Optional | Returns `null`/`boolean`/`number`/`string`/`array`/`object` for the first match. |
+| `JSON.NUMINCRBY key path delta` | Required | Adds `delta` to every numeric match; returns a single value or a bracketed list for multiple matches. |
+| `JSON.NUMMULTBY key path factor` | Required | Composed from two `JSON.NUMINCRBY`-equivalent calls (see internal doc §4.5); does not support multi-match wildcard paths (returns an error instead of multiplying each match). |
+| `JSON.STRAPPEND key [path] value` | Optional | Appends to every string match; errors if any match isn't a string. |
+| `JSON.STRLEN key [path]` | Optional | Length of the first string match. |
+| `JSON.ARRAPPEND key path value...` | Required | Appends one or more parsed JSON values to every array match. |
+| `JSON.ARRLEN key [path]` | Optional | Length of the first array match. |
+| `JSON.ARRPOP key [path] [index]` | Optional | Removes and returns one element (default: last) from the first array match. |
+| `JSON.OBJKEYS key [path]` | Optional | Keys of the first object match. |
+| `JSON.OBJLEN key [path]` | Optional | Field count of the first object match. |
+| `JSON.TOGGLE key path` | Required | Flips every boolean match. |
+| `JSON.CLEAR key [path]` | Optional | Empties array/object matches, or zeroes non-zero numeric matches. |
+| `JSON.MGET key... path` | Required | One shared path across multiple keys; dispatched **sequentially**, one shard round-trip per key (§4.6/Future Improvements — not yet bucketed like `MGET`/`MSET`). |
+
 ---
 
 ## 4. Performance Guarantees & Theoretical Complexity
@@ -67,8 +92,8 @@ Client ──► JSON.NUMINCRBY user:1 $.stats.views 1 ──► In-Place Mutati
 - **Path traversal is O(document breadth) per segment, not indexed** — `Field` lookups on an
   `Object` are O(1) (backed by `serde_json`'s own map), but `Wildcard`/`Slice` segments
   necessarily visit every child at that level; there's no precomputed path index.
-- **`JSON.MGET`'s sequential fan-out (§4.5) is the single biggest addressable cost** on
-  multi-key JSON reads spread across shards — see Future Improvements.
+- **`JSON.MGET`'s sequential fan-out (internal doc §4.6) is the single biggest addressable cost**
+  on multi-key JSON reads spread across shards — see Future Improvements.
 
 ---
 

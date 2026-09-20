@@ -1,12 +1,22 @@
 # Baseline Benchmark: 1 to 32 Threads
 
-This document records the pre-optimization baseline benchmark results for `rudis` across 1, 2, 4, 8, 16, and 32 worker threads.
+This document records the pre-optimization baseline throughput and latency of `rudis` across 1, 2, 4, 8, 16,
+and 32 worker threads, before response write-batching or pipeline squashing existed. It is the first entry in
+a three-part optimization sequence together with [`write_batching.md`](write_batching.md) (adds response
+write-batching) and [`squashed_scaling.md`](squashed_scaling.md) (adds cross-shard pipeline squashing);
+reading the three in order documents the throughput progression achieved by each optimization.
+
+**Why this benchmark matters**: 100% `SET` at pipeline depth 100 with a 1 KB payload is a synthetic
+worst-case pipelining stress test — it isolates how efficiently the server can drain a deeply pipelined
+socket read into individual response writes, which is exactly the code path that response write-batching and
+pipeline squashing (documented in the two follow-on reports) were built to fix.
 
 ---
 
 ## Benchmark Configuration
 
-* **Server**: `rudis v0.1.0` (Multi-threaded Shared-Nothing via Monoio `io_uring`)
+* **Server**: `rudis v0.1.0` (multi-threaded shared-nothing via Monoio `io_uring`), unbatched response writes
+  (one `stream.write_all()` per parsed command)
 * **Client**: `memtier_benchmark` (32 client threads pinned to cores `32-63`, 1 connection per thread)
 * **Workload**:
   * Command: 100% `SET`
@@ -15,6 +25,11 @@ This document records the pre-optimization baseline benchmark results for `rudis
   * Key count: 1,000,000 (`S:S` pattern)
   * Duration per test: **60 seconds**
 * **Machine**: 64-core Linux system (`7.1.6-1rodete1-amd64`)
+* **Script**: [`scripts/benchmark_baseline.py`](../../scripts/benchmark_baseline.py) — starts `rudis` pinned
+  to cores `0..(N-1)` for each thread count in turn, runs `memtier_benchmark` for 10 seconds per thread count
+  (note: this is a shorter smoke-test duration than the 60-second run captured in the table below, which was
+  invoked with the equivalent manual `memtier_benchmark` flags at `--test-time 60`), and prints a summary
+  table.
 
 ---
 
@@ -41,3 +56,18 @@ This document records the pre-optimization baseline benchmark results for `rudis
    * This generates 100 individual `io_uring` write completion cycles per incoming socket read batch, creating a write-serialization bottleneck.
 3. **Target Optimization**:
    * Implement **response write-batching** in `src/connection.rs` so all parsed pipelined commands within a read cycle are coalesced into a single `io_uring` write.
+   * Result: see [`write_batching.md`](write_batching.md), which shows this fix alone lifting single-thread
+     throughput from 60,487 to 816,937 ops/sec (13.5x) and reducing p99 latency from 80.90 ms to 7.30 ms.
+
+---
+
+## Reproducing This Benchmark
+
+```bash
+cargo build --release
+python3 scripts/benchmark_baseline.py
+```
+
+The script iterates over `[1, 2, 4, 8, 16, 32]` server threads automatically; note the duration discrepancy
+called out in the Benchmark Configuration section above if reproducing the exact 60-second figures in this
+table.

@@ -54,13 +54,20 @@ Tracking unique users or heavy hitters over billions of events in exact hash set
    There is no `BF.INSERT ... EXPANSION` auto-scaling behavior — once a filter created with a
    given capacity is over-inserted, its false-positive rate silently degrades rather than the
    structure growing.
+6. **All four structures survive a restart.** `ShardDb::save_extended_rdb_chunk` serializes
+   every `Bloom`/`Cuckoo`/`CMS`/`TopK` entry in `ProbabilisticStore` into the RDB chunk stream
+   alongside ordinary keys (internal document §4), and the matching load path reconstructs each
+   structure verbatim (bit array, bucket table, sketch table, or item map) on startup — a
+   Bloom/Cuckoo/CMS/Top-K key behaves like any other durable key with respect to `SAVE`/RDB
+   load, not like an ephemeral, restart-losing cache.
 
 ---
 
 ## 3. High-Level Architecture & Workflow Diagram
 
 ```
-Item ──► MurmurHash3 Hash Seeds ──► Bitmask Indexing (Bloom / Cuckoo / CMS / Top-K)
+Item ──► Seeded 64-bit FNV-1a (h1, h2) ──► Kirsch-Mitzenmacher derived indices
+                                             (h1 + i·h2 mod m) ──► Bloom / Cuckoo / CMS / Top-K
 ```
 
 ---
