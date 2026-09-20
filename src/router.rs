@@ -196,6 +196,13 @@ impl Router {
         }
     }
 
+    #[inline(always)]
+    pub fn target_shard_and_hash(&self, key: &[u8]) -> (usize, u64) {
+        let key_hash = crate::table::hash_key(key);
+        let target = self.target_shard(key);
+        (target, key_hash)
+    }
+
     pub fn check_slot_redirection(
         &self,
         slot: u16,
@@ -475,7 +482,7 @@ impl Router {
     }
 
     pub async fn cool_key(&self, key: &[u8]) -> bool {
-        let target = target_shard(key, self.num_shards);
+        let target = self.target_shard(key);
         if target == self.shard_id {
             self.cool_local(key).await
         } else {
@@ -494,7 +501,7 @@ impl Router {
 
     pub async fn decommit(&self, key: Option<&[u8]>) -> usize {
         if let Some(k) = key {
-            let target = target_shard(k, self.num_shards);
+            let target = self.target_shard(k);
             if target == self.shard_id {
                 self.decommit_local(Some(k))
             } else {
@@ -605,7 +612,7 @@ impl Router {
     }
 
     pub async fn spill_key(&self, key: &[u8]) -> bool {
-        let target = target_shard(key, self.num_shards);
+        let target = self.target_shard(key);
         if target == self.shard_id {
             self.spill_local(key).await
         } else {
@@ -627,7 +634,7 @@ impl Router {
             return false;
         }
 
-        let target = target_shard(key, self.num_shards);
+        let target = self.target_shard(key);
         if target == self.shard_id {
             self.load_local(key).await
         } else {
@@ -752,7 +759,7 @@ impl Router {
     }
 
     pub async fn get(&self, key: Bytes) -> Option<Bytes> {
-        let target = target_shard(&key, self.num_shards);
+        let target = self.target_shard(&key);
         if target == self.shard_id {
             self.get_local_direct(&key).await
         } else {
@@ -788,7 +795,7 @@ impl Router {
         key: Bytes,
     ) -> Option<(crate::table::RudisValue, Option<Duration>)> {
         self.ensure_loaded(&key).await;
-        let target = target_shard(&key, self.num_shards);
+        let target = self.target_shard(&key);
         if target == self.shard_id {
             self.local_db.borrow_mut().get_entry(&key)
         } else {
@@ -803,7 +810,7 @@ impl Router {
     }
 
     pub async fn set(&self, key: Bytes, value: Bytes, expire_in: Option<Duration>) {
-        let target = target_shard(&key, self.num_shards);
+        let target = self.target_shard(&key);
         if target == self.shard_id {
             if let Some(aof) = &self.aof
                 && let Some(bytes) = crate::aof::command_to_resp(&Command::Set {
@@ -1155,7 +1162,7 @@ impl Router {
         let mut num_remote_shards = 0;
 
         for (idx, key) in keys.into_iter().enumerate() {
-            let (target, key_hash) = target_shard_and_hash(key.as_ref(), self.num_shards);
+            let (target, key_hash) = self.target_shard_and_hash(key.as_ref());
             if target == self.shard_id {
                 local_keys.push((idx, key, key_hash));
             } else {
@@ -1646,7 +1653,7 @@ impl Router {
     }
 
     pub async fn exists(&self, key: Bytes) -> bool {
-        let (target, hash) = target_shard_and_hash(&key, self.num_shards);
+        let (target, hash) = self.target_shard_and_hash(&key);
         if target == self.shard_id {
             self.local_db.borrow_mut().exists_with_hash(&key, hash)
         } else {
@@ -1661,7 +1668,7 @@ impl Router {
     }
 
     pub async fn incr_by(&self, key: Bytes, delta: i64) -> Result<i64, String> {
-        let target = target_shard(&key, self.num_shards);
+        let target = self.target_shard(&key);
         if target == self.shard_id {
             let res = self.local_db.borrow_mut().incr_by(key.clone(), delta);
             if res.is_ok()
@@ -1689,7 +1696,7 @@ impl Router {
     }
 
     pub async fn expire(&self, key: Bytes, duration: Duration) -> bool {
-        let target = target_shard(&key, self.num_shards);
+        let target = self.target_shard(&key);
         if target == self.shard_id {
             let res = self.local_db.borrow_mut().expire(&key, duration);
             if res
@@ -1715,7 +1722,7 @@ impl Router {
     }
 
     pub async fn persist(&self, key: Bytes) -> bool {
-        let target = target_shard(&key, self.num_shards);
+        let target = self.target_shard(&key);
         if target == self.shard_id {
             let res = self.local_db.borrow_mut().persist(&key);
             if res
@@ -1770,7 +1777,7 @@ impl Router {
     }
 
     pub async fn ttl(&self, key: Bytes, in_millis: bool) -> i64 {
-        let target = target_shard(&key, self.num_shards);
+        let target = self.target_shard(&key);
         if target == self.shard_id {
             self.local_db.borrow_mut().ttl(&key, in_millis)
         } else {
@@ -1790,7 +1797,7 @@ impl Router {
 
     pub async fn count_keys_in_slot(&self, slot: u16) -> usize {
         if self.cluster_enabled || crate::cluster::HAS_ACTIVE_CLUSTER.load(Ordering::Relaxed) {
-            let target = slot_to_shard(slot, self.num_shards);
+            let target = self.target_shard_for_slot(slot);
             if target == self.shard_id {
                 self.local_db.borrow_mut().count_keys_in_slot(slot)
             } else {
@@ -1826,7 +1833,7 @@ impl Router {
 
     pub async fn get_keys_in_slot(&self, slot: u16, count: usize) -> Vec<Bytes> {
         if self.cluster_enabled || crate::cluster::HAS_ACTIVE_CLUSTER.load(Ordering::Relaxed) {
-            let target = slot_to_shard(slot, self.num_shards);
+            let target = self.target_shard_for_slot(slot);
             if target == self.shard_id {
                 self.local_db.borrow_mut().get_keys_in_slot(slot, count)
             } else {
@@ -1889,7 +1896,7 @@ impl Router {
     pub async fn stick(&self, keys: &[Bytes]) -> usize {
         let mut count = 0;
         for key in keys {
-            let target = target_shard(key, self.num_shards);
+            let target = self.target_shard(key);
             if target == self.shard_id {
                 if self.local_db.borrow_mut().stick(key.clone()) {
                     count += 1;
@@ -1911,7 +1918,7 @@ impl Router {
     pub async fn unstick(&self, keys: &[Bytes]) -> usize {
         let mut count = 0;
         for key in keys {
-            let target = target_shard(key, self.num_shards);
+            let target = self.target_shard(key);
             if target == self.shard_id {
                 if self.local_db.borrow_mut().unstick(key) {
                     count += 1;
@@ -1931,7 +1938,7 @@ impl Router {
     }
 
     pub async fn is_sticky(&self, key: &Bytes) -> bool {
-        let target = target_shard(key, self.num_shards);
+        let target = self.target_shard(key);
         if target == self.shard_id {
             self.local_db.borrow().is_sticky(key)
         } else {
@@ -1949,7 +1956,7 @@ impl Router {
     }
 
     pub async fn delex(&self, key: Bytes, condition: Option<(String, Bytes)>) -> bool {
-        let target = target_shard(&key, self.num_shards);
+        let target = self.target_shard(&key);
         if target == self.shard_id {
             let mut db = self.local_db.borrow_mut();
             let should_del = match condition {
@@ -2146,10 +2153,9 @@ impl Router {
 
     pub async fn publish(&self, channel: Bytes, message: Bytes) -> usize {
         let mut total = self.pubsub.borrow().publish(&channel, &message);
-        let mask = self.presence_table.interested_shards(&channel);
         let mut pending = Vec::new();
         for (sid, sender) in self.senders.iter().enumerate() {
-            if sid != self.shard_id && (mask & (1u64 << sid)) != 0 {
+            if sid != self.shard_id && self.presence_table.is_shard_interested(sid, &channel) {
                 let (tx, rx) = self.acquire_pubsub_responder();
                 let msg = ShardMessage::Publish {
                     channel: channel.clone(),
@@ -4193,5 +4199,45 @@ mod tests {
                 .expect("cross-shard mset must yield an in-flight handle");
             assert_eq!(inflight.descriptor.pending.load(Ordering::Acquire), 1);
         });
+    }
+
+    #[test]
+    fn test_dynamic_slot_routing_and_presence_table_multi_word() {
+        let num_shards = 4;
+        let (mut senders_mesh, _receivers) = crate::mailbox::create_shard_mesh(num_shards);
+        let senders = senders_mesh.remove(0);
+        let db0 = Rc::new(RefCell::new(crate::shard::ShardDb::new(9995)));
+        let mut router = Router::new(
+            0,
+            num_shards,
+            9995,
+            db0,
+            senders,
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+        router.cluster_enabled = true;
+
+        let key = b"my_cluster_key";
+        let slot = key_slot(key);
+        let default_target = router.target_shard(key);
+        assert_eq!(default_target, router.target_shard_for_slot(slot));
+
+        // Reassign slot owner dynamically (as in cluster migration)
+        let new_owner = (default_target + 1) % num_shards;
+        router.set_slot_owner(slot, new_owner);
+        assert_eq!(router.target_shard(key), new_owner);
+        assert_eq!(router.target_shard_for_slot(slot), new_owner);
+        let (dyn_target, _) = router.target_shard_and_hash(key);
+        assert_eq!(dyn_target, new_owner);
+
+        // Multi-word presence table (>64 shards)
+        let presence = crate::pubsub::ShardedPresenceTable::new();
+        presence.add_subscriber(100, b"news");
+        assert!(presence.is_shard_interested(100, b"news"));
+        assert!(!presence.is_shard_interested(101, b"news"));
+        presence.remove_subscriber(100, b"news");
+        assert!(!presence.is_shard_interested(100, b"news"));
     }
 }

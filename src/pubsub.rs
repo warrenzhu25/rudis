@@ -81,10 +81,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 
 pub const PUBSUB_STRIPES: usize = 16;
+pub const PUBSUB_WORDS_PER_STRIPE: usize = 4; // Scales cleanly up to 256 shards
 
 pub struct ShardedPresenceTable {
-    pub channel_stripes: [AtomicU64; PUBSUB_STRIPES],
-    pub pattern_presence: AtomicU64,
+    pub channel_stripes: [[AtomicU64; PUBSUB_WORDS_PER_STRIPE]; PUBSUB_STRIPES],
+    pub pattern_presence: [AtomicU64; PUBSUB_WORDS_PER_STRIPE],
 }
 
 impl Default for ShardedPresenceTable {
@@ -96,8 +97,9 @@ impl Default for ShardedPresenceTable {
 impl ShardedPresenceTable {
     pub const fn new() -> Self {
         Self {
-            channel_stripes: [const { AtomicU64::new(0) }; PUBSUB_STRIPES],
-            pattern_presence: AtomicU64::new(0),
+            channel_stripes: [const { [const { AtomicU64::new(0) }; PUBSUB_WORDS_PER_STRIPE] };
+                PUBSUB_STRIPES],
+            pattern_presence: [const { AtomicU64::new(0) }; PUBSUB_WORDS_PER_STRIPE],
         }
     }
 
@@ -108,33 +110,61 @@ impl ShardedPresenceTable {
 
     #[inline(always)]
     pub fn add_subscriber(&self, shard_id: usize, channel: &[u8]) {
-        let stripe = Self::stripe_for(channel);
-        self.channel_stripes[stripe].fetch_or(1u64 << shard_id, Ordering::Relaxed);
+        let word = shard_id / 64;
+        let bit = shard_id % 64;
+        if word < PUBSUB_WORDS_PER_STRIPE {
+            let stripe = Self::stripe_for(channel);
+            self.channel_stripes[stripe][word].fetch_or(1u64 << bit, Ordering::Relaxed);
+        }
     }
 
     #[inline(always)]
     pub fn remove_subscriber(&self, shard_id: usize, channel: &[u8]) {
-        let stripe = Self::stripe_for(channel);
-        self.channel_stripes[stripe].fetch_and(!(1u64 << shard_id), Ordering::Relaxed);
+        let word = shard_id / 64;
+        let bit = shard_id % 64;
+        if word < PUBSUB_WORDS_PER_STRIPE {
+            let stripe = Self::stripe_for(channel);
+            self.channel_stripes[stripe][word].fetch_and(!(1u64 << bit), Ordering::Relaxed);
+        }
     }
 
     #[inline(always)]
     pub fn add_pattern_subscriber(&self, shard_id: usize) {
-        self.pattern_presence
-            .fetch_or(1u64 << shard_id, Ordering::Relaxed);
+        let word = shard_id / 64;
+        let bit = shard_id % 64;
+        if word < PUBSUB_WORDS_PER_STRIPE {
+            self.pattern_presence[word].fetch_or(1u64 << bit, Ordering::Relaxed);
+        }
     }
 
     #[inline(always)]
     pub fn remove_pattern_subscriber(&self, shard_id: usize) {
-        self.pattern_presence
-            .fetch_and(!(1u64 << shard_id), Ordering::Relaxed);
+        let word = shard_id / 64;
+        let bit = shard_id % 64;
+        if word < PUBSUB_WORDS_PER_STRIPE {
+            self.pattern_presence[word].fetch_and(!(1u64 << bit), Ordering::Relaxed);
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_shard_interested(&self, shard_id: usize, channel: &[u8]) -> bool {
+        let word = shard_id / 64;
+        let bit = shard_id % 64;
+        if word < PUBSUB_WORDS_PER_STRIPE {
+            let stripe = Self::stripe_for(channel);
+            let mask = self.channel_stripes[stripe][word].load(Ordering::Relaxed)
+                | self.pattern_presence[word].load(Ordering::Relaxed);
+            (mask & (1u64 << bit)) != 0
+        } else {
+            true
+        }
     }
 
     #[inline(always)]
     pub fn interested_shards(&self, channel: &[u8]) -> u64 {
         let stripe = Self::stripe_for(channel);
-        self.channel_stripes[stripe].load(Ordering::Relaxed)
-            | self.pattern_presence.load(Ordering::Relaxed)
+        self.channel_stripes[stripe][0].load(Ordering::Relaxed)
+            | self.pattern_presence[0].load(Ordering::Relaxed)
     }
 }
 
