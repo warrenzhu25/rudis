@@ -10347,3 +10347,67 @@ fn test_sismember_hash_contains_e2e() {
         ":0\r\n"
     );
 }
+
+#[test]
+fn test_fast_path_del_exists_mget_mset_e2e() {
+    let port = 16980;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut conn = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. MSET and MGET
+    assert_eq!(
+        send_and_read(&mut conn, b"*7\r\n$4\r\nMSET\r\n$2\r\nk1\r\n$2\r\nv1\r\n$2\r\nk2\r\n$2\r\nv2\r\n$2\r\nk3\r\n$2\r\nv3\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut conn,
+            b"*4\r\n$4\r\nMGET\r\n$2\r\nk1\r\n$2\r\nk2\r\n$2\r\nk3\r\n"
+        ),
+        "*3\r\n$2\r\nv1\r\n$2\r\nv2\r\n$2\r\nv3\r\n"
+    );
+
+    // 2. Multi-key EXISTS
+    assert_eq!(
+        send_and_read(
+            &mut conn,
+            b"*4\r\n$6\r\nEXISTS\r\n$2\r\nk1\r\n$2\r\nk2\r\n$2\r\nk3\r\n"
+        ),
+        ":3\r\n"
+    );
+
+    // 3. Single-key EXISTS
+    assert_eq!(
+        send_and_read(&mut conn, b"*2\r\n$6\r\nEXISTS\r\n$2\r\nk1\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut conn, b"*2\r\n$6\r\nEXISTS\r\n$7\r\nmissing\r\n"),
+        ":0\r\n"
+    );
+
+    // 4. Single-key DEL
+    assert_eq!(
+        send_and_read(&mut conn, b"*2\r\n$3\r\nDEL\r\n$2\r\nk1\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut conn, b"*2\r\n$3\r\nDEL\r\n$2\r\nk1\r\n"),
+        ":0\r\n"
+    );
+
+    // 5. Multi-key DEL
+    assert_eq!(
+        send_and_read(&mut conn, b"*3\r\n$3\r\nDEL\r\n$2\r\nk2\r\n$2\r\nk3\r\n"),
+        ":2\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut conn,
+            b"*4\r\n$6\r\nEXISTS\r\n$2\r\nk1\r\n$2\r\nk2\r\n$2\r\nk3\r\n"
+        ),
+        ":0\r\n"
+    );
+}

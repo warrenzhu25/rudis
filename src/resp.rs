@@ -1378,8 +1378,8 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
 
     // First check if the full frame is present before consuming any bytes from buf
     let mut scan_cursor = newline_pos + 2;
-    let mut offsets = [(0usize, 0usize); 8];
-    let is_small = num_args <= 8;
+    let mut offsets = [(0usize, 0usize); 16];
+    let is_small = num_args <= 16;
 
     #[allow(clippy::needless_range_loop)]
     for i in 0..num_args {
@@ -1443,11 +1443,18 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
                             past_expired: false,
                         }));
                     }
-                    if cmd_bytes.eq_ignore_ascii_case(b"DEL") && num_args == 2 {
+                    if cmd_bytes.eq_ignore_ascii_case(b"DEL") && num_args >= 2 {
                         let (k_start, k_len) = offsets[1];
-                        return Ok(Some(Command::Del(smallvec![
-                            frame.slice(k_start..k_start + k_len),
-                        ])));
+                        if num_args == 2 {
+                            return Ok(Some(Command::Del(smallvec![
+                                frame.slice(k_start..k_start + k_len),
+                            ])));
+                        }
+                        let mut keys = SmallVec::with_capacity(num_args - 1);
+                        for &(k_s, k_l) in offsets[1..num_args].iter() {
+                            keys.push(frame.slice(k_s..k_s + k_l));
+                        }
+                        return Ok(Some(Command::Del(keys)));
                     }
                 }
                 4 => {
@@ -1510,6 +1517,29 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
                     if cmd_bytes.eq_ignore_ascii_case(b"PING") && num_args == 1 {
                         return Ok(Some(Command::Ping(None)));
                     }
+                    if cmd_bytes.eq_ignore_ascii_case(b"MGET") && num_args >= 2 {
+                        let mut keys = Vec::with_capacity(num_args - 1);
+                        for &(k_s, k_l) in offsets[1..num_args].iter() {
+                            keys.push(frame.slice(k_s..k_s + k_l));
+                        }
+                        return Ok(Some(Command::Mget(keys)));
+                    }
+                    if cmd_bytes.eq_ignore_ascii_case(b"MSET")
+                        && num_args >= 3
+                        && (num_args - 1).is_multiple_of(2)
+                    {
+                        let num_pairs = (num_args - 1) / 2;
+                        let mut pairs = Vec::with_capacity(num_pairs);
+                        for p in 0..num_pairs {
+                            let (k_start, k_len) = offsets[1 + p * 2];
+                            let (v_start, v_len) = offsets[2 + p * 2];
+                            pairs.push((
+                                frame.slice(k_start..k_start + k_len),
+                                frame.slice(v_start..v_start + v_len),
+                            ));
+                        }
+                        return Ok(Some(Command::Mset(pairs)));
+                    }
                 }
                 5 => {
                     if cmd_bytes.eq_ignore_ascii_case(b"LPUSH") && num_args == 3 {
@@ -1522,11 +1552,18 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
                     }
                 }
                 6 => {
-                    if cmd_bytes.eq_ignore_ascii_case(b"EXISTS") && num_args == 2 {
+                    if cmd_bytes.eq_ignore_ascii_case(b"EXISTS") && num_args >= 2 {
                         let (k_start, k_len) = offsets[1];
-                        return Ok(Some(Command::Exists(smallvec![
-                            frame.slice(k_start..k_start + k_len),
-                        ])));
+                        if num_args == 2 {
+                            return Ok(Some(Command::Exists(smallvec![
+                                frame.slice(k_start..k_start + k_len),
+                            ])));
+                        }
+                        let mut keys = SmallVec::with_capacity(num_args - 1);
+                        for &(k_s, k_l) in offsets[1..num_args].iter() {
+                            keys.push(frame.slice(k_s..k_s + k_l));
+                        }
+                        return Ok(Some(Command::Exists(keys)));
                     }
                     if cmd_bytes.eq_ignore_ascii_case(b"LRANGE")
                         && num_args == 4
@@ -8799,6 +8836,47 @@ mod tests {
                 assert_eq!(values[0], Bytes::from_static(b"v1"));
             }
             _ => panic!("Expected Lpush command"),
+        }
+
+        // Fast-path multi-key EXISTS (3 keys):
+        let mut buf = BytesMut::from("*4\r\n$6\r\nEXISTS\r\n$2\r\nk1\r\n$2\r\nk2\r\n$2\r\nk3\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        match cmd {
+            Command::Exists(keys) => {
+                assert_eq!(keys.len(), 3);
+                assert_eq!(keys[0], Bytes::from_static(b"k1"));
+                assert_eq!(keys[1], Bytes::from_static(b"k2"));
+                assert_eq!(keys[2], Bytes::from_static(b"k3"));
+            }
+            _ => panic!("Expected Exists command"),
+        }
+
+        // Fast-path MGET (3 keys):
+        let mut buf = BytesMut::from("*4\r\n$4\r\nMGET\r\n$2\r\nk1\r\n$2\r\nk2\r\n$2\r\nk3\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        match cmd {
+            Command::Mget(keys) => {
+                assert_eq!(keys.len(), 3);
+                assert_eq!(keys[0], Bytes::from_static(b"k1"));
+                assert_eq!(keys[1], Bytes::from_static(b"k2"));
+                assert_eq!(keys[2], Bytes::from_static(b"k3"));
+            }
+            _ => panic!("Expected Mget command"),
+        }
+
+        // Fast-path MSET (2 pairs):
+        let mut buf =
+            BytesMut::from("*5\r\n$4\r\nMSET\r\n$2\r\nk1\r\n$2\r\nv1\r\n$2\r\nk2\r\n$2\r\nv2\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        match cmd {
+            Command::Mset(pairs) => {
+                assert_eq!(pairs.len(), 2);
+                assert_eq!(pairs[0].0, Bytes::from_static(b"k1"));
+                assert_eq!(pairs[0].1, Bytes::from_static(b"v1"));
+                assert_eq!(pairs[1].0, Bytes::from_static(b"k2"));
+                assert_eq!(pairs[1].1, Bytes::from_static(b"v2"));
+            }
+            _ => panic!("Expected Mset command"),
         }
     }
 }

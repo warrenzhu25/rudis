@@ -8695,6 +8695,17 @@ pub fn execute_local_command(
             false
         }
         Command::Del(keys) => {
+            if keys.len() == 1 {
+                let deleted = db.del(&keys[0]);
+                if deleted {
+                    crate::search::delete_document_hook(&String::from_utf8_lossy(&keys[0]));
+                    record_change!(cmd);
+                    out.extend_from_slice(b":1\r\n");
+                } else {
+                    out.extend_from_slice(b":0\r\n");
+                }
+                return false;
+            }
             let mut count = 0usize;
             for k in keys {
                 if db.del(k) {
@@ -8709,6 +8720,11 @@ pub fn execute_local_command(
             false
         }
         Command::Exists(keys) => {
+            if keys.len() == 1 {
+                let exists = db.exists(&keys[0]);
+                out.extend_from_slice(if exists { b":1\r\n" } else { b":0\r\n" });
+                return false;
+            }
             let mut count = 0usize;
             for k in keys {
                 if db.exists(k) {
