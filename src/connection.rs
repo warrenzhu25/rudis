@@ -12667,12 +12667,21 @@ async fn execute_commands_squashed(
                     } = cmd
                 {
                     has_local_writes = true;
-                    match router
-                        .local_db
-                        .borrow_mut()
-                        .table
-                        .hset_slice_with_hash(key, key_hash, fields)
-                    {
+                    let res = if fields.len() == 1 {
+                        let (ref f, ref v) = fields[0];
+                        router
+                            .local_db
+                            .borrow_mut()
+                            .table
+                            .hset_single_field_with_hash(key, key_hash, f, v)
+                    } else {
+                        router
+                            .local_db
+                            .borrow_mut()
+                            .table
+                            .hset_slice_with_hash(key, key_hash, fields)
+                    };
+                    match res {
                         Ok(count) => {
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                 touch_watched_key(router.port, key.as_ref());
@@ -12718,12 +12727,20 @@ async fn execute_commands_squashed(
                     } = cmd
                 {
                     has_local_writes = true;
-                    match router
-                        .local_db
-                        .borrow_mut()
-                        .table
-                        .sadd_slice_with_hash(key, key_hash, members)
-                    {
+                    let res = if members.len() == 1 {
+                        router
+                            .local_db
+                            .borrow_mut()
+                            .table
+                            .sadd_single_member_with_hash(key, key_hash, &members[0])
+                    } else {
+                        router
+                            .local_db
+                            .borrow_mut()
+                            .table
+                            .sadd_slice_with_hash(key, key_hash, members)
+                    };
+                    match res {
                         Ok(count) => {
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                 touch_watched_key(router.port, key.as_ref());

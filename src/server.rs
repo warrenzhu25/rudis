@@ -707,7 +707,13 @@ pub fn run_shard_worker(
                                         && let Command::Hset { ref key, ref fields } = cmd
                                     {
                                         has_writes = true;
-                                        match r.local_db.borrow_mut().table.hset_slice_with_hash(key, key_hash, fields) {
+                                        let res = if fields.len() == 1 {
+                                            let (ref f, ref v) = fields[0];
+                                            r.local_db.borrow_mut().table.hset_single_field_with_hash(key, key_hash, f, v)
+                                        } else {
+                                            r.local_db.borrow_mut().table.hset_slice_with_hash(key, key_hash, fields)
+                                        };
+                                        match res {
                                             Ok(count) => {
                                                 if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                     crate::connection::touch_watched_key(r.port, key.as_ref());
@@ -738,7 +744,12 @@ pub fn run_shard_worker(
                                         && let Command::Sadd { ref key, ref members } = cmd
                                     {
                                         has_writes = true;
-                                        match r.local_db.borrow_mut().table.sadd_slice_with_hash(key, key_hash, members) {
+                                        let res = if members.len() == 1 {
+                                            r.local_db.borrow_mut().table.sadd_single_member_with_hash(key, key_hash, &members[0])
+                                        } else {
+                                            r.local_db.borrow_mut().table.sadd_slice_with_hash(key, key_hash, members)
+                                        };
+                                        match res {
                                             Ok(count) => {
                                                 if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                     crate::connection::touch_watched_key(r.port, key.as_ref());
@@ -1011,7 +1022,13 @@ pub fn run_shard_worker(
                                     && let Command::Hset { ref key, ref fields } = cmd
                                 {
                                     has_writes = true;
-                                    match db.table.hset_slice_with_hash(key, key_hash, fields) {
+                                    let res = if fields.len() == 1 {
+                                        let (ref f, ref v) = fields[0];
+                                        db.table.hset_single_field_with_hash(key, key_hash, f, v)
+                                    } else {
+                                        db.table.hset_slice_with_hash(key, key_hash, fields)
+                                    };
+                                    match res {
                                         Ok(count) => {
                                             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                 crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
@@ -1042,7 +1059,12 @@ pub fn run_shard_worker(
                                     && let Command::Sadd { ref key, ref members } = cmd
                                 {
                                     has_writes = true;
-                                    match db.table.sadd_slice_with_hash(key, key_hash, members) {
+                                    let res = if members.len() == 1 {
+                                        db.table.sadd_single_member_with_hash(key, key_hash, &members[0])
+                                    } else {
+                                        db.table.sadd_slice_with_hash(key, key_hash, members)
+                                    };
+                                    match res {
                                         Ok(count) => {
                                             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                 crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());

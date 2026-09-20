@@ -9999,3 +9999,55 @@ fn test_mutations_find_entry_mut_e2e() {
         "$1\r\n5\r\n"
     );
 }
+
+#[test]
+fn test_single_item_hset_sadd_e2e() {
+    let port = 16920;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut conn = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Single-field HSET
+    assert_eq!(
+        send_and_read(&mut conn, b"HSET e2e_single_hash f1 v1\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut conn, b"HGET e2e_single_hash f1\r\n"),
+        "$2\r\nv1\r\n"
+    );
+    // Update existing field returns :0
+    assert_eq!(
+        send_and_read(&mut conn, b"HSET e2e_single_hash f1 v1_new\r\n"),
+        ":0\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut conn, b"HGET e2e_single_hash f1\r\n"),
+        "$6\r\nv1_new\r\n"
+    );
+
+    // 2. Single-member SADD
+    assert_eq!(
+        send_and_read(&mut conn, b"SADD e2e_single_set m1\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut conn, b"SISMEMBER e2e_single_set m1\r\n"),
+        ":1\r\n"
+    );
+    // Add existing member returns :0
+    assert_eq!(
+        send_and_read(&mut conn, b"SADD e2e_single_set m1\r\n"),
+        ":0\r\n"
+    );
+    // Add new member returns :1
+    assert_eq!(
+        send_and_read(&mut conn, b"SADD e2e_single_set m2\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut conn, b"SCARD e2e_single_set\r\n"),
+        ":2\r\n"
+    );
+}

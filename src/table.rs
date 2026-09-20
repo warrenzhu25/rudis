@@ -3015,6 +3015,92 @@ impl RudisTable {
         self.hset_slice_internal(key.as_ref(), h, Some(key), fields)
     }
 
+    #[inline(always)]
+    pub fn hset_single_field_with_hash(
+        &mut self,
+        key: &Bytes,
+        h: u64,
+        field: &Bytes,
+        val: &Bytes,
+    ) -> Result<usize, &'static str> {
+        let max_entries =
+            crate::connection::HASH_MAX_ENTRIES.load(std::sync::atomic::Ordering::Relaxed);
+        let max_value =
+            crate::connection::HASH_MAX_VALUE.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some((idx, entry)) = self.table.find_entry_mut(key.as_ref(), h) {
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+            } else {
+                match &mut entry.val {
+                    RudisValue::SmallHash(pairs) => {
+                        if pairs.len() == 1 && pairs[0].0 == *field {
+                            pairs[0].1 = val.clone();
+                            if val.len() > max_value {
+                                let map: RudisHashMap = pairs.drain(..).collect();
+                                entry.val = RudisValue::Hash(map);
+                            }
+                            return Ok(0);
+                        }
+                        if let Some(pos) = pairs.iter().position(|(k, _)| k == field) {
+                            pairs[pos].1 = val.clone();
+                            if val.len() > max_value {
+                                let map: RudisHashMap = pairs.drain(..).collect();
+                                entry.val = RudisValue::Hash(map);
+                            }
+                            return Ok(0);
+                        } else {
+                            pairs.push((field.clone(), val.clone()));
+                            if pairs.len() > max_entries
+                                || field.len() > max_value
+                                || val.len() > max_value
+                            {
+                                let map: RudisHashMap = pairs.drain(..).collect();
+                                entry.val = RudisValue::Hash(map);
+                            }
+                            return Ok(1);
+                        }
+                    }
+                    RudisValue::Hash(map) => {
+                        if let Some(existing_val) = map.get_mut(field) {
+                            *existing_val = val.clone();
+                            return Ok(0);
+                        }
+                        map.insert(field.clone(), val.clone());
+                        return Ok(1);
+                    }
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
+                }
+            }
+        }
+
+        let (_, insert_idx) = self.table.find_or_prepare_insert(key.as_ref(), h);
+        let val = if field.len() <= max_value && val.len() <= max_value {
+            let mut pairs = self.arena.acquire_small_hash(1);
+            pairs.push((field.clone(), val.clone()));
+            RudisValue::SmallHash(pairs)
+        } else {
+            let mut map = RudisHashMap::with_capacity_and_hasher(1, FxBuildHasher::default());
+            map.insert(field.clone(), val.clone());
+            RudisValue::Hash(map)
+        };
+        let entry = RudisEntry {
+            key: key.clone(),
+            val,
+            expire_at: None,
+        };
+        self.table.insert_prepared(entry, h, insert_idx);
+        Ok(1)
+    }
+
     pub fn hset_slice(
         &mut self,
         key: &[u8],
@@ -5096,6 +5182,77 @@ impl RudisTable {
         members: &[Bytes],
     ) -> Result<usize, &'static str> {
         self.sadd_slice_internal(key.as_ref(), h, Some(key), members)
+    }
+
+    #[inline(always)]
+    pub fn sadd_single_member_with_hash(
+        &mut self,
+        key: &Bytes,
+        h: u64,
+        member: &Bytes,
+    ) -> Result<usize, &'static str> {
+        if let Some((idx, entry)) = self.table.find_entry_mut(key.as_ref(), h) {
+            if self.num_expires > 0
+                && let Some(expire_at) = entry.expire_at
+                && !crate::connection::ALLOW_ACCESS_EXPIRED
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                && Instant::now() >= expire_at
+            {
+                self.expire_slot(idx);
+            } else {
+                match &mut entry.val {
+                    RudisValue::Set(RudisSet::Small(v)) if v.len() == 1 => {
+                        let m_bytes = member.as_ref();
+                        let m_hash = hash64(m_bytes);
+                        if v[0].hash == m_hash
+                            && v[0].member.len() == m_bytes.len()
+                            && v[0].member.as_ref() == m_bytes
+                        {
+                            return Ok(0);
+                        }
+                        v.push(SmallSetEntry {
+                            hash: m_hash,
+                            member: member.clone(),
+                        });
+                        return Ok(1);
+                    }
+                    RudisValue::Set(RudisSet::Small(v)) if v.is_empty() => {
+                        let m_bytes = member.as_ref();
+                        let m_hash = hash64(m_bytes);
+                        v.push(SmallSetEntry {
+                            hash: m_hash,
+                            member: member.clone(),
+                        });
+                        return Ok(1);
+                    }
+                    RudisValue::Set(set) => {
+                        let added = if set.insert_slice(member) { 1 } else { 0 };
+                        return Ok(added);
+                    }
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
+                }
+            }
+        }
+
+        let (_, insert_idx) = self.table.find_or_prepare_insert(key.as_ref(), h);
+        let mut v = self.arena.acquire_small_set(1);
+        let m_bytes = member.as_ref();
+        let m_hash = hash64(m_bytes);
+        v.push(SmallSetEntry {
+            hash: m_hash,
+            member: member.clone(),
+        });
+        let entry = RudisEntry {
+            key: key.clone(),
+            val: RudisValue::Set(RudisSet::Small(v)),
+            expire_at: None,
+        };
+        self.table.insert_prepared(entry, h, insert_idx);
+        Ok(1)
     }
 
     pub fn sadd_slice(&mut self, key: &[u8], members: &[Bytes]) -> Result<usize, &'static str> {
@@ -11254,5 +11411,57 @@ mod tests {
         assert_eq!(out, b"$1\r\nb\r\n");
         assert_eq!(table.len(), 0);
         assert!(!table.table.ctrl.contains(&DELETED));
+    }
+
+    #[test]
+    fn test_hset_sadd_single_item() {
+        let mut table = RudisTable::new();
+
+        // 1. Single-field HSET test: create, update, wrong type
+        let hk = Bytes::from("myhash");
+        let hh = hash_key(hk.as_ref());
+        let f1 = Bytes::from("f1");
+        let v1 = Bytes::from("v1");
+        let v1_new = Bytes::from("v1_updated");
+
+        assert_eq!(table.hset_single_field_with_hash(&hk, hh, &f1, &v1), Ok(1));
+        assert_eq!(table.hget(hk.as_ref(), f1.as_ref()), Ok(Some(v1.clone())));
+
+        // Update existing field returns 0
+        assert_eq!(
+            table.hset_single_field_with_hash(&hk, hh, &f1, &v1_new),
+            Ok(0)
+        );
+        assert_eq!(table.hget(hk.as_ref(), f1.as_ref()), Ok(Some(v1_new)));
+
+        // Add second field to small hash
+        let f2 = Bytes::from("f2");
+        let v2 = Bytes::from("v2");
+        assert_eq!(table.hset_single_field_with_hash(&hk, hh, &f2, &v2), Ok(1));
+        assert_eq!(table.hget(hk.as_ref(), f2.as_ref()), Ok(Some(v2)));
+
+        // 2. Single-member SADD test: create, update existing, add second
+        let sk = Bytes::from("myset");
+        let sh = hash_key(sk.as_ref());
+        let m1 = Bytes::from("m1");
+        let m2 = Bytes::from("m2");
+
+        assert_eq!(table.sadd_single_member_with_hash(&sk, sh, &m1), Ok(1));
+        assert!(table.sismember(sk.as_ref(), m1.as_ref()).unwrap());
+
+        // Adding already-existing member returns 0
+        assert_eq!(table.sadd_single_member_with_hash(&sk, sh, &m1), Ok(0));
+
+        // Adding new member returns 1
+        assert_eq!(table.sadd_single_member_with_hash(&sk, sh, &m2), Ok(1));
+        assert!(table.sismember(sk.as_ref(), m2.as_ref()).unwrap());
+
+        // Wrong type error test
+        assert!(
+            table
+                .hset_single_field_with_hash(&sk, sh, &f1, &v1)
+                .is_err()
+        );
+        assert!(table.sadd_single_member_with_hash(&hk, hh, &m1).is_err());
     }
 }
