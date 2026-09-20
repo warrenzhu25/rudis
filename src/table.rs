@@ -6593,11 +6593,16 @@ impl RudisTable {
     }
 
     pub fn count_keys_in_slot(&mut self, slot: u16) -> usize {
-        if self.table.slot_counts[slot as usize] == 0 {
+        if self.table.items == 0 {
             return 0;
         }
-        if self.num_expires == 0 {
-            return self.table.slot_counts[slot as usize] as usize;
+        if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
+            if self.table.slot_counts[slot as usize] == 0 {
+                return 0;
+            }
+            if self.num_expires == 0 {
+                return self.table.slot_counts[slot as usize] as usize;
+            }
         }
         let now = Instant::now();
         let mut count = 0;
@@ -6626,6 +6631,14 @@ impl RudisTable {
     }
 
     pub fn get_keys_in_slot(&mut self, slot: u16, count: usize) -> Vec<Bytes> {
+        if self.table.items == 0 {
+            return Vec::new();
+        }
+        if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed)
+            && self.table.slot_counts[slot as usize] == 0
+        {
+            return Vec::new();
+        }
         let mut result = Vec::new();
         let mut expired_indices = Vec::new();
         let now = if self.num_expires > 0 {
@@ -9493,8 +9506,7 @@ impl RudisTable {
     }
 }
 
-pub fn crc64(data: &[u8]) -> u64 {
-    let mut crc: u64 = 0;
+pub fn crc64_update(mut crc: u64, data: &[u8]) -> u64 {
     for &b in data {
         crc ^= (b as u64) << 56;
         for _ in 0..8 {
@@ -9506,6 +9518,10 @@ pub fn crc64(data: &[u8]) -> u64 {
         }
     }
     crc
+}
+
+pub fn crc64(data: &[u8]) -> u64 {
+    crc64_update(0, data)
 }
 
 pub fn load_rdb(

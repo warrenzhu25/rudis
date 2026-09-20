@@ -891,6 +891,24 @@ pub enum QueryAst {
     MatchAll,
 }
 
+impl QueryAst {
+    pub fn knn_k(&self) -> Option<usize> {
+        match self {
+            QueryAst::KnnVector { k, .. } => Some(*k),
+            QueryAst::And(subs) | QueryAst::Or(subs) => {
+                for sub in subs {
+                    if let Some(k) = sub.knn_k() {
+                        return Some(k);
+                    }
+                }
+                None
+            }
+            QueryAst::FieldScope { inner, .. } => inner.knn_k(),
+            _ => None,
+        }
+    }
+}
+
 pub fn parse_query(q: &str) -> QueryAst {
     let q = q.trim();
     if q == "*" || q.is_empty() {

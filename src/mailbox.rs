@@ -343,7 +343,7 @@ impl<T> SpscQueue<T> {
     pub fn push(&self, item: T) {
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Acquire);
-        if tail.wrapping_sub(head) < self.capacity {
+        if !self.has_overflow.load(Ordering::Acquire) && tail.wrapping_sub(head) < self.capacity {
             unsafe {
                 *self.buffer[tail & self.mask].get() = Some(item);
             }
@@ -362,6 +362,19 @@ impl<T> SpscQueue<T> {
         if head != tail {
             let item = unsafe { (*self.buffer[head & self.mask].get()).take() };
             self.head.store(head.wrapping_add(1), Ordering::Release);
+            if self.has_overflow.load(Ordering::Acquire) {
+                let mut q = self.overflow.lock().unwrap();
+                if let Some(next_item) = q.pop_front() {
+                    let t = self.tail.load(Ordering::Relaxed);
+                    unsafe {
+                        *self.buffer[t & self.mask].get() = Some(next_item);
+                    }
+                    self.tail.store(t.wrapping_add(1), Ordering::Release);
+                }
+                if q.is_empty() {
+                    self.has_overflow.store(false, Ordering::Release);
+                }
+            }
             item
         } else if self.has_overflow.load(Ordering::Acquire) {
             let mut q = self.overflow.lock().unwrap();
@@ -488,7 +501,7 @@ pub fn create_shard_mesh(num_shards: usize) -> (Vec<Vec<ShardSender>>, Vec<Shard
     for _ in 0..num_shards {
         let mut row = Vec::with_capacity(num_shards);
         for _ in 0..num_shards {
-            row.push(std::sync::Arc::new(SpscQueue::new(4096)));
+            row.push(std::sync::Arc::new(SpscQueue::new(256)));
         }
         rings.push(row);
     }

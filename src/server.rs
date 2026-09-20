@@ -174,13 +174,16 @@ pub fn run_shard_worker(
                     monoio::spawn(async move {
                         let mut ticker = 0u64;
                         loop {
-                            monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            monoio::time::sleep(std::time::Duration::from_millis(5)).await;
                             let flush_chunk = flush_writer.borrow_mut().take_flush_chunk();
                             if let Some((file, chunk, offset)) = flush_chunk {
-                                let _ = file.write_all_at(chunk, offset).await;
+                                let (res, returned_chunk) = file.write_all_at(chunk, offset).await;
+                                if res.is_ok() {
+                                    flush_writer.borrow_mut().recycle_chunk(returned_chunk);
+                                }
                             }
                             ticker += 1;
-                            if fsync_every_sec && ticker.is_multiple_of(20) {
+                            if fsync_every_sec && ticker.is_multiple_of(200) {
                                 let file = flush_writer.borrow().get_file();
                                 if let Some(file) = file {
                                     let _ = file.sync_data().await;
@@ -1558,7 +1561,7 @@ pub fn run_shard_worker(
                             .remove_client_with_presence(client_id, None);
                     }
                     ShardMessage::InitSearchIndex { schema, responder } => {
-                        cross_shard_db.borrow_mut().init_search_index(schema);
+                        cross_shard_db.borrow_mut().init_search_index(*schema);
                         let _ = responder.send(());
                     }
                     ShardMessage::DropSearchIndex { name, responder } => {
@@ -1743,7 +1746,8 @@ pub fn run_shard_worker(
                         let mut db = cross_shard_db.borrow_mut();
                         let should_del = match condition {
                             None => true,
-                            Some((op, expected)) => {
+                            Some(cond) => {
+                                let (op, expected) = &*cond;
                                 if let Some(val) = db.get(&key) {
                                     match op.to_uppercase().as_str() {
                                         "IFEQ" => val == expected,

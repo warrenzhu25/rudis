@@ -1777,39 +1777,81 @@ impl Router {
     }
 
     pub async fn count_keys_in_slot(&self, slot: u16) -> usize {
-        let target = slot_to_shard(slot, self.num_shards);
-        if target == self.shard_id {
-            self.local_db.borrow_mut().count_keys_in_slot(slot)
-        } else {
-            let (tx, rx) = flume::bounded(1);
-            let msg = ShardMessage::CountKeysInSlot {
-                slot,
-                responder: tx,
-            };
-            if self.senders[target].send(msg).is_ok() {
-                rx.recv_async().await.unwrap_or(0)
+        if self.cluster_enabled || crate::cluster::HAS_ACTIVE_CLUSTER.load(Ordering::Relaxed) {
+            let target = slot_to_shard(slot, self.num_shards);
+            if target == self.shard_id {
+                self.local_db.borrow_mut().count_keys_in_slot(slot)
             } else {
-                0
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::CountKeysInSlot {
+                    slot,
+                    responder: tx,
+                };
+                if self.senders[target].send(msg).is_ok() {
+                    rx.recv_async().await.unwrap_or(0)
+                } else {
+                    0
+                }
             }
+        } else {
+            let mut total = self.local_db.borrow_mut().count_keys_in_slot(slot);
+            for s in 0..self.num_shards {
+                if s == self.shard_id {
+                    continue;
+                }
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::CountKeysInSlot {
+                    slot,
+                    responder: tx,
+                };
+                if self.senders[s].send(msg).is_ok() {
+                    total += rx.recv_async().await.unwrap_or(0);
+                }
+            }
+            total
         }
     }
 
     pub async fn get_keys_in_slot(&self, slot: u16, count: usize) -> Vec<Bytes> {
-        let target = slot_to_shard(slot, self.num_shards);
-        if target == self.shard_id {
-            self.local_db.borrow_mut().get_keys_in_slot(slot, count)
-        } else {
-            let (tx, rx) = flume::bounded(1);
-            let msg = ShardMessage::GetKeysInSlot {
-                slot,
-                count,
-                responder: tx,
-            };
-            if self.senders[target].send(msg).is_ok() {
-                rx.recv_async().await.unwrap_or_default()
+        if self.cluster_enabled || crate::cluster::HAS_ACTIVE_CLUSTER.load(Ordering::Relaxed) {
+            let target = slot_to_shard(slot, self.num_shards);
+            if target == self.shard_id {
+                self.local_db.borrow_mut().get_keys_in_slot(slot, count)
             } else {
-                Vec::new()
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::GetKeysInSlot {
+                    slot,
+                    count,
+                    responder: tx,
+                };
+                if self.senders[target].send(msg).is_ok() {
+                    rx.recv_async().await.unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
             }
+        } else {
+            let mut results = self.local_db.borrow_mut().get_keys_in_slot(slot, count);
+            for s in 0..self.num_shards {
+                if results.len() >= count {
+                    break;
+                }
+                if s == self.shard_id {
+                    continue;
+                }
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::GetKeysInSlot {
+                    slot,
+                    count: count - results.len(),
+                    responder: tx,
+                };
+                if self.senders[s].send(msg).is_ok()
+                    && let Ok(batch) = rx.recv_async().await
+                {
+                    results.extend(batch);
+                }
+            }
+            results
         }
     }
 
@@ -1927,7 +1969,7 @@ impl Router {
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::Delex {
                 key,
-                condition,
+                condition: condition.map(Box::new),
                 responder: tx,
             };
             if self.senders[target].send(msg).is_ok() {
@@ -2391,7 +2433,7 @@ impl Router {
             if sid != self.shard_id {
                 let (tx, rx) = flume::bounded(1);
                 let msg = ShardMessage::InitSearchIndex {
-                    schema: schema.clone(),
+                    schema: Box::new(schema.clone()),
                     responder: tx,
                 };
                 if sender.send(msg).is_ok() {
@@ -2467,8 +2509,8 @@ impl Router {
                     let (tx, rx) = flume::bounded(1);
                     let msg = ShardMessage::SearchQuery {
                         index: index.to_string(),
-                        ast: ast.clone(),
-                        options: scatter_opts.clone(),
+                        ast: Box::new(ast.clone()),
+                        options: Box::new(scatter_opts.clone()),
                         responder: tx,
                     };
                     if sender.send(msg).is_ok() {
@@ -2508,13 +2550,25 @@ impl Router {
             });
         }
 
+        let effective_limit = if let Some(k) = ast.knn_k() {
+            opts.limit.min(k)
+        } else {
+            opts.limit
+        };
+
+        let reported_total = if let Some(k) = ast.knn_k() {
+            all_totals.min(k)
+        } else {
+            all_totals
+        };
+
         let paged: Vec<crate::search::SearchHit> = all_hits
             .into_iter()
             .skip(opts.offset)
-            .take(opts.limit)
+            .take(effective_limit)
             .collect();
 
-        (all_totals, paged)
+        (reported_total, paged)
     }
 
     pub async fn ft_aggregate(
@@ -2860,7 +2914,10 @@ impl Router {
                 );
             } else {
                 let (tx, rx) = flume::bounded(1);
-                let msg = ShardMessage::ExecuteReplicaCmd { cmd, responder: tx };
+                let msg = ShardMessage::ExecuteReplicaCmd {
+                    cmd: Box::new(cmd),
+                    responder: tx,
+                };
                 if self.senders[target].send(msg).is_ok() {
                     let _ = rx.recv_async().await;
                 }
@@ -2874,7 +2931,7 @@ impl Router {
                             let (tx, rx) = flume::bounded(1);
                             if sender
                                 .send(ShardMessage::ExecuteReplicaCmd {
-                                    cmd: Command::Flushall,
+                                    cmd: Box::new(Command::Flushall),
                                     responder: tx,
                                 })
                                 .is_ok()
@@ -2908,21 +2965,59 @@ impl Router {
     }
 
     pub async fn perform_save_rdb(&self) -> Result<(), String> {
-        let full_rdb = self.generate_full_rdb().await;
         static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let tmp_id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let filename = self.db_dir.join("dump.rdb");
         let tmp_filename =
             self.db_dir
                 .join(format!("dump.rdb.tmp.{}_{}", std::process::id(), tmp_id));
-        let res = (|| -> Result<(), String> {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&tmp_filename).map_err(|e| e.to_string())?;
-            file.write_all(&full_rdb).map_err(|e| e.to_string())?;
-            file.sync_all().map_err(|e| e.to_string())?;
-            std::fs::rename(&tmp_filename, &filename).map_err(|e| e.to_string())?;
-            Ok(())
-        })();
+
+        use std::io::Write;
+        let mut file = std::fs::File::create(&tmp_filename).map_err(|e| e.to_string())?;
+
+        let header = b"REDIS0011\xFE\x00";
+        file.write_all(header).map_err(|e| e.to_string())?;
+        let mut crc = crate::table::crc64(header);
+
+        // Local shard chunk
+        let mut local_chunk = Vec::new();
+        self.local_db.borrow_mut().save_rdb_chunk(&mut local_chunk);
+        if !local_chunk.is_empty() {
+            crc = crate::table::crc64_update(crc, &local_chunk);
+            file.write_all(&local_chunk).map_err(|e| e.to_string())?;
+        }
+        drop(local_chunk);
+
+        // Remote shard chunks streamed and dropped one-by-one
+        let mut responders = Vec::new();
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                if sender
+                    .send(ShardMessage::SaveRdbChunk { responder: tx })
+                    .is_ok()
+                {
+                    responders.push(rx);
+                }
+            }
+        }
+        for rx in responders {
+            if let Ok(chunk) = rx.recv_async().await {
+                if !chunk.is_empty() {
+                    crc = crate::table::crc64_update(crc, &chunk);
+                    file.write_all(&chunk).map_err(|e| e.to_string())?;
+                }
+                drop(chunk);
+            }
+        }
+
+        let eof = [0xFF];
+        crc = crate::table::crc64_update(crc, &eof);
+        file.write_all(&eof).map_err(|e| e.to_string())?;
+        file.write_all(&crc.to_le_bytes())
+            .map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp_filename, &filename).map_err(|e| e.to_string())?;
 
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2930,7 +3025,7 @@ impl Router {
             .as_secs();
         self.last_save_time.store(now_unix, Ordering::Relaxed);
         self.is_saving.store(false, Ordering::SeqCst);
-        res
+        Ok(())
     }
 
     pub fn my_id(&self) -> String {

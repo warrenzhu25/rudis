@@ -23,6 +23,7 @@ impl Default for AofConfig {
 
 pub struct AofWriter {
     buffer: Vec<u8>,
+    spare_buffer: Option<Vec<u8>>,
     file: Option<std::rc::Rc<monoio::fs::File>>,
     path: PathBuf,
     offset: u64,
@@ -41,6 +42,7 @@ impl AofWriter {
         let offset = file.metadata().await.map(|m| m.len()).unwrap_or(0);
         Ok(Self {
             buffer: Vec::with_capacity(65536),
+            spare_buffer: None,
             file: Some(std::rc::Rc::new(file)),
             path,
             offset,
@@ -50,6 +52,7 @@ impl AofWriter {
     pub fn new_in_memory() -> Self {
         Self {
             buffer: Vec::with_capacity(65536),
+            spare_buffer: None,
             file: None,
             path: PathBuf::new(),
             offset: 0,
@@ -72,12 +75,24 @@ impl AofWriter {
     }
 
     #[inline]
+    pub fn recycle_chunk(&mut self, mut chunk: Vec<u8>) {
+        if chunk.capacity() <= 4 * 1024 * 1024 {
+            chunk.clear();
+            self.spare_buffer = Some(chunk);
+        }
+    }
+
+    #[inline]
     pub fn take_flush_chunk(&mut self) -> Option<(std::rc::Rc<monoio::fs::File>, Vec<u8>, u64)> {
         if self.buffer.is_empty() {
             return None;
         }
         let file = self.file.clone()?;
-        let chunk = std::mem::replace(&mut self.buffer, Vec::with_capacity(65536));
+        let next_buf = self
+            .spare_buffer
+            .take()
+            .unwrap_or_else(|| Vec::with_capacity(65536));
+        let chunk = std::mem::replace(&mut self.buffer, next_buf);
         let off = self.offset;
         self.offset += chunk.len() as u64;
         Some((file, chunk, off))

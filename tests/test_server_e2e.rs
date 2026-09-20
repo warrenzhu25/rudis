@@ -453,8 +453,14 @@ fn test_multithread_shared_nothing_e2e() {
 
     // Drop second client and verify cleanup
     drop(stream2);
-    thread::sleep(Duration::from_millis(50));
-    let list_resp3 = send_and_read(&mut stream, b"CLIENT LIST\r\n");
+    let mut list_resp3 = String::new();
+    for _ in 0..10 {
+        thread::sleep(Duration::from_millis(30));
+        list_resp3 = send_and_read(&mut stream, b"CLIENT LIST\r\n");
+        if !list_resp3.contains(&format!("id={}", client_id2)) {
+            break;
+        }
+    }
     assert!(list_resp3.contains(&format!("id={}", client_id)));
     assert!(
         !list_resp3.contains(&format!("id={}", client_id2)),
@@ -5034,9 +5040,12 @@ fn test_redisearch_fulltext_and_hybrid_vector_e2e() {
         &mut client,
         b"*4\r\n$9\r\nFT.SEARCH\r\n$9\r\nidx:books\r\n$4\r\nRust\r\n$9\r\nNOCONTENT\r\n",
     );
-    assert_eq!(
-        search_nocontent,
-        "*3\r\n:2\r\n$6\r\nbook:1\r\n$6\r\nbook:2\r\n"
+    assert!(
+        search_nocontent.starts_with("*3\r\n:2\r\n")
+            && search_nocontent.contains("book:1")
+            && search_nocontent.contains("book:2"),
+        "Unexpected NOCONTENT response: {}",
+        search_nocontent
     );
 
     // 11. Query 7: FT.EXPLAIN

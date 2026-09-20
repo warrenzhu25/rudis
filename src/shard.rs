@@ -461,7 +461,7 @@ pub enum ShardMessage {
         client_id: u64,
     },
     InitSearchIndex {
-        schema: crate::search::IndexSchema,
+        schema: Box<crate::search::IndexSchema>,
         responder: flume::Sender<()>,
     },
     DropSearchIndex {
@@ -470,8 +470,8 @@ pub enum ShardMessage {
     },
     SearchQuery {
         index: String,
-        ast: crate::search::QueryAst,
-        options: crate::search::SearchOptions,
+        ast: Box<crate::search::QueryAst>,
+        options: Box<crate::search::SearchOptions>,
         responder: flume::Sender<(usize, Vec<crate::search::SearchHit>)>,
     },
     Keys {
@@ -504,7 +504,7 @@ pub enum ShardMessage {
         responder: flume::Sender<()>,
     },
     ExecuteReplicaCmd {
-        cmd: Command,
+        cmd: Box<Command>,
         responder: flume::Sender<()>,
     },
     TierSpill {
@@ -558,7 +558,7 @@ pub enum ShardMessage {
     },
     Delex {
         key: Bytes,
-        condition: Option<(String, Bytes)>,
+        condition: Option<Box<(String, Bytes)>>,
         responder: flume::Sender<bool>,
     },
 }
@@ -2651,5 +2651,10 @@ mod tests {
 
         let big = CompactResp::from_vec(vec![0u8; 100]);
         assert_eq!(big.estimated_len(), 100);
+    }
+
+    #[test]
+    fn test_shard_message_size() {
+        assert!(std::mem::size_of::<ShardMessage>() <= 88);
     }
 }
