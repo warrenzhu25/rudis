@@ -469,7 +469,7 @@ pub enum Command {
     Type(Bytes),
     Dbsize,
     Select(u32),
-    Slowlog(Bytes),
+    Slowlog(Vec<Bytes>),
     Debug(Vec<Bytes>),
     Flushdb,
     Flushall,
@@ -4468,12 +4468,12 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::Select(idx)))
         }
         "SLOWLOG" => {
-            let sub = if args.len() > 1 {
-                args[1].clone()
+            let sub_args = if args.len() > 1 {
+                args[1..].to_vec()
             } else {
-                Bytes::from_static(b"GET")
+                vec![Bytes::from_static(b"GET")]
             };
-            Ok(Some(Command::Slowlog(sub)))
+            Ok(Some(Command::Slowlog(sub_args)))
         }
         "DEBUG" => Ok(Some(Command::Debug(args[1..].to_vec()))),
         "DIGEST" => {

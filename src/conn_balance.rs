@@ -307,6 +307,7 @@ mod tests {
         // instant placement is decided. Asserting that here means the deferred
         // scheme cannot be reintroduced without this test failing, which a
         // throughput-style test cannot guarantee.
+        let _guard = lock_census();
         const SHARDS: usize = 8;
         reset_counts(SHARDS);
 

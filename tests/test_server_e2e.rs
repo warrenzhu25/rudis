@@ -11024,3 +11024,75 @@ fn test_per_shard_parallel_replication_stream_e2e() {
     let ack_cmd = format_resp_cmd(&["REPLCONF", "ACK", "42"]);
     flows[0].write_all(&ack_cmd).unwrap();
 }
+
+#[test]
+fn test_slowlog_operational_observability_e2e() {
+    let port = 17045;
+    start_test_server(port, 2);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Reset slowlog and set log-slower-than to 0 (log all commands)
+    assert_eq!(send_and_read(&mut client, b"SLOWLOG RESET\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut client, b"CONFIG SET slowlog-log-slower-than 0\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"CONFIG SET slowlog-max-len 10\r\n"),
+        "+OK\r\n"
+    );
+
+    // 2. Execute commands
+    assert_eq!(
+        send_and_read(&mut client, b"SET test_key test_val\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"GET test_key\r\n"),
+        "$8\r\ntest_val\r\n"
+    );
+
+    // 3. SLOWLOG LEN should be at least 2
+    let len_resp = send_and_read(&mut client, b"SLOWLOG LEN\r\n");
+    assert!(len_resp.starts_with(':'));
+    let len: usize = len_resp.trim_start_matches(':').trim().parse().unwrap();
+    assert!(len >= 2);
+
+    // 4. SLOWLOG GET 1 returns 7 fields
+    let get_resp = send_and_read(&mut client, b"SLOWLOG GET 1\r\n");
+    assert!(get_resp.starts_with("*1\r\n*7\r\n"));
+
+    // 5. Bounds checking on count
+    let err_resp = send_and_read(&mut client, b"SLOWLOG GET -2\r\n");
+    assert_eq!(
+        err_resp,
+        "-ERR count should be greater than or equal to -1\r\n"
+    );
+
+    // 6. Sensitive argument redaction
+    assert_eq!(
+        send_and_read(&mut client, b"CONFIG SET requirepass my_secret_pass\r\n"),
+        "+OK\r\n"
+    );
+    let get_all = send_and_read(&mut client, b"SLOWLOG GET 1\r\n");
+    assert!(get_all.contains("(redacted)"));
+    assert!(!get_all.contains("my_secret_pass"));
+
+    // 7. Check CONFIG GET options
+    let cfg_resp = send_and_read(&mut client, b"CONFIG GET slowlog-entry-max-argc\r\n");
+    assert!(cfg_resp.contains("slowlog-entry-max-argc"));
+    assert_eq!(
+        send_and_read(&mut client, b"CONFIG SET slowlog-entry-max-argc 1\r\n"),
+        "-ERR argument must be between 2 and 2147483647\r\n"
+    );
+
+    // 8. INFO STATS contains slowlog metrics
+    let info_resp = send_and_read(&mut client, b"INFO STATS\r\n");
+    assert!(info_resp.contains("slowlog_commands_count:"));
+    assert!(info_resp.contains("slowlog_commands_time_ms_sum:"));
+    assert!(info_resp.contains("slowlog_commands_time_ms_max:"));
+
+    // 9. Reset slowlog
+    assert_eq!(send_and_read(&mut client, b"SLOWLOG RESET\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut client, b"SLOWLOG LEN\r\n"), ":0\r\n");
+}

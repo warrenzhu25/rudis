@@ -3633,6 +3633,46 @@ async fn execute_command(
     let cmd_name = get_cmd_name(&cmd);
     record_cmd_stat(cmd_name);
 
+    let slow_threshold =
+        crate::slowlog::SLOWLOG_LOG_SLOWER_THAN.load(std::sync::atomic::Ordering::Relaxed);
+    let skip_slowlog = matches!(cmd, Command::Slowlog(_) | Command::Quit);
+    let cmd_for_slowlog = if slow_threshold >= 0 && !skip_slowlog {
+        Some(cmd.clone())
+    } else {
+        None
+    };
+    let exec_start = if slow_threshold >= 0 {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+    struct SlowlogTracker<'a> {
+        cmd: Option<Command>,
+        start: Option<std::time::Instant>,
+        client_id: u64,
+        client_registry: &'a RefCell<hashbrown::HashMap<u64, ClientInfo>>,
+    }
+    impl<'a> Drop for SlowlogTracker<'a> {
+        fn drop(&mut self) {
+            if let (Some(cmd), Some(start)) = (self.cmd.take(), self.start.take()) {
+                let duration_us = start.elapsed().as_micros() as u64;
+                let (addr_str, name_str) =
+                    if let Some(c) = self.client_registry.borrow().get(&self.client_id) {
+                        (c.addr.to_string(), c.name.clone().unwrap_or_default())
+                    } else {
+                        ("".to_string(), "".to_string())
+                    };
+                crate::slowlog::log_command_if_slow(&cmd, duration_us, &addr_str, &name_str);
+            }
+        }
+    }
+    let _slowlog_guard = SlowlogTracker {
+        cmd: cmd_for_slowlog,
+        start: exec_start,
+        client_id,
+        client_registry,
+    };
+
     if !*authenticated
         && !matches!(
             cmd,
@@ -4389,10 +4429,19 @@ async fn execute_command(
                     .upload_threshold_pct
                     .load(std::sync::atomic::Ordering::Relaxed),
             );
+            let slowlog_count =
+                crate::slowlog::SLOWLOG_COMMANDS_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+            let slowlog_sum_us = crate::slowlog::SLOWLOG_COMMANDS_TIME_US_SUM
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let slowlog_max_us = crate::slowlog::SLOWLOG_COMMANDS_TIME_US_MAX
+                .load(std::sync::atomic::Ordering::Relaxed);
             let stats_str = format!(
-                "# Stats\r\ntotal_connections_received:0\r\ntotal_commands_processed:0\r\ninstantaneous_ops_per_sec:0\r\ntotal_net_input_bytes:0\r\ntotal_net_output_bytes:0\r\ninstantaneous_input_kbps:0.00\r\ninstantaneous_output_kbps:0.00\r\nrejected_connections:0\r\nsync_full:0\r\nsync_partial_ok:0\r\nsync_partial_err:0\r\nexpired_keys:{}\r\nevicted_keys:{}\r\nkeyspace_hits:0\r\nkeyspace_misses:0\r\npubsub_channels:0\r\npubsub_patterns:0\r\nlatest_fork_usec:0\r\n",
+                "# Stats\r\ntotal_connections_received:0\r\ntotal_commands_processed:0\r\ninstantaneous_ops_per_sec:0\r\ntotal_net_input_bytes:0\r\ntotal_net_output_bytes:0\r\ninstantaneous_input_kbps:0.00\r\ninstantaneous_output_kbps:0.00\r\nrejected_connections:0\r\nsync_full:0\r\nsync_partial_ok:0\r\nsync_partial_err:0\r\nexpired_keys:{}\r\nevicted_keys:{}\r\nkeyspace_hits:0\r\nkeyspace_misses:0\r\npubsub_channels:0\r\npubsub_patterns:0\r\nlatest_fork_usec:0\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\n",
                 crate::table::get_expired_keys(),
-                crate::table::get_evicted_keys()
+                crate::table::get_evicted_keys(),
+                slowlog_count,
+                slowlog_sum_us as f64 / 1000.0,
+                slowlog_max_us as f64 / 1000.0,
             );
             let blocked_clients_count = {
                 let hub_arc = crate::block::get_block_hub_for_port(router.port);
@@ -4423,10 +4472,17 @@ async fn execute_command(
                     let mut entries: Vec<_> = map.iter().collect();
                     entries.sort_by_key(|(k, _)| *k);
                     for (cmd, calls) in entries {
-                        s.push_str(&format!(
-                            "cmdstat_{}:calls={},usec=100,usec_per_call=100.00,rejected_calls=0,failed_calls=0\r\n",
-                            cmd, calls
-                        ));
+                        if let Some(slow) = crate::slowlog::get_cmd_slow_stat(cmd) {
+                            s.push_str(&format!(
+                                "cmdstat_{}:calls={},usec=100,usec_per_call=100.00,rejected_calls=0,failed_calls=0,slowlog_count={},slowlog_time_ms_sum={:.2},slowlog_time_ms_max={:.2}\r\n",
+                                cmd, calls, slow.count, slow.time_ms_sum, slow.time_ms_max
+                            ));
+                        } else {
+                            s.push_str(&format!(
+                                "cmdstat_{}:calls={},usec=100,usec_per_call=100.00,rejected_calls=0,failed_calls=0\r\n",
+                                cmd, calls
+                            ));
+                        }
                     }
                 }
                 s
@@ -4737,6 +4793,46 @@ async fn execute_command(
                     val
                 );
                 out.extend_from_slice(resp.as_bytes());
+            } else if p_str == "slowlog-log-slower-than" {
+                let val = crate::slowlog::SLOWLOG_LOG_SLOWER_THAN
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .to_string();
+                let resp = format!(
+                    "*2\r\n$23\r\nslowlog-log-slower-than\r\n${}\r\n{}\r\n",
+                    val.len(),
+                    val
+                );
+                out.extend_from_slice(resp.as_bytes());
+            } else if p_str == "slowlog-max-len" {
+                let val = crate::slowlog::SLOWLOG_MAX_LEN
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .to_string();
+                let resp = format!(
+                    "*2\r\n$15\r\nslowlog-max-len\r\n${}\r\n{}\r\n",
+                    val.len(),
+                    val
+                );
+                out.extend_from_slice(resp.as_bytes());
+            } else if p_str == "slowlog-entry-max-argc" {
+                let val = crate::slowlog::SLOWLOG_ENTRY_MAX_ARGC
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .to_string();
+                let resp = format!(
+                    "*2\r\n$22\r\nslowlog-entry-max-argc\r\n${}\r\n{}\r\n",
+                    val.len(),
+                    val
+                );
+                out.extend_from_slice(resp.as_bytes());
+            } else if p_str == "slowlog-entry-max-string-len" {
+                let val = crate::slowlog::SLOWLOG_ENTRY_MAX_STRING_LEN
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .to_string();
+                let resp = format!(
+                    "*2\r\n$28\r\nslowlog-entry-max-string-len\r\n${}\r\n{}\r\n",
+                    val.len(),
+                    val
+                );
+                out.extend_from_slice(resp.as_bytes());
             } else if p_str == "*" {
                 let max_mem = crate::tiering::get_max_memory(router.port).to_string();
                 let offload = crate::tiering::get_offload_threshold_pct(router.port).to_string();
@@ -4804,8 +4900,57 @@ async fn execute_command(
                 } else {
                     out.extend_from_slice(b"-ERR Invalid argument for CONFIG SET\r\n");
                 }
+            } else if p_str == "slowlog-log-slower-than" {
+                if let Ok(v) = val_str.parse::<i64>() {
+                    crate::slowlog::SLOWLOG_LOG_SLOWER_THAN
+                        .store(v, std::sync::atomic::Ordering::Relaxed);
+                    out.extend_from_slice(b"+OK\r\n");
+                } else {
+                    out.extend_from_slice(
+                        b"-ERR Invalid argument for CONFIG SET slowlog-log-slower-than\r\n",
+                    );
+                }
+            } else if p_str == "slowlog-max-len" {
+                if let Ok(v) = val_str.parse::<usize>() {
+                    crate::slowlog::SLOWLOG_MAX_LEN.store(v, std::sync::atomic::Ordering::Relaxed);
+                    crate::slowlog::trim_slowlog_buffer();
+                    out.extend_from_slice(b"+OK\r\n");
+                } else {
+                    out.extend_from_slice(
+                        b"-ERR Invalid argument for CONFIG SET slowlog-max-len\r\n",
+                    );
+                }
+            } else if p_str == "slowlog-entry-max-argc" {
+                if let Ok(v) = val_str.parse::<usize>() {
+                    if v < 2 {
+                        out.extend_from_slice(
+                            b"-ERR argument must be between 2 and 2147483647\r\n",
+                        );
+                    } else {
+                        crate::slowlog::SLOWLOG_ENTRY_MAX_ARGC
+                            .store(v, std::sync::atomic::Ordering::Relaxed);
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                } else {
+                    out.extend_from_slice(b"-ERR argument must be between 2 and 2147483647\r\n");
+                }
+            } else if p_str == "slowlog-entry-max-string-len" {
+                if let Ok(v) = val_str.parse::<usize>() {
+                    if v < 1 {
+                        out.extend_from_slice(
+                            b"-ERR argument must be between 1 and 2147483647\r\n",
+                        );
+                    } else {
+                        crate::slowlog::SLOWLOG_ENTRY_MAX_STRING_LEN
+                            .store(v, std::sync::atomic::Ordering::Relaxed);
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                } else {
+                    out.extend_from_slice(b"-ERR argument must be between 1 and 2147483647\r\n");
+                }
             } else if p_str == "resetstat" {
                 router.reset_command_stats().await;
+                crate::slowlog::reset_slowlog_stats();
                 out.extend_from_slice(b"+OK\r\n");
             } else if p_str == "maxclients" {
                 if let Ok(n) = val_str.parse::<usize>() {
@@ -6818,13 +6963,54 @@ async fn execute_command(
             out.extend_from_slice(b"+OK\r\n");
             false
         }
-        Command::Slowlog(sub) => {
-            if sub.eq_ignore_ascii_case(b"reset") {
-                out.extend_from_slice(b"+OK\r\n");
-            } else if sub.eq_ignore_ascii_case(b"len") {
-                out.extend_from_slice(b":0\r\n");
+        Command::Slowlog(args) => {
+            let sub = if !args.is_empty() {
+                args[0].to_ascii_lowercase()
             } else {
-                out.extend_from_slice(b"*0\r\n");
+                b"get".to_vec()
+            };
+            if sub == b"reset" {
+                crate::slowlog::slowlog_reset();
+                out.extend_from_slice(b"+OK\r\n");
+            } else if sub == b"len" {
+                let len = crate::slowlog::slowlog_len();
+                out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
+            } else if sub == b"help" {
+                let help_lines = [
+                    "SLOWLOG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                    "GET [<count>]",
+                    "    Return top <count> entries from the slowlog (default: 10, -1 for all).",
+                    "LEN",
+                    "    Return the length of the slowlog.",
+                    "RESET",
+                    "    Reset the slowlog, clearing all entries.",
+                    "HELP",
+                    "    Return top-level help about SLOWLOG subcommands.",
+                ];
+                out.extend_from_slice(format!("*{}\r\n", help_lines.len()).as_bytes());
+                for line in help_lines {
+                    out.extend_from_slice(format!("${}\r\n{}\r\n", line.len(), line).as_bytes());
+                }
+            } else {
+                let count = if args.len() > 1 {
+                    match std::str::from_utf8(&args[1])
+                        .ok()
+                        .and_then(|s| s.parse::<i64>().ok())
+                    {
+                        Some(c) if c < -1 => {
+                            out.extend_from_slice(
+                                b"-ERR count should be greater than or equal to -1\r\n",
+                            );
+                            return false;
+                        }
+                        Some(c) => Some(c),
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                let entries = crate::slowlog::slowlog_get(count);
+                crate::slowlog::write_slowlog_entries_resp(&entries, out);
             }
             false
         }
@@ -10246,13 +10432,54 @@ pub fn execute_local_command(
             out.extend_from_slice(b"+OK\r\n");
             false
         }
-        Command::Slowlog(sub) => {
-            if sub.eq_ignore_ascii_case(b"reset") {
-                out.extend_from_slice(b"+OK\r\n");
-            } else if sub.eq_ignore_ascii_case(b"len") {
-                out.extend_from_slice(b":0\r\n");
+        Command::Slowlog(args) => {
+            let sub = if !args.is_empty() {
+                args[0].to_ascii_lowercase()
             } else {
-                out.extend_from_slice(b"*0\r\n");
+                b"get".to_vec()
+            };
+            if sub == b"reset" {
+                crate::slowlog::slowlog_reset();
+                out.extend_from_slice(b"+OK\r\n");
+            } else if sub == b"len" {
+                let len = crate::slowlog::slowlog_len();
+                out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
+            } else if sub == b"help" {
+                let help_lines = [
+                    "SLOWLOG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                    "GET [<count>]",
+                    "    Return top <count> entries from the slowlog (default: 10, -1 for all).",
+                    "LEN",
+                    "    Return the length of the slowlog.",
+                    "RESET",
+                    "    Reset the slowlog, clearing all entries.",
+                    "HELP",
+                    "    Return top-level help about SLOWLOG subcommands.",
+                ];
+                out.extend_from_slice(format!("*{}\r\n", help_lines.len()).as_bytes());
+                for line in help_lines {
+                    out.extend_from_slice(format!("${}\r\n{}\r\n", line.len(), line).as_bytes());
+                }
+            } else {
+                let count = if args.len() > 1 {
+                    match std::str::from_utf8(&args[1])
+                        .ok()
+                        .and_then(|s| s.parse::<i64>().ok())
+                    {
+                        Some(c) if c < -1 => {
+                            out.extend_from_slice(
+                                b"-ERR count should be greater than or equal to -1\r\n",
+                            );
+                            return false;
+                        }
+                        Some(c) => Some(c),
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                let entries = crate::slowlog::slowlog_get(count);
+                crate::slowlog::write_slowlog_entries_resp(&entries, out);
             }
             false
         }
