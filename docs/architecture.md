@@ -82,7 +82,33 @@ Rudis employs a **Thread-Per-Core (Shared-Nothing)** multi-reactor architecture 
 
 ---
 
-## 3. Life of a Command Request
+## 3. Memory Layout & Cache Optimization
+
+High-throughput thread-per-core architectures are frequently memory-bandwidth bound. Rudis enforces compact data structure layouts to maximize CPU L1/L2/L3 cache line utilization:
+
+```
+                  RudisEntry (88 Bytes Total)
+  ┌─────────────────────────┬─────────────────────────┬─────────────────────────┐
+  │      key: Bytes         │   val: RudisValue       │  expire_at: Option<Inst>│
+  │       (24 Bytes)        │       (40 Bytes)        │       (24 Bytes)        │
+  └─────────────────────────┴─────────────────────────┴─────────────────────────┘
+```
+
+1. **Boxed Large Variants in `RudisValue` (40 Bytes)**:
+   - In Rust, an enum's size is determined by its largest variant. Collections like `RudisHashMap`, `RudisSet`, `RudisZSet`, and `RudisStream` are boxed (`Box<T>`).
+   - This shrinks `RudisValue` from 88 bytes down to **40 bytes** (-54.5%), ensuring string and scalar values incur minimal memory overhead.
+2. **`RudisEntry` Cache Line Density (88 Bytes)**:
+   - Shrunk from 136 bytes to **88 bytes** (-35.3%), significantly improving CPU cache locality during hash probe traversals.
+3. **Sparse Cluster Slot States**:
+   - Instead of allocating dense 16,384-element vectors across all 16 shards ($16 \times 16{,}384 \times 32\text{B} = 8.4\text{ MB}$), `Router` uses a sparse `HashMap<u16, SlotState>`, eliminating redundant boot allocations.
+4. **SPSC Queue Footprint**:
+   - Each inter-shard mailbox uses a compact 256-slot ring buffer with an overflow queue for extreme bursts, keeping cross-shard channel matrix memory minimal ($16 \times 16 \times 256 = 65{,}536$ total slots).
+5. **THP Disablement**:
+   - Boot-time `libc::prctl(PR_SET_THP_DISABLE, 1)` prevents the Linux kernel from promoting 4KB allocations to 2MB Transparent Huge Pages, eliminating COW page duplication penalties.
+
+---
+
+## 4. Life of a Command Request
 
 When a client sends a command to Rudis, it is processed through one of two execution paths depending on key ownership:
 
@@ -125,7 +151,7 @@ sequenceDiagram
 
 ---
 
-## 4. Parallel Cross-Shard Pipeline Squashing
+## 5. Parallel Cross-Shard Pipeline Squashing
 
 When a client sends pipelined requests or multi-key commands (`MGET`, `MSET`, `DEL`), naive implementations dispatch requests sequentially or one key at a time, incurring $O(K)$ channel round-trips.
 

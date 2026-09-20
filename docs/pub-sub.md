@@ -31,11 +31,11 @@ Rudis solves this with two major innovations:
 
 | Type | Location | Architectural Role |
 | :--- | :--- | :--- |
-| `PubSubHub` | `src/pubsub.rs` | Global registry tracking active channel subscriptions and striped presence bitmasks. |
-| `StripedPresenceBitmask` | `src/pubsub.rs` | 16-stripe atomic bitmask array (`AtomicU64`) recording subscriber presence per shard. |
-| `ShardPubSub` | `src/pubsub.rs` | Thread-local subscription table mapping channels to local client connection handles. |
-| `ShardedPubSubRegistry` | `src/pubsub.rs` | Slot-bound subscription map managing `SSUBSCRIBE` bindings on individual shards. |
-| `PubSubMessage` | `src/pubsub.rs` | Zero-copy reference-counted message wrapper utilizing `bytes::Bytes` for payload sharing. |
+| `PubSubHub` | `src/pubsub.rs` | Per-shard subscription hub tracking local `channels`, `patterns`, `shard_channels`, and bounded `clients` egress senders. |
+| `ShardedPresenceTable` | `src/pubsub.rs` | 16-stripe atomic bitmask array (`[AtomicU64; 16]`) tracking which shards host subscribers for standard and pattern channels. |
+| `build_pubsub_frame` | `src/pubsub.rs` | Generates standardized RESP2/RESP3 push frame buffers (`message`, `smessage`) returning zero-copy `bytes::Bytes`. |
+| `build_pubsub_pframe` | `src/pubsub.rs` | Generates standardized RESP2/RESP3 pattern push frame buffers (`pmessage`) returning zero-copy `bytes::Bytes`. |
+| `flume::Sender<Bytes>` | `src/pubsub.rs` | Bounded connection-local egress channel delivering zero-copy `Bytes` with subscriber backpressure protection. |
 
 ---
 

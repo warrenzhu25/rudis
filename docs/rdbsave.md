@@ -41,12 +41,33 @@ Rudis eliminates `fork()` entirely. Worker shards serialize snapshot records inc
 ### Sequential Shard Chunk Pipeline:
 1. When `BGSAVE` or `SAVE` is triggered, the coordinator instructs worker shards to serialize their local keyspace into standardized RDB format.
 2. Rather than gathering multi-gigabyte memory buffers simultaneously across all 16 shards, Rudis streams remote shard RDB chunks **sequentially one-by-one**.
-3. As each shard's chunk is flushed to disk via `io_uring`, the buffer is immediately deallocated and reclaimed, ensuring peak memory during snapshots remains minimal ($< 520\text{ MB}$ total RSS on 16 cores).
-4. CRC64 checksums are computed incrementally across chunks using vector SIMD instructions.
+3. As each shard's chunk is flushed to disk via `io_uring`, the buffer is immediately deallocated and reclaimed, ensuring peak memory during snapshots remains minimal ($473.7\text{ MB}$ peak RSS under active write load on 16 cores).
+4. CRC64 checksums are computed incrementally across chunks using vector SIMD instructions (`crc64_update`).
 
 ---
 
-## 3. Sub-Millisecond Reflink Snapshots (`ioctl(FICLONE)`)
+## 3. Kernel Transparent Huge Pages (THP) Disablement
+
+Linux Transparent Huge Pages (THP) can silently ruin in-memory datastore performance:
+- With THP enabled, the kernel promotes standard 4KB physical pages into 2MB huge pages.
+- When any copy-on-write operation or minor mutation occurs, Linux must copy the entire 2MB block rather than 4KB, causing a **512x COW amplification** and massive RSS bloat.
+- On boot, Rudis explicitly calls `libc::prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0)`:
+  - Opts out the process and all worker threads from 2MB THP promotion.
+  - Reduces boot memory by 61MB across 16 cores.
+  - Keeps page faults fine-grained at 4KB.
+
+---
+
+## 4. Sequential AOF Compaction (`BGREWRITEAOF`)
+
+When running Append-Only File (AOF) persistence, compaction is handled via `BGREWRITEAOF`:
+- **64KB `BufWriter` Direct Streaming**: In `rewrite_shard_aof`, canonical RESP commands (`SET`, `HSET`, `RPUSH`) are written directly to disk via a 64KB `BufWriter`, completely eliminating large heap-allocated `Vec<u8>` buffers (reducing allocation from 160MB to 1MB).
+- **Sequential Shard Execution**: Remote shards are rewritten sequentially one-by-one in `perform_rewrite_aof`, preventing 15 worker cores from competing for disk I/O and spiking memory concurrently.
+- **Continuous Live Logging**: Once rewrite completes, the active `AofWriter` atomically reopens the file and streams incremental operations with zero dropped writes.
+
+---
+
+## 5. Sub-Millisecond Reflink Snapshots (`ioctl(FICLONE)`)
 
 On modern copy-on-write filesystems (XFS, Btrfs, OpenZFS), Rudis leverages Linux kernel `ioctl(FICLONE)` reflink capabilities for tiered and persisted storage:
 
@@ -62,10 +83,13 @@ ioctl(dest_fd, FICLONE, src_fd);
 
 ---
 
-## 4. Snapshot Isolation Guarantees
+## 6. Snapshot Isolation & Telemetry (16 Cores, AMD EPYC)
 
-| Engine | Mechanism | Memory Overhead during Snapshot | Main Thread Latency Impact |
-| :--- | :--- | :---: | :---: |
-| **Redis 7** | Process `fork()` + Linux CoW | Up to **+200% RAM** (Can trigger OOM) | 10–200 ms page table freeze |
-| **Dragonfly** | Fiber-level DashTable versioning | +15% to +35% RAM | Negligible |
-| **Rudis** | Sequential `io_uring` + `FICLONE` Reflink | **< 5% RAM Spike** | **Sub-millisecond tail latency** |
+| Metric / Property | Redis 7.2 | Dragonfly v1.39 | Rudis (16 Cores) |
+| :--- | :---: | :---: | :---: |
+| **Snapshot Mechanism** | Process `fork()` + Linux CoW | Fiber-level DashTable versioning | **Sequential `io_uring` + `FICLONE` Reflink** |
+| **Baseline RSS** | ~220 MB | 219.8 MB | **357.6 MB** |
+| **BGSAVE Peak RSS** | > 650 MB (up to 3x) | 263.0 MB | **473.7 MB** |
+| **Throughput during BGSAVE** | Stalled / degraded | 1.84M ops/s | **2.18M ops/s (+18.1% vs DF)** |
+| **Main Thread Latency Impact**| 10–200 ms page freeze | Negligible | **Sub-millisecond p99 (0.47 ms)** |
+| **Reflink `FICLONE` Support** | No | No | **Yes (< 1 ms instant checkpoint)** |

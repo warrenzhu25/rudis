@@ -41,11 +41,11 @@ flowchart LR
 
 | Type | Location | Architectural Role |
 | :--- | :--- | :--- |
-| `ReplicationHub` | `src/replication.rs` | Coordinates global replication state, flow registration, and command propagation. |
-| `ReplicaInfo` | `src/replication.rs` | Tracks active replica metadata: role (`Master`/`Slave`), client port, and capabilities. |
-| `ShardFlow` | `src/replication.rs` | Represents an active TCP socket streaming mutations directly from a worker core. |
-| `MasterFlowSender` | `src/replication.rs` | Thread-local sender channel pushing shard-local mutations into the flow socket buffer. |
-| `PsyncResult` | `src/replication.rs` | Encapsulates replication handshake negotiation (`FullResync`, `PartialSync`, `WaitOffset`). |
+| `ReplicationHub` | `src/replication.rs` | Coordinates global replication state, flow registration, and multi-threaded command propagation. |
+| `ShardReplicaFlow` | `src/replication.rs` | Represents an active per-shard replication flow with client ID, LSN sequence, and direct streaming channel. |
+| `ConnectedReplica` | `src/replication.rs` | Tracks connected replica metadata, listening port, and replication offset acknowledgment. |
+| `ReplicationBacklog` | `src/replication.rs` | Circular byte buffer supporting Redis PSYNC2 partial resynchronization without full RDB transfer. |
+| `ReplicationRole` | `src/replication.rs` | Current node state (`Master` with primary/secondary replids or `Slave` with master link status). |
 
 ---
 

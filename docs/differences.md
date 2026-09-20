@@ -51,3 +51,22 @@ This document summarizes the architectural, operational, and semantic difference
 
 * **Redis** requires external proxy layers (like Twemproxy or Envoy) to speak Memcached protocol.
 * **Rudis** natively accepts both Redis RESP commands and Memcached text-based commands (`set`, `get`, `incr`, `decr`, `stats`, `quit`) on the same listening port (`6379`) with zero configuration. Framing is automatically detected upon initial connection read, sharing database 0 with zero proxy overhead.
+
+---
+
+## 5. Pub/Sub Messaging & Sharded Delivery
+
+* **Redis**: Standard Pub/Sub broadcasts messages across the entire cluster bus. Redis 7 introduced `SPUBLISH` for slot-bound pub/sub.
+* **Dragonfly**: Backed by a 16-shard `ShardedHashMap` with fine-grained mutexes and RCU pointer swaps.
+* **Rudis**: Uses a **16-stripe atomic presence bitmask** (`ShardedPresenceTable`) to completely eliminate cross-shard broadcast storms for global `PUBLISH`, and point-to-point CRC16 slot routing for Redis 7 `SPUBLISH` with zero-copy `bytes::Bytes` delivery and bounded subscriber queue backpressure.
+
+---
+
+## 6. Document Store & RediSearch Engine
+
+* **Redis**: Requires loading external dynamic C modules (`rejson.so`, `redisearch.so`).
+* **Dragonfly**: Implements a native subset of JSON and search commands.
+* **Rudis**: Natively integrates RFC 8259 RedisJSON document indexing and RediSearch with:
+  - **Balanced `RangeTree`**: $O(\log N + K)$ numeric range indexing replacing naive linear filter scans.
+  - **`FT.AGGREGATE` Pipeline**: Full multi-stage execution pipeline supporting `GROUPBY`, `REDUCE` (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), `APPLY` arithmetic expressions with recursive-descent evaluation, `SORTBY`, and `LIMIT`.
+  - **Hybrid Vector Fusion**: Reciprocal Rank Fusion (RRF) combining Okapi BM25 full-text rank scores with HNSW vector cosine similarity.
