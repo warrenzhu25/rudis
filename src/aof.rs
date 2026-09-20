@@ -96,12 +96,55 @@ impl AofWriter {
         Ok(())
     }
 
+    pub async fn flush_rc(aof: &std::rc::Rc<std::cell::RefCell<Self>>) -> std::io::Result<()> {
+        let chunk_and_off = aof.borrow_mut().take_flush_chunk();
+        if let Some((file, chunk, offset)) = chunk_and_off {
+            let (res, _) = file.write_all_at(chunk, offset).await;
+            res?;
+        }
+        Ok(())
+    }
+
     pub async fn sync(&mut self) -> std::io::Result<()> {
         self.flush().await?;
         if let Some(file) = &self.file {
             file.sync_data().await?;
         }
         Ok(())
+    }
+
+    pub async fn reopen_after_rewrite(
+        aof: &std::rc::Rc<std::cell::RefCell<Self>>,
+    ) -> std::io::Result<u64> {
+        let path = aof.borrow().path.clone();
+        if path.as_os_str().is_empty() {
+            return Ok(0);
+        }
+        let file = monoio::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&path)
+            .await?;
+        let new_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+        let rc_file = std::rc::Rc::new(file);
+        let chunk_and_off = {
+            let mut writer = aof.borrow_mut();
+            writer.file = Some(rc_file.clone());
+            writer.offset = new_size;
+            if !writer.buffer.is_empty() {
+                let chunk = std::mem::replace(&mut writer.buffer, Vec::with_capacity(65536));
+                let off = writer.offset;
+                writer.offset += chunk.len() as u64;
+                Some((chunk, off))
+            } else {
+                None
+            }
+        };
+        if let Some((chunk, off)) = chunk_and_off {
+            let (res, _) = rc_file.write_all_at(chunk, off).await;
+            res?;
+        }
+        Ok(new_size)
     }
 }
 
@@ -1180,7 +1223,56 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
                 }
                 count += 1;
             }
+            crate::table::RudisValue::HyperLogLog(hll) => {
+                buf.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$");
+                buf.extend_from_slice(k.len().to_string().as_bytes());
+                buf.extend_from_slice(b"\r\n");
+                buf.extend_from_slice(k);
+                buf.extend_from_slice(b"\r\n$");
+                buf.extend_from_slice(hll.len().to_string().as_bytes());
+                buf.extend_from_slice(b"\r\n");
+                buf.extend_from_slice(hll.as_ref());
+                buf.extend_from_slice(b"\r\n");
+                count += 1;
+            }
+            crate::table::RudisValue::Stream(stream) if !stream.entries.is_empty() => {
+                for (sid, fields) in &stream.entries {
+                    let id_str = sid.to_string();
+                    let num_args = 2 + 1 + fields.len() * 2;
+                    buf.extend_from_slice(
+                        format!("*{}\r\n$4\r\nXADD\r\n${}\r\n", num_args, k.len()).as_bytes(),
+                    );
+                    buf.extend_from_slice(k);
+                    buf.extend_from_slice(
+                        format!("\r\n${}\r\n{}\r\n", id_str.len(), id_str).as_bytes(),
+                    );
+                    for (f, v) in fields {
+                        buf.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
+                        buf.extend_from_slice(f.as_ref());
+                        buf.extend_from_slice(format!("\r\n${}\r\n", v.len()).as_bytes());
+                        buf.extend_from_slice(v.as_ref());
+                        buf.extend_from_slice(b"\r\n");
+                    }
+                    count += 1;
+                }
+            }
             _ => {}
+        }
+
+        if !matches!(val_ref, crate::table::RudisValue::String(_))
+            && let Some(exp) = entry.expire_at
+        {
+            let rem_ms = exp.duration_since(now).as_millis() as u64;
+            let rem_ms_str = rem_ms.to_string();
+            buf.extend_from_slice(b"*3\r\n$7\r\nPEXPIRE\r\n$");
+            buf.extend_from_slice(k.len().to_string().as_bytes());
+            buf.extend_from_slice(b"\r\n");
+            buf.extend_from_slice(k);
+            buf.extend_from_slice(b"\r\n$");
+            buf.extend_from_slice(rem_ms_str.len().to_string().as_bytes());
+            buf.extend_from_slice(b"\r\n");
+            buf.extend_from_slice(rem_ms_str.as_bytes());
+            buf.extend_from_slice(b"\r\n");
         }
     }
 
@@ -1295,6 +1387,51 @@ mod tests {
                 .unwrap()
                 .contains("rewrite")
         );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_aof_writer_reopen_and_continuous_logging() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("rudis-aof-reopen-unit-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let aof_file = temp_dir.join("appendonly-0.aof");
+
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let writer = std::rc::Rc::new(std::cell::RefCell::new(
+                AofWriter::open(aof_file.clone()).await.unwrap(),
+            ));
+            writer
+                .borrow_mut()
+                .append(b"*3\r\n$3\r\nSET\r\n$2\r\nk1\r\n$2\r\nv1\r\n");
+            AofWriter::flush_rc(&writer).await.unwrap();
+
+            // Populate db with k1 and rewrite
+            let mut db = ShardDb::new(6379);
+            db.set(Bytes::from("k1"), Bytes::from("v1"), None);
+            let count = rewrite_shard_aof(&mut db, &temp_dir, 0).unwrap();
+            assert_eq!(count, 1);
+
+            // Reopen writer after rewrite and log k2
+            let new_size = AofWriter::reopen_after_rewrite(&writer).await.unwrap();
+            assert!(new_size > 0);
+            writer
+                .borrow_mut()
+                .append(b"*3\r\n$3\r\nSET\r\n$2\r\nk2\r\n$2\r\nv2\r\n");
+            AofWriter::flush_rc(&writer).await.unwrap();
+
+            // Replay and verify both k1 and k2
+            let mut new_db = ShardDb::new(6379);
+            let replayed = replay_aof(&aof_file, &mut new_db).unwrap();
+            assert_eq!(replayed, 2);
+            assert_eq!(new_db.get(b"k1"), Some(Bytes::from("v1")));
+            assert_eq!(new_db.get(b"k2"), Some(Bytes::from("v2")));
+        });
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

@@ -7814,6 +7814,17 @@ fn test_aof_bgrewriteaof_compaction_e2e() {
     let compacted_size1 = aof_file1.metadata().map(|m| m.len()).unwrap_or(0);
     assert!(compacted_size0 + compacted_size1 > 0);
 
+    // 3.5. Execute new writes on client1 AFTER rewrite to verify logging continues on compacted AOF files
+    assert_eq!(
+        send_and_read(&mut client1, b"SET after_rewrite_key after_rewrite_val\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client1, b"HSET myhash f3 v3\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(send_and_read(&mut client1, b"SAVE\r\n"), "+OK\r\n");
+
     drop(client1);
     thread::sleep(Duration::from_millis(200));
 
@@ -7827,7 +7838,7 @@ fn test_aof_bgrewriteaof_compaction_e2e() {
 
     let mut client2 = TcpStream::connect(format!("127.0.0.1:{}", port2)).unwrap();
 
-    // 5. Verify all compacted state restored cleanly across shards
+    // 5. Verify all compacted state and subsequent writes restored cleanly across shards
     assert_eq!(
         send_and_read(&mut client2, b"GET counter\r\n"),
         "$2\r\n49\r\n"
@@ -7836,6 +7847,14 @@ fn test_aof_bgrewriteaof_compaction_e2e() {
     assert_eq!(
         send_and_read(&mut client2, b"HGET myhash f1\r\n"),
         "$2\r\nv1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client2, b"HGET myhash f3\r\n"),
+        "$2\r\nv3\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client2, b"GET after_rewrite_key\r\n"),
+        "$17\r\nafter_rewrite_val\r\n"
     );
     assert_eq!(
         send_and_read(&mut client2, b"JSON.GET doc1 $.val\r\n"),

@@ -49,7 +49,7 @@ own number as a `##` section in this file.
 | **11** | **Redis Cluster Topology & Gossip Protocol** | `src/cluster.rs` | Plain-text line gossip protocol (not binary), full-state resend every 500ms, unilateral (non-quorum) failure detection, a real majority-vote replica election. Slot redirection is genuinely wired into the command path via `connection.rs` + `ClusterHub`, now including the pipelined squashed-command path. |
 | **12** | **CRDT Data Types & Manual Multi-Region Sync** | `src/crdt.rs` | Real LWW-Register/OR-Set/PN-Counter CRDTs with a CAS-based Hybrid Logical Clock. Single-key commands now correctly route through the normal key-slot mechanism, and `CRDT.DUMP`/`MERGE`/`GC` now fan out to every shard — but sync between separate Rudis *instances* is still entirely manual, no automatic network transport. |
 | **13** | **Lua Scripting & Redis 7 Functions Engine** | `src/scripting.rs` | A fresh `mlua::Lua` VM per call (no persistent interpreter or bytecode cache), SHA1-cached script/library *source text*, real `redis.call`/`redis.pcall` via the normal command-execution path. `FCALL`'s AOF-bypass bug is now fixed. |
-| **14** | **Persistence & Replication Engines** | `src/replication.rs`, `src/aof.rs` | Still no AOF rewrite/compaction — the file grows forever. Partial `PSYNC` resync (`+CONTINUE`) is now fully supported on both master and replica sides with automated reconnect and PSYNC2 failover handover. A real custom RDB binary format with a CRC64 trailer. |
+| **14** | **Persistence & Replication Engines** | `src/replication.rs`, `src/aof.rs` | AOF rewrite and compaction via `BGREWRITEAOF` is fully implemented across shards with atomic swap and live reopen. Partial `PSYNC` resync (`+CONTINUE`) is fully supported on both master and replica sides with automated reconnect and PSYNC2 failover handover. A real custom RDB binary format with a CRC64 trailer. |
 | **15** | **Security, Memory Allocator & TLS** | `src/acl.rs`, `src/allocator.rs`, `src/tls.rs` | ACL now hashes passwords (SHA1 with a hardcoded global salt — weak, and the plaintext is *still also* stored) and genuinely enforces per-command/per-key permissions. TLS is now wired to a `--tls-port` listener, but has a **critical live bug**: its kTLS fast-path marks itself active without ever installing kernel key material, so it silently sends all "encrypted" traffic in cleartext. |
 | **16** | **JSON Document Store & JSONPath Engine** | `src/json.rs` | A real, hand-written JSONPath subset (no recursive descent, no filter expressions) over `serde_json::Value`. Single-key commands genuinely route per-shard, unlike Vector (08); `JSON.MGET` is still sequential per-key, unlike the already-fixed `MGET`/`MSET`. Not included in RDB persistence. |
 | **17** | **Geospatial Commands** | `src/geo.rs` | Owns zero storage — every `GEO*` command is a thin layer over `ZADD`/`ZSCORE`/`ZRANGE` (Component 05), matching real Redis's own architecture. `GEORADIUS`/`GEORADIUSBYMEMBER`/`GEOSEARCH` are three independent O(N) full-set brute-force scans, not geohash-neighborhood-pruned. |
@@ -4673,8 +4673,10 @@ This subsystem covers two related but independent durability mechanisms:
    to a full RDB snapshot otherwise — see §4.3 for the update to this (this doc previously,
    correctly, documented this as entirely unimplemented; it has since been built).
 
-**Update**: AOF rewrite/compaction is still entirely absent (§4.1 — unchanged). Partial
-resynchronization is now real on both the **master** and **replica** sides
+**Update**: AOF rewrite/compaction via `BGREWRITEAOF` is fully implemented across shards
+(§4.1), snapshotting non-expired table entries, JSON documents, sets, lists, hashes, streams,
+and preserving TTLs, with atomic temp-file rename and live reopen on active writers. Partial
+resynchronization is real on both the **master** and **replica** sides
 (§4.3) — `run_replica_worker` tracks its `master_replid` and `master_repl_offset`,
 reconnects automatically with `PSYNC <replid> <offset>`, and applies `+CONTINUE` diffs
 without full RDB snapshots.
@@ -4683,10 +4685,10 @@ without full RDB snapshots.
 
 ### 2. Key Invariants & Concurrency Constraints
 
-1. **AOF is append-only, forever.** `AofWriter::append` only ever grows `self.buffer`
-   (later flushed to disk via `write_all_at` at the current end-of-file `offset`). There is
-   no `BGREWRITEAOF`, no periodic compaction, and no mechanism that ever shrinks or rewrites
-   the file — it grows for as long as the process runs with AOF enabled.
+1. **AOF compaction via `BGREWRITEAOF` is supported.** `AofWriter::append` grows `self.buffer`
+   (later flushed to disk via `write_all_at` at the current end-of-file `offset`). Periodic
+   or explicit `BGREWRITEAOF` snapshots memory state to a temporary file, syncs it, atomically
+   renames it to replace the AOF file, and reopens `AofWriter` on the new file at the new offset.
 2. **Partial resync is supported on both master and replica sides.**
    `run_master_replica_stream` (`src/connection.rs`) inspects the `PSYNC` command's
    replid/offset arguments via `ReplicationHub::try_partial_resync`, and replies `+CONTINUE <replid>\r\n<backlog-diff-bytes>`
@@ -5057,7 +5059,7 @@ state currently is at request time.
 
 ### 7. Future Improvements
 
-- **High — implement AOF rewrite/compaction (§4.1).** An AOF-enabled node that runs for a long time under sustained writes has an ever-growing file and an ever-growing restart replay cost, with no relief mechanism (no `BGREWRITEAOF` equivalent exists at all). Since `RudisTable` already has a working RDB chunk format (Component 05) used for full resync, the natural implementation is: periodically (or on an explicit `BGREWRITEAOF`-equivalent command) snapshot the current dataset to a fresh AOF-equivalent-from-RDB, atomically swap it in for the old growing file, and discard the old one — reusing existing RDB serialization rather than building new compaction logic from scratch.
+- **RESOLVED — AOF rewrite and compaction via `BGREWRITEAOF` (§4.1).** `rewrite_shard_aof` snapshots live state across shards (strings, hashes, lists, sets, zsets, streams, hyperloglog, json) with TTL preservation into an atomic temporary file, and `AofWriter::reopen_after_rewrite` live-reopens the compacted file across coordinator and worker shards so subsequent write traffic continues uninterrupted. Verified by `test_aof_compaction_and_rewrite`, `test_aof_writer_reopen_and_continuous_logging`, and `test_aof_bgrewriteaof_compaction_e2e`.
 - **RESOLVED — partial resynchronization on master and replica (§2.3/§4.3).** The master genuinely serves `+CONTINUE` with just the missing backlog bytes when a valid replid+offset is presented, and `run_replica_worker` now tracks its `master_replid` and `master_repl_offset`, automatically reconnects via `'reconnect_loop`, sends `PSYNC <replid> <offset>`, and applies `+CONTINUE` diff streams directly without requesting full RDB re-transfer. Tested via `test_replica_partial_resync_and_psync2_failover` and `test_replica_partial_resync_reconnect_e2e`.
 - **Low — derive `replid` from something closer to Redis's real generation scheme**, or at least document that the current `fxhash`-over-port-and-timestamp approach (§3) is a real, working, but not cryptographically-derived identifier — same category of note as Component 11's node-ID generation.
 - **Low — make the 1MB `ReplicationBacklog` size and the 50ms/~1s AOF flush/fsync cadence configurable** rather than hardcoded, once partial resync (above) makes the backlog size an operationally meaningful tuning knob rather than just an `INFO`-reporting detail.

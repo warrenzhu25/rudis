@@ -2396,6 +2396,9 @@ impl Router {
             crate::aof::rewrite_shard_aof(&mut db, &self.db_dir, self.shard_id)
                 .map_err(|e| e.to_string())?
         };
+        if let Some(aof) = &self.aof {
+            let _ = crate::aof::AofWriter::reopen_after_rewrite(aof).await;
+        }
 
         let mut responders = Vec::new();
         for (sid, sender) in self.senders.iter().enumerate() {
