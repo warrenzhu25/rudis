@@ -655,6 +655,12 @@ pub fn run_shard_worker(
                                         } = cmd
                                     {
                                         has_writes = true;
+                                        if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                            crate::connection::touch_watched_key(r.port, key.as_ref());
+                                        }
+                                        if crate::connection::HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                            crate::connection::notify_key_invalidation(r.port, key.as_ref(), 0);
+                                        }
                                         r.local_db.borrow_mut().table.set_with_hash(key, key_hash, value, expire_in);
                                         results.push((idx, crate::shard::CompactResp::OK));
                                         continue;
@@ -972,6 +978,12 @@ pub fn run_shard_worker(
                                     } = cmd
                                 {
                                     has_writes = true;
+                                    if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                        crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
+                                    }
+                                    if crate::connection::HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                        crate::connection::notify_key_invalidation(cross_shard_router.port, key.as_ref(), 0);
+                                    }
                                     db.table.set_with_hash(key, key_hash, value, expire_in);
                                     results.push((idx, crate::shard::CompactResp::OK));
                                     continue;

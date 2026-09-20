@@ -13431,6 +13431,12 @@ async fn execute_commands_squashed(
                     } = cmd
                 {
                     has_local_writes = true;
+                    if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                        touch_watched_key(router.port, key.as_ref());
+                    }
+                    if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                        notify_key_invalidation(router.port, key.as_ref(), client_id);
+                    }
                     local_db
                         .table
                         .set_with_hash(key, key_hash, value, expire_in);
@@ -13445,6 +13451,9 @@ async fn execute_commands_squashed(
                         Ok(val) => {
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                 touch_watched_key(router.port, key.as_ref());
+                            }
+                            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                notify_key_invalidation(router.port, key.as_ref(), client_id);
                             }
                             if val == 1 {
                                 responses[idx] = crate::shard::CompactResp::INT_1;
@@ -13480,6 +13489,9 @@ async fn execute_commands_squashed(
                         has_local_writes = true;
                         if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                             touch_watched_key(router.port, keys[0].as_ref());
+                        }
+                        if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                            notify_key_invalidation(router.port, keys[0].as_ref(), client_id);
                         }
                         responses[idx] = crate::shard::CompactResp::INT_1;
                     } else {
@@ -13521,6 +13533,9 @@ async fn execute_commands_squashed(
                         Ok(count) => {
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                 touch_watched_key(router.port, key.as_ref());
+                            }
+                            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                notify_key_invalidation(router.port, key.as_ref(), client_id);
                             }
                             if count == 1 {
                                 responses[idx] = crate::shard::CompactResp::INT_1;
@@ -13574,6 +13589,9 @@ async fn execute_commands_squashed(
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                 touch_watched_key(router.port, key.as_ref());
                             }
+                            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                notify_key_invalidation(router.port, key.as_ref(), client_id);
+                            }
                             if count == 1 {
                                 responses[idx] = crate::shard::CompactResp::INT_1;
                             } else if count == 0 {
@@ -13604,6 +13622,9 @@ async fn execute_commands_squashed(
                         Ok((count, incr_score)) => {
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                 touch_watched_key(router.port, key.as_ref());
+                            }
+                            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                notify_key_invalidation(router.port, key.as_ref(), client_id);
                             }
                             if flags.incr {
                                 local_buf.clear();
@@ -13641,6 +13662,9 @@ async fn execute_commands_squashed(
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                 touch_watched_key(router.port, key.as_ref());
                             }
+                            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                notify_key_invalidation(router.port, key.as_ref(), client_id);
+                            }
                             if len == 1 {
                                 responses[idx] = crate::shard::CompactResp::INT_1;
                             } else if len == 0 {
@@ -13666,6 +13690,9 @@ async fn execute_commands_squashed(
                                 if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                     touch_watched_key(router.port, key.as_ref());
                                 }
+                                if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                    notify_key_invalidation(router.port, key.as_ref(), client_id);
+                                }
                                 responses[idx] = CompactResp::from_owned_bulk(v);
                                 continue;
                             }
@@ -13689,6 +13716,15 @@ async fn execute_commands_squashed(
                                     has_local_writes = true;
                                     if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                         touch_watched_key(router.port, key.as_ref());
+                                    }
+                                    if HAS_TRACKING_CLIENTS
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                    {
+                                        notify_key_invalidation(
+                                            router.port,
+                                            key.as_ref(),
+                                            client_id,
+                                        );
                                     }
                                 }
                             }
@@ -13740,6 +13776,9 @@ async fn execute_commands_squashed(
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                 touch_watched_key(router.port, key.as_ref());
                             }
+                            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                notify_key_invalidation(router.port, key.as_ref(), client_id);
+                            }
                             responses[idx] = CompactResp::from_integer(val);
                             continue;
                         }
@@ -13757,6 +13796,9 @@ async fn execute_commands_squashed(
                                 has_local_writes = true;
                                 if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                     touch_watched_key(router.port, key.as_ref());
+                                }
+                                if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                    notify_key_invalidation(router.port, key.as_ref(), client_id);
                                 }
                                 responses[idx] = CompactResp::from_owned_bulk(v);
                                 continue;
@@ -13781,6 +13823,15 @@ async fn execute_commands_squashed(
                                     has_local_writes = true;
                                     if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                         touch_watched_key(router.port, key.as_ref());
+                                    }
+                                    if HAS_TRACKING_CLIENTS
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                    {
+                                        notify_key_invalidation(
+                                            router.port,
+                                            key.as_ref(),
+                                            client_id,
+                                        );
                                     }
                                 }
                             }

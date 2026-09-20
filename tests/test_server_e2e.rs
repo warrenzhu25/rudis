@@ -11302,3 +11302,67 @@ fn test_requirepass_and_sha256_acl_enforcement_e2e() {
     let mut unauth_client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
     assert_eq!(send_and_read(&mut unauth_client, b"PING\r\n"), "+PONG\r\n");
 }
+
+#[test]
+fn test_squashed_batch_set_watch_and_tracking_invalidation_e2e() {
+    let port = 19995;
+    start_test_server(port, 4);
+
+    // 1. WATCH invalidation by pipelined/squashed SET
+    let mut watcher = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let mut mutator = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    assert_eq!(
+        send_and_read(&mut watcher, b"WATCH watch_squash_k\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(send_and_read(&mut watcher, b"MULTI\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut watcher, b"GET watch_squash_k\r\n"),
+        "+QUEUED\r\n"
+    );
+
+    // Mutator sends pipelined batch containing SET
+    let pipeline = b"SET dummy1 v1\r\nSET watch_squash_k updated_val\r\nSET dummy2 v2\r\n";
+    mutator.write_all(pipeline).unwrap();
+    let mut resp_buf = vec![0u8; 1024];
+    let n = mutator.read(&mut resp_buf).unwrap();
+    let resp_str = String::from_utf8_lossy(&resp_buf[..n]);
+    assert!(resp_str.contains("+OK\r\n"));
+
+    // EXEC must return nil array (transaction aborted due to tainted watch)
+    let exec_resp = send_and_read(&mut watcher, b"EXEC\r\n");
+    assert_eq!(exec_resp, "*-1\r\n");
+
+    // 2. CLIENT TRACKING invalidation by pipelined/squashed SET
+    let mut tracker = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let hello_resp = send_and_read(&mut tracker, b"HELLO 3\r\n");
+    assert!(hello_resp.starts_with('%'));
+    assert_eq!(
+        send_and_read(&mut tracker, b"CLIENT TRACKING on\r\n"),
+        "+OK\r\n"
+    );
+
+    // Read key to register interest
+    assert_eq!(
+        send_and_read(&mut tracker, b"GET track_squash_k\r\n"),
+        "_\r\n"
+    );
+
+    // Mutator sends pipelined batch updating track_squash_k
+    let pipeline2 = b"SET dummy3 v3\r\nSET track_squash_k new_val\r\n";
+    mutator.write_all(pipeline2).unwrap();
+    let mut resp_buf2 = vec![0u8; 1024];
+    let n2 = mutator.read(&mut resp_buf2).unwrap();
+    let resp_str2 = String::from_utf8_lossy(&resp_buf2[..n2]);
+    assert!(resp_str2.contains("+OK\r\n"));
+
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let mut next_resp = send_and_read(&mut tracker, b"PING\r\n");
+    if !next_resp.contains("invalidate") {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        next_resp.push_str(&send_and_read(&mut tracker, b"PING\r\n"));
+    }
+    assert!(next_resp.contains("invalidate"));
+    assert!(next_resp.contains("track_squash_k"));
+}
