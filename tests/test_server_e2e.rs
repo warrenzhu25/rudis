@@ -10430,3 +10430,39 @@ fn test_fast_path_del_exists_mget_mset_e2e() {
         ":0\r\n"
     );
 }
+
+#[test]
+fn test_coalesced_cross_shard_mesh_e2e() {
+    let port = 16990;
+    let num_shards = 8;
+    start_test_server(port, num_shards);
+
+    let mut conn = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Cross-shard MSET across 8 shards
+    assert_eq!(
+        send_and_read(
+            &mut conn,
+            b"MSET mesh_k1 v1 mesh_k2 v2 mesh_k3 v3 mesh_k4 v4 mesh_k5 v5 mesh_k6 v6 mesh_k7 v7 mesh_k8 v8\r\n"
+        ),
+        "+OK\r\n"
+    );
+
+    // 2. Cross-shard MGET across 8 shards
+    let resp = send_and_read(
+        &mut conn,
+        b"MGET mesh_k1 mesh_k2 mesh_k3 mesh_k4 mesh_k5 mesh_k6 mesh_k7 mesh_k8\r\n",
+    );
+    assert!(resp.starts_with("*8\r\n"));
+    assert!(resp.contains("$2\r\nv1\r\n"));
+    assert!(resp.contains("$2\r\nv8\r\n"));
+
+    // 3. Multi-key DEL across 8 shards
+    assert_eq!(
+        send_and_read(
+            &mut conn,
+            b"DEL mesh_k1 mesh_k2 mesh_k3 mesh_k4 mesh_k5 mesh_k6 mesh_k7 mesh_k8\r\n"
+        ),
+        ":8\r\n"
+    );
+}

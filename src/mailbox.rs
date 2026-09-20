@@ -403,19 +403,23 @@ pub struct SendError;
 pub struct RecvError;
 
 /// Sender handle from one shard to a specific target shard.
-/// Pushes to a dedicated lock-free SPSC ring and conditionally notifies the target thread.
+/// Pushes to a dedicated lock-free SPSC ring and conditionally notifies the target thread
+/// only when the target is actually sleeping.
 #[derive(Clone)]
 pub struct ShardSender {
     pub target_shard: usize,
     pub ring: std::sync::Arc<SpscQueue<crate::shard::ShardMessage>>,
     pub target_notify: flume::Sender<()>,
+    pub target_sleeping: std::sync::Arc<AtomicBool>,
 }
 
 impl ShardSender {
     #[inline(always)]
     pub fn send(&self, msg: crate::shard::ShardMessage) -> Result<(), SendError> {
         self.ring.push(msg);
-        let _ = self.target_notify.try_send(());
+        if self.target_sleeping.load(Ordering::SeqCst) {
+            let _ = self.target_notify.try_send(());
+        }
         Ok(())
     }
 }
@@ -427,6 +431,7 @@ pub struct ShardReceiver {
     pub shard_id: usize,
     pub incoming_rings: Vec<std::sync::Arc<SpscQueue<crate::shard::ShardMessage>>>,
     pub notify_rx: flume::Receiver<()>,
+    pub sleeping: std::sync::Arc<AtomicBool>,
 }
 
 impl ShardReceiver {
@@ -446,9 +451,17 @@ impl ShardReceiver {
                 return Ok(msg);
             }
 
+            self.sleeping.store(true, Ordering::SeqCst);
+            if let Ok(msg) = self.try_recv() {
+                self.sleeping.store(false, Ordering::Relaxed);
+                return Ok(msg);
+            }
+
             if self.notify_rx.recv().is_err() {
+                self.sleeping.store(false, Ordering::Relaxed);
                 return self.try_recv();
             }
+            self.sleeping.store(false, Ordering::Relaxed);
             while self.notify_rx.try_recv().is_ok() {}
 
             if let Ok(msg) = self.try_recv() {
@@ -463,9 +476,17 @@ impl ShardReceiver {
                 return Ok(msg);
             }
 
+            self.sleeping.store(true, Ordering::SeqCst);
+            if let Ok(msg) = self.try_recv() {
+                self.sleeping.store(false, Ordering::Relaxed);
+                return Ok(msg);
+            }
+
             if self.notify_rx.recv_async().await.is_err() {
+                self.sleeping.store(false, Ordering::Relaxed);
                 return self.try_recv();
             }
+            self.sleeping.store(false, Ordering::Relaxed);
             while self.notify_rx.try_recv().is_ok() {}
 
             if let Ok(msg) = self.try_recv() {
@@ -480,6 +501,11 @@ pub fn create_shard_mesh(num_shards: usize) -> (Vec<Vec<ShardSender>>, Vec<Shard
     let mut notifiers = Vec::with_capacity(num_shards);
     for _ in 0..num_shards {
         notifiers.push(flume::bounded::<()>(1));
+    }
+
+    let mut sleeping_flags = Vec::with_capacity(num_shards);
+    for _ in 0..num_shards {
+        sleeping_flags.push(std::sync::Arc::new(AtomicBool::new(false)));
     }
 
     // Matrix of SPSC rings: rings[i][j] is the ring from producer shard i to consumer shard j
@@ -501,6 +527,7 @@ pub fn create_shard_mesh(num_shards: usize) -> (Vec<Vec<ShardSender>>, Vec<Shard
                 target_shard: j,
                 ring: ring.clone(),
                 target_notify: notifiers[j].0.clone(),
+                target_sleeping: sleeping_flags[j].clone(),
             });
         }
         senders_mesh.push(shard_senders);
@@ -516,6 +543,7 @@ pub fn create_shard_mesh(num_shards: usize) -> (Vec<Vec<ShardSender>>, Vec<Shard
             shard_id: j,
             incoming_rings: incoming,
             notify_rx: notifier.1,
+            sleeping: sleeping_flags[j].clone(),
         });
     }
 
@@ -711,5 +739,37 @@ mod tests {
         assert_eq!(queue.pop(), Some(5));
         assert_eq!(queue.pop(), None);
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_shard_mesh_sleeping_state_and_wakeup() {
+        let (senders_mesh, receivers) = create_shard_mesh(2);
+        let sender = senders_mesh[0][1].clone();
+        let receiver = receivers.into_iter().nth(1).unwrap();
+
+        // 1. When receiver is not sleeping, sending does not push into flume channel
+        assert!(!sender.target_sleeping.load(Ordering::SeqCst));
+        sender
+            .send(crate::shard::ShardMessage::NotifyList { keys: vec![] })
+            .unwrap();
+        assert!(receiver.notify_rx.is_empty());
+
+        // 2. Message is immediately available in lock-free ring
+        let msg = receiver.try_recv().unwrap();
+        assert!(matches!(msg, crate::shard::ShardMessage::NotifyList { .. }));
+
+        // 3. Threaded wakeup: receiver awaits recv(), sender wakes it up
+        let h = thread::spawn(move || {
+            let msg = receiver.recv().unwrap();
+            assert!(matches!(msg, crate::shard::ShardMessage::NotifyList { .. }));
+        });
+
+        // Give receiver thread brief moment to enter sleeping state in recv()
+        thread::sleep(Duration::from_millis(20));
+        assert!(sender.target_sleeping.load(Ordering::SeqCst));
+        sender
+            .send(crate::shard::ShardMessage::NotifyList { keys: vec![] })
+            .unwrap();
+        h.join().unwrap();
     }
 }
