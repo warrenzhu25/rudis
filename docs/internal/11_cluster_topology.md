@@ -1,8 +1,6 @@
 # Component 11: Redis Cluster Topology & Gossip Protocol (Implementation)
 
-## Component 11: Redis Cluster Topology & Gossip Protocol — Code Reference & Implementation
-
-> **Source Files**: ``src/cluster.rs``
+> **Source Files**: `src/cluster.rs`
 
 
 ---
@@ -77,8 +75,6 @@ commands (`dfly_migrate_init`/`dfly_migrate_flow`/`dfly_migrate_ack`/
 string, a counter incremented by whatever `flow_id` value is passed in) rather
 than any real data-transfer protocol; no keys are actually copied between nodes
 by this code.
-
----
 
 ---
 
@@ -212,8 +208,6 @@ path at all; don't conflate the two.
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/connection.rs`**: reads `router.slot_states` and `get_cluster_hub(port)`
@@ -232,8 +226,6 @@ path at all; don't conflate the two.
   the replication subsystem.
 - **`src/server.rs`** (Component 01): calls `start_cluster_bus(port)` exactly
   once, only from the `shard_id == 0` worker thread.
-
----
 
 ---
 

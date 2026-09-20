@@ -1,8 +1,6 @@
 # Component 06: Blocking Operations & The Reactive Event Hub (Implementation)
 
-## Component 06: Blocking Operations & The Reactive Event Hub — Code Reference & Implementation
-
-> **Source Files**: ``src/block.rs``
+> **Source Files**: `src/block.rs`
 
 
 ---
@@ -78,8 +76,6 @@ pub struct BlockHub {
 There is no unified `Waiter`/`WaiterType`/`BlockedPopResult` type — list, zset, and stream
 waiters are three separate types with three separate queues and three separate result enums,
 and channels are `flume::Sender`, not `oneshot::Sender`.
-
----
 
 ---
 
@@ -278,8 +274,6 @@ every key queue it was registered under.
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/server.rs`**: the cross-shard receiver's `ShardMessage::NotifyList { keys }` handler
@@ -296,8 +290,6 @@ every key queue it was registered under.
   the storage engine itself rather than being handed already-popped values.
 - **`src/router.rs`** (Component 04): local writes broadcast `ShardMessage::NotifyList` to every
   *other* shard so a blocked client on shard A can be woken by a write on shard B.
-
----
 
 ---
 

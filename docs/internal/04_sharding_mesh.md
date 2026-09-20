@@ -1,8 +1,6 @@
 # Component 04: Sharding Architecture & Cross-Core Mesh (Implementation)
 
-## Component 04: Sharding Architecture & Cross-Core Mesh — Code Reference & Implementation
-
-> **Source Files**: ``src/router.rs`, `src/shard.rs``
+> **Source Files**: `src/router.rs`, `src/shard.rs`
 
 
 ---
@@ -152,8 +150,6 @@ pub struct ShardDb {
 when overwriting or deleting a key that currently lives (partially) on NVMe — the
 storage engine (`RudisTable`, documented in Component 05) and the tiering engine have to
 stay in sync on every mutation, and `ShardDb::set`/`del` is where that happens.
-
----
 
 ---
 
@@ -439,8 +435,6 @@ simple mutual-exclusion lock per shard, not a full multi-version scheduler.
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/connection.rs`** (Component 02): calls `target_shard_of_cmd`/`Router` methods to
@@ -469,8 +463,6 @@ simple mutual-exclusion lock per shard, not a full multi-version scheduler.
   engine; everything else on `ShardDb` is a separate, later-added subsystem
   (`tier_manager`, `vector_indexes`, `crdt_store`, `json_store`,
   `probabilistic_store`) living alongside it, not folded into `RudisValue`.
-
----
 
 ---
 

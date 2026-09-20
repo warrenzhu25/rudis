@@ -1,8 +1,6 @@
 # Component 07: NVMe SSD Tiered Storage Engine (Design)
 
-## Component 07: NVMe SSD Tiered Storage Engine
-
-> **Source Files**: ``src/tiering.rs``
+> **Source Files**: `src/tiering.rs`
 
 
 ---
@@ -19,8 +17,6 @@ is the disk I/O and page-packing layer underneath it.
 
 ---
 
----
-
 ### 2. Key Invariants & Concurrency Constraints
 
 1. **Thread-local, `Rc`-based, not `Arc`/`Mutex`**: `ShardTierManager` holds `file: Rc<monoio::fs::File>` and uses `RefCell`/`Cell` internally — it is only ever used by the one shard that owns it, consistent with the rest of the shared-nothing architecture. Cross-shard tiering requests go through `ShardMessage::Tier*` variants (Component 04), not by sharing a `ShardTierManager` across threads.
@@ -31,9 +27,7 @@ is the disk I/O and page-packing layer underneath it.
 
 ---
 
----
-
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **`O_DIRECT` is conditional, not guaranteed** (§2.2) — actual page-cache-bypass behavior
   depends on `RUDIS_DIRECT_IO` being set and the filesystem/kernel actually honoring the flag;

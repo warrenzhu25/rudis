@@ -1,8 +1,6 @@
 # Component 19: Pub/Sub Messaging Hub (Implementation)
 
-## Component 19: Pub/Sub Messaging Hub — Code Reference & Implementation
-
-> **Source Files**: ``src/pubsub.rs``
+> **Source Files**: `src/pubsub.rs`
 
 
 ---
@@ -44,8 +42,6 @@ Two reverse indices (`client_channels`/`client_patterns`) exist purely so
 `unsubscribe_all`/`punsubscribe_all`/`total_subscriptions`/connection-drop cleanup don't have
 to scan every channel/pattern in the hub looking for a given client — a real, deliberate
 O(subscriptions for this client) design instead of O(all channels/patterns).
-
----
 
 ---
 
@@ -121,8 +117,6 @@ tears down every channel and pattern subscription for that client in one call, r
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/connection.rs`** (Component 02): `run_pubsub_loop` is the sole caller of
@@ -139,8 +133,6 @@ tears down every channel and pattern subscription for that client in one call, r
   is the wire message a remote shard's `PubSubHub.publish` call is delivered through.
 - **`src/table.rs`**: no relationship — pub/sub state is entirely separate from `RudisTable`;
   a channel name is never a Redis key and never interacts with expiration/eviction.
-
----
 
 ---
 

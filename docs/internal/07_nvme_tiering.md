@@ -1,8 +1,6 @@
 # Component 07: NVMe SSD Tiered Storage Engine (Implementation)
 
-## Component 07: NVMe SSD Tiered Storage Engine — Code Reference & Implementation
-
-> **Source Files**: ``src/tiering.rs``
+> **Source Files**: `src/tiering.rs`
 
 
 ---
@@ -76,8 +74,6 @@ pub struct OpManager {
 `offload_threshold_pct` (default 60), `upload_threshold_pct` (default 80), ...) — all
 `AtomicU64`, updated from `router.rs`'s tiering methods (Component 04) and read by whatever
 reports tiering stats (`INFO`-style output, not shown in this file).
-
----
 
 ---
 
@@ -224,8 +220,6 @@ userspace round-trip) → a plain buffered `std::fs::copy`.
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/table.rs`** (Component 05): owns the `RudisValue::Tiered`/`RudisValue::Cooled`
@@ -248,8 +242,6 @@ userspace round-trip) → a plain buffered `std::fs::copy`.
   variable, not a CLI flag; `--maxmemory`/`--tiered-offload-threshold`/
   `--tiered-upload-threshold` (Component 01) feed `set_max_memory`/`set_offload_threshold_pct`/
   `set_upload_threshold_pct` in this file.
-
----
 
 ---
 

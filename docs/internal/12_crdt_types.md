@@ -1,8 +1,6 @@
 # Component 12: CRDT Data Types & Manual Multi-Region Sync (Implementation)
 
-## Component 12: CRDT Data Types & Manual Multi-Region Sync — Code Reference & Implementation
-
-> **Source Files**: ``src/crdt.rs``
+> **Source Files**: `src/crdt.rs`
 
 
 ---
@@ -78,8 +76,6 @@ claimed: `LwwRegister`/`OrSet` are concretely `Bytes`-keyed (not generic `<T>`),
 tracks per-element `HashSet<HlcTimestamp>` tags directly (no separate UUID type), and
 `PnCounter`'s fields are named `p`/`n` (not `increments`/`decrements`) and store signed
 `i64` per-node deltas rather than only-positive `u64` add/remove counts.
-
----
 
 ---
 
@@ -190,8 +186,6 @@ anywhere in `server.rs` — it's an on-demand command.
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/shard.rs`**: `ShardDb.crdt_store: CrdtStore` plus thin `#[inline]` wrappers
@@ -211,8 +205,6 @@ anywhere in `server.rs` — it's an on-demand command.
 - **`src/table.rs`**: no interaction. CRDT values are **not** stored as `RudisValue`
   variants — they live entirely in `CrdtStore`'s own maps, a parallel store next to
   `RudisTable`, not inside it.
-
----
 
 ---
 

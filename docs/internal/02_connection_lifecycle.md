@@ -1,8 +1,6 @@
 # Component 02: Connection Lifecycle & Command Execution (Implementation)
 
-## Component 02: Connection Lifecycle & Command Execution — Code Reference & Implementation
-
-> **Source Files**: ``src/connection.rs``
+> **Source Files**: `src/connection.rs`
 
 
 ---
@@ -103,8 +101,6 @@ pub type ResponderChannel = (
 (`CompactResp`, defined in `src/shard.rs`, has replaced the plain `Vec<u8>` response payload
 used previously — a memory-compacted reply representation, not documented here since it
 belongs to `src/shard.rs`.)
-
----
 
 ---
 
@@ -469,8 +465,6 @@ and RESP3's native `,<double>\r\n` double type depending on `CURRENT_CLIENT_RESP
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/resp.rs`**: Supplies `parse_command`, decoding buffered bytes into `Command` values.
@@ -497,8 +491,6 @@ and RESP3's native `,<double>\r\n` double type depending on `CURRENT_CLIENT_RESP
 - **`src/aof.rs`**: `execute_local_command` takes an `Option<&RefCell<AofWriter>>` to append
   write commands for persistence; `command_to_resp` is also reused to detect "is this command
   a write" for the replica read-only guard.
-
----
 
 ---
 

@@ -1,8 +1,6 @@
 # Component 12: CRDT Data Types & Manual Multi-Region Sync (Design)
 
-## Component 12: CRDT Data Types & Manual Multi-Region Sync
-
-> **Source Files**: ``src/crdt.rs``
+> **Source Files**: `src/crdt.rs`
 
 
 ---
@@ -47,8 +45,6 @@ one.
 
 ---
 
----
-
 ### 2. Key Invariants & Concurrency Constraints
 
 1. **Deterministic Convergence (real, and tested)**: `LwwRegister::merge`, `OrSet::merge`,
@@ -68,9 +64,7 @@ one.
 
 ---
 
----
-
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **Lock-free clock advancement**: `HybridLogicalClock::now`/`update` use CAS retry loops,
   not a mutex — cheap even under contention from multiple connections on the same shard.

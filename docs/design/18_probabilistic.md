@@ -1,8 +1,6 @@
 # Component 18: Probabilistic Data Structures (Design)
 
-## Component 18: Probabilistic Data Structures
-
-> **Source Files**: ``src/probabilistic.rs``
+> **Source Files**: `src/probabilistic.rs`
 
 
 ---
@@ -19,8 +17,6 @@ frequency tracker** (Space-Saving algorithm) — exposed via RedisBloom-compatib
 across shards — confirmed directly in `connection.rs`: `BfAdd`/`CfAdd`/`CmsIncrby`/`TopkAdd`/
 etc. all appear in the same `target_shard_of_cmd`/local-vs-`execute_remote` dispatch arm as
 ordinary keyed commands.
-
----
 
 ---
 
@@ -58,9 +54,7 @@ ordinary keyed commands.
 
 ---
 
----
-
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **Bloom/Cuckoo `add`/`contains` are O(num_hashes) / O(1)** respectively — a Bloom filter
   check costs up to 30 bit-array probes (bounded, per §2.2's clamp), a Cuckoo filter check is

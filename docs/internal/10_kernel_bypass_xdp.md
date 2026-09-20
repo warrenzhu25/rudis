@@ -1,8 +1,6 @@
 # Component 10: Kernel Bypass & Zero-Copy Networking (Implementation)
 
-## Component 10: Kernel Bypass & Zero-Copy Networking — Code Reference & Implementation
-
-> **Source Files**: ``src/xdp.rs`, `src/zerocopy.rs``
+> **Source Files**: `src/xdp.rs`, `src/zerocopy.rs`
 
 
 ---
@@ -119,8 +117,6 @@ does).
 
 ---
 
----
-
 ### 4. Execution Algorithms & Code Logic
 
 #### 4.1 `XdpEngine::process_packet` — manual, CPU-side Ethernet/IPv4 parsing
@@ -213,8 +209,6 @@ see Component 07), but nothing ever calls it or submits the resulting entry to a
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/connection.rs`**: the only real integration point — six `Xdp*` `Command` variants
@@ -227,8 +221,6 @@ see Component 07), but nothing ever calls it or submits the resulting entry to a
   `XdpAction`).
 - **`src/zerocopy.rs`**: no cross-component interactions to document — verified zero callers
   outside its own `#[cfg(test)]` module.
-
----
 
 ---
 

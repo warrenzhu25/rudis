@@ -1,8 +1,6 @@
 # Component 16: JSON Document Store & JSONPath Engine (Implementation)
 
-## Component 16: JSON Document Store & JSONPath Engine — Code Reference & Implementation
-
-> **Source Files**: ``src/json.rs``
+> **Source Files**: `src/json.rs`
 
 
 ---
@@ -45,8 +43,6 @@ pub struct JsonStore {
 There is no bespoke JSON representation — every stored document is a plain `serde_json::Value`
 (the same enum `Value::{Null, Bool, Number, String, Array, Object}` any `serde_json` consumer
 would use), not a Redis-specific compact encoding.
-
----
 
 ---
 
@@ -128,8 +124,6 @@ plain `MGET`, `JsonMget` was never given the bucket-by-shard-then-fan-out treatm
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/connection.rs`** (Component 02): dispatches every single-key `Command::Json*` through
@@ -146,8 +140,6 @@ plain `MGET`, `JsonMget` was never given the bucket-by-shard-then-fan-out treatm
   save/restore chunk logic for any reference to `json_store` finds none — `JsonStore` is not
   included in `save_rdb_chunk`/`load_rdb`, so JSON documents do **not** survive a restart via
   RDB. This is the same gap Component 08 §7 flagged for vector indexes.
-
----
 
 ---
 

@@ -1,8 +1,6 @@
 # Component 17: Geospatial Commands (Design)
 
-## Component 17: Geospatial Commands
-
-> **Source Files**: ``src/geo.rs``
+> **Source Files**: `src/geo.rs`
 
 
 ---
@@ -19,8 +17,6 @@ command family as a thin layer over `ZSET`, and it means `ZRANGE`/`ZSCORE`/any o
 command works unmodified against a "geo set" key too — a real compatibility feature and a real
 footgun (an arbitrary `ZADD` against a geo key can insert a member with a score that isn't a
 valid geohash at all, and nothing rejects it).
-
----
 
 ---
 
@@ -45,9 +41,7 @@ valid geohash at all, and nothing rejects it).
 
 ---
 
----
-
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **`GEOADD`/`GEODIST`/`GEOPOS` are O(1)-ish**, bounded by the underlying `ZADD`/`ZSCORE` cost
   (Component 05) plus a fixed amount of bit-interleaving/Haversine math — no scan involved.

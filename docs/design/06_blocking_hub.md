@@ -1,8 +1,6 @@
 # Component 06: Blocking Operations & The Reactive Event Hub (Design)
 
-## Component 06: Blocking Operations & The Reactive Event Hub
-
-> **Source Files**: ``src/block.rs``
+> **Source Files**: `src/block.rs`
 
 
 ---
@@ -54,9 +52,7 @@ by every shard thread serving that port.
 
 ---
 
----
-
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **Not zero-overhead while blocked**: unlike a pure channel-based design, each blocked client
   costs a wakeup-and-poll cycle at most every 20ms (`wait_for_blocked_result`'s cap) purely to

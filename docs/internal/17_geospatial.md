@@ -1,8 +1,6 @@
 # Component 17: Geospatial Commands (Implementation)
 
-## Component 17: Geospatial Commands — Code Reference & Implementation
-
-> **Source Files**: ``src/geo.rs``
+> **Source Files**: `src/geo.rs`
 
 
 ---
@@ -46,8 +44,6 @@ pub struct GeoItemResult {
 `GeoItemResult` + `format_geo_results` unify the reply-formatting for every command that can
 return `WITHCOORD`/`WITHDIST`/`WITHHASH` options (`GEORADIUS`, `GEORADIUSBYMEMBER`,
 `GEOSEARCH`) — one shared formatter rather than three separately hand-written reply encoders.
-
----
 
 ---
 
@@ -128,8 +124,6 @@ precise at very large box dimensions.
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/table.rs`** (Component 05): every geo command is built entirely on `RudisTable`'s
@@ -141,8 +135,6 @@ precise at very large box dimensions.
 - **`src/resp.rs`** (Component 03): parses `GEOADD`/`GEODIST`/etc.'s arguments (including unit
   strings `m`/`km`/`mi`/`ft` and `BYRADIUS`/`BYBOX`/`ASC`/`DESC`/`WITHCOORD`/`WITHDIST`/
   `WITHHASH` option flags) into the `Command::Geo*` variants this file's helpers consume.
-
----
 
 ---
 

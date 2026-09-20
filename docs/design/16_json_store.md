@@ -1,8 +1,6 @@
 # Component 16: JSON Document Store & JSONPath Engine (Design)
 
-## Component 16: JSON Document Store & JSONPath Engine
-
-> **Source Files**: ``src/json.rs``
+> **Source Files**: `src/json.rs`
 
 
 ---
@@ -19,8 +17,6 @@ in `connection.rs`: every `Command::Json*` variant (except `JsonMget`, see §4.5
 the same `target_shard_of_cmd`/local-vs-`execute_remote` dispatch arm as ordinary string/hash/
 list commands, so a `JSON.SET`/`GET` on a given key always lands on the one shard that key
 actually hashes to, regardless of which shard's connection issued it.
-
----
 
 ---
 
@@ -51,9 +47,7 @@ actually hashes to, regardless of which shard's connection issued it.
 
 ---
 
----
-
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **`JSON.GET` cost scales with matched-subtree size, not query specificity** — every call
   does a fresh `serde_json::to_string` of whatever `query_json_path` returned, with no

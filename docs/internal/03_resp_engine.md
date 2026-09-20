@@ -1,8 +1,6 @@
 # Component 03: RESP Protocol Engine & Command Parser (Implementation)
 
-## Component 03: RESP Protocol Engine & Command Parser — Code Reference & Implementation
-
-> **Source Files**: ``src/resp.rs``
+> **Source Files**: `src/resp.rs`
 
 
 ---
@@ -68,8 +66,6 @@ constraint of the type, not an oversight.
 The enum's category list above comes directly from the file's own `// SECTION NAME` comments
 (`grep -n "^    // [A-Z]" src/resp.rs`), which is the fastest way to get an up-to-date map of
 what's supported without reading all ~1,000 lines of variant declarations.
-
----
 
 ---
 
@@ -277,8 +273,6 @@ here (see the storage engine's SIMD control-byte matching in Part 1 of
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/connection.rs`**: The sole consumer of `parse_command`. All reply serialization
@@ -289,8 +283,6 @@ here (see the storage engine's SIMD control-byte matching in Part 1 of
   and the storage engine share vocabulary rather than each redefining it.
 - **`src/block.rs`**: `ClientSubcommand::Unblock` carries a `crate::block::ClientUnblockType`
   defined in the blocking-operations module.
-
----
 
 ---
 

@@ -1,8 +1,6 @@
 # Component 14: Persistence & Replication Engines (Implementation)
 
-## Component 14: Persistence & Replication Engines — Code Reference & Implementation
-
-> **Source Files**: ``src/replication.rs`, `src/aof.rs``
+> **Source Files**: `src/replication.rs`, `src/aof.rs`
 
 
 ---
@@ -132,8 +130,6 @@ not on `has_replicas`. This matters precisely because partial resync needs histo
 connected, every replica that fully disconnected and came back would find an empty/stale
 backlog and be forced into a full resync anyway, defeating the point. `has_connected_replicas`
 now also reports `true` whenever `backlog_active` is set, even with zero live replicas.
-
----
 
 ---
 
@@ -308,8 +304,6 @@ state currently is at request time.
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/router.rs`** (Component 04): `Router::del`/`set`/`incr_by`/`expire`/`persist` (the
@@ -328,8 +322,6 @@ state currently is at request time.
   (`save_rdb_chunk`, `load_rdb`, `load_rdb_bytes`) that both startup restore and full-resync
   RDB transfer are built on — this file only stitches those chunks together and moves the
   bytes over the wire.
-
----
 
 ---
 

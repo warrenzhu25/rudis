@@ -1,8 +1,6 @@
 # Component 11: Redis Cluster Topology & Gossip Protocol (Design)
 
-## Component 11: Redis Cluster Topology & Gossip Protocol
-
-> **Source Files**: ``src/cluster.rs``
+> **Source Files**: `src/cluster.rs`
 
 
 ---
@@ -17,8 +15,6 @@ staleness, and a real majority-vote replica election for failover. It is a singl
 process-wide singleton per listening port (`get_cluster_hub(port)`), and only the
 shard-0 worker thread ever starts the cluster-bus listener for that port
 (`start_cluster_bus`, called from `run_shard_worker` — see Component 01).
-
----
 
 ---
 
@@ -54,9 +50,7 @@ shard-0 worker thread ever starts the cluster-bus listener for that port
 
 ---
 
----
-
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **Not zero-allocation, not io_uring-based**: every gossip tick and every
   `CLUSTER MEET`/`FAILOVER` opens a brand-new blocking `TcpStream` per peer

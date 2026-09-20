@@ -1,8 +1,6 @@
 # Component 09: RediSearch Full-Text Engine & Reciprocal Rank Fusion (Design)
 
-## Component 09: RediSearch Full-Text Engine & Reciprocal Rank Fusion
-
-> **Source Files**: ``src/search.rs``
+> **Source Files**: `src/search.rs`
 
 
 ---
@@ -16,8 +14,6 @@ hand-written inverted-index posting-list structure, real Okapi BM25 relevance sc
 RediSearch-like query-string parser (`parse_query`/`QueryAst`), and Reciprocal Rank Fusion for
 merging two ranked result lists. Auto-indexing is wired into `HSET`/`HMSET`/`JSON.SET` (root
 path only) in `src/connection.rs`.
-
----
 
 ---
 
@@ -52,9 +48,7 @@ path only) in `src/connection.rs`.
 
 ---
 
----
-
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **Global `RwLock` contention, not per-shard isolation** (§2.2): every indexed write and every
   `FT.SEARCH` call takes a real lock on the process-wide index (a write lock for indexing, a

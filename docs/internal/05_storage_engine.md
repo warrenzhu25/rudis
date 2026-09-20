@@ -1,8 +1,6 @@
 # Component 05: Storage Engine & Compact Encodings (Implementation)
 
-## Component 05: Storage Engine & Compact Encodings — Code Reference & Implementation
-
-> **Source Files**: ``src/table.rs``
+> **Source Files**: `src/table.rs`
 
 
 ---
@@ -78,8 +76,6 @@ Two cursors, not one: `sample_cursor` drives active TTL expiration (unchanged, �
 `used_memory` is a running estimate of live value bytes, updated on every insert, mutation,
 delete, and expiration — it did not exist in the original design and exists to give
 `src/tiering.rs` a cheap signal for memory-pressure decisions without walking the table.
-
----
 
 ---
 
@@ -218,8 +214,6 @@ unconditionally here. There is no sparse encoding for small cardinalities.
 
 ---
 
----
-
 ### 5. Expiration & Memory Management
 
 #### 5.1 Passive expiration on read — now with a global bypass and stat counter
@@ -308,8 +302,6 @@ the start every time.
 
 ---
 
----
-
 ### 6. Cluster Slot Indexing (architecture change from the original design)
 
 The original design maintained a full reverse index, `slot_to_keys: HashMap<u16,
@@ -343,8 +335,6 @@ likely, for removing the double-bookkeeping cost the old `slot_to_keys` paid on 
 insert/delete (cloning each key into a second `HashSet`). Both scanning functions still do
 opportunistic lazy expiration of any expired keys they encounter along the way, same as
 before.
-
----
 
 ---
 

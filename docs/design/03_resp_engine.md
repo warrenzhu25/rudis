@@ -1,8 +1,6 @@
 # Component 03: RESP Protocol Engine & Command Parser (Design)
 
-## Component 03: RESP Protocol Engine & Command Parser
-
-> **Source Files**: ``src/resp.rs``
+> **Source Files**: `src/resp.rs`
 
 
 ---
@@ -22,8 +20,6 @@ pub/sub, transactions, cluster/gossip, ACL, scripting, vector search, geospatial
 structures, RDB serialization, tiered-storage control commands, and a Memcached text-protocol
 gateway — not because the core parsing algorithm itself grew complex. That algorithm (the
 two-pass zero-copy RESP array parser) is unchanged from the original implementation.
-
----
 
 ---
 
@@ -49,9 +45,7 @@ two-pass zero-copy RESP array parser) is unchanged from the original implementat
 
 ---
 
----
-
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **Zero-copy on the hot (RESP array) path**: every bulk-string argument is a `Bytes` slice
   sharing the original read buffer's allocation, not a fresh heap copy.

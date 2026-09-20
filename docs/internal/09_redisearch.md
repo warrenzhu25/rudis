@@ -1,8 +1,6 @@
 # Component 09: RediSearch Full-Text Engine & Reciprocal Rank Fusion (Implementation)
 
-## Component 09: RediSearch Full-Text Engine & Reciprocal Rank Fusion — Code Reference & Implementation
-
-> **Source Files**: ``src/search.rs``
+> **Source Files**: `src/search.rs`
 
 
 ---
@@ -76,8 +74,6 @@ There is **no `vector_index: Option<HnswIndex>` field anywhere** — vectors are
 as plain `Vec<f32>` inside `DocMeta.vector_fields`, and KNN search (§4.4) is a brute-force linear
 scan, not an HNSW lookup. `src/vector.rs`'s `HnswIndex` (Component 08) is a completely separate
 data structure used only by the standalone `VECTOR.*`-style commands, not by this file.
-
----
 
 ---
 
@@ -240,8 +236,6 @@ that constructs both hit lists manually rather than through a real KNN search.
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/connection.rs`**: `Command::FtCreate/FtSearch/FtInfo/FtDropIndex/FtExplain/FtAdd`
@@ -262,8 +256,6 @@ that constructs both hit lists manually rather than through a real KNN search.
   scalar fields into `HashMap<String, String>` before calling `index_document_hook` — nested
   objects/arrays are stringified via `.to_string()`, not recursively flattened into
   dotted-path fields.
-
----
 
 ---
 

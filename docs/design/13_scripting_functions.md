@@ -1,8 +1,6 @@
 # Component 13: Lua Scripting & Redis 7 Functions Engine (Design)
 
-## Component 13: Lua Scripting & Redis 7 Functions Engine
-
-> **Source Files**: ``src/scripting.rs``
+> **Source Files**: `src/scripting.rs`
 
 
 ---
@@ -15,8 +13,6 @@ LOAD`/`SCRIPT EXISTS`/`SCRIPT FLUSH` and Redis 7 Functions (`FUNCTION LOAD`, `FC
 struct — every `EVAL`/`EVALSHA`/`FCALL` call creates a **brand-new `mlua::Lua` instance**,
 runs once, and drops it. Script *source* is cached (by SHA1, and by function-library name);
 compiled bytecode and the Lua VM itself are not.
-
----
 
 ---
 
@@ -47,9 +43,7 @@ compiled bytecode and the Lua VM itself are not.
 
 ---
 
----
-
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **No bytecode caching, despite the SHA1 cache's name.** `SCRIPT_CACHE` only saves
   re-transmission of the script *text* for `EVALSHA`; Lua source is re-parsed by `mlua` on

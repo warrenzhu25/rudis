@@ -1,8 +1,6 @@
 # Component 18: Probabilistic Data Structures (Implementation)
 
-## Component 18: Probabilistic Data Structures — Code Reference & Implementation
-
-> **Source Files**: ``src/probabilistic.rs``
+> **Source Files**: `src/probabilistic.rs`
 
 
 ---
@@ -50,8 +48,6 @@ for a Bloom filter and a key of the same name used for a Cuckoo filter would be 
 independent entries (in different maps), not a naming collision, since the command layer
 (`connection.rs`) dispatches to the right map by command family (`BF.*` vs `CF.*` vs...), not
 by inspecting what's already stored under that key.
-
----
 
 ---
 
@@ -140,8 +136,6 @@ a larger-scale Space-Saving implementation would use.
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/connection.rs`** (Component 02): dispatches every `BF.*`/`CF.*`/`CMS.*`/`TOPK.*`
@@ -156,8 +150,6 @@ a larger-scale Space-Saving implementation would use.
   and vector indexes (Component 08 §7): none of `bloom_filters`/`cuckoo_filters`/
   `cms_sketches`/`topk_trackers` are referenced anywhere in the RDB save/restore chunk logic,
   so all four structure types are lost on restart.
-
----
 
 ---
 

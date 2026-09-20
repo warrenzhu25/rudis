@@ -1,8 +1,6 @@
 # Component 14: Persistence & Replication Engines (Design)
 
-## Component 14: Persistence & Replication Engines
-
-> **Source Files**: ``src/replication.rs`, `src/aof.rs``
+> **Source Files**: `src/replication.rs`, `src/aof.rs`
 
 
 ---
@@ -29,8 +27,6 @@ resynchronization is real on both the **master** and **replica** sides
 (§4.3) — `run_replica_worker` tracks its `master_replid` and `master_repl_offset`,
 reconnects automatically with `PSYNC <replid> <offset>`, and applies `+CONTINUE` diffs
 without full RDB snapshots.
-
----
 
 ---
 
@@ -70,9 +66,7 @@ without full RDB snapshots.
 
 ---
 
----
-
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **AOF write cost is O(1) amortized per command**, bounded by the 50ms/~1s flush-fsync
   cadence — but **AOF file size and restart replay time are both unbounded** relative to

@@ -1,8 +1,6 @@
 # Component 04: Sharding Architecture & Cross-Core Mesh (Design)
 
-## Component 04: Sharding Architecture & Cross-Core Mesh
-
-> **Source Files**: ``src/router.rs`, `src/shard.rs``
+> **Source Files**: `src/router.rs`, `src/shard.rs`
 
 
 ---
@@ -26,8 +24,6 @@ persistence/replication/tiering conceptually.
 
 ---
 
----
-
 ### 2. Key Invariants & Concurrency Constraints
 
 1. **Deterministic Key Ownership (static formula)**: `target_shard(key, num_shards)` maps
@@ -48,9 +44,7 @@ persistence/replication/tiering conceptually.
 
 ---
 
----
-
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **Lock-Free Communication**: unchanged — `flume` channels, no mutexes, no atomics on
   the per-key data path itself.

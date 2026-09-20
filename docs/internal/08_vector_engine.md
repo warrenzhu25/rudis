@@ -1,8 +1,6 @@
 # Component 08: Vector Search Engine: HNSW, SQ8 & Product Quantization (Implementation)
 
-## Component 08: Vector Search Engine: HNSW, SQ8 & Product Quantization — Code Reference & Implementation
-
-> **Source Files**: ``src/vector.rs``
+> **Source Files**: `src/vector.rs`
 
 
 ---
@@ -86,8 +84,6 @@ Note the node always keeps its full `Vec<f32>` regardless of whether SQ8/PQ is a
 enabled — quantization here is an additional fast-path structure for candidate scoring,
 not a memory-savings replacement for the raw vector (the "reranking" pass in §4.3 depends
 on the exact float vector still being present).
-
----
 
 ---
 
@@ -206,8 +202,6 @@ central node, just the first surviving slot.
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/resp.rs`**: parses `VADD`/`VQUERY`/`VSIM`/`VDEL`/`VINFO` into `Command` variants;
@@ -223,8 +217,6 @@ central node, just the first surviving slot.
   both being "search" subsystems.
 - **`src/table.rs`**: no relationship — vector data lives entirely in `ShardDb.vector_indexes`,
   not in `RudisValue`/`RudisTable` at all.
-
----
 
 ---
 

@@ -1,8 +1,6 @@
 # Component 10: Kernel Bypass & Zero-Copy Networking (Design)
 
-## Component 10: Kernel Bypass & Zero-Copy Networking
-
-> **Source Files**: ``src/xdp.rs`, `src/zerocopy.rs``
+> **Source Files**: `src/xdp.rs`, `src/zerocopy.rs`
 
 
 ---
@@ -30,8 +28,6 @@ what its name and the previous version of this document claimed:
 
 ---
 
----
-
 ### 2. Key Invariants & Concurrency Constraints
 
 1. **`XdpEngine` is a single global, not per-shard**: `get_xdp_engine()` returns a clone of an
@@ -55,9 +51,7 @@ what its name and the previous version of this document claimed:
 
 ---
 
----
-
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **No measured network-layer performance benefit exists from either file.** `xdp.rs`'s cost is
   whatever it costs to run `process_packet` once per `XDP.PACKET` command a client explicitly

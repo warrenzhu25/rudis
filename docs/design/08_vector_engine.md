@@ -1,8 +1,6 @@
 # Component 08: Vector Search Engine: HNSW, SQ8 & Product Quantization (Design)
 
-## Component 08: Vector Search Engine: HNSW, SQ8 & Product Quantization
-
-> **Source Files**: ``src/vector.rs``
+> **Source Files**: `src/vector.rs`
 
 
 ---
@@ -28,8 +26,6 @@ which shard a given connection lands on (decided by the kernel via `SO_REUSEPORT
 Component 01) silently determines which index a `VADD`/`VQUERY` actually reads or writes.
 There is no fan-out, no merge, and no consistency check across shards. Treat this as the
 single most important operational caveat for this subsystem.
-
----
 
 ---
 
@@ -64,9 +60,7 @@ single most important operational caveat for this subsystem.
 
 ---
 
----
-
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - Distance kernels are genuinely AVX2+FMA accelerated at 16 floats/iteration when the CPU
   supports it, with a correct portable fallback otherwise — no unconditional `unsafe` on

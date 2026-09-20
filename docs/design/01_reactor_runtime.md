@@ -1,8 +1,6 @@
 # Component 01: Reactor Runtime & Server Lifecycle (Design)
 
-## Component 01: Reactor Runtime & Server Lifecycle
-
-> **Source Files**: ``src/main.rs`, `src/server.rs``
+> **Source Files**: `src/main.rs`, `src/server.rs`
 
 
 ---
@@ -12,8 +10,6 @@
 The **Reactor Runtime & Server Lifecycle** subsystem is responsible for bootstrapping the Rudis server process, pinning worker threads to physical CPU cores, setting up Linux `io_uring` instances via the `monoio` asynchronous runtime, and running each shard's event loop for its entire lifetime.
 
 Unlike Redis (single-threaded event loop) or lock-based multi-threaded servers, Rudis uses a **Shared-Nothing Multi-Reactor** pattern: every worker core runs its own independent `monoio` runtime driving an isolated Linux `io_uring` ring, its own `SO_REUSEPORT` listener, and its own thread-local database. `src/main.rs` parses CLI arguments and spawns one OS thread per shard; `src/server.rs::run_shard_worker` is the entire body of that thread — it never returns.
-
----
 
 ---
 
@@ -27,9 +23,7 @@ Unlike Redis (single-threaded event loop) or lock-based multi-threaded servers, 
 
 ---
 
----
-
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **Zero-syscall-per-connection ingress**: `SO_REUSEPORT` means the kernel — not userspace — decides which shard's listener gets each new connection.
 - **No cross-core cache traffic in the common case**: local key access never leaves the owning thread; only the `ShardMessage` mesh and the shared `BlockHub` mutex cross cores, and both are only exercised on non-local or blocking operations.

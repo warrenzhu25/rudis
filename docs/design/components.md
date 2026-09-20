@@ -60,7 +60,7 @@ Unlike Redis (single-threaded event loop) or lock-based multi-threaded servers, 
 
 ---
 
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **Zero-syscall-per-connection ingress**: `SO_REUSEPORT` means the kernel — not userspace — decides which shard's listener gets each new connection.
 - **No cross-core cache traffic in the common case**: local key access never leaves the owning thread; only the `ShardMessage` mesh and the shared `BlockHub` mutex cross cores, and both are only exercised on non-local or blocking operations.
@@ -121,7 +121,7 @@ gateway). It is genuinely the busiest file in the codebase, not a thin dispatche
 
 ---
 
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **Pre-allocated responder pool, not one-shot channels**: `ResponderChannel`s are built once
   per connection (`(0..router.num_shards).map(|_| flume::bounded(1))`) and reused for every
@@ -201,7 +201,7 @@ two-pass zero-copy RESP array parser) is unchanged from the original implementat
 
 ---
 
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **Zero-copy on the hot (RESP array) path**: every bulk-string argument is a `Bytes` slice
   sharing the original read buffer's allocation, not a fresh heap copy.
@@ -266,7 +266,7 @@ persistence/replication/tiering conceptually.
 
 ---
 
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **Lock-Free Communication**: unchanged — `flume` channels, no mutexes, no atomics on
   the per-key data path itself.
@@ -337,7 +337,7 @@ memory usage and NVMe-tiering state per key.
 
 ---
 
-### 7. Performance Characteristics
+### 3. Performance Characteristics
 
 - **SIMD group probing is unchanged**: still one 128-bit load and compare per 16-slot group,
   triangular-step probing to avoid primary clustering.
@@ -416,7 +416,7 @@ by every shard thread serving that port.
 
 ---
 
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **Not zero-overhead while blocked**: unlike a pure channel-based design, each blocked client
   costs a wakeup-and-poll cycle at most every 20ms (`wait_for_blocked_result`'s cap) purely to
@@ -468,7 +468,7 @@ is the disk I/O and page-packing layer underneath it.
 
 ---
 
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **`O_DIRECT` is conditional, not guaranteed** (§2.2) — actual page-cache-bypass behavior
   depends on `RUDIS_DIRECT_IO` being set and the filesystem/kernel actually honoring the flag;
@@ -557,7 +557,7 @@ single most important operational caveat for this subsystem.
 
 ---
 
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - Distance kernels are genuinely AVX2+FMA accelerated at 16 floats/iteration when the CPU
   supports it, with a correct portable fallback otherwise — no unconditional `unsafe` on
@@ -628,7 +628,7 @@ path only) in `src/connection.rs`.
 
 ---
 
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **Global `RwLock` contention, not per-shard isolation** (§2.2): every indexed write and every
   `FT.SEARCH` call takes a real lock on the process-wide index (a write lock for indexing, a
@@ -704,7 +704,7 @@ what its name and the previous version of this document claimed:
 
 ---
 
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **No measured network-layer performance benefit exists from either file.** `xdp.rs`'s cost is
   whatever it costs to run `process_packet` once per `XDP.PACKET` command a client explicitly
@@ -778,7 +778,7 @@ shard-0 worker thread ever starts the cluster-bus listener for that port
 
 ---
 
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **Not zero-allocation, not io_uring-based**: every gossip tick and every
   `CLUSTER MEET`/`FAILOVER` opens a brand-new blocking `TcpStream` per peer
@@ -871,7 +871,7 @@ one.
 
 ---
 
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **Lock-free clock advancement**: `HybridLogicalClock::now`/`update` use CAS retry loops,
   not a mutex — cheap even under contention from multiple connections on the same shard.
@@ -935,7 +935,7 @@ compiled bytecode and the Lua VM itself are not.
 
 ---
 
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **No bytecode caching, despite the SHA1 cache's name.** `SCRIPT_CACHE` only saves
   re-transmission of the script *text* for `EVALSHA`; Lua source is re-parsed by `mlua` on
@@ -1027,7 +1027,7 @@ without full RDB snapshots.
 
 ---
 
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **AOF write cost is O(1) amortized per command**, bounded by the 50ms/~1s flush-fsync
   cadence — but **AOF file size and restart replay time are both unbounded** relative to
@@ -1084,7 +1084,7 @@ Three unrelated system-services modules bundled under one doc:
 
 ---
 
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **Auth check cost**: one `RwLock::read()` acquisition plus a linear scan over `passwords`/`password_hashes` (typically 0-1 entries each) plus one SHA1 computation per `AUTH` call — negligible, and only paid once per connection lifetime in the common case.
 - **Real per-command ACL overhead now exists (updated)**: every command after authentication takes an `AclManager` read-lock and a `HashMap`/`HashSet` lookup via `can_execute_command`/`can_access_key` (§4.1) — small, but no longer zero as the old doc stated; this is a real, permanent per-command cost on every connection now, not just at `AUTH` time.
@@ -1148,7 +1148,7 @@ actually hashes to, regardless of which shard's connection issued it.
 
 ---
 
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **`JSON.GET` cost scales with matched-subtree size, not query specificity** — every call
   does a fresh `serde_json::to_string` of whatever `query_json_path` returned, with no
@@ -1211,7 +1211,7 @@ valid geohash at all, and nothing rejects it).
 
 ---
 
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **`GEOADD`/`GEODIST`/`GEOPOS` are O(1)-ish**, bounded by the underlying `ZADD`/`ZSCORE` cost
   (Component 05) plus a fixed amount of bit-interleaving/Haversine math — no scan involved.
@@ -1287,7 +1287,7 @@ ordinary keyed commands.
 
 ---
 
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **Bloom/Cuckoo `add`/`contains` are O(num_hashes) / O(1)** respectively — a Bloom filter
   check costs up to 30 bit-array probes (bounded, per §2.2's clamp), a Cuckoo filter check is
@@ -1364,7 +1364,7 @@ hub across shards.
 
 ---
 
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **Direct-channel publish is O(subscribers to that channel)** — no overhead from unrelated
   channels or patterns.

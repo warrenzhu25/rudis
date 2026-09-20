@@ -1,8 +1,6 @@
 # Component 02: Connection Lifecycle & Command Execution (Design)
 
-## Component 02: Connection Lifecycle & Command Execution
-
-> **Source Files**: ``src/connection.rs``
+> **Source Files**: `src/connection.rs`
 
 
 ---
@@ -19,8 +17,6 @@ routing decision — plus command-specific execution logic for the full command 
 hashes, lists, sets, sorted sets, streams with consumer groups, HyperLogLog, bitmaps, geo,
 probabilistic structures, JSON, vector search, Lua scripting, and a Memcached text-protocol
 gateway). It is genuinely the busiest file in the codebase, not a thin dispatcher.
-
----
 
 ---
 
@@ -47,9 +43,7 @@ gateway). It is genuinely the busiest file in the codebase, not a thin dispatche
 
 ---
 
----
-
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **Pre-allocated responder pool, not one-shot channels**: `ResponderChannel`s are built once
   per connection (`(0..router.num_shards).map(|_| flume::bounded(1))`) and reused for every

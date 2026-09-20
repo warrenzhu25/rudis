@@ -1,8 +1,6 @@
 # Component 01: Reactor Runtime & Server Lifecycle (Implementation)
 
-## Component 01: Reactor Runtime & Server Lifecycle — Code Reference & Implementation
-
-> **Source Files**: ``src/main.rs`, `src/server.rs``
+> **Source Files**: `src/main.rs`, `src/server.rs`
 
 
 ---
@@ -76,8 +74,6 @@ pub fn run_shard_worker(
 
 Every shard gets a clone of the full `senders` vector (so it can reach any other shard) but
 only its own `rx`, plus its own clone of the optional `tls_config`.
-
----
 
 ---
 
@@ -214,8 +210,6 @@ stream)` (a real `rustls` handshake driven over the `monoio` stream) *before* be
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/connection.rs`**: every accepted socket is handed off as `handle_connection(...)`, spawned as a task on this shard's runtime. See Component 02.
@@ -226,8 +220,6 @@ stream)` (a real `rustls` handshake driven over the `monoio` stream) *before* be
 - **`src/block.rs`**: `get_block_hub_for_port(port)` is consulted both for `CLIENT LIST`'s blocked-flag and for `ShardMessage::NotifyList` wakeups — the one place this subsystem reaches for a real, shared mutex instead of thread-local state.
 - **`src/pubsub.rs`**: `PubSubHub` is created per-shard but `Publish`/`PubsubChannels`/`PubsubNumsub`/`PubsubNumpat` are also reachable as `ShardMessage` variants so a publish on one shard can fan out to subscribers connected via other shards.
 - **`src/tls.rs`** (Component 15 — no longer dead code): `TlsWorkerConfig`, `TlsSession::new`/`handshake_monoio`, and the cert-loading/self-signed-generation functions are now genuinely called from here when `--tls-port` is set; `crate::connection::handle_tls_connection` is the TLS-specific counterpart to the plain loop's `handle_connection`.
-
----
 
 ---
 

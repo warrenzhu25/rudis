@@ -1,8 +1,6 @@
 # Component 05: Storage Engine & Compact Encodings (Design)
 
-## Component 05: Storage Engine & Compact Encodings
-
-> **Source Files**: ``src/table.rs``
+> **Source Files**: `src/table.rs`
 
 
 ---
@@ -21,8 +19,6 @@ Intset/skiplist-based structure. What has grown substantially since the original
 everything built on top of it: `RudisValue` now has 11 variants instead of 2, several of
 which have their own adaptive small/full representations, and `RudisTable` now tracks live
 memory usage and NVMe-tiering state per key.
-
----
 
 ---
 
@@ -50,9 +46,7 @@ memory usage and NVMe-tiering state per key.
 
 ---
 
----
-
-### 7. Performance Characteristics
+### 3. Performance Characteristics
 
 - **SIMD group probing is unchanged**: still one 128-bit load and compare per 16-slot group,
   triangular-step probing to avoid primary clustering.

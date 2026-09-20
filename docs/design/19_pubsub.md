@@ -1,8 +1,6 @@
 # Component 19: Pub/Sub Messaging Hub (Design)
 
-## Component 19: Pub/Sub Messaging Hub
-
-> **Source Files**: ``src/pubsub.rs``
+> **Source Files**: `src/pubsub.rs`
 
 
 ---
@@ -19,8 +17,6 @@ shard, owned by `Router.pubsub`, not a process-wide `Arc<Mutex<_>>`) — cross-s
 (a publisher on shard A reaching a subscriber connected via shard B) is handled by `Router::
 publish` fanning the message out to every other shard's own `PubSubHub`, not by sharing one
 hub across shards.
-
----
 
 ---
 
@@ -57,9 +53,7 @@ hub across shards.
 
 ---
 
----
-
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **Direct-channel publish is O(subscribers to that channel)** — no overhead from unrelated
   channels or patterns.

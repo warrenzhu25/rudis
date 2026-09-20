@@ -1,8 +1,6 @@
 # Component 13: Lua Scripting & Redis 7 Functions Engine (Implementation)
 
-## Component 13: Lua Scripting & Redis 7 Functions Engine — Code Reference & Implementation
-
-> **Source Files**: ``src/scripting.rs``
+> **Source Files**: `src/scripting.rs`
 
 
 ---
@@ -64,8 +62,6 @@ pub struct FunctionLib {
 the source with `lua.load(script_content)` on every single call, since the VM itself is
 recreated each time). `FunctionLib` has no `read_only`/`description` fields the old doc
 claimed; it just tracks which top-level function names a library registered.
-
----
 
 ---
 
@@ -208,8 +204,6 @@ match the old doc's description, modulo the exact function names.
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/connection.rs`** (Component 02): owns all `SCRIPT_CACHE`/`FUNCTION_LIBS` mutation
@@ -224,8 +218,6 @@ match the old doc's description, modulo the exact function names.
   `redis.call` executes a write command, exactly as an ordinary client-issued command would.
 - **`src/aof.rs`**: `EVAL`/`EVALSHA` and, as of the current source, `FCALL` writes are all
   appended via the `aof` parameter threaded into `eval_script`/`call_function` (§4.4).
-
----
 
 ---
 

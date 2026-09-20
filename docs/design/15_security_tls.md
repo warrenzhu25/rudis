@@ -1,8 +1,6 @@
 # Component 15: Security, Memory Allocator & TLS (Design)
 
-## Component 15: Security, Memory Allocator & TLS
-
-> **Source Files**: ``src/acl.rs`, `src/allocator.rs`, `src/tls.rs``
+> **Source Files**: `src/acl.rs`, `src/allocator.rs`, `src/tls.rs`
 
 
 ---
@@ -23,8 +21,6 @@ Three unrelated system-services modules bundled under one doc:
 
 ---
 
----
-
 ### 2. Key Invariants & Concurrency Constraints
 
 1. **One `AclManager` per listening port, not global**: `PORT_ACLS: LazyLock<Mutex<HashMap<u16, Arc<RwLock<AclManager>>>>>`, looked up via `get_acl_for_port(port)`. Every shard thread serving the same port shares the same `Arc<RwLock<AclManager>>` — this is, like `BlockHub` (Component 06), a deliberate exception to the shared-nothing/zero-lock architecture, needed because auth state has to be consistent across every shard's independently-accepted connections on that port.
@@ -35,9 +31,7 @@ Three unrelated system-services modules bundled under one doc:
 
 ---
 
----
-
-### 6. Performance Characteristics
+### 3. Performance Characteristics
 
 - **Auth check cost**: one `RwLock::read()` acquisition plus a linear scan over `passwords`/`password_hashes` (typically 0-1 entries each) plus one SHA1 computation per `AUTH` call — negligible, and only paid once per connection lifetime in the common case.
 - **Real per-command ACL overhead now exists (updated)**: every command after authentication takes an `AclManager` read-lock and a `HashMap`/`HashSet` lookup via `can_execute_command`/`can_access_key` (§4.1) — small, but no longer zero as the old doc stated; this is a real, permanent per-command cost on every connection now, not just at `AUTH` time.

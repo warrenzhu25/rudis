@@ -1,8 +1,6 @@
 # Component 15: Security, Memory Allocator & TLS (Implementation)
 
-## Component 15: Security, Memory Allocator & TLS — Code Reference & Implementation
-
-> **Source Files**: ``src/acl.rs`, `src/allocator.rs`, `src/tls.rs``
+> **Source Files**: `src/acl.rs`, `src/allocator.rs`, `src/tls.rs`
 
 
 ---
@@ -87,8 +85,6 @@ pub struct AllocatorStats {
 ```
 
 (`fragmentation_ratio` is derived as `resident / allocated`, not a jemalloc-native field.)
-
----
 
 ---
 
@@ -303,16 +299,12 @@ is just never set to `true` by a bare `TCP_ULP` success, and the code always tak
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/connection.rs`**: `get_acl_for_port` backs both the `AUTH`/`ACL *` command handlers and the new per-command/per-key enforcement in `execute_command`/`execute_commands_squashed` (§4.1); `allocator::format_memory_info` is called via `INFO`; and, new, `handle_tls_connection` is a second connection-handling entry point (alongside plain `handle_connection`) that routes all I/O through a `TlsSession` (§4.4).
 - **`src/server.rs`** (Component 01): now conditionally binds a second `SO_REUSEPORT` listener on `--tls-port` and spawns a dedicated TLS accept loop per shard (§4.4), in addition to everything it did before.
 - **`src/main.rs`**: parses the new `--tls-port`/`--tls-cert-file`/`--tls-key-file` CLI flags, builds a `rustls::ServerConfig` once (via `tls::create_server_config` or `tls::generate_self_signed_cert` if no cert/key files are given) before spawning any shard thread, and passes it down as `TlsWorkerConfig`.
 - **`src/tiering.rs`**: does not call `allocator::get_allocator_stats()` — memory-pressure decisions for auto-tiering are driven by a separately tracked `used_memory` estimate on `RudisTable` (see Component 05), not by live jemalloc RSS figures. Unchanged by this update.
-
----
 
 ---
 
