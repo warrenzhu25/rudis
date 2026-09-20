@@ -44,31 +44,31 @@
         ]
       },
       "MSET_5K": {
-        "ops_sec_median": 395251.05,
-        "ops_sec_mean": 394406.22,
-        "ops_sec_min": 391274.42,
-        "ops_sec_max": 396693.19,
-        "ops_sec_cv_pct": 0.7100382773810466,
-        "avg_latency_median": 0.645,
-        "p99_latency_median": 0.645,
+        "ops_sec_median": 389853.5,
+        "ops_sec_mean": 391004.00666666665,
+        "ops_sec_min": 384754.21,
+        "ops_sec_max": 398404.31,
+        "ops_sec_cv_pct": 1.7692273946271517,
+        "avg_latency_median": 0.654,
+        "p99_latency_median": 0.654,
         "runs": [
-          396693.19,
-          391274.42,
-          395251.05
+          398404.31,
+          389853.5,
+          384754.21
         ]
       },
       "MGET_5K": {
-        "ops_sec_median": 359351.23,
-        "ops_sec_mean": 360377.89666666667,
-        "ops_sec_min": 356682.11,
-        "ops_sec_max": 365100.35,
-        "ops_sec_cv_pct": 1.1971581072676114,
-        "avg_latency_median": 0.711,
-        "p99_latency_median": 0.711,
+        "ops_sec_median": 346020.35,
+        "ops_sec_mean": 347084.51,
+        "ops_sec_min": 342331.74,
+        "ops_sec_max": 352901.44,
+        "ops_sec_cv_pct": 1.5503721514780249,
+        "avg_latency_median": 0.739,
+        "p99_latency_median": 0.739,
         "runs": [
-          356682.11,
-          359351.23,
-          365100.35
+          346020.35,
+          342331.74,
+          352901.44
         ]
       },
       "HSET": {
@@ -270,31 +270,31 @@
         ]
       },
       "MSET_5K": {
-        "ops_sec_median": 700213.32,
-        "ops_sec_mean": 700902.5599999999,
-        "ops_sec_min": 696727.57,
-        "ops_sec_max": 705766.79,
-        "ops_sec_cv_pct": 0.6510666621885411,
-        "avg_latency_median": 0.364,
-        "p99_latency_median": 0.364,
+        "ops_sec_median": 709597.56,
+        "ops_sec_mean": 708619.6333333333,
+        "ops_sec_min": 701830.7,
+        "ops_sec_max": 714430.64,
+        "ops_sec_cv_pct": 0.8958092273691268,
+        "avg_latency_median": 0.359,
+        "p99_latency_median": 0.359,
         "runs": [
-          696727.57,
-          705766.79,
-          700213.32
+          701830.7,
+          709597.56,
+          714430.64
         ]
       },
       "MGET_5K": {
-        "ops_sec_median": 476916.43,
-        "ops_sec_mean": 483064.39666666667,
-        "ops_sec_min": 475823.66,
-        "ops_sec_max": 496453.1,
-        "ops_sec_cv_pct": 2.433932423698038,
-        "avg_latency_median": 0.536,
-        "p99_latency_median": 0.536,
+        "ops_sec_median": 491996.58,
+        "ops_sec_mean": 491450.5466666667,
+        "ops_sec_min": 484099.4,
+        "ops_sec_max": 498255.66,
+        "ops_sec_cv_pct": 1.4418613551698842,
+        "avg_latency_median": 0.519,
+        "p99_latency_median": 0.519,
         "runs": [
-          476916.43,
-          496453.1,
-          475823.66
+          498255.66,
+          484099.4,
+          491996.58
         ]
       },
       "HSET": {
