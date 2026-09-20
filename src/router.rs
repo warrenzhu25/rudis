@@ -3022,6 +3022,7 @@ impl Router {
             .map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
         std::fs::rename(&tmp_filename, &filename).map_err(|e| e.to_string())?;
+        let _ = crate::aof::sync_parent_dir(std::path::Path::new(&filename));
 
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

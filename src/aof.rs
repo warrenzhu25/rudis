@@ -1317,8 +1317,24 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
     let file = writer.into_inner().map_err(|e| e.into_error())?;
     file.sync_all()?;
     std::fs::rename(&tmp_path, &target_path)?;
+    let _ = sync_parent_dir(&target_path);
 
     Ok(count)
+}
+
+/// Flushes directory metadata so that recently renamed files are durable across sudden power loss
+pub fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        let dir_path = if parent.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(dir_file) = std::fs::File::open(dir_path) {
+            dir_file.sync_all()?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1447,6 +1463,19 @@ mod tests {
             assert_eq!(new_db.get(b"k1"), Some(Bytes::from("v1")));
             assert_eq!(new_db.get(b"k2"), Some(Bytes::from("v2")));
         });
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_sync_parent_dir_durability() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("rudis-sync-dir-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let test_file = temp_dir.join("test.txt");
+        std::fs::write(&test_file, b"data").unwrap();
+
+        assert!(sync_parent_dir(&test_file).is_ok());
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
