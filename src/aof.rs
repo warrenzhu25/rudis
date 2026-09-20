@@ -1092,9 +1092,21 @@ pub fn replay_aof(path: &Path, db: &mut ShardDb) -> std::io::Result<usize> {
 
 pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::io::Result<usize> {
     use std::io::Write;
-    let mut buf = Vec::with_capacity(65536);
     let mut count = 0;
     let now = std::time::Instant::now();
+
+    static TMP_REWRITE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let tmp_id = TMP_REWRITE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = dir.join(format!(
+        "appendonly-{}.aof.tmp.{}_{}",
+        shard_id,
+        std::process::id(),
+        tmp_id
+    ));
+    let target_path = dir.join(format!("appendonly-{}.aof", shard_id));
+
+    let file = std::fs::File::create(&tmp_path)?;
+    let mut writer = std::io::BufWriter::with_capacity(65536, file);
 
     // 1. Snapshot all non-expired entries in RudisTable as canonical RESP commands
     for entry in db.table.entries() {
@@ -1113,118 +1125,118 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
                 if let Some(exp) = entry.expire_at {
                     let rem_ms = exp.duration_since(now).as_millis() as u64;
                     let rem_ms_str = rem_ms.to_string();
-                    buf.extend_from_slice(b"*5\r\n$3\r\nSET\r\n$");
-                    buf.extend_from_slice(k.len().to_string().as_bytes());
-                    buf.extend_from_slice(b"\r\n");
-                    buf.extend_from_slice(k);
-                    buf.extend_from_slice(b"\r\n$");
-                    buf.extend_from_slice(val.len().to_string().as_bytes());
-                    buf.extend_from_slice(b"\r\n");
-                    buf.extend_from_slice(val.as_ref());
-                    buf.extend_from_slice(b"\r\n$2\r\nPX\r\n$");
-                    buf.extend_from_slice(rem_ms_str.len().to_string().as_bytes());
-                    buf.extend_from_slice(b"\r\n");
-                    buf.extend_from_slice(rem_ms_str.as_bytes());
-                    buf.extend_from_slice(b"\r\n");
+                    writer.write_all(b"*5\r\n$3\r\nSET\r\n$")?;
+                    writer.write_all(k.len().to_string().as_bytes())?;
+                    writer.write_all(b"\r\n")?;
+                    writer.write_all(k)?;
+                    writer.write_all(b"\r\n$")?;
+                    writer.write_all(val.len().to_string().as_bytes())?;
+                    writer.write_all(b"\r\n")?;
+                    writer.write_all(val.as_ref())?;
+                    writer.write_all(b"\r\n$2\r\nPX\r\n$")?;
+                    writer.write_all(rem_ms_str.len().to_string().as_bytes())?;
+                    writer.write_all(b"\r\n")?;
+                    writer.write_all(rem_ms_str.as_bytes())?;
+                    writer.write_all(b"\r\n")?;
                 } else {
-                    buf.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$");
-                    buf.extend_from_slice(k.len().to_string().as_bytes());
-                    buf.extend_from_slice(b"\r\n");
-                    buf.extend_from_slice(k);
-                    buf.extend_from_slice(b"\r\n$");
-                    buf.extend_from_slice(val.len().to_string().as_bytes());
-                    buf.extend_from_slice(b"\r\n");
-                    buf.extend_from_slice(val.as_ref());
-                    buf.extend_from_slice(b"\r\n");
+                    writer.write_all(b"*3\r\n$3\r\nSET\r\n$")?;
+                    writer.write_all(k.len().to_string().as_bytes())?;
+                    writer.write_all(b"\r\n")?;
+                    writer.write_all(k)?;
+                    writer.write_all(b"\r\n$")?;
+                    writer.write_all(val.len().to_string().as_bytes())?;
+                    writer.write_all(b"\r\n")?;
+                    writer.write_all(val.as_ref())?;
+                    writer.write_all(b"\r\n")?;
                 }
                 count += 1;
             }
             crate::table::RudisValue::Int(val) => {
                 let val_str = val.to_string();
-                buf.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$");
-                buf.extend_from_slice(k.len().to_string().as_bytes());
-                buf.extend_from_slice(b"\r\n");
-                buf.extend_from_slice(k);
-                buf.extend_from_slice(b"\r\n$");
-                buf.extend_from_slice(val_str.len().to_string().as_bytes());
-                buf.extend_from_slice(b"\r\n");
-                buf.extend_from_slice(val_str.as_bytes());
-                buf.extend_from_slice(b"\r\n");
+                writer.write_all(b"*3\r\n$3\r\nSET\r\n$")?;
+                writer.write_all(k.len().to_string().as_bytes())?;
+                writer.write_all(b"\r\n")?;
+                writer.write_all(k)?;
+                writer.write_all(b"\r\n$")?;
+                writer.write_all(val_str.len().to_string().as_bytes())?;
+                writer.write_all(b"\r\n")?;
+                writer.write_all(val_str.as_bytes())?;
+                writer.write_all(b"\r\n")?;
                 count += 1;
             }
             crate::table::RudisValue::SmallHash(pairs) if !pairs.is_empty() => {
-                buf.extend_from_slice(
+                writer.write_all(
                     format!("*{}\r\n$4\r\nHSET\r\n${}\r\n", pairs.len() * 2 + 2, k.len())
                         .as_bytes(),
-                );
-                buf.extend_from_slice(k);
-                buf.extend_from_slice(b"\r\n");
+                )?;
+                writer.write_all(k)?;
+                writer.write_all(b"\r\n")?;
                 for (field, v) in pairs {
-                    buf.extend_from_slice(format!("${}\r\n", field.len()).as_bytes());
-                    buf.extend_from_slice(field.as_ref());
-                    buf.extend_from_slice(format!("\r\n${}\r\n", v.len()).as_bytes());
-                    buf.extend_from_slice(v.as_ref());
-                    buf.extend_from_slice(b"\r\n");
+                    writer.write_all(format!("${}\r\n", field.len()).as_bytes())?;
+                    writer.write_all(field.as_ref())?;
+                    writer.write_all(format!("\r\n${}\r\n", v.len()).as_bytes())?;
+                    writer.write_all(v.as_ref())?;
+                    writer.write_all(b"\r\n")?;
                 }
                 count += 1;
             }
             crate::table::RudisValue::Hash(map) if !map.is_empty() => {
-                buf.extend_from_slice(
+                writer.write_all(
                     format!("*{}\r\n$4\r\nHSET\r\n${}\r\n", map.len() * 2 + 2, k.len()).as_bytes(),
-                );
-                buf.extend_from_slice(k);
-                buf.extend_from_slice(b"\r\n");
+                )?;
+                writer.write_all(k)?;
+                writer.write_all(b"\r\n")?;
                 for (field, v) in map.as_ref() {
-                    buf.extend_from_slice(format!("${}\r\n", field.len()).as_bytes());
-                    buf.extend_from_slice(field.as_ref());
-                    buf.extend_from_slice(format!("\r\n${}\r\n", v.len()).as_bytes());
-                    buf.extend_from_slice(v.as_ref());
-                    buf.extend_from_slice(b"\r\n");
+                    writer.write_all(format!("${}\r\n", field.len()).as_bytes())?;
+                    writer.write_all(field.as_ref())?;
+                    writer.write_all(format!("\r\n${}\r\n", v.len()).as_bytes())?;
+                    writer.write_all(v.as_ref())?;
+                    writer.write_all(b"\r\n")?;
                 }
                 count += 1;
             }
             crate::table::RudisValue::List(list) if !list.is_empty() => {
-                buf.extend_from_slice(
+                writer.write_all(
                     format!("*{}\r\n$5\r\nRPUSH\r\n${}\r\n", list.len() + 2, k.len()).as_bytes(),
-                );
-                buf.extend_from_slice(k);
-                buf.extend_from_slice(b"\r\n");
+                )?;
+                writer.write_all(k)?;
+                writer.write_all(b"\r\n")?;
                 for item in list {
-                    buf.extend_from_slice(format!("${}\r\n", item.len()).as_bytes());
-                    buf.extend_from_slice(item.as_ref());
-                    buf.extend_from_slice(b"\r\n");
+                    writer.write_all(format!("${}\r\n", item.len()).as_bytes())?;
+                    writer.write_all(item.as_ref())?;
+                    writer.write_all(b"\r\n")?;
                 }
                 count += 1;
             }
             crate::table::RudisValue::Set(set) if !set.is_empty() => {
                 let members: Vec<bytes::Bytes> = set.to_vec();
-                buf.extend_from_slice(
+                writer.write_all(
                     format!("*{}\r\n$4\r\nSADD\r\n${}\r\n", members.len() + 2, k.len()).as_bytes(),
-                );
-                buf.extend_from_slice(k);
-                buf.extend_from_slice(b"\r\n");
+                )?;
+                writer.write_all(k)?;
+                writer.write_all(b"\r\n")?;
                 for m in members {
-                    buf.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
-                    buf.extend_from_slice(m.as_ref());
-                    buf.extend_from_slice(b"\r\n");
+                    writer.write_all(format!("${}\r\n", m.len()).as_bytes())?;
+                    writer.write_all(m.as_ref())?;
+                    writer.write_all(b"\r\n")?;
                 }
                 count += 1;
             }
             crate::table::RudisValue::ZSet(zset) if !zset.is_empty() => {
                 let elements = zset.to_vec();
-                buf.extend_from_slice(
+                writer.write_all(
                     format!(
                         "*{}\r\n$4\r\nZADD\r\n${}\r\n",
                         elements.len() * 2 + 2,
                         k.len()
                     )
                     .as_bytes(),
-                );
-                buf.extend_from_slice(k);
-                buf.extend_from_slice(b"\r\n");
+                )?;
+                writer.write_all(k)?;
+                writer.write_all(b"\r\n")?;
                 for (member, score) in elements {
                     let score_str = score.to_string();
-                    buf.extend_from_slice(
+                    writer.write_all(
                         format!(
                             "${}\r\n{}\r\n${}\r\n",
                             score_str.len(),
@@ -1232,41 +1244,40 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
                             member.len()
                         )
                         .as_bytes(),
-                    );
-                    buf.extend_from_slice(member.as_ref());
-                    buf.extend_from_slice(b"\r\n");
+                    )?;
+                    writer.write_all(member.as_ref())?;
+                    writer.write_all(b"\r\n")?;
                 }
                 count += 1;
             }
             crate::table::RudisValue::HyperLogLog(hll) => {
-                buf.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$");
-                buf.extend_from_slice(k.len().to_string().as_bytes());
-                buf.extend_from_slice(b"\r\n");
-                buf.extend_from_slice(k);
-                buf.extend_from_slice(b"\r\n$");
-                buf.extend_from_slice(hll.len().to_string().as_bytes());
-                buf.extend_from_slice(b"\r\n");
-                buf.extend_from_slice(hll.as_ref());
-                buf.extend_from_slice(b"\r\n");
+                writer.write_all(b"*3\r\n$3\r\nSET\r\n$")?;
+                writer.write_all(k.len().to_string().as_bytes())?;
+                writer.write_all(b"\r\n")?;
+                writer.write_all(k)?;
+                writer.write_all(b"\r\n$")?;
+                writer.write_all(hll.len().to_string().as_bytes())?;
+                writer.write_all(b"\r\n")?;
+                writer.write_all(hll.as_ref())?;
+                writer.write_all(b"\r\n")?;
                 count += 1;
             }
             crate::table::RudisValue::Stream(stream) if !stream.entries.is_empty() => {
                 for (sid, fields) in &stream.entries {
                     let id_str = sid.to_string();
                     let num_args = 2 + 1 + fields.len() * 2;
-                    buf.extend_from_slice(
+                    writer.write_all(
                         format!("*{}\r\n$4\r\nXADD\r\n${}\r\n", num_args, k.len()).as_bytes(),
-                    );
-                    buf.extend_from_slice(k);
-                    buf.extend_from_slice(
-                        format!("\r\n${}\r\n{}\r\n", id_str.len(), id_str).as_bytes(),
-                    );
+                    )?;
+                    writer.write_all(k)?;
+                    writer
+                        .write_all(format!("\r\n${}\r\n{}\r\n", id_str.len(), id_str).as_bytes())?;
                     for (f, v) in fields {
-                        buf.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
-                        buf.extend_from_slice(f.as_ref());
-                        buf.extend_from_slice(format!("\r\n${}\r\n", v.len()).as_bytes());
-                        buf.extend_from_slice(v.as_ref());
-                        buf.extend_from_slice(b"\r\n");
+                        writer.write_all(format!("${}\r\n", f.len()).as_bytes())?;
+                        writer.write_all(f.as_ref())?;
+                        writer.write_all(format!("\r\n${}\r\n", v.len()).as_bytes())?;
+                        writer.write_all(v.as_ref())?;
+                        writer.write_all(b"\r\n")?;
                     }
                     count += 1;
                 }
@@ -1279,42 +1290,31 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
         {
             let rem_ms = exp.duration_since(now).as_millis() as u64;
             let rem_ms_str = rem_ms.to_string();
-            buf.extend_from_slice(b"*3\r\n$7\r\nPEXPIRE\r\n$");
-            buf.extend_from_slice(k.len().to_string().as_bytes());
-            buf.extend_from_slice(b"\r\n");
-            buf.extend_from_slice(k);
-            buf.extend_from_slice(b"\r\n$");
-            buf.extend_from_slice(rem_ms_str.len().to_string().as_bytes());
-            buf.extend_from_slice(b"\r\n");
-            buf.extend_from_slice(rem_ms_str.as_bytes());
-            buf.extend_from_slice(b"\r\n");
+            writer.write_all(b"*3\r\n$7\r\nPEXPIRE\r\n$")?;
+            writer.write_all(k.len().to_string().as_bytes())?;
+            writer.write_all(b"\r\n")?;
+            writer.write_all(k)?;
+            writer.write_all(b"\r\n$")?;
+            writer.write_all(rem_ms_str.len().to_string().as_bytes())?;
+            writer.write_all(b"\r\n")?;
+            writer.write_all(rem_ms_str.as_bytes())?;
+            writer.write_all(b"\r\n")?;
         }
     }
 
     // 2. Snapshot JSON documents
     for (k, doc) in db.json_store.iter() {
         let doc_str = serde_json::to_string(doc).unwrap_or_default();
-        buf.extend_from_slice(format!("*4\r\n$8\r\nJSON.SET\r\n${}\r\n", k.len()).as_bytes());
-        buf.extend_from_slice(k.as_ref());
-        buf.extend_from_slice(
+        writer.write_all(format!("*4\r\n$8\r\nJSON.SET\r\n${}\r\n", k.len()).as_bytes())?;
+        writer.write_all(k.as_ref())?;
+        writer.write_all(
             format!("\r\n$1\r\n$\r\n${}\r\n{}\r\n", doc_str.len(), doc_str).as_bytes(),
-        );
+        )?;
         count += 1;
     }
 
-    // 3. Atomically write to temp file and rename
-    static TMP_REWRITE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let tmp_id = TMP_REWRITE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp_path = dir.join(format!(
-        "appendonly-{}.aof.tmp.{}_{}",
-        shard_id,
-        std::process::id(),
-        tmp_id
-    ));
-    let target_path = dir.join(format!("appendonly-{}.aof", shard_id));
-
-    let mut file = std::fs::File::create(&tmp_path)?;
-    file.write_all(&buf)?;
+    writer.flush()?;
+    let file = writer.into_inner().map_err(|e| e.into_error())?;
     file.sync_all()?;
     std::fs::rename(&tmp_path, &target_path)?;
 

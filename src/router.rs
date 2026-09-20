@@ -2827,7 +2827,7 @@ impl Router {
             let _ = crate::aof::AofWriter::reopen_after_rewrite(aof).await;
         }
 
-        let mut responders = Vec::new();
+        // Remote shards rewritten sequentially one-by-one to eliminate concurrent 15-shard I/O and memory spikes
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
                 let (tx, rx) = flume::bounded(1);
@@ -2838,15 +2838,10 @@ impl Router {
                         responder: tx,
                     })
                     .is_ok()
+                    && let Ok(Ok(count)) = rx.recv_async().await
                 {
-                    responders.push(rx);
+                    total_rewritten += count;
                 }
-            }
-        }
-
-        for rx in responders {
-            if let Ok(Ok(count)) = rx.recv_async().await {
-                total_rewritten += count;
             }
         }
 
