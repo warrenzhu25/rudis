@@ -2988,26 +2988,22 @@ impl Router {
         }
         drop(local_chunk);
 
-        // Remote shard chunks streamed and dropped one-by-one
-        let mut responders = Vec::new();
+        // Remote shard chunks streamed sequentially one-by-one:
+        // Only one shard ever holds a serialized chunk in memory at any time.
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
                 let (tx, rx) = flume::bounded(1);
                 if sender
                     .send(ShardMessage::SaveRdbChunk { responder: tx })
                     .is_ok()
+                    && let Ok(chunk) = rx.recv_async().await
                 {
-                    responders.push(rx);
+                    if !chunk.is_empty() {
+                        crc = crate::table::crc64_update(crc, &chunk);
+                        file.write_all(&chunk).map_err(|e| e.to_string())?;
+                    }
+                    drop(chunk);
                 }
-            }
-        }
-        for rx in responders {
-            if let Ok(chunk) = rx.recv_async().await {
-                if !chunk.is_empty() {
-                    crc = crate::table::crc64_update(crc, &chunk);
-                    file.write_all(&chunk).map_err(|e| e.to_string())?;
-                }
-                drop(chunk);
             }
         }
 

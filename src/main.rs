@@ -64,6 +64,13 @@ struct Args {
 }
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        // Disable Linux Transparent Huge Pages (THP) for this process and all its worker threads.
+        // Prevents the kernel from promoting allocations to 2MB physical pages and eliminates 512x COW amplification.
+        libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0);
+    }
+
     rudis::telemetry::init_telemetry();
     rudis::shutdown::install_signal_handlers();
     let args = Args::parse();
