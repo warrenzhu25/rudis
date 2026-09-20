@@ -1,5 +1,8 @@
+use bytes::Bytes;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, RwLock};
+
+pub type DocId = u32;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldType {
@@ -38,21 +41,21 @@ pub struct IndexSchema {
     pub schema_fields: Vec<SchemaField>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Posting {
-    pub doc_id: String,
+    pub doc_id: DocId,
     pub term_freq: u32,
-    pub positions: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
 pub struct DocMeta {
-    pub doc_id: String,
+    pub key: Bytes,
     pub doc_len: usize, // total tokens
     pub fields: HashMap<String, String>,
     pub numeric_fields: HashMap<String, f64>,
     pub tag_fields: HashMap<String, HashSet<String>>,
     pub vector_fields: HashMap<String, Vec<f32>>,
+    pub terms: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -60,8 +63,12 @@ pub struct InvertedIndex {
     pub schema: Option<IndexSchema>,
     // term -> list of postings
     pub inverted: HashMap<String, Vec<Posting>>,
+    // key -> dense DocId
+    pub key_to_id: HashMap<Bytes, DocId>,
     // doc_id -> metadata
-    pub docs: HashMap<String, DocMeta>,
+    pub id_to_meta: HashMap<DocId, DocMeta>,
+    pub next_doc_id: DocId,
+    pub free_ids: Vec<DocId>,
     pub total_docs: usize,
     pub total_terms: usize,
 }
@@ -317,10 +324,23 @@ impl InvertedIndex {
         Self {
             schema: Some(schema),
             inverted: HashMap::new(),
-            docs: HashMap::new(),
+            key_to_id: HashMap::new(),
+            id_to_meta: HashMap::new(),
+            next_doc_id: 1,
+            free_ids: Vec::new(),
             total_docs: 0,
             total_terms: 0,
         }
+    }
+
+    #[inline(always)]
+    pub fn doc_id_of(&self, key: &[u8]) -> Option<DocId> {
+        self.key_to_id.get(key).copied()
+    }
+
+    #[inline(always)]
+    pub fn key_of(&self, doc_id: DocId) -> Option<&Bytes> {
+        self.id_to_meta.get(&doc_id).map(|m| &m.key)
     }
 
     pub fn avg_doc_len(&self) -> f64 {
@@ -333,12 +353,16 @@ impl InvertedIndex {
 
     pub fn add_document(
         &mut self,
-        doc_id: &str,
+        doc_id_str: &str,
         fields: HashMap<String, String>,
         vectors: Option<HashMap<String, Vec<f32>>>,
     ) {
+        let key_bytes = Bytes::copy_from_slice(doc_id_str.as_bytes());
+
         // If document already exists, remove old entries first
-        self.remove_document(doc_id);
+        if self.key_to_id.contains_key(&key_bytes) {
+            self.remove_document(doc_id_str);
+        }
 
         let schema = match &self.schema {
             Some(s) => s.clone(),
@@ -348,7 +372,7 @@ impl InvertedIndex {
         let mut doc_len = 0;
         let mut numeric_fields = HashMap::new();
         let mut tag_fields = HashMap::new();
-        let mut term_positions: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut term_positions: HashMap<String, u32> = HashMap::new();
 
         for (field_name, field_val) in &fields {
             if let Some(ftype) = schema.fields.get(field_name) {
@@ -356,8 +380,8 @@ impl InvertedIndex {
                     FieldType::Text { nostem, .. } => {
                         let tokens = tokenize_text(field_val, !*nostem);
                         doc_len += tokens.len();
-                        for (pos, tok) in tokens.into_iter().enumerate() {
-                            term_positions.entry(tok).or_default().push(pos as u32);
+                        for tok in tokens {
+                            *term_positions.entry(tok).or_default() += 1;
                         }
                     }
                     FieldType::Numeric { .. } => {
@@ -388,20 +412,26 @@ impl InvertedIndex {
                 // Untyped text fallback
                 let tokens = tokenize_text(field_val, true);
                 doc_len += tokens.len();
-                for (pos, tok) in tokens.into_iter().enumerate() {
-                    term_positions.entry(tok).or_default().push(pos as u32);
+                for tok in tokens {
+                    *term_positions.entry(tok).or_default() += 1;
                 }
             }
         }
 
-        for (term, positions) in term_positions {
-            let freq = positions.len() as u32;
+        let doc_id = self.free_ids.pop().unwrap_or_else(|| {
+            let id = self.next_doc_id;
+            self.next_doc_id += 1;
+            id
+        });
+
+        let mut indexed_terms = Vec::with_capacity(term_positions.len());
+        for (term, freq) in term_positions {
             let posting = Posting {
-                doc_id: doc_id.to_string(),
+                doc_id,
                 term_freq: freq,
-                positions,
             };
-            self.inverted.entry(term).or_default().push(posting);
+            self.inverted.entry(term.clone()).or_default().push(posting);
+            indexed_terms.push(term);
         }
 
         let mut vector_fields = vectors.unwrap_or_default();
@@ -417,28 +447,42 @@ impl InvertedIndex {
         }
 
         let doc_meta = DocMeta {
-            doc_id: doc_id.to_string(),
+            key: key_bytes.clone(),
             doc_len,
             fields,
             numeric_fields,
             tag_fields,
             vector_fields,
+            terms: indexed_terms,
         };
 
-        self.docs.insert(doc_id.to_string(), doc_meta);
+        self.key_to_id.insert(key_bytes, doc_id);
+        self.id_to_meta.insert(doc_id, doc_meta);
         self.total_docs += 1;
         self.total_terms += doc_len;
     }
 
-    pub fn remove_document(&mut self, doc_id: &str) {
-        if let Some(meta) = self.docs.remove(doc_id) {
+    pub fn remove_document(&mut self, key: &str) {
+        let key_bytes = key.as_bytes();
+        let doc_id = match self.key_to_id.remove(key_bytes) {
+            Some(id) => id,
+            None => return,
+        };
+
+        if let Some(meta) = self.id_to_meta.remove(&doc_id) {
             self.total_docs = self.total_docs.saturating_sub(1);
             self.total_terms = self.total_terms.saturating_sub(meta.doc_len);
+            self.free_ids.push(doc_id);
 
-            for postings in self.inverted.values_mut() {
-                postings.retain(|p| p.doc_id != doc_id);
+            // O(1) removal directed by the document's indexed terms
+            for term in &meta.terms {
+                if let Some(postings) = self.inverted.get_mut(term) {
+                    postings.retain(|p| p.doc_id != doc_id);
+                    if postings.is_empty() {
+                        self.inverted.remove(term);
+                    }
+                }
             }
-            self.inverted.retain(|_, postings| !postings.is_empty());
         }
     }
 
@@ -894,76 +938,75 @@ impl Default for SearchOptions {
     }
 }
 
-pub fn execute_search(
+fn evaluate_ast(
     index: &InvertedIndex,
     ast: &QueryAst,
     opts: &SearchOptions,
-) -> (usize, Vec<SearchHit>) {
-    let mut candidate_scores: HashMap<String, f64> = HashMap::new();
-
-    // 1. Evaluate AST to produce candidate matching documents with scores
+) -> HashMap<DocId, f64> {
     match ast {
         QueryAst::MatchAll => {
-            for doc_id in index.docs.keys() {
-                candidate_scores.insert(doc_id.clone(), 1.0);
+            let mut map = HashMap::with_capacity(index.id_to_meta.len());
+            for &doc_id in index.id_to_meta.keys() {
+                map.insert(doc_id, 1.0);
             }
+            map
         }
         QueryAst::Term(t) => {
+            let mut map = HashMap::new();
             if let Some(postings) = index.inverted.get(t) {
                 for p in postings {
-                    if let Some(doc) = index.docs.get(&p.doc_id) {
+                    if let Some(doc) = index.id_to_meta.get(&p.doc_id) {
                         let score = index.bm25_score(t, p, doc.doc_len);
-                        candidate_scores.insert(p.doc_id.clone(), score);
+                        map.insert(p.doc_id, score);
                     }
                 }
             }
+            map
         }
         QueryAst::Prefix(pfx) => {
+            let mut map = HashMap::new();
             for (term, postings) in &index.inverted {
                 if term.starts_with(pfx) {
                     for p in postings {
-                        if let Some(doc) = index.docs.get(&p.doc_id) {
+                        if let Some(doc) = index.id_to_meta.get(&p.doc_id) {
                             let score = index.bm25_score(term, p, doc.doc_len);
-                            *candidate_scores.entry(p.doc_id.clone()).or_default() += score;
+                            *map.entry(p.doc_id).or_default() += score;
                         }
                     }
                 }
             }
+            map
         }
         QueryAst::Exact(exact_term) => {
+            let mut map = HashMap::new();
             if let Some(postings) = index.inverted.get(exact_term) {
                 for p in postings {
-                    if let Some(doc) = index.docs.get(&p.doc_id) {
+                    if let Some(doc) = index.id_to_meta.get(&p.doc_id) {
                         let score = index.bm25_score(exact_term, p, doc.doc_len);
-                        candidate_scores.insert(p.doc_id.clone(), score);
+                        map.insert(p.doc_id, score);
                     }
                 }
             }
+            map
         }
         QueryAst::FieldScope { field, inner } => {
-            let (total, hits) = execute_search(
-                index,
-                inner,
-                &SearchOptions {
-                    limit: usize::MAX,
-                    ..Default::default()
-                },
-            );
-            if total > 0 {
-                for h in hits {
-                    if let Some(doc) = index.docs.get(&h.doc_id)
-                        && (doc.fields.contains_key(field)
-                            || field
-                                .strip_prefix("$.")
-                                .is_some_and(|f| doc.fields.contains_key(f)))
-                    {
-                        candidate_scores.insert(h.doc_id, h.score);
-                    }
+            let sub_scores = evaluate_ast(index, inner, opts);
+            let mut map = HashMap::new();
+            for (doc_id, score) in sub_scores {
+                if let Some(doc) = index.id_to_meta.get(&doc_id)
+                    && (doc.fields.contains_key(field)
+                        || field
+                            .strip_prefix("$.")
+                            .is_some_and(|f| doc.fields.contains_key(f)))
+                {
+                    map.insert(doc_id, score);
                 }
             }
+            map
         }
         QueryAst::NumericRange { field, min, max } => {
-            for (doc_id, doc) in &index.docs {
+            let mut map = HashMap::new();
+            for (&doc_id, doc) in &index.id_to_meta {
                 let num_val = doc.numeric_fields.get(field).copied().or_else(|| {
                     field
                         .strip_prefix("$.")
@@ -973,12 +1016,14 @@ pub fn execute_search(
                     && val >= *min
                     && val <= *max
                 {
-                    candidate_scores.insert(doc_id.clone(), 1.0);
+                    map.insert(doc_id, 1.0);
                 }
             }
+            map
         }
         QueryAst::TagFilter { field, tags } => {
-            for (doc_id, doc) in &index.docs {
+            let mut map = HashMap::new();
+            for (&doc_id, doc) in &index.id_to_meta {
                 let tags_opt = doc
                     .tag_fields
                     .get(field)
@@ -986,77 +1031,52 @@ pub fn execute_search(
                 if let Some(doc_tags) = tags_opt {
                     let matched = tags.iter().any(|t| doc_tags.contains(t));
                     if matched {
-                        candidate_scores.insert(doc_id.clone(), 1.0);
+                        map.insert(doc_id, 1.0);
                     }
                 }
             }
+            map
         }
         QueryAst::And(sub_asts) => {
-            if !sub_asts.is_empty() {
-                // Intersect candidates
-                let mut first = true;
-                let mut current_set = HashMap::new();
-                for sub in sub_asts {
-                    let (_, hits) = execute_search(
-                        index,
-                        sub,
-                        &SearchOptions {
-                            limit: usize::MAX,
-                            params: opts.params.clone(),
-                            ..Default::default()
-                        },
-                    );
-                    let sub_map: HashMap<String, f64> =
-                        hits.into_iter().map(|h| (h.doc_id, h.score)).collect();
-                    if first {
-                        current_set = sub_map;
-                        first = false;
-                    } else {
-                        current_set.retain(|id, score| {
-                            if let Some(sub_score) = sub_map.get(id) {
-                                *score += *sub_score;
-                                true
-                            } else {
-                                false
-                            }
-                        });
-                    }
-                }
-                candidate_scores = current_set;
+            if sub_asts.is_empty() {
+                return HashMap::new();
             }
+            let mut current = evaluate_ast(index, &sub_asts[0], opts);
+            for sub in &sub_asts[1..] {
+                if current.is_empty() {
+                    break;
+                }
+                let sub_map = evaluate_ast(index, sub, opts);
+                current.retain(|id, score| {
+                    if let Some(sub_score) = sub_map.get(id) {
+                        *score += *sub_score;
+                        true
+                    } else {
+                        false
+                    }
+                });
+            }
+            current
         }
         QueryAst::Or(sub_asts) => {
+            let mut map = HashMap::new();
             for sub in sub_asts {
-                let (_, hits) = execute_search(
-                    index,
-                    sub,
-                    &SearchOptions {
-                        limit: usize::MAX,
-                        params: opts.params.clone(),
-                        ..Default::default()
-                    },
-                );
-                for h in hits {
-                    *candidate_scores.entry(h.doc_id).or_default() += h.score;
+                let sub_map = evaluate_ast(index, sub, opts);
+                for (id, score) in sub_map {
+                    *map.entry(id).or_default() += score;
                 }
             }
+            map
         }
         QueryAst::Not(sub) => {
-            let (_, hits) = execute_search(
-                index,
-                sub,
-                &SearchOptions {
-                    limit: usize::MAX,
-                    params: opts.params.clone(),
-                    ..Default::default()
-                },
-            );
-            let excluded: HashSet<String> = hits.into_iter().map(|h| h.doc_id).collect();
-            for doc_id in index.docs.keys() {
-                if !excluded.contains(doc_id) {
-                    candidate_scores.insert(doc_id.clone(), 1.0);
+            let excluded = evaluate_ast(index, sub, opts);
+            let mut map = HashMap::new();
+            for &doc_id in index.id_to_meta.keys() {
+                if !excluded.contains_key(&doc_id) {
+                    map.insert(doc_id, 1.0);
                 }
             }
+            map
         }
         QueryAst::KnnVector {
             field,
@@ -1080,10 +1100,9 @@ pub fn execute_search(
                 Vec::new()
             };
 
-            // Compute vector cosine distance against all docs having this vector field
             let mut vector_dists = Vec::new();
             if !effective_vec.is_empty() {
-                for (doc_id, doc) in &index.docs {
+                for (&doc_id, doc) in &index.id_to_meta {
                     let vec_opt = doc.vector_fields.get(field).or_else(|| {
                         field
                             .strip_prefix("$.")
@@ -1093,26 +1112,35 @@ pub fn execute_search(
                         && effective_vec.len() == doc_vec.len()
                     {
                         let sim = cosine_similarity(&effective_vec, doc_vec);
-                        vector_dists.push((doc_id.clone(), sim));
+                        vector_dists.push((doc_id, sim));
                     }
                 }
             }
             vector_dists.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let mut map = HashMap::new();
             for (id, sim) in vector_dists.into_iter().take(*k) {
-                candidate_scores.insert(id, sim as f64);
+                map.insert(id, sim as f64);
             }
+            map
         }
     }
+}
 
+pub fn execute_search(
+    index: &InvertedIndex,
+    ast: &QueryAst,
+    opts: &SearchOptions,
+) -> (usize, Vec<SearchHit>) {
+    let candidate_scores = evaluate_ast(index, ast, opts);
     let total_matches = candidate_scores.len();
 
     // 2. Sort results
-    let mut scored_docs: Vec<(String, f64)> = candidate_scores.into_iter().collect();
+    let mut scored_docs: Vec<(DocId, f64)> = candidate_scores.into_iter().collect();
 
     if let Some((sort_field, asc)) = &opts.sortby {
         scored_docs.sort_by(|a, b| {
-            let doc_a = index.docs.get(&a.0);
-            let doc_b = index.docs.get(&b.0);
+            let doc_a = index.id_to_meta.get(&a.0);
+            let doc_b = index.id_to_meta.get(&b.0);
             let val_a = doc_a
                 .and_then(|d| {
                     d.numeric_fields.get(sort_field).copied().or_else(|| {
@@ -1153,28 +1181,28 @@ pub fn execute_search(
     let mut hits = Vec::new();
     for (doc_id, score) in paged {
         let mut fields = HashMap::new();
-        if !opts.nocontent
-            && let Some(doc) = index.docs.get(&doc_id)
-        {
-            if let Some(ret_fields) = &opts.return_fields {
-                for rf in ret_fields {
-                    if let Some(v) = doc.fields.get(rf) {
-                        fields.insert(rf.clone(), v.clone());
-                    } else if let Some(stripped) = rf.strip_prefix("$.")
-                        && let Some(v) = doc.fields.get(stripped)
-                    {
-                        fields.insert(rf.clone(), v.clone());
+        if let Some(doc) = index.id_to_meta.get(&doc_id) {
+            if !opts.nocontent {
+                if let Some(ret_fields) = &opts.return_fields {
+                    for rf in ret_fields {
+                        if let Some(v) = doc.fields.get(rf) {
+                            fields.insert(rf.clone(), v.clone());
+                        } else if let Some(stripped) = rf.strip_prefix("$.")
+                            && let Some(v) = doc.fields.get(stripped)
+                        {
+                            fields.insert(rf.clone(), v.clone());
+                        }
                     }
+                } else {
+                    fields = doc.fields.clone();
                 }
-            } else {
-                fields = doc.fields.clone();
             }
+            hits.push(SearchHit {
+                doc_id: String::from_utf8_lossy(&doc.key).to_string(),
+                score,
+                fields,
+            });
         }
-        hits.push(SearchHit {
-            doc_id,
-            score,
-            fields,
-        });
     }
 
     (total_matches, hits)
@@ -1504,5 +1532,65 @@ mod tests {
 
     fn h2_clone(h: &SearchHit) -> SearchHit {
         h.clone()
+    }
+
+    #[test]
+    fn test_dense_doc_id_and_term_directed_deletion() {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "title".to_string(),
+            FieldType::Text {
+                weight: 1.0,
+                sortable: false,
+                nostem: false,
+            },
+        );
+        let schema = IndexSchema {
+            name: "idx:dense_test".to_string(),
+            on_type: "HASH".to_string(),
+            prefixes: vec!["doc:".to_string()],
+            fields,
+            schema_fields: Vec::new(),
+        };
+        let mut idx = InvertedIndex::new(schema);
+
+        let mut d1 = HashMap::new();
+        d1.insert("title".to_string(), "alpha beta gamma".to_string());
+        idx.add_document("doc:1", d1, None);
+
+        let mut d2 = HashMap::new();
+        d2.insert("title".to_string(), "gamma delta epsilon".to_string());
+        idx.add_document("doc:2", d2, None);
+
+        // Verify dense DocIds assigned
+        let id1 = idx.doc_id_of(b"doc:1").expect("doc:1 has id");
+        let id2 = idx.doc_id_of(b"doc:2").expect("doc:2 has id");
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+        assert_eq!(idx.key_of(id1).map(|b| b.as_ref()), Some(b"doc:1".as_ref()));
+        assert_eq!(idx.total_docs, 2);
+
+        // Verify postings contain DocIds
+        assert_eq!(idx.inverted.get("alpha").unwrap().len(), 1);
+        assert_eq!(idx.inverted.get("gamma").unwrap().len(), 2);
+
+        // Delete doc:1
+        idx.remove_document("doc:1");
+        assert_eq!(idx.total_docs, 1);
+        assert!(idx.doc_id_of(b"doc:1").is_none());
+        assert!(idx.key_of(id1).is_none());
+
+        // Term "alpha" had only doc:1, so it should be pruned completely from inverted index
+        assert!(!idx.inverted.contains_key("alpha"));
+        // Term "gamma" still has doc:2
+        assert_eq!(idx.inverted.get("gamma").unwrap().len(), 1);
+        assert_eq!(idx.inverted.get("gamma").unwrap()[0].doc_id, id2);
+
+        // Add doc:3 - should recycle id1 from free_ids
+        let mut d3 = HashMap::new();
+        d3.insert("title".to_string(), "zeta eta".to_string());
+        idx.add_document("doc:3", d3, None);
+        let id3 = idx.doc_id_of(b"doc:3").expect("doc:3 has id");
+        assert_eq!(id3, id1, "doc:3 should reuse recycled doc_id");
     }
 }

@@ -679,6 +679,7 @@ pub fn run_shard_worker(
                                         continue;
                                     } else if aof_ref.is_none()
                                         && !crate::replication::has_connected_replicas(r.port)
+                                        && !crate::search::has_active_search_indices()
                                         && let Command::Del(ref keys) = cmd && keys.len() == 1
                                     {
                                         let deleted = r.local_db.borrow_mut().del_with_hash(keys[0].as_ref(), key_hash);
@@ -704,6 +705,7 @@ pub fn run_shard_worker(
                                         }
                                     } else if aof_ref.is_none()
                                         && !crate::replication::has_connected_replicas(r.port)
+                                        && !crate::search::has_active_search_indices()
                                         && let Command::Hset { ref key, ref fields } = cmd
                                     {
                                         has_writes = true;
@@ -994,6 +996,7 @@ pub fn run_shard_worker(
                                     continue;
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
+                                    && !crate::search::has_active_search_indices()
                                     && let Command::Del(ref keys) = cmd && keys.len() == 1
                                 {
                                     let deleted = db.del_with_hash(keys[0].as_ref(), key_hash);
@@ -1019,6 +1022,7 @@ pub fn run_shard_worker(
                                     }
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
+                                    && !crate::search::has_active_search_indices()
                                     && let Command::Hset { ref key, ref fields } = cmd
                                 {
                                     has_writes = true;

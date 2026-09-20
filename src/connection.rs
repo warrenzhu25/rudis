@@ -12633,6 +12633,7 @@ async fn execute_commands_squashed(
                     continue;
                 } else if router.aof.is_none()
                     && !crate::replication::has_connected_replicas(router.port)
+                    && !crate::search::has_active_search_indices()
                     && let Command::Del(ref keys) = cmd
                     && keys.len() == 1
                 {
@@ -12663,6 +12664,7 @@ async fn execute_commands_squashed(
                     }
                 } else if router.aof.is_none()
                     && !crate::replication::has_connected_replicas(router.port)
+                    && !crate::search::has_active_search_indices()
                     && let Command::Hset {
                         ref key,
                         ref fields,
