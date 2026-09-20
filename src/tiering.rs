@@ -406,6 +406,8 @@ pub struct ShardTierManager {
     pub op_manager: Rc<OpManager>,
     pub small_bins: RefCell<SmallBinsManager>,
     pub is_direct_io: bool,
+    pub free_pages: RefCell<Vec<u64>>,
+    pub free_extents: RefCell<Vec<(u64, u64)>>,
 }
 
 impl ShardTierManager {
@@ -449,6 +451,8 @@ impl ShardTierManager {
             op_manager: Rc::new(OpManager::new()),
             small_bins: RefCell::new(SmallBinsManager::new()),
             is_direct_io: is_direct,
+            free_pages: RefCell::new(Vec::new()),
+            free_extents: RefCell::new(Vec::new()),
         })
     }
 
@@ -490,6 +494,7 @@ impl ShardTierManager {
         for page_idx in &dead {
             let offset = page_idx * PAGE_SIZE as u64;
             Self::punch_hole(&self.file, offset, PAGE_SIZE as u64, &self.stats);
+            self.free_pages.borrow_mut().push(*page_idx);
         }
         if count > 0 {
             self.stats.gc_cycles.fetch_add(1, Ordering::Relaxed);
@@ -570,6 +575,33 @@ impl ShardTierManager {
         Ok((is_reflink, file_size))
     }
 
+    pub fn allocate_page(&self) -> u64 {
+        if let Some(page_idx) = self.free_pages.borrow_mut().pop() {
+            page_idx
+        } else {
+            let next_page_idx = self.current_offset.get() / PAGE_SIZE as u64;
+            self.current_offset
+                .set(self.current_offset.get() + PAGE_SIZE as u64);
+            next_page_idx
+        }
+    }
+
+    pub fn allocate_extent(&self, aligned_len: usize) -> u64 {
+        let req_len = aligned_len as u64;
+        let mut extents = self.free_extents.borrow_mut();
+        if let Some(idx) = extents.iter().position(|(_, len)| *len >= req_len) {
+            let (offset, len) = extents.swap_remove(idx);
+            if len > req_len {
+                extents.push((offset + req_len, len - req_len));
+            }
+            offset
+        } else {
+            let offset = self.current_offset.get();
+            self.current_offset.set(offset + req_len);
+            offset
+        }
+    }
+
     /// Stash a single record onto disk.
     /// Values < 2048 bytes are packed into 4096-byte SmallBins with direct I/O alignment.
     /// Values >= 2048 bytes flush the active bin and write in aligned 4096-byte blocks.
@@ -602,9 +634,7 @@ impl ShardTierManager {
 
             if need_new_bin {
                 self.flush_active_bin().await?;
-                let next_page_idx = self.current_offset.get() / PAGE_SIZE as u64;
-                self.current_offset
-                    .set(self.current_offset.get() + PAGE_SIZE as u64);
+                let next_page_idx = self.allocate_page();
                 self.small_bins.borrow_mut().active_bin = Some(ActiveBin::new(next_page_idx));
             }
 
@@ -638,10 +668,9 @@ impl ShardTierManager {
             if write_buf.len() < aligned_len {
                 write_buf.resize(aligned_len, 0);
             }
-            let offset = self.current_offset.get();
+            let offset = self.allocate_extent(aligned_len);
             let (res, _) = self.file.write_all_at(write_buf, offset).await;
             res?;
-            self.current_offset.set(offset + aligned_len as u64);
             self.stats.disk_writes.fetch_add(1, Ordering::Relaxed);
             self.stats.total_stashes.fetch_add(1, Ordering::Relaxed);
 
@@ -698,6 +727,15 @@ impl ShardTierManager {
                 .dead_bytes
                 .fetch_add(aligned_len as u64, Ordering::Relaxed);
             Self::punch_hole(&self.file, ptr.offset, aligned_len as u64, &self.stats);
+            if aligned_len == PAGE_SIZE {
+                self.free_pages
+                    .borrow_mut()
+                    .push(ptr.offset / PAGE_SIZE as u64);
+            } else {
+                self.free_extents
+                    .borrow_mut()
+                    .push((ptr.offset, aligned_len as u64));
+            }
         }
     }
 
@@ -953,5 +991,46 @@ mod tests {
 
         assert_eq!(stats.disk_reads.load(Ordering::Relaxed), 0);
         assert_eq!(stats.ram_hits.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_free_extent_and_page_reuse() {
+        let temp_dir = std::env::temp_dir().join(format!("rudis_tier_test_{}", std::process::id()));
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let manager = ShardTierManager::open(0, 55555, &temp_dir).await.unwrap();
+            assert_eq!(manager.current_offset.get(), 0);
+
+            // 1. Allocate page
+            let p0 = manager.allocate_page();
+            assert_eq!(p0, 0);
+            assert_eq!(manager.current_offset.get(), PAGE_SIZE as u64);
+
+            // 2. Free page and allocate again: should reuse p0 without advancing current_offset
+            manager.free_pages.borrow_mut().push(p0);
+            let p0_reused = manager.allocate_page();
+            assert_eq!(p0_reused, 0);
+            assert_eq!(manager.current_offset.get(), PAGE_SIZE as u64);
+
+            // 3. Allocate extent
+            let ext0 = manager.allocate_extent(PAGE_SIZE * 2);
+            assert_eq!(ext0, PAGE_SIZE as u64);
+            assert_eq!(manager.current_offset.get(), PAGE_SIZE as u64 * 3);
+
+            // 4. Free extent and allocate again: should reuse ext0 without advancing current_offset
+            manager
+                .free_extents
+                .borrow_mut()
+                .push((ext0, PAGE_SIZE as u64 * 2));
+            let ext0_reused = manager.allocate_extent(PAGE_SIZE * 2);
+            assert_eq!(ext0_reused, ext0);
+            assert_eq!(manager.current_offset.get(), PAGE_SIZE as u64 * 3);
+        });
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
