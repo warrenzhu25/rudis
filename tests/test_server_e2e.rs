@@ -11185,3 +11185,62 @@ fn test_config_rewrite_and_dynamic_configuration_e2e() {
     let _ = std::fs::remove_file(&cfg_path);
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+#[test]
+fn test_resp3_hello_negotiation_and_noproto_e2e() {
+    let port = 19997;
+    start_test_server(port, 2);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Unsupported protocol versions
+    let err1 = send_and_read(&mut client, b"HELLO 1\r\n");
+    assert_eq!(err1, "-NOPROTO unsupported protocol version\r\n");
+
+    let err4 = send_and_read(&mut client, b"HELLO 4\r\n");
+    assert_eq!(err4, "-NOPROTO unsupported protocol version\r\n");
+
+    let err_foo = send_and_read(&mut client, b"HELLO foo\r\n");
+    assert_eq!(err_foo, "-NOPROTO unsupported protocol version\r\n");
+
+    // 2. HELLO 2 negotiation (RESP2 array response)
+    let hello2 = send_and_read(&mut client, b"HELLO 2\r\n");
+    assert!(hello2.starts_with("*14\r\n"));
+    assert!(hello2.contains("$5\r\nproto\r\n:2\r\n"));
+    assert!(hello2.contains("$4\r\nmode\r\n$10\r\nstandalone\r\n"));
+    assert!(hello2.contains("$4\r\nrole\r\n$6\r\nmaster\r\n"));
+
+    // 3. HELLO 3 negotiation (RESP3 map response) with SETNAME
+    let hello3 = send_and_read(&mut client, b"HELLO 3 SETNAME mytestapp\r\n");
+    assert!(hello3.starts_with("%7\r\n"));
+    assert!(hello3.contains("$5\r\nproto\r\n:3\r\n"));
+    assert!(hello3.contains("$4\r\nmode\r\n$10\r\nstandalone\r\n"));
+    assert!(hello3.contains("$4\r\nrole\r\n$6\r\nmaster\r\n"));
+
+    // Verify client name was updated
+    let client_info = send_and_read(&mut client, b"CLIENT INFO\r\n");
+    assert!(client_info.contains("name=mytestapp"));
+
+    // 4. Mode reflection under cluster mode
+    let cluster_hub = rudis::cluster::get_cluster_hub(port);
+    cluster_hub
+        .cluster_enabled
+        .store(true, std::sync::atomic::Ordering::Release);
+    let hello_cluster = send_and_read(&mut client, b"HELLO 3\r\n");
+    assert!(hello_cluster.contains("$4\r\nmode\r\n$7\r\ncluster\r\n"));
+    cluster_hub
+        .cluster_enabled
+        .store(false, std::sync::atomic::Ordering::Release);
+
+    // 5. Role reflection under replica mode
+    let hub = rudis::replication::get_replication_hub(port);
+    hub.is_slave_atomic
+        .store(true, std::sync::atomic::Ordering::Release);
+    rudis::replication::HAS_SLAVE_INSTANCE.store(true, std::sync::atomic::Ordering::Release);
+
+    let hello_replica = send_and_read(&mut client, b"HELLO 2\r\n");
+    assert!(hello_replica.contains("$4\r\nrole\r\n$7\r\nreplica\r\n"));
+
+    hub.is_slave_atomic
+        .store(false, std::sync::atomic::Ordering::Release);
+    rudis::replication::HAS_SLAVE_INSTANCE.store(false, std::sync::atomic::Ordering::Release);
+}

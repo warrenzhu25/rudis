@@ -707,7 +707,7 @@ pub enum Command {
     },
     // VALKEY EXTENDED COMMANDS
     Hello {
-        proto: Option<u8>,
+        proto: Option<i64>,
         auth: Option<(String, String)>,
         setname: Option<String>,
     },
@@ -5965,11 +5965,15 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let mut auth = None;
             let mut setname = None;
             let mut i = 1;
-            if i < args.len()
-                && let Ok(p) = String::from_utf8_lossy(&args[i]).parse::<u8>()
-            {
-                proto = Some(p);
-                i += 1;
+            if i < args.len() {
+                let first_arg = String::from_utf8_lossy(&args[i]);
+                if let Ok(p) = first_arg.parse::<i64>() {
+                    proto = Some(p);
+                    i += 1;
+                } else if !["AUTH", "SETNAME"].contains(&first_arg.to_uppercase().as_str()) {
+                    proto = Some(-1);
+                    i += 1;
+                }
             }
             while i < args.len() {
                 let opt = String::from_utf8_lossy(&args[i]).to_uppercase();

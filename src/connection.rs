@@ -7035,6 +7035,14 @@ async fn execute_command(
             ref auth,
             ref setname,
         } => {
+            if let Some(p) = proto
+                && p != 2
+                && p != 3
+            {
+                out.extend_from_slice(b"-NOPROTO unsupported protocol version\r\n");
+                return false;
+            }
+
             let acl = crate::acl::get_acl_for_port(router.port);
             let default_requires_auth = acl
                 .read()
@@ -7084,8 +7092,26 @@ async fn execute_command(
             out.extend_from_slice(b"$7\r\nversion\r\n$5\r\n7.2.0\r\n");
             out.extend_from_slice(format!("$5\r\nproto\r\n:{}\r\n", proto_ver).as_bytes());
             out.extend_from_slice(format!("$2\r\nid\r\n:{}\r\n", client_id).as_bytes());
-            out.extend_from_slice(b"$4\r\nmode\r\n$10\r\nstandalone\r\n");
-            out.extend_from_slice(b"$4\r\nrole\r\n$6\r\nmaster\r\n");
+
+            let is_cluster = router.cluster_enabled
+                || crate::cluster::get_cluster_hub(router.port)
+                    .cluster_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed);
+            if is_cluster {
+                out.extend_from_slice(b"$4\r\nmode\r\n$7\r\ncluster\r\n");
+            } else {
+                out.extend_from_slice(b"$4\r\nmode\r\n$10\r\nstandalone\r\n");
+            }
+
+            let is_replica = crate::replication::HAS_SLAVE_INSTANCE
+                .load(std::sync::atomic::Ordering::Relaxed)
+                && crate::replication::get_replication_hub(router.port).is_slave();
+            if is_replica {
+                out.extend_from_slice(b"$4\r\nrole\r\n$7\r\nreplica\r\n");
+            } else {
+                out.extend_from_slice(b"$4\r\nrole\r\n$6\r\nmaster\r\n");
+            }
+
             out.extend_from_slice(b"$7\r\nmodules\r\n*0\r\n");
             false
         }
