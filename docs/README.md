@@ -14,6 +14,7 @@ Welcome to the internal architecture specifications and engineering documentatio
 * **[Differences with Redis & Dragonfly](differences.md)**: Architectural and behavioral comparison between Rudis, Dragonfly, and Redis, covering memory models, limits, clustering, and persistence guarantees.
 
 ### Subsystem Specifications & Performance Guides
-* **[Component Architecture Specifications](components.md)**: Deep architectural breakdown of all 19 internal subsystems (`RudisTable`, `BlockHub`, Tiering, HNSW Vector, Inverted Index Search, XDP Bypass, CRDTs, JSON, etc.).
+* **[Subsystem Design Specifications](design/README.md)**: High-level architectural design and rationale ("why") across all 19 subsystems ([consolidated guide](design/components.md)).
+* **[Subsystem Implementation & Code References](internal/README.md)**: Concrete data structures, step-by-step algorithms, and source line references in `src/` ([consolidated guide](internal/components.md)).
 * **[Comprehensive Performance Guide](benchmarks/comprehensive_performance_guide.md)**: 16-core AMD EPYC benchmark results, throughput, latency distributions, and profiling methodology.
 * **[Benchmark Directory & Reproduction Scripts](benchmarks/README.md)**: Automated reproduction scripts and memtier benchmark workloads.

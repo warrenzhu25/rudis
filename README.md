@@ -305,7 +305,8 @@ For deep technical walkthroughs, internal architecture specifications, and bench
 * [**Pub/Sub Messaging Architecture**](docs/pub-sub.md): Striped shard presence bitmask and Redis 7 slot-bound sharded pub/sub (`SPUBLISH`).
 * [**Fork-less io_uring Snapshots & Reflinks**](docs/rdbsave.md): Fork-less streaming persistence and sub-millisecond `ioctl(FICLONE)` reflink checkpoints.
 * [**Differences with Redis & Dragonfly**](docs/differences.md): Semantic and architectural comparison across memory, limits, and networking.
-* [**Component Architecture Specifications**](docs/components.md): Specifications for all 19 subsystems (`RudisTable`, `BlockHub`, Tiering, Vector, Search, XDP, CRDTs, JSON, etc.).
+* [**Subsystem Design Specifications**](docs/design/README.md): High-level architectural design and rationale ("why") across all 19 subsystems.
+* [**Subsystem Implementation & Code References**](docs/internal/README.md): Concrete data structures, step-by-step algorithms, and source code references in `src/`.
 * [**Comprehensive Performance Guide**](docs/benchmarks/comprehensive_performance_guide.md): 16-core benchmark telemetry, latency distributions, and reproduction scripts.
 
 ---

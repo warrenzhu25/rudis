@@ -1,0 +1,40 @@
+# Component 01: Reactor Runtime & Server Lifecycle (Design)
+
+## Component 01: Reactor Runtime & Server Lifecycle
+
+> **Source Files**: ``src/main.rs`, `src/server.rs``
+
+
+---
+
+### 1. Architectural Purpose & Scope
+
+The **Reactor Runtime & Server Lifecycle** subsystem is responsible for bootstrapping the Rudis server process, pinning worker threads to physical CPU cores, setting up Linux `io_uring` instances via the `monoio` asynchronous runtime, and running each shard's event loop for its entire lifetime.
+
+Unlike Redis (single-threaded event loop) or lock-based multi-threaded servers, Rudis uses a **Shared-Nothing Multi-Reactor** pattern: every worker core runs its own independent `monoio` runtime driving an isolated Linux `io_uring` ring, its own `SO_REUSEPORT` listener, and its own thread-local database. `src/main.rs` parses CLI arguments and spawns one OS thread per shard; `src/server.rs::run_shard_worker` is the entire body of that thread — it never returns.
+
+---
+
+---
+
+### 2. Key Invariants & Concurrency Constraints
+
+1. **Thread-per-Core Pinning**: Every worker thread is pinned to an exclusive CPU core using `core_affinity::set_for_current`, unless `--no-pin` is passed. No worker thread is migrated by the OS scheduler once pinned.
+2. **`SO_REUSEPORT` Ingress Balancing**: Every worker thread opens its own listening socket bound to the same port (`socket.set_reuse_port(true)`). The kernel distributes new incoming connections across all bound sockets by a 4-tuple hash, with zero userspace dispatch.
+3. **Thread-local database, no locks in the data path**: `ShardDb` lives in a plain `Rc<RefCell<ShardDb>>` — not `Arc<Mutex<_>>`. Because `Rc`/`RefCell` aren't `Send`, the compiler itself refuses to let a `ShardDb` handle cross a thread boundary.
+4. **One real exception to "zero locks": the blocking-command hub.** `crate::block::get_block_hub_for_port(port)` returns an `Arc<Mutex<BlockHub>>` from a process-wide `static` map keyed by port (`PORT_BLOCK_HUBS`), so it *is* shared and mutex-guarded across every shard thread serving that port. This is a deliberate, narrow exception: blocking commands (`BLPOP`, `BZPOPMIN`, ...) need cross-shard wakeups, which the shared-nothing model can't give them for free, so a small locked structure was introduced specifically for that coordination rather than for the data path itself.
+5. **No graceful shutdown.** There is no signal handler anywhere in `src/server.rs` or `src/main.rs` — no `SIGINT`/`SIGTERM` trap, no drain, no flush-on-exit logic. The process only stops if every thread's infinite loop is killed externally (the accept loop and the cross-shard receiver loop both run forever).
+
+---
+
+---
+
+### 6. Performance Characteristics
+
+- **Zero-syscall-per-connection ingress**: `SO_REUSEPORT` means the kernel — not userspace — decides which shard's listener gets each new connection.
+- **No cross-core cache traffic in the common case**: local key access never leaves the owning thread; only the `ShardMessage` mesh and the shared `BlockHub` mutex cross cores, and both are only exercised on non-local or blocking operations.
+- **Bounded periodic work, not full scans**: the 100ms expiration cycle, 20ms auto-tier check, and 2s GC task are all designed to do fixed, small amounts of work per tick rather than scanning the whole shard, so they never show up as a latency spike on the shared single-threaded runtime.
+- **The cross-shard receiver loop now amortizes async overhead across up to 64 messages per wakeup** (§4.2's `try_recv` burst-draining) instead of paying one `recv_async().await` suspend/resume cycle per message — a real, measurable win under sustained cross-shard traffic (e.g. many concurrent `MGET`/`MSET` fan-outs or heavy pipeline squashing hitting one shard from many peers at once).
+- **Batch-level tiering checks are now gated on whether tiering is enabled at all** (`has_tier_manager`, §4.2) — a shard running with no tiered storage configured skips the per-`Get`-in-batch `is_tiered` lookup entirely rather than paying a cheap-but-nonzero check on every batched read.
+
+---
