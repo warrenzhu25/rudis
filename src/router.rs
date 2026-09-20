@@ -1484,12 +1484,15 @@ impl Router {
     pub async fn del(&self, key: Bytes) -> bool {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
-            let deleted = self.local_db.borrow_mut().del(&key);
-            if deleted
-                && let Some(aof) = &self.aof
-                && let Some(bytes) = crate::aof::command_to_resp(&Command::Del(smallvec![key]))
-            {
-                aof.borrow_mut().append(&bytes);
+            let mut db = self.local_db.borrow_mut();
+            let deleted = db.del(&key);
+            if deleted {
+                db.delete_document_local(&String::from_utf8_lossy(&key));
+                if let Some(aof) = &self.aof
+                    && let Some(bytes) = crate::aof::command_to_resp(&Command::Del(smallvec![key]))
+                {
+                    aof.borrow_mut().append(&bytes);
+                }
             }
             deleted
         } else {
@@ -2196,6 +2199,154 @@ impl Router {
             }
         }
         total
+    }
+
+    pub fn has_search_index(&self, name: &str) -> bool {
+        self.local_db.borrow().search_indices.contains_key(name)
+            || crate::search::get_search_index(name).is_some()
+    }
+
+    pub async fn create_search_index(
+        &self,
+        schema: crate::search::IndexSchema,
+    ) -> Result<(), String> {
+        let name = schema.name.clone();
+        if self.has_search_index(&name) {
+            return Err(format!("Index already exists: {}", name));
+        }
+
+        // Initialize on local shard
+        self.local_db.borrow_mut().init_search_index(schema.clone());
+
+        // Broadcast to all other shards
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::InitSearchIndex {
+                    schema: schema.clone(),
+                    responder: tx,
+                };
+                if sender.send(msg).is_ok() {
+                    let _ = rx.recv_async().await;
+                }
+            }
+        }
+
+        // Also register in global search registry
+        let _ = crate::search::create_search_index(schema);
+
+        Ok(())
+    }
+
+    pub async fn drop_search_index(&self, name: &str) -> Result<(), String> {
+        let mut any_dropped = self.local_db.borrow_mut().drop_search_index(name);
+
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::DropSearchIndex {
+                    name: name.to_string(),
+                    responder: tx,
+                };
+                if sender.send(msg).is_ok()
+                    && let Ok(dropped) = rx.recv_async().await
+                {
+                    any_dropped = any_dropped || dropped;
+                }
+            }
+        }
+
+        let _ = crate::search::drop_search_index(name);
+
+        if any_dropped {
+            Ok(())
+        } else {
+            Err(format!("Unknown Index name: {}", name))
+        }
+    }
+
+    pub async fn ft_search(
+        &self,
+        index: &str,
+        ast: &crate::search::QueryAst,
+        opts: &crate::search::SearchOptions,
+    ) -> (usize, Vec<crate::search::SearchHit>) {
+        let scatter_opts = crate::search::SearchOptions {
+            offset: 0,
+            limit: opts.offset.saturating_add(opts.limit),
+            ..opts.clone()
+        };
+
+        let (local_total, local_hits) = {
+            let db = self.local_db.borrow();
+            if let Some(idx) = db.search_indices.get(index) {
+                crate::search::execute_search(idx, ast, &scatter_opts)
+            } else if let Some(idx_arc) = crate::search::get_search_index(index) {
+                let idx = idx_arc.read().unwrap();
+                crate::search::execute_search(&idx, ast, &scatter_opts)
+            } else {
+                (0, Vec::new())
+            }
+        };
+
+        let mut all_totals = local_total;
+        let mut all_hits = local_hits;
+
+        if self.num_shards > 1 {
+            let mut pending = Vec::new();
+            for (sid, sender) in self.senders.iter().enumerate() {
+                if sid != self.shard_id {
+                    let (tx, rx) = flume::bounded(1);
+                    let msg = ShardMessage::SearchQuery {
+                        index: index.to_string(),
+                        ast: ast.clone(),
+                        options: scatter_opts.clone(),
+                        responder: tx,
+                    };
+                    if sender.send(msg).is_ok() {
+                        pending.push(rx);
+                    }
+                }
+            }
+
+            for rx in pending {
+                if let Ok((remote_total, remote_hits)) = rx.recv_async().await {
+                    all_totals += remote_total;
+                    all_hits.extend(remote_hits);
+                }
+            }
+        }
+
+        // Sort combined hits from all shards
+        if let Some((_sort_field, asc)) = &opts.sortby {
+            if *asc {
+                all_hits.sort_by(|a, b| {
+                    a.sort_val
+                        .partial_cmp(&b.sort_val)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            } else {
+                all_hits.sort_by(|a, b| {
+                    b.sort_val
+                        .partial_cmp(&a.sort_val)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+        } else {
+            all_hits.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        let paged: Vec<crate::search::SearchHit> = all_hits
+            .into_iter()
+            .skip(opts.offset)
+            .take(opts.limit)
+            .collect();
+
+        (all_totals, paged)
     }
 
     pub async fn keys(&self, pattern: &[u8]) -> Vec<Bytes> {

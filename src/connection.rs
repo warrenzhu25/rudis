@@ -7544,7 +7544,7 @@ async fn execute_command(
                 schema_fields,
             };
             let on_type_str = schema.on_type.to_uppercase();
-            match crate::search::create_search_index(schema) {
+            match router.create_search_index(schema).await {
                 Ok(()) => {
                     if on_type_str == "JSON" {
                         let local_db = router.local_db.borrow();
@@ -7564,10 +7564,9 @@ async fn execute_command(
             query,
             options,
         } => {
-            if let Some(idx_arc) = crate::search::get_search_index(&index) {
-                let idx = idx_arc.read().unwrap();
+            if router.has_search_index(&index) {
                 let ast = crate::search::parse_query(&query);
-                let (total, hits) = crate::search::execute_search(&idx, &ast, &options);
+                let (total, hits) = router.ft_search(&index, &ast, &options).await;
 
                 if options.nocontent {
                     out.extend_from_slice(
@@ -7622,7 +7621,7 @@ async fn execute_command(
             false
         }
         Command::FtDropIndex { index, dd: _ } => {
-            match crate::search::drop_search_index(&index) {
+            match router.drop_search_index(&index).await {
                 Ok(()) => out.extend_from_slice(b"+OK\r\n"),
                 Err(e) => out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes()),
             }
@@ -8698,6 +8697,7 @@ pub fn execute_local_command(
             if keys.len() == 1 {
                 let deleted = db.del(&keys[0]);
                 if deleted {
+                    db.delete_document_local(&String::from_utf8_lossy(&keys[0]));
                     crate::search::delete_document_hook(&String::from_utf8_lossy(&keys[0]));
                     record_change!(cmd);
                     out.extend_from_slice(b":1\r\n");
@@ -8710,6 +8710,7 @@ pub fn execute_local_command(
             for k in keys {
                 if db.del(k) {
                     count += 1;
+                    db.delete_document_local(&String::from_utf8_lossy(k));
                     crate::search::delete_document_hook(&String::from_utf8_lossy(k));
                 }
             }
@@ -8775,7 +8776,7 @@ pub fn execute_local_command(
             match db.hset_slice_fast(key, fields) {
                 Ok(count) => {
                     record_change!(cmd);
-                    if crate::search::has_active_search_indices() {
+                    if db.has_search_indices() || crate::search::has_active_search_indices() {
                         let str_fields: std::collections::HashMap<String, String> = fields
                             .iter()
                             .map(|(k, v)| {
@@ -8785,6 +8786,7 @@ pub fn execute_local_command(
                                 )
                             })
                             .collect();
+                        db.index_document_local(&String::from_utf8_lossy(key), str_fields.clone());
                         crate::search::index_document_hook(
                             &String::from_utf8_lossy(key),
                             str_fields,
@@ -8816,7 +8818,7 @@ pub fn execute_local_command(
             match db.hset_slice_fast(key, fields) {
                 Ok(_) => {
                     record_change!(cmd);
-                    if crate::search::has_active_search_indices() {
+                    if db.has_search_indices() || crate::search::has_active_search_indices() {
                         let str_fields: std::collections::HashMap<String, String> = fields
                             .iter()
                             .map(|(k, v)| {
@@ -8826,6 +8828,7 @@ pub fn execute_local_command(
                                 )
                             })
                             .collect();
+                        db.index_document_local(&String::from_utf8_lossy(key), str_fields.clone());
                         crate::search::index_document_hook(
                             &String::from_utf8_lossy(key),
                             str_fields,
@@ -11393,8 +11396,10 @@ pub fn execute_local_command(
             match db.json_store.json_set(key, path, json_val, *nx, *xx) {
                 Ok(true) => {
                     record_change!(cmd);
-                    if let Some(doc) = db.json_store.get(key) {
-                        crate::search::index_json_document_hook(&String::from_utf8_lossy(key), doc);
+                    if let Some(doc) = db.json_store.get(key).cloned() {
+                        let k_str = String::from_utf8_lossy(key);
+                        db.index_json_document_local(&k_str, &doc);
+                        crate::search::index_json_document_hook(&k_str, &doc);
                     }
                     out.extend_from_slice(b"+OK\r\n");
                 }
@@ -11423,10 +11428,13 @@ pub fn execute_local_command(
             let count = db.json_store.json_del(key, path.as_deref());
             if count > 0 {
                 record_change!(cmd);
-                if let Some(doc) = db.json_store.get(key) {
-                    crate::search::index_json_document_hook(&String::from_utf8_lossy(key), doc);
+                let k_str = String::from_utf8_lossy(key);
+                if let Some(doc) = db.json_store.get(key).cloned() {
+                    db.index_json_document_local(&k_str, &doc);
+                    crate::search::index_json_document_hook(&k_str, &doc);
                 } else {
-                    crate::search::delete_document_hook(&String::from_utf8_lossy(key));
+                    db.delete_document_local(&k_str);
+                    crate::search::delete_document_hook(&k_str);
                 }
             }
             write_resp_integer(out, count as i64);

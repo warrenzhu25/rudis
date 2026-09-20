@@ -432,6 +432,20 @@ pub enum ShardMessage {
     PubsubNumpat {
         responder: flume::Sender<usize>,
     },
+    InitSearchIndex {
+        schema: crate::search::IndexSchema,
+        responder: flume::Sender<()>,
+    },
+    DropSearchIndex {
+        name: String,
+        responder: flume::Sender<bool>,
+    },
+    SearchQuery {
+        index: String,
+        ast: crate::search::QueryAst,
+        options: crate::search::SearchOptions,
+        responder: flume::Sender<(usize, Vec<crate::search::SearchHit>)>,
+    },
     Keys {
         pattern: Bytes,
         responder: flume::Sender<Vec<Bytes>>,
@@ -541,6 +555,7 @@ pub struct ShardDb {
     pub json_store: crate::json::JsonStore,
     pub probabilistic_store: crate::probabilistic::ProbabilisticStore,
     pub sticky_keys: hashbrown::HashSet<Bytes>,
+    pub search_indices: std::collections::HashMap<String, crate::search::InvertedIndex>,
 }
 
 impl ShardDb {
@@ -554,6 +569,72 @@ impl ShardDb {
             json_store: crate::json::JsonStore::new(),
             probabilistic_store: crate::probabilistic::ProbabilisticStore::new(),
             sticky_keys: hashbrown::HashSet::new(),
+            search_indices: std::collections::HashMap::new(),
+        }
+    }
+
+    #[inline(always)]
+    pub fn has_search_indices(&self) -> bool {
+        !self.search_indices.is_empty()
+    }
+
+    pub fn init_search_index(&mut self, schema: crate::search::IndexSchema) {
+        self.search_indices.insert(
+            schema.name.clone(),
+            crate::search::InvertedIndex::new(schema),
+        );
+    }
+
+    pub fn drop_search_index(&mut self, name: &str) -> bool {
+        self.search_indices.remove(name).is_some()
+    }
+
+    pub fn index_document_local(
+        &mut self,
+        key: &str,
+        fields: std::collections::HashMap<String, String>,
+    ) {
+        for idx in self.search_indices.values_mut() {
+            if let Some(schema) = &idx.schema {
+                if schema.on_type.to_uppercase() != "HASH" {
+                    continue;
+                }
+                let matched = if schema.prefixes.is_empty() {
+                    true
+                } else {
+                    schema.prefixes.iter().any(|p| key.starts_with(p))
+                };
+                if matched {
+                    idx.add_document(key, fields.clone(), None);
+                }
+            }
+        }
+    }
+
+    pub fn delete_document_local(&mut self, key: &str) {
+        for idx in self.search_indices.values_mut() {
+            idx.remove_document(key);
+        }
+    }
+
+    pub fn index_json_document_local(&mut self, key: &str, root: &serde_json::Value) {
+        for idx in self.search_indices.values_mut() {
+            if let Some(schema) = &idx.schema {
+                if schema.on_type.to_uppercase() != "JSON" {
+                    continue;
+                }
+                let matched = if schema.prefixes.is_empty() {
+                    true
+                } else {
+                    schema.prefixes.iter().any(|p| key.starts_with(p))
+                };
+                if !matched {
+                    continue;
+                }
+                let (extracted_fields, extracted_vectors) =
+                    crate::search::extract_json_fields(schema, root);
+                idx.add_document(key, extracted_fields, extracted_vectors);
+            }
         }
     }
 

@@ -10466,3 +10466,77 @@ fn test_coalesced_cross_shard_mesh_e2e() {
         ":8\r\n"
     );
 }
+
+#[test]
+fn test_sharded_scatter_gather_search_e2e() {
+    let port = 17010;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Create index across 4 shards
+    assert_eq!(
+        send_and_read(
+            &mut client,
+            b"FT.CREATE idx:multishard ON HASH PREFIX 1 item: SCHEMA title TEXT price NUMERIC SORTABLE tag TAG\r\n"
+        ),
+        "+OK\r\n"
+    );
+
+    // 2. Populate 12 documents that distribute across shards
+    for i in 1..=12 {
+        let title = format!("Rust high performance cluster item {}", i);
+        let price = (i * 10).to_string();
+        let item_key = format!("item:{}", i);
+        let cmd = format!(
+            "*8\r\n$4\r\nHSET\r\n${}\r\n{}\r\n$5\r\ntitle\r\n${}\r\n{}\r\n$5\r\nprice\r\n${}\r\n{}\r\n$3\r\ntag\r\n$20\r\nhardware,distributed\r\n",
+            item_key.len(),
+            item_key,
+            title.len(),
+            title,
+            price.len(),
+            price
+        );
+        let resp = send_and_read(&mut client, cmd.as_bytes());
+        assert_eq!(resp, ":3\r\n");
+    }
+
+    // 3. Scatter-gather search across all 4 shards: query "cluster" NOCONTENT
+    let search_all = send_and_read(
+        &mut client,
+        b"FT.SEARCH idx:multishard cluster NOCONTENT\r\n",
+    );
+    assert!(
+        search_all.starts_with("*11\r\n:12\r\n"),
+        "All 12 documents from all 4 shards should be gathered, got: {}",
+        search_all
+    );
+
+    // 4. Sorted search with pagination across shards: SORTBY price ASC LIMIT 0 5 NOCONTENT
+    let search_paged = send_and_read(
+        &mut client,
+        b"FT.SEARCH idx:multishard cluster NOCONTENT SORTBY price ASC LIMIT 0 5\r\n",
+    );
+    assert_eq!(
+        search_paged,
+        "*6\r\n:12\r\n$6\r\nitem:1\r\n$6\r\nitem:2\r\n$6\r\nitem:3\r\n$6\r\nitem:4\r\n$6\r\nitem:5\r\n"
+    );
+
+    // 5. Delete item:1, verify it is immediately absent from scatter-gather search
+    assert_eq!(send_and_read(&mut client, b"DEL item:1\r\n"), ":1\r\n");
+    let search_after_del = send_and_read(
+        &mut client,
+        b"FT.SEARCH idx:multishard cluster NOCONTENT\r\n",
+    );
+    assert!(search_after_del.contains(":11\r\n"));
+    assert!(!search_after_del.contains("item:1\r\n"));
+
+    // 6. Drop index
+    assert_eq!(
+        send_and_read(&mut client, b"FT.DROPINDEX idx:multishard\r\n"),
+        "+OK\r\n"
+    );
+    let search_dropped = send_and_read(&mut client, b"FT.SEARCH idx:multishard cluster\r\n");
+    assert!(search_dropped.contains("ERR Unknown Index name"));
+}

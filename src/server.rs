@@ -451,9 +451,11 @@ pub fn run_shard_worker(
                         descriptor.finish();
                     }
                     ShardMessage::Del { key, responder } => {
-                        let deleted = cross_shard_db.borrow_mut().del(&key);
-                        if deleted
-                            && let Some(aof) = &cross_shard_aof
+                        let mut db = cross_shard_db.borrow_mut();
+                        let deleted = db.del(&key);
+                        if deleted {
+                            db.delete_document_local(&String::from_utf8_lossy(&key));
+                            if let Some(aof) = &cross_shard_aof
                                 && let Some(bytes) =
                                     crate::aof::command_to_resp(&crate::resp::Command::Del(smallvec![
                                         key,
@@ -461,6 +463,7 @@ pub fn run_shard_worker(
                                 {
                                     aof.borrow_mut().append(&bytes);
                                 }
+                        }
                         let _ = responder.send(deleted);
                     }
                     ShardMessage::DelKeys { keys, responder } => {
@@ -471,6 +474,7 @@ pub fn run_shard_worker(
                             for k in keys {
                                 if db.del(&k) {
                                     count += 1;
+                                    db.delete_document_local(&String::from_utf8_lossy(&k));
                                     deleted_keys.push(k);
                                 }
                             }
@@ -1498,6 +1502,28 @@ pub fn run_shard_worker(
                     ShardMessage::PubsubNumpat { responder } => {
                         let cnt = cross_shard_pubsub.borrow().numpat();
                         let _ = responder.send(cnt);
+                    }
+                    ShardMessage::InitSearchIndex { schema, responder } => {
+                        cross_shard_db.borrow_mut().init_search_index(schema);
+                        let _ = responder.send(());
+                    }
+                    ShardMessage::DropSearchIndex { name, responder } => {
+                        let dropped = cross_shard_db.borrow_mut().drop_search_index(&name);
+                        let _ = responder.send(dropped);
+                    }
+                    ShardMessage::SearchQuery {
+                        index,
+                        ast,
+                        options,
+                        responder,
+                    } => {
+                        let db = cross_shard_db.borrow();
+                        let res = if let Some(idx) = db.search_indices.get(&index) {
+                            crate::search::execute_search(idx, &ast, &options)
+                        } else {
+                            (0, Vec::new())
+                        };
+                        let _ = responder.send(res);
                     }
                     ShardMessage::Keys { pattern, responder } => {
                         let keys = cross_shard_db.borrow_mut().keys(&pattern);
