@@ -1,0 +1,98 @@
+{
+  "Dragonfly_Base": {
+    "ops_sec": 1919090.62,
+    "avg_lat": 0.528,
+    "p50": 0.528,
+    "p99": 0.528,
+    "p99_9": 0.528,
+    "baseline_rss_mb": 219.765625,
+    "peak_rss_mb": 245.04296875,
+    "delta_rss_mb": 25.27734375,
+    "cpu_user_pct": 1131.2270824973123,
+    "cpu_sys_pct": 368.9672541043934,
+    "cores_used": 15.001943366017056,
+    "trigger": null
+  },
+  "Rudis_Base": {
+    "ops_sec": 2408314.54,
+    "avg_lat": 0.42,
+    "p50": 0.42,
+    "p99": 0.42,
+    "p99_9": 0.42,
+    "baseline_rss_mb": 793.40234375,
+    "peak_rss_mb": 1396.8203125,
+    "delta_rss_mb": 603.41796875,
+    "cpu_user_pct": 779.4542617406256,
+    "cpu_sys_pct": 648.7476184633218,
+    "cores_used": 14.282018802039474,
+    "trigger": null
+  },
+  "Dragonfly_BGSAVE": {
+    "ops_sec": 1869243.96,
+    "avg_lat": 0.542,
+    "p50": 0.542,
+    "p99": 0.542,
+    "p99_9": 0.542,
+    "baseline_rss_mb": 219.76953125,
+    "peak_rss_mb": 266.57421875,
+    "delta_rss_mb": 46.8046875,
+    "cpu_user_pct": 1137.437669751468,
+    "cpu_sys_pct": 360.796904187341,
+    "cores_used": 14.98234573938809,
+    "trigger": {
+      "size_mb": 5.33203125,
+      "type": "RDB",
+      "elapsed_sec": 0.21673989295959473
+    }
+  },
+  "Rudis_BGSAVE": {
+    "ops_sec": 2298312.1,
+    "avg_lat": 0.441,
+    "p50": 0.441,
+    "p99": 0.441,
+    "p99_9": 0.441,
+    "baseline_rss_mb": 792.79296875,
+    "peak_rss_mb": 1373.4609375,
+    "delta_rss_mb": 580.66796875,
+    "cpu_user_pct": 738.4276773004176,
+    "cpu_sys_pct": 608.0289461124946,
+    "cores_used": 13.464566234129123,
+    "trigger": {
+      "size_mb": 149.66861248016357,
+      "type": "RDB",
+      "elapsed_sec": 0.5941128730773926
+    }
+  },
+  "Rudis_AOF": {
+    "ops_sec": 1276070.12,
+    "avg_lat": 0.796,
+    "p50": 0.796,
+    "p99": 0.796,
+    "p99_9": 0.796,
+    "baseline_rss_mb": 802.734375,
+    "peak_rss_mb": 1338.98046875,
+    "delta_rss_mb": 536.24609375,
+    "cpu_user_pct": 594.9622621571907,
+    "cpu_sys_pct": 473.30458185626895,
+    "cores_used": 10.682668440134597,
+    "trigger": null
+  },
+  "Rudis_BGREWRITEAOF": {
+    "ops_sec": 1306872.31,
+    "avg_lat": 0.778,
+    "p50": 0.778,
+    "p99": 0.778,
+    "p99_9": 0.778,
+    "baseline_rss_mb": 806.1328125,
+    "peak_rss_mb": 1320.0859375,
+    "delta_rss_mb": 513.953125,
+    "cpu_user_pct": 670.3537631916658,
+    "cpu_sys_pct": 534.6679405111398,
+    "cores_used": 12.050217037028059,
+    "trigger": {
+      "size_mb": 1300.114803314209,
+      "type": "AOF-Rewrite",
+      "elapsed_sec": 1.0021100044250488
+    }
+  }
+}
