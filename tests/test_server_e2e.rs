@@ -10317,3 +10317,33 @@ fn test_list_fast_push_pop_e2e() {
     assert_eq!(send_and_read(&mut conn, b"RPOP fast_rlist\r\n"), "$-1\r\n");
     assert_eq!(send_and_read(&mut conn, b"EXISTS fast_rlist\r\n"), ":0\r\n");
 }
+
+#[test]
+fn test_sismember_hash_contains_e2e() {
+    let port = 16970;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut conn = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    assert_eq!(
+        send_and_read(&mut conn, b"SADD e2e_set m1 m2 m3\r\n"),
+        ":3\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut conn, b"SISMEMBER e2e_set m1\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut conn, b"SISMEMBER e2e_set m2\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut conn, b"SISMEMBER e2e_set m3\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut conn, b"SISMEMBER e2e_set missing\r\n"),
+        ":0\r\n"
+    );
+}

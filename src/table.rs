@@ -750,15 +750,28 @@ impl RudisSet {
 
     #[inline(always)]
     pub fn contains(&self, member: &[u8]) -> bool {
+        let m_hash = hash64(member);
+        self.contains_with_hash(member, m_hash)
+    }
+
+    #[inline(always)]
+    pub fn contains_with_hash(&self, member: &[u8], m_hash: u64) -> bool {
         match self {
             RudisSet::Small(v) => {
                 let m_len = member.len();
                 match v.len() {
                     0 => false,
-                    1 => v[0].member.len() == m_len && v[0].member.as_ref() == member,
+                    1 => {
+                        v[0].hash == m_hash
+                            && v[0].member.len() == m_len
+                            && v[0].member.as_ref() == member
+                    }
                     _ => {
                         for m in v {
-                            if m.member.len() == m_len && m.member.as_ref() == member {
+                            if m.hash == m_hash
+                                && m.member.len() == m_len
+                                && m.member.as_ref() == member
+                            {
                                 return true;
                             }
                         }
@@ -5515,7 +5528,10 @@ impl RudisTable {
                 return Ok(false);
             }
             match &entry.val {
-                RudisValue::Set(set) => Ok(set.contains(member)),
+                RudisValue::Set(set) => {
+                    let m_hash = hash64(member);
+                    Ok(set.contains_with_hash(member, m_hash))
+                }
                 _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
             }
         } else {
@@ -5552,7 +5568,8 @@ impl RudisTable {
             }
             match &entry.val {
                 RudisValue::Set(set) => {
-                    if set.contains(member) {
+                    let m_hash = hash64(member);
+                    if set.contains_with_hash(member, m_hash) {
                         Ok(crate::shard::CompactResp::INT_1)
                     } else {
                         Ok(crate::shard::CompactResp::INT_0)
@@ -11625,5 +11642,35 @@ mod tests {
         );
         assert_eq!(out, b"$5\r\nitem1\r\n");
         assert!(!table.exists(k.as_ref()));
+    }
+
+    #[test]
+    fn test_sismember_contains_with_hash() {
+        let mut table = RudisTable::new();
+        let k = Bytes::from("set_hash_test");
+        let h = hash_key(k.as_ref());
+        let m1 = Bytes::from("member1");
+        let m2 = Bytes::from("member2");
+        let m3 = Bytes::from("nonexistent");
+
+        assert_eq!(table.sadd_slice(&k, &[m1.clone(), m2.clone()]), Ok(2));
+
+        // Test with sismember and sismember_compact_with_hash
+        assert_eq!(table.sismember(k.as_ref(), m1.as_ref()), Ok(true));
+        assert_eq!(table.sismember(k.as_ref(), m2.as_ref()), Ok(true));
+        assert_eq!(table.sismember(k.as_ref(), m3.as_ref()), Ok(false));
+
+        assert_eq!(
+            table.sismember_compact_with_hash(k.as_ref(), h, m1.as_ref()),
+            Ok(crate::shard::CompactResp::INT_1)
+        );
+        assert_eq!(
+            table.sismember_compact_with_hash(k.as_ref(), h, m2.as_ref()),
+            Ok(crate::shard::CompactResp::INT_1)
+        );
+        assert_eq!(
+            table.sismember_compact_with_hash(k.as_ref(), h, m3.as_ref()),
+            Ok(crate::shard::CompactResp::INT_0)
+        );
     }
 }
