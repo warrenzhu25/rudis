@@ -30,11 +30,58 @@ pub fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
     p == pattern.len()
 }
 
+#[inline]
+pub fn build_pubsub_frame(kind: &[u8], channel: &[u8], message: &[u8], is_resp3: bool) -> Bytes {
+    let mut buf = Vec::with_capacity(32 + kind.len() + channel.len() + message.len());
+    let prefix = if is_resp3 { b">3\r\n" } else { b"*3\r\n" };
+    buf.extend_from_slice(prefix);
+    buf.extend_from_slice(b"$");
+    buf.extend_from_slice(kind.len().to_string().as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(kind);
+    buf.extend_from_slice(b"\r\n$");
+    buf.extend_from_slice(channel.len().to_string().as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(channel);
+    buf.extend_from_slice(b"\r\n$");
+    buf.extend_from_slice(message.len().to_string().as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(message);
+    buf.extend_from_slice(b"\r\n");
+    Bytes::from(buf)
+}
+
+#[inline]
+pub fn build_pubsub_pframe(
+    pattern: &[u8],
+    channel: &[u8],
+    message: &[u8],
+    is_resp3: bool,
+) -> Bytes {
+    let mut buf = Vec::with_capacity(40 + pattern.len() + channel.len() + message.len());
+    let prefix = if is_resp3 { b">4\r\n" } else { b"*4\r\n" };
+    buf.extend_from_slice(prefix);
+    buf.extend_from_slice(b"$8\r\npmessage\r\n$");
+    buf.extend_from_slice(pattern.len().to_string().as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(pattern);
+    buf.extend_from_slice(b"\r\n$");
+    buf.extend_from_slice(channel.len().to_string().as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(channel);
+    buf.extend_from_slice(b"\r\n$");
+    buf.extend_from_slice(message.len().to_string().as_bytes());
+    buf.extend_from_slice(b"\r\n");
+    buf.extend_from_slice(message);
+    buf.extend_from_slice(b"\r\n");
+    Bytes::from(buf)
+}
+
 #[derive(Default)]
 pub struct PubSubHub {
     pub channels: hashbrown::HashMap<Bytes, hashbrown::HashSet<u64>>,
     pub patterns: hashbrown::HashMap<Bytes, hashbrown::HashSet<u64>>,
-    pub clients: hashbrown::HashMap<u64, flume::Sender<Vec<u8>>>,
+    pub clients: hashbrown::HashMap<u64, flume::Sender<Bytes>>,
     pub client_channels: hashbrown::HashMap<u64, hashbrown::HashSet<Bytes>>,
     pub client_patterns: hashbrown::HashMap<u64, hashbrown::HashSet<Bytes>>,
     pub client_resp3: hashbrown::HashSet<u64>,
@@ -63,7 +110,7 @@ impl PubSubHub {
         &mut self,
         client_id: u64,
         channel: Bytes,
-        tx: flume::Sender<Vec<u8>>,
+        tx: flume::Sender<Bytes>,
         is_resp3: bool,
     ) -> usize {
         self.clients.insert(client_id, tx);
@@ -129,7 +176,7 @@ impl PubSubHub {
         &mut self,
         client_id: u64,
         pattern: Bytes,
-        tx: flume::Sender<Vec<u8>>,
+        tx: flume::Sender<Bytes>,
         is_resp3: bool,
     ) -> usize {
         self.clients.insert(client_id, tx);
@@ -196,28 +243,22 @@ impl PubSubHub {
 
         // 1. Direct channel subscribers
         if let Some(subscribers) = self.channels.get(channel) {
-            let mut frame_resp2 = Vec::new();
-            frame_resp2.extend_from_slice(b"*3\r\n$7\r\nmessage\r\n$");
-            frame_resp2.extend_from_slice(channel.len().to_string().as_bytes());
-            frame_resp2.extend_from_slice(b"\r\n");
-            frame_resp2.extend_from_slice(channel);
-            frame_resp2.extend_from_slice(b"\r\n$");
-            frame_resp2.extend_from_slice(message.len().to_string().as_bytes());
-            frame_resp2.extend_from_slice(b"\r\n");
-            frame_resp2.extend_from_slice(message);
-            frame_resp2.extend_from_slice(b"\r\n");
-
-            let mut frame_resp3 = frame_resp2.clone();
-            frame_resp3[0] = b'>';
+            let mut frame_resp2: Option<Bytes> = None;
+            let mut frame_resp3: Option<Bytes> = None;
 
             for client_id in subscribers {
-                let frame = if self.client_resp3.contains(client_id) {
-                    &frame_resp3
+                let is_resp3 = self.client_resp3.contains(client_id);
+                let frame = if is_resp3 {
+                    frame_resp3.get_or_insert_with(|| {
+                        build_pubsub_frame(b"message", channel, message, true)
+                    })
                 } else {
-                    &frame_resp2
+                    frame_resp2.get_or_insert_with(|| {
+                        build_pubsub_frame(b"message", channel, message, false)
+                    })
                 };
                 if let Some(tx) = self.clients.get(client_id)
-                    && tx.send(frame.clone()).is_ok()
+                    && tx.try_send(frame.clone()).is_ok()
                 {
                     count += 1;
                 }
@@ -227,32 +268,22 @@ impl PubSubHub {
         // 2. Pattern subscribers
         for (pattern, subscribers) in &self.patterns {
             if glob_match(pattern, channel) {
-                let mut frame_resp2 = Vec::new();
-                frame_resp2.extend_from_slice(b"*4\r\n$8\r\npmessage\r\n$");
-                frame_resp2.extend_from_slice(pattern.len().to_string().as_bytes());
-                frame_resp2.extend_from_slice(b"\r\n");
-                frame_resp2.extend_from_slice(pattern);
-                frame_resp2.extend_from_slice(b"\r\n$");
-                frame_resp2.extend_from_slice(channel.len().to_string().as_bytes());
-                frame_resp2.extend_from_slice(b"\r\n");
-                frame_resp2.extend_from_slice(channel);
-                frame_resp2.extend_from_slice(b"\r\n$");
-                frame_resp2.extend_from_slice(message.len().to_string().as_bytes());
-                frame_resp2.extend_from_slice(b"\r\n");
-                frame_resp2.extend_from_slice(message);
-                frame_resp2.extend_from_slice(b"\r\n");
-
-                let mut frame_resp3 = frame_resp2.clone();
-                frame_resp3[0] = b'>';
+                let mut frame_resp2: Option<Bytes> = None;
+                let mut frame_resp3: Option<Bytes> = None;
 
                 for client_id in subscribers {
-                    let frame = if self.client_resp3.contains(client_id) {
-                        &frame_resp3
+                    let is_resp3 = self.client_resp3.contains(client_id);
+                    let frame = if is_resp3 {
+                        frame_resp3.get_or_insert_with(|| {
+                            build_pubsub_pframe(pattern, channel, message, true)
+                        })
                     } else {
-                        &frame_resp2
+                        frame_resp2.get_or_insert_with(|| {
+                            build_pubsub_pframe(pattern, channel, message, false)
+                        })
                     };
                     if let Some(tx) = self.clients.get(client_id)
-                        && tx.send(frame.clone()).is_ok()
+                        && tx.try_send(frame.clone()).is_ok()
                     {
                         count += 1;
                     }
@@ -337,5 +368,47 @@ mod tests {
         assert!(!hub.client_resp3.contains(&2));
         hub.punsubscribe(3, b"news*");
         assert!(!hub.client_resp3.contains(&3));
+    }
+
+    #[test]
+    fn test_pubsub_slow_consumer_backpressure_and_zero_copy() {
+        let mut hub = PubSubHub::new();
+        let (tx1, rx1) = flume::bounded(2);
+        let (tx2, rx2) = flume::bounded(10);
+
+        hub.subscribe(1, Bytes::from_static(b"fast_lane"), tx1, false);
+        hub.subscribe(2, Bytes::from_static(b"fast_lane"), tx2, false);
+
+        // First 2 publishes fill client 1's queue
+        assert_eq!(hub.publish(b"fast_lane", b"msg1"), 2);
+        assert_eq!(hub.publish(b"fast_lane", b"msg2"), 2);
+
+        // Third publish: client 1 queue is full (backpressure), client 2 accepts
+        assert_eq!(hub.publish(b"fast_lane", b"msg3"), 1);
+
+        // Verify client 1 has msg1 and msg2, but msg3 was dropped due to backpressure
+        assert_eq!(
+            rx1.try_recv().unwrap(),
+            Bytes::from_static(b"*3\r\n$7\r\nmessage\r\n$9\r\nfast_lane\r\n$4\r\nmsg1\r\n")
+        );
+        assert_eq!(
+            rx1.try_recv().unwrap(),
+            Bytes::from_static(b"*3\r\n$7\r\nmessage\r\n$9\r\nfast_lane\r\n$4\r\nmsg2\r\n")
+        );
+        assert!(rx1.try_recv().is_err());
+
+        // Verify client 2 received all three messages
+        assert_eq!(
+            rx2.try_recv().unwrap(),
+            Bytes::from_static(b"*3\r\n$7\r\nmessage\r\n$9\r\nfast_lane\r\n$4\r\nmsg1\r\n")
+        );
+        assert_eq!(
+            rx2.try_recv().unwrap(),
+            Bytes::from_static(b"*3\r\n$7\r\nmessage\r\n$9\r\nfast_lane\r\n$4\r\nmsg2\r\n")
+        );
+        assert_eq!(
+            rx2.try_recv().unwrap(),
+            Bytes::from_static(b"*3\r\n$7\r\nmessage\r\n$9\r\nfast_lane\r\n$4\r\nmsg3\r\n")
+        );
     }
 }

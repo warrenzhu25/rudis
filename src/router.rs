@@ -123,6 +123,7 @@ pub struct Router {
     pub mset_batch_pool: Rc<RefCell<Vec<Vec<Vec<(Bytes, Bytes)>>>>>,
     pub mget_desc_pool: Rc<RefCell<Vec<std::sync::Arc<crate::mailbox::ScatterMgetDescriptor>>>>,
     pub mset_desc_pool: Rc<RefCell<Vec<std::sync::Arc<crate::mailbox::ScatterMsetDescriptor>>>>,
+    pub pubsub_responder_pool: Rc<RefCell<Vec<(flume::Sender<usize>, flume::Receiver<usize>)>>>,
     pub tier_stats: std::sync::Arc<crate::tiering::TieringStats>,
 }
 
@@ -167,6 +168,7 @@ impl Router {
             mset_batch_pool: Rc::new(RefCell::new(Vec::new())),
             mget_desc_pool: Rc::new(RefCell::new(Vec::new())),
             mset_desc_pool: Rc::new(RefCell::new(Vec::new())),
+            pubsub_responder_pool: Rc::new(RefCell::new(Vec::new())),
             tier_stats: crate::tiering::get_tier_stats(port),
         }
     }
@@ -891,6 +893,20 @@ impl Router {
     pub fn release_notify_channel(&self, tx: flume::Sender<()>, rx: flume::Receiver<()>) {
         while rx.try_recv().is_ok() {}
         self.notify_channel_pool.borrow_mut().push((tx, rx));
+    }
+
+    #[inline(always)]
+    pub fn acquire_pubsub_responder(&self) -> (flume::Sender<usize>, flume::Receiver<usize>) {
+        self.pubsub_responder_pool
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(|| flume::bounded(1))
+    }
+
+    #[inline(always)]
+    pub fn release_pubsub_responder(&self, tx: flume::Sender<usize>, rx: flume::Receiver<usize>) {
+        while rx.try_recv().is_ok() {}
+        self.pubsub_responder_pool.borrow_mut().push((tx, rx));
     }
 
     pub fn acquire_mget_descriptor(
@@ -2073,21 +2089,24 @@ impl Router {
         let mut pending = Vec::new();
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
-                let (tx, rx) = flume::bounded(1);
+                let (tx, rx) = self.acquire_pubsub_responder();
                 let msg = ShardMessage::Publish {
                     channel: channel.clone(),
                     message: message.clone(),
-                    responder: tx,
+                    responder: tx.clone(),
                 };
                 if sender.send(msg).is_ok() {
-                    pending.push(rx);
+                    pending.push((tx, rx));
+                } else {
+                    self.release_pubsub_responder(tx, rx);
                 }
             }
         }
-        for rx in pending {
+        for (tx, rx) in pending {
             if let Ok(count) = rx.recv_async().await {
                 total += count;
             }
+            self.release_pubsub_responder(tx, rx);
         }
         total
     }

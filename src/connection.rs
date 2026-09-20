@@ -1580,7 +1580,7 @@ async fn run_pubsub_loop(
     mut buf: BytesMut,
 ) {
     let (mut reader, mut writer) = stream.into_split();
-    let (write_tx, write_rx) = flume::unbounded::<Vec<u8>>();
+    let (write_tx, write_rx) = flume::bounded::<Bytes>(4096);
 
     monoio::spawn(async move {
         while let Ok(data) = write_rx.recv_async().await {
@@ -1754,7 +1754,7 @@ async fn run_pubsub_loop(
     let mut out = Vec::new();
     let q = handle_cmd(initial_sub, &mut out);
     if !out.is_empty() {
-        let _ = write_tx.send(out);
+        let _ = write_tx.send(Bytes::from(out));
     }
     if q {
         return;
@@ -1764,7 +1764,7 @@ async fn run_pubsub_loop(
         let mut out = Vec::new();
         let q = handle_cmd(cmd, &mut out);
         if !out.is_empty() {
-            let _ = write_tx.send(out);
+            let _ = write_tx.send(Bytes::from(out));
         }
         if q {
             return;
@@ -1777,7 +1777,7 @@ async fn run_pubsub_loop(
                 let mut out = Vec::new();
                 let q = handle_cmd(cmd, &mut out);
                 if !out.is_empty() {
-                    let _ = write_tx.send(out);
+                    let _ = write_tx.send(Bytes::from(out));
                 }
                 if q {
                     return;
@@ -1787,7 +1787,7 @@ async fn run_pubsub_loop(
             Err(e) => {
                 let mut out = Vec::new();
                 write_resp_err(&mut out, &e);
-                let _ = write_tx.send(out);
+                let _ = write_tx.send(Bytes::from(out));
                 return;
             }
         }
@@ -1806,7 +1806,7 @@ async fn run_pubsub_loop(
                             let mut out = Vec::new();
                             let q = handle_cmd(cmd, &mut out);
                             if !out.is_empty() {
-                                let _ = write_tx.send(out);
+                                let _ = write_tx.send(Bytes::from(out));
                             }
                             if q {
                                 return;
@@ -1816,7 +1816,7 @@ async fn run_pubsub_loop(
                         Err(e) => {
                             let mut out = Vec::new();
                             write_resp_err(&mut out, &e);
-                            let _ = write_tx.send(out);
+                            let _ = write_tx.send(Bytes::from(out));
                             return;
                         }
                     }
