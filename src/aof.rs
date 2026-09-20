@@ -1174,7 +1174,7 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
                 );
                 buf.extend_from_slice(k);
                 buf.extend_from_slice(b"\r\n");
-                for (field, v) in map {
+                for (field, v) in map.as_ref() {
                     buf.extend_from_slice(format!("${}\r\n", field.len()).as_bytes());
                     buf.extend_from_slice(field.as_ref());
                     buf.extend_from_slice(format!("\r\n${}\r\n", v.len()).as_bytes());

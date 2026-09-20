@@ -1430,11 +1430,14 @@ pub fn run_shard_worker(
                         }
                     }
                     ShardMessage::SetSlotState { slot, state } => {
-                        cross_shard_slot_states.borrow_mut()[slot as usize] = state;
+                        if state == crate::shard::SlotState::Stable {
+                            cross_shard_slot_states.borrow_mut().remove(&slot);
+                        } else {
+                            cross_shard_slot_states.borrow_mut().insert(slot, state);
+                        }
                     }
                     ShardMessage::SetSlotOwner { slot, owner } => {
-                        cross_shard_slot_states.borrow_mut()[slot as usize] =
-                            crate::shard::SlotState::Stable;
+                        cross_shard_slot_states.borrow_mut().remove(&slot);
                         cross_shard_slot_owners.borrow_mut()[slot as usize] = owner;
                     }
                     ShardMessage::DumpKey { key, responder } => {

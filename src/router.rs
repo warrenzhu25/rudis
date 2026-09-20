@@ -107,7 +107,7 @@ pub struct Router {
     pub cluster_enabled: bool,
     pub local_db: Rc<RefCell<ShardDb>>,
     pub senders: Vec<crate::mailbox::ShardSender>,
-    pub slot_states: Rc<RefCell<Vec<crate::shard::SlotState>>>,
+    pub slot_states: Rc<RefCell<hashbrown::HashMap<u16, crate::shard::SlotState>>>,
     pub slot_owners: Rc<RefCell<Vec<usize>>>,
     pub aof: Option<Rc<RefCell<crate::aof::AofWriter>>>,
     pub pubsub: Rc<RefCell<crate::pubsub::PubSubHub>>,
@@ -139,10 +139,9 @@ impl Router {
         pubsub: Rc<RefCell<crate::pubsub::PubSubHub>>,
         db_dir: std::path::PathBuf,
     ) -> Self {
-        let mut slot_states = Vec::with_capacity(16384);
+        let slot_states = hashbrown::HashMap::new();
         let mut slot_owners = Vec::with_capacity(16384);
         for s in 0..16384 {
-            slot_states.push(crate::shard::SlotState::Stable);
             slot_owners.push(slot_to_shard(s as u16, num_shards));
         }
         Self {
@@ -175,6 +174,15 @@ impl Router {
         }
     }
 
+    #[inline(always)]
+    pub fn get_slot_state(&self, slot: u16) -> crate::shard::SlotState {
+        self.slot_states
+            .borrow()
+            .get(&slot)
+            .cloned()
+            .unwrap_or(crate::shard::SlotState::Stable)
+    }
+
     pub fn target_shard_for_slot(&self, slot: u16) -> usize {
         self.slot_owners.borrow()[slot as usize]
     }
@@ -194,7 +202,7 @@ impl Router {
         key_exists: bool,
         asking: bool,
     ) -> Result<(), String> {
-        let state = self.slot_states.borrow()[slot as usize].clone();
+        let state = self.get_slot_state(slot);
         match state {
             crate::shard::SlotState::Migrating(target) => {
                 if !key_exists {
@@ -215,7 +223,11 @@ impl Router {
     }
 
     pub fn set_slot_state(&self, slot: u16, state: crate::shard::SlotState) {
-        self.slot_states.borrow_mut()[slot as usize] = state.clone();
+        if state == crate::shard::SlotState::Stable {
+            self.slot_states.borrow_mut().remove(&slot);
+        } else {
+            self.slot_states.borrow_mut().insert(slot, state.clone());
+        }
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
                 let _ = sender.send(ShardMessage::SetSlotState {
@@ -227,7 +239,7 @@ impl Router {
     }
 
     pub fn set_slot_owner(&self, slot: u16, owner: usize) {
-        self.slot_states.borrow_mut()[slot as usize] = crate::shard::SlotState::Stable;
+        self.slot_states.borrow_mut().remove(&slot);
         self.slot_owners.borrow_mut()[slot as usize] = owner;
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {

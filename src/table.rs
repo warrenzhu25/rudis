@@ -1110,12 +1110,12 @@ pub enum RudisValue {
     String(Bytes),
     Int(i64),
     SmallHash(Vec<(Bytes, Bytes)>),
-    Hash(RudisHashMap),
+    Hash(Box<RudisHashMap>),
     List(std::collections::VecDeque<Bytes>),
-    Set(RudisSet),
-    ZSet(RudisZSet),
+    Set(Box<RudisSet>),
+    ZSet(Box<RudisZSet>),
     HyperLogLog(Box<[u8; 16384]>),
-    Stream(RudisStream),
+    Stream(Box<RudisStream>),
     Tiered(TieredPointer),
     Cooled {
         ptr: TieredPointer,
@@ -1681,8 +1681,16 @@ impl RudisTable {
         match val {
             RudisValue::List(deque) => self.arena.recycle_list(deque),
             RudisValue::SmallHash(pairs) => self.arena.recycle_small_hash(pairs),
-            RudisValue::Set(RudisSet::Small(v)) => self.arena.recycle_small_set(v),
-            RudisValue::ZSet(RudisZSet::Small(v)) => self.arena.recycle_small_zset(v),
+            RudisValue::Set(s) => {
+                if let RudisSet::Small(v) = *s {
+                    self.arena.recycle_small_set(v);
+                }
+            }
+            RudisValue::ZSet(z) => {
+                if let RudisZSet::Small(v) = *z {
+                    self.arena.recycle_small_zset(v);
+                }
+            }
             _ => {}
         }
     }
@@ -3093,7 +3101,7 @@ impl RudisTable {
                             pairs[0].1 = val.clone();
                             if val.len() > max_value {
                                 let map: RudisHashMap = pairs.drain(..).collect();
-                                entry.val = RudisValue::Hash(map);
+                                entry.val = RudisValue::Hash(Box::new(map));
                             }
                             return Ok(0);
                         }
@@ -3101,7 +3109,7 @@ impl RudisTable {
                             pairs[pos].1 = val.clone();
                             if val.len() > max_value {
                                 let map: RudisHashMap = pairs.drain(..).collect();
-                                entry.val = RudisValue::Hash(map);
+                                entry.val = RudisValue::Hash(Box::new(map));
                             }
                             return Ok(0);
                         } else {
@@ -3111,7 +3119,7 @@ impl RudisTable {
                                 || val.len() > max_value
                             {
                                 let map: RudisHashMap = pairs.drain(..).collect();
-                                entry.val = RudisValue::Hash(map);
+                                entry.val = RudisValue::Hash(Box::new(map));
                             }
                             return Ok(1);
                         }
@@ -3141,7 +3149,7 @@ impl RudisTable {
         } else {
             let mut map = RudisHashMap::with_capacity_and_hasher(1, FxBuildHasher::default());
             map.insert(field.clone(), val.clone());
-            RudisValue::Hash(map)
+            RudisValue::Hash(Box::new(map))
         };
         let entry = RudisEntry {
             key: key.clone(),
@@ -3191,7 +3199,7 @@ impl RudisTable {
                                 pairs[0].1 = v.clone();
                                 if v.len() > max_value {
                                     let map: RudisHashMap = pairs.drain(..).collect();
-                                    entry.val = RudisValue::Hash(map);
+                                    entry.val = RudisValue::Hash(Box::new(map));
                                 }
                                 return Ok(0);
                             }
@@ -3199,7 +3207,7 @@ impl RudisTable {
                                 pairs[pos].1 = v.clone();
                                 if v.len() > max_value {
                                     let map: RudisHashMap = pairs.drain(..).collect();
-                                    entry.val = RudisValue::Hash(map);
+                                    entry.val = RudisValue::Hash(Box::new(map));
                                 }
                             } else {
                                 pairs.push((f.clone(), v.clone()));
@@ -3208,7 +3216,7 @@ impl RudisTable {
                                     || v.len() > max_value
                                 {
                                     let map: RudisHashMap = pairs.drain(..).collect();
-                                    entry.val = RudisValue::Hash(map);
+                                    entry.val = RudisValue::Hash(Box::new(map));
                                 }
                                 added = 1;
                             }
@@ -3228,7 +3236,7 @@ impl RudisTable {
                                     .any(|(k, v)| k.len() > max_value || v.len() > max_value)
                             {
                                 let map: RudisHashMap = pairs.drain(..).collect();
-                                entry.val = RudisValue::Hash(map);
+                                entry.val = RudisValue::Hash(Box::new(map));
                             }
                             return Ok(added);
                         }
@@ -3298,7 +3306,7 @@ impl RudisTable {
                     added += 1;
                 }
             }
-            (RudisValue::Hash(map), added)
+            (RudisValue::Hash(Box::new(map)), added)
         };
         let entry = RudisEntry {
             key: key_bytes
@@ -3343,7 +3351,7 @@ impl RudisTable {
                     pairs.push((field, value));
                     if should_promote {
                         let map: RudisHashMap = pairs.drain(..).collect();
-                        entry.val = RudisValue::Hash(map);
+                        entry.val = RudisValue::Hash(Box::new(map));
                     }
                     return Ok(1);
                 }
@@ -3365,7 +3373,7 @@ impl RudisTable {
         let val = if field.len() > max_value || value.len() > max_value {
             let mut map = RudisHashMap::default();
             map.insert(field, value);
-            RudisValue::Hash(map)
+            RudisValue::Hash(Box::new(map))
         } else {
             RudisValue::SmallHash(vec![(field, value)])
         };
@@ -3825,10 +3833,14 @@ impl RudisTable {
                     RudisValue::SmallHash(_) => Some("listpack"),
                     RudisValue::Hash(_) => Some("hashtable"),
                     RudisValue::List(_) => Some("quicklist"),
-                    RudisValue::Set(RudisSet::Small(_)) => Some("intset"),
-                    RudisValue::Set(RudisSet::Full(_)) => Some("hashtable"),
-                    RudisValue::ZSet(RudisZSet::Small(_)) => Some("listpack"),
-                    RudisValue::ZSet(RudisZSet::Full { .. }) => Some("skiplist"),
+                    RudisValue::Set(s) => match &**s {
+                        RudisSet::Small(_) => Some("intset"),
+                        RudisSet::Full(_) => Some("hashtable"),
+                    },
+                    RudisValue::ZSet(z) => match &**z {
+                        RudisZSet::Small(_) => Some("listpack"),
+                        RudisZSet::Full { .. } => Some("skiplist"),
+                    },
                     RudisValue::Stream(_) => Some("stream"),
                     _ => Some("raw"),
                 };
@@ -3872,7 +3884,7 @@ impl RudisTable {
                                 .any(|(k, v)| k.len() > max_value || v.len() > max_value)
                         {
                             let map: RudisHashMap = pairs.drain(..).collect();
-                            entry.val = RudisValue::Hash(map);
+                            entry.val = RudisValue::Hash(Box::new(map));
                         }
                     }
                     return Ok(new_val);
@@ -3955,7 +3967,7 @@ impl RudisTable {
                                 .any(|(k, v)| k.len() > max_value || v.len() > max_value)
                         {
                             let map: RudisHashMap = pairs.drain(..).collect();
-                            entry.val = RudisValue::Hash(map);
+                            entry.val = RudisValue::Hash(Box::new(map));
                         }
                     }
                     return Ok(new_val);
@@ -5306,34 +5318,36 @@ impl RudisTable {
                 self.expire_slot(idx);
             } else {
                 match &mut entry.val {
-                    RudisValue::Set(RudisSet::Small(v)) if v.len() == 1 => {
-                        let m_bytes = member.as_ref();
-                        let m_hash = hash64(m_bytes);
-                        if v[0].hash == m_hash
-                            && v[0].member.len() == m_bytes.len()
-                            && v[0].member.as_ref() == m_bytes
-                        {
-                            return Ok(0);
+                    RudisValue::Set(s) => match &mut **s {
+                        RudisSet::Small(v) if v.len() == 1 => {
+                            let m_bytes = member.as_ref();
+                            let m_hash = hash64(m_bytes);
+                            if v[0].hash == m_hash
+                                && v[0].member.len() == m_bytes.len()
+                                && v[0].member.as_ref() == m_bytes
+                            {
+                                return Ok(0);
+                            }
+                            v.push(SmallSetEntry {
+                                hash: m_hash,
+                                member: member.clone(),
+                            });
+                            return Ok(1);
                         }
-                        v.push(SmallSetEntry {
-                            hash: m_hash,
-                            member: member.clone(),
-                        });
-                        return Ok(1);
-                    }
-                    RudisValue::Set(RudisSet::Small(v)) if v.is_empty() => {
-                        let m_bytes = member.as_ref();
-                        let m_hash = hash64(m_bytes);
-                        v.push(SmallSetEntry {
-                            hash: m_hash,
-                            member: member.clone(),
-                        });
-                        return Ok(1);
-                    }
-                    RudisValue::Set(set) => {
-                        let added = if set.insert_slice(member) { 1 } else { 0 };
-                        return Ok(added);
-                    }
+                        RudisSet::Small(v) if v.is_empty() => {
+                            let m_bytes = member.as_ref();
+                            let m_hash = hash64(m_bytes);
+                            v.push(SmallSetEntry {
+                                hash: m_hash,
+                                member: member.clone(),
+                            });
+                            return Ok(1);
+                        }
+                        set => {
+                            let added = if set.insert_slice(member) { 1 } else { 0 };
+                            return Ok(added);
+                        }
+                    },
                     _ => {
                         return Err(
                             "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -5353,7 +5367,7 @@ impl RudisTable {
         });
         let entry = RudisEntry {
             key: key.clone(),
-            val: RudisValue::Set(RudisSet::Small(v)),
+            val: RudisValue::Set(Box::new(RudisSet::Small(v))),
             expire_at: None,
         };
         self.table.insert_prepared(entry, h, insert_idx);
@@ -5447,7 +5461,7 @@ impl RudisTable {
             key: key_bytes
                 .cloned()
                 .unwrap_or_else(|| Bytes::copy_from_slice(key)),
-            val: RudisValue::Set(set),
+            val: RudisValue::Set(Box::new(set)),
             expire_at: None,
         };
         self.table.insert_prepared(entry, h, insert_idx);
@@ -5691,7 +5705,7 @@ impl RudisTable {
                 }
                 if let Some(entry) = self.table.get_slot(idx) {
                     match &entry.val {
-                        RudisValue::Set(s) => sets.push(s.clone()),
+                        RudisValue::Set(s) => sets.push((**s).clone()),
                         _ => {
                             return Err(
                                 "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -5766,9 +5780,9 @@ impl RudisTable {
                     match &entry.val {
                         RudisValue::Set(s) => {
                             if i == 0 {
-                                first_set = Some(s.clone());
+                                first_set = Some((**s).clone());
                             } else {
-                                other_sets.push(s.clone());
+                                other_sets.push((**s).clone());
                             }
                         }
                         _ => {
@@ -5842,7 +5856,7 @@ impl RudisTable {
                 }
                 if let Some(entry) = self.table.get_slot(idx) {
                     match &entry.val {
-                        RudisValue::Set(s) => sets.push(s.clone()),
+                        RudisValue::Set(s) => sets.push((**s).clone()),
                         _ => {
                             return Err(
                                 "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -5886,7 +5900,7 @@ impl RudisTable {
                 }
                 if let Some(entry) = self.table.get_slot(idx) {
                     match &entry.val {
-                        RudisValue::Set(s) => sets.push(s.clone()),
+                        RudisValue::Set(s) => sets.push((**s).clone()),
                         _ => {
                             return Err(
                                 "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -5928,9 +5942,9 @@ impl RudisTable {
                     match &entry.val {
                         RudisValue::Set(s) => {
                             if i == 0 {
-                                first_set = Some(s.clone());
+                                first_set = Some((**s).clone());
                             } else {
-                                other_sets.push(s.clone());
+                                other_sets.push((**s).clone());
                             }
                         }
                         _ => {
@@ -6145,7 +6159,7 @@ impl RudisTable {
             new_set.insert(member);
             self.table.insert(RudisEntry {
                 key: destination,
-                val: RudisValue::Set(new_set),
+                val: RudisValue::Set(Box::new(new_set)),
                 expire_at: None,
             });
             true
@@ -6223,7 +6237,7 @@ impl RudisTable {
             }
             let entry = RudisEntry {
                 key: dest,
-                val: RudisValue::ZSet(zset),
+                val: RudisValue::ZSet(Box::new(zset)),
                 expire_at: None,
             };
             self.table.insert(entry);
@@ -6248,7 +6262,7 @@ impl RudisTable {
             }
             let entry = RudisEntry {
                 key: dest,
-                val: RudisValue::ZSet(zset),
+                val: RudisValue::ZSet(Box::new(zset)),
                 expire_at: None,
             };
             self.table.insert(entry);
@@ -6267,7 +6281,7 @@ impl RudisTable {
             }
             let entry = RudisEntry {
                 key: dest,
-                val: RudisValue::ZSet(zset),
+                val: RudisValue::ZSet(Box::new(zset)),
                 expire_at: None,
             };
             self.table.insert(entry);
@@ -6466,8 +6480,8 @@ impl RudisTable {
                 }
                 if let Some(entry) = self.table.get_slot(idx) {
                     match &entry.val {
-                        RudisValue::ZSet(zs) => collections.push(SetOrZSet::ZSet(zs.clone())),
-                        RudisValue::Set(s) => collections.push(SetOrZSet::Set(s.clone())),
+                        RudisValue::ZSet(zs) => collections.push(SetOrZSet::ZSet((**zs).clone())),
+                        RudisValue::Set(s) => collections.push(SetOrZSet::Set((**s).clone())),
                         _ => {
                             return Err(
                                 "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -6841,7 +6855,7 @@ impl RudisTable {
             key: key_bytes
                 .cloned()
                 .unwrap_or_else(|| Bytes::copy_from_slice(key)),
-            val: RudisValue::ZSet(zset),
+            val: RudisValue::ZSet(Box::new(zset)),
             expire_at: None,
         };
         self.table.insert_prepared(entry, h, insert_idx);
@@ -6995,7 +7009,7 @@ impl RudisTable {
         zset.insert(delta, member);
         let entry = RudisEntry {
             key,
-            val: RudisValue::ZSet(zset),
+            val: RudisValue::ZSet(Box::new(zset)),
             expire_at: None,
         };
         self.table.insert(entry);
@@ -7046,7 +7060,8 @@ impl RudisTable {
                     return Ok(crate::shard::CompactResp::EMPTY_ARRAY);
                 }
                 match &entry.val {
-                    RudisValue::ZSet(zset) => {
+                    RudisValue::ZSet(zset_box) => {
+                        let zset = &**zset_box;
                         let n = zset.len();
                         if n == 0 {
                             return Ok(crate::shard::CompactResp::EMPTY_ARRAY);
@@ -7179,7 +7194,8 @@ impl RudisTable {
                 return Ok(());
             }
             match &entry.val {
-                RudisValue::ZSet(zset) => {
+                RudisValue::ZSet(zset_box) => {
+                    let zset = &**zset_box;
                     let n = zset.len();
                     if n == 0 {
                         crate::connection::write_resp_array_header(out, 0);
@@ -7345,7 +7361,7 @@ impl RudisTable {
         let count = items.len();
         self.table.insert(RudisEntry {
             key: Bytes::copy_from_slice(dst),
-            val: RudisValue::ZSet(zset),
+            val: RudisValue::ZSet(Box::new(zset)),
             expire_at: None,
         });
         Ok(count)
@@ -8352,7 +8368,7 @@ impl RudisTable {
 
                 let entry = RudisEntry {
                     key,
-                    val: RudisValue::Stream(stream),
+                    val: RudisValue::Stream(Box::new(stream)),
                     expire_at: None,
                 };
                 self.table.insert(entry);
@@ -8389,7 +8405,7 @@ impl RudisTable {
 
         let entry = RudisEntry {
             key,
-            val: RudisValue::Stream(stream),
+            val: RudisValue::Stream(Box::new(stream)),
             expire_at: None,
         };
         self.table.insert(entry);
@@ -8639,7 +8655,7 @@ impl RudisTable {
             RudisValue::Set(s) => {
                 payload.push(2u8);
                 payload.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                for item in s {
+                for item in s.as_ref() {
                     payload.extend_from_slice(&(item.len() as u32).to_le_bytes());
                     payload.extend_from_slice(item);
                 }
@@ -8666,7 +8682,7 @@ impl RudisTable {
             RudisValue::Hash(h) => {
                 payload.push(4u8);
                 payload.extend_from_slice(&(h.len() as u32).to_le_bytes());
-                for (f, v) in h {
+                for (f, v) in h.as_ref() {
                     payload.extend_from_slice(&(f.len() as u32).to_le_bytes());
                     payload.extend_from_slice(f);
                     payload.extend_from_slice(&(v.len() as u32).to_le_bytes());
@@ -8763,7 +8779,7 @@ impl RudisTable {
                     set.insert(Bytes::copy_from_slice(&data[cursor..cursor + len]));
                     cursor += len;
                 }
-                RudisValue::Set(set)
+                RudisValue::Set(Box::new(set))
             }
             3 => {
                 if cursor + 4 > data.len() {
@@ -8794,7 +8810,7 @@ impl RudisTable {
                     let score = f64::from_bits(score_bits);
                     zset.insert(score, member);
                 }
-                RudisValue::ZSet(zset)
+                RudisValue::ZSet(Box::new(zset))
             }
             4 => {
                 if cursor + 4 > data.len() {
@@ -8863,7 +8879,7 @@ impl RudisTable {
 
                         hash.insert(f, v);
                     }
-                    RudisValue::Hash(hash)
+                    RudisValue::Hash(Box::new(hash))
                 }
             }
             5 => {
@@ -8926,11 +8942,11 @@ impl RudisTable {
                     }
                     entries.insert(StreamId::new(ms, seq), fields);
                 }
-                RudisValue::Stream(RudisStream {
+                RudisValue::Stream(Box::new(RudisStream {
                     entries,
                     last_id: StreamId::new(last_ms, last_seq),
                     groups: HashMap::new(),
-                })
+                }))
             }
             _ => return Err("DUMP payload version or checksum are wrong"),
         };
@@ -9128,7 +9144,7 @@ impl RudisTable {
             let stream = RudisStream::new();
             let entry = RudisEntry {
                 key: key.clone(),
-                val: RudisValue::Stream(stream),
+                val: RudisValue::Stream(Box::new(stream)),
                 expire_at: None,
             };
             self.table.insert(entry);
@@ -9955,11 +9971,15 @@ mod tests {
 
     #[test]
     fn test_rudis_entry_size() {
-        assert_eq!(std::mem::size_of::<RudisStream>(), 80);
-        assert_eq!(std::mem::size_of::<RudisZSet>(), 64);
-        assert_eq!(std::mem::size_of::<RudisValue>(), 88);
-        assert_eq!(std::mem::size_of::<RudisEntry>(), 136);
-        assert_eq!(std::mem::size_of::<Option<RudisEntry>>(), 136);
+        println!("RudisValue = {}", std::mem::size_of::<RudisValue>());
+        println!("RudisEntry = {}", std::mem::size_of::<RudisEntry>());
+        println!(
+            "Option<RudisEntry> = {}",
+            std::mem::size_of::<Option<RudisEntry>>()
+        );
+        assert_eq!(std::mem::size_of::<RudisValue>(), 40);
+        assert_eq!(std::mem::size_of::<RudisEntry>(), 88);
+        assert_eq!(std::mem::size_of::<Option<RudisEntry>>(), 88);
     }
 
     #[test]

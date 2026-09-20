@@ -2754,7 +2754,7 @@ async fn migrate_keys_to_node(
                 );
                 tx_buf.extend_from_slice(k);
                 tx_buf.extend_from_slice(b"\r\n");
-                for (f, v) in h {
+                for (f, v) in h.as_ref() {
                     tx_buf.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
                     tx_buf.extend_from_slice(f);
                     tx_buf.extend_from_slice(format!("\r\n${}\r\n", v.len()).as_bytes());
@@ -2802,7 +2802,7 @@ async fn migrate_keys_to_node(
                 );
                 tx_buf.extend_from_slice(k);
                 tx_buf.extend_from_slice(b"\r\n");
-                for item in s {
+                for item in s.as_ref() {
                     tx_buf.extend_from_slice(format!("${}\r\n", item.len()).as_bytes());
                     tx_buf.extend_from_slice(item);
                     tx_buf.extend_from_slice(b"\r\n");
@@ -3697,7 +3697,7 @@ async fn execute_command(
 
     if let Some(key) = cmd_primary_key(&cmd) {
         let slot = key_slot(key);
-        let state = router.slot_states.borrow()[slot as usize].clone();
+        let state = router.get_slot_state(slot);
         match state {
             crate::shard::SlotState::Moved(target) => {
                 out.extend_from_slice(format!("-MOVED {} {}\r\n", slot, target).as_bytes());
@@ -7186,7 +7186,7 @@ async fn execute_command(
                         );
                         tx_buf.extend_from_slice(k);
                         tx_buf.extend_from_slice(b"\r\n");
-                        for (f, v) in fields {
+                        for (f, v) in fields.as_ref() {
                             tx_buf.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
                             tx_buf.extend_from_slice(f);
                             tx_buf.extend_from_slice(b"\r\n");
@@ -7236,7 +7236,7 @@ async fn execute_command(
                         );
                         tx_buf.extend_from_slice(k);
                         tx_buf.extend_from_slice(b"\r\n");
-                        for m in set {
+                        for m in set.as_ref() {
                             tx_buf.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
                             tx_buf.extend_from_slice(m);
                             tx_buf.extend_from_slice(b"\r\n");
@@ -12807,9 +12807,7 @@ async fn execute_commands_squashed(
                         } else {
                             first_slot = Some(slot);
                         }
-                        if router.slot_states.borrow()[slot as usize]
-                            != crate::shard::SlotState::Stable
-                        {
+                        if router.get_slot_state(slot) != crate::shard::SlotState::Stable {
                             invalid_slot = true;
                         }
                         if let Some(my_slots) = &my_slots_guard {
