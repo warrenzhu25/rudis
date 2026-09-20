@@ -10150,3 +10150,36 @@ fn test_consolidated_batch_borrowing_e2e() {
     // Verify final state
     assert_eq!(send_and_read(&mut conn, b"DBSIZE\r\n"), ":0\r\n");
 }
+
+#[test]
+fn test_list_fast_push_pop_e2e() {
+    let port = 16960;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut conn = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Single-item LPUSH and LPOP
+    assert_eq!(
+        send_and_read(&mut conn, b"LPUSH fast_list v1\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut conn, b"LPOP fast_list\r\n"),
+        "$2\r\nv1\r\n"
+    );
+    assert_eq!(send_and_read(&mut conn, b"LPOP fast_list\r\n"), "$-1\r\n");
+    assert_eq!(send_and_read(&mut conn, b"EXISTS fast_list\r\n"), ":0\r\n");
+
+    // 2. Single-item RPUSH and RPOP
+    assert_eq!(
+        send_and_read(&mut conn, b"RPUSH fast_rlist rv1\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut conn, b"RPOP fast_rlist\r\n"),
+        "$3\r\nrv1\r\n"
+    );
+    assert_eq!(send_and_read(&mut conn, b"RPOP fast_rlist\r\n"), "$-1\r\n");
+    assert_eq!(send_and_read(&mut conn, b"EXISTS fast_rlist\r\n"), ":0\r\n");
+}

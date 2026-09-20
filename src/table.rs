@@ -4120,6 +4120,10 @@ impl RudisTable {
             } else {
                 match &mut entry.val {
                     RudisValue::List(deque) => {
+                        if values.len() == 1 {
+                            deque.push_front(values[0].clone());
+                            return Ok(deque.len());
+                        }
                         for v in values {
                             deque.push_front(v.clone());
                         }
@@ -4136,8 +4140,12 @@ impl RudisTable {
 
         let (_, insert_idx) = self.table.find_or_prepare_insert(key, h);
         let mut deque = self.arena.acquire_list(values.len());
-        for v in values {
-            deque.push_front(v.clone());
+        if values.len() == 1 {
+            deque.push_front(values[0].clone());
+        } else {
+            for v in values {
+                deque.push_front(v.clone());
+            }
         }
         let len = deque.len();
         let entry = RudisEntry {
@@ -4190,6 +4198,10 @@ impl RudisTable {
             } else {
                 match &mut entry.val {
                     RudisValue::List(deque) => {
+                        if values.len() == 1 {
+                            deque.push_back(values[0].clone());
+                            return Ok(deque.len());
+                        }
                         for v in values {
                             deque.push_back(v.clone());
                         }
@@ -4206,8 +4218,12 @@ impl RudisTable {
 
         let (_, insert_idx) = self.table.find_or_prepare_insert(key, h);
         let mut deque = self.arena.acquire_list(values.len());
-        for v in values {
-            deque.push_back(v.clone());
+        if values.len() == 1 {
+            deque.push_back(values[0].clone());
+        } else {
+            for v in values {
+                deque.push_back(v.clone());
+            }
         }
         let len = deque.len();
         let entry = RudisEntry {
@@ -4313,6 +4329,16 @@ impl RudisTable {
             let mut has_written = false;
             let is_empty = match &mut entry.val {
                 RudisValue::List(deque) => {
+                    if count.is_none() && deque.len() == 1 {
+                        let val = deque.pop_front().unwrap();
+                        crate::connection::write_resp_bulk(out, &val);
+                        let entry = self.table.remove_present(idx);
+                        if self.num_expires > 0 && entry.expire_at.is_some() {
+                            self.num_expires = self.num_expires.saturating_sub(1);
+                        }
+                        self.recycle_value(entry.val);
+                        return Ok(true);
+                    }
                     if let Some(cnt) = count {
                         let n = cnt.min(deque.len());
                         crate::connection::write_resp_array_header(out, n);
@@ -4393,6 +4419,16 @@ impl RudisTable {
             let mut has_written = false;
             let is_empty = match &mut entry.val {
                 RudisValue::List(deque) => {
+                    if count.is_none() && deque.len() == 1 {
+                        let val = deque.pop_back().unwrap();
+                        crate::connection::write_resp_bulk(out, &val);
+                        let entry = self.table.remove_present(idx);
+                        if self.num_expires > 0 && entry.expire_at.is_some() {
+                            self.num_expires = self.num_expires.saturating_sub(1);
+                        }
+                        self.recycle_value(entry.val);
+                        return Ok(true);
+                    }
                     if let Some(cnt) = count {
                         let n = cnt.min(deque.len());
                         crate::connection::write_resp_array_header(out, n);
@@ -4470,6 +4506,15 @@ impl RudisTable {
             }
             let (popped, is_empty) = match &mut entry.val {
                 RudisValue::List(deque) => {
+                    if deque.len() == 1 {
+                        let val = deque.pop_front();
+                        let entry = self.table.remove_present(idx);
+                        if self.num_expires > 0 && entry.expire_at.is_some() {
+                            self.num_expires = self.num_expires.saturating_sub(1);
+                        }
+                        self.recycle_value(entry.val);
+                        return Ok(val);
+                    }
                     let val = deque.pop_front();
                     let empty = deque.is_empty();
                     (val, empty)
@@ -4518,6 +4563,15 @@ impl RudisTable {
             }
             let (popped, is_empty) = match &mut entry.val {
                 RudisValue::List(deque) => {
+                    if deque.len() == 1 {
+                        let val = deque.pop_back();
+                        let entry = self.table.remove_present(idx);
+                        if self.num_expires > 0 && entry.expire_at.is_some() {
+                            self.num_expires = self.num_expires.saturating_sub(1);
+                        }
+                        self.recycle_value(entry.val);
+                        return Ok(val);
+                    }
                     let val = deque.pop_back();
                     let empty = deque.is_empty();
                     (val, empty)
@@ -11494,5 +11548,49 @@ mod tests {
         );
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(table.get_with_hash(exp_k.as_ref(), exp_h), Ok(None));
+    }
+
+    #[test]
+    fn test_list_single_item_fast_path() {
+        let mut table = RudisTable::new();
+        let k = Bytes::from("l_single");
+        let h = hash_key(k.as_ref());
+        let val1 = Bytes::from("item1");
+        let val2 = Bytes::from("item2");
+
+        // 1. LPUSH single item to new list
+        assert_eq!(
+            table.lpush_slice_fast(&k, std::slice::from_ref(&val1)),
+            Ok(1)
+        );
+        // 2. LPUSH second item
+        assert_eq!(
+            table.lpush_slice_fast(&k, std::slice::from_ref(&val2)),
+            Ok(2)
+        );
+
+        // 3. LPOP one item (leaves 1)
+        assert_eq!(table.lpop_one_with_hash(k.as_ref(), h), Ok(Some(val2)));
+        // 4. LPOP last item (deque.len() == 1 shortcut cleans up key)
+        assert_eq!(
+            table.lpop_one_with_hash(k.as_ref(), h),
+            Ok(Some(val1.clone()))
+        );
+        // List is now deleted
+        assert_eq!(table.lpop_one_with_hash(k.as_ref(), h), Ok(None));
+        assert!(!table.exists(k.as_ref()));
+
+        // 5. RPUSH single item and write_rpop_resp_with_hash shortcut
+        assert_eq!(
+            table.rpush_slice_fast(&k, std::slice::from_ref(&val1)),
+            Ok(1)
+        );
+        let mut out = Vec::new();
+        assert_eq!(
+            table.write_rpop_resp_with_hash(k.as_ref(), h, None, &mut out),
+            Ok(true)
+        );
+        assert_eq!(out, b"$5\r\nitem1\r\n");
+        assert!(!table.exists(k.as_ref()));
     }
 }
