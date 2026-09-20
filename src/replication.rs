@@ -14,6 +14,7 @@ pub enum ReplicationRole {
         master_port: u16,
         link_status: String,
         master_repl_offset: u64,
+        master_replid: String,
         sync_in_progress: bool,
     },
 }
@@ -177,10 +178,24 @@ impl ReplicationHub {
         let new_replid = format!("{:016x}{:016x}{:08x}", h1, h2, self.port);
 
         let mut role = self.role.write().unwrap();
+        let (replid2, second_offset) = match &*role {
+            ReplicationRole::Slave {
+                master_replid,
+                master_repl_offset,
+                ..
+            } if !master_replid.is_empty() => (master_replid.clone(), *master_repl_offset as i64),
+            _ => ("0000000000000000000000000000000000000000".to_string(), -1),
+        };
+
+        if second_offset >= 0 {
+            self.master_repl_offset
+                .store(second_offset as u64, Ordering::SeqCst);
+        }
+
         *role = ReplicationRole::Master {
             replid: new_replid,
-            replid2: "0000000000000000000000000000000000000000".to_string(),
-            second_offset: -1,
+            replid2,
+            second_offset,
         };
         self.is_slave_atomic.store(false, Ordering::Release);
     }
@@ -252,7 +267,7 @@ impl ReplicationHub {
         }
         let target_offset = (req_offset as u64) + 1;
 
-        let replid_matches = {
+        let (current_replid, replid_matches) = {
             let role = self.role.read().unwrap();
             match &*role {
                 ReplicationRole::Master {
@@ -260,14 +275,15 @@ impl ReplicationHub {
                     replid2,
                     second_offset,
                 } => {
-                    req_replid == replid
+                    let matches = req_replid == replid
                         || req_replid == self.master_replid
                         || (!replid2.is_empty()
                             && req_replid == replid2
                             && *second_offset >= 0
-                            && req_offset <= *second_offset)
+                            && req_offset <= *second_offset);
+                    (replid.clone(), matches)
                 }
-                _ => false,
+                _ => (String::new(), false),
             }
         };
 
@@ -285,7 +301,7 @@ impl ReplicationHub {
         drop(backlog);
 
         let rep = self.register_replica(client_id, sender);
-        Some((self.master_replid.clone(), diff, rep))
+        Some((current_replid, diff, rep))
     }
 
     pub fn can_partial_resync(&self, req_replid: &str, req_offset: i64) -> bool {
@@ -447,8 +463,14 @@ impl ReplicationHub {
                 master_port,
                 link_status,
                 master_repl_offset,
+                master_replid,
                 sync_in_progress,
             } => {
+                let displayed_replid = if !master_replid.is_empty() {
+                    master_replid.as_str()
+                } else {
+                    self.master_replid.as_str()
+                };
                 format!(
                     "# Replication\r\n\
                      role:slave\r\n\
@@ -468,8 +490,8 @@ impl ReplicationHub {
                     link_status,
                     if sync_in_progress { 1 } else { 0 },
                     master_repl_offset,
-                    self.master_replid,
-                    self.master_repl_offset.load(Ordering::SeqCst)
+                    displayed_replid,
+                    master_repl_offset,
                 )
             }
         }
@@ -541,11 +563,33 @@ pub fn start_replica_sync(
 
     hub.is_slave_atomic.store(true, Ordering::Release);
     HAS_SLAVE_INSTANCE.store(true, Ordering::Release);
+
+    let (cached_replid, cached_offset) = {
+        let role = hub.role.read().unwrap();
+        if let ReplicationRole::Slave {
+            master_host: ref prev_host,
+            master_port: prev_port,
+            ref master_replid,
+            master_repl_offset,
+            ..
+        } = *role
+        {
+            if prev_host == &master_host && prev_port == master_port {
+                (master_replid.clone(), master_repl_offset)
+            } else {
+                (String::new(), 0)
+            }
+        } else {
+            (String::new(), 0)
+        }
+    };
+
     *hub.role.write().unwrap() = ReplicationRole::Slave {
         master_host: master_host.clone(),
         master_port,
         link_status: "connecting".to_string(),
-        master_repl_offset: 0,
+        master_repl_offset: cached_offset,
+        master_replid: cached_replid,
         sync_in_progress: true,
     };
 
@@ -556,6 +600,11 @@ pub fn start_replica_sync(
     monoio::spawn(async move {
         run_replica_worker(port, master_host, master_port, router, cancel_rx, hub_clone).await;
     });
+}
+
+#[inline]
+fn is_sync_cancelled(rx: &flume::Receiver<()>) -> bool {
+    rx.try_recv().is_ok() || rx.is_disconnected()
 }
 
 async fn run_replica_worker(
@@ -581,9 +630,151 @@ async fn run_replica_worker(
         }
     };
 
-    let mut stream = match TcpStream::connect(&addr).await {
-        Ok(s) => s,
-        Err(_) => {
+    'reconnect_loop: loop {
+        if is_sync_cancelled(&cancel_rx) {
+            break 'reconnect_loop;
+        }
+
+        let mut stream = match TcpStream::connect(&addr).await {
+            Ok(s) => s,
+            Err(_) => {
+                if let ReplicationRole::Slave {
+                    ref mut link_status,
+                    ..
+                } = *hub.role.write().unwrap()
+                {
+                    *link_status = "down".to_string();
+                }
+                if is_sync_cancelled(&cancel_rx) {
+                    break 'reconnect_loop;
+                }
+                monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue 'reconnect_loop;
+            }
+        };
+
+        let mut buf = bytes::BytesMut::with_capacity(65536);
+        let mut read_buf = vec![0u8; 8192];
+
+        macro_rules! send_and_expect_line {
+            ($payload:expr) => {{
+                if stream.write_all($payload).await.0.is_err() {
+                    if let ReplicationRole::Slave {
+                        ref mut link_status,
+                        ..
+                    } = *hub.role.write().unwrap()
+                    {
+                        *link_status = "down".to_string();
+                    }
+                    if is_sync_cancelled(&cancel_rx) {
+                        break 'reconnect_loop;
+                    }
+                    monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue 'reconnect_loop;
+                }
+                let mut line_res = None;
+                loop {
+                    if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
+                        let line = buf.split_to(pos + 2);
+                        line_res = Some(line);
+                        break;
+                    }
+                    let (res, returned) = stream.read(read_buf).await;
+                    read_buf = returned;
+                    match res {
+                        Ok(0) | Err(_) => {
+                            if let ReplicationRole::Slave {
+                                ref mut link_status,
+                                ..
+                            } = *hub.role.write().unwrap()
+                            {
+                                *link_status = "down".to_string();
+                            }
+                            break;
+                        }
+                        Ok(n) => buf.extend_from_slice(&read_buf[..n]),
+                    }
+                }
+                match line_res {
+                    Some(l) => l,
+                    None => {
+                        if is_sync_cancelled(&cancel_rx) {
+                            break 'reconnect_loop;
+                        }
+                        monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue 'reconnect_loop;
+                    }
+                }
+            }};
+        }
+
+        // 1. PING
+        let line = send_and_expect_line!(b"*1\r\n$4\r\nPING\r\n");
+        if !line.starts_with(b"+PONG") {
+            if is_sync_cancelled(&cancel_rx) {
+                break 'reconnect_loop;
+            }
+            monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+            continue 'reconnect_loop;
+        }
+
+        // 2. REPLCONF listening-port
+        let my_port_s = my_port.to_string();
+        let replconf_port = format!(
+            "*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n${}\r\n{}\r\n",
+            my_port_s.len(),
+            my_port_s
+        );
+        let line = send_and_expect_line!(replconf_port.into_bytes());
+        if !line.starts_with(b"+OK") {
+            if is_sync_cancelled(&cancel_rx) {
+                break 'reconnect_loop;
+            }
+            monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+            continue 'reconnect_loop;
+        }
+
+        // 3. REPLCONF capa psync2
+        let line = send_and_expect_line!(b"*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n");
+        if !line.starts_with(b"+OK") {
+            if is_sync_cancelled(&cancel_rx) {
+                break 'reconnect_loop;
+            }
+            monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+            continue 'reconnect_loop;
+        }
+
+        // 4. PSYNC
+        let (cached_replid, cached_offset) = {
+            let role = hub.role.read().unwrap();
+            if let ReplicationRole::Slave {
+                ref master_replid,
+                master_repl_offset,
+                ..
+            } = *role
+            {
+                (master_replid.clone(), master_repl_offset)
+            } else {
+                (String::new(), 0)
+            }
+        };
+
+        let psync_payload = if !cached_replid.is_empty() {
+            format!(
+                "*3\r\n$5\r\nPSYNC\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
+                cached_replid.len(),
+                cached_replid,
+                cached_offset.to_string().len(),
+                cached_offset
+            )
+            .into_bytes()
+        } else {
+            b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n".to_vec()
+        };
+
+        let line = send_and_expect_line!(psync_payload);
+        let is_continue = line.starts_with(b"+CONTINUE");
+        if !line.starts_with(b"+FULLRESYNC") && !is_continue {
             if let ReplicationRole::Slave {
                 ref mut link_status,
                 ..
@@ -591,187 +782,195 @@ async fn run_replica_worker(
             {
                 *link_status = "down".to_string();
             }
-            return;
-        }
-    };
-
-    let mut buf = bytes::BytesMut::with_capacity(65536);
-    let mut read_buf = vec![0u8; 8192];
-
-    macro_rules! send_and_expect_line {
-        ($payload:expr) => {{
-            if stream.write_all($payload).await.0.is_err() {
-                return;
+            if is_sync_cancelled(&cancel_rx) {
+                break 'reconnect_loop;
             }
+            monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+            continue 'reconnect_loop;
+        }
+
+        let line_str = String::from_utf8_lossy(&line);
+        let parts: Vec<&str> = line_str.split_whitespace().collect();
+
+        let (new_replid, initial_offset) = if is_continue {
+            let r_id = if parts.len() >= 2 {
+                parts[1].to_string()
+            } else {
+                cached_replid.clone()
+            };
+            (r_id, cached_offset)
+        } else {
+            let r_id = if parts.len() >= 2 {
+                parts[1].to_string()
+            } else {
+                String::new()
+            };
+            let off: u64 = if parts.len() >= 3 {
+                parts[2].parse().unwrap_or(0)
+            } else {
+                0
+            };
+            (r_id, off)
+        };
+
+        if !is_continue {
+            // 5. Read RDB header: $<len>\r\n
+            let mut rdb_len: Option<usize> = None;
             loop {
                 if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
                     let line = buf.split_to(pos + 2);
-                    break line;
+                    if line.starts_with(b"$") {
+                        let s = std::str::from_utf8(&line[1..line.len() - 2]).unwrap_or("0");
+                        rdb_len = Some(s.parse().unwrap_or(0));
+                        break;
+                    }
                 }
                 let (res, returned) = stream.read(read_buf).await;
                 read_buf = returned;
                 match res {
-                    Ok(0) | Err(_) => return,
+                    Ok(0) | Err(_) => break,
                     Ok(n) => buf.extend_from_slice(&read_buf[..n]),
                 }
             }
-        }};
-    }
 
-    // 1. PING
-    let line = send_and_expect_line!(b"*1\r\n$4\r\nPING\r\n");
-    if !line.starts_with(b"+PONG") {
-        return;
-    }
-
-    // 2. REPLCONF listening-port
-    let my_port_s = my_port.to_string();
-    let replconf_port = format!(
-        "*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n${}\r\n{}\r\n",
-        my_port_s.len(),
-        my_port_s
-    );
-    let line = send_and_expect_line!(replconf_port.into_bytes());
-    if !line.starts_with(b"+OK") {
-        return;
-    }
-
-    // 3. REPLCONF capa psync2
-    let line = send_and_expect_line!(b"*3\r\n$8\r\nREPLCONF\r\n$4\r\ncapa\r\n$6\r\npsync2\r\n");
-    if !line.starts_with(b"+OK") {
-        return;
-    }
-
-    // 4. PSYNC ? -1
-    let line = send_and_expect_line!(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n");
-    let is_continue = line.starts_with(b"+CONTINUE");
-    if !line.starts_with(b"+FULLRESYNC") && !is_continue {
-        return;
-    }
-
-    let initial_offset: u64 = if is_continue {
-        let role = hub.role.read().unwrap();
-        if let ReplicationRole::Slave {
-            master_repl_offset, ..
-        } = *role
-        {
-            master_repl_offset
-        } else {
-            0
-        }
-    } else {
-        let line_str = String::from_utf8_lossy(&line);
-        let parts: Vec<&str> = line_str.split_whitespace().collect();
-        if parts.len() >= 3 {
-            parts[2].parse().unwrap_or(0)
-        } else {
-            0
-        }
-    };
-
-    if !is_continue {
-        // 5. Read RDB header: $<len>\r\n
-        let rdb_len: usize = loop {
-            if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
-                let line = buf.split_to(pos + 2);
-                if line.starts_with(b"$") {
-                    let s = std::str::from_utf8(&line[1..line.len() - 2]).unwrap_or("0");
-                    break s.parse().unwrap_or(0);
-                }
-            }
-            let (res, returned) = stream.read(read_buf).await;
-            read_buf = returned;
-            match res {
-                Ok(0) | Err(_) => return,
-                Ok(n) => buf.extend_from_slice(&read_buf[..n]),
-            }
-        };
-
-        // 6. Read rdb_len bytes
-        while buf.len() < rdb_len {
-            let (res, returned) = stream.read(read_buf).await;
-            read_buf = returned;
-            match res {
-                Ok(0) | Err(_) => return,
-                Ok(n) => buf.extend_from_slice(&read_buf[..n]),
-            }
-        }
-        let rdb_bytes = buf.split_to(rdb_len).freeze();
-
-        // 7. Restore RDB into router
-        router.restore_rdb_bytes(rdb_bytes).await;
-    }
-
-    // 8. Mark link_status up
-    {
-        let mut role = hub.role.write().unwrap();
-        if let ReplicationRole::Slave {
-            ref mut link_status,
-            ref mut master_repl_offset,
-            ref mut sync_in_progress,
-            ..
-        } = *role
-        {
-            *link_status = "up".to_string();
-            *master_repl_offset = initial_offset;
-            *sync_in_progress = false;
-        }
-    }
-
-    // 9. Streaming loop: receive and apply mutations
-    let mut current_offset = initial_offset;
-    loop {
-        if cancel_rx.try_recv().is_ok() {
-            break;
-        }
-
-        while !buf.is_empty() {
-            let initial_buf_len = buf.len();
-            match crate::resp::parse_command(&mut buf) {
-                Ok(Some(cmd)) => {
-                    let consumed = initial_buf_len - buf.len();
-                    current_offset += consumed as u64;
-
-                    match &cmd {
-                        crate::resp::Command::Replconf(args) => {
-                            if args.len() >= 2 && args[0].eq_ignore_ascii_case(b"getack") {
-                                let off_str = current_offset.to_string();
-                                let ack_reply = format!(
-                                    "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n${}\r\n{}\r\n",
-                                    off_str.len(),
-                                    off_str
-                                );
-                                let _ = stream.write_all(ack_reply.into_bytes()).await.0;
-                            }
-                        }
-                        crate::resp::Command::Ping(_) => {}
-                        _ => {
-                            router.execute_replica_command(cmd).await;
-                        }
-                    }
-
+            let rdb_len = match rdb_len {
+                Some(l) => l,
+                None => {
                     if let ReplicationRole::Slave {
-                        ref mut master_repl_offset,
+                        ref mut link_status,
                         ..
                     } = *hub.role.write().unwrap()
                     {
-                        *master_repl_offset = current_offset;
+                        *link_status = "down".to_string();
                     }
+                    if is_sync_cancelled(&cancel_rx) {
+                        break 'reconnect_loop;
+                    }
+                    monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue 'reconnect_loop;
                 }
-                Ok(None) => break,
-                Err(_) => {
-                    buf.clear();
-                    break;
+            };
+
+            // 6. Read rdb_len bytes
+            let mut read_failed = false;
+            while buf.len() < rdb_len {
+                let (res, returned) = stream.read(read_buf).await;
+                read_buf = returned;
+                match res {
+                    Ok(0) | Err(_) => {
+                        read_failed = true;
+                        break;
+                    }
+                    Ok(n) => buf.extend_from_slice(&read_buf[..n]),
                 }
+            }
+            if read_failed {
+                if let ReplicationRole::Slave {
+                    ref mut link_status,
+                    ..
+                } = *hub.role.write().unwrap()
+                {
+                    *link_status = "down".to_string();
+                }
+                if is_sync_cancelled(&cancel_rx) {
+                    break 'reconnect_loop;
+                }
+                monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+                continue 'reconnect_loop;
+            }
+
+            let rdb_bytes = buf.split_to(rdb_len).freeze();
+
+            // 7. Restore RDB into router
+            router.restore_rdb_bytes(rdb_bytes).await;
+        }
+
+        // 8. Mark link_status up
+        {
+            let mut role = hub.role.write().unwrap();
+            if let ReplicationRole::Slave {
+                ref mut link_status,
+                ref mut master_repl_offset,
+                ref mut master_replid,
+                ref mut sync_in_progress,
+                ..
+            } = *role
+            {
+                *link_status = "up".to_string();
+                *master_repl_offset = initial_offset;
+                *master_replid = new_replid;
+                *sync_in_progress = false;
             }
         }
 
-        let (res, returned) = stream.read(read_buf).await;
-        read_buf = returned;
-        match res {
-            Ok(0) | Err(_) => break,
-            Ok(n) => buf.extend_from_slice(&read_buf[..n]),
+        // 9. Streaming loop: receive and apply mutations
+        let mut current_offset = initial_offset;
+        loop {
+            if is_sync_cancelled(&cancel_rx) {
+                break 'reconnect_loop;
+            }
+
+            while !buf.is_empty() {
+                let initial_buf_len = buf.len();
+                match crate::resp::parse_command(&mut buf) {
+                    Ok(Some(cmd)) => {
+                        let consumed = initial_buf_len - buf.len();
+                        current_offset += consumed as u64;
+
+                        match &cmd {
+                            crate::resp::Command::Replconf(args) => {
+                                if args.len() >= 2 && args[0].eq_ignore_ascii_case(b"getack") {
+                                    let off_str = current_offset.to_string();
+                                    let ack_reply = format!(
+                                        "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n${}\r\n{}\r\n",
+                                        off_str.len(),
+                                        off_str
+                                    );
+                                    let _ = stream.write_all(ack_reply.into_bytes()).await.0;
+                                }
+                            }
+                            crate::resp::Command::Ping(_) => {}
+                            _ => {
+                                router.execute_replica_command(cmd).await;
+                            }
+                        }
+
+                        if let ReplicationRole::Slave {
+                            ref mut master_repl_offset,
+                            ..
+                        } = *hub.role.write().unwrap()
+                        {
+                            *master_repl_offset = current_offset;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        buf.clear();
+                        break;
+                    }
+                }
+            }
+
+            let (res, returned) = stream.read(read_buf).await;
+            read_buf = returned;
+            match res {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buf.extend_from_slice(&read_buf[..n]),
+            }
         }
+
+        if let ReplicationRole::Slave {
+            ref mut link_status,
+            ..
+        } = *hub.role.write().unwrap()
+        {
+            *link_status = "down".to_string();
+        }
+
+        if is_sync_cancelled(&cancel_rx) {
+            break 'reconnect_loop;
+        }
+        monoio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
     if let ReplicationRole::Slave {
@@ -908,5 +1107,63 @@ mod tests {
         hub.make_master();
         assert!(hub.is_master());
         assert!(!hub.is_slave());
+    }
+
+    #[test]
+    fn test_replica_partial_resync_and_psync2_failover() {
+        let hub = ReplicationHub::new(19997);
+        let master_replid = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2".to_string();
+        *hub.role.write().unwrap() = ReplicationRole::Slave {
+            master_host: "127.0.0.1".to_string(),
+            master_port: 6379,
+            link_status: "up".to_string(),
+            master_repl_offset: 120,
+            master_replid: master_replid.clone(),
+            sync_in_progress: false,
+        };
+        hub.is_slave_atomic.store(true, Ordering::Release);
+
+        // Verify info replication outputs master_replid and offset
+        let info = hub.format_info_replication();
+        assert!(info.contains("role:slave"));
+        assert!(info.contains(&format!("master_replid:{}", master_replid)));
+        assert!(info.contains("slave_repl_offset:120"));
+
+        // Promote slave to master via make_master
+        hub.make_master();
+        assert!(hub.is_master());
+        assert!(!hub.is_slave());
+        assert_eq!(hub.master_repl_offset.load(Ordering::SeqCst), 120);
+
+        // Verify replid2 and second_offset inherited
+        {
+            let role = hub.role.read().unwrap();
+            match &*role {
+                ReplicationRole::Master {
+                    replid,
+                    replid2,
+                    second_offset,
+                } => {
+                    assert_ne!(replid, &master_replid);
+                    assert_eq!(replid2, &master_replid);
+                    assert_eq!(*second_offset, 120);
+                }
+                _ => panic!("Expected master role"),
+            }
+        }
+
+        // Test that try_partial_resync succeeds for a client asking for replid2 at offset <= second_offset
+        let (tx, _rx) = flume::unbounded();
+        assert!(
+            hub.try_partial_resync(100, tx.clone(), &master_replid, 120)
+                .is_some()
+        );
+        hub.unregister_replica(100);
+
+        // Asking for replid2 at offset > second_offset fails
+        assert!(
+            hub.try_partial_resync(101, tx, &master_replid, 121)
+                .is_none()
+        );
     }
 }

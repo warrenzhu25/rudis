@@ -3110,6 +3110,140 @@ fn test_primary_replica_replication_e2e() {
 }
 
 #[test]
+fn test_replica_partial_resync_reconnect_e2e() {
+    let master_port = 16424;
+    let replica_port = 16425;
+
+    start_test_server(master_port, 2);
+    start_test_server(replica_port, 2);
+
+    let mut master_client = TcpStream::connect(format!("127.0.0.1:{}", master_port)).unwrap();
+    let mut replica_client = TcpStream::connect(format!("127.0.0.1:{}", replica_port)).unwrap();
+
+    // 1. Pre-populate master with initial keys
+    assert_eq!(
+        send_and_read(&mut master_client, b"SET k1 v1\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut master_client, b"SET k2 v2\r\n"),
+        "+OK\r\n"
+    );
+
+    // 2. Start replication: initial full resync
+    assert_eq!(
+        send_and_read(
+            &mut replica_client,
+            format!("REPLICAOF 127.0.0.1 {}\r\n", master_port).as_bytes()
+        ),
+        "+OK\r\n"
+    );
+
+    // Wait for replica to be connected
+    let mut replica_role = String::new();
+    for _ in 0..40 {
+        replica_role = send_and_read(&mut replica_client, b"ROLE\r\n");
+        if replica_role.contains("slave") && replica_role.contains("connected") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(replica_role.contains("slave") && replica_role.contains("connected"));
+
+    // Verify initial keys present on replica
+    assert_eq!(
+        send_and_read(&mut replica_client, b"GET k1\r\n"),
+        "$2\r\nv1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut replica_client, b"GET k2\r\n"),
+        "$2\r\nv2\r\n"
+    );
+
+    // 3. Write live mutations to master
+    assert_eq!(
+        send_and_read(&mut master_client, b"SET k3 v3\r\n"),
+        "+OK\r\n"
+    );
+    for _ in 0..40 {
+        if send_and_read(&mut replica_client, b"GET k3\r\n") == "$2\r\nv3\r\n" {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        send_and_read(&mut replica_client, b"GET k3\r\n"),
+        "$2\r\nv3\r\n"
+    );
+
+    // Check INFO replication on replica to verify replid and offset
+    let rep_info = send_and_read(&mut replica_client, b"INFO replication\r\n");
+    assert!(rep_info.contains("role:slave"));
+    assert!(rep_info.contains("master_link_status:up"));
+
+    // 4. Trigger reconnect on replica: re-issuing REPLICAOF to same master
+    // preserves cached master_replid and offset, performing partial resync (PSYNC <replid> <offset>)
+    assert_eq!(
+        send_and_read(&mut master_client, b"SET k4 v4\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut replica_client,
+            format!("REPLICAOF 127.0.0.1 {}\r\n", master_port).as_bytes()
+        ),
+        "+OK\r\n"
+    );
+
+    // Wait for reconnection
+    for _ in 0..40 {
+        let role = send_and_read(&mut replica_client, b"ROLE\r\n");
+        if role.contains("connected") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // Verify k4 is replicated after partial sync
+    for _ in 0..40 {
+        if send_and_read(&mut replica_client, b"GET k4\r\n") == "$2\r\nv4\r\n" {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        send_and_read(&mut replica_client, b"GET k4\r\n"),
+        "$2\r\nv4\r\n"
+    );
+
+    // 5. Subsequent mutations replicate cleanly
+    assert_eq!(
+        send_and_read(&mut master_client, b"SET k5 v5\r\n"),
+        "+OK\r\n"
+    );
+    for _ in 0..40 {
+        if send_and_read(&mut replica_client, b"GET k5\r\n") == "$2\r\nv5\r\n" {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        send_and_read(&mut replica_client, b"GET k5\r\n"),
+        "$2\r\nv5\r\n"
+    );
+
+    // 6. Test promotion to master via REPLICAOF NO ONE
+    assert_eq!(
+        send_and_read(&mut replica_client, b"REPLICAOF NO ONE\r\n"),
+        "+OK\r\n"
+    );
+    thread::sleep(Duration::from_millis(100));
+    let promoted_info = send_and_read(&mut replica_client, b"INFO replication\r\n");
+    assert!(promoted_info.contains("role:master"));
+    assert!(promoted_info.contains("second_repl_offset:"));
+}
+
+#[test]
 fn test_lua_scripting_engine_e2e() {
     let port = 16430;
     start_test_server(port, 2);

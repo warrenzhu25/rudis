@@ -49,7 +49,7 @@ own number as a `##` section in this file.
 | **11** | **Redis Cluster Topology & Gossip Protocol** | `src/cluster.rs` | Plain-text line gossip protocol (not binary), full-state resend every 500ms, unilateral (non-quorum) failure detection, a real majority-vote replica election. Slot redirection is genuinely wired into the command path via `connection.rs` + `ClusterHub`, now including the pipelined squashed-command path. |
 | **12** | **CRDT Data Types & Manual Multi-Region Sync** | `src/crdt.rs` | Real LWW-Register/OR-Set/PN-Counter CRDTs with a CAS-based Hybrid Logical Clock. Single-key commands now correctly route through the normal key-slot mechanism, and `CRDT.DUMP`/`MERGE`/`GC` now fan out to every shard — but sync between separate Rudis *instances* is still entirely manual, no automatic network transport. |
 | **13** | **Lua Scripting & Redis 7 Functions Engine** | `src/scripting.rs` | A fresh `mlua::Lua` VM per call (no persistent interpreter or bytecode cache), SHA1-cached script/library *source text*, real `redis.call`/`redis.pcall` via the normal command-execution path. `FCALL`'s AOF-bypass bug is now fixed. |
-| **14** | **Persistence & Replication Engines** | `src/replication.rs`, `src/aof.rs` | Still no AOF rewrite/compaction — the file grows forever. Partial `PSYNC` resync (`+CONTINUE`) is now real on the master side, but Rudis's own replica always sends `PSYNC ? -1`, so a Rudis-to-Rudis pair never actually exercises it. A real custom RDB binary format with a CRC64 trailer. |
+| **14** | **Persistence & Replication Engines** | `src/replication.rs`, `src/aof.rs` | Still no AOF rewrite/compaction — the file grows forever. Partial `PSYNC` resync (`+CONTINUE`) is now fully supported on both master and replica sides with automated reconnect and PSYNC2 failover handover. A real custom RDB binary format with a CRC64 trailer. |
 | **15** | **Security, Memory Allocator & TLS** | `src/acl.rs`, `src/allocator.rs`, `src/tls.rs` | ACL now hashes passwords (SHA1 with a hardcoded global salt — weak, and the plaintext is *still also* stored) and genuinely enforces per-command/per-key permissions. TLS is now wired to a `--tls-port` listener, but has a **critical live bug**: its kTLS fast-path marks itself active without ever installing kernel key material, so it silently sends all "encrypted" traffic in cleartext. |
 | **16** | **JSON Document Store & JSONPath Engine** | `src/json.rs` | A real, hand-written JSONPath subset (no recursive descent, no filter expressions) over `serde_json::Value`. Single-key commands genuinely route per-shard, unlike Vector (08); `JSON.MGET` is still sequential per-key, unlike the already-fixed `MGET`/`MSET`. Not included in RDB persistence. |
 | **17** | **Geospatial Commands** | `src/geo.rs` | Owns zero storage — every `GEO*` command is a thin layer over `ZADD`/`ZSCORE`/`ZRANGE` (Component 05), matching real Redis's own architecture. `GEORADIUS`/`GEORADIUSBYMEMBER`/`GEOSEARCH` are three independent O(N) full-set brute-force scans, not geohash-neighborhood-pruned. |
@@ -4674,9 +4674,10 @@ This subsystem covers two related but independent durability mechanisms:
    correctly, documented this as entirely unimplemented; it has since been built).
 
 **Update**: AOF rewrite/compaction is still entirely absent (§4.1 — unchanged). Partial
-resynchronization, previously fully unimplemented, is now real on the **master** side
-(§4.3) — but see §4.3's caveat: this codebase's own **replica** implementation never
-actually requests one.
+resynchronization is now real on both the **master** and **replica** sides
+(§4.3) — `run_replica_worker` tracks its `master_replid` and `master_repl_offset`,
+reconnects automatically with `PSYNC <replid> <offset>`, and applies `+CONTINUE` diffs
+without full RDB snapshots.
 
 ---
 
@@ -4686,18 +4687,14 @@ actually requests one.
    (later flushed to disk via `write_all_at` at the current end-of-file `offset`). There is
    no `BGREWRITEAOF`, no periodic compaction, and no mechanism that ever shrinks or rewrites
    the file — it grows for as long as the process runs with AOF enabled.
-2. **Master-side partial resync is now real; the replica side never asks for one.**
-   `run_master_replica_stream` (`src/connection.rs`) now inspects the `PSYNC` command's own
-   replid/offset arguments (previously received but discarded) via
-   `ReplicationHub::try_partial_resync`, and replies `+CONTINUE <replid>\r\n<backlog-diff-bytes>`
-   when the requested offset still falls inside the retained backlog window for a matching
-   replid, falling back to `+FULLRESYNC <replid> <offset>\r\n$<len>\r\n<rdb-bytes>` otherwise
-   (§4.3). **But** `run_replica_worker` — this codebase's own replica-side connect logic —
-   still unconditionally sends the literal `PSYNC ? -1` on every connection, including
-   reconnects; it never tracks or requests its own last-known offset. So a rudis replica
-   talking to a rudis (or real Redis) master never actually triggers the new `+CONTINUE` path
-   itself — the feature only benefits a *different* client (a real Redis replica, or a future
-   rudis version) connecting to a rudis master. See §4.3 and Future Improvements.
+2. **Partial resync is supported on both master and replica sides.**
+   `run_master_replica_stream` (`src/connection.rs`) inspects the `PSYNC` command's
+   replid/offset arguments via `ReplicationHub::try_partial_resync`, and replies `+CONTINUE <replid>\r\n<backlog-diff-bytes>`
+   when the requested offset falls inside the retained backlog window for a matching
+   replid (or `replid2`), falling back to `+FULLRESYNC <replid> <offset>\r\n$<len>\r\n<rdb-bytes>` otherwise
+   (§4.3). `run_replica_worker` tracks its `master_repl_offset` and `master_replid`, sending
+   `PSYNC <cached_replid> <cached_offset>` on reconnects, receiving `+CONTINUE`, and executing
+   the backlog diff commands without requesting a full RDB snapshot.
 3. **The replication backlog is maintained, and now genuinely read back — by the master
    serving a partial resync.** `ReplicationHub::propagate` still appends every propagated
    command to `self.backlog` (a `ReplicationBacklog`), and that data is no longer write-only:
@@ -5061,7 +5058,7 @@ state currently is at request time.
 ### 7. Future Improvements
 
 - **High — implement AOF rewrite/compaction (§4.1).** An AOF-enabled node that runs for a long time under sustained writes has an ever-growing file and an ever-growing restart replay cost, with no relief mechanism (no `BGREWRITEAOF` equivalent exists at all). Since `RudisTable` already has a working RDB chunk format (Component 05) used for full resync, the natural implementation is: periodically (or on an explicit `BGREWRITEAOF`-equivalent command) snapshot the current dataset to a fresh AOF-equivalent-from-RDB, atomically swap it in for the old growing file, and discard the old one — reusing existing RDB serialization rather than building new compaction logic from scratch.
-- **RESOLVED (master side) / High (replica side still open) — partial resynchronization (§2.3/§4.3).** The master now genuinely serves `+CONTINUE` with just the missing backlog bytes when a valid replid+offset is presented, tested against boundary cases (`test_backlog_append_and_diff`, `test_try_partial_resync`). What's still missing: `run_replica_worker` always sends `PSYNC ? -1`, never its own last-known offset, so this codebase's own replica can never actually trigger the path it just gained. The remaining fix is narrow: track `master_repl_offset`/`master_replid` across a replica's disconnect (they already live on `ReplicationRole::Slave`, just aren't read at handshake time) and send `PSYNC <replid> <offset>` instead of `PSYNC ? -1` whenever those are known from a prior successful sync.
+- **RESOLVED — partial resynchronization on master and replica (§2.3/§4.3).** The master genuinely serves `+CONTINUE` with just the missing backlog bytes when a valid replid+offset is presented, and `run_replica_worker` now tracks its `master_replid` and `master_repl_offset`, automatically reconnects via `'reconnect_loop`, sends `PSYNC <replid> <offset>`, and applies `+CONTINUE` diff streams directly without requesting full RDB re-transfer. Tested via `test_replica_partial_resync_and_psync2_failover` and `test_replica_partial_resync_reconnect_e2e`.
 - **Low — derive `replid` from something closer to Redis's real generation scheme**, or at least document that the current `fxhash`-over-port-and-timestamp approach (§3) is a real, working, but not cryptographically-derived identifier — same category of note as Component 11's node-ID generation.
 - **Low — make the 1MB `ReplicationBacklog` size and the 50ms/~1s AOF flush/fsync cadence configurable** rather than hardcoded, once partial resync (above) makes the backlog size an operationally meaningful tuning knob rather than just an `INFO`-reporting detail.
 
