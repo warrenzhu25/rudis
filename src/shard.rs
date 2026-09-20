@@ -227,6 +227,16 @@ impl CompactResp {
     }
 
     #[inline(always)]
+    pub fn estimated_len(&self) -> usize {
+        match self {
+            CompactResp::Small { len, .. } => *len as usize,
+            CompactResp::Big(vec) => vec.len(),
+            CompactResp::Bulk(bytes) => bytes.len() + 16,
+            CompactResp::Array1Bulk(bytes) => bytes.len() + 20,
+        }
+    }
+
+    #[inline(always)]
     pub fn write_to(&self, out: &mut Vec<u8>) {
         match self {
             CompactResp::Small { len, data } => out.extend_from_slice(&data[..*len as usize]),
@@ -2519,5 +2529,18 @@ mod tests {
         let neighbors = new_db.vquery("test_idx", &[1.0, 2.0, 3.0], 1, false);
         assert_eq!(neighbors.len(), 1);
         assert_eq!(neighbors[0].0, vec_doc);
+    }
+
+    #[test]
+    fn test_compact_resp_estimated_len() {
+        assert_eq!(CompactResp::OK.estimated_len(), 5); // +OK\r\n
+        assert_eq!(CompactResp::INT_1.estimated_len(), 4); // :1\r\n
+        assert_eq!(CompactResp::NULL.estimated_len(), 5); // $-1\r\n
+
+        let bulk = CompactResp::Bulk(Bytes::from("hello"));
+        assert!(bulk.estimated_len() >= 5);
+
+        let big = CompactResp::from_vec(vec![0u8; 100]);
+        assert_eq!(big.estimated_len(), 100);
     }
 }

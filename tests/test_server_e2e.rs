@@ -10082,3 +10082,38 @@ fn test_mget_scatter_gather_e2e() {
         "*3\r\n$9\r\nmget_val0\r\n$-1\r\n$9\r\nmget_val2\r\n"
     );
 }
+
+#[test]
+fn test_pipeline_write_buffering_and_sigpipe_resilience_e2e() {
+    let port = 16940;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    // 1. Pipeline write test with pre-reserved output buffer
+    let mut conn = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let mut pipe = String::new();
+    for i in 0..100 {
+        pipe.push_str(&format!("SET pipe_k{} pipe_v{}\r\n", i, i));
+    }
+    use std::io::{Read, Write};
+    conn.write_all(pipe.as_bytes()).unwrap();
+
+    let mut buf = [0u8; 1024];
+    let mut read_buf = Vec::new();
+    while read_buf.windows(2).filter(|w| *w == b"\r\n").count() < 100 {
+        let n = conn.read(&mut buf).unwrap();
+        read_buf.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(read_buf.windows(2).filter(|w| *w == b"\r\n").count(), 100);
+
+    // 2. Abrupt client disconnect resilience (SIGPIPE safety)
+    {
+        let mut drop_conn = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        let _ = drop_conn.write_all(b"MGET pipe_k0 pipe_k1 pipe_k2 pipe_k3\r\n");
+        // Abruptly drop socket before reading reply
+    }
+    std::thread::sleep(Duration::from_millis(50));
+
+    // Verify server remains alive and responsive
+    assert_eq!(send_and_read(&mut conn, b"PING\r\n"), "+PONG\r\n");
+}

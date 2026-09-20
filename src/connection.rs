@@ -13144,7 +13144,9 @@ async fn execute_commands_squashed(
         }
     }
 
-    // 5. Append responses in exact FIFO pipeline order
+    // 5. Append responses in exact FIFO pipeline order with pre-reserved capacity
+    let total_len: usize = responses.iter().map(|r| r.estimated_len()).sum();
+    out.reserve(total_len);
     for resp in responses.iter() {
         resp.write_to(out);
     }
