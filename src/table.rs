@@ -1500,26 +1500,6 @@ impl RudisFlatTable {
     }
 
     #[inline(always)]
-    pub fn prepare_insert(&mut self, key: &[u8], hash: u64) -> (Option<usize>, usize) {
-        if self.is_rehashing() {
-            self.migrate_key_if_in_old(key, hash);
-            self.rehash_step(16);
-        }
-        if self.growth_left == 0 {
-            if self.is_rehashing() {
-                self.finish_rehash();
-            }
-            let new_cap = if self.items * 2 < self.capacity && self.capacity > GROUP_SIZE {
-                self.capacity
-            } else {
-                self.capacity * 2
-            };
-            self.resize(new_cap);
-        }
-        self.find_or_prepare_insert(key, hash)
-    }
-
-    #[inline(always)]
     pub fn is_rehashing(&self) -> bool {
         self.old_table.is_some()
     }
@@ -1623,7 +1603,23 @@ impl RudisFlatTable {
 
     pub fn insert(&mut self, entry: RudisEntry) -> Option<RudisEntry> {
         let h = hash_key(&entry.key);
-        let (existing, insert_idx) = self.prepare_insert(&entry.key, h);
+        if self.is_rehashing() {
+            self.migrate_key_if_in_old(&entry.key, h);
+            self.rehash_step(16);
+        }
+        if self.growth_left == 0 {
+            if self.is_rehashing() {
+                self.finish_rehash();
+            }
+            let new_cap = if self.items * 2 < self.capacity && self.capacity > GROUP_SIZE {
+                self.capacity
+            } else {
+                self.capacity * 2
+            };
+            self.resize(new_cap);
+        }
+
+        let (existing, insert_idx) = self.find_or_prepare_insert(&entry.key, h);
 
         if let Some(idx) = existing {
             self.slots[idx].replace(entry)
@@ -2281,7 +2277,7 @@ impl RudisTable {
             RudisValue::String(Bytes::copy_from_slice(&value))
         };
         let val_bytes = val.approx_bytes();
-        let (existing, candidate_idx) = self.table.prepare_insert(&key, h);
+        let (existing, candidate_idx) = self.table.find_or_prepare_insert(&key, h);
         if let Some(idx) = existing
             && let Some(entry) = self.table.get_slot_mut(idx)
         {
@@ -2431,15 +2427,7 @@ impl RudisTable {
         key_bytes: Option<&Bytes>,
         delta: i64,
     ) -> Result<i64, &'static str> {
-        let (existing, candidate_idx) = self.table.prepare_insert(key, h);
-        if let Some(idx) = existing {
-            let entry = unsafe {
-                self.table
-                    .slots
-                    .get_unchecked_mut(idx)
-                    .as_mut()
-                    .unwrap_unchecked()
-            };
+        if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
@@ -2474,6 +2462,7 @@ impl RudisTable {
             }
         }
 
+        let (_, candidate_idx) = self.table.find_or_prepare_insert(key, h);
         let new_val = delta;
         let entry = RudisEntry {
             key: key_bytes
@@ -3327,7 +3316,7 @@ impl RudisTable {
             }
         }
 
-        let (_, insert_idx) = self.table.prepare_insert(key.as_ref(), h);
+        let (_, insert_idx) = self.table.find_or_prepare_insert(key.as_ref(), h);
         let val = if field.len() <= max_value && val.len() <= max_value {
             let mut pairs = self.arena.acquire_small_hash(1);
             pairs.push((field.clone(), val.clone()));
@@ -3457,7 +3446,7 @@ impl RudisTable {
             }
         }
 
-        let (_, insert_idx) = self.table.prepare_insert(key, h);
+        let (_, insert_idx) = self.table.find_or_prepare_insert(key, h);
         let (val, added) = if fields.len() <= max_entries
             && (if fields.len() == 1 {
                 fields[0].0.len() <= max_value && fields[0].1.len() <= max_value
@@ -4382,7 +4371,7 @@ impl RudisTable {
             }
         }
 
-        let (_, insert_idx) = self.table.prepare_insert(key, h);
+        let (_, insert_idx) = self.table.find_or_prepare_insert(key, h);
         let mut deque = self.arena.acquire_list(values.len());
         if values.len() == 1 {
             deque.push_front(values[0].clone());
@@ -4460,7 +4449,7 @@ impl RudisTable {
             }
         }
 
-        let (_, insert_idx) = self.table.prepare_insert(key, h);
+        let (_, insert_idx) = self.table.find_or_prepare_insert(key, h);
         let mut deque = self.arena.acquire_list(values.len());
         if values.len() == 1 {
             deque.push_back(values[0].clone());
@@ -5543,7 +5532,7 @@ impl RudisTable {
             }
         }
 
-        let (_, insert_idx) = self.table.prepare_insert(key.as_ref(), h);
+        let (_, insert_idx) = self.table.find_or_prepare_insert(key.as_ref(), h);
         let mut v = self.arena.acquire_small_set(1);
         let m_bytes = member.as_ref();
         let m_hash = hash64(m_bytes);
@@ -5605,7 +5594,7 @@ impl RudisTable {
             }
         }
 
-        let (_, insert_idx) = self.table.prepare_insert(key, h);
+        let (_, insert_idx) = self.table.find_or_prepare_insert(key, h);
         let set = if members.len() <= SMALL_SET_LIMIT {
             let mut v = self.arena.acquire_small_set(members.len());
             if members.len() == 1 {
@@ -7016,7 +7005,7 @@ impl RudisTable {
             return Ok((0, None));
         }
 
-        let (_, insert_idx) = self.table.prepare_insert(key, h);
+        let (_, insert_idx) = self.table.find_or_prepare_insert(key, h);
         let mut zset = if elements.len() <= SMALL_ZSET_LIMIT {
             let v = self.arena.acquire_small_zset(elements.len());
             RudisZSet::Small(v)

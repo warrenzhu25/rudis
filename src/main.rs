@@ -63,6 +63,29 @@ struct Args {
     cluster_enabled: Option<String>,
 }
 
+fn get_process_affinity_cores() -> Vec<usize> {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0 {
+            let mut cores = Vec::new();
+            for i in 0..libc::CPU_SETSIZE as usize {
+                if libc::CPU_ISSET(i, &set) {
+                    cores.push(i);
+                }
+            }
+            if !cores.is_empty() {
+                return cores;
+            }
+        }
+    }
+    core_affinity::get_core_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| c.id)
+        .collect()
+}
+
 fn main() {
     #[cfg(target_os = "linux")]
     unsafe {
@@ -129,9 +152,9 @@ fn main() {
         }
     }
 
-    let core_ids = core_affinity::get_core_ids().unwrap_or_default();
-    let num_cores = if !core_ids.is_empty() {
-        core_ids.len()
+    let allowed_cores = get_process_affinity_cores();
+    let num_cores = if !allowed_cores.is_empty() {
+        allowed_cores.len()
     } else {
         std::thread::available_parallelism()
             .map(|n| n.get())
@@ -220,8 +243,10 @@ fn main() {
         let shard_senders = senders_mesh[shard_id].clone();
         let shard_aof_config = aof_config.clone();
         let shard_tls_config = tls_config.clone();
-        let core_id = if !args.no_pin && shard_id < core_ids.len() {
-            Some(core_ids[shard_id])
+        let core_id = if !args.no_pin && shard_id < allowed_cores.len() {
+            Some(core_affinity::CoreId {
+                id: allowed_cores[shard_id],
+            })
         } else {
             None
         };

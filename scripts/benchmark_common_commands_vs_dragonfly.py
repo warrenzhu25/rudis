@@ -268,6 +268,42 @@ if WORKLOAD_FILTER:
     if not WORKLOADS:
         raise SystemExit(f"BENCH_WORKLOADS matched no workloads: {WORKLOAD_FILTER}")
 
+def is_port_in_use(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.2)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+def ensure_port_free(port, name="server", timeout=5.0):
+    start = time.time()
+    while time.time() - start < timeout:
+        if not is_port_in_use(port):
+            print(f"[*] Port check: port {port} is unused and available for {name}.")
+            return True
+        subprocess.run(["fuser", "-k", "-9", f"{port}/tcp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.2)
+    if is_port_in_use(port):
+        raise RuntimeError(f"[!] Port {port} is still in use after {timeout}s cleanup!")
+    print(f"[*] Port check: port {port} is unused and available for {name}.")
+    return True
+
+def stop_and_reap(proc, port, name="server", timeout=5.0):
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    start = time.time()
+    while time.time() - start < timeout:
+        if not is_port_in_use(port):
+            break
+        subprocess.run(["fuser", "-k", "-9", f"{port}/tcp"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.2)
+    if is_port_in_use(port):
+        raise RuntimeError(f"[!] Port {port} still in use after stopping {name} (PID {proc.pid})!")
+    print(f"[*] Post-check: {name} (PID {proc.pid}) stopped and port {port} is verified unused.")
+
 def wait_ping(port, timeout=8.0):
     start = time.time()
     while time.time() - start < timeout:
@@ -505,6 +541,7 @@ def benchmark_at_core_count(cores):
     results = {"Dragonfly": {}, "Rudis": {}}
 
     # 1. Dragonfly
+    ensure_port_free(6381, "Dragonfly")
     print(f"\n>>> Launching Dragonfly v1.39 ({cores} threads)...")
     dfly_cmd = [
         "taskset", "-c", server_cpus,
@@ -517,18 +554,14 @@ def benchmark_at_core_count(cores):
     dfly_proc = subprocess.Popen(dfly_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if not wait_ping(6381):
         print("Failed to start Dragonfly on port 6381")
-        dfly_proc.kill()
+        stop_and_reap(dfly_proc, 6381, "Dragonfly")
     else:
         for wl in WORKLOADS:
             print(f"    [Dragonfly] {wl['name']} ({wl['category']}):")
             m = run_workload_benchmark("Dragonfly", 6381, wl)
             if m:
                 results["Dragonfly"][wl["id"]] = m
-        dfly_proc.terminate()
-        try:
-            dfly_proc.wait(timeout=5)
-        except Exception:
-            dfly_proc.kill()
+        stop_and_reap(dfly_proc, 6381, "Dragonfly")
 
     time.sleep(1.0)
 
@@ -539,6 +572,7 @@ def benchmark_at_core_count(cores):
         print(f"[*] Ensuring latest release build via {cargo_bin} build --release...")
         subprocess.run([cargo_bin, "build", "--release"], check=True, cwd=repo_dir)
 
+    ensure_port_free(6379, "Rudis")
     print(f"\n>>> Launching Rudis ({cores} threads)...")
     rudis_cmd = [
         "taskset", "-c", server_cpus,
@@ -550,18 +584,14 @@ def benchmark_at_core_count(cores):
     rudis_proc = subprocess.Popen(rudis_cmd, stdout=rudis_log, stderr=subprocess.STDOUT)
     if not wait_ping(6379):
         print("Failed to start Rudis on port 6379")
-        rudis_proc.kill()
+        stop_and_reap(rudis_proc, 6379, "Rudis")
     else:
         for wl in WORKLOADS:
             print(f"    [Rudis] {wl['name']} ({wl['category']}):")
             m = run_workload_benchmark("Rudis", 6379, wl)
             if m:
                 results["Rudis"][wl["id"]] = m
-        rudis_proc.terminate()
-        try:
-            rudis_proc.wait(timeout=5)
-        except Exception:
-            rudis_proc.kill()
+        stop_and_reap(rudis_proc, 6379, "Rudis")
 
     # Print summary table for this core count
     print(f"\n----------------------------------------------------------------------------------------------------------------------")
