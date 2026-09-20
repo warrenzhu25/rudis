@@ -58,17 +58,17 @@
         ]
       },
       "MGET_5K": {
-        "ops_sec_median": 358272.56,
-        "ops_sec_mean": 359826.55333333334,
-        "ops_sec_min": 353549.24,
-        "ops_sec_max": 367657.86,
-        "ops_sec_cv_pct": 2.0044895761850534,
-        "avg_latency_median": 0.713,
-        "p99_latency_median": 0.713,
+        "ops_sec_median": 347743.4,
+        "ops_sec_mean": 349087.17,
+        "ops_sec_min": 342345.0,
+        "ops_sec_max": 357173.11,
+        "ops_sec_cv_pct": 2.15815218073047,
+        "avg_latency_median": 0.735,
+        "p99_latency_median": 0.735,
         "runs": [
-          367657.86,
-          358272.56,
-          353549.24
+          342345.0,
+          347743.4,
+          357173.11
         ]
       },
       "HSET": {
@@ -284,17 +284,17 @@
         ]
       },
       "MGET_5K": {
-        "ops_sec_median": 479437.47,
-        "ops_sec_mean": 474747.7633333333,
-        "ops_sec_min": 462659.93,
-        "ops_sec_max": 482145.89,
-        "ops_sec_cv_pct": 2.20166334172857,
-        "avg_latency_median": 0.533,
-        "p99_latency_median": 0.533,
+        "ops_sec_median": 484501.25,
+        "ops_sec_mean": 482774.95666666667,
+        "ops_sec_min": 478140.8,
+        "ops_sec_max": 485682.82,
+        "ops_sec_cv_pct": 0.8372626807187742,
+        "avg_latency_median": 0.527,
+        "p99_latency_median": 0.527,
         "runs": [
-          482145.89,
-          479437.47,
-          462659.93
+          484501.25,
+          478140.8,
+          485682.82
         ]
       },
       "HSET": {
