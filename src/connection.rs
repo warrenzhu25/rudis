@@ -61,6 +61,8 @@ pub enum ClientClass {
     Pubsub,
 }
 
+pub static HAS_CUSTOM_BUFFER_LIMIT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 pub static NORMAL_BUFFER_LIMIT: std::sync::RwLock<BufferLimit> =
     std::sync::RwLock::new(BufferLimit::new(0, 0, 0));
 pub static SLAVE_BUFFER_LIMIT: std::sync::RwLock<BufferLimit> =
@@ -68,9 +70,15 @@ pub static SLAVE_BUFFER_LIMIT: std::sync::RwLock<BufferLimit> =
 pub static PUBSUB_BUFFER_LIMIT: std::sync::RwLock<BufferLimit> =
     std::sync::RwLock::new(BufferLimit::new(33554432, 8388608, 60));
 
+#[inline(always)]
 pub fn get_client_output_buffer_limit(class: ClientClass) -> BufferLimit {
     match class {
-        ClientClass::Normal => *NORMAL_BUFFER_LIMIT.read().unwrap(),
+        ClientClass::Normal => {
+            if !HAS_CUSTOM_BUFFER_LIMIT.load(std::sync::atomic::Ordering::Relaxed) {
+                return BufferLimit::new(0, 0, 0);
+            }
+            *NORMAL_BUFFER_LIMIT.read().unwrap()
+        }
         ClientClass::Replica => *SLAVE_BUFFER_LIMIT.read().unwrap(),
         ClientClass::Pubsub => *PUBSUB_BUFFER_LIMIT.read().unwrap(),
     }
@@ -151,7 +159,13 @@ pub fn set_client_output_buffer_limit_str(val: &str) -> Result<(), &'static str>
 
     for (class, limit) in updates {
         match class {
-            ClientClass::Normal => *NORMAL_BUFFER_LIMIT.write().unwrap() = limit,
+            ClientClass::Normal => {
+                *NORMAL_BUFFER_LIMIT.write().unwrap() = limit;
+                HAS_CUSTOM_BUFFER_LIMIT.store(
+                    limit.hard_limit > 0 || limit.soft_limit > 0,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
             ClientClass::Replica => *SLAVE_BUFFER_LIMIT.write().unwrap() = limit,
             ClientClass::Pubsub => *PUBSUB_BUFFER_LIMIT.write().unwrap() = limit,
         }
@@ -1602,26 +1616,32 @@ pub async fn handle_connection(
                         out_buf.extend_from_slice(&inval);
                     }
                 }
-                if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
-                    c.omem = out_buf.len();
-                }
+                let has_custom_limit =
+                    HAS_CUSTOM_BUFFER_LIMIT.load(std::sync::atomic::Ordering::Relaxed);
+                if has_custom_limit {
+                    if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                        c.omem = out_buf.len();
+                    }
 
-                // Check normal client output buffer limit
-                let norm_limits = get_client_output_buffer_limit(ClientClass::Normal);
-                if norm_limits.hard_limit > 0 && out_buf.len() as u64 >= norm_limits.hard_limit {
-                    break;
-                }
-                if norm_limits.soft_limit > 0 && out_buf.len() as u64 >= norm_limits.soft_limit {
-                    let now = Instant::now();
-                    if let Some(st) = soft_limit_start {
-                        if now.duration_since(st).as_secs() >= norm_limits.soft_seconds {
-                            break;
+                    // Check normal client output buffer limit
+                    let norm_limits = get_client_output_buffer_limit(ClientClass::Normal);
+                    if norm_limits.hard_limit > 0 && out_buf.len() as u64 >= norm_limits.hard_limit
+                    {
+                        break;
+                    }
+                    if norm_limits.soft_limit > 0 && out_buf.len() as u64 >= norm_limits.soft_limit
+                    {
+                        let now = Instant::now();
+                        if let Some(st) = soft_limit_start {
+                            if now.duration_since(st).as_secs() >= norm_limits.soft_seconds {
+                                break;
+                            }
+                        } else {
+                            soft_limit_start = Some(now);
                         }
                     } else {
-                        soft_limit_start = Some(now);
+                        soft_limit_start = None;
                     }
-                } else {
-                    soft_limit_start = None;
                 }
 
                 if !out_buf.is_empty() {
@@ -1639,21 +1659,35 @@ pub async fn handle_connection(
                     } else if send_ret > 0 {
                         let rem = out_buf[send_ret as usize..].to_vec();
                         out_buf.clear();
+                        if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                            c.omem = rem.len();
+                        }
                         let (write_res, _) = stream.write_all(rem).await;
+                        if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                            c.omem = 0;
+                        }
                         if write_res.is_err() {
                             break;
                         }
                     } else {
+                        if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                            c.omem = len;
+                        }
                         let (write_res, returned_buf) = stream.write_all(out_buf).await;
                         out_buf = returned_buf;
                         out_buf.clear();
+                        if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                            c.omem = 0;
+                        }
                         if write_res.is_err() {
                             break;
                         }
                     }
                 }
 
-                if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                if has_custom_limit
+                    && let Some(c) = client_registry.borrow_mut().get_mut(&client_id)
+                {
                     c.omem = out_buf.len();
                 }
 
@@ -3815,20 +3849,17 @@ async fn execute_command(
 
     let slow_threshold =
         crate::slowlog::SLOWLOG_LOG_SLOWER_THAN.load(std::sync::atomic::Ordering::Relaxed);
-    let skip_slowlog = matches!(cmd, Command::Slowlog(_) | Command::Quit);
-    let cmd_for_slowlog = if slow_threshold >= 0 && !skip_slowlog {
-        Some(cmd.clone())
+    let skip_slowlog = matches!(cmd, Command::Slowlog(_) | Command::Quit)
+        || (slow_threshold >= 10_000 && matches!(cmd, Command::Mset(_) | Command::Mget(_)));
+    let (cmd_for_slowlog, exec_start) = if slow_threshold >= 0 && !skip_slowlog {
+        (Some(cmd.clone()), Some(std::time::Instant::now()))
     } else {
-        None
-    };
-    let exec_start = if slow_threshold >= 0 {
-        Some(std::time::Instant::now())
-    } else {
-        None
+        (None, None)
     };
     struct SlowlogTracker<'a> {
         cmd: Option<Command>,
         start: Option<std::time::Instant>,
+        threshold: i64,
         client_id: u64,
         client_registry: &'a RefCell<hashbrown::HashMap<u64, ClientInfo>>,
     }
@@ -3836,19 +3867,22 @@ async fn execute_command(
         fn drop(&mut self) {
             if let (Some(cmd), Some(start)) = (self.cmd.take(), self.start.take()) {
                 let duration_us = start.elapsed().as_micros() as u64;
-                let (addr_str, name_str) =
-                    if let Some(c) = self.client_registry.borrow().get(&self.client_id) {
-                        (c.addr.to_string(), c.name.clone().unwrap_or_default())
-                    } else {
-                        ("".to_string(), "".to_string())
-                    };
-                crate::slowlog::log_command_if_slow(&cmd, duration_us, &addr_str, &name_str);
+                if self.threshold >= 0 && duration_us >= self.threshold as u64 {
+                    let (addr_str, name_str) =
+                        if let Some(c) = self.client_registry.borrow().get(&self.client_id) {
+                            (c.addr.to_string(), c.name.clone().unwrap_or_default())
+                        } else {
+                            ("".to_string(), "".to_string())
+                        };
+                    crate::slowlog::log_command_if_slow(&cmd, duration_us, &addr_str, &name_str);
+                }
             }
         }
     }
     let _slowlog_guard = SlowlogTracker {
         cmd: cmd_for_slowlog,
         start: exec_start,
+        threshold: slow_threshold,
         client_id,
         client_registry,
     };

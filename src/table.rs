@@ -1233,30 +1233,27 @@ unsafe fn probe_group_match_del_empty(ptr: *const u8, tag: u8) -> (u16, u16, u16
     (match_mask, del_mask, empty_mask)
 }
 
-/// A high-performance flat hash table utilizing 16-slot SIMD group probing
-/// with inlined values and expiration metadata.
-pub struct RudisFlatTable {
-    ctrl: Vec<u8>,
+const SEG_SHIFT: usize = 10;
+const SEG_CAP: usize = 1 << SEG_SHIFT; // 1024 slots per segment (~48KB, L1/L2 cache resident)
+const SEG_MASK: usize = SEG_CAP - 1;
+
+/// Fixed-size SwissTable segment managed by `RudisFlatTable`'s extendible hashing directory.
+pub struct RawSegment {
+    pub ctrl: Vec<u8>,
     pub slots: Vec<Option<RudisEntry>>,
     pub capacity: usize,
     mask: usize,
-    items: usize,
-    growth_left: usize,
-    pub slot_counts: Box<[u32; 16384]>,
-    pub old_table: Option<Box<RudisFlatTable>>,
-    pub rehash_idx: usize,
+    pub items: usize,
+    pub growth_left: usize,
+    pub local_depth: u8,
 }
 
-impl RudisFlatTable {
-    pub fn new(capacity: usize) -> Self {
-        let cap = capacity.next_power_of_two().max(GROUP_SIZE);
-        let mut ctrl = vec![EMPTY; cap + GROUP_SIZE];
-        ctrl.copy_within(0..GROUP_SIZE, cap);
-
+impl RawSegment {
+    pub fn new(capacity: usize, local_depth: u8) -> Self {
+        let cap = capacity.next_power_of_two().clamp(GROUP_SIZE, SEG_CAP);
+        let ctrl = vec![EMPTY; cap + GROUP_SIZE];
         let mut slots = Vec::with_capacity(cap);
-        for _ in 0..cap {
-            slots.push(None);
-        }
+        slots.resize_with(cap, || None);
 
         Self {
             ctrl,
@@ -1264,10 +1261,8 @@ impl RudisFlatTable {
             capacity: cap,
             mask: cap - 1,
             items: 0,
-            growth_left: cap * 7 / 8,
-            slot_counts: vec![0u32; 16384].into_boxed_slice().try_into().unwrap(),
-            old_table: None,
-            rehash_idx: 0,
+            growth_left: (cap * 7) / 8,
+            local_depth,
         }
     }
 
@@ -1279,13 +1274,9 @@ impl RudisFlatTable {
         }
     }
 
-    /// Finds the index and entry reference of a matching key, if present.
     #[inline(always)]
     pub fn find_entry(&self, key: &[u8], hash: u64) -> Option<(usize, &RudisEntry)> {
         if self.items == 0 {
-            if let Some(ref old) = self.old_table {
-                return old.find_entry(key, hash);
-            }
             return None;
         }
         let tag = fingerprint(hash);
@@ -1299,7 +1290,6 @@ impl RudisFlatTable {
             while bits != 0 {
                 let offset = bits.trailing_zeros() as usize;
                 let slot_idx = (idx + offset) & self.mask;
-                // SAFETY: A SIMD tag match strictly matches 0..=127, never EMPTY (0xFF) or DELETED (0xFE).
                 let entry = unsafe {
                     self.slots
                         .get_unchecked(slot_idx)
@@ -1313,30 +1303,20 @@ impl RudisFlatTable {
             }
 
             if empty_mask != 0 {
-                if let Some(ref old) = self.old_table {
-                    return old.find_entry(key, hash);
-                }
                 return None;
             }
 
             step += GROUP_SIZE;
             if step >= self.capacity {
-                if let Some(ref old) = self.old_table {
-                    return old.find_entry(key, hash);
-                }
                 return None;
             }
             idx = (idx + step) & self.mask;
         }
     }
 
-    /// Checks whether a key exists in the flat table without returning the entry reference.
     #[inline(always)]
     pub fn contains(&self, key: &[u8], hash: u64) -> bool {
         if self.items == 0 {
-            if let Some(ref old) = self.old_table {
-                return old.contains(key, hash);
-            }
             return false;
         }
         let tag = fingerprint(hash);
@@ -1350,7 +1330,6 @@ impl RudisFlatTable {
             while bits != 0 {
                 let offset = bits.trailing_zeros() as usize;
                 let slot_idx = (idx + offset) & self.mask;
-                // SAFETY: A SIMD tag match strictly matches 0..=127, never EMPTY or DELETED.
                 let entry = unsafe {
                     self.slots
                         .get_unchecked(slot_idx)
@@ -1364,30 +1343,19 @@ impl RudisFlatTable {
             }
 
             if empty_mask != 0 {
-                if let Some(ref old) = self.old_table {
-                    return old.contains(key, hash);
-                }
                 return false;
             }
 
             step += GROUP_SIZE;
             if step >= self.capacity {
-                if let Some(ref old) = self.old_table {
-                    return old.contains(key, hash);
-                }
                 return false;
             }
             idx = (idx + step) & self.mask;
         }
     }
 
-    /// Finds the index and mutable entry reference of a matching key, if present.
     #[inline(always)]
     pub fn find_entry_mut(&mut self, key: &[u8], hash: u64) -> Option<(usize, &mut RudisEntry)> {
-        if self.is_rehashing() {
-            self.migrate_key_if_in_old(key, hash);
-            self.rehash_step(1);
-        }
         if self.items == 0 {
             return None;
         }
@@ -1402,7 +1370,6 @@ impl RudisFlatTable {
             while bits != 0 {
                 let offset = bits.trailing_zeros() as usize;
                 let slot_idx = (idx + offset) & self.mask;
-                // SAFETY: A SIMD tag match strictly matches 0..=127, never EMPTY or DELETED.
                 let entry = unsafe {
                     self.slots
                         .get_unchecked(slot_idx)
@@ -1410,7 +1377,6 @@ impl RudisFlatTable {
                         .unwrap_unchecked()
                 };
                 if entry.key.len() == key.len() && entry.key.as_ref() == key {
-                    // SAFETY: slot_idx is valid and within bounds
                     let entry_mut = unsafe {
                         self.slots
                             .get_unchecked_mut(slot_idx)
@@ -1434,19 +1400,8 @@ impl RudisFlatTable {
         }
     }
 
-    /// Finds the index of a matching key, if present.
     #[inline(always)]
-    pub fn find(&mut self, key: &[u8], hash: u64) -> Option<usize> {
-        if self.is_rehashing() {
-            self.migrate_key_if_in_old(key, hash);
-            self.rehash_step(1);
-        }
-        self.find_entry(key, hash).map(|(idx, _)| idx)
-    }
-
-    /// Searches for key and returns either `(Some(existing_slot_idx), candidate_insert_idx)`
-    /// or `(None, candidate_insert_idx)`.
-    fn find_or_prepare_insert(&self, key: &[u8], hash: u64) -> (Option<usize>, usize) {
+    pub fn find_or_prepare_insert_raw(&self, key: &[u8], hash: u64) -> (Option<usize>, usize) {
         if self.items == 0 {
             return (None, (hash as usize) & self.mask);
         }
@@ -1462,7 +1417,6 @@ impl RudisFlatTable {
             while bits != 0 {
                 let offset = bits.trailing_zeros() as usize;
                 let slot_idx = (idx + offset) & self.mask;
-                // SAFETY: A SIMD tag match strictly matches 0..=127, never EMPTY or DELETED.
                 let entry = unsafe {
                     self.slots
                         .get_unchecked(slot_idx)
@@ -1500,195 +1454,301 @@ impl RudisFlatTable {
     }
 
     #[inline(always)]
-    pub fn is_rehashing(&self) -> bool {
-        self.old_table.is_some()
-    }
-
-    /// On-demand single-key migration: if `key` exists in `old_table`, moves it immediately to `self`.
-    pub fn migrate_key_if_in_old(&mut self, key: &[u8], hash: u64) {
-        let mut old = match self.old_table.take() {
-            Some(o) => o,
-            None => return,
-        };
-
-        if let Some((old_idx, _)) = old.find_entry(key, hash)
-            && let Some(entry) = old.slots[old_idx].take()
-        {
-            old.set_ctrl(old_idx, DELETED);
-            old.items -= 1;
-            let (existing, insert_idx) = self.find_or_prepare_insert(&entry.key, hash);
-            if existing.is_none() {
-                let tag = fingerprint(hash);
-                self.set_ctrl(insert_idx, tag);
-                self.slots[insert_idx] = Some(entry);
-                self.items += 1;
-                self.growth_left = self.growth_left.saturating_sub(1);
-            }
-        }
-
-        if old.items == 0 || self.rehash_idx >= old.capacity {
-            self.old_table = None;
-            self.rehash_idx = 0;
-        } else {
-            self.old_table = Some(old);
-        }
-    }
-
-    /// Progressively migrates up to `n` buckets from `old_table` to `self`.
-    pub fn rehash_step(&mut self, n: usize) -> bool {
-        let mut old = match self.old_table.take() {
-            Some(o) => o,
-            None => return false,
-        };
-
-        let mut work = n;
-        let mut empty_limit = n * 10;
-        while work > 0 && empty_limit > 0 && self.rehash_idx < old.capacity {
-            if let Some(entry) = old.slots[self.rehash_idx].take() {
-                old.set_ctrl(self.rehash_idx, DELETED);
-                old.items -= 1;
-                let h = hash_key(&entry.key);
-                let (existing, insert_idx) = self.find_or_prepare_insert(&entry.key, h);
-                if existing.is_none() {
-                    let tag = fingerprint(h);
-                    self.set_ctrl(insert_idx, tag);
-                    self.slots[insert_idx] = Some(entry);
-                    self.items += 1;
-                    self.growth_left = self.growth_left.saturating_sub(1);
-                }
-                work -= 1;
-            } else {
-                empty_limit -= 1;
-            }
-            self.rehash_idx += 1;
-        }
-
-        if old.items == 0 || self.rehash_idx >= old.capacity {
-            self.old_table = None;
-            self.rehash_idx = 0;
-            false
-        } else {
-            self.old_table = Some(old);
-            true
-        }
-    }
-
-    pub fn finish_rehash(&mut self) {
-        while self.rehash_step(1024) {}
-    }
-
-    fn resize(&mut self, new_cap: usize) {
-        if self.capacity < 1024 {
-            let mut new_table = RudisFlatTable::new(new_cap);
-            for entry in self.slots.drain(..).flatten() {
-                let h = hash_key(&entry.key);
-                let (_, insert_idx) = new_table.find_or_prepare_insert(&entry.key, h);
-                let tag = fingerprint(h);
-                new_table.set_ctrl(insert_idx, tag);
-                new_table.slots[insert_idx] = Some(entry);
-                new_table.items += 1;
-                new_table.growth_left = new_table.growth_left.saturating_sub(1);
-            }
-            new_table.slot_counts = self.slot_counts.clone();
-            *self = new_table;
-        } else {
-            let mut new_table = RudisFlatTable::new(new_cap);
-            new_table.slot_counts = self.slot_counts.clone();
-            let old = std::mem::replace(self, new_table);
-            self.old_table = Some(Box::new(old));
-            self.rehash_idx = 0;
-            self.rehash_step(16);
-        }
-    }
-
-    pub fn insert(&mut self, entry: RudisEntry) -> Option<RudisEntry> {
-        let h = hash_key(&entry.key);
-        if self.is_rehashing() {
-            self.migrate_key_if_in_old(&entry.key, h);
-            self.rehash_step(16);
-        }
-        if self.growth_left == 0 {
-            if self.is_rehashing() {
-                self.finish_rehash();
-            }
-            let new_cap = if self.items * 2 < self.capacity && self.capacity > GROUP_SIZE {
-                self.capacity
-            } else {
-                self.capacity * 2
-            };
-            self.resize(new_cap);
-        }
-
-        let (existing, insert_idx) = self.find_or_prepare_insert(&entry.key, h);
-
-        if let Some(idx) = existing {
-            self.slots[idx].replace(entry)
-        } else {
-            let tag = fingerprint(h);
-            self.set_ctrl(insert_idx, tag);
-            if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
-                let slot = crate::router::key_slot(&entry.key) as usize;
-                self.slot_counts[slot] += 1;
-            }
-            self.slots[insert_idx] = Some(entry);
-            self.items += 1;
-            self.growth_left = self.growth_left.saturating_sub(1);
-            None
-        }
-    }
-
-    #[inline(always)]
-    pub fn insert_prepared(&mut self, entry: RudisEntry, hash: u64, insert_idx: usize) {
-        if self.growth_left == 0 {
-            self.insert(entry);
-            return;
-        }
+    pub fn insert_at(&mut self, entry: RudisEntry, hash: u64, insert_idx: usize) {
+        let was_empty = self.ctrl[insert_idx] == EMPTY;
         let tag = fingerprint(hash);
         self.set_ctrl(insert_idx, tag);
-        if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
-            let slot = crate::router::key_slot(&entry.key) as usize;
-            self.slot_counts[slot] += 1;
-        }
         self.slots[insert_idx] = Some(entry);
         self.items += 1;
-        self.growth_left = self.growth_left.saturating_sub(1);
+        if was_empty {
+            self.growth_left = self.growth_left.saturating_sub(1);
+        }
     }
 
     #[inline(always)]
     pub fn remove(&mut self, slot_idx: usize) -> Option<RudisEntry> {
+        let entry = self.slots.get_mut(slot_idx)?.take()?;
         self.set_ctrl(slot_idx, DELETED);
         self.items -= 1;
         if self.items == 0 {
             self.ctrl.fill(EMPTY);
-            self.growth_left = self.capacity * 7 / 8;
+            self.growth_left = (self.capacity * 7) / 8;
         }
-        let entry = self.slots[slot_idx].take();
-        if let Some(ref e) = entry
-            && crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed)
-        {
-            let slot = crate::router::key_slot(&e.key) as usize;
-            self.slot_counts[slot] = self.slot_counts[slot].saturating_sub(1);
-        }
-        entry
+        Some(entry)
     }
 
-    /// Optimized removal when the caller already verified `self.slots[slot_idx]` is `Some`.
-    /// Avoids outer Option checks and inlines cleanly into `del_with_hash`.
     #[inline(always)]
     pub fn remove_present(&mut self, slot_idx: usize) -> RudisEntry {
         self.set_ctrl(slot_idx, DELETED);
         self.items -= 1;
         if self.items == 0 {
             self.ctrl.fill(EMPTY);
-            self.growth_left = self.capacity * 7 / 8;
+            self.growth_left = (self.capacity * 7) / 8;
         }
-        // SAFETY: Caller verified presence via find_entry
-        let entry = unsafe {
+        unsafe {
             self.slots
                 .get_unchecked_mut(slot_idx)
                 .take()
                 .unwrap_unchecked()
+        }
+    }
+
+    pub fn rebuild(&mut self, new_cap: usize) {
+        let mut next = RawSegment::new(new_cap, self.local_depth);
+        for entry in self.slots.drain(..).flatten() {
+            let h = hash_key(&entry.key);
+            let (_, insert_idx) = next.find_or_prepare_insert_raw(&entry.key, h);
+            next.insert_at(entry, h, insert_idx);
+        }
+        *self = next;
+    }
+}
+
+/// Dragonfly-style Extendible Hashing Table (`Directory` + Fixed-Size SIMD `RawSegment`s).
+/// Eliminates monolithic stop-the-world resizes and `old_table` double-lookup overhead.
+pub struct RudisFlatTable {
+    pub segments: Vec<RawSegment>,
+    pub directory: Vec<u32>,
+    pub global_depth: u8,
+    dir_mask: usize,
+    pub capacity: usize,
+    pub items: usize,
+    pub slot_counts: Box<[u32; 16384]>,
+}
+
+impl RudisFlatTable {
+    pub fn new(capacity: usize) -> Self {
+        let init_cap = capacity.next_power_of_two().clamp(GROUP_SIZE, SEG_CAP);
+        let seg = RawSegment::new(init_cap, 0);
+        Self {
+            segments: vec![seg],
+            directory: vec![0],
+            global_depth: 0,
+            dir_mask: 0,
+            capacity: init_cap,
+            items: 0,
+            slot_counts: vec![0u32; 16384].into_boxed_slice().try_into().unwrap(),
+        }
+    }
+
+    #[inline(always)]
+    fn dir_index(&self, hash: u64) -> usize {
+        ((hash >> SEG_SHIFT) as usize) & self.dir_mask
+    }
+
+    /// Splits or grows `segments[seg_id]` when `growth_left == 0`.
+    fn split_or_grow_segment(&mut self, mut dir_idx: usize, mut seg_id: usize, key_hash: u64) {
+        while self.segments[seg_id].growth_left == 0 {
+            let seg_items = self.segments[seg_id].items;
+            let seg_cap = self.segments[seg_id].capacity;
+
+            // 1. If < 50% full (dominated by DELETED tombstones), compact segment in-place.
+            if seg_items * 2 < seg_cap {
+                self.segments[seg_id].rebuild(seg_cap);
+                break;
+            }
+
+            // 2. If single initial segment hasn't reached SEG_CAP (1024) yet, double in-place.
+            if seg_cap < SEG_CAP {
+                let new_cap = (seg_cap * 2).min(SEG_CAP);
+                self.segments[seg_id].rebuild(new_cap);
+                self.capacity = if self.segments.len() == 1 {
+                    new_cap
+                } else {
+                    self.segments.len() << SEG_SHIFT
+                };
+                break;
+            }
+
+            // 3. Extendible Hashing Segment Split (1024-slot segment -> two 1024-slot segments)
+            let d = self.segments[seg_id].local_depth;
+            if d == self.global_depth {
+                let len = self.directory.len();
+                self.directory.reserve(len);
+                for i in 0..len {
+                    self.directory.push(self.directory[i]);
+                }
+                self.global_depth += 1;
+                self.dir_mask = self.directory.len() - 1;
+                dir_idx = self.dir_index(key_hash);
+            }
+
+            let mut seg_zero = RawSegment::new(SEG_CAP, d + 1);
+            let mut seg_one = RawSegment::new(SEG_CAP, d + 1);
+            let bit_shift = SEG_SHIFT + (d as usize);
+
+            for entry in self.segments[seg_id].slots.drain(..).flatten() {
+                let h = hash_key(&entry.key);
+                if ((h >> bit_shift) & 1) == 0 {
+                    let (_, idx) = seg_zero.find_or_prepare_insert_raw(&entry.key, h);
+                    seg_zero.insert_at(entry, h, idx);
+                } else {
+                    let (_, idx) = seg_one.find_or_prepare_insert_raw(&entry.key, h);
+                    seg_one.insert_at(entry, h, idx);
+                }
+            }
+
+            self.segments[seg_id] = seg_zero;
+            let new_seg_id = self.segments.len();
+            self.segments.push(seg_one);
+            self.capacity = self.segments.len() << SEG_SHIFT;
+
+            let base = dir_idx & ((1usize << d) - 1);
+            let step = 1usize << (d + 1);
+            let mut i = base | (1usize << d);
+            while i < self.directory.len() {
+                self.directory[i] = new_seg_id as u32;
+                i += step;
+            }
+
+            dir_idx = self.dir_index(key_hash);
+            seg_id = self.directory[dir_idx] as usize;
+        }
+    }
+
+    #[inline(always)]
+    pub fn find_entry(&self, key: &[u8], hash: u64) -> Option<(usize, &RudisEntry)> {
+        if self.items == 0 {
+            return None;
+        }
+        let dir_idx = self.dir_index(hash);
+        let seg_id = unsafe { *self.directory.get_unchecked(dir_idx) as usize };
+        let seg = unsafe { self.segments.get_unchecked(seg_id) };
+        seg.find_entry(key, hash)
+            .map(|(local_idx, entry)| ((seg_id << SEG_SHIFT) | local_idx, entry))
+    }
+
+    #[inline(always)]
+    pub fn contains(&self, key: &[u8], hash: u64) -> bool {
+        if self.items == 0 {
+            return false;
+        }
+        let dir_idx = self.dir_index(hash);
+        let seg_id = unsafe { *self.directory.get_unchecked(dir_idx) as usize };
+        let seg = unsafe { self.segments.get_unchecked(seg_id) };
+        seg.contains(key, hash)
+    }
+
+    #[inline(always)]
+    pub fn find_entry_mut(&mut self, key: &[u8], hash: u64) -> Option<(usize, &mut RudisEntry)> {
+        if self.items == 0 {
+            return None;
+        }
+        let dir_idx = self.dir_index(hash);
+        let seg_id = unsafe { *self.directory.get_unchecked(dir_idx) as usize };
+        let seg = unsafe { self.segments.get_unchecked_mut(seg_id) };
+        seg.find_entry_mut(key, hash)
+            .map(|(local_idx, entry)| ((seg_id << SEG_SHIFT) | local_idx, entry))
+    }
+
+    #[inline(always)]
+    pub fn find(&mut self, key: &[u8], hash: u64) -> Option<usize> {
+        self.find_entry(key, hash).map(|(idx, _)| idx)
+    }
+
+    #[inline(always)]
+    pub fn find_or_prepare_insert(&mut self, key: &[u8], hash: u64) -> (Option<usize>, usize) {
+        let mut dir_idx = self.dir_index(hash);
+        let mut seg_id = unsafe { *self.directory.get_unchecked(dir_idx) as usize };
+
+        if self.segments[seg_id].growth_left == 0 {
+            if let Some((local_idx, _)) = self.segments[seg_id].find_entry(key, hash) {
+                let global_idx = (seg_id << SEG_SHIFT) | local_idx;
+                return (Some(global_idx), global_idx);
+            }
+            self.split_or_grow_segment(dir_idx, seg_id, hash);
+            dir_idx = self.dir_index(hash);
+            seg_id = unsafe { *self.directory.get_unchecked(dir_idx) as usize };
+        }
+
+        let (existing, local_idx) = self.segments[seg_id].find_or_prepare_insert_raw(key, hash);
+        let base = seg_id << SEG_SHIFT;
+        (existing.map(|i| base | i), base | local_idx)
+    }
+
+    #[inline(always)]
+    pub fn is_rehashing(&self) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub fn migrate_key_if_in_old(&mut self, _key: &[u8], _hash: u64) {}
+
+    #[inline(always)]
+    pub fn rehash_step(&mut self, _n: usize) -> bool {
+        false
+    }
+
+    #[inline(always)]
+    pub fn finish_rehash(&mut self) {}
+
+    pub fn insert(&mut self, entry: RudisEntry) -> Option<RudisEntry> {
+        let h = hash_key(&entry.key);
+        let (existing, global_idx) = self.find_or_prepare_insert(&entry.key, h);
+        let seg_id = global_idx >> SEG_SHIFT;
+        let local_idx = global_idx & SEG_MASK;
+
+        if existing.is_some() {
+            self.segments[seg_id].slots[local_idx].replace(entry)
+        } else {
+            if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
+                let slot = crate::router::key_slot(&entry.key) as usize;
+                self.slot_counts[slot] += 1;
+            }
+            self.segments[seg_id].insert_at(entry, h, local_idx);
+            self.items += 1;
+            None
+        }
+    }
+
+    #[inline(always)]
+    pub fn insert_prepared(&mut self, entry: RudisEntry, hash: u64, global_idx: usize) {
+        if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
+            let slot = crate::router::key_slot(&entry.key) as usize;
+            self.slot_counts[slot] += 1;
+        }
+        let seg_id = global_idx >> SEG_SHIFT;
+        let local_idx = global_idx & SEG_MASK;
+        unsafe {
+            self.segments
+                .get_unchecked_mut(seg_id)
+                .insert_at(entry, hash, local_idx);
+        }
+        self.items += 1;
+    }
+
+    #[inline(always)]
+    pub fn remove_key(&mut self, key: &[u8], hash: u64) -> Option<RudisEntry> {
+        if self.items == 0 {
+            return None;
+        }
+        let (idx, _) = self.find_entry(key, hash)?;
+        Some(self.remove_present(idx))
+    }
+
+    #[inline(always)]
+    pub fn remove(&mut self, global_idx: usize) -> Option<RudisEntry> {
+        let seg_id = global_idx >> SEG_SHIFT;
+        let local_idx = global_idx & SEG_MASK;
+        let entry = self.segments.get_mut(seg_id)?.remove(local_idx)?;
+        self.items -= 1;
+        if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
+            let slot = crate::router::key_slot(&entry.key) as usize;
+            self.slot_counts[slot] = self.slot_counts[slot].saturating_sub(1);
+        }
+        Some(entry)
+    }
+
+    #[inline(always)]
+    pub fn remove_present(&mut self, global_idx: usize) -> RudisEntry {
+        let seg_id = global_idx >> SEG_SHIFT;
+        let local_idx = global_idx & SEG_MASK;
+        let entry = unsafe {
+            self.segments
+                .get_unchecked_mut(seg_id)
+                .remove_present(local_idx)
         };
+        self.items -= 1;
         if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
             let slot = crate::router::key_slot(&entry.key) as usize;
             self.slot_counts[slot] = self.slot_counts[slot].saturating_sub(1);
@@ -1697,23 +1757,65 @@ impl RudisFlatTable {
     }
 
     #[inline(always)]
-    pub fn get_slot(&self, idx: usize) -> Option<&RudisEntry> {
-        self.slots[idx].as_ref()
+    pub fn get_slot(&self, global_idx: usize) -> Option<&RudisEntry> {
+        let seg_id = global_idx >> SEG_SHIFT;
+        let local_idx = global_idx & SEG_MASK;
+        self.segments.get(seg_id)?.slots.get(local_idx)?.as_ref()
     }
 
     #[inline(always)]
-    pub fn get_slot_mut(&mut self, idx: usize) -> Option<&mut RudisEntry> {
-        self.slots[idx].as_mut()
+    pub fn get_slot_mut(&mut self, global_idx: usize) -> Option<&mut RudisEntry> {
+        let seg_id = global_idx >> SEG_SHIFT;
+        let local_idx = global_idx & SEG_MASK;
+        self.segments
+            .get_mut(seg_id)?
+            .slots
+            .get_mut(local_idx)?
+            .as_mut()
+    }
+
+    #[inline]
+    pub fn entries(&self) -> impl Iterator<Item = &RudisEntry> {
+        self.segments.iter().flat_map(|s| s.slots.iter().flatten())
+    }
+
+    #[inline]
+    pub fn entries_mut(&mut self) -> impl Iterator<Item = &mut RudisEntry> {
+        self.segments
+            .iter_mut()
+            .flat_map(|s| s.slots.iter_mut().flatten())
+    }
+
+    #[inline]
+    pub fn enumerate_slots(&self) -> impl Iterator<Item = (usize, Option<&RudisEntry>)> {
+        self.segments.iter().enumerate().flat_map(|(seg_id, seg)| {
+            let base = seg_id << SEG_SHIFT;
+            seg.slots
+                .iter()
+                .enumerate()
+                .map(move |(local_idx, opt)| (base | local_idx, opt.as_ref()))
+        })
+    }
+
+    #[inline]
+    pub fn has_deleted(&self) -> bool {
+        self.segments.iter().any(|s| s.ctrl.contains(&DELETED))
+    }
+
+    #[inline]
+    pub fn ctrl_bytes(&self) -> usize {
+        self.segments.iter().map(|s| s.ctrl.len()).sum::<usize>()
+            + self.directory.len() * std::mem::size_of::<u32>()
     }
 
     #[inline(always)]
     pub fn len(&self) -> usize {
-        self.items + self.old_table.as_ref().map_or(0, |o| o.items)
+        self.items
     }
 
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.items == 0
     }
 
     #[inline(always)]
@@ -1723,27 +1825,51 @@ impl RudisFlatTable {
 
     #[inline(always)]
     pub fn clear(&mut self) {
-        let cap = self.capacity;
-        self.ctrl.fill(EMPTY);
-        self.ctrl.copy_within(0..GROUP_SIZE, cap);
-        self.slots.fill(None);
+        let seg = RawSegment::new(64, 0);
+        self.segments.clear();
+        self.segments.push(seg);
+        self.directory.clear();
+        self.directory.push(0);
+        self.global_depth = 0;
+        self.dir_mask = 0;
+        self.capacity = 64;
         self.items = 0;
-        self.growth_left = (cap * 7) / 8;
         self.slot_counts.fill(0);
-        self.old_table = None;
-        self.rehash_idx = 0;
     }
 
     pub fn defrag(&mut self) -> usize {
-        if self.is_rehashing() {
-            self.finish_rehash();
-        }
-        let optimal_cap = (self.items * 2).next_power_of_two().max(GROUP_SIZE).max(64);
         let before_cap = self.capacity;
-        let has_deleted = self.ctrl.contains(&DELETED);
-        if optimal_cap < self.capacity || has_deleted {
-            self.resize(optimal_cap);
+        let optimal_cap = (self.items * 2).next_power_of_two().max(64);
+        let has_del = self.has_deleted();
+
+        if optimal_cap <= SEG_CAP
+            && (self.segments.len() > 1 || optimal_cap < before_cap || has_del)
+        {
+            let target_cap = optimal_cap.clamp(64, SEG_CAP);
+            let mut single = RawSegment::new(target_cap, 0);
+            for seg in self.segments.iter_mut() {
+                for entry in seg.slots.drain(..).flatten() {
+                    let h = hash_key(&entry.key);
+                    let (_, idx) = single.find_or_prepare_insert_raw(&entry.key, h);
+                    single.insert_at(entry, h, idx);
+                }
+            }
+            self.segments.clear();
+            self.segments.push(single);
+            self.directory.clear();
+            self.directory.push(0);
+            self.global_depth = 0;
+            self.dir_mask = 0;
+            self.capacity = target_cap;
             before_cap.saturating_sub(self.capacity)
+        } else if has_del {
+            for seg in self.segments.iter_mut() {
+                if seg.ctrl.contains(&DELETED) {
+                    let cap = seg.capacity;
+                    seg.rebuild(cap);
+                }
+            }
+            0
         } else {
             0
         }
@@ -1862,32 +1988,16 @@ impl RudisTable {
 
     #[inline]
     pub fn entries(&self) -> impl Iterator<Item = &RudisEntry> {
-        self.table.slots.iter().flatten().chain(
-            self.table
-                .old_table
-                .as_ref()
-                .into_iter()
-                .flat_map(|o| o.slots.iter().flatten()),
-        )
+        self.table.entries()
     }
 
     #[inline(always)]
-    pub fn prepare_key_lookup(&mut self, key: &[u8], hash: u64) {
-        if self.table.is_rehashing() {
-            self.table.migrate_key_if_in_old(key, hash);
-            self.table.rehash_step(1);
-        }
-    }
+    pub fn prepare_key_lookup(&mut self, _key: &[u8], _hash: u64) {}
 
     pub fn recalculate_used_memory(&mut self) -> usize {
         let mut total = self.table.capacity * std::mem::size_of::<Option<RudisEntry>>()
-            + self.table.ctrl.len()
+            + self.table.ctrl_bytes()
             + 16384 * 4;
-        if let Some(ref old) = self.table.old_table {
-            total += old.capacity * std::mem::size_of::<Option<RudisEntry>>()
-                + old.ctrl.len()
-                + 16384 * 4;
-        }
         for entry in self.entries() {
             total += entry.key.len() + entry.val.approx_bytes() + 64;
         }
@@ -1897,7 +2007,7 @@ impl RudisTable {
 
     pub fn active_defrag(&mut self) -> usize {
         let freed = self.table.defrag();
-        for entry in self.table.slots.iter_mut().flatten() {
+        for entry in self.table.entries_mut() {
             match &mut entry.val {
                 RudisValue::String(b) => {
                     if !b.is_empty() {
@@ -2665,7 +2775,7 @@ impl RudisTable {
         self.table.clear();
         self.num_expires = 0;
         let base_mem = self.table.capacity * std::mem::size_of::<Option<RudisEntry>>()
-            + self.table.ctrl.len()
+            + self.table.ctrl_bytes()
             + 16384 * 4;
         self.used_memory = base_mem;
     }
@@ -2813,10 +2923,8 @@ impl RudisTable {
     pub fn decommit_all_cooled(&mut self) -> (usize, u64) {
         let mut count = 0;
         let mut total_freed = 0u64;
-        for opt in self.table.slots.iter_mut() {
-            if let Some(entry) = opt
-                && let RudisValue::Cooled { ptr, val } = &entry.val
-            {
+        for entry in self.table.entries_mut() {
+            if let RudisValue::Cooled { ptr, val } = &entry.val {
                 let p = *ptr;
                 let freed = val.approx_bytes() as u64;
                 entry.val = RudisValue::Tiered(p);
@@ -2830,14 +2938,14 @@ impl RudisTable {
 
     pub fn get_hot_keys_for_spill(&mut self, limit: usize) -> Vec<Bytes> {
         let mut hot = Vec::with_capacity(limit);
-        let total_slots = self.table.slots.len();
+        let total_slots = self.table.capacity();
         if total_slots == 0 {
             return hot;
         }
         let start = self.spill_cursor % total_slots;
         let mut idx = start;
         for _ in 0..total_slots {
-            if let Some(entry) = &self.table.slots[idx]
+            if let Some(entry) = self.table.get_slot(idx)
                 && !matches!(entry.val, RudisValue::Tiered(_) | RudisValue::Cooled { .. })
             {
                 hot.push(entry.key.clone());
@@ -6796,7 +6904,7 @@ impl RudisTable {
         let now = Instant::now();
         let mut count = 0;
         let mut expired_indices = Vec::new();
-        for (idx, opt) in self.table.slots.iter().enumerate() {
+        for (idx, opt) in self.table.enumerate_slots() {
             if let Some(entry) = opt
                 && crate::router::key_slot(&entry.key) == slot
             {
@@ -6835,7 +6943,7 @@ impl RudisTable {
         } else {
             None
         };
-        for (idx, opt) in self.table.slots.iter().enumerate() {
+        for (idx, opt) in self.table.enumerate_slots() {
             if let Some(entry) = opt
                 && crate::router::key_slot(&entry.key) == slot
             {
@@ -6863,7 +6971,7 @@ impl RudisTable {
 
     pub fn flush_slots(&mut self, ranges: &[(u16, u16)]) -> usize {
         let mut to_remove = Vec::new();
-        for (idx, opt) in self.table.slots.iter().enumerate() {
+        for (idx, opt) in self.table.enumerate_slots() {
             if let Some(entry) = opt {
                 let slot = crate::router::key_slot(&entry.key);
                 for &(start, end) in ranges {
@@ -11704,7 +11812,7 @@ mod tests {
         }
         assert_eq!(table.len(), 0);
         // Verify all ctrl bytes were reset to EMPTY (no DELETED tombstones remain)
-        assert!(!table.table.ctrl.contains(&DELETED));
+        assert!(!table.table.has_deleted());
 
         // 3. Test write_lpop_resp_with_hash on empty and populated lists
         let list_k = Bytes::from("test_list");
@@ -11733,7 +11841,7 @@ mod tests {
         );
         assert_eq!(out, b"$1\r\nb\r\n");
         assert_eq!(table.len(), 0);
-        assert!(!table.table.ctrl.contains(&DELETED));
+        assert!(!table.table.has_deleted());
     }
 
     #[test]
@@ -11889,13 +11997,14 @@ mod tests {
     }
 
     #[test]
-    fn test_progressive_incremental_rehashing() {
+    fn test_extendible_hashing_segment_splits() {
         let mut table = RudisFlatTable::new(1024);
-        assert!(!table.is_rehashing());
+        assert_eq!(table.segments.len(), 1);
+        assert_eq!(table.global_depth, 0);
 
-        // Fill table until progressive rehash is triggered
-        let mut i = 0;
-        while !table.is_rehashing() {
+        // Insert 3,000 keys to trigger multiple segment splits across directory depths
+        let total_inserted = 3000;
+        for i in 0..total_inserted {
             let key = Bytes::from(format!("key_{:04}", i));
             let val = RudisValue::String(Bytes::from("val"));
             table.insert(RudisEntry {
@@ -11903,34 +12012,37 @@ mod tests {
                 val,
                 expire_at: None,
             });
-            i += 1;
         }
 
-        // Table reached capacity and transitioned to progressive rehash
-        assert!(table.is_rehashing());
-        assert!(table.old_table.is_some());
-        let total_inserted = i;
+        assert!(table.segments.len() >= 4);
+        assert!(table.global_depth >= 2);
+        assert_eq!(table.len(), total_inserted);
 
-        // Verify keys can be found during active rehashing
+        // Verify all keys can be looked up directly via single-segment probe
         for k in 0..total_inserted {
             let key = format!("key_{:04}", k);
             let h = hash_key(key.as_bytes());
             assert!(table.contains(key.as_bytes(), h));
+            assert!(table.find_entry(key.as_bytes(), h).is_some());
         }
 
-        // Advance rehash progressively
-        while table.is_rehashing() {
-            table.rehash_step(64);
-        }
-
-        assert!(!table.is_rehashing());
-        assert!(table.old_table.is_none());
-
-        // All keys still present after complete rehash
-        for k in 0..total_inserted {
+        // Delete half the keys and re-insert to verify tombstone reuse and segment stability
+        for k in (0..total_inserted).step_by(2) {
             let key = format!("key_{:04}", k);
             let h = hash_key(key.as_bytes());
-            assert!(table.contains(key.as_bytes(), h));
+            assert!(table.remove_key(key.as_bytes(), h).is_some());
         }
+        assert_eq!(table.len(), total_inserted / 2);
+
+        for k in (0..total_inserted).step_by(2) {
+            let key = Bytes::from(format!("key_{:04}", k));
+            let val = RudisValue::String(Bytes::from("val2"));
+            table.insert(RudisEntry {
+                key,
+                val,
+                expire_at: None,
+            });
+        }
+        assert_eq!(table.len(), total_inserted);
     }
 }
