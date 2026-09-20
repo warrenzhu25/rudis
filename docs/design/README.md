@@ -33,4 +33,7 @@ For low-level implementation details, data structures, and line-by-line code ref
 
 ---
 
-* **Consolidated Document**: Read the entire unified design specification in [**`components.md`**](components.md).
+### Deep-Dive Architectural Specifications
+* [**`components.md`**](components.md): The unified consolidated design specification covering all 19 subsystems.
+* [**`rudis_table.md`**](rudis_table.md): Custom in-memory storage engine design (SwissTable & DASH-inspired 64-byte aligned SIMD buckets).
+* [**`tiered_storage.md`**](tiered_storage.md): NVMe SSD tiered storage engine design (SmallBins, Direct I/O, OpManager coalescing).

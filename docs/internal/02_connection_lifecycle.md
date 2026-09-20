@@ -372,7 +372,7 @@ synchronous counterpart called both for genuinely-local keys and for remote batc
 via `ShardMessage::Batch`) is a similarly-sized ~3,750-line match. Both are too large to
 usefully excerpt command-by-command here — the mechanism worth understanding is that they
 are two independent match statements over the same `Command` enum kept in sync by hand (see
-`docs/designs/components.md` Part 3 §7 for why that duplication exists rather than a single
+`docs/design/components.md` Part 3 §7 for why that duplication exists rather than a single
 shared function — that rationale still holds structurally, though the functions themselves
 have grown far beyond what that doc shows).
 

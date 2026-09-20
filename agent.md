@@ -134,14 +134,14 @@ All official benchmark numbers must be committed under `docs/benchmarks/`:
 
 | Module | Location | Purpose | Design Doc |
 | :--- | :--- | :--- | :--- |
-| **Server Runtime** | `src/server.rs`, `src/main.rs` | Worker thread initialization, `SO_REUSEPORT` binding, Monoio `io_uring` event loop, active expiration cycle task, cross-shard receiver mesh. | [Part 2](docs/designs/components.md#part-2-server-runtime-and-entrypoint) |
-| **Connection & Protocol** | `src/connection.rs` | Per-connection async loop, pipeline squashing, reusable channel pool, socket write batching. | [Part 3](docs/designs/components.md#part-3-connection-handling-and-pipeline-squashing) |
-| **Shard Store** | `src/shard.rs`, `src/table.rs` | Thread-local `ShardDb`, key-value store, expiration timestamps, active/passive TTL eviction. | [Part 1](docs/designs/components.md#part-1-storage-engine-rudistable) |
-| **Router** | `src/router.rs` | CRC16 key hashing (`target_shard`), cross-shard routing mesh senders. | [Part 4](docs/designs/components.md#part-4-router-and-cross-shard-mesh) |
-| **RESP Engine** | `src/resp.rs` | Zero-copy parser for RESP arrays and inline Redis commands. | [Part 5](docs/designs/components.md#part-5-resp-parsing-engine) |
-| **Entrypoint** | `src/main.rs` | CLI arguments, core affinity mapping, cross-shard channel instantiation. | [Part 2](docs/designs/components.md#part-2-server-runtime-and-entrypoint) |
+| **Server Runtime** | `src/server.rs`, `src/main.rs` | Worker thread initialization, `SO_REUSEPORT` binding, Monoio `io_uring` event loop, active expiration cycle task, cross-shard receiver mesh. | [01_reactor_runtime](docs/design/01_reactor_runtime.md) |
+| **Connection & Protocol** | `src/connection.rs` | Per-connection async loop, pipeline squashing, reusable channel pool, socket write batching. | [02_connection_lifecycle](docs/design/02_connection_lifecycle.md) |
+| **Shard Store** | `src/shard.rs`, `src/table.rs` | Thread-local `ShardDb`, key-value store, expiration timestamps, active/passive TTL eviction. | [05_storage_engine](docs/design/05_storage_engine.md) |
+| **Router** | `src/router.rs` | CRC16 key hashing (`target_shard`), cross-shard routing mesh senders. | [04_sharding_mesh](docs/design/04_sharding_mesh.md) |
+| **RESP Engine** | `src/resp.rs` | Zero-copy parser for RESP arrays and inline Redis commands. | [03_resp_engine](docs/design/03_resp_engine.md) |
+| **Entrypoint** | `src/main.rs` | CLI arguments, core affinity mapping, cross-shard channel instantiation. | [01_reactor_runtime](docs/design/01_reactor_runtime.md) |
 | **Tests** | `tests/` | Multi-threaded end-to-end tests (`test_server_e2e.rs`) and channel waker verification (`test_cross_thread.rs`). | — |
 
-All five components are documented in one file, [`docs/designs/components.md`](docs/designs/components.md),
-written as a learning guide against the *actual* shipped code — not just what it does, but why
+All 19 components are documented in [`docs/design/components.md`](docs/design/components.md) (high-level design and rationale) and [`docs/internal/components.md`](docs/internal/components.md) (concrete implementation and code references),
+written as learning guides against the *actual* shipped code — not just what it does, but why
 it's built that way, with known limitations and gaps called out explicitly rather than left implicit.

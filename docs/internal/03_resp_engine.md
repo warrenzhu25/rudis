@@ -273,7 +273,7 @@ Unchanged from the original design — a `.windows(2).position(|w| w == b"\r\n")
 only ever used to find the end of small protocol headers (array lengths, bulk-string length
 prefixes), never to scan payload data, so there's no SIMD opportunity being left on the table
 here (see the storage engine's SIMD control-byte matching in Part 1 of
-`docs/designs/components.md` for where that technique actually applies, on 16-byte groups).
+`docs/design/components.md` for where that technique actually applies, on 16-byte groups).
 
 ---
 
