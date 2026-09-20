@@ -9,24 +9,30 @@ This document defines the mandatory operating guidelines, architectural invarian
 `rudis` is designed from the ground up for extreme throughput and low tail latency on modern multi-core Linux systems. Every modification must uphold these principles:
 
 1. **Shared-Nothing (Thread-per-Core)**:
-   - Every worker thread is pinned to an exclusive physical CPU core via `core_affinity`.
+   - Every worker thread is pinned to an exclusive physical CPU core via `core_affinity` (disabled with `--no-pin`).
    - Each thread runs its own isolated `monoio` event loop driving an independent Linux `io_uring` instance.
    - Ingress utilizes kernel-level `SO_REUSEPORT` balancing so each core accepts connections independently.
+   - The default number of shards is `min(available_cores, 8)` (see `src/main.rs`), overridable via `--threads`/`threads`. It need not equal the physical core count.
+   - Key routing is mode-dependent: **standalone mode (default)** hashes the key's hash-tag with `FxHash` modulo `num_shards` — there is no 16,384-slot table involved. **Cluster mode** (`cluster-enabled yes`) uses the classic Redis Cluster scheme, `CRC16(hash_tag) % 16384`, mapped onto per-shard slot ranges, for wire compatibility with Redis Cluster clients. Do not assume CRC16/slot routing is universal — it is cluster-mode-only.
 
-2. **Zero Mutexes / Zero Locks in Data Path**:
-   - `ShardDb` is purely thread-local. Operations on local keys execute against thread-local `HashMap` instances with zero mutexes, zero atomic operations, and zero cross-core cache invalidation.
-   - Under no circumstances should `Arc<Mutex<...>>` or global locks be introduced to the storage engine or data path.
+2. **Zero Mutexes / Zero Locks in the Per-Key Data Path**:
+   - `ShardDb` is purely thread-local. Operations on local keys execute against thread-local table instances with zero mutexes, zero atomic operations, and zero cross-core cache invalidation on the read/write hot path.
+   - Under no circumstances should `Arc<Mutex<...>>` or a global lock be introduced around `ShardDb`/`RudisTable` itself or any other per-key data structure.
+   - **This invariant has real, deliberate, narrow exceptions elsewhere in the codebase — know them before assuming "zero locks" is absolute:**
+     - `src/mailbox.rs`'s cross-shard SPSC ring (capacity 256 per shard pair) is lock-free, but each ring has a `std::sync::Mutex`-guarded overflow `VecDeque` for bursts beyond that capacity. This is a real `Mutex` on the cross-shard message path, gated to the rare overflow case — it is not lock-free in the strict sense, and future changes to the mailbox must preserve (or explicitly re-justify changing) that scoping.
+     - `BlockHub` (`src/block.rs`), the cluster topology registry (`ClusterHub`, `src/cluster.rs`), the global search-index registry (`src/search.rs`), and several control-plane globals in `src/connection.rs` (buffer limits, client tracker, `CMD_STATS`, `MAX_MEMORY_POLICY`) are process-wide state protected by `RwLock`/atomics, not thread-local. These are intentional, documented exceptions for state that must be visible identically across every shard (blocking waiters, cluster membership, search index metadata, admin/observability counters) — never treat them as evidence that the per-key hot path is allowed to take a lock, and never add a new global lock without the same level of justification these have in `docs/design/`.
+   - **Memory Allocator**: the actual `#[global_allocator]` (see `src/lib.rs`) is `tikv_jemallocator::Jemalloc`, exposed with live stats via `tikv-jemalloc-ctl`. `mimalloc` is listed in `Cargo.toml` but is **not** the configured global allocator — do not assume it is wired in; if you see `mimalloc` referenced in older documentation or comments, treat it as stale.
 
 3. **Parallel Cross-Shard Pipeline Squashing**:
-   - Pipelined requests from a connection are parsed in batch and grouped by target shard (`CRC16(key) % num_shards`).
+   - Pipelined requests from a connection are parsed in batch and grouped by target shard using the routing rule in point 1 above (not unconditionally CRC16).
    - Local shard operations execute immediately and inline with zero channel hops.
-   - Remote shard operations are dispatched as **one single batched hop per destination shard** (`ShardMessage::Batch`), allowing all remote shards to execute concurrently across cores.
+   - Remote shard operations are dispatched as **one single batched hop per destination shard** (`ShardMessage::Batch`, see `src/shard.rs`), allowing all remote shards to execute concurrently across cores.
    - Responses must always be returned in the exact original FIFO command sequence.
 
-4. **Zero-Allocation Steady State**:
+4. **Zero-Allocation Steady State (Hot Paths) — Goal, With Known Exceptions**:
    - **Zero-Copy Parsing**: Payloads must be parsed as zero-copy buffer slices (`Bytes::split_to(len).freeze()`).
-   - **Reusable Channels**: Remote batch responders (`ResponderChannel`) must be pre-allocated per connection and reused across loop iterations. Never allocate one-shot channels (`flume::bounded(1)`) on the hot request path.
-   - **Memory Allocator**: Uses `mimalloc` as the global allocator (`#[global_allocator] static GLOBAL: mimalloc::MiMalloc`) to guarantee thread-local heap allocation and lock-free cross-thread deallocation.
+   - **Reusable Channels on the Fast Path**: The hottest cross-shard call sites (`GET`, `SET`, batched `MGET`/`MSET`, and similar) reuse pooled, pre-allocated reply descriptors (`FastGetDescriptor`, `FastSetDescriptor`, `BatchResponder`, `ScatterMgetDescriptor`, `ScatterMsetDescriptor` in `src/mailbox.rs`) instead of allocating a channel per call. **New hot-path code must follow this pattern, not allocate `flume::bounded(1)` per call.**
+   - Be aware this is a **standard to converge on, not yet a universally-enforced invariant**: many other `ShardMessage` variants outside the hottest call sites still allocate a fresh `flume::bounded(1)` request/reply channel per remote call today (see `docs/internal/04_sharding_mesh.md` §3 for the current inventory). Do not assume every cross-shard command already uses a pooled descriptor — check the specific message variant before relying on that assumption, and prefer migrating a variant to a pooled descriptor over adding new one-shot-channel call sites.
 
 ---
 
@@ -137,7 +143,8 @@ All official benchmark numbers must be committed under `docs/benchmarks/`:
 | **Server Runtime** | `src/server.rs`, `src/main.rs` | Worker thread initialization, `SO_REUSEPORT` binding, Monoio `io_uring` event loop, active expiration cycle task, cross-shard receiver mesh. | [01_reactor_runtime](docs/design/01_reactor_runtime.md) |
 | **Connection & Protocol** | `src/connection.rs` | Per-connection async loop, pipeline squashing, reusable channel pool, socket write batching. | [02_connection_lifecycle](docs/design/02_connection_lifecycle.md) |
 | **Shard Store** | `src/shard.rs`, `src/table.rs` | Thread-local `ShardDb`, key-value store, expiration timestamps, active/passive TTL eviction. | [05_storage_engine](docs/design/05_storage_engine.md) |
-| **Router** | `src/router.rs` | CRC16 key hashing (`target_shard`), cross-shard routing mesh senders. | [04_sharding_mesh](docs/design/04_sharding_mesh.md) |
+| **Router** | `src/router.rs` | Key-to-shard routing (`target_shard`): `FxHash % num_shards` in standalone mode, `CRC16 % 16384` slot routing in cluster mode. | [04_sharding_mesh](docs/design/04_sharding_mesh.md) |
+| **Cross-Shard Mailbox** | `src/mailbox.rs` | Lock-free per-shard-pair SPSC rings, `flume`-based wake signal, pooled reply descriptors (`FastGetDescriptor`, `BatchResponder`, etc.), mutex-guarded overflow queue. | [04_sharding_mesh](docs/design/04_sharding_mesh.md) |
 | **RESP Engine** | `src/resp.rs` | Zero-copy parser for RESP arrays and inline Redis commands. | [03_resp_engine](docs/design/03_resp_engine.md) |
 | **Entrypoint** | `src/main.rs` | CLI arguments, core affinity mapping, cross-shard channel instantiation. | [01_reactor_runtime](docs/design/01_reactor_runtime.md) |
 | **Tests** | `tests/` | Multi-threaded end-to-end tests (`test_server_e2e.rs`) and channel waker verification (`test_cross_thread.rs`). | — |

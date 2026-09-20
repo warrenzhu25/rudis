@@ -1,1560 +1,831 @@
 # Rudis Subsystem Architecture & High-Level Design Guide
 
 This document provides the high-level architectural specifications for all 19 core subsystems of **Rudis**.
-It details **what** each subsystem does, **why** it was designed that way, its **key concurrency invariants**, and its **performance characteristics**.
+It summarizes **what** each subsystem does, **why** it was designed that way, its **key concurrency invariants**,
+and the most important findings from this session's source-verification pass against the current codebase.
 
-For concrete Rust struct definitions, step-by-step execution algorithms, and source line references, see [`docs/internal/components.md`](../internal/components.md).
+Each entry links to its full per-subsystem design document under `docs/design/`, which carries the complete
+invariant list, architecture diagrams, and performance discussion. This document is a rollup, not a
+replacement — read the linked document for implementation-adjacent depth, and see
+[`docs/internal/components.md`](../internal/components.md) for concrete Rust struct definitions,
+step-by-step algorithms, and source line references.
 
 ---
 
 ## Subsystem Index
 
-- [01. Reactor Runtime & Server Lifecycle](#component-01) (`src/main.rs, src/server.rs`)
-- [02. Connection Lifecycle & Command Execution](#component-02) (`src/connection.rs`)
-- [03. RESP Protocol Engine & Command Parser](#component-03) (`src/resp.rs`)
-- [04. Sharding Architecture & Cross-Core Mesh](#component-04) (`src/router.rs, src/shard.rs`)
-- [05. Storage Engine & Compact Encodings](#component-05) (`src/table.rs`)
-- [06. Blocking Operations & The Reactive Event Hub](#component-06) (`src/block.rs`)
-- [07. NVMe SSD Tiered Storage Engine](#component-07) (`src/tiering.rs, src/tiering/`)
-- [08. Vector Search Engine: HNSW, SQ8 & Product Quantization](#component-08) (`src/vector.rs`)
-- [09. RediSearch Full-Text Engine & Reciprocal Rank Fusion](#component-09) (`src/search.rs`)
-- [10. Kernel Bypass & Zero-Copy Networking](#component-10) (`src/xdp.rs, src/zerocopy.rs`)
-- [11. Redis Cluster Topology & Gossip Protocol](#component-11) (`src/cluster.rs`)
-- [12. CRDT Data Types & Manual Multi-Region Sync](#component-12) (`src/crdt.rs`)
-- [13. Lua Scripting & Redis 7 Functions Engine](#component-13) (`src/scripting.rs`)
-- [14. Persistence & Replication Engines](#component-14) (`src/replication.rs, src/aof.rs`)
-- [15. Security, Memory Allocator & TLS](#component-15) (`src/acl.rs, src/allocator.rs, src/tls.rs`)
-- [16. JSON Document Store & JSONPath Engine](#component-16) (`src/json.rs`)
-- [17. Geospatial Commands](#component-17) (`src/geo.rs`)
-- [18. Probabilistic Data Structures](#component-18) (`src/probabilistic.rs`)
-- [19. Pub/Sub Messaging Hub](#component-19) (`src/pubsub.rs`)
+- [01. Reactor Runtime & Server Lifecycle](#component-01-reactor-runtime--server-lifecycle) (`src/main.rs, src/server.rs`)
+- [02. Connection Lifecycle & Command Execution](#component-02-connection-lifecycle--command-execution) (`src/connection.rs`)
+- [03. RESP Protocol Engine & Command Parser](#component-03-resp-protocol-engine--command-parser) (`src/resp.rs`)
+- [04. Sharding Architecture & Cross-Core Mesh](#component-04-sharding-architecture--cross-core-mesh) (`src/router.rs, src/shard.rs, src/mailbox.rs`)
+- [05. Storage Engine & Compact Encodings](#component-05-storage-engine--compact-encodings) (`src/table.rs`)
+- [06. Blocking Operations & The Reactive Event Hub](#component-06-blocking-operations--the-reactive-event-hub) (`src/block.rs`)
+- [07. NVMe SSD Tiered Storage Engine](#component-07-nvme-ssd-tiered-storage-engine) (`src/tiering.rs, src/tiering/`)
+- [08. Vector Search Engine: HNSW, SQ8 & Product Quantization](#component-08-vector-search-engine-hnsw-sq8--product-quantization) (`src/vector.rs`)
+- [09. RediSearch Full-Text Engine & Reciprocal Rank Fusion](#component-09-redisearch-full-text-engine--reciprocal-rank-fusion) (`src/search.rs`)
+- [10. Kernel Bypass & Zero-Copy Networking](#component-10-kernel-bypass--zero-copy-networking) (`src/xdp.rs, src/zerocopy.rs`)
+- [11. Redis Cluster Topology & Gossip Protocol](#component-11-redis-cluster-topology--gossip-protocol) (`src/cluster.rs`)
+- [12. CRDT Data Types & Manual Multi-Region Sync](#component-12-crdt-data-types--manual-multi-region-sync) (`src/crdt.rs`)
+- [13. Lua Scripting & Redis 7 Functions Engine](#component-13-lua-scripting--redis-7-functions-engine) (`src/scripting.rs`)
+- [14. Persistence & Replication Engines](#component-14-persistence--replication-engines) (`src/replication.rs, src/aof.rs`)
+- [15. Security, Memory Allocator & TLS](#component-15-security-memory-allocator--tls) (`src/acl.rs, src/allocator.rs, src/tls.rs`)
+- [16. JSON Document Store & JSONPath Engine](#component-16-json-document-store--jsonpath-engine) (`src/json.rs`)
+- [17. Geospatial Commands](#component-17-geospatial-commands) (`src/geo.rs`)
+- [18. Probabilistic Data Structures](#component-18-probabilistic-data-structures) (`src/probabilistic.rs`)
+- [19. Pub/Sub Messaging Hub](#component-19-pubsub-messaging-hub) (`src/pubsub.rs`)
 
 ---
 
 ## Component 01: Reactor Runtime & Server Lifecycle
 
-## 1. Executive Summary & Problem Statement
+**Source files:** `src/main.rs, src/server.rs`
 
-### 1.1 The Problem
-Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+**Purpose & problem statement.** Redis's single event loop saturates one CPU core while leaving the rest of a
+multi-core host idle; naive multi-threaded alternatives (Memcached-style global or fine-grained mutexes) trade
+that bottleneck for spinlock contention and cross-socket cache-line bouncing. Rudis instead pins one
+`monoio`/io_uring reactor per physical core, each owning an exclusive `SO_REUSEPORT` listener and a
+thread-local `ShardDb`.
 
-### 1.2 The Rudis Solution
-Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+**Key design choice.** `ShardDb` lives in `Rc<RefCell<ShardDb>>`, a type that is not `Send` — the compiler
+itself refuses to let a shard's data cross a thread boundary, enforcing the shared-nothing invariant instead
+of relying on convention or review. Shard count defaults to `min(available_cores, 8)`. A small, explicitly
+enumerated set of structures is the deliberate exception to "zero locks": the blocking-command hub
+(`Arc<Mutex<BlockHub>>`), the replication hub, and connection-count balancing counters — none of these sit in
+the local-key hot path.
 
----
+**Key invariants.**
+- Thread-per-core pinning via `core_affinity`, unless `--no-pin`; `SO_REUSEPORT` (non-cluster) or per-shard
+  dedicated ports (cluster mode) balance ingress without userspace dispatch.
+- Every accepted connection is panic-isolated via a hand-rolled `catch_unwind_async` future combinator, so one
+  connection's panic cannot take down the other tasks sharing that shard's single-threaded runtime.
+- Shutdown is real but partial: a signal sets an atomic flag, both accept loops break within ~200ms and the AOF
+  writer flushes and fsyncs — but in-flight connections and background periodic tasks are not drained.
+- Bounded, fixed-size periodic work only: a 100ms active-expiration cycle, a 20ms auto-tiering pressure check,
+  and a 2s tiering GC pass — none scans the whole shard, so none shows up as a latency spike.
+- The cross-shard receiver loop amortizes wakeup cost by draining up to 64 already-queued messages per wakeup
+  instead of suspending once per message.
 
-## 2. Contributor Mental Model & Architectural Principles
+**Performance characteristics.** Local key access has no cross-core cost at all — no lock, no channel, no
+extra atomic beyond the storage engine's own. `SO_REUSEPORT`'s kernel-side load balancing is measurably uneven
+for a small number of long-lived connections (the codebase's own `conn_balance.rs` module comment gives a
+64-connections-over-16-shards example where the busiest shard gets far more than its share); this imbalance is
+mitigated by the `conn_balance` module, not eliminated.
 
-### 2.1 The Mental Model
-Each worker core runs an entirely isolated world. Worker threads never share data structures, never take global locks, and never migrate between CPU cores. Ingress connections are kernel-balanced via SO_REUSEPORT, driving an independent Linux io_uring instance via Monoio.
+**Verified findings.** No correctness gaps specific to this subsystem were identified in this session's
+verification pass. Shutdown's lack of connection/task draining and no automatic `SAVE` on exit are documented,
+known limitations rather than bugs (see Component 14 for the related, more serious `save <seconds> <changes>`
+scheduling gap).
 
-### 2.2 Design Rationale (The "Why")
-Traditional Redis uses a single event loop (ae.c) which bottlenecks on a single CPU core, wasting 98% of multi-core servers. Multi-threaded stores like Memcached use global or fine-grained mutexes that trigger cache line bouncing across sockets. Rudis uses Thread-Per-Core on Linux io_uring to achieve zero-syscall batching and 100% L1/L2 cache locality.
-
-### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
-1. **Thread-per-Core Pinning**: Every worker thread is pinned to an exclusive CPU core using `core_affinity::set_for_current`, unless `--no-pin` is passed. No worker thread is migrated by the OS scheduler once pinned.
-2. **`SO_REUSEPORT` Ingress Balancing**: Every worker thread opens its own listening socket bound to the same port (`socket.set_reuse_port(true)`). The kernel distributes new incoming connections across all bound sockets by a 4-tuple hash, with zero userspace dispatch.
-3. **Thread-local database, no locks in the data path**: `ShardDb` lives in a plain `Rc<RefCell<ShardDb>>` — not `Arc<Mutex<_>>`. Because `Rc`/`RefCell` aren't `Send`, the compiler itself refuses to let a `ShardDb` handle cross a thread boundary.
-4. **One real exception to "zero locks": the blocking-command hub.** `crate::block::get_block_hub_for_port(port)` returns an `Arc<Mutex<BlockHub>>` from a process-wide `static` map keyed by port (`PORT_BLOCK_HUBS`), so it *is* shared and mutex-guarded across every shard thread serving that port. This is a deliberate, narrow exception: blocking commands (`BLPOP`, `BZPOPMIN`, ...) need cross-shard wakeups, which the shared-nothing model can't give them for free, so a small locked structure was introduced specifically for that coordination rather than for the data path itself.
-5. **No graceful shutdown.** There is no signal handler anywhere in `src/server.rs` or `src/main.rs` — no `SIGINT`/`SIGTERM` trap, no drain, no flush-on-exit logic. The process only stops if every thread's infinite loop is killed externally (the accept loop and the cross-shard receiver loop both run forever).
-
----
-
-## 3. High-Level Architecture & Workflow Diagram
-
-```
-Linux Kernel (SO_REUSEPORT 4-Tuple Hash)
-                               │
-               ┌───────────────┴───────────────┐
-               ▼                               ▼
-       Core 0 (Shard 0)                Core 1 (Shard 1)
-       • Monoio Reactor (io_uring)     • Monoio Reactor (io_uring)
-       • Local ShardDb (Zero Locks)    • Local ShardDb (Zero Locks)
-       • Periodic Tasks (Expire, Tier) • Periodic Tasks (Expire, Tier)
-```
-
----
-
-## 4. Performance Guarantees & Theoretical Complexity
-
-- **Zero-syscall-per-connection ingress**: `SO_REUSEPORT` means the kernel — not userspace — decides which shard's listener gets each new connection.
-- **No cross-core cache traffic in the common case**: local key access never leaves the owning thread; only the `ShardMessage` mesh and the shared `BlockHub` mutex cross cores, and both are only exercised on non-local or blocking operations.
-- **Bounded periodic work, not full scans**: the 100ms expiration cycle, 20ms auto-tier check, and 2s GC task are all designed to do fixed, small amounts of work per tick rather than scanning the whole shard, so they never show up as a latency spike on the shared single-threaded runtime.
-- **The cross-shard receiver loop now amortizes async overhead across up to 64 messages per wakeup** (§4.2's `try_recv` burst-draining) instead of paying one `recv_async().await` suspend/resume cycle per message — a real, measurable win under sustained cross-shard traffic (e.g. many concurrent `MGET`/`MSET` fan-outs or heavy pipeline squashing hitting one shard from many peers at once).
-- **Batch-level tiering checks are now gated on whether tiering is enabled at all** (`has_tier_manager`, §4.2) — a shard running with no tiered storage configured skips the per-`Get`-in-batch `is_tiered` lookup entirely rather than paying a cheap-but-nonzero check on every batched read.
-
----
-
-## 5. Implementation References & Contributor Guide
-
-For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
-* [**`docs/internal/01_reactor_runtime.md`**](../internal/01_reactor_runtime.md): Low-level implementation and code reference.
-* **Source Files**: `src/main.rs, src/server.rs`
-
+**Further reading:** [`docs/internal/01_reactor_runtime.md`](../internal/01_reactor_runtime.md)
 
 ---
 
 ## Component 02: Connection Lifecycle & Command Execution
 
-## 1. Executive Summary & Problem Statement
+**Source files:** `src/connection.rs`
 
-### 1.1 The Problem
-Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+**Purpose & problem statement.** In a thread-per-core design, naive key-by-key dispatch of a pipelined
+client's commands would incur one inter-thread round trip per remote-routed command, and a fresh
+channel-based reply path allocates on every hop. Rudis instead pins a connection to its accepting core for its
+whole lifetime and "squashes" an eligible pipeline into one batched message per remote shard touched.
 
-### 1.2 The Rudis Solution
-Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+**Key design choice.** The reply path for squashed batches is not a `flume`-channel responder pool but
+`BatchResponder`, a pooled, lock-free single-slot mailbox in `src/mailbox.rs` (`AtomicBool` + `UnsafeCell`):
+the remote shard writes the payload then flips the flag (`Release`), and the connection polls the flag directly
+(`Acquire`) without an allocation. A paired `flume::bounded(1)` channel exists purely as an async wake-up for
+the fallback path — it never carries the payload itself.
 
----
+**Key invariants.**
+- Pure single-threaded client state: `handle_connection`'s locals are plain stack variables — no `Arc`/`Mutex`.
+- A blocking command (e.g. `BLPOP`) flushes any already-buffered pipelined replies before suspending, so
+  earlier responses are never held hostage by a later blocking wait.
+- Cross-shard `MULTI`/`EXEC` acquires a per-shard advisory lock across every touched shard, in ascending
+  shard-ID order, to avoid deadlocking against a differently-ordered concurrent transaction.
+- Pipeline squashing is gated on more than routability: the client must be authenticated and, under active
+  ACLs or cluster mode, have real permission for *every* key of *every* command in the batch — one ineligible
+  command defeats squashing for the whole batch, falling back to the sequential path.
+- `MGET`/`MSET` genuinely parallelize across shards via pooled scatter-gather descriptors (`src/mailbox.rs`),
+  bounded by the slowest touched shard rather than the sum of every key's round-trip.
 
-## 2. Contributor Mental Model & Architectural Principles
+**Performance characteristics.** Pooled, cross-connection-reused mailboxes give zero-allocation steady-state
+cross-shard fan-out; small replies are stored inline (`CompactResp::Small`, up to 30 bytes) with no heap
+allocation. The spin-then-block cross-shard harvest trades CPU for latency: non-blocking sweeps happen without
+yielding to the cooperative scheduler, so other connections on the *same core* make no progress during the
+spin phase — an explicit, accepted fairness cost for the common case where remote shards reply in microseconds.
 
-### 2.1 The Mental Model
-A connection spends its entire lifetime pinned to the worker core that accepted it. It reads RESP command frames in batches, groups them by destination shard (pipeline squashing), and executes local commands inline with zero channel hops.
+**Verified findings.** The plain `SET` fast path inside the squashed-pipeline path
+(`execute_commands_squashed`) does **not** call `touch_watched_key`/`notify_key_invalidation`, unlike its
+sibling inline fast paths (`INCRBY`, `DEL`, `HSET`, `SADD`, `ZADD`, `LPUSH`, `LPOP`, all of which do). A plain
+`SET` executed inside a squashed batch, under the AOF-less/replica-less conditions that gate the fast path,
+will not taint an active `WATCH` on that key and will not emit a RESP3 client-side-cache invalidation — a real,
+verified correctness gap, not a design choice.
 
-### 2.2 Design Rationale (The "Why")
-In pipelined workloads, dispatching requests key-by-key across threads incurs O(K) inter-thread round-trips. Pipeline squashing buckets commands by target shard and sends one single batched message per remote core, slashing channel hops and socket write syscalls.
-
-### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
-1. **Pure Single-Threaded Client State**: Every connection is handled exclusively by the
-   core that accepted it (`handle_connection`'s locals — `in_multi`, `tx_queue`, `asking`,
-   `authenticated`, `auth_user` — are plain stack variables, no `Arc`/`Mutex`).
-2. **Blocking Commands Force an Immediate Flush First**: Before executing a command like
-   `BLPOP` that may suspend the task for up to its timeout, `handle_connection` flushes any
-   already-buffered responses to the socket first — otherwise earlier pipelined replies would
-   sit unsent for the entire blocking duration.
-3. **Cross-Shard Transactions Use Explicit Locks**: A `MULTI`/`EXEC` block whose queued
-   commands touch more than one shard acquires a distributed "VLL" (very-lightweight-locking)
-   lock across every touched shard before running the batch, and releases it after — see §4.2.
-4. **Squashing Is Gated on More Than Just Routability**: The pipeline-squashing fast path
-   (`execute_commands_squashed`) additionally requires the client to already be authenticated,
-   have real ACL permission for each command and its key, and (for keyed commands) that this
-   node's cluster-gossip table actually confirms ownership of the key's slot — not merely that
-   the slot's local `SlotState` is `Stable` — see §4.4.
-5. **Non-Blocking Cross-Shard Dispatch**: Remote-shard work is always sent as a
-   `ShardMessage::Batch` over pre-allocated `flume` channels and awaited without blocking the
-   reactor thread — other connections on the same core keep making progress.
-
----
-
-## 3. High-Level Architecture & Workflow Diagram
-
-```
-Client Pipelined Stream: [GET k1, SET k2, GET k3]
-                               │
-                In-Place Pipeline Parser
-                               │
-                ┌──────────────┴──────────────┐
-                ▼                             ▼
-        Local Shard (k1, k3)          Remote Shard (k2)
-        Execute Inline (0 hops)       Single Batched SPSC Hop
-                │                             │
-                └──────────────┬──────────────┘
-                               ▼
-               Vectored Write Coalescing to Socket
-```
-
----
-
-## 4. Performance Guarantees & Theoretical Complexity
-
-- **Pre-allocated responder pool, not one-shot channels**: `ResponderChannel`s are built once
-  per connection (`(0..router.num_shards).map(|_| flume::bounded(1))`) and reused for every
-  pipeline flush — still the mechanism behind zero-allocation steady-state cross-shard fan-out.
-- **`CompactResp` replies**: batched remote responses are carried as `CompactResp` rather than
-  a plain `Vec<u8>`, reducing per-reply allocation/copy overhead in the squashed path.
-- **Command-name lowercasing/stat tracking is not free**: every executed command updates a
-  global `CMD_STATS` map (`record_cmd_stat`) under a `RwLock`, plus per-client `last_cmd`
-  bookkeeping — real but modest fixed overhead paid on every command, not just squashed
-  batches.
-- **`MGET`/`MSET` now genuinely parallelize across shards** (§4.6) via pooled channels and a
-  spin-then-block harvest, closing what was previously the single biggest cost on multi-shard
-  multi-key workloads — bounded by the slowest remote shard's response time now, not by the
-  sum of every remote shard's response time.
-- **The spin-then-block harvest trades CPU for latency, with a fairness cost worth naming**:
-  up to 128 non-blocking `try_recv` sweeps (`std::hint::spin_loop()` between them) happen
-  *without yielding to `monoio`'s cooperative scheduler* — on this shared-nothing,
-  single-threaded-per-core design, that means other connections' tasks on the *same core*
-  make no progress while an `MGET`/`MSET` is in its spin phase. Fine when remote shards
-  reply within microseconds (the common case this was tuned for); a burst of concurrent
-  `MGET`/`MSET` calls each waiting on a genuinely slow remote shard could measurably delay
-  unrelated connections sharing that core until the 128-iteration cap is hit and each falls
-  back to a real `.await`.
-
----
-
-## 5. Implementation References & Contributor Guide
-
-For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
-* [**`docs/internal/02_connection_lifecycle.md`**](../internal/02_connection_lifecycle.md): Low-level implementation and code reference.
-* **Source Files**: `src/connection.rs`
-
+**Further reading:** [`docs/internal/02_connection_lifecycle.md`](../internal/02_connection_lifecycle.md)
 
 ---
 
 ## Component 03: RESP Protocol Engine & Command Parser
 
-## 1. Executive Summary & Problem Statement
+**Source files:** `src/resp.rs`
 
-### 1.1 The Problem
-Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+**Purpose & problem statement.** On a thread-per-core design, the same core that parses a command also
+executes and serializes its reply, so every allocation or copy spent parsing subtracts directly from that
+core's throughput budget. `resp.rs` owns exactly two responsibilities — frame parsing and command
+construction — with no reply-serialization code (that lives in `connection.rs`).
 
-### 1.2 The Rudis Solution
-Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+**Key design choice.** RESP-array arguments are extracted via `BytesMut::split_to(len).freeze()` — a
+reference-count bump, never a byte copy — and a dedicated fast-dispatch path in `parse_resp_array` handles
+arrays of ≤16 elements for the highest-frequency commands, building the `Command` enum directly from cached
+offsets and skipping the 283-arm `build_command` match entirely. The inline-text and Memcached-compatibility
+parsers deliberately copy instead, since neither is on the pipelined hot path.
 
----
+**Key invariants.**
+- All-or-nothing frame consumption: a partially buffered command leaves the input buffer completely untouched
+  (`Ok(None)`); a complete command is fully consumed in one call.
+- Three independent input grammars — RESP arrays, inline space-separated text, and Memcached's ASCII storage
+  grammar — dispatched from one entry point (`parse_command`) purely by the first byte, or by trial-parse for
+  the Memcached case.
+- No RESP3 *input* parsing exists in this file: `HELLO` is recognized, but RESP3 is purely an output-side
+  concern implemented in `connection.rs`.
+- Errors are untyped `String`s, distinguished only by convention (e.g. a literal `WRONGTYPE`/`CROSSSLOT`/`MOVED`
+  prefix that callers inspect).
 
-## 2. Contributor Mental Model & Architectural Principles
+**Performance characteristics.** The fast path does one refcount bump per whole command instead of one per
+argument, and bypasses the large `build_command` match for the highest-frequency verbs. No throughput/latency
+benchmark figures are published for this component — the design doc explicitly declines to assert numbers that
+have not been measured against the current build.
 
-### 2.1 The Mental Model
-Zero-copy parsing over borrowed byte slices. Converts RESP2 arrays (*3\r\n...), RESP3 types, and inline space-separated commands into strongly-typed Command enums without intermediate string copies.
+**Verified findings.** No maximum bulk-string/array length is enforced (overflow is guarded, but a large,
+valid length has no configurable cap — no `proto-max-bulk-len` equivalent). This is a documented gap, not a
+newly discovered correctness bug.
 
-### 2.2 Design Rationale (The "Why")
-Memory allocation and string copying during command parsing dominate CPU profiles in high-QPS benchmarks. Rudis parses command frames in place using bytes::Bytes slices, achieving zero-allocation parsing for all hot-path commands.
-
-### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
-1. **Zero-Copy RESP Array Parsing**: Bulk string arguments inside a `*N\r\n...` frame are
-   extracted via `BytesMut::split_to(len).freeze()` — a reference-count bump on the
-   underlying buffer, never a byte-for-byte copy.
-2. **All-or-Nothing Frame Consumption**: A partially buffered command (still waiting on more
-   bytes from the socket) leaves the input buffer completely untouched (`Ok(None)`); a
-   complete command is parsed and fully consumed in one call. There's no partial-consumption
-   state to track between calls.
-3. **Three Independent Input Grammars, One Entry Point**: `parse_command` recognizes RESP
-   arrays (`*...`), plain space-separated inline text (`GET foo\r\n`), and Memcached's ASCII
-   storage-command grammar (`set key flags exptime bytes\r\n<data>\r\n`) — dispatched purely
-   by the first byte of the buffer, or by trial-parsing for the Memcached case (see §4.1).
-4. **No RESP3 wire-format parsing in this file.** `HELLO` is recognized and parsed as a
-   `Command` (so a client can request protocol v3), but nothing in `resp.rs` parses RESP3
-   input types (maps `%`, sets `~`, doubles `,`, booleans `#`, nulls `_`, pushes `>`) — every
-   incoming command is still a flat array of `$`-prefixed bulk strings. RESP3 is purely an
-   *output*-side concern implemented in `connection.rs` (a per-client `is_resp3` flag and a
-   thread-local `CURRENT_CLIENT_RESP3` cell gate which reply format gets written).
-
----
-
-## 3. High-Level Architecture & Workflow Diagram
-
-```
-Raw Ingress Bytes: *3\r\n$3\r\nSET\r\n$4\r\nuser\r\n$5\r\nalice\r\n
-                                      │
-                         Zero-Copy Group Probing
-                                      │
-                         Command::Set { key: Bytes("user"), val: Bytes("alice") }
-```
-
----
-
-## 4. Performance Guarantees & Theoretical Complexity
-
-- **Zero-copy on the hot (RESP array) path**: every bulk-string argument is a `Bytes` slice
-  sharing the original read buffer's allocation, not a fresh heap copy.
-- **The inline and Memcached paths copy**: both exist for compatibility/interactive use, not
-  throughput, and neither is on the benchmarked pipeline path.
-- **`build_command`'s dispatch is a single string match, not a lookup table**: with 200+ arms,
-  this is a large `match` the compiler is left to optimize (typically into some mix of
-  length-bucketed comparisons/jump tables); no bespoke perfect-hash or trie dispatch was
-  built for it.
-
----
-
-## 5. Implementation References & Contributor Guide
-
-For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
-* [**`docs/internal/03_resp_engine.md`**](../internal/03_resp_engine.md): Low-level implementation and code reference.
-* **Source Files**: `src/resp.rs`
-
+**Further reading:** [`docs/internal/03_resp_engine.md`](../internal/03_resp_engine.md)
 
 ---
 
 ## Component 04: Sharding Architecture & Cross-Core Mesh
 
-## 1. Executive Summary & Problem Statement
+**Source files:** `src/router.rs, src/shard.rs, src/mailbox.rs`
 
-### 1.1 The Problem
-Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+**Purpose & problem statement.** A shared-nothing design still needs a way to move a key request from the
+core that accepted the connection to the core that owns the key, without reintroducing the locking the
+architecture exists to avoid. Every key maps deterministically to exactly one shard, and a remote request is
+never satisfied by locking another shard's table — it is serialized into a message and handed across a
+lock-free channel (the "mesh") to the owning shard.
 
-### 1.2 The Rudis Solution
-Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+**Key design choice — corrects a materially stale prior description.** Cross-shard communication is **not**
+"exclusively `flume` channels" carrying every payload. The hottest paths — single-key `GET`/`SET`, pipelined
+`Batch` replies, and `MGET`/`MSET` scatter-gather — use purpose-built, pooled, lock-free shared-memory
+completion cells defined in `src/mailbox.rs` (`FastGetDescriptor`, `FastSetDescriptor`, `BatchResponder`,
+`ScatterMgetDescriptor`, `ScatterMsetDescriptor`), each an `Arc`'d, single-writer/single-reader structure
+using an `AtomicBool` + `UnsafeCell` release/acquire handoff. `flume` channels remain throughout the mesh, but
+on these hot paths they carry only a zero-sized wake-up signal, never the payload. Lower-traffic per-key
+operations (`DEL`, `EXISTS`, `EXPIRE`, `PERSIST`, `TTL`, …) genuinely still allocate a fresh
+`flume::bounded(1)` request/reply channel per remote call.
 
----
+**Routing model.** Standalone mode: 64-bit FxHash of the key's hash-tag, mod `num_shards` — no fixed slot
+space. Cluster mode: CRC16/XMODEM of the hash-tag mod 16,384 → slot → contiguous shard range
+(`slot_to_shard(slot, num_shards) = (slot * num_shards) / 16384`, multiply-then-divide, not modulo).
 
-## 2. Contributor Mental Model & Architectural Principles
+**Key invariants.**
+- `Router` is `Clone`, not a singleton — cloning bumps `Rc`/`Arc` refcounts only.
+- A shard never blocks another shard's event loop; a slow remote shard only delays the caller awaiting it.
+- Live cluster slot migration is tracked via a per-slot `Stable`/`Migrating`/`Importing`/`Moved` state machine
+  that gates `-MOVED`/`-ASK` redirection on the single-command path.
 
-### 2.1 The Mental Model
-Keys are assigned to 16,384 cluster slots using CRC16: slot = crc16(key) % 16384. Every core knows the slot ownership table. Cross-shard communication uses lock-free bounded SPSC rings paired with eventfd wakers.
+**Performance characteristics.** Local execution has no cross-core cost at all. Remote execution cost is
+dominated by scheduling latency (an SPSC push/pop is a handful of atomic operations), not the mesh mechanism
+itself. Batching amortizes fixed per-message overhead by turning N per-key round-trips into one message per
+remote shard actually touched.
 
-### 2.2 Design Rationale (The "Why")
-Cross-core communication must not introduce lock contention or thread migration. Dedicated bounded SPSC rings guarantee lock-free message passing, and eventfd wakers notify sleeping reactors only when needed.
+**Verified findings.** Two genuinely different key-routing entry points coexist in `router.rs`, and they can
+disagree during a live slot migration: the **static** free functions (`target_shard`, `target_shard_and_hash`)
+compute `slot_to_shard` directly and never consult `slot_owners`, while the **dynamic** instance method
+`Router::target_shard` indexes `self.slot_owners`, which reflects any live `set_slot_owner` override. Call-site
+split: static routing is used by `get`, `set`, `expire`, `persist`, `ttl`, `incr_by`, `exists`, and the
+pipelined dispatch phase `begin_mget_resp`; dynamic routing is used by `expiretime`, `del_keys`, the synchronous
+`mget`/`mset`, and `json_mget`. The practical consequence: the same `MGET` command can route differently
+depending on which of the two `Router` entry points handles it — `Router::mget` (dynamic) versus
+`begin_mget_resp`/`finish_mget_resp` (static) — a real, currently unresolved routing inconsistency, not a
+theoretical one. A related, distinct gap: `MGET`/`MSET`'s dispatch never consults per-key slot-migration state
+at all (only the single-command path does).
 
-### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
-1. **Deterministic Key Ownership (static formula)**: `target_shard(key, num_shards)` maps
-   every key to exactly one shard via `crc16(hash_tag(key)) % 16384` → contiguous slot
-   range → shard index. This is unchanged from the original design and is what nearly
-   every command actually routes through (see §4.4 for the caveat).
-2. **Lock-Free Asynchronous Mesh**: cross-shard communication is exclusively `flume`
-   channels (unbounded senders held by every shard, one per-shard receiver drained in
-   that shard's own event loop). No shared memory, no mutex, no `oneshot` crate — despite
-   what an earlier, inaccurate draft of this document claimed.
-3. **Hash Tag Compatibility**: `extract_hash_tag` — only the substring between the first
-   `{` and the next non-empty `}` is hashed, so `{user:100}:profile` and
-   `{user:100}:orders` land on the same shard.
-4. **`Router` is `Clone`, not a singleton reference**: cloning just bumps `Rc`/`Arc`
-   refcounts on its fields (see §3) — cheap, and necessary because async tasks spawned
-   off a `Router` method (e.g. `bgsave`'s background save) need an owned copy to move into
-   `monoio::spawn`.
-
----
-
-## 3. High-Level Architecture & Workflow Diagram
-
-```
-Key Routing: slot = CRC16(key) % 16384
-                               │
-               ┌───────────────┴───────────────┐
-               ▼                               ▼
-       Local Shard (Inline)            Remote Shard (Mesh)
-       Execute in ShardDb              Bounded SPSC Ring + eventfd
-```
-
----
-
-## 4. Performance Guarantees & Theoretical Complexity
-
-- **Lock-Free Communication**: unchanged — `flume` channels, no mutexes, no atomics on
-  the per-key data path itself.
-- **Per-op remote calls still allocate**: as documented in §4.2, the non-batched router
-  methods allocate a fresh one-shot channel per remote call; only the pipelined
-  `ShardMessage::Batch` path (Component 02) uses a pre-allocated pool.
-- **`CompactResp`'s 30-byte inline buffer** removes a heap allocation from the
-  overwhelmingly common case (short RESP replies) of the cross-shard batch response path.
-- **`MGET`/`MSET` now parallelize across shards, with pooled channels and a busy-poll
-  fast-harvest phase** (§4.3, resolved) — one `ShardMessage::Mget`/`Mset` per remote
-  shard touched, dispatched together and harvested via non-blocking `try_recv` before
-  falling back to a real `.await`, so throughput on multi-shard keysets is now bounded by
-  the slowest remote shard's response, not by the sum of every key's round-trip.
-
----
-
-## 5. Implementation References & Contributor Guide
-
-For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
-* [**`docs/internal/04_sharding_mesh.md`**](../internal/04_sharding_mesh.md): Low-level implementation and code reference.
-* **Source Files**: `src/router.rs, src/shard.rs`
-
+**Further reading:** [`docs/internal/04_sharding_mesh.md`](../internal/04_sharding_mesh.md)
 
 ---
 
 ## Component 05: Storage Engine & Compact Encodings
 
-## 1. Executive Summary & Problem Statement
+**Source files:** `src/table.rs`
 
-### 1.1 The Problem
-Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+**Purpose & problem statement.** A classic separate value-table/expiry-table design (as in Redis's `dict.c`)
+needs two hash lookups per access and pays pointer-chasing costs walking chained buckets. `RudisTable` is a
+SwissTable/hashbrown-style open-addressed hash table that inlines a key's value **and** its expiration
+timestamp into one 88-byte `RudisEntry` (`key: Bytes` 32B + `val: RudisValue` 40B + `expire_at: Option<Instant>`
+16B), so a single probe answers both "does this key exist" and "is it still valid."
 
-### 1.2 The Rudis Solution
-Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+**Key design choice.** Fingerprint-and-probe over chaining: an 8-bit control byte per slot plus a
+1-byte hash fingerprint let a lookup reject most non-matching slots via a single SIMD compare before ever
+touching the full key. Probing uses the same triangular group-stepping scheme hashbrown uses, avoiding the
+primary clustering plain linear probing causes.
 
----
+**Key invariants.**
+- Thread isolation: no mutexes, `RwLock`s, or atomics guard the table itself (only two process-wide `AtomicU64`
+  counters exist, for `INFO` stats, not synchronization).
+- `Hash`, `Set`, and `ZSet` values get adaptive small-form/full-form promotion past a size threshold; `List`
+  and `Stream` do not (their backing types are already the right shape at any size).
+- Passive inline eviction: any operation encountering an expired key frees it immediately, unless a debug-only
+  `ALLOW_ACCESS_EXPIRED` flag is set.
+- Cold-storage awareness without cold-storage I/O: `table.rs` performs no disk I/O itself, but
+  `RudisValue::Tiered`/`RudisValue::Cooled` exist so the table can represent "this value lives on disk" or
+  "this value lives on disk *and* is cached in RAM" for Component 07 to act on.
 
-## 2. Contributor Mental Model & Architectural Principles
+**Performance characteristics.** Probing is one unaligned 128-bit SIMD load and compare per 16-slot group on
+x86_64 (no ARM/NEON path — a portable scalar fallback covers non-x86_64), at up to 7/8 load factor. Resize is
+still monolithic: `RudisFlatTable::resize` rehashes the *entire* table in one synchronous pass — the
+segmented/incremental resize from the original design's roadmap was never built (see the companion deep-dive
+below). `used_memory` is a heuristic estimate (a fixed per-variant overhead plus a flat 64 bytes/entry), not
+exact allocator accounting.
 
-### 2.1 The Mental Model
-RudisTable is a custom in-memory hash table designed for 64-byte CPU cache lines with 1-byte SIMD group probing. Each entry contains the key, value, and optional TTL in a single cache-conscious 88-byte RudisEntry.
+**Verified findings.** The companion design document [`rudis_table.md`](rudis_table.md) — the original
+bucket-layout deep-dive — has been corrected against the current implementation: its 64-byte-cache-line-aligned
+bucket layout, ARM/NEON SIMD path, and segmented/incrementally-splitting DASH-style directory were **never
+built**; `src/table.rs` uses unaligned SIMD loads, a monolithic (non-segmented) `RudisFlatTable`, and FxHash
+only (not a mix of "foldhash or fxhash" as an earlier draft stated). Separately, a value in the `Tiered` state
+(spilled to NVMe by Component 07) is written as zero payload bytes during RDB/AOF serialization — see
+Component 14's Verified Findings for the full description of that data-loss bug.
 
-### 2.2 Design Rationale (The "Why")
-Standard hash tables (dict.c or hashbrown) suffer from pointer chasing and decoupled TTL tables requiring multiple lookups. RudisTable packs key, value, and expiration into an aligned 88-byte slot with SIMD probe acceleration.
-
-### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
-1. **Thread-Isolation**: Each `RudisTable` belongs to a single shard thread. It contains
-   **no mutexes, atomic operations for its own data, or lock-free concurrency wrappers**
-   (the two global counters described in §5 are process-wide atomics, but they're simple
-   monotonic stats, not synchronization for the table itself).
-2. **Inlined Metadata & Expiration**: `expire_at: Option<Instant>` lives directly inside
-   `RudisEntry`. Checking key validity never requires a secondary hash lookup.
-3. **Adaptive Small/Full Promotion — but not for every type**: `Hash`, `Set`, and `ZSet`
-   values each start in a compact linear form and promote to an indexed form once they
-   cross a size threshold (§4). Hash's thresholds are runtime-configurable via global
-   atomics; Set's and ZSet's are hardcoded constants. `List` and `Stream` have no compact
-   form at all — they use the same representation regardless of size.
-4. **Passive Inline Eviction, with an escape hatch**: any operation encountering an expired
-   key immediately frees it and returns `None`/empty, unless the process-wide
-   `crate::connection::ALLOW_ACCESS_EXPIRED` atomic flag is set, in which case expiration
-   checks are skipped entirely (see §5.1).
-5. **Cold-storage awareness**: a value can be partially or fully moved to NVMe by
-   `src/tiering.rs`. `table.rs` doesn't perform that I/O itself, but `RudisValue::Tiered`
-   and `RudisValue::Cooled` exist specifically so the table can represent "this key's value
-   lives on disk" or "this key's value lives on disk *and* is still cached in RAM" (§5.3).
-
----
-
-## 3. High-Level Architecture & Workflow Diagram
-
-```
-RudisEntry (88 Bytes Total)
-  ┌─────────────────────────┬─────────────────────────┬─────────────────────────┐
-  │      key: Bytes         │   val: RudisValue       │  expire_at: Option<Inst>│
-  │       (24 Bytes)        │       (40 Bytes)        │       (24 Bytes)        │
-  └─────────────────────────┴─────────────────────────┴─────────────────────────┘
-```
-
----
-
-## 4. Performance Guarantees & Theoretical Complexity
-
-- **SIMD group probing is unchanged**: still one 128-bit load and compare per 16-slot group,
-  triangular-step probing to avoid primary clustering.
-- **Zero-allocation `INCR`/`DECR`** when the value is already `Int`-encoded — mutates the
-  `i64` in place instead of round-tripping through string formatting.
-- **Hand-written integer/byte conversions** (`parse_i64_bytes`, `format_i64`) avoid
-  `std::str`/`format!` overhead on the hottest string-command paths.
-- **Resize is still monolithic**: `RudisFlatTable::resize` still rehashes the entire table
-  into a fresh allocation at 7/8 load factor — the segmented/incremental resize from the
-  original design's roadmap was never built.
-- **Small-form promotions trade O(n) linear scans for cache-friendly `Vec` access** below
-  their thresholds — real for `Hash`/`Set`/`ZSet`, applied inconsistently (Hash's threshold
-  is live-configurable; Set's and ZSet's are compile-time constants).
-- **`used_memory` is an estimate, not exact accounting** — it's derived from
-  `RudisValue::approx_bytes()` (a fixed per-variant heuristic, e.g. `+16`/`+32` bytes of
-  assumed overhead per element) plus a flat `+64` bytes per entry, not a precise allocator
-  measurement.
-
----
-
-## 5. Implementation References & Contributor Guide
-
-For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
-* [**`docs/internal/05_storage_engine.md`**](../internal/05_storage_engine.md): Low-level implementation and code reference.
-* **Source Files**: `src/table.rs`
-
+**Further reading:** [`docs/internal/05_storage_engine.md`](../internal/05_storage_engine.md) ·
+[`rudis_table.md`](rudis_table.md) (original bucket-layout design, corrected against the implementation)
 
 ---
 
 ## Component 06: Blocking Operations & The Reactive Event Hub
 
-## 1. Executive Summary & Problem Statement
+**Source files:** `src/block.rs`
 
-### 1.1 The Problem
-Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+**Purpose & problem statement.** A client blocked on `BLPOP` on shard A must be woken by a write executed on
+shard B, but the shared-nothing model gives shard B no way to reach into shard A's thread-local state.
+`BlockHub` is a thread-safe reactive registry for blocking operations (`BLPOP`, `BRPOP`, `BZPOPMIN`,
+`XREAD BLOCK`) that signals a waiting connection without polling for the value itself.
 
-### 1.2 The Rudis Solution
-Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+**Key design choice.** `BlockHub` is the one deliberate, narrow exception to "zero locks": one
+`std::sync::Mutex<BlockHub>` per listening port, reached via `get_block_hub_for_port(port)` and shared by
+every shard serving that port. The pop happens *inside* the same critical section that selects the waiter —
+"pick a waiter" and "remove the value" are atomic by construction, avoiding a race between a separate
+notify-then-pop design.
 
----
+**Key invariants.**
+- Reactor threads never sleep on a plain timer: a blocked command yields via `.await`ing a polling helper that
+  also actively watches for client disconnect (a channel receive alone cannot detect a dead TCP socket without
+  a clean FIN).
+- FIFO fairness per key: waiter queues are `VecDeque`s, and notification always pops from the front.
+- Guaranteed cleanup via RAII: a `BlockedClientGuard`'s `Drop` impl unconditionally unregisters the waiter,
+  whether it resolved by pop, timeout, `CLIENT UNBLOCK`, or the connection task itself being dropped.
+- `pause()`/`resume()` are wired to `MULTI`/`EXEC` deferral, not to Redis's `CLIENT PAUSE` — which is a
+  complete no-op stub in Rudis.
 
-## 2. Contributor Mental Model & Architectural Principles
+**Performance characteristics.** A blocked client costs a wakeup-and-poll cycle at most every 20ms purely for
+disconnect detection, but is woken immediately (no polling delay) on a real notification. The global per-port
+mutex is held only for a short, synchronous, non-`.await`-ing critical section, and contention scales with
+blocking-waiter registration/notification activity — ordinary (non-blocking) commands never touch this lock.
 
-### 2.1 The Mental Model
-A thread-safe reactive registry for blocking operations (BLPOP, BRPOP, BZPOPMIN, XREAD BLOCK). When a key receives a push on any shard, BlockHub signals the waiting connection without polling.
+**Verified findings.** No correctness gaps specific to this subsystem were identified in this session's
+verification pass.
 
-### 2.2 Design Rationale (The "Why")
-In shared-nothing architectures, blocking operations require cross-shard coordination because a producer on Core 0 can unblock a consumer waiting on Core 3. BlockHub provides this narrow, locked coordination layer.
-
-### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
-1. **The one deliberate exception to "zero locks."** `BlockHub` lives behind a real
-   `std::sync::Mutex`, reachable from any shard via `get_block_hub_for_port(port)`:
-   ```rust
-   pub static PORT_BLOCK_HUBS: LazyLock<Mutex<HashMap<u16, Arc<Mutex<BlockHub>>>>> =
-       LazyLock::new(|| Mutex::new(HashMap::new()));
-
-   pub fn get_block_hub_for_port(port: u16) -> Arc<Mutex<BlockHub>> {
-       let mut map = PORT_BLOCK_HUBS.lock().unwrap();
-       map.entry(port)
-           .or_insert_with(|| Arc::new(Mutex::new(BlockHub::new(port))))
-           .clone()
-   }
-   ```
-   Every caller does `get_block_hub_for_port(port).lock().unwrap()` around a short, synchronous
-   critical section (register a waiter, or walk a key's waiter queue and pop values). This one
-   `Mutex` is the price paid for cross-shard wakeups: a client blocked on shard A must be
-   wakeable by a write executed on shard B, which the thread-local `Rc<RefCell<ShardDb>>` model
-   can't do on its own.
-2. **Reactor threads never sleep on a plain timer.** A blocked command doesn't `sleep()` the
-   whole event loop — it registers a waiter (a `flume::Sender`), yields by `.await`ing a
-   polling helper (`wait_for_blocked_result`, §4.2) that also has to actively watch for client
-   disconnect, since a channel receive alone can't detect a dead TCP socket (see §4.2).
-3. **FIFO fairness per key.** Waiter queues are `VecDeque`, and `notify_*` always
-   `pop_front()`s — the client that has been waiting longest on a key is served first.
-4. **Guaranteed cleanup via RAII.** `BlockedClientGuard`'s `Drop` impl calls
-   `hub.unregister_blocked_client(client_id)` unconditionally, so a waiter registration can
-   never outlive the `.await` that registered it — whether it resolved by pop, by timeout, by
-   `CLIENT UNBLOCK`, or by the connection task itself being dropped.
-5. **Transaction-aware deferral, not `CLIENT PAUSE`.** `BlockHub::pause()`/`resume()` exist —
-   but they're wired to `MULTI`/`EXEC`, not to Redis's `CLIENT PAUSE` command (which is a
-   complete no-op stub in Rudis, see §4.4).
-
----
-
-## 3. High-Level Architecture & Workflow Diagram
-
-```
-Consumer on Core 0 (BLPOP list 10)  ──► Registers in BlockHub
-                                                     ▲
-       Producer on Core 1 (LPUSH list "x") ──► Unblocks waiting Core 0
-```
-
----
-
-## 4. Performance Guarantees & Theoretical Complexity
-
-- **Not zero-overhead while blocked**: unlike a pure channel-based design, each blocked client
-  costs a wakeup-and-poll cycle at most every 20ms (`wait_for_blocked_result`'s cap) purely to
-  detect disconnection via `libc::poll`, in addition to being woken immediately (no polling
-  delay) whenever a real `notify_list`/`notify_zset`/`notify_stream` fires.
-- **One global mutex per port, held briefly**: every register/notify/unblock operation takes
-  `PORT_BLOCK_HUBS`'s per-port `Mutex<BlockHub>` for a short, synchronous, non-`.await`-ing
-  critical section (no lock is ever held across an `.await` point) — contention scales with how
-  many shards are simultaneously registering or notifying blocking waiters, not with the number
-  of ordinary (non-blocking) commands, which never touch this lock at all.
-- **Transaction-batched wakeups**: the `pause`/`resume` mechanism (§4.4) turns what could be up
-  to one wakeup attempt per write inside a large `MULTI`/`EXEC` into a single deferred batch
-  processed once, after the transaction (and any cross-shard lock release) fully completes.
-
----
-
-## 5. Implementation References & Contributor Guide
-
-For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
-* [**`docs/internal/06_blocking_hub.md`**](../internal/06_blocking_hub.md): Low-level implementation and code reference.
-* **Source Files**: `src/block.rs`
-
+**Further reading:** [`docs/internal/06_blocking_hub.md`](../internal/06_blocking_hub.md)
 
 ---
 
 ## Component 07: NVMe SSD Tiered Storage Engine
 
-## 1. Executive Summary & Problem Statement
+**Source files:** `src/tiering.rs, src/tiering/`
 
-### 1.1 The Problem
-Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+**Purpose & problem statement.** DRAM capacity is finite and expensive; naive spill-to-disk designs either
+fragment small values across many small files or lose NVMe's latency advantage by going through the buffered
+page cache. Keys follow a Hot (DRAM) → Cooled (DRAM, eviction candidate) → Tiered (NVMe) lifecycle; sub-2KB
+records are packed into 4KB-aligned SmallBins pages to eliminate write amplification.
 
-### 1.2 The Rudis Solution
-Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+**Key design choice.** Each shard owns a thread-local `ShardTierManager` (`Rc`-based, not `Arc`/`Mutex`) —
+cross-shard tiering requests go through ordinary `ShardMessage::Tier*` mesh messages (Component 04), never a
+shared manager. `O_DIRECT` is opt-in via the `RUDIS_DIRECT_IO` environment variable and silently falls back to
+buffered I/O if the underlying filesystem doesn't support it — there is no page-cache-bypass guarantee unless
+both the env var is set *and* the filesystem supports it.
 
----
+**Key invariants.**
+- Read coalescing is the concurrency-sensitive part: `OpManager::read_page_coalesced` ensures only one physical
+  read happens per in-flight 4KB page; other callers wait on the first reader's result.
+- Write backpressure is a hardcoded 16MB byte-counter ceiling (`pending_stash_bytes`), not a queue depth;
+  `stash_record` returns `WouldBlock` once exceeded.
+- Once a key has ever been tiered, `Router::load_local` restores it to `RudisValue::Cooled`, not back to a
+  bare hot value — there is no direct `Cooled → Hot` transition; `Cooled` is a permanent write-through layer.
+- `upload_threshold_pct` is configured and reported via `TIER INFO`, but is not consumed by any gating
+  decision — only `offload_threshold_pct` actually gates `Router::is_memory_constrained`.
 
-## 2. Contributor Mental Model & Architectural Principles
+**Performance characteristics.** GC reclaims whole 4KB pages, not individual records — a page with even one
+surviving record cannot be punched, so deletion-heavy small-value workloads can accumulate dead-but-unfreed
+bytes. Snapshotting cost depends on filesystem reflink support: instant on btrfs/XFS-with-reflink, an in-kernel
+`copy_file_range` loop otherwise, falling back to a full userspace `std::fs::copy` only if neither
+kernel-assisted path is available.
 
-### 2.1 The Mental Model
-Transparently offloads cold data to NVMe SSDs while keeping hot keys in DRAM. Keys follow a 3-State Lifecycle: Hot (DRAM) -> Cooled (eviction candidate in DRAM) -> Cold (NVMe disk). Sub-4KB items are packed into 4KB aligned pages.
+**Verified findings.** The companion design document [`tiered_storage.md`](tiered_storage.md) — the original
+Dragonfly-inspired deep-dive — has been corrected against the implementation: its proposed 16-byte packed-
+pointer `RudisExternalPtr` union, intrusive doubly-linked `CoolRecord` LRU cooling queue, and mimalloc-style
+segmented `ExternalAllocator` with a free-range tree were **not built**. What shipped is simpler: the plain
+17-byte `TieredPointer` struct, the `RudisValue::Cooled{ptr, val}` enum variant (no LRU ordering — eviction is
+either targeted or a full-table sweep), and a monotonically increasing `current_offset` write cursor.
+**Critically, freed disk space returned via `fallocate(FALLOC_FL_PUNCH_HOLE)` on delete is never reused by
+future writes** — `current_offset` keeps growing regardless of how many holes exist behind it, so the backing
+file's logical size grows unboundedly under a sustained tier-churn workload even though physical disk usage
+stays bounded. Separately: `RudisValue::Tiered` entries are written as zero payload bytes during RDB/AOF
+serialization (see Component 14).
 
-### 2.2 Design Rationale (The "Why")
-DRAM is expensive ($5/GB) and capacity-constrained. NVMe SSDs provide 1M+ IOPS at 1/20th the cost. SmallBins 4KB bin packing eliminates filesystem write amplification, and Direct I/O (O_DIRECT) avoids double caching.
-
-### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
-1. **Thread-local, `Rc`-based, not `Arc`/`Mutex`**: `ShardTierManager` holds `file: Rc<monoio::fs::File>` and uses `RefCell`/`Cell` internally — it is only ever used by the one shard that owns it, consistent with the rest of the shared-nothing architecture. Cross-shard tiering requests go through `ShardMessage::Tier*` variants (Component 04), not by sharing a `ShardTierManager` across threads.
-2. **`O_DIRECT` is opt-in and falls back automatically.** `ShardTierManager::open` only attempts `O_DIRECT` if the `RUDIS_DIRECT_IO` environment variable is set to something other than `"0"`; if the `O_DIRECT` open call fails (common on filesystems/kernels that don't support it), it silently retries with a normal buffered open. There is no page-cache-bypass guarantee unless that env var is set *and* the underlying filesystem actually supports it.
-3. **Global, per-port shared statistics behind a lock.** `TieringStats` (23 atomic counters) is stored in a process-wide `static TIER_STATS: RwLock<Option<HashMap<u16, Arc<TieringStats>>>>`, one entry per listening port, shared by every shard on that port. This is a real (small, read-mostly) synchronization point outside the shared-nothing data path, used purely for reporting (`INFO`-style stats), not for coordinating storage itself.
-4. **Read coalescing, not hole punching, is the concurrency-sensitive part.** `OpManager::read_page_coalesced` ensures that if two in-flight reads target the same 4KB page, only one physical `read_exact_at` happens; the second caller waits on a `flume::bounded(1)` channel fed by the first.
-5. **Write backpressure via a byte counter, not a queue depth.** `OpManager::check_write_backpressure` returns `true` once `pending_stash_bytes` (tracked via `AtomicUsize`, incremented in `start_pending_stash`/decremented in `finish_pending_stash`/`cancel_pending_stash`) exceeds a hardcoded 16MB; `ShardTierManager::stash_record` refuses new stashes (`io::ErrorKind::WouldBlock`) while over that limit.
-
----
-
-## 3. High-Level Architecture & Workflow Diagram
-
-```
-Hot (DRAM)  ──(Memory Pressure)──►  Cooled (DRAM Eviction Candidate)
-                                                    │
-                                           (SmallBins 4KB Packing)
-                                                    │
-                                                    ▼
-                                           Cold (NVMe O_DIRECT Disk)
-```
-
----
-
-## 4. Performance Guarantees & Theoretical Complexity
-
-- **`O_DIRECT` is conditional, not guaranteed** (§2.2) — actual page-cache-bypass behavior
-  depends on `RUDIS_DIRECT_IO` being set and the filesystem/kernel actually honoring the flag;
-  silently falls back to normal buffered I/O otherwise.
-- **Read coalescing collapses concurrent hot-page reads** to one physical read plus N
-  in-memory channel deliveries, avoiding redundant disk I/O when several keys on the same
-  4KB SmallBin page are accessed close together.
-- **Write backpressure is a simple byte-budget gate** (16MB of in-flight stash data), not a
-  queue-depth or per-key limit — a burst of large concurrent spills can hit it and get
-  `WouldBlock` back to the caller.
-- **GC reclaims whole 4KB pages, not individual records** — a page with even one surviving
-  record can't be punched; deletion-heavy small-value workloads can accumulate dead-but-unfreed
-  bytes (`dead_bytes` stat) until every record sharing a page happens to be deleted.
-- **Snapshotting cost depends entirely on filesystem reflink support** — instant on
-  btrfs/XFS-with-reflink, an in-kernel `copy_file_range` loop otherwise (still avoiding a
-  full userspace read+write round trip), and only falls all the way back to `std::fs::copy`
-  if both kernel-assisted paths are unavailable.
-
----
-
-## 5. Implementation References & Contributor Guide
-
-For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
-* [**`docs/internal/07_nvme_tiering.md`**](../internal/07_nvme_tiering.md): Low-level implementation and code reference.
-* **Source Files**: `src/tiering.rs, src/tiering/`
-
+**Further reading:** [`docs/internal/07_nvme_tiering.md`](../internal/07_nvme_tiering.md) ·
+[`tiered_storage.md`](tiered_storage.md) (original allocator/cooling-queue design, corrected against the
+implementation)
 
 ---
 
 ## Component 08: Vector Search Engine: HNSW, SQ8 & Product Quantization
 
-## 1. Executive Summary & Problem Statement
+**Source files:** `src/vector.rs`
 
-### 1.1 The Problem
-Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+**Purpose & problem statement.** Storing and searching millions of high-dimensional embeddings at full `f32`
+precision is memory-intensive, and brute-force nearest-neighbor search does not scale to large corpora. A
+thread-local HNSW graph index per shard gives approximate nearest-neighbor search with logarithmic-ish graph
+traversal, with optional SQ8 scalar quantization or Product Quantization to shrink the per-vector footprint.
 
-### 1.2 The Rudis Solution
-Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+**Key design choice.** Distance kernels (`dot_product`, `l2_distance_sq`, `cosine_distance`) probe CPU
+features at call time — AVX-512 first, then AVX2/FMA, then a portable 8-lane-unrolled scalar fallback — with
+no ARM/NEON path. All three metrics return a "smaller is closer" distance (inner product is negated) so the
+graph-traversal min-heap logic is metric-agnostic.
 
----
+**Key invariants.**
+- Thread-local only: an `HnswIndex` lives inside one shard's `ShardDb` with no `ShardMessage` variant to reach
+  a vector index on another shard — this is unimplemented cross-shard support, not a locking decision.
+- Product Quantization codebooks are **not trained on data** — each `(dim, m)` combination produces
+  byte-for-byte identical, deterministically generated centroids (unit basis vectors plus a fixed hash-derived
+  fill), with no k-means or training pass over real vectors.
+- HNSW layer assignment is deterministic: the graph's PRNG is seeded with a fixed constant every time, not OS
+  randomness — two indexes built from the same insertion order produce identical topology.
 
-## 2. Contributor Mental Model & Architectural Principles
+**Performance characteristics.** SQ8 gives a 4x memory reduction (4 bytes/dim → 1 byte/dim), and PQ gives up
+to 32x — both figures are derived directly from the type definitions, not measured. No throughput/latency
+numbers are published: prior unsourced figures (">3,500 vectors/sec", "<400µs p99", "75% RAM reduction") have
+been removed rather than repeated unverified.
 
-### 2.1 The Mental Model
-High-dimensional vector indexing using Hierarchical Navigable Small World (HNSW) graphs. SIMD-accelerated distance metrics (AVX2/SSE2) with optional SQ8 scalar quantization and Product Quantization.
+**Verified findings.** No data-loss or correctness bugs were identified. The most significant documented gap
+is architectural, not a bug: vector indexes have no cross-shard reach at all, and (like Component 16's JSON
+store) are excluded from RDB persistence.
 
-### 2.2 Design Rationale (The "Why")
-Float32 vectors consume massive memory (5.12MB per 10k 128-dim vectors). SQ8 quantization compresses vectors by 75% with negligible recall loss, fitting multi-million embedding datasets into standard instances.
-
-### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
-1. **Thread-local, not cross-shard**: consistent with the rest of the codebase, `HnswIndex`
-   instances live inside one shard's `ShardDb` with no locks — but unlike the key-value
-   store, there is no `ShardMessage` variant to reach a vector index on another shard at all
-   (see §1). This isn't a locking decision, it's simply unimplemented cross-shard support.
-2. **Runtime AVX2 detection, x86_64 only**: `dot_product`/`l2_distance_sq` check
-   `is_x86_feature_detected!("avx2")`/`"fma"` at call time and fall back to a portable
-   8-lane-unrolled scalar implementation otherwise. There is **no ARM/NEON code path** —
-   only `#[cfg(target_arch = "x86_64")]` SIMD kernels exist; any other architecture always
-   takes the portable path.
-3. **All three metrics return a "smaller is closer" distance, not a raw similarity score**:
-   `VectorMetric::IP` (inner product) returns `-dot_product(a, b)` specifically so that, like
-   `L2` and `Cosine`, a smaller returned value always means "more similar" — letting
-   `search_layer`'s single min/max-heap logic work identically regardless of metric.
-4. **Product Quantization codebooks are not trained on data.** `ProductQuantizer::new`
-   generates each subvector's 256 centroids deterministically: centroid 0 is the zero
-   vector, centroids `1..=d_sub` are positive unit basis vectors, `d_sub+1..=2*d_sub` are
-   negative unit basis vectors, and the remainder are filled by a fixed SplitMix64-style
-   hash of `(centroid_id, subvector_id, dim_id)` mapped into `[-1, 1]`. There is no k-means
-   or any training pass over real vectors — every `ProductQuantizer` for a given `(dim, m)`
-   produces byte-for-byte identical codebooks. Real PQ implementations cluster the actual
-   data distribution; this one does not, which will cost recall accordingly.
-5. **HNSW layer assignment is deterministic across index instances.** `HnswIndex::new`
-   seeds a custom xorshift64 PRNG (`rng_state`) with the fixed constant
-   `0x853c49e6748fea9b` every time — not from OS randomness, the clock, or the index name.
-   Two indexes built by inserting the same vectors in the same order will have identical
-   graph topology.
-
----
-
-## 3. High-Level Architecture & Workflow Diagram
-
-```
-Layer 2:  [Node A] ───────────────────────► [Node D]
-                      │                                 │
-       Layer 1:  [Node A] ──────► [Node B] ──────► [Node D]
-                      │              │                  │
-       Layer 0:  [Node A] ─► [N1] ─► [Node B] ─► [N2] ─► [Node D]
-```
-
----
-
-## 4. Performance Guarantees & Theoretical Complexity
-
-- Distance kernels are genuinely AVX2+FMA accelerated at 16 floats/iteration when the CPU
-  supports it, with a correct portable fallback otherwise — no unconditional `unsafe` on
-  unsupported hardware.
-- SQ8 scoring reuses the same AVX2 kernels against `u8` data, so approximate scoring during
-  graph traversal is not meaningfully slower per-comparison than exact float scoring.
-- No numbers in this document are benchmarked — the previous version's "\>3,500 vectors/sec",
-  "\<400µs p99", and "75% RAM reduction" figures were unsourced and have been removed rather
-  than repeated unverified. SQ8's memory reduction ratio (4 bytes/dim -> 1 byte/dim, i.e. 4x
-  smaller for the quantized copy, kept *alongside* the original `Vec<f32>` per §3's note) is
-  the one ratio derivable directly from the type definitions, not from measurement.
-
----
-
-## 5. Implementation References & Contributor Guide
-
-For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
-* [**`docs/internal/08_vector_engine.md`**](../internal/08_vector_engine.md): Low-level implementation and code reference.
-* **Source Files**: `src/vector.rs`
-
+**Further reading:** [`docs/internal/08_vector_engine.md`](../internal/08_vector_engine.md)
 
 ---
 
 ## Component 09: RediSearch Full-Text Engine & Reciprocal Rank Fusion
 
-## 1. Executive Summary & Problem Statement
+**Source files:** `src/search.rs`
 
-### 1.1 The Problem
-Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+**Purpose & problem statement.** A full-text/secondary-index engine needs to see writes from every shard (a
+document's fields can change from any core), which is in tension with a shared-nothing, per-shard storage
+model. Rudis supports `TEXT` (Okapi BM25), `TAG`, `NUMERIC` (balanced range tree), and `VECTOR` (brute-force
+cosine) fields via `FT.CREATE`/`FT.SEARCH`/`FT.AGGREGATE`, with lexical and vector results fusable via
+Reciprocal Rank Fusion.
 
-### 1.2 The Rudis Solution
-Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+**Key design choice — corrects a materially stale prior description.** The indexing model is genuinely
+**per-shard partitioned, not a single global lock**. Each index is stored twice: the real query-execution path
+is a per-shard partition (`ShardDb.search_indices: HashMap<String, InvertedIndex>`) — `Router::ft_search`
+queries the local partition first, then scatter-gathers to every other shard, each of which answers using only
+its own local partition. A process-wide mirror registry (`SEARCH_INDICES`, behind a real `RwLock`) exists
+purely for `FT.INFO`/metadata queries and as a defensive fallback — real lock contention exists only on that
+mirror, not on the per-shard query path. Document identity is a dense `u32` `DocId` with free-list reclamation
+on delete (`key_to_id`/`free_ids`), **not the document's string key** — deletion is O(terms in that document),
+not a vocabulary scan.
 
----
+**Key invariants.**
+- Automatic ingestion is restricted to `HSET`/`HMSET`/`JSON.SET` (root path) only — no deferred/background
+  indexing job, and other write paths (`SET`, `LPUSH`, …) never trigger re-indexing.
+- BM25 uses one whole-document length, not per-field lengths — `FieldType::Text.weight` is parsed by
+  `FT.CREATE` but never read anywhere in the scoring function, so declared field weights have no effect.
+- Vector KNN is exact brute-force (`O(indexed documents)` per query), not an HNSW lookup — there is no
+  `vector_index: Option<HnswIndex>` field anywhere in `InvertedIndex`.
 
-## 2. Contributor Mental Model & Architectural Principles
+**Performance characteristics.** Numeric range queries are genuinely sub-linear (a `BTreeMap`-backed range
+tree, O(log N + K)). Dual-write to the per-shard partition and the process-wide mirror roughly doubles
+indexing CPU/memory cost. `And`/`Or`/`Not` evaluation materializes a full intermediate result set per AST node
+rather than streaming or short-circuiting. Posting lists are uncompressed `Vec<Posting>` with no
+delta-encoding.
 
-### 2.1 The Mental Model
-Multi-field full-text and secondary index. Supports TEXT (Okapi BM25), TAG, and NUMERIC fields with a balanced RangeTree. FT.AGGREGATE executes multi-stage pipelines with reducers and arithmetic expressions.
+**Verified findings.** This session corrected a stale prior characterization of this subsystem as a single
+globally locked index registry with string-keyed postings; the actual, verified architecture is per-shard
+partitioned with dense integer document IDs, as described above.
 
-### 2.2 Design Rationale (The "Why")
-Standard search modules in Redis require dynamic C modules. Rudis natively integrates full-text search, sub-millisecond RangeTree numeric queries (O(log N + K)), and multi-shard scatter-gather aggregation.
-
-### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
-1. **Automatic Document Ingestion, but only for `HSET`/`HMSET`/`JSON.SET`**: every `HSET`,
-   `HMSET`, and `JSON.SET key $ ...` call in `connection.rs` calls
-   `crate::search::index_document_hook(key, str_fields)` after the write succeeds, converting
-   whatever field values it has into `HashMap<String, String>` and re-indexing that document
-   against every index whose prefix matches. Other write paths (`SET`, `LPUSH`, ...) do **not**
-   trigger re-indexing.
-2. **The index registry is a real, global, cross-shard-shared data structure — not
-   thread-local.** Despite this looking like a per-shard subsystem, `SEARCH_INDICES` is a
-   single process-wide `static LazyLock<RwLock<HashMap<String, Arc<RwLock<InvertedIndex>>>>>`.
-   Every shard thread that handles an `HSET`/`FT.SEARCH`/etc. call takes a real
-   `std::sync::RwLock` read or write lock on it. This is a genuine, deliberate exception to
-   the shared-nothing/zero-lock architecture — the same category of exception as `BlockHub`
-   (Component 06) — needed because a search index has to see writes from every shard, not just
-   the one that happens to own a given key's slot.
-3. **Deterministic Tokenization with a real (small) stop-word list and a heuristic stemmer**:
-   `tokenize_text` splits on non-alphanumeric characters, lowercases, drops any token in the
-   ~170-word `ENGLISH_STOP_WORDS` set, and optionally passes survivors through `simple_stem` — a
-   handful of suffix-stripping rules (`-ing`, `-ies`→`-y`, `-es`, `-ed`, trailing `-s`), not a
-   real Porter/Snowball stemmer.
-4. **Real BM25, but with a single whole-document length, not one length per field.** `DocMeta`
-   stores one `doc_len: usize` — the total token count across *all* indexed text fields of a
-   document combined — and `InvertedIndex::avg_doc_len()` is `total_terms / total_docs` across
-   the whole index, not per field. This is architecturally simpler than genuine multi-field
-   BM25F (which needs per-field lengths/weights) despite `FieldType::Text` carrying a `weight`
-   field — that `weight` is accepted by `FT.CREATE`'s parser but **`bm25_score` never reads
-   it** (verified: no reference to any field's `weight` anywhere in the scoring function).
-
----
-
-## 3. High-Level Architecture & Workflow Diagram
-
-```
-Query: FT.SEARCH idx "@price:[10 50] @brand:{apple}"
-                               │
-               ┌───────────────┴───────────────┐
-               ▼                               ▼
-       RangeTree: [10 50]              Tag Inverted Index
-       O(log N + K) B-Tree             Bitmap Intersection
-               │                               │
-               └───────────────┬───────────────┘
-                               ▼
-               Okapi BM25 Ranking & Aggregation Pipeline
-```
-
----
-
-## 4. Performance Guarantees & Theoretical Complexity
-
-- **Global `RwLock` contention, not per-shard isolation** (§2.2): every indexed write and every
-  `FT.SEARCH` call takes a real lock on the process-wide index (a write lock for indexing, a
-  read lock for search) — under concurrent writers across many shards to prefixed keys, this is
-  a real, shared contention point unlike the rest of the storage engine.
-- **`And`/`Or`/`Not` evaluation re-runs `execute_search` recursively per sub-clause** with
-  `limit: usize::MAX`, materializing a full intermediate `Vec<SearchHit>`/`HashMap` at every AST
-  node rather than streaming or short-circuiting — fine for the small corpora this has been
-  exercised against, not optimized for deep or wide boolean queries.
-- **No compression**: posting lists are plain `Vec<Posting>` (doc_id `String` + `u32` term
-  frequency + `Vec<u32>` positions per entry) — no delta-encoding, no compression, and the
-  tracked term `positions` are never actually read by anything (no phrase-query support uses
-  them).
-
----
-
-## 5. Implementation References & Contributor Guide
-
-For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
-* [**`docs/internal/09_redisearch.md`**](../internal/09_redisearch.md): Low-level implementation and code reference.
-* **Source Files**: `src/search.rs`
-
+**Further reading:** [`docs/internal/09_redisearch.md`](../internal/09_redisearch.md)
 
 ---
 
 ## Component 10: Kernel Bypass & Zero-Copy Networking
 
-## 1. Executive Summary & Problem Statement
+**Source files:** `src/xdp.rs, src/zerocopy.rs`
 
-### 1.1 The Problem
-Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+**Purpose & problem statement.** At very high packet rates, the Linux kernel's networking stack is a
+documented source of CPU overhead that true kernel-bypass networking (AF_XDP) is designed to eliminate. This
+subsystem does not perform real kernel bypass today and is not on the server's live network path — stated
+plainly in its own design document, not a criticism reconstructed after the fact.
 
-### 1.2 The Rudis Solution
-Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+**Key design choice.** `xdp.rs` implements the AF_XDP data structures — UMEM, fill/completion/Rx/Tx rings, a
+socket abstraction — as real, tested in-process Rust collections (`Vec`, atomics, `RwLock`), instantiated once
+per shard at boot and driven by a genuine background polling loop in `src/server.rs`. `zerocopy.rs`
+(`RegisteredBufferPool`, `ZeroCopyEngine`) implements real `MSG_ZEROCOPY`/`SO_ZEROCOPY` send primitives with
+correct fallback behavior. Neither module makes a real AF_XDP syscall, loads eBPF, or binds a physical
+interface; the only way real payloads enter either path is through explicit `XDP.*` admin commands.
 
----
+**Key invariants.**
+- `XdpMode` (`Driver`/`Skb`/`Simulated`) is cosmetic: it only changes what `XDP.INFO` reports as a string, and
+  `Driver` mode is never actually selected by any code path.
+- The CIDR rule table and per-source-IP token-bucket rate limiter are real, correct, O(small-N) userspace
+  logic — a testable filter-policy engine, just not connected to live traffic.
+- `zerocopy.rs`'s `send_zc` has zero callers outside its own unit tests anywhere in `src/`; the real connection
+  write path (`connection.rs`) does not use this module.
 
-## 2. Contributor Mental Model & Architectural Principles
+**Performance characteristics.** No line-rate, packets-per-second, or CPU-overhead figures are claimed for
+this subsystem — any such numbers would necessarily be invented, since nothing here sees real network traffic
+at scale.
 
-### 2.1 The Mental Model
-Hardware kernel bypass for line-rate networking. Ingress network frames bypass standard kernel socket stacks using AF_XDP (XSK) driver UMEM rings, pre-registered io_uring fixed buffers, and Linux SO_ZEROCOPY.
+**Verified findings.** No new correctness bugs. This session's verification corrected an earlier internal-doc
+revision that incorrectly claimed `XdpEngine` had no socket/ring/UMEM types at all — those types exist and are
+real, just disconnected from the live path.
 
-### 2.2 Design Rationale (The "Why")
-At millions of QPS, Linux kernel network stack overhead (sk_buff allocations, netfilter, page table walks) consumes up to 40% of CPU cycles. AF_XDP reads raw packets directly into userspace driver rings.
-
-### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
-1. **`XdpEngine` is a single global, not per-shard**: `get_xdp_engine()` returns a clone of an
-   `Arc<XdpEngine>` behind a process-wide `static GLOBAL_XDP_ENGINE: LazyLock<Arc<XdpEngine>>`
-   — every shard thread that calls `XDP.*` commands shares the exact same instance, coordinated
-   via `RwLock<Vec<XdpRule>>` and `RwLock<HashMap<u32, TokenBucket>>` (a real, if narrow,
-   exception to the shared-nothing model, similar in shape to `BlockHub` in Component 06).
-2. **`XdpMode` is cosmetic, not functional**: the global engine picks `XdpMode::Skb` if
-   `/sys/class/net` exists on the host, else `XdpMode::Simulated` — this only changes what
-   `XDP.INFO` reports as a string; it does not change `process_packet`'s behavior or attach
-   anything to a real interface in either mode.
-3. **`RegisteredBufferPool` owns raw allocated memory directly** (`alloc_zeroed`/`dealloc` via
-   `std::alloc`, not a `Vec`), page-aligned via `Layout::from_size_align(total_size, PAGE_SIZE)`,
-   with a manual `unsafe impl Send + Sync` — correct in isolation, but again: nothing in the
-   codebase actually constructs one outside its own test.
-4. **`ZeroCopyEngine::send_zc` degrades gracefully**: only applies `MSG_ZEROCOPY` for payloads
-   `>= PAGE_SIZE` (4KB, per a comment citing page-locking overhead for smaller sends), and on
-   `ENOBUFS` (kernel zero-copy completion queue full) or general zero-copy failure, retries once
-   with a plain blocking `send()` — this fallback logic is real and correct, it's just never
-   invoked by anything.
-
----
-
-## 3. High-Level Architecture & Workflow Diagram
-
-```
-NIC Hardware ──► eBPF XDP Driver ──► AF_XDP UMEM Ring ──► Worker Thread
-       (Bypasses standard Linux kernel network stack & socket buffers)
-```
-
----
-
-## 4. Performance Guarantees & Theoretical Complexity
-
-- **No measured network-layer performance benefit exists from either file.** `xdp.rs`'s cost is
-  whatever it costs to run `process_packet` once per `XDP.PACKET` command a client explicitly
-  sends — i.e., it's exercised at whatever rate a test or admin script chooses to call it, not
-  at line rate against real traffic. `zerocopy.rs` is entirely inert in the running server.
-- **The token-bucket rate limiter and CIDR rule table are real, correct, O(1)-per-packet
-  (rules are a linear scan, but the rule list is expected to be small) userspace logic** — useful
-  as a testable filter-policy engine, just not connected to anything that would make it a DDoS
-  defense in practice.
-- Any performance claims in the previous version of this document (100GbE line-rate, "28 million
-  packets/sec", "&lt;5% CPU utilization" for `MSG_ZEROCOPY`) were invented and have been removed;
-  none of it has ever been benchmarked because none of it runs on the real request path.
-
----
-
-## 5. Implementation References & Contributor Guide
-
-For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
-* [**`docs/internal/10_kernel_bypass_xdp.md`**](../internal/10_kernel_bypass_xdp.md): Low-level implementation and code reference.
-* **Source Files**: `src/xdp.rs, src/zerocopy.rs`
-
+**Further reading:** [`docs/internal/10_kernel_bypass_xdp.md`](../internal/10_kernel_bypass_xdp.md)
 
 ---
 
 ## Component 11: Redis Cluster Topology & Gossip Protocol
 
-## 1. Executive Summary & Problem Statement
+**Source files:** `src/cluster.rs`
 
-### 1.1 The Problem
-Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+**Purpose & problem statement.** Horizontal scaling requires partitioning the keyspace across independent
+nodes, redirecting misrouted clients, detecting and failing over dead nodes, and moving live data between
+nodes — all while remaining compatible with unmodified Redis Cluster clients. Rudis implements the standard
+16,384-slot/CRC16 model with `-MOVED`/`-ASK` redirection, gossip-based quorum failure detection, and
+majority-vote replica promotion.
 
-### 1.2 The Rudis Solution
-Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+**Key design choice.** The cluster bus intentionally runs on plain, synchronous `std::net::TcpStream`/
+`TcpListener` on dedicated OS threads — not `io_uring`/`monoio` — since it is a low-rate control-plane
+concern, separate from the thread-per-core data path. `ClusterHub` is process-wide shared state behind
+`RwLock`s/atomics (one per port, via a global registry), the same category of deliberate shared-nothing
+exception as `BlockHub` (Component 06) and the search-index mirror (Component 09).
 
----
+**Key invariants.**
+- Full-state gossip, not incremental: `cluster_bus_tick` resends the entire known node table to every peer on
+  every 500ms tick — O(peers²) bandwidth per tick, an explicit, acknowledged scalability boundary, not designed
+  or tested for hundreds of nodes.
+- Failure detection requires quorum corroboration: a peer is locally marked `"fail?"` after 5s of missed
+  PONGs, piggybacked in gossip to other nodes; escalation to a broadcast `"fail"` requires corroborating votes
+  from a strict majority of known masters — protecting against one node's own network partition causing a
+  false failover.
+- Replica promotion requires a genuine majority vote gated by monotonically increasing epochs (one vote per
+  epoch per master) — `CLUSTER FAILOVER FORCE` is the only way to bypass voting.
 
-## 2. Contributor Mental Model & Architectural Principles
+**Performance characteristics.** Slot migration is fully synchronous and sequential, not pipelined — keys are
+migrated in batches of 100 over a single connection, one migration at a time, despite `CLUSTER REBALANCE`
+accepting (but silently ignoring) a `PIPELINE` argument. The cluster bus opens a brand-new blocking `TcpStream`
+per peer per tick or handshake — "the opposite of the rest of Rudis's zero-copy, `monoio`-based data path,"
+acceptable only at control-plane rates.
 
-### 2.1 The Mental Model
-Decentralized cluster topology with a dedicated cluster bus port (port + 10000). 16,384 hash slots with dynamic slot state machine, gossip failure detection, and live shard migration.
+**Verified findings.** `CLUSTER SETSLOT`/`REBALANCE`/`RESHARD` perform a **genuine DUMP-and-replay of every
+key** in a migrating slot to the target node — a real data-path operation, not bookkeeping. This is distinct
+from (and more fully built out than) the Dragonfly-compatible `DFLYMIGRATE`/`DFLYCLUSTER` command family, which
+remains state-bookkeeping only ("no keys are read, serialized, or transferred" by that path) — a real
+correction against any prior characterization of Rudis's cluster migration as bookkeeping-only. Separately:
+slot-ownership/migration state is tracked in three independent places — `router.slot_states` (Component 04,
+per-shard), `ClusterHub.my_slots`/`.nodes` (gossip-populated), and `ClusterHub.slot_states` (a second,
+distinct migrating/importing tracker) — all three are genuinely consulted by different parts of the redirect
+path but do not share storage, a documented "latent source of future drift" related to, but distinct from,
+Component 04's two-routing-entry-point inconsistency.
 
-### 2.2 Design Rationale (The "Why")
-Provides transparent horizontal scaling across multiple physical nodes with standard Redis cluster client compatibility (-MOVED and -ASK redirects).
-
-### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
-1. **One `ClusterHub` per port, shared via a global registry**: `CLUSTER_HUBS:
-   LazyLock<RwLock<HashMap<u16, Arc<ClusterHub>>>>`. `get_cluster_hub(port)`
-   lazily creates and caches one `Arc<ClusterHub>` per port — this is process-wide
-   shared, mutex/rwlock-guarded state, not thread-local (a deliberate, narrow
-   exception to the shared-nothing model, same category as `BlockHub` in
-   Component 06).
-2. **Plain-text wire protocol, not binary framing**: every cluster-bus message
-   (`MEET`, `PING`, `FAIL`, `FAILOVER`, `FAILOVER_AUTH_REQUEST`,
-   `FAILOVER_ANNOUNCE`) is a `\r\n`-terminated space-separated ASCII line, parsed
-   with `split_whitespace()`. There is no binary struct, no magic-byte signature,
-   no `#[repr(C, packed)]` header of any kind.
-3. **Synchronous blocking I/O on dedicated OS threads, not `io_uring`/`monoio`**:
-   the cluster bus listener runs on its own `std::thread`, using plain
-   `std::net::TcpStream`/`TcpListener` with short (200-500ms) read/write
-   timeouts — completely separate from the rest of Rudis's async, io_uring-based
-   networking. Each inbound connection also gets its own `std::thread::spawn`.
-4. **Quorum-based failure detection with distributed gossip corroboration**: a peer is
-   locally marked `"fail?"` (PFAIL) after 5s of missed PONGs. That opinion is piggybacked
-   in gossip payloads to peer nodes, which record it in `pfail_reports: HashMap<String, HashSet<String>>`.
-   Escalation to confirmed `"fail"` requires corroborating PFAIL votes from a strict majority
-   of masters (`total_votes >= quorum`), at which point a `FAIL <node_id>` broadcast is sent to
-   notify all peers. If connectivity recovers, PFAIL opinions are retracted via gossip.
-5. **Replica election *is* a real majority vote**: `start_election` does send
-   `FAILOVER_AUTH_REQUEST` to every known master and only promotes itself after
-   collecting `>= (total_masters / 2) + 1` `FAILOVER_AUTH_ACK` replies, gated by
-   `last_vote_epoch` (one vote per epoch per master) — this part matches the
-   Architectural Purpose's claim, unlike the failure-detection consensus.
-
----
-
-## 3. High-Level Architecture & Workflow Diagram
-
-```
-Client ──► Node A (Slot 5000) ──► -MOVED 5000 Node-B:6379
-                                                │
-       Cluster Bus (Gossip PING/PONG) ──────────┘
-```
-
----
-
-## 4. Performance Guarantees & Theoretical Complexity
-
-- **Not zero-allocation, not io_uring-based**: every gossip tick and every
-  `CLUSTER MEET`/`FAILOVER` opens a brand-new blocking `TcpStream` per peer
-  (connect + write + read, each with its own 200-500ms timeout) on a plain OS
-  thread — the opposite of the rest of Rudis's zero-copy/`monoio` design.
-  Acceptable for a control-plane path that runs a few times a second, not
-  something to model the data-path invariants on.
-- **Full-state gossip, not incremental**: `cluster_bus_tick` re-sends the entire
-  known node table to every peer on every 500ms tick — bandwidth is O(peers²)
-  per tick, not the randomized-sample gossip real Redis Cluster uses. Fine at
-  small cluster sizes (a handful of nodes), not validated or designed for
-  hundreds of nodes despite what an earlier draft of this doc claimed about
-  "100-node cluster convergence."
-- **Failure detection is local and synchronous, not a distributed vote** (§2.4)
-  — a node can mark a peer `"fail"` purely from its own missed-PONG timer, with
-  no corroboration from other nodes, unlike the real replica-election step which
-  does require a genuine majority.
-
----
-
-## 5. Implementation References & Contributor Guide
-
-For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
-* [**`docs/internal/11_cluster_topology.md`**](../internal/11_cluster_topology.md): Low-level implementation and code reference.
-* **Source Files**: `src/cluster.rs`
-
+**Further reading:** [`docs/internal/11_cluster_topology.md`](../internal/11_cluster_topology.md)
 
 ---
 
 ## Component 12: CRDT Data Types & Manual Multi-Region Sync
 
-## 1. Executive Summary & Problem Statement
+**Source files:** `src/crdt.rs`
 
-### 1.1 The Problem
-Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+**Purpose & problem statement.** Active-active multi-region replication cannot rely on synchronous consensus
+without cross-region round-trip latency on every write, and naive last-write-wins merges can silently lose
+concurrent updates. Rudis exposes `LwwRegister`, `OrSet`, and `PnCounter` CRDTs ordered by a Hybrid Logical
+Clock (HLC), each with a mathematically commutative/associative/idempotent merge function.
 
-### 1.2 The Rudis Solution
-Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+**Key design choice.** Synchronization is entirely manual and operator-driven: there is no background peer
+discovery or automatic transport. A caller runs `CRDT.DUMP`, moves the bytes externally by whatever means it
+chooses, and calls `CRDT.MERGE` on the receiving side. `CrdtStore` is a store parallel to the main keyspace —
+CRDT values are not `RudisValue` variants and share none of the main keyspace's TTL/eviction machinery.
 
----
+**Key invariants.**
+- Every merge function is genuinely commutative/associative/idempotent, exercised by dedicated convergence unit
+  tests (`test_lww_register_convergence`, `test_pn_counter_convergence`, `test_orset_add_wins`).
+- `OrSet` is add-wins: `remove` only tombstones the specific add-tags it has observed so far, so a concurrent,
+  not-yet-seen add survives a merge.
+- The HLC advances via a lock-free compare-exchange retry loop, not a mutex.
+- Tombstones are not reclaimed automatically — only an explicit `CRDT.GC [ttl_ms]` call prunes them; nothing
+  in `server.rs` schedules this.
 
-## 2. Contributor Mental Model & Architectural Principles
+**Performance characteristics.** `export_sync_payload`/`CRDT.DUMP` is O(total CRDT state size) and
+single-threaded — there is no incremental/delta export; every call re-serializes the entire store into one flat
+buffer.
 
-### 2.1 The Mental Model
-Conflict-Free Replicated Data Types for active-active multi-region replication. Hybrid Logical Clocks (HLC) provide causal ordering without dependency on synchronized physical clocks.
+**Verified findings.** CRDT writes are **not** appended to the AOF and **not** streamed to connected PSYNC
+replicas — `command_to_resp` (Component 14) has no match arm for any `Command::Crdt*` variant. A node's CRDT
+state today survives only in memory plus whatever external process runs `CRDT.DUMP`/`CRDT.MERGE`; a restart or
+failover loses it. This is a real, verified gap, not a documented design trade-off.
 
-### 2.2 Design Rationale (The "Why")
-Cross-region replication cannot rely on global consensus without incurring multi-hundred-millisecond write latencies. CRDTs allow local writes to commit instantly and merge deterministically across regions.
-
-### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
-1. **Deterministic Convergence (real, and tested)**: `LwwRegister::merge`, `OrSet::merge`,
-   and `PnCounter::merge` are each commutative/idempotent by construction (see §4) — the
-   file's own `#[cfg(test)]` module (`test_lww_register_convergence`,
-   `test_pn_counter_convergence`, `test_orset_add_wins`) exercises exactly this.
-2. **HLC via lock-free CAS, not a mutex**: `HybridLogicalClock` stores
-   `latest_physical_ms: AtomicU64` / `latest_logical: AtomicU32` and advances them with a
-   compare-exchange retry loop (§4.1) — real lock-free code, not a fabrication.
-3. **Add-Wins semantics for `OrSet`**: a concurrent add and remove of the same element
-   resolve in favor of the add, because `remove` only tombstones the specific add-tags
-   (`HlcTimestamp`s) it has *observed so far* — a later add carries a fresh tag the remove
-   never saw, so it survives merge. Verified by `test_orset_add_wins`.
-4. **No consensus, because there's no network layer to reach consensus over**: with sync
-   entirely manual (§1), there's no Paxos/Raft and also no automatic conflict detection —
-   whoever runs `CRDT.MERGE` decides when and with what payload merging happens.
-
----
-
-## 3. High-Level Architecture & Workflow Diagram
-
-```
-Region US-East (Write k=v1 at HLC_1) ──┐
-                                              ├──► Deterministic LWW Merge
-       Region EU-West (Write k=v2 at HLC_2) ──┘    (HLC_2 > HLC_1 wins)
-```
-
----
-
-## 4. Performance Guarantees & Theoretical Complexity
-
-- **Lock-free clock advancement**: `HybridLogicalClock::now`/`update` use CAS retry loops,
-  not a mutex — cheap even under contention from multiple connections on the same shard.
-- **Export is O(total CRDT state size) and single-threaded**: `export_sync_payload` builds
-  one `Vec<u8>` for the *entire* store in one call; there's no incremental/delta export —
-  every `CRDT.DUMP` re-serializes everything currently held.
-- **No network cost inside Rudis**: since sync is manual (§1), there's no WAN traffic,
-  retry logic, or delta-batching to account for here at all — that cost (if any) lives
-  entirely in whatever external process actually transports the dump/merge payloads.
-
----
-
-## 5. Implementation References & Contributor Guide
-
-For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
-* [**`docs/internal/12_crdt_types.md`**](../internal/12_crdt_types.md): Low-level implementation and code reference.
-* **Source Files**: `src/crdt.rs`
-
+**Further reading:** [`docs/internal/12_crdt_types.md`](../internal/12_crdt_types.md)
 
 ---
 
 ## Component 13: Lua Scripting & Redis 7 Functions Engine
 
-## 1. Executive Summary & Problem Statement
+**Source files:** `src/scripting.rs`
 
-### 1.1 The Problem
-Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+**Purpose & problem statement.** Read-modify-write and multi-step business logic implemented purely via
+client round-trips is slow and non-atomic. An embedded Lua 5.4 interpreter (`mlua`) executes `EVAL`/`EVALSHA`
+scripts and Redis 7 `FUNCTION`/`FCALL` libraries entirely on the connection's local shard, with `redis.call`
+bridging back into the same command-execution path (`execute_local_command`) as ordinary traffic — atomicity
+falls out of the shard's single-threaded event loop for free, with no explicit lock.
 
-### 1.2 The Rudis Solution
-Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+**Key design choice, stated plainly by the design doc itself: Rudis's Lua environment is not sandboxed.**
+Each invocation constructs a fresh `mlua::Lua::new()` with the full default standard library present (`os`,
+`io`, `package`, `debug` all available), no instruction/time limit, and no `SCRIPT KILL`. `EVAL`/`EVALSHA`/
+`FCALL` should be treated as requiring the same trust level as direct shell access.
 
----
+**Key invariants.**
+- Fresh interpreter per call, no persistent VM or bytecode cache — only the script's **source text** is
+  cached, keyed by SHA1, in a process-wide `RwLock<HashMap<String, String>>`.
+- Scripts and functions never route based on `KEYS` — `EVAL`/`EVALSHA`/`FCALL` always execute on the
+  connection's local shard; a script touching a key belonging to a different shard silently operates on the
+  wrong shard's slot for that key rather than erroring.
+- `SCRIPT_CACHE`/`FUNCTION_LIBS` are process-wide, not per-shard — a script loaded on one shard's connection is
+  immediately visible to calls arriving on any other shard.
+- Every write a script performs via `redis.call` is independently AOF-logged and replicated as its own
+  constituent command (effects replication), matching modern Redis's default behavior.
 
-## 2. Contributor Mental Model & Architectural Principles
+**Performance characteristics.** `FUNCTION LOAD` registers function names via a one-time discovery pass, but
+`FCALL` **re-executes the entire library's top-level source on every call** in a fresh interpreter — there is
+no cached, ready-to-invoke closure between calls.
 
-### 2.1 The Mental Model
-Embedded Lua 5.4 runtime via mlua. Supports transient scripts (EVAL, EVALSHA) and persistent Redis 7 function libraries (FUNCTION LOAD, FCALL) with sandboxed standard library.
+**Verified findings.** No data-loss bugs were identified. The absence of sandboxing and per-call full-library
+re-execution are both real, verified, and load-bearing operational characteristics documented above rather than
+newly discovered defects.
 
-### 2.2 Design Rationale (The "Why")
-Atomic multi-operation transactions and server-side business logic require script execution without client round-trips. Redis 7 functions provide first-class, versioned library management.
-
-### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
-1. **Fresh interpreter per call, no persistent VM or bytecode cache.** `eval_script` and
-   `call_function` both call `Lua::new()` at the top and let it drop at the end of the
-   function. There is nothing analogous to the old doc's `ScriptEngine`/`script_cache:
-   HashMap<String, Vec<u8>>` (compiled bytecode) — what's cached is the **script's source
-   text**, keyed by its SHA1 hex digest, in a global `RwLock<HashMap<String, String>>`.
-2. **No sandboxing.** Grepping the file for `io`/`os`/`debug`/`package` global stripping
-   finds nothing — `mlua::Lua::new()` is used unmodified, so a script has full access to
-   whatever the default Lua 5.4 standard library exposes (the old doc's "Security
-   Sandboxing" invariant does not exist in the real code).
-3. **Deterministic execution w.r.t. the shard, by construction, not by an explicit lock.**
-   Because `redis.call`/`redis.pcall` synchronously call `crate::connection::
-   execute_local_command` against the same `Rc<RefCell<ShardDb>>` the calling connection
-   task already holds, and Rudis's per-core execution model means nothing else touches
-   that `RefCell` concurrently, a script's commands execute atomically relative to other
-   traffic on the shard for free — not because scripting.rs added any synchronization of
-   its own.
-4. **Global, cross-shard-visible caches.** Both `SCRIPT_CACHE` (source by SHA1) and
-   `FUNCTION_LIBS` (function libraries) are `static LazyLock<RwLock<HashMap<...>>>` —
-   process-wide, not per-shard. A script loaded via `SCRIPT LOAD`/`FUNCTION LOAD` on one
-   shard's connection is immediately visible to `EVALSHA`/`FCALL` calls arriving on any
-   other shard, because it's the same global map — this is a deliberate (if easy-to-miss)
-   departure from the rest of the codebase's thread-local, shared-nothing design.
-
----
-
-## 3. High-Level Architecture & Workflow Diagram
-
-```
-Client ──► FCALL my_lib:my_func ──► Lua 5.4 VM (mlua) ──► redis.call() ──► ShardDb
-```
-
----
-
-## 4. Performance Guarantees & Theoretical Complexity
-
-- **No bytecode caching, despite the SHA1 cache's name.** `SCRIPT_CACHE` only saves
-  re-transmission of the script *text* for `EVALSHA`; Lua source is re-parsed by `mlua` on
-  every single `EVAL`/`EVALSHA` call, and a fresh `Lua::new()` VM is constructed and torn down
-  per call — there is no persistent interpreter or precompiled-chunk reuse the old doc's
-  "Bytecode Caching" section claimed.
-- **In-process, zero-IPC command execution**: real and accurate from the old doc — `redis.call`
-  invokes `execute_local_command` directly against the shard's own `Rc<RefCell<ShardDb>>`,
-  with no network or channel hop, since scripts only ever run against the local shard.
-- **Process-wide global locks on every script/function load or lookup**: `SCRIPT_CACHE`/
-  `FUNCTION_LIBS` are `RwLock`s taken on every `EVAL` (write lock, unconditionally, via
-  `load_script`), `EVALSHA` (read lock), and `FCALL` (read lock) — a real (if narrow and
-  presumably low-contention) departure from the rest of the codebase's lock-free, thread-local
-  design, shared with the `BlockHub` exception documented in Component 06/01.
-
----
-
-## 5. Implementation References & Contributor Guide
-
-For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
-* [**`docs/internal/13_scripting_functions.md`**](../internal/13_scripting_functions.md): Low-level implementation and code reference.
-* **Source Files**: `src/scripting.rs`
-
+**Further reading:** [`docs/internal/13_scripting_functions.md`](../internal/13_scripting_functions.md)
 
 ---
 
 ## Component 14: Persistence & Replication Engines
 
-## 1. Executive Summary & Problem Statement
+**Source files:** `src/replication.rs, src/aof.rs`
 
-### 1.1 The Problem
-Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+**Purpose & problem statement.** A datastore needs both durability across restarts and a warm replica copy,
+without entangling the two or paying Redis's `fork()`-based copy-on-write risk on a large, busy dataset. Every
+mutating command is serialized to canonical RESP once (`command_to_resp`), then independently handed to the
+local AOF writer and to replica fan-out — a node can run AOF-only, replication-only, both, or neither.
 
-### 1.2 The Rudis Solution
-Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+**Key design choice.** Full-dataset transfer (RDB save, initial replica sync) uses no `fork()`: the
+coordinating shard serializes its own data first, then messages each other shard in turn over the existing
+cross-shard mailbox, holding only one shard's chunk in memory at a time. Two wire-compatible master-side
+replication paths exist: standard `PSYNC` (full resync via RDB-shaped blob, or partial resync via a genuine
+fixed-capacity ring-buffer backlog) and a Dragonfly-compatible `DFLY FLOW` per-shard streaming handshake
+(master-side only — Rudis's own replica only ever speaks `PSYNC`).
 
----
+**Key invariants.**
+- `BGREWRITEAOF` is real and synchronous-per-shard: an atomic temp-file rename plus a directory fsync, with
+  remote shards rewritten sequentially (not concurrently) to bound peak memory during compaction.
+- Partial resync is real on both sides: the master answers `+CONTINUE <replid>` with just the backlog diff
+  when the requested offset is still in the retained window, else falls back to `+FULLRESYNC`.
+- Any command without an explicit `command_to_resp` match arm is invisible to *both* AOF and replication —
+  this is the mechanism behind Component 12's CRDT-write gap.
+- `ReplicationHub` is shared, cross-thread state (`Arc`/`RwLock`/atomics) looked up per port — a second,
+  independent exception (alongside `BlockHub`) to the zero-lock architecture, needed because a write on any
+  shard must reach every connected replica.
 
-## 2. Contributor Mental Model & Architectural Principles
+**Performance characteristics.** AOF write cost is O(1) amortized per command; file size and restart replay
+time both grow unboundedly with lifetime write volume until an explicit `BGREWRITEAOF` compacts — nothing
+compacts automatically. The replication backlog size and AOF fsync cadence are compile-time constants, not
+runtime-configurable (no `appendfsync always/everysec/no` policy choice exists).
 
-### 2.1 The Mental Model
-Fork-less streaming snapshots and parallel multi-flow TCP replication. Replicas open N parallel TCP connections (DFLY FLOW), streaming mutations directly from worker cores with zero locks.
+**Verified findings.** **`RudisValue::Tiered` values (keys currently offloaded to NVMe by Component 07) are
+serialized as zero payload bytes during both `SAVE`/`BGSAVE` (RDB) and `BGREWRITEAOF`.** The serialization match
+arm for `RudisValue::Tiered` writes nothing at all — not even a type tag — while the key's length and bytes are
+still written ahead of it; this desynchronizes the reader's cursor for everything that follows in that shard's
+chunk. This is a genuine, currently-unhandled data-loss/corruption edge case affecting any deployment that
+saves or compacts while tiered storage is active, not a hypothetical one. Separately: **the classic
+`save <seconds> <changes>` autosave directive is parsed and stored verbatim in Rudis's config parser, but no
+code path in `router.rs` or `server.rs` ever reads it to schedule an automatic `BGSAVE`** — the directive is
+accepted without a parse error but has no runtime effect; there is currently no automatic, save-point-triggered
+background snapshotting in Rudis.
 
-### 2.2 Design Rationale (The "Why")
-Redis fork() triggers catastrophic copy-on-write memory doubling and main thread stalls. Funneling replication through a single TCP socket bottlenecks multi-core servers. Rudis streams snapshots sequentially and replicates in parallel.
-
-### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
-1. **AOF compaction via `BGREWRITEAOF` is supported.** `AofWriter::append` grows `self.buffer`
-   (later flushed to disk via `write_all_at` at the current end-of-file `offset`). Periodic
-   or explicit `BGREWRITEAOF` snapshots memory state to a temporary file, syncs it, atomically
-   renames it to replace the AOF file, and reopens `AofWriter` on the new file at the new offset.
-2. **Partial resync is supported on both master and replica sides.**
-   `run_master_replica_stream` (`src/connection.rs`) inspects the `PSYNC` command's
-   replid/offset arguments via `ReplicationHub::try_partial_resync`, and replies `+CONTINUE <replid>\r\n<backlog-diff-bytes>`
-   when the requested offset falls inside the retained backlog window for a matching
-   replid (or `replid2`), falling back to `+FULLRESYNC <replid> <offset>\r\n$<len>\r\n<rdb-bytes>` otherwise
-   (§4.3). `run_replica_worker` tracks its `master_repl_offset` and `master_replid`, sending
-   `PSYNC <cached_replid> <cached_offset>` on reconnects, receiving `+CONTINUE`, and executing
-   the backlog diff commands without requesting a full RDB snapshot.
-3. **The replication backlog is maintained, and now genuinely read back — by the master
-   serving a partial resync.** `ReplicationHub::propagate` still appends every propagated
-   command to `self.backlog` (a `ReplicationBacklog`), and that data is no longer write-only:
-   `try_partial_resync`/`ReplicationBacklog::get_diff` (§4.3) slice it to answer a
-   `+CONTINUE` request. It's also still consulted for `INFO replication`'s `repl_backlog_*`
-   fields, as before.
-4. **Replication uses shared, cross-thread state (`Arc`/`RwLock`), unlike the request path.**
-   `ReplicationHub` is looked up via `get_replication_hub(port)` from a process-wide
-   `LazyLock<RwLock<HashMap<u16, Arc<ReplicationHub>>>>` — every shard on a given port shares
-   the *same* hub instance, guarded by `RwLock`s and atomics throughout. This is a second,
-   independent exception to the "zero locks" architecture (the first being the blocking-op
-   `BlockHub` documented in Component 06), needed because replication fan-out is inherently
-   cross-shard: any shard's write must reach every connected replica, not just the shard that
-   handled it.
-5. **AOF writing and replication propagation are decoupled but both driven from the same
-   call site.** `record_mutation` (in `replication.rs`) is the single function that both
-   appends to a shard's local `AofWriter` (if present) and calls `propagate_bytes` — but nothing
-   requires both to be enabled together; a node can run with AOF on and no replicas, or
-   replication with AOF disabled, independently.
-
----
-
-## 3. High-Level Architecture & Workflow Diagram
-
-```
-Master Worker Core 0 ──(DFLY FLOW 0)──► Replica Worker Core 0
-       Master Worker Core 1 ──(DFLY FLOW 1)──► Replica Worker Core 1
-       (Parallel zero-lock streaming direct from worker cores)
-```
-
----
-
-## 4. Performance Guarantees & Theoretical Complexity
-
-- **AOF write cost is O(1) amortized per command**, bounded by the 50ms/~1s flush-fsync
-  cadence — but **AOF file size and restart replay time are both unbounded** relative to
-  total lifetime write volume, since nothing ever compacts the file (§4.1). A long-running,
-  write-heavy node with AOF enabled will have an ever-growing file and an ever-growing
-  startup replay cost.
-- **Full resync still re-transfers the entire dataset** via `generate_full_rdb` (fans out to
-  every shard, waits for all chunks) — but this is no longer the *only* path (§4.3): a
-  client presenting a still-in-backlog offset gets a `+CONTINUE` and just the missing bytes
-  instead. The catch, per §4.3, is that this codebase's own replica never actually asks for
-  the cheap path — a rudis-to-rudis pair still pays full-dataset-transfer cost on every
-  reconnect today, even though the master is capable of doing better.
-- **Replication fan-out itself is cheap per write**: `propagate` is an `O(num_replicas)`
-  loop of non-blocking `flume` sends per mutating command, independent of dataset size.
-
----
-
-## 5. Implementation References & Contributor Guide
-
-For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
-* [**`docs/internal/14_persistence_replication.md`**](../internal/14_persistence_replication.md): Low-level implementation and code reference.
-* **Source Files**: `src/replication.rs, src/aof.rs`
-
+**Further reading:** [`docs/internal/14_persistence_replication.md`](../internal/14_persistence_replication.md)
 
 ---
 
 ## Component 15: Security, Memory Allocator & TLS
 
-## 1. Executive Summary & Problem Statement
+**Source files:** `src/acl.rs, src/allocator.rs, src/tls.rs`
 
-### 1.1 The Problem
-Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+**Purpose & problem statement.** Production deployments need per-user credentials and command/key-level
+authorization, allocator visibility under a workload of many small short-lived allocations, and encrypted
+client connections. A per-port `AclManager` enforces real authentication and authorization; `jemalloc` (with a
+thread-local `SmallCollectionArena` recycling pool layered on top) is the global allocator; `rustls` terminates
+TLS on an optional dedicated port.
 
-### 1.2 The Rudis Solution
-Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+**Key design choice.** `AclManager` lives behind `PORT_ACLS: LazyLock<Mutex<HashMap<u16, Arc<RwLock<...>>>>>`
+— one manager per listening port, shared by every shard on that port, the same category of deliberate
+shared-nothing exception as `BlockHub` (Component 06). Every command after authentication takes a real
+`can_execute_command`/`can_access_key` check; a denied command gets a real `-NOPERM` reply, and the
+squash-eligibility path falls back to the sequential path (where the denial actually fires) rather than
+silently allowing a denied command through.
 
----
+**Key invariants.**
+- Passwords are hashed (SHA1 with a fixed, hardcoded salt) but plaintext storage was **not removed** —
+  `ACL SETUSER user >password` still pushes the plaintext into `passwords` *and* the hash into
+  `password_hashes`, and `check_auth` accepts either. SHA1 is a fast general-purpose hash, not a slow
+  work-factor KDF (Argon2/bcrypt/scrypt) — offline brute force is cheap, and the single shared salt makes a
+  precomputed rainbow table viable across every user and deployment.
+- `CONFIG SET requirepass <pw>` mutates the default user's password fields directly but never calls
+  `AclManager::set_user` — it never sets `HAS_CUSTOM_ACL` and never clears the default user's `nopass` flag,
+  so auth enforcement is **not** actually turned on by `requirepass` alone (via `CONFIG SET` or the config-file
+  directive); only an explicit `ACL SETUSER default ... >password` reliably enforces auth.
+- ACL command *categories* (`+@read`/`-@write`) and pub/sub channel patterns (`&channel:*`) are parsed as
+  accepted tokens but have no effect — only individual command names and simple key-prefix patterns are
+  actually enforced.
 
-## 2. Contributor Mental Model & Architectural Principles
+**Performance characteristics.** Auth check cost is one `RwLock` read plus a linear scan over 0–1 password
+entries plus one SHA1 computation — negligible, paid once per connection. Real per-command ACL overhead now
+exists: every command after auth takes a read-lock and a hash-set lookup, small but no longer zero.
 
-### 2.1 The Mental Model
-Granular Access Control Lists (ACLs), per-core jemalloc memory telemetry, and rustls TLS 1.2/1.3 handshakes offloaded to Linux kernel TLS (kTLS / TCP_ULP).
+**Verified findings.** TLS is genuinely wired up end-to-end for the safe `rustls` path — the handshake is a
+correct async adaptation of the rustls handshake loop, not dead code. **But the kTLS offload fast path has a
+critical, live bug: it silently transmits application data in plaintext.** `enable_ktls` performs only the
+first of two required `setsockopt` calls (`TCP_ULP`, attaching the kernel TLS module) — this succeeds on
+essentially any modern Linux host regardless of whether key material was ever installed, so `is_ktls_active`
+becomes `true` on real deployments. The second, actually-required call that installs the negotiated
+cipher/key/IV into the kernel socket does not exist. Once `is_ktls_active` is set, `read_plaintext`/
+`write_plaintext` read/write the raw socket directly with **no rustls encryption at all**, while both client
+and server believe a real TLS session is active because the handshake itself genuinely succeeded. This is
+worse than TLS simply being absent: enabling `--tls-port` today produces a working handshake followed by
+silent plaintext for anyone who trusts it.
 
-### 2.2 Design Rationale (The "Why")
-Enterprise cloud deployments require per-user permissions, TLS wire encryption, and deep allocator visibility. kTLS offloads AES-GCM cipher processing to kernel hardware pipelines for zero-copy transmission.
-
-### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
-1. **One `AclManager` per listening port, not global**: `PORT_ACLS: LazyLock<Mutex<HashMap<u16, Arc<RwLock<AclManager>>>>>`, looked up via `get_acl_for_port(port)`. Every shard thread serving the same port shares the same `Arc<RwLock<AclManager>>` — this is, like `BlockHub` (Component 06), a deliberate exception to the shared-nothing/zero-lock architecture, needed because auth state has to be consistent across every shard's independently-accepted connections on that port.
-2. **Authentication is enforced, and authorization is now real too (updated).** `execute_command` gates on `authenticated: bool` exactly as before (`-NOAUTH` for anything but `AUTH`/`HELLO`/`QUIT` while unauthenticated), but immediately after that gate it now looks up the authenticated user's `AclUser` by `auth_user` and calls two new real methods before dispatching: `can_execute_command(cmd_name)` (checks `disallowed_commands`/`allowed_commands` depending on `all_commands`, always allowing `PING`/`RESET`/`QUIT`/`AUTH`/`HELLO`) and, if the command has a primary key, `can_access_key(key)` (checks `allowed_key_patterns`, a `prefix*`/exact-match list, unless `all_keys`). A denied command gets a real `-NOPERM` reply and returns without executing (§4.1). The pipelined squash-eligibility check (`execute_commands_squashed`) also consults these two methods per command — a command an ACL would deny just falls back to the sequential path, where the real `-NOPERM` denial happens.
-3. **Passwords are now hashed, but plaintext storage was not removed — this is a real gap, not full resolution.** `AclUser` gained a `password_hashes: Vec<String>` field, and `hash_password` computes `SHA1("rudis_acl_salt_v1:" + password)`. But `ACL SETUSER user >password` still pushes the plaintext into `passwords` *and* the hash into `password_hashes` (§4.2) — the plaintext field was never removed, so anyone who could previously read plaintext passwords from memory/a core dump still can. The hash itself is also weak by password-hashing standards: SHA1 is a fast general-purpose hash (not a slow KDF like Argon2/bcrypt/scrypt, so no work-factor resistance to offline brute force), and the salt (`"rudis_acl_salt_v1:"`) is a single hardcoded constant shared by every user and every deployment, not a per-user random salt — identical passwords across users or across a fleet of Rudis instances produce identical hashes, and the fixed salt is trivially precomputable into a rainbow table once known. `check_auth` accepts a match against either the plaintext or the hash (`§4.1`), so both weaknesses are live simultaneously.
-4. **TLS is now genuinely wired up — and its kTLS fast-path has a real, severe bug: it silently transmits plaintext.** A `--tls-port` listener now exists (§4.4) and performs a real `rustls` handshake via `TlsSession::handshake_monoio`. After a successful handshake, it unconditionally attempts `enable_ktls`, which only calls `setsockopt(IPPROTO_TCP, TCP_ULP, "tls")` — attaching the kernel's TLS upper-layer-protocol module — and, if that syscall merely *succeeds* (which it will on any Linux host with the `tls` kernel module loadable, regardless of whether any key material was ever installed), sets `is_ktls_active = true`. Both `TlsSession::read_plaintext` and `write_plaintext` then branch on `is_ktls_active`: when true, they read/write **raw socket bytes directly, with no rustls encryption/decryption at all**, on the assumption the kernel is doing it. But the second, actually-required `setsockopt(SOL_TLS, TLS_TX/TLS_RX, ...)` call that installs the negotiated key into the kernel socket is still missing (this exact gap was already flagged when the code was dead — see §4.4) — so the kernel never encrypts anything, and **every byte of application data after the handshake goes out on the wire in cleartext**, while both client and server believe they completed a real TLS session. This is worse than TLS simply not existing: a client connecting to `--tls-port` gets a real, correctly-negotiated handshake and then a false sense of security for the rest of the connection.
-5. **Allocator stats are read-only telemetry**, gated behind no lock beyond jemalloc's own internal epoch counter (`tikv_jemalloc_ctl::epoch::advance()`), safely callable from any thread without coordination with the rest of Rudis.
-
----
-
-## 3. High-Level Architecture & Workflow Diagram
-
-```
-Client TLS Handshake ──► rustls (Userspace) ──► Linux kTLS (TCP_ULP) ──► Zero-Copy Wire
-```
-
----
-
-## 4. Performance Guarantees & Theoretical Complexity
-
-- **Auth check cost**: one `RwLock::read()` acquisition plus a linear scan over `passwords`/`password_hashes` (typically 0-1 entries each) plus one SHA1 computation per `AUTH` call — negligible, and only paid once per connection lifetime in the common case.
-- **Real per-command ACL overhead now exists (updated)**: every command after authentication takes an `AclManager` read-lock and a `HashMap`/`HashSet` lookup via `can_execute_command`/`can_access_key` (§4.1) — small, but no longer zero as the old doc stated; this is a real, permanent per-command cost on every connection now, not just at `AUTH` time.
-- **Allocator stats are cheap but not free**: unchanged — `epoch::advance()` triggers jemalloc to refresh its internal counters, more than a simple atomic load; only invoked from `INFO`, not a hot-path command.
-- **TLS has real handshake and per-byte I/O cost now that it's wired up**: the `rustls` handshake (§4.4) is genuine CPU work paid once per TLS connection; ongoing traffic either goes through real `rustls` encrypt/decrypt (the safe, intended path) or — per the §4.4 bug — bypasses encryption entirely once `is_ktls_active` is (incorrectly) set, which is *faster* than real encryption precisely because it isn't doing any. Do not read that speed as a feature.
-
----
-
-## 5. Implementation References & Contributor Guide
-
-For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
-* [**`docs/internal/15_security_tls.md`**](../internal/15_security_tls.md): Low-level implementation and code reference.
-* **Source Files**: `src/acl.rs, src/allocator.rs, src/tls.rs`
-
+**Further reading:** [`docs/internal/15_security_tls.md`](../internal/15_security_tls.md)
 
 ---
 
 ## Component 16: JSON Document Store & JSONPath Engine
 
-## 1. Executive Summary & Problem Statement
+**Source files:** `src/json.rs`
 
-### 1.1 The Problem
-Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+**Purpose & problem statement.** Bolting a JSON document type onto Redis normally requires a dynamically
+loaded C module (RedisJSON). `JsonStore` is a native, per-shard `HashMap<Bytes, serde_json::Value>` alongside
+the main keyspace, with a hand-rolled JSONPath engine supporting field/index/wildcard/slice selectors and
+in-place, auto-vivifying mutations.
 
-### 1.2 The Rudis Solution
-Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+**Key design choice.** The JSONPath implementation is real but deliberately partial: `$`, `.field`, `[idx]`
+(including negative indices), `[*]` wildcards, `[start:end]` slices, and quoted field names are supported, but
+there is **no recursive descent (`$..field`) and no filter-expression syntax (`?(@.price < 10)`)** — a path
+using either silently matches nothing rather than erroring.
 
----
+**Key invariants.**
+- Whole-document storage: one complete `serde_json::Value` tree per key; `JSON.GET` always re-serializes the
+  matched subtree fresh via `serde_json::to_string`, with no cached serialized form or memoization.
+- Auto-vivification happens on `SET`, not on read; `NX`/`XX` are checked once up front against whether the
+  target path already resolves to something.
+- `query_json_path`/`query_json_path_mut` are hand-duplicated for immutable/mutable access — a real, verified
+  duplication with no stated rationale; a bugfix to one traversal rule must be applied to both copies by hand.
 
-## 2. Contributor Mental Model & Architectural Principles
+**Performance characteristics.** `JSON.GET` cost scales with matched-subtree size, not query specificity (no
+memoization). Path traversal is O(document breadth) per segment for `Wildcard`/`Slice` segments (no path
+index), though plain `Field` lookups are O(1).
 
-### 2.1 The Mental Model
-Native RFC 8259 document store. Supports recursive JSONPath selectors ($..*, [*], array slices) and in-place atomic mutations without full document deserialization.
+**Verified findings.** `JSON.NUMMULTBY` silently fails on multi-match wildcard paths: because it is composed
+from two `JSON.NUMINCRBY` calls and parses the intermediate result as a single `f64`, a path matching more than
+one node returns a bracketed multi-value string that fails to parse, so the command errors instead of
+multiplying every match — even though the equivalent `JSON.NUMINCRBY` on the same path works correctly.
+`JSON.SET` can silently destroy a differently-typed intermediate value while auto-vivifying a deep path: an
+existing-but-wrong-type intermediate element is overwritten with a fresh empty container rather than raising an
+error. `JSON.MGET` is dispatched sequentially, one shard round-trip per key, unlike the bucketed fan-out
+`MGET`/`MSET` received. `JsonStore` is excluded from RDB persistence entirely — JSON documents do not survive a
+restart via `SAVE`/`BGSAVE` (the same gap Component 08's vector indexes have).
 
-### 2.2 Design Rationale (The "Why")
-External JSON modules in Redis require dynamic C loading. Rudis natively supports JSON.SET, JSON.GET, and sub-path mutations with zero proxy latency.
-
-### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
-1. **A real, but partial, JSONPath implementation.** `parse_json_path` hand-parses `$`, bare
-   `.field` traversal, `[idx]` (including negative indices), `[*]` wildcards, `[start:end]`
-   slices (including negative/omitted bounds), and `["quoted"]`/`['quoted']` field names. There
-   is **no recursive descent (`$..field`) and no filter-expression syntax (`?(@.price < 10)`)**
-   — both real RedisJSON/JSONPath features. A path using either silently fails to match
-   anything (parses as a literal field name containing those characters) rather than erroring.
-2. **Whole-document storage, no incremental structure.** `JsonStore.docs: HashMap<Bytes,
-   Value>` stores one complete `serde_json::Value` tree per key. A `JSON.SET`/`NUMINCRBY`/etc.
-   on a deeply nested path still has to parse the target's own sub-value in place (via
-   `query_json_path_mut`, no full-document re-parse), but `JSON.GET` always calls
-   `serde_json::to_string` fresh on whatever subtree matched — there's no cached serialized
-   form, and a `JSON.GET key $` on a huge document re-serializes the entire thing every call.
-3. **`query_json_path`/`query_json_path_mut` are structurally identical, hand-duplicated for
-   `&`/`&mut`.** Every match arm in the immutable traversal (§4.2) has a corresponding
-   `_mut` arm doing the identical navigation logic against `.get`/`.get_mut`,
-   `.values()`/`.values_mut()`, `&arr[i]`/`&mut arr[i]`. This is a real, verified
-   duplication (not a design choice with a stated rationale) — a bugfix to one traversal
-   rule (e.g. how negative slice bounds clamp) has to be applied to both copies by hand.
-4. **Auto-vivification on `SET`, not on read.** `set_json_path` creates intermediate
-   `Object`/`Array` containers as needed when writing to a path whose parents don't exist yet
-   (§4.3) — real Redis JSON has the same behavior. `NX`/`XX` are checked once, up front,
-   against whether the *target* path already resolves to something, before any mutation.
-
----
-
-## 3. High-Level Architecture & Workflow Diagram
-
-```
-Client ──► JSON.NUMINCRBY user:1 $.stats.views 1 ──► In-Place Mutation in ShardDb
-```
-
----
-
-## 4. Performance Guarantees & Theoretical Complexity
-
-- **`JSON.GET` cost scales with matched-subtree size, not query specificity** — every call
-  does a fresh `serde_json::to_string` of whatever `query_json_path` returned, with no
-  memoization; repeatedly reading the same small field from a large sibling-heavy document is
-  cheap, but repeatedly reading `$` on a large document is not.
-- **Path traversal is O(document breadth) per segment, not indexed** — `Field` lookups on an
-  `Object` are O(1) (backed by `serde_json`'s own map), but `Wildcard`/`Slice` segments
-  necessarily visit every child at that level; there's no precomputed path index.
-- **`JSON.MGET`'s sequential fan-out (§4.5) is the single biggest addressable cost** on
-  multi-key JSON reads spread across shards — see Future Improvements.
-
----
-
-## 5. Implementation References & Contributor Guide
-
-For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
-* [**`docs/internal/16_json_store.md`**](../internal/16_json_store.md): Low-level implementation and code reference.
-* **Source Files**: `src/json.rs`
-
+**Further reading:** [`docs/internal/16_json_store.md`](../internal/16_json_store.md)
 
 ---
 
 ## Component 17: Geospatial Commands
 
-## 1. Executive Summary & Problem Statement
+**Source files:** `src/geo.rs`
 
-### 1.1 The Problem
-Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+**Purpose & problem statement.** Proximity queries need an efficient way to find nearby points without a
+dedicated spatial index structure. Coordinates are encoded as 52-bit interleaved geohashes and stored directly
+as ordinary ZSet scores, so `GEOADD`/`GEODIST`/`GEOPOS` reuse the sorted-set storage engine (Component 05)
+outright — a "geo set" *is* a `RudisZSet`.
 
-### 1.2 The Rudis Solution
-Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+**Key design choice.** Radius/box search decomposes the query region into geohash score intervals
+(`geohash_search_ranges`) before touching the ZSet, issuing one range query per interval rather than decoding
+every member — pruning narrows the candidate set but the final exact Haversine/box distance check
+(`GeoSearchShape::is_inside`) guarantees no false positives make it into the result.
 
----
+**Key invariants.**
+- 52-bit interleaved encoding (26 bits longitude + 26 bits latitude) matches real Redis's internal encoding —
+  the 11-character textual geohash is computed on demand only for `GEOHASH` command output.
+- Latitude is clamped to `±85.05112878°` (not `±90°`), matching real Redis's own documented limitation exactly.
+- Distance uses Haversine (great-circle spherical), not an ellipsoidal (Vincenty) model, with the same Earth
+  radius constant real Redis's own implementation uses — an intentional match to upstream behavior, not a
+  simplification unique to Rudis.
+- Geo commands route per-key across shards exactly like ordinary `ZSET` commands — no geo-specific routing.
 
-## 2. Contributor Mental Model & Architectural Principles
+**Performance characteristics.** `GEOADD`/`GEODIST`/`GEOPOS` are O(1)-ish, bounded by the underlying
+`ZADD`/`ZSCORE` cost plus fixed bit-interleaving/Haversine math. Against the `Full` (skip-list) ZSet
+representation, radius/box search is roughly O(log N + k) per interval; against the `Small` (linear-vector)
+representation, each interval query is a linear scan regardless.
 
-### 2.1 The Mental Model
-Geospatial indexing using 52-bit integer geohashes. Coordinates (longitude, latitude) map to 52-bit integers stored as scores in Sorted Sets (ZSet). Distance queries use the Haversine spherical formula.
+**Verified findings.** No correctness gaps were identified. All of this subsystem's approximations (spherical
+rather than ellipsoidal distance, a flat-Earth local approximation for box width/height, a self-derived
+interval decomposition rather than real Redis's literal "9 neighboring cells" technique) are documented as
+deliberate choices that intentionally match or closely approximate real Redis's own behavior.
 
-### 2.2 Design Rationale (The "Why")
-Geohashes map 2D coordinates into 1D space, enabling standard B-tree / skip-list range queries to find nearby entities with zero specialized spatial index overhead.
-
-### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
-1. **Encoding is 52-bit interleaved (26 bits longitude + 26 bits latitude), matching real
-   Redis's internal encoding** — not the 5-bit-alphabet, 11-character textual geohash;
-   that (`geohash_to_base32`) is only computed on demand for the `GEOHASH` command's text
-   output, never used as the stored representation.
-2. **Latitude is clamped to the real Web Mercator-projectable range**
-   (`GEO_LAT_MIN`/`MAX` = ±85.05112878°, not ±90°) — this matches real Redis's own
-   documented limitation exactly (values interleave cleanly only within this range); a
-   `GEOADD` outside it is rejected with `"ERR invalid latitude"`.
-3. **Distance is Haversine (great-circle on a sphere), not an ellipsoidal (Vincenty) model** —
-   using `EARTH_RADIUS_METERS = 6372797.560856`, the same constant real Redis's own Haversine
-   implementation uses. This is an approximation (Earth isn't a perfect sphere) but is exactly
-   what real Redis does too, so behavior matches rather than diverges.
-4. **Geo commands route per-key across shards exactly like ordinary ZSET commands** (verified:
-   `Geoadd`/`Geodist`/`Geopos`/`Geosearch`/etc. all appear in the same `target_shard_of_cmd`
-   dispatch arm as other keyed commands, Component 02 §4.5) — there is no geo-specific routing
-   concern; a "geo set" is routed by the same CRC16 key-slot mechanism as any other key.
-
----
-
-## 3. High-Level Architecture & Workflow Diagram
-
-```
-(Longitude, Latitude) ──► 52-Bit Integer Geohash ──► ZSet Score (B-Tree)
-```
-
----
-
-## 4. Performance Guarantees & Theoretical Complexity
-
-- **`GEOADD`/`GEODIST`/`GEOPOS` are O(1)-ish**, bounded by the underlying `ZADD`/`ZSCORE` cost
-  (Component 05) plus a fixed amount of bit-interleaving/Haversine math — no scan involved.
-- **`GEORADIUS`/`GEORADIUSBYMEMBER`/`GEOSEARCH` are all O(N) in the size of the geo set**
-  (§4.4), not O(matches) or O(log N + matches) the way a geohash-neighborhood-aware
-  implementation would be — a large geo set with a small-radius search still decodes and
-  distance-checks every member.
-- **No caching of decoded coordinates** — every scan re-runs `decode_geohash` (cheap bit
-  extraction) per member per call; not a measurable cost relative to the Haversine
-  trigonometry, which dominates.
-
----
-
-## 5. Implementation References & Contributor Guide
-
-For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
-* [**`docs/internal/17_geospatial.md`**](../internal/17_geospatial.md): Low-level implementation and code reference.
-* **Source Files**: `src/geo.rs`
-
+**Further reading:** [`docs/internal/17_geospatial.md`](../internal/17_geospatial.md)
 
 ---
 
 ## Component 18: Probabilistic Data Structures
 
-## 1. Executive Summary & Problem Statement
+**Source files:** `src/probabilistic.rs`
 
-### 1.1 The Problem
-Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+**Purpose & problem statement.** Tracking set membership, frequency, or heavy hitters over billions of events
+in exact structures (hash sets, counters) exhausts memory at scale. Bloom filters, Cuckoo filters, Count-Min
+Sketch, and a Top-K/Space-Saving tracker give bounded-error answers in a small, fixed memory footprint.
 
-### 1.2 The Rudis Solution
-Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+**Key design choice.** A single hash-function family underlies all four structures: `fnv1a_hash` (seeded
+64-bit FNV-1a) and Kirsch-Mitzenmacher `double_hash` derive every additional hash from two real computed
+hashes rather than one call per hash function — no cryptographic hash appears anywhere in this file, which is
+appropriate for these structures' intended use.
 
----
+**Key invariants.**
+- Bloom filter sizing follows standard textbook formulas computed once at creation, with hash count clamped to
+  `[1, 30]`.
+- The Cuckoo filter is a complete implementation including real eviction ("cuckoo kicks", capped at 500) and
+  real per-fingerprint deletion — not a simplified always-fails-when-full variant.
+- Top-K is a genuine Space-Saving algorithm, not an exact top-K: at capacity, it evicts the minimum-count
+  tracked item and gives the new item that evicted item's count plus the increment.
+- No structure ever shrinks or auto-resizes; capacity/width/depth are fixed at creation, and over-inserting
+  silently degrades accuracy rather than growing the structure.
 
-## 2. Contributor Mental Model & Architectural Principles
+**Performance characteristics.** Bloom `add`/`contains` cost is O(num_hashes, ≤30); Cuckoo `add`/`contains` is
+O(1) (two fixed 4-slot bucket scans); Count-Min Sketch operations are O(depth), independent of the number of
+distinct items tracked.
 
-### 2.1 The Mental Model
-Constant-memory probabilistic data structures: Bloom Filters (membership testing), Cuckoo Filters (membership with deletion), Count-Min Sketch (frequency estimation), and Top-K (Space-Saving heavy hitters).
+**Verified findings.** No correctness gaps were identified. All four structures survive a restart: they are
+serialized into the RDB chunk stream by `ShardDb::save_extended_rdb_chunk` and reconstructed verbatim on load
+— unlike Components 08, 12, and 16, this subsystem has no RDB persistence gap.
 
-### 2.2 Design Rationale (The "Why")
-Tracking unique users or heavy hitters over billions of events in exact hash sets exhausts gigabytes of memory. Probabilistic structures provide bounded-error answers in kilobytes of RAM.
-
-### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
-1. **A single custom hash function underlies all four structures.** `fnv1a_hash` (a
-   seeded 64-bit FNV-1a) and `double_hash` (two independent FNV-1a calls with different fixed
-   seeds, used for Kirsch-Mitzenmacher double-hashing) are shared by the Bloom filter, Cuckoo
-   filter, and Count-Min Sketch — there is no per-structure hash family, and no cryptographic
-   hash anywhere in this file (not a concern for these structures' intended use, unlike an
-   auth-adjacent context).
-2. **Bloom filter sizing follows the standard formulas, computed once at creation.**
-   `BloomFilter::new(capacity, error_rate)` derives bit-array size via
-   $m = \lceil -n \ln(p) / (\ln 2)^2 \rceil$ and hash count via $k = \text{round}((m/n)\ln 2)$,
-   clamped to `[1, 30]` hashes — real, textbook Bloom filter parameter derivation, not
-   hardcoded constants.
-3. **The Cuckoo filter is a real, complete implementation including eviction ("cuckoo
-   kicks").** `add` tries both candidate buckets first, and only falls back to the
-   randomized-kick relocation loop (`MAX_KICKS = 500`) if both are full — a genuine cuckoo
-   hashing insert, not a simplified always-fails-when-full variant. `delete` is also real
-   (removes a matching fingerprint from either candidate bucket), which is one of the
-   Cuckoo filter's actual advantages over a Bloom filter (Bloom filters can't support
-   deletion at all without a counting variant, which isn't implemented here).
-4. **The Top-K tracker is a real Space-Saving algorithm, not an exact top-K.** Once at
-   capacity, `TopK::add` evicts the *minimum-count* tracked item and gives the new item that
-   evicted item's count plus the increment — the standard Space-Saving guarantee (every
-   tracked count is an overestimate, bounded by the true frequency of whatever was evicted
-   last), not an exact frequency count.
-5. **No structure ever shrinks or is auto-resized.** A Bloom/Cuckoo filter's bit array or
-   bucket count is fixed at creation time (`BF.RESERVE`/`CF.RESERVE`'s capacity argument); a
-   Count-Min Sketch's width/depth are likewise fixed at `CMS.INITBYDIM`/`INITBYPROB` time.
-   There is no `BF.INSERT ... EXPANSION` auto-scaling behavior — once a filter created with a
-   given capacity is over-inserted, its false-positive rate silently degrades rather than the
-   structure growing.
-
----
-
-## 3. High-Level Architecture & Workflow Diagram
-
-```
-Item ──► MurmurHash3 Hash Seeds ──► Bitmask Indexing (Bloom / Cuckoo / CMS / Top-K)
-```
-
----
-
-## 4. Performance Guarantees & Theoretical Complexity
-
-- **Bloom/Cuckoo `add`/`contains` are O(num_hashes) / O(1)** respectively — a Bloom filter
-  check costs up to 30 bit-array probes (bounded, per §2.2's clamp), a Cuckoo filter check is
-  two fixed-size (4-slot) bucket scans regardless of fill level.
-- **Cuckoo insertion degrades under high load factor** — the `MAX_KICKS = 500` eviction chain
-  only triggers once both candidate buckets are full, and a filter approaching its rated
-  capacity will trigger it increasingly often before either succeeding or returning
-  `"ERR Cuckoo filter is full"` — a real, expected cuckoo-hashing characteristic, not a bug.
-- **Count-Min Sketch `incr_by`/`query` are O(depth)**, independent of how many distinct items
-  have been tracked — the whole point of a fixed-size sketch over an exact per-item counter map.
-- **Top-K's eviction is O(k) per new distinct item once at capacity** (§4.4) — negligible at
-  small `k`, would matter if `TOPK.RESERVE` were ever used with a very large `k`.
-
----
-
-## 5. Implementation References & Contributor Guide
-
-For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
-* [**`docs/internal/18_probabilistic.md`**](../internal/18_probabilistic.md): Low-level implementation and code reference.
-* **Source Files**: `src/probabilistic.rs`
-
+**Further reading:** [`docs/internal/18_probabilistic.md`](../internal/18_probabilistic.md)
 
 ---
 
 ## Component 19: Pub/Sub Messaging Hub
 
-## 1. Executive Summary & Problem Statement
+**Source files:** `src/pubsub.rs`
 
-### 1.1 The Problem
-Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+**Purpose & problem statement.** A globally addressable publish/subscribe namespace is in tension with
+shared-nothing shards: broadcasting every `PUBLISH` to every shard wastes cross-core messages at scale, while
+centralizing subscription state in one lock reintroduces the contention the architecture exists to avoid.
 
-### 1.2 The Rudis Solution
-Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+**Key design choice.** Subscription state stays fully local per shard (`PubSubHub`, a plain `Rc<RefCell<_>>`
+— no cross-thread synchronization at all). A shared `ShardedPresenceTable` — 16 striped atomic bitmasks keyed
+by channel-name hash, plus one unstriped pattern-presence bitmask — lets a publisher decide which *other*
+shards are worth contacting before dispatching. The bitmask is a hint, never a source of truth: stripe
+collisions can cause an occasional spurious remote lookup (a harmless false positive), but it can never cause a
+missed delivery, since the receiving shard's own hub still performs the exact channel/pattern match.
 
----
+**Key invariants.**
+- `Router::publish` delivers to local subscribers first, then consults `presence_table.interested_shards`
+  and dispatches `ShardMessage::Publish` only to shards whose bit is set — not unconditionally to every shard —
+  issuing every send before awaiting any reply ("dispatch all, then await all").
+- Sharded Pub/Sub (`SPUBLISH`) is a separate, deterministic routing class: the channel name is hashed via the
+  same CRC16 slot function as key routing, resolving to exactly one target shard with no presence-table
+  consultation at all.
+- A full per-subscriber delivery queue causes a silent, non-blocking drop (`try_send`) rather than backpressure
+  on the publisher — a dropped message is not counted in `PUBLISH`'s reported receiver count.
+- Glob matching (`glob_match`) is a hand-written backtracking `*`/`?` matcher with **no `[...]`
+  character-class support** — narrower than real Redis's fuller glob syntax.
 
-## 2. Contributor Mental Model & Architectural Principles
+**Performance characteristics.** Direct-channel publish is O(subscribers to that channel). Pattern publish is
+O(total registered patterns in that shard's hub) per publish, not O(matching patterns) — a deployment with many
+active `PSUBSCRIBE` patterns pays a glob-match per pattern on every `PUBLISH` regardless of how many actually
+match. One reply frame is built once and cloned per subscriber, not re-serialized per recipient.
 
-### 2.1 The Mental Model
-Shared-nothing Pub/Sub messaging. Uses a 16-stripe atomic presence bitmask (ShardedPresenceTable) to eliminate cross-shard broadcast storms, and Redis 7 slot-bound sharded pub/sub (SPUBLISH) for point-to-point routing.
+**Verified findings.** No correctness gaps were identified. The presence-bitmask's over-approximating (never
+under-approximating) behavior, the glob matcher's lack of character classes, and sharded Pub/Sub's
+single-shard-only delivery scope are all documented as deliberate, stated design trade-offs.
 
-### 2.2 Design Rationale (The "Why")
-Global PUBLISH in shared-nothing architectures causes broadcast storms across all worker cores. The striped presence bitmask lets publishers bypass uninterested shards entirely, cutting cross-core hops by up to 90%.
-
-### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
-1. **Genuinely per-shard, not a `BlockHub`/`ACL`/search-registry-style global exception.**
-   `Router.pubsub: Rc<RefCell<PubSubHub>>` — a plain `Rc`/`RefCell`, exactly like `ShardDb`
-   itself, with no `Arc`/`Mutex` anywhere. A subscriber's registration (`channels`,
-   `patterns`, `clients`, `client_channels`, `client_patterns`) only ever exists in the
-   `PubSubHub` of the one shard that accepted that subscriber's connection.
-2. **Cross-shard delivery is a real, parallel fan-out — send-then-await, matching the
-   squashed-pipeline pattern.** `Router::publish` (Component 04) delivers to local
-   subscribers immediately, then dispatches one `ShardMessage::Publish` to every *other*
-   shard (all sends issued before any await), and sums each shard's returned delivery count —
-   the same "dispatch all, then await all" shape used throughout the codebase for
-   parallelism (Components 02/04).
-3. **A hand-written glob matcher, not a regex or a crate.** `glob_match` implements `*`/`?`
-   wildcard matching via an explicit backtracking scan (tracking the last `*` position and
-   resuming from there on a mismatch) rather than compiling a regex or pulling in a glob
-   crate — used both for `PSUBSCRIBE` pattern matching against published channels and for
-   `PUBSUB CHANNELS <pattern>`'s filtering.
-4. **No RESP3 push-type framing anywhere in this file — verified.** Every delivered message
-   (`message`/`pmessage`) and every subscribe/unsubscribe confirmation is hard-coded RESP2
-   array framing (`*3\r\n$7\r\nmessage\r\n...`); grepping this file for `is_resp3`/`resp3`
-   finds zero matches. A RESP3-negotiated client (Component 02's `CURRENT_CLIENT_RESP3`
-   machinery) still receives ordinary array-type frames for pub/sub messages instead of the
-   RESP3 push type (`>3\r\n...`) real Redis sends once a client has opted into RESP3 — see §7.
-5. **A subscriber count of zero triggers cleanup, not a lingering empty entry.** Every
-   `unsubscribe`/`punsubscribe`/`unsubscribe_all`/`punsubscribe_all` path removes the
-   channel/pattern's `HashSet` entirely once it's empty (not left as an empty set), and
-   removes the client's `flume::Sender` from `clients` once its last subscription anywhere
-   drops to zero (`total_subscriptions(client_id) == 0`) — no unbounded growth from
-   subscribe/unsubscribe churn.
-
----
-
-## 3. High-Level Architecture & Workflow Diagram
-
-```
-PUBLISH "news" "hello" ──► Check ShardedPresenceTable Bitmask
-                                       │
-                        ┌──────────────┴──────────────┐
-                        ▼                             ▼
-                 Shard 0 (Present)             Shard 2 (Present)
-                 (Deliver to Clients)          (Deliver to Clients)
-                 [Shards 1, 3..15 bypassed with ZERO channel messages]
-```
-
----
-
-## 4. Performance Guarantees & Theoretical Complexity
-
-- **Direct-channel publish is O(subscribers to that channel)** — no overhead from unrelated
-  channels or patterns.
-- **Pattern publish is O(total registered patterns) per publish**, not O(matching patterns)
-  (§4.2) — a deployment with many distinct active `PSUBSCRIBE` patterns pays a glob-match per
-  pattern on every single `PUBLISH`, regardless of how many (if any) actually match.
-- **Cross-shard fan-out cost is O(num_shards) per `PUBLISH`, done in parallel** (§2.2) — every
-  publish touches every other shard's `PubSubHub` once via a `flume` message, dispatched
-  concurrently rather than sequentially, matching the codebase's general cross-shard fan-out
-  pattern.
-- **One frame is built once and cloned per subscriber**, not re-serialized per recipient —
-  the `Vec<u8>` frame construction cost is paid once regardless of subscriber count.
-
----
-
-## 5. Implementation References & Contributor Guide
-
-For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
-* [**`docs/internal/19_pubsub.md`**](../internal/19_pubsub.md): Low-level implementation and code reference.
-* **Source Files**: `src/pubsub.rs`
-
+**Further reading:** [`docs/internal/19_pubsub.md`](../internal/19_pubsub.md)

@@ -10,8 +10,9 @@ being included — none are taken on the reviewing agent's word alone).
 There was no pending diff to review (the working tree was clean at review time — the last
 commits had all landed already), so a literal "review everything" pass isn't the highest-value
 use of review effort: the bulk of `src/`'s known architectural gaps, dead-code findings, and
-design trade-offs are **already cataloged** in [`docs/components.md`](components.md)'s 19
-per-component "Future Improvements" sections, each one individually verified against source
+design trade-offs are **already cataloged** in [`docs/design/components.md`](design/components.md)
+and [`docs/internal/components.md`](internal/components.md)'s 19 per-component "Future
+Improvements" sections, each one individually verified against source
 during that documentation effort. Re-deriving that list here would just duplicate it.
 
 Instead, this review targets the highest-risk, least-reviewed code: the three most recent
@@ -26,7 +27,8 @@ codebase for what it *does*, not for what changed most recently or most riskily)
 **For the rest of the codebase's known gaps** — the >64-shard MGET/MSET bug, the kTLS
 plaintext bug, ACL's weak password hashing, the O(N) GEORADIUS scans, missing RDB persistence
 for JSON/Probabilistic/Vector state, and everything else already found — see each component's
-own "Future Improvements" section in `docs/components.md`. This document does not repeat those.
+own "Future Improvements" section in `docs/design/components.md` and
+`docs/internal/components.md`. This document does not repeat those.
 
 ---
 
