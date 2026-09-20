@@ -2517,6 +2517,29 @@ impl Router {
         (all_totals, paged)
     }
 
+    pub async fn ft_aggregate(
+        &self,
+        index: &str,
+        query: &str,
+        options: crate::search::AggregateOptions,
+    ) -> Vec<crate::search::AggregateRow> {
+        let ast = crate::search::parse_query(query);
+        let search_opts = crate::search::SearchOptions {
+            limit: 100_000,
+            offset: 0,
+            nocontent: false,
+            return_fields: if options.load_fields.is_empty() {
+                None
+            } else {
+                Some(options.load_fields.clone())
+            },
+            sortby: None,
+            ..Default::default()
+        };
+        let (_total, hits) = self.ft_search(index, &ast, &search_opts).await;
+        crate::search::execute_aggregate_pipeline(hits, &options)
+    }
+
     pub async fn keys(&self, pattern: &[u8]) -> Vec<Bytes> {
         let mut all_keys = self.local_db.borrow_mut().keys(pattern);
         let mut pending = Vec::new();

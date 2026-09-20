@@ -3316,6 +3316,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         | Command::TopkInfo(_) => "TOPK",
         Command::FtCreate { .. }
         | Command::FtSearch { .. }
+        | Command::FtAggregate { .. }
         | Command::FtInfo(_)
         | Command::FtDropIndex { .. }
         | Command::FtExplain { .. }
@@ -7761,6 +7762,28 @@ async fn execute_command(
                             write_resp_bulk(out, k.as_bytes());
                             write_resp_bulk(out, v.as_bytes());
                         }
+                    }
+                }
+            } else {
+                out.extend_from_slice(format!("-ERR Unknown Index name: {}\r\n", index).as_bytes());
+            }
+            false
+        }
+        Command::FtAggregate {
+            index,
+            query,
+            options,
+        } => {
+            if router.has_search_index(&index) {
+                let rows = router.ft_aggregate(&index, &query, options).await;
+                out.extend_from_slice(
+                    format!("*{}\r\n:{}\r\n", 1 + rows.len(), rows.len()).as_bytes(),
+                );
+                for row in rows {
+                    out.extend_from_slice(format!("*{}\r\n", row.len() * 2).as_bytes());
+                    for (k, v) in row {
+                        write_resp_bulk(out, k.as_bytes());
+                        write_resp_bulk(out, v.as_bytes());
                     }
                 }
             } else {

@@ -10790,3 +10790,143 @@ fn test_numeric_range_search_across_shards_e2e() {
         "+OK\r\n"
     );
 }
+
+#[test]
+fn test_ft_aggregate_multishard_pipeline_e2e() {
+    let port = 17035;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    let format_resp_cmd = |args: &[&str]| -> Vec<u8> {
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for arg in args {
+            out.extend_from_slice(format!("${}\r\n{}\r\n", arg.len(), arg).as_bytes());
+        }
+        out
+    };
+
+    // 1. Create index
+    let create_cmd = format_resp_cmd(&[
+        "FT.CREATE",
+        "idx:sales",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "sale:",
+        "SCHEMA",
+        "region",
+        "TAG",
+        "revenue",
+        "NUMERIC",
+        "SORTABLE",
+    ]);
+    assert_eq!(send_and_read(&mut client, &create_cmd), "+OK\r\n");
+
+    // 2. Insert transactions across 4 shards
+    let sales = [
+        ("sale:1", "north", "100"),
+        ("sale:2", "north", "250"),
+        ("sale:3", "north", "150"),
+        ("sale:4", "south", "80"),
+        ("sale:5", "south", "120"),
+        ("sale:6", "east", "300"),
+        ("sale:7", "east", "400"),
+        ("sale:8", "west", "50"),
+        ("sale:9", "west", "150"),
+        ("sale:10", "west", "100"),
+    ];
+
+    for (key, region, revenue) in sales {
+        let set_cmd = format_resp_cmd(&["HSET", key, "region", region, "revenue", revenue]);
+        let resp = send_and_read(&mut client, &set_cmd);
+        assert_eq!(resp, ":2\r\n");
+    }
+
+    // 3. Test FT.AGGREGATE with GROUPBY + REDUCE + APPLY + SORTBY + LIMIT
+    // GROUPBY 1 @region REDUCE COUNT 0 AS count REDUCE SUM 1 @revenue AS sum_rev APPLY @sum_rev * 1.05 AS rev_tax SORTBY 2 @rev_tax DESC LIMIT 0 2
+    let agg_cmd = format_resp_cmd(&[
+        "FT.AGGREGATE",
+        "idx:sales",
+        "*",
+        "LOAD",
+        "2",
+        "@region",
+        "@revenue",
+        "GROUPBY",
+        "1",
+        "@region",
+        "REDUCE",
+        "COUNT",
+        "0",
+        "AS",
+        "count",
+        "REDUCE",
+        "SUM",
+        "1",
+        "@revenue",
+        "AS",
+        "sum_rev",
+        "APPLY",
+        "@sum_rev * 1.05",
+        "AS",
+        "rev_tax",
+        "SORTBY",
+        "2",
+        "@rev_tax",
+        "DESC",
+        "LIMIT",
+        "0",
+        "2",
+    ]);
+
+    let agg_resp = send_and_read(&mut client, &agg_cmd);
+    // Should return 2 rows: East (700 * 1.05 = 735), North (500 * 1.05 = 525)
+    assert!(
+        agg_resp.starts_with("*3\r\n:2\r\n"),
+        "Expected 2 rows, got: {}",
+        agg_resp
+    );
+    assert!(agg_resp.contains("east"));
+    assert!(agg_resp.contains("735"));
+    assert!(agg_resp.contains("north"));
+    assert!(agg_resp.contains("525"));
+
+    // 4. Test global aggregation: GROUPBY 0 REDUCE COUNT 0 AS total REDUCE SUM 1 @revenue AS grand_total
+    let global_agg_cmd = format_resp_cmd(&[
+        "FT.AGGREGATE",
+        "idx:sales",
+        "*",
+        "LOAD",
+        "1",
+        "@revenue",
+        "GROUPBY",
+        "0",
+        "REDUCE",
+        "COUNT",
+        "0",
+        "AS",
+        "total",
+        "REDUCE",
+        "SUM",
+        "1",
+        "@revenue",
+        "AS",
+        "grand_total",
+    ]);
+
+    let global_resp = send_and_read(&mut client, &global_agg_cmd);
+    assert!(
+        global_resp.starts_with("*2\r\n:1\r\n"),
+        "Expected 1 global row, got: {}",
+        global_resp
+    );
+    assert!(global_resp.contains("total") && global_resp.contains("10"));
+    assert!(global_resp.contains("grand_total") && global_resp.contains("1700"));
+
+    // Cleanup: Drop index
+    let drop_cmd = format_resp_cmd(&["FT.DROPINDEX", "idx:sales"]);
+    assert_eq!(send_and_read(&mut client, &drop_cmd), "+OK\r\n");
+}

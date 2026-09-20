@@ -1406,6 +1406,494 @@ pub fn reciprocal_rank_fusion(
     merged
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum Reducer {
+    Count { alias: String },
+    Sum { field: String, alias: String },
+    Avg { field: String, alias: String },
+    Min { field: String, alias: String },
+    Max { field: String, alias: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupByStage {
+    pub fields: Vec<String>,
+    pub reducers: Vec<Reducer>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApplyStage {
+    pub expr: String,
+    pub alias: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortByStage {
+    pub fields: Vec<(String, bool)>, // (field, ascending)
+    pub max: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AggregateStage {
+    Group(GroupByStage),
+    Apply(ApplyStage),
+    Sort(SortByStage),
+    Limit { offset: usize, num: usize },
+    Filter(String),
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AggregateOptions {
+    pub load_fields: Vec<String>,
+    pub stages: Vec<AggregateStage>,
+}
+
+pub type AggregateRow = Vec<(String, String)>;
+
+pub fn get_row_field<'a>(row: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    let clean = name.strip_prefix('@').unwrap_or(name);
+    for (k, v) in row {
+        let k_clean = k.strip_prefix('@').unwrap_or(k);
+        if k_clean == clean {
+            return Some(v.as_str());
+        }
+    }
+    None
+}
+
+pub fn set_row_field(row: &mut Vec<(String, String)>, name: String, val: String) {
+    let clean = name.strip_prefix('@').unwrap_or(&name);
+    for (k, v) in row.iter_mut() {
+        let k_clean = k.strip_prefix('@').unwrap_or(k);
+        if k_clean == clean {
+            *v = val;
+            return;
+        }
+    }
+    row.push((name, val));
+}
+
+/// Simple recursive descent expression evaluator for arithmetic and field references
+pub fn evaluate_expr(expr: &str, row: &[(String, String)]) -> Result<f64, String> {
+    let tokens = tokenize_expr(expr);
+    let mut pos = 0;
+    let res = parse_expr_addition(&tokens, &mut pos, row)?;
+    Ok(res)
+}
+
+#[derive(Debug, PartialEq)]
+enum ExprToken {
+    Num(f64),
+    Field(String),
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    LParen,
+    RParen,
+}
+
+fn tokenize_expr(s: &str) -> Vec<ExprToken> {
+    let mut tokens = Vec::new();
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            ' ' | '\t' | '\r' | '\n' => {
+                i += 1;
+            }
+            '+' => {
+                tokens.push(ExprToken::Plus);
+                i += 1;
+            }
+            '-' => {
+                tokens.push(ExprToken::Minus);
+                i += 1;
+            }
+            '*' => {
+                tokens.push(ExprToken::Star);
+                i += 1;
+            }
+            '/' => {
+                tokens.push(ExprToken::Slash);
+                i += 1;
+            }
+            '(' => {
+                tokens.push(ExprToken::LParen);
+                i += 1;
+            }
+            ')' => {
+                tokens.push(ExprToken::RParen);
+                i += 1;
+            }
+            '@' => {
+                i += 1;
+                let mut field = String::new();
+                while i < chars.len()
+                    && (chars[i].is_alphanumeric()
+                        || chars[i] == '_'
+                        || chars[i] == '.'
+                        || chars[i] == ':')
+                {
+                    field.push(chars[i]);
+                    i += 1;
+                }
+                tokens.push(ExprToken::Field(field));
+            }
+            c if c.is_ascii_digit() || c == '.' => {
+                let mut num_str = String::new();
+                while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                    num_str.push(chars[i]);
+                    i += 1;
+                }
+                if let Ok(val) = num_str.parse::<f64>() {
+                    tokens.push(ExprToken::Num(val));
+                }
+            }
+            c if c.is_alphabetic() || c == '_' => {
+                let mut ident = String::new();
+                while i < chars.len()
+                    && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '.')
+                {
+                    ident.push(chars[i]);
+                    i += 1;
+                }
+                tokens.push(ExprToken::Field(ident));
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    tokens
+}
+
+fn parse_expr_addition(
+    tokens: &[ExprToken],
+    pos: &mut usize,
+    row: &[(String, String)],
+) -> Result<f64, String> {
+    let mut left = parse_expr_multiplication(tokens, pos, row)?;
+    while *pos < tokens.len() {
+        match tokens[*pos] {
+            ExprToken::Plus => {
+                *pos += 1;
+                let right = parse_expr_multiplication(tokens, pos, row)?;
+                left += right;
+            }
+            ExprToken::Minus => {
+                *pos += 1;
+                let right = parse_expr_multiplication(tokens, pos, row)?;
+                left -= right;
+            }
+            _ => break,
+        }
+    }
+    Ok(left)
+}
+
+fn parse_expr_multiplication(
+    tokens: &[ExprToken],
+    pos: &mut usize,
+    row: &[(String, String)],
+) -> Result<f64, String> {
+    let mut left = parse_expr_primary(tokens, pos, row)?;
+    while *pos < tokens.len() {
+        match tokens[*pos] {
+            ExprToken::Star => {
+                *pos += 1;
+                let right = parse_expr_primary(tokens, pos, row)?;
+                left *= right;
+            }
+            ExprToken::Slash => {
+                *pos += 1;
+                let right = parse_expr_primary(tokens, pos, row)?;
+                if right != 0.0 {
+                    left /= right;
+                } else {
+                    left = 0.0;
+                }
+            }
+            _ => break,
+        }
+    }
+    Ok(left)
+}
+
+fn parse_expr_primary(
+    tokens: &[ExprToken],
+    pos: &mut usize,
+    row: &[(String, String)],
+) -> Result<f64, String> {
+    if *pos >= tokens.len() {
+        return Err("Unexpected end of expression".to_string());
+    }
+    match &tokens[*pos] {
+        ExprToken::Num(n) => {
+            let val = *n;
+            *pos += 1;
+            Ok(val)
+        }
+        ExprToken::Field(name) => {
+            let field_val = get_row_field(row, name)
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            *pos += 1;
+            Ok(field_val)
+        }
+        ExprToken::Minus => {
+            *pos += 1;
+            let val = parse_expr_primary(tokens, pos, row)?;
+            Ok(-val)
+        }
+        ExprToken::LParen => {
+            *pos += 1;
+            let val = parse_expr_addition(tokens, pos, row)?;
+            if *pos < tokens.len() && tokens[*pos] == ExprToken::RParen {
+                *pos += 1;
+            }
+            Ok(val)
+        }
+        _ => Err("Invalid token in expression".to_string()),
+    }
+}
+
+pub fn evaluate_filter(filter: &str, row: &[(String, String)]) -> bool {
+    let parts: Vec<&str> = filter.split_whitespace().collect();
+    if parts.len() < 3 {
+        return true;
+    }
+    let field = parts[0].strip_prefix('@').unwrap_or(parts[0]);
+    let op = parts[1];
+    let raw_target = parts[2..].join(" ");
+    let target = raw_target.trim_matches('\'').trim_matches('"');
+    let val = get_row_field(row, field).unwrap_or("");
+
+    match op {
+        "==" | "=" => val == target,
+        "!=" => val != target,
+        ">" => {
+            if let (Ok(v), Ok(t)) = (val.parse::<f64>(), target.parse::<f64>()) {
+                v > t
+            } else {
+                val > target
+            }
+        }
+        ">=" => {
+            if let (Ok(v), Ok(t)) = (val.parse::<f64>(), target.parse::<f64>()) {
+                v >= t
+            } else {
+                val >= target
+            }
+        }
+        "<" => {
+            if let (Ok(v), Ok(t)) = (val.parse::<f64>(), target.parse::<f64>()) {
+                v < t
+            } else {
+                val < target
+            }
+        }
+        "<=" => {
+            if let (Ok(v), Ok(t)) = (val.parse::<f64>(), target.parse::<f64>()) {
+                v <= t
+            } else {
+                val <= target
+            }
+        }
+        _ => true,
+    }
+}
+
+pub fn execute_aggregate_pipeline(
+    hits: Vec<SearchHit>,
+    options: &AggregateOptions,
+) -> Vec<AggregateRow> {
+    // 1. Initial rows
+    let mut rows: Vec<AggregateRow> = hits
+        .into_iter()
+        .map(|hit| {
+            let mut row = Vec::new();
+            row.push(("__key".to_string(), hit.doc_id.clone()));
+            row.push(("__score".to_string(), hit.score.to_string()));
+
+            if options.load_fields.is_empty() {
+                for (k, v) in hit.fields {
+                    row.push((k, v));
+                }
+            } else {
+                for f in &options.load_fields {
+                    let clean = f.strip_prefix('@').unwrap_or(f);
+                    if let Some(v) = hit.fields.get(clean) {
+                        row.push((clean.to_string(), v.clone()));
+                    } else if let Some(stripped) = clean.strip_prefix("$.")
+                        && let Some(v) = hit.fields.get(stripped)
+                    {
+                        row.push((clean.to_string(), v.clone()));
+                    }
+                }
+            }
+            row
+        })
+        .collect();
+
+    // 2. Execute pipeline stages sequentially
+    for stage in &options.stages {
+        match stage {
+            AggregateStage::Filter(f) => {
+                rows.retain(|r| evaluate_filter(f, r));
+            }
+            AggregateStage::Apply(apply) => {
+                for r in &mut rows {
+                    let computed = match evaluate_expr(&apply.expr, r) {
+                        Ok(num) => {
+                            if num.fract() == 0.0 {
+                                (num as i64).to_string()
+                            } else {
+                                format!("{:.4}", num)
+                                    .trim_end_matches('0')
+                                    .trim_end_matches('.')
+                                    .to_string()
+                            }
+                        }
+                        Err(_) => {
+                            let src_field = apply.expr.strip_prefix('@').unwrap_or(&apply.expr);
+                            get_row_field(r, src_field).unwrap_or("").to_string()
+                        }
+                    };
+                    set_row_field(r, apply.alias.clone(), computed);
+                }
+            }
+            AggregateStage::Group(grp) => {
+                let mut groups: HashMap<Vec<String>, Vec<AggregateRow>> = HashMap::new();
+                for r in rows {
+                    let group_key: Vec<String> = grp
+                        .fields
+                        .iter()
+                        .map(|f| get_row_field(&r, f).unwrap_or("").to_string())
+                        .collect();
+                    groups.entry(group_key).or_default().push(r);
+                }
+
+                let mut new_rows = Vec::new();
+                for (group_key, group_rows) in groups {
+                    let mut new_row = Vec::new();
+                    for (i, f) in grp.fields.iter().enumerate() {
+                        new_row.push((f.clone(), group_key[i].clone()));
+                    }
+                    for red in &grp.reducers {
+                        match red {
+                            Reducer::Count { alias } => {
+                                new_row.push((alias.clone(), group_rows.len().to_string()));
+                            }
+                            Reducer::Sum { field, alias } => {
+                                let mut sum = 0.0;
+                                for r in &group_rows {
+                                    if let Some(v) = get_row_field(r, field)
+                                        && let Ok(n) = v.parse::<f64>()
+                                    {
+                                        sum += n;
+                                    }
+                                }
+                                let val_str = if sum.fract() == 0.0 {
+                                    (sum as i64).to_string()
+                                } else {
+                                    sum.to_string()
+                                };
+                                new_row.push((alias.clone(), val_str));
+                            }
+                            Reducer::Avg { field, alias } => {
+                                let mut sum = 0.0;
+                                let mut count = 0;
+                                for r in &group_rows {
+                                    if let Some(v) = get_row_field(r, field)
+                                        && let Ok(n) = v.parse::<f64>()
+                                    {
+                                        sum += n;
+                                        count += 1;
+                                    }
+                                }
+                                let avg = if count > 0 { sum / count as f64 } else { 0.0 };
+                                let val_str = if avg.fract() == 0.0 {
+                                    (avg as i64).to_string()
+                                } else {
+                                    format!("{:.2}", avg)
+                                };
+                                new_row.push((alias.clone(), val_str));
+                            }
+                            Reducer::Min { field, alias } => {
+                                let mut min = f64::INFINITY;
+                                for r in &group_rows {
+                                    if let Some(v) = get_row_field(r, field)
+                                        && let Ok(n) = v.parse::<f64>()
+                                        && n < min
+                                    {
+                                        min = n;
+                                    }
+                                }
+                                let val_str = if min.is_infinite() {
+                                    "0".to_string()
+                                } else if min.fract() == 0.0 {
+                                    (min as i64).to_string()
+                                } else {
+                                    min.to_string()
+                                };
+                                new_row.push((alias.clone(), val_str));
+                            }
+                            Reducer::Max { field, alias } => {
+                                let mut max = f64::NEG_INFINITY;
+                                for r in &group_rows {
+                                    if let Some(v) = get_row_field(r, field)
+                                        && let Ok(n) = v.parse::<f64>()
+                                        && n > max
+                                    {
+                                        max = n;
+                                    }
+                                }
+                                let val_str = if max.is_infinite() {
+                                    "0".to_string()
+                                } else if max.fract() == 0.0 {
+                                    (max as i64).to_string()
+                                } else {
+                                    max.to_string()
+                                };
+                                new_row.push((alias.clone(), val_str));
+                            }
+                        }
+                    }
+                    new_rows.push(new_row);
+                }
+                rows = new_rows;
+            }
+            AggregateStage::Sort(sort) => {
+                rows.sort_by(|a, b| {
+                    for (field, asc) in &sort.fields {
+                        let va = get_row_field(a, field).unwrap_or("");
+                        let vb = get_row_field(b, field).unwrap_or("");
+                        let ord = if let (Ok(na), Ok(nb)) = (va.parse::<f64>(), vb.parse::<f64>()) {
+                            na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal)
+                        } else {
+                            va.cmp(vb)
+                        };
+                        let final_ord = if *asc { ord } else { ord.reverse() };
+                        if final_ord != std::cmp::Ordering::Equal {
+                            return final_ord;
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+                if let Some(max_rows) = sort.max {
+                    rows.truncate(max_rows);
+                }
+            }
+            AggregateStage::Limit { offset, num } => {
+                rows = rows.into_iter().skip(*offset).take(*num).collect();
+            }
+        }
+    }
+
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1848,5 +2336,135 @@ mod tests {
         let (total2, hits2) = execute_search(&idx, &ast, &SearchOptions::default());
         assert_eq!(total2, 1);
         assert_eq!(hits2[0].doc_id, "prod:1");
+    }
+
+    #[test]
+    fn test_ft_aggregate_pipeline_groupby_reduce_apply_sort() {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "title".to_string(),
+            FieldType::Text {
+                weight: 1.0,
+                sortable: false,
+                nostem: false,
+            },
+        );
+        fields.insert(
+            "category".to_string(),
+            FieldType::Tag {
+                separator: ',',
+                casesensitive: false,
+            },
+        );
+        fields.insert("price".to_string(), FieldType::Numeric { sortable: true });
+
+        let schema = IndexSchema {
+            name: "idx:agg_test".to_string(),
+            on_type: "HASH".to_string(),
+            prefixes: vec!["item:".to_string()],
+            fields,
+            schema_fields: Vec::new(),
+        };
+        let mut idx = InvertedIndex::new(schema);
+
+        // Books
+        let mut b1 = HashMap::new();
+        b1.insert("title".to_string(), "rust in action".to_string());
+        b1.insert("category".to_string(), "books".to_string());
+        b1.insert("price".to_string(), "40.0".to_string());
+        idx.add_document("item:1", b1, None);
+
+        let mut b2 = HashMap::new();
+        b2.insert("title".to_string(), "programming rust".to_string());
+        b2.insert("category".to_string(), "books".to_string());
+        b2.insert("price".to_string(), "50.0".to_string());
+        idx.add_document("item:2", b2, None);
+
+        // Electronics
+        let mut e1 = HashMap::new();
+        e1.insert("title".to_string(), "wireless mouse".to_string());
+        e1.insert("category".to_string(), "electronics".to_string());
+        e1.insert("price".to_string(), "30.0".to_string());
+        idx.add_document("item:3", e1, None);
+
+        let mut e2 = HashMap::new();
+        e2.insert("title".to_string(), "mechanical keyboard".to_string());
+        e2.insert("category".to_string(), "electronics".to_string());
+        e2.insert("price".to_string(), "120.0".to_string());
+        idx.add_document("item:4", e2, None);
+
+        // Execute search for all items
+        let ast = parse_query("*");
+        let (_total, hits) = execute_search(&idx, &ast, &SearchOptions::default());
+
+        // Pipeline:
+        // GROUPBY 1 @category
+        //   REDUCE COUNT 0 AS cnt
+        //   REDUCE SUM 1 @price AS sum_price
+        //   REDUCE AVG 1 @price AS avg_price
+        //   REDUCE MIN 1 @price AS min_price
+        //   REDUCE MAX 1 @price AS max_price
+        // APPLY @sum_price * 1.1 AS taxed
+        // SORTBY 2 @taxed DESC
+        let options = AggregateOptions {
+            load_fields: vec!["category".to_string(), "price".to_string()],
+            stages: vec![
+                AggregateStage::Group(GroupByStage {
+                    fields: vec!["category".to_string()],
+                    reducers: vec![
+                        Reducer::Count {
+                            alias: "cnt".to_string(),
+                        },
+                        Reducer::Sum {
+                            field: "price".to_string(),
+                            alias: "sum_price".to_string(),
+                        },
+                        Reducer::Avg {
+                            field: "price".to_string(),
+                            alias: "avg_price".to_string(),
+                        },
+                        Reducer::Min {
+                            field: "price".to_string(),
+                            alias: "min_price".to_string(),
+                        },
+                        Reducer::Max {
+                            field: "price".to_string(),
+                            alias: "max_price".to_string(),
+                        },
+                    ],
+                }),
+                AggregateStage::Apply(ApplyStage {
+                    expr: "@sum_price * 1.1".to_string(),
+                    alias: "taxed".to_string(),
+                }),
+                AggregateStage::Sort(SortByStage {
+                    fields: vec![("taxed".to_string(), false)], // DESC
+                    max: None,
+                }),
+            ],
+        };
+
+        let rows = execute_aggregate_pipeline(hits, &options);
+        assert_eq!(rows.len(), 2);
+
+        // Row 0 should be electronics (sum 150 * 1.1 = 165)
+        let row0 = &rows[0];
+        assert_eq!(get_row_field(row0, "category"), Some("electronics"));
+        assert_eq!(get_row_field(row0, "cnt"), Some("2"));
+        assert_eq!(get_row_field(row0, "sum_price"), Some("150"));
+        assert_eq!(get_row_field(row0, "avg_price"), Some("75"));
+        assert_eq!(get_row_field(row0, "min_price"), Some("30"));
+        assert_eq!(get_row_field(row0, "max_price"), Some("120"));
+        assert_eq!(get_row_field(row0, "taxed"), Some("165"));
+
+        // Row 1 should be books (sum 90 * 1.1 = 99)
+        let row1 = &rows[1];
+        assert_eq!(get_row_field(row1, "category"), Some("books"));
+        assert_eq!(get_row_field(row1, "cnt"), Some("2"));
+        assert_eq!(get_row_field(row1, "sum_price"), Some("90"));
+        assert_eq!(get_row_field(row1, "avg_price"), Some("45"));
+        assert_eq!(get_row_field(row1, "min_price"), Some("40"));
+        assert_eq!(get_row_field(row1, "max_price"), Some("50"));
+        assert_eq!(get_row_field(row1, "taxed"), Some("99"));
     }
 }

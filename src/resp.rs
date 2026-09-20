@@ -1140,6 +1140,11 @@ pub enum Command {
         query: String,
         options: crate::search::SearchOptions,
     },
+    FtAggregate {
+        index: String,
+        query: String,
+        options: crate::search::AggregateOptions,
+    },
     FtInfo(String),
     FtDropIndex {
         index: String,
@@ -7799,6 +7804,176 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
             }
             Ok(Some(Command::FtSearch {
+                index,
+                query,
+                options,
+            }))
+        }
+        "FT.AGGREGATE" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'ft.aggregate' command".to_string());
+            }
+            let index = String::from_utf8_lossy(&args[1]).to_string();
+            let query = String::from_utf8_lossy(&args[2]).to_string();
+            let mut options = crate::search::AggregateOptions::default();
+
+            let mut i = 3;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                if opt == "LOAD" && i + 1 < args.len() {
+                    let nargs: usize = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(0);
+                    i += 2;
+                    for _ in 0..nargs {
+                        if i < args.len() {
+                            let mut f = String::from_utf8_lossy(&args[i]).to_string();
+                            if let Some(stripped) = f.strip_prefix('@') {
+                                f = stripped.to_string();
+                            }
+                            options.load_fields.push(f);
+                            i += 1;
+                        }
+                    }
+                } else if opt == "GROUPBY" && i + 1 < args.len() {
+                    let num_fields: usize =
+                        String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(0);
+                    i += 2;
+                    let mut group_fields = Vec::new();
+                    for _ in 0..num_fields {
+                        if i < args.len() {
+                            let mut f = String::from_utf8_lossy(&args[i]).to_string();
+                            if let Some(stripped) = f.strip_prefix('@') {
+                                f = stripped.to_string();
+                            }
+                            group_fields.push(f);
+                            i += 1;
+                        }
+                    }
+                    let mut reducers = Vec::new();
+                    while i < args.len()
+                        && String::from_utf8_lossy(&args[i]).to_uppercase() == "REDUCE"
+                    {
+                        i += 1;
+                        if i >= args.len() {
+                            break;
+                        }
+                        let func = String::from_utf8_lossy(&args[i]).to_uppercase();
+                        i += 1;
+                        let nargs: usize = if i < args.len() {
+                            String::from_utf8_lossy(&args[i]).parse().unwrap_or(0)
+                        } else {
+                            0
+                        };
+                        i += 1;
+                        let mut reduce_args = Vec::new();
+                        for _ in 0..nargs {
+                            if i < args.len() {
+                                let mut a = String::from_utf8_lossy(&args[i]).to_string();
+                                if let Some(stripped) = a.strip_prefix('@') {
+                                    a = stripped.to_string();
+                                }
+                                reduce_args.push(a);
+                                i += 1;
+                            }
+                        }
+                        let mut alias = func.to_lowercase();
+                        if i + 1 < args.len()
+                            && String::from_utf8_lossy(&args[i]).to_uppercase() == "AS"
+                        {
+                            alias = String::from_utf8_lossy(&args[i + 1]).to_string();
+                            i += 2;
+                        }
+                        match func.as_str() {
+                            "COUNT" => reducers.push(crate::search::Reducer::Count { alias }),
+                            "SUM" => {
+                                let field = reduce_args.into_iter().next().unwrap_or_default();
+                                reducers.push(crate::search::Reducer::Sum { field, alias });
+                            }
+                            "AVG" => {
+                                let field = reduce_args.into_iter().next().unwrap_or_default();
+                                reducers.push(crate::search::Reducer::Avg { field, alias });
+                            }
+                            "MIN" => {
+                                let field = reduce_args.into_iter().next().unwrap_or_default();
+                                reducers.push(crate::search::Reducer::Min { field, alias });
+                            }
+                            "MAX" => {
+                                let field = reduce_args.into_iter().next().unwrap_or_default();
+                                reducers.push(crate::search::Reducer::Max { field, alias });
+                            }
+                            _ => {}
+                        }
+                    }
+                    options.stages.push(crate::search::AggregateStage::Group(
+                        crate::search::GroupByStage {
+                            fields: group_fields,
+                            reducers,
+                        },
+                    ));
+                } else if opt == "APPLY" && i + 1 < args.len() {
+                    let expr = String::from_utf8_lossy(&args[i + 1]).to_string();
+                    i += 2;
+                    let mut alias = expr.clone();
+                    if i + 1 < args.len()
+                        && String::from_utf8_lossy(&args[i]).to_uppercase() == "AS"
+                    {
+                        alias = String::from_utf8_lossy(&args[i + 1]).to_string();
+                        i += 2;
+                    }
+                    options.stages.push(crate::search::AggregateStage::Apply(
+                        crate::search::ApplyStage { expr, alias },
+                    ));
+                } else if opt == "SORTBY" && i + 1 < args.len() {
+                    let nargs: usize = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(0);
+                    i += 2;
+                    let mut sort_fields = Vec::new();
+                    let mut count = 0;
+                    while count < nargs && i < args.len() {
+                        let mut f = String::from_utf8_lossy(&args[i]).to_string();
+                        if let Some(stripped) = f.strip_prefix('@') {
+                            f = stripped.to_string();
+                        }
+                        i += 1;
+                        count += 1;
+                        let mut asc = true;
+                        if count < nargs && i < args.len() {
+                            let dir = String::from_utf8_lossy(&args[i]).to_uppercase();
+                            if dir == "DESC" {
+                                asc = false;
+                                i += 1;
+                                count += 1;
+                            } else if dir == "ASC" {
+                                asc = true;
+                                i += 1;
+                                count += 1;
+                            }
+                        }
+                        sort_fields.push((f, asc));
+                    }
+                    options.stages.push(crate::search::AggregateStage::Sort(
+                        crate::search::SortByStage {
+                            fields: sort_fields,
+                            max: None,
+                        },
+                    ));
+                } else if opt == "LIMIT" && i + 2 < args.len() {
+                    let offset: usize = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(0);
+                    let num: usize = String::from_utf8_lossy(&args[i + 2]).parse().unwrap_or(10);
+                    i += 3;
+                    options
+                        .stages
+                        .push(crate::search::AggregateStage::Limit { offset, num });
+                } else if opt == "FILTER" && i + 1 < args.len() {
+                    let expr = String::from_utf8_lossy(&args[i + 1]).to_string();
+                    i += 2;
+                    options
+                        .stages
+                        .push(crate::search::AggregateStage::Filter(expr));
+                } else {
+                    i += 1;
+                }
+            }
+
+            Ok(Some(Command::FtAggregate {
                 index,
                 query,
                 options,
