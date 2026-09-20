@@ -10540,3 +10540,46 @@ fn test_sharded_scatter_gather_search_e2e() {
     let search_dropped = send_and_read(&mut client, b"FT.SEARCH idx:multishard cluster\r\n");
     assert!(search_dropped.contains("ERR Unknown Index name"));
 }
+
+#[test]
+fn test_pubsub_presence_table_selective_fanout_e2e() {
+    let port = 17020;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut sub1 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let resp1 = send_and_read(&mut sub1, b"SUBSCRIBE stream_alpha\r\n");
+    assert!(resp1.contains("subscribe") && resp1.contains("stream_alpha"));
+
+    let mut sub2 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let resp2 = send_and_read(&mut sub2, b"SUBSCRIBE stream_alpha\r\n");
+    assert!(resp2.contains("subscribe") && resp2.contains("stream_alpha"));
+
+    let mut pub_client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // Publish to nobody: presence table returns empty mask, returns 0 immediately
+    let resp = send_and_read(&mut pub_client, b"PUBLISH non_existent_channel msg\r\n");
+    assert_eq!(resp, ":0\r\n");
+
+    // Publish to stream_alpha: delivers to both subscribers across shards
+    let resp = send_and_read(&mut pub_client, b"PUBLISH stream_alpha hello_world\r\n");
+    assert_eq!(resp, ":2\r\n");
+
+    let mut buf = [0u8; 512];
+    let n1 = sub1.read(&mut buf).unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n1]).contains("hello_world"));
+
+    let n2 = sub2.read(&mut buf).unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n2]).contains("hello_world"));
+
+    // Sub1 unsubscribes
+    let un_resp = send_and_read(&mut sub1, b"UNSUBSCRIBE stream_alpha\r\n");
+    assert!(un_resp.contains("unsubscribe"));
+
+    // Next publish only delivers to sub2
+    let resp = send_and_read(&mut pub_client, b"PUBLISH stream_alpha second_msg\r\n");
+    assert_eq!(resp, ":1\r\n");
+
+    let n2 = sub2.read(&mut buf).unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n2]).contains("second_msg"));
+}

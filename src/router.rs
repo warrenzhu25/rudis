@@ -124,6 +124,7 @@ pub struct Router {
     pub mget_desc_pool: Rc<RefCell<Vec<std::sync::Arc<crate::mailbox::ScatterMgetDescriptor>>>>,
     pub mset_desc_pool: Rc<RefCell<Vec<std::sync::Arc<crate::mailbox::ScatterMsetDescriptor>>>>,
     pub pubsub_responder_pool: Rc<RefCell<Vec<(flume::Sender<usize>, flume::Receiver<usize>)>>>,
+    pub presence_table: std::sync::Arc<crate::pubsub::ShardedPresenceTable>,
     pub tier_stats: std::sync::Arc<crate::tiering::TieringStats>,
 }
 
@@ -169,6 +170,7 @@ impl Router {
             mget_desc_pool: Rc::new(RefCell::new(Vec::new())),
             mset_desc_pool: Rc::new(RefCell::new(Vec::new())),
             pubsub_responder_pool: Rc::new(RefCell::new(Vec::new())),
+            presence_table: crate::pubsub::get_presence_table(port),
             tier_stats: crate::tiering::get_tier_stats(port),
         }
     }
@@ -2089,9 +2091,10 @@ impl Router {
 
     pub async fn publish(&self, channel: Bytes, message: Bytes) -> usize {
         let mut total = self.pubsub.borrow().publish(&channel, &message);
+        let mask = self.presence_table.interested_shards(&channel);
         let mut pending = Vec::new();
         for (sid, sender) in self.senders.iter().enumerate() {
-            if sid != self.shard_id {
+            if sid != self.shard_id && (mask & (1u64 << sid)) != 0 {
                 let (tx, rx) = self.acquire_pubsub_responder();
                 let msg = ShardMessage::Publish {
                     channel: channel.clone(),

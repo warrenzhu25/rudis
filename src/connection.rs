@@ -879,15 +879,18 @@ pub async fn handle_connection(
         port: u16,
         client_id: u64,
         registry: Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
-        pubsub: Rc<RefCell<crate::pubsub::PubSubHub>>,
+        router: Rc<Router>,
     }
     impl Drop for ClientCleanup {
         fn drop(&mut self) {
             ACTIVE_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             flush_local_cmd_stats();
             self.registry.borrow_mut().remove(&self.client_id);
-            if !self.pubsub.borrow().clients.is_empty() {
-                self.pubsub.borrow_mut().remove_client(self.client_id);
+            if !self.router.pubsub.borrow().clients.is_empty() {
+                self.router.pubsub.borrow_mut().remove_client_with_presence(
+                    self.client_id,
+                    Some((self.router.shard_id, &self.router.presence_table)),
+                );
             }
             unregister_client_tracking(self.port, self.client_id);
             if crate::block::has_blocked_waiters(self.port) {
@@ -901,7 +904,7 @@ pub async fn handle_connection(
         port: router.port,
         client_id,
         registry: client_registry.clone(),
-        pubsub: router.pubsub.clone(),
+        router: router.clone(),
     };
 
     let ConnScratch {
@@ -1615,8 +1618,15 @@ async fn run_pubsub_loop(
         match cmd {
             Command::Subscribe(channels) => {
                 let mut hub = router.pubsub.borrow_mut();
+                let presence_info = Some((router.shard_id, &*router.presence_table));
                 for ch in channels {
-                    let count = hub.subscribe(client_id, ch.clone(), write_tx.clone(), is_resp3);
+                    let count = hub.subscribe_with_presence(
+                        client_id,
+                        ch.clone(),
+                        write_tx.clone(),
+                        is_resp3,
+                        presence_info,
+                    );
                     out.extend_from_slice(prefix);
                     out.extend_from_slice(b"$9\r\nsubscribe\r\n$");
                     out.extend_from_slice(ch.len().to_string().as_bytes());
@@ -1630,8 +1640,9 @@ async fn run_pubsub_loop(
             }
             Command::Unsubscribe(channels) => {
                 let mut hub = router.pubsub.borrow_mut();
+                let presence_info = Some((router.shard_id, &*router.presence_table));
                 if channels.is_empty() {
-                    let unsubs = hub.unsubscribe_all(client_id);
+                    let unsubs = hub.unsubscribe_all_with_presence(client_id, presence_info);
                     if unsubs.is_empty() {
                         let total = hub.total_subscriptions(client_id);
                         out.extend_from_slice(prefix);
@@ -1652,7 +1663,8 @@ async fn run_pubsub_loop(
                     }
                 } else {
                     for ch in channels {
-                        let remaining = hub.unsubscribe(client_id, &ch);
+                        let remaining =
+                            hub.unsubscribe_with_presence(client_id, &ch, presence_info);
                         out.extend_from_slice(prefix);
                         out.extend_from_slice(b"$11\r\nunsubscribe\r\n$");
                         out.extend_from_slice(ch.len().to_string().as_bytes());
@@ -1667,8 +1679,15 @@ async fn run_pubsub_loop(
             }
             Command::Psubscribe(patterns) => {
                 let mut hub = router.pubsub.borrow_mut();
+                let presence_info = Some((router.shard_id, &*router.presence_table));
                 for pat in patterns {
-                    let count = hub.psubscribe(client_id, pat.clone(), write_tx.clone(), is_resp3);
+                    let count = hub.psubscribe_with_presence(
+                        client_id,
+                        pat.clone(),
+                        write_tx.clone(),
+                        is_resp3,
+                        presence_info,
+                    );
                     out.extend_from_slice(prefix);
                     out.extend_from_slice(b"$10\r\npsubscribe\r\n$");
                     out.extend_from_slice(pat.len().to_string().as_bytes());
@@ -1682,8 +1701,9 @@ async fn run_pubsub_loop(
             }
             Command::Punsubscribe(patterns) => {
                 let mut hub = router.pubsub.borrow_mut();
+                let presence_info = Some((router.shard_id, &*router.presence_table));
                 if patterns.is_empty() {
-                    let unsubs = hub.punsubscribe_all(client_id);
+                    let unsubs = hub.punsubscribe_all_with_presence(client_id, presence_info);
                     if unsubs.is_empty() {
                         let total = hub.total_subscriptions(client_id);
                         out.extend_from_slice(prefix);
@@ -1704,7 +1724,8 @@ async fn run_pubsub_loop(
                     }
                 } else {
                     for pat in patterns {
-                        let remaining = hub.punsubscribe(client_id, &pat);
+                        let remaining =
+                            hub.punsubscribe_with_presence(client_id, &pat, presence_info);
                         out.extend_from_slice(prefix);
                         out.extend_from_slice(b"$12\r\npunsubscribe\r\n$");
                         out.extend_from_slice(pat.len().to_string().as_bytes());

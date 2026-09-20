@@ -77,6 +77,83 @@ pub fn build_pubsub_pframe(
     Bytes::from(buf)
 }
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, RwLock};
+
+pub const PUBSUB_STRIPES: usize = 16;
+
+pub struct ShardedPresenceTable {
+    pub channel_stripes: [AtomicU64; PUBSUB_STRIPES],
+    pub pattern_presence: AtomicU64,
+}
+
+impl Default for ShardedPresenceTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ShardedPresenceTable {
+    pub const fn new() -> Self {
+        Self {
+            channel_stripes: [const { AtomicU64::new(0) }; PUBSUB_STRIPES],
+            pattern_presence: AtomicU64::new(0),
+        }
+    }
+
+    #[inline(always)]
+    pub fn stripe_for(channel: &[u8]) -> usize {
+        (crate::table::hash_key(channel) as usize) % PUBSUB_STRIPES
+    }
+
+    #[inline(always)]
+    pub fn add_subscriber(&self, shard_id: usize, channel: &[u8]) {
+        let stripe = Self::stripe_for(channel);
+        self.channel_stripes[stripe].fetch_or(1u64 << shard_id, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn remove_subscriber(&self, shard_id: usize, channel: &[u8]) {
+        let stripe = Self::stripe_for(channel);
+        self.channel_stripes[stripe].fetch_and(!(1u64 << shard_id), Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn add_pattern_subscriber(&self, shard_id: usize) {
+        self.pattern_presence
+            .fetch_or(1u64 << shard_id, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn remove_pattern_subscriber(&self, shard_id: usize) {
+        self.pattern_presence
+            .fetch_and(!(1u64 << shard_id), Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn interested_shards(&self, channel: &[u8]) -> u64 {
+        let stripe = Self::stripe_for(channel);
+        self.channel_stripes[stripe].load(Ordering::Relaxed)
+            | self.pattern_presence.load(Ordering::Relaxed)
+    }
+}
+
+static PRESENCE_TABLES: LazyLock<RwLock<hashbrown::HashMap<u16, Arc<ShardedPresenceTable>>>> =
+    LazyLock::new(|| RwLock::new(hashbrown::HashMap::new()));
+
+pub fn get_presence_table(port: u16) -> Arc<ShardedPresenceTable> {
+    let read = PRESENCE_TABLES.read().unwrap();
+    if let Some(t) = read.get(&port) {
+        return t.clone();
+    }
+    drop(read);
+    let mut write = PRESENCE_TABLES.write().unwrap();
+    write
+        .entry(port)
+        .or_insert_with(|| Arc::new(ShardedPresenceTable::new()))
+        .clone()
+}
+
 #[derive(Default)]
 pub struct PubSubHub {
     pub channels: hashbrown::HashMap<Bytes, hashbrown::HashSet<u64>>,
@@ -85,6 +162,8 @@ pub struct PubSubHub {
     pub client_channels: hashbrown::HashMap<u64, hashbrown::HashSet<Bytes>>,
     pub client_patterns: hashbrown::HashMap<u64, hashbrown::HashSet<Bytes>>,
     pub client_resp3: hashbrown::HashSet<u64>,
+    pub stripe_counts: [usize; PUBSUB_STRIPES],
+    pub total_patterns: usize,
 }
 
 impl PubSubHub {
@@ -106,12 +185,13 @@ impl PubSubHub {
         ch_count + pat_count
     }
 
-    pub fn subscribe(
+    pub fn subscribe_with_presence(
         &mut self,
         client_id: u64,
         channel: Bytes,
         tx: flume::Sender<Bytes>,
         is_resp3: bool,
+        presence_info: Option<(usize, &ShardedPresenceTable)>,
     ) -> usize {
         self.clients.insert(client_id, tx);
         if is_resp3 {
@@ -119,10 +199,20 @@ impl PubSubHub {
         } else {
             self.client_resp3.remove(&client_id);
         }
-        self.channels
+        let newly_inserted = self
+            .channels
             .entry(channel.clone())
             .or_default()
             .insert(client_id);
+        if newly_inserted {
+            let stripe = ShardedPresenceTable::stripe_for(&channel);
+            if self.stripe_counts[stripe] == 0
+                && let Some((shard_id, presence)) = presence_info
+            {
+                presence.add_subscriber(shard_id, &channel);
+            }
+            self.stripe_counts[stripe] += 1;
+        }
         self.client_channels
             .entry(client_id)
             .or_default()
@@ -130,9 +220,32 @@ impl PubSubHub {
         self.total_subscriptions(client_id)
     }
 
-    pub fn unsubscribe(&mut self, client_id: u64, channel: &[u8]) -> usize {
+    pub fn subscribe(
+        &mut self,
+        client_id: u64,
+        channel: Bytes,
+        tx: flume::Sender<Bytes>,
+        is_resp3: bool,
+    ) -> usize {
+        self.subscribe_with_presence(client_id, channel, tx, is_resp3, None)
+    }
+
+    pub fn unsubscribe_with_presence(
+        &mut self,
+        client_id: u64,
+        channel: &[u8],
+        presence_info: Option<(usize, &ShardedPresenceTable)>,
+    ) -> usize {
         if let Some(set) = self.channels.get_mut(channel) {
-            set.remove(&client_id);
+            if set.remove(&client_id) {
+                let stripe = ShardedPresenceTable::stripe_for(channel);
+                self.stripe_counts[stripe] = self.stripe_counts[stripe].saturating_sub(1);
+                if self.stripe_counts[stripe] == 0
+                    && let Some((shard_id, presence)) = presence_info
+                {
+                    presence.remove_subscriber(shard_id, channel);
+                }
+            }
             if set.is_empty() {
                 self.channels.remove(channel);
             }
@@ -151,12 +264,28 @@ impl PubSubHub {
         total
     }
 
-    pub fn unsubscribe_all(&mut self, client_id: u64) -> Vec<(Bytes, usize)> {
+    pub fn unsubscribe(&mut self, client_id: u64, channel: &[u8]) -> usize {
+        self.unsubscribe_with_presence(client_id, channel, None)
+    }
+
+    pub fn unsubscribe_all_with_presence(
+        &mut self,
+        client_id: u64,
+        presence_info: Option<(usize, &ShardedPresenceTable)>,
+    ) -> Vec<(Bytes, usize)> {
         let mut res = Vec::new();
         if let Some(ch_set) = self.client_channels.remove(&client_id) {
             for ch in ch_set {
                 if let Some(set) = self.channels.get_mut(&ch) {
-                    set.remove(&client_id);
+                    if set.remove(&client_id) {
+                        let stripe = ShardedPresenceTable::stripe_for(&ch);
+                        self.stripe_counts[stripe] = self.stripe_counts[stripe].saturating_sub(1);
+                        if self.stripe_counts[stripe] == 0
+                            && let Some((shard_id, presence)) = presence_info
+                        {
+                            presence.remove_subscriber(shard_id, &ch);
+                        }
+                    }
                     if set.is_empty() {
                         self.channels.remove(&ch);
                     }
@@ -172,12 +301,17 @@ impl PubSubHub {
         res
     }
 
-    pub fn psubscribe(
+    pub fn unsubscribe_all(&mut self, client_id: u64) -> Vec<(Bytes, usize)> {
+        self.unsubscribe_all_with_presence(client_id, None)
+    }
+
+    pub fn psubscribe_with_presence(
         &mut self,
         client_id: u64,
         pattern: Bytes,
         tx: flume::Sender<Bytes>,
         is_resp3: bool,
+        presence_info: Option<(usize, &ShardedPresenceTable)>,
     ) -> usize {
         self.clients.insert(client_id, tx);
         if is_resp3 {
@@ -185,10 +319,19 @@ impl PubSubHub {
         } else {
             self.client_resp3.remove(&client_id);
         }
-        self.patterns
+        let newly_inserted = self
+            .patterns
             .entry(pattern.clone())
             .or_default()
             .insert(client_id);
+        if newly_inserted {
+            if self.total_patterns == 0
+                && let Some((shard_id, presence)) = presence_info
+            {
+                presence.add_pattern_subscriber(shard_id);
+            }
+            self.total_patterns += 1;
+        }
         self.client_patterns
             .entry(client_id)
             .or_default()
@@ -196,9 +339,31 @@ impl PubSubHub {
         self.total_subscriptions(client_id)
     }
 
-    pub fn punsubscribe(&mut self, client_id: u64, pattern: &[u8]) -> usize {
+    pub fn psubscribe(
+        &mut self,
+        client_id: u64,
+        pattern: Bytes,
+        tx: flume::Sender<Bytes>,
+        is_resp3: bool,
+    ) -> usize {
+        self.psubscribe_with_presence(client_id, pattern, tx, is_resp3, None)
+    }
+
+    pub fn punsubscribe_with_presence(
+        &mut self,
+        client_id: u64,
+        pattern: &[u8],
+        presence_info: Option<(usize, &ShardedPresenceTable)>,
+    ) -> usize {
         if let Some(set) = self.patterns.get_mut(pattern) {
-            set.remove(&client_id);
+            if set.remove(&client_id) {
+                self.total_patterns = self.total_patterns.saturating_sub(1);
+                if self.total_patterns == 0
+                    && let Some((shard_id, presence)) = presence_info
+                {
+                    presence.remove_pattern_subscriber(shard_id);
+                }
+            }
             if set.is_empty() {
                 self.patterns.remove(pattern);
             }
@@ -217,12 +382,27 @@ impl PubSubHub {
         total
     }
 
-    pub fn punsubscribe_all(&mut self, client_id: u64) -> Vec<(Bytes, usize)> {
+    pub fn punsubscribe(&mut self, client_id: u64, pattern: &[u8]) -> usize {
+        self.punsubscribe_with_presence(client_id, pattern, None)
+    }
+
+    pub fn punsubscribe_all_with_presence(
+        &mut self,
+        client_id: u64,
+        presence_info: Option<(usize, &ShardedPresenceTable)>,
+    ) -> Vec<(Bytes, usize)> {
         let mut res = Vec::new();
         if let Some(pat_set) = self.client_patterns.remove(&client_id) {
             for pat in pat_set {
                 if let Some(set) = self.patterns.get_mut(&pat) {
-                    set.remove(&client_id);
+                    if set.remove(&client_id) {
+                        self.total_patterns = self.total_patterns.saturating_sub(1);
+                        if self.total_patterns == 0
+                            && let Some((shard_id, presence)) = presence_info
+                        {
+                            presence.remove_pattern_subscriber(shard_id);
+                        }
+                    }
                     if set.is_empty() {
                         self.patterns.remove(&pat);
                     }
@@ -236,6 +416,10 @@ impl PubSubHub {
             self.client_resp3.remove(&client_id);
         }
         res
+    }
+
+    pub fn punsubscribe_all(&mut self, client_id: u64) -> Vec<(Bytes, usize)> {
+        self.punsubscribe_all_with_presence(client_id, None)
     }
 
     pub fn publish(&self, channel: &[u8], message: &[u8]) -> usize {
@@ -294,10 +478,18 @@ impl PubSubHub {
         count
     }
 
-    pub fn remove_client(&mut self, client_id: u64) {
-        self.unsubscribe_all(client_id);
-        self.punsubscribe_all(client_id);
+    pub fn remove_client_with_presence(
+        &mut self,
+        client_id: u64,
+        presence_info: Option<(usize, &ShardedPresenceTable)>,
+    ) {
+        self.unsubscribe_all_with_presence(client_id, presence_info);
+        self.punsubscribe_all_with_presence(client_id, presence_info);
         self.client_resp3.remove(&client_id);
+    }
+
+    pub fn remove_client(&mut self, client_id: u64) {
+        self.remove_client_with_presence(client_id, None);
     }
 
     pub fn channels(&self, pattern: Option<&[u8]>) -> Vec<Bytes> {
@@ -410,5 +602,64 @@ mod tests {
             rx2.try_recv().unwrap(),
             Bytes::from_static(b"*3\r\n$7\r\nmessage\r\n$9\r\nfast_lane\r\n$4\r\nmsg3\r\n")
         );
+    }
+
+    #[test]
+    fn test_sharded_presence_table_bitmask_tracking() {
+        let presence = ShardedPresenceTable::new();
+        let mut hub_shard0 = PubSubHub::new();
+        let mut hub_shard1 = PubSubHub::new();
+
+        let (tx0, _rx0) = flume::bounded(10);
+        let (tx1, _rx1) = flume::bounded(10);
+
+        // Before any subscriptions, no shards are interested
+        assert_eq!(presence.interested_shards(b"sports"), 0);
+
+        // Shard 0 subscribes to "sports"
+        hub_shard0.subscribe_with_presence(
+            1,
+            Bytes::from_static(b"sports"),
+            tx0.clone(),
+            false,
+            Some((0, &presence)),
+        );
+        let mask = presence.interested_shards(b"sports");
+        assert_eq!(mask & (1 << 0), 1 << 0, "Shard 0 should be marked present");
+        assert_eq!(mask & (1 << 1), 0, "Shard 1 should not be marked present");
+
+        // Shard 1 subscribes to "sports" as well
+        hub_shard1.subscribe_with_presence(
+            2,
+            Bytes::from_static(b"sports"),
+            tx1,
+            false,
+            Some((1, &presence)),
+        );
+        let mask = presence.interested_shards(b"sports");
+        assert_eq!(mask & ((1 << 0) | (1 << 1)), (1 << 0) | (1 << 1));
+
+        // Shard 0 unsubscribes
+        hub_shard0.unsubscribe_with_presence(1, b"sports", Some((0, &presence)));
+        let mask = presence.interested_shards(b"sports");
+        assert_eq!(mask & (1 << 0), 0, "Shard 0 bit should be cleared");
+        assert_eq!(mask & (1 << 1), 1 << 1, "Shard 1 bit should remain");
+
+        // Pattern subscription on shard 0 marks pattern presence for all channels
+        hub_shard0.psubscribe_with_presence(
+            3,
+            Bytes::from_static(b"news.*"),
+            tx0,
+            false,
+            Some((0, &presence)),
+        );
+        assert_eq!(
+            presence.interested_shards(b"any_channel") & (1 << 0),
+            1 << 0
+        );
+
+        // Unsubscribe pattern clears pattern presence
+        hub_shard0.punsubscribe_with_presence(3, b"news.*", Some((0, &presence)));
+        assert_eq!(presence.interested_shards(b"any_channel") & (1 << 0), 0);
     }
 }
