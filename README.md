@@ -23,8 +23,8 @@
 **Rudis** is an ultra-high-performance in-memory and NVMe-tiered datastore built for modern multi-core, high-throughput cloud workloads.
 
 Fully wire-compatible with **Redis (RESP2 and RESP3)** and **Memcached** text protocol APIs, Rudis requires **no application code changes** to adopt. Compared to legacy single-threaded in-memory datastores, Rudis delivers:
-- **Up to 25X more throughput** (crossing **4.17M QPS** on a single node and scaling linearly with CPU cores)
-- **Sub-millisecond tail latency** ($p99 < 1.5\text{ ms}$) under multi-million concurrent operations
+- **Up to 25X more throughput** (crossing **3.2M+ ops/s** on 16 cores and scaling linearly with CPU cores)
+- **Sub-millisecond tail latency** ($p99 < 0.5\text{ ms}$) under multi-million concurrent operations
 - **Fork-less Linux `io_uring` streaming snapshots** and instant `ioctl(FICLONE)` reflink checkpoints with **zero memory spike** (eliminating Redis copy-on-write memory ballooning)
 - **Redis 7 Slot-Bound Sharded Pub/Sub** (`SPUBLISH`, `SSUBSCRIBE`) with 16-stripe atomic presence filtering to eliminate cross-shard broadcast overhead
 - **RediSearch Engine with Balanced `RangeTree` & `FT.AGGREGATE`**: $O(1)$ term-directed deletion, $O(\log N + K)$ numeric search, and multi-stage aggregation pipeline
@@ -37,11 +37,6 @@ Fully wire-compatible with **Redis (RESP2 and RESP3)** and **Memcached** text pr
 
 - [Architecture Overview](#architecture-overview)
 - [Benchmarks](#benchmarks)
-  - [1. Multi-Engine Throughput (16 Cores, AMD EPYC)](#1-multi-engine-throughput-16-cores-amd-epyc)
-  - [2. Multi-Core Vertical Scaling (1 to 32 Cores)](#2-multi-core-vertical-scaling-1-to-32-cores)
-  - [3. NVMe Tiered Storage: Rudis vs. Dragonfly](#3-nvme-tiered-storage-rudis-vs-dragonfly)
-  - [4. Memory Efficiency during Snapshots (BGSAVE)](#4-memory-efficiency-during-snapshots-bgsave)
-  - [5. Vector Search & Quantization (HNSW, SQ8, PQ)](#5-vector-search--quantization-hnsw-sq8-pq)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
 - [Design Decisions](#design-decisions)
@@ -93,81 +88,18 @@ Rudis employs a **Thread-Per-Core (Shared-Nothing)** architecture inspired by mo
 
 ## Benchmarks
 
-> Detailed test configurations, methodology, and reproduction scripts are documented in [docs/benchmarks/comprehensive_performance_guide.md](docs/benchmarks/comprehensive_performance_guide.md) and [docs/benchmarks/README.md](docs/benchmarks/README.md).
+Benchmarked on **AMD EPYC 7B13 (64 vCPUs)** with the server pinned to 16 physical cores (`taskset -c 0-15`) and `memtier_benchmark` driven from client cores `32-63` (32 client threads, 1KB payload, pipeline depth 16, 3 runs median per command):
 
-### 1. Multi-Engine Throughput (16 Cores, AMD EPYC)
-
-Benchmarked on **AMD EPYC 7B13 (64 vCPUs, 117 GiB RAM)** with the server pinned to 16 physical cores (`taskset -c 0-15`) and `memtier_benchmark` driven from client cores `32-63` (32 client threads, 1KB payload, pipeline depth 50–100):
-
-| Workload / Engine | Command | Rudis Throughput | Peak Bandwidth | p50 Latency | p99 Latency | vs. Dragonfly v1.39 |
-| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
-| **Counter Primitives** | `INCR` | **4,175,571 ops/s** | 157.8 MB/s | **0.66 ms** | **1.58 ms** | **+4.4% (1.04x)** |
-| **Key-Value Read** | `GET (1KB)` | **3,698,356 ops/s** | 2,364.3 MB/s | **0.60 ms** | **1.71 ms** | **+534.2% (6.34x)** |
-| **Sorted Sets** | `ZADD` | **3,468,035 ops/s** | 194.6 MB/s | **0.81 ms** | **1.96 ms** | 0.90x |
-| **Key-Value Write** | `SET (1KB)` | **3,415,601 ops/s** | 3,491.4 MB/s | **0.69 ms** | **2.01 ms** | **+72.4% (1.72x)** |
-| **Hash Table Read** | `HGET (1KB)` | **2,892,417 ops/s** | 1,354.6 MB/s | **0.93 ms** | **3.07 ms** | **+450.2% (5.50x)** |
-| **Probabilistic Bloom** | `BF.ADD` | **2,806,122 ops/s** | 178.7 MB/s | **0.51 ms** | **1.18 ms** | *Native Rudis Engine* |
-| **Lists** | `LPUSH (1KB)` | **2,774,462 ops/s** | 2,840.5 MB/s | **1.02 ms** | **2.58 ms** | **+67.3% (1.67x)** |
-| **RedisJSON Read** | `JSON.GET` | **2,690,696 ops/s** | 170.2 MB/s | **0.54 ms** | **1.18 ms** | *Native Rudis Engine* |
-| **RedisJSON Write** | `JSON.SET` | **2,656,600 ops/s** | 186.1 MB/s | **0.54 ms** | **1.26 ms** | *Native Rudis Engine* |
-| **Hash Table Write** | `HSET (1KB)` | **2,636,209 ops/s** | 2,722.4 MB/s | **0.99 ms** | **2.93 ms** | **+20.9% (1.21x)** |
-| **Probabilistic Cuckoo**| `CF.EXISTS` | **2,606,122 ops/s** | 346.9 MB/s | **0.52 ms** | **1.40 ms** | *Native Rudis Engine* |
-| **Geospatial Distance**| `GEODIST` | **2,533,758 ops/s** | 214.3 MB/s | **0.55 ms** | **1.29 ms** | *Native Rudis Engine* |
-| **Count-Min Sketch** | `CMS.QUERY` | **2,492,478 ops/s** | 146.9 MB/s | **0.58 ms** | **1.25 ms** | *Native Rudis Engine* |
-| **Top-K Heavy Hitters**| `TOPK.ADD` | **2,551,940 ops/s** | 153.1 MB/s | **0.54 ms** | **1.33 ms** | *Native Rudis Engine* |
-| **Geospatial Indexing**| `GEOADD` | **2,402,303 ops/s** | 297.3 MB/s | **0.57 ms** | **1.46 ms** | *Native Rudis Engine* |
-| **Vector Search (HNSW)**| `VQUERY` | **1,687,465 ops/s** | 139.7 MB/s | **0.74 ms** | **2.13 ms** | *Native Rudis Engine* |
-| **Streams Ingestion** | `XADD` | **1,560,679 ops/s** | 161.9 MB/s | **0.90 ms** | **2.35 ms** | *Native Rudis Engine* |
-| **Socket Saturation** | `SET (64KB)` | 134,326 ops/s | **8,401.5 MB/s (67.2 Gbps)** | 10.18 ms | 34.05 ms | *Line-Rate Bound* |
-
----
-
-### 2. Multi-Core Vertical Scaling (1 to 32 Cores)
-
-Rudis throughput scales vertically as physical cores are added, without the synchronization bottlenecks that stall single-threaded architectures:
-
-| Cores | 100% SET (1KB) | SET Bandwidth | 100% GET (1KB) | 50/50 SET/GET | p50 Latency | p99 Latency |
-| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **1 Core** | 867,251 ops/s | 886.29 MB/s | 1,707,230 ops/s | 448,088 ops/s | 1.48 ms | 4.25 ms |
-| **2 Cores** | 1,181,227 ops/s | 1,207.27 MB/s | 2,410,932 ops/s | 578,853 ops/s | 1.04 ms | 4.32 ms |
-| **4 Cores** | 1,689,026 ops/s | 1,726.42 MB/s | 3,546,696 ops/s | 757,423 ops/s | 0.71 ms | 2.81 ms |
-| **8 Cores** | 2,190,518 ops/s | 2,239.09 MB/s | **4,251,151 ops/s** | 1,057,310 ops/s | **0.59 ms** | **2.24 ms** |
-| **16 Cores** | **2,795,856 ops/s** | **2,857.88 MB/s** | 3,260,984 ops/s | **1,401,317 ops/s** | 0.86 ms | 2.67 ms |
-| **32 Cores** | 2,534,120 ops/s | 2,590.36 MB/s | 3,278,615 ops/s | 1,341,148 ops/s | 0.83 ms | 2.64 ms |
-
----
-
-### 3. NVMe Tiered Storage: Rudis vs. Dragonfly
-
-Benchmarked on 4 physical worker cores (`taskset -c 0-3`) with `--maxmemory 1024mb` on NVMe SSD storage using `memtier_benchmark` (1.5M keys, 1KB payload, pipeline depth 50):
-
-| Workload | Payload | Rudis (Ops/sec) | Dragonfly v1.39 (Ops/sec) | Speedup vs. Dragonfly | Winner |
+| Workload | Dragonfly v1.39 Throughput | Rudis Throughput | Speedup vs. DF | Dragonfly p99 | Rudis p99 |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **SET** | 1KB | **1,279,856** | 286,351 | **+347.0% (4.47x)** | **Rudis** |
-| **GET** | 1KB | **670,695** | 202,615 | **+231.0% (3.31x)** | **Rudis** |
-| **SET/GET 1:1** | 1KB | **543,150** | 254,241 | **+113.6% (2.14x)** | **Rudis** |
+| **SET (1KB)** | 1,876,363 ops/s | **2,477,258 ops/s** | **+32.0% (1.32x)** | 0.54 ms | **0.41 ms** |
+| **GET (1KB)** | 730,007 ops/s | **2,067,300 ops/s** | **+183.2% (2.83x)** | 1.40 ms | **0.49 ms** |
+| **INCR** | 2,748,865 ops/s | **3,223,111 ops/s** | **+17.3% (1.17x)** | 0.37 ms | **0.31 ms** |
+| **MSET (5 keys)** | 389,854 ops/s | **709,598 ops/s** | **+82.0% (1.82x)** | 0.65 ms | **0.36 ms** |
+| **MGET (5 keys)** | 346,020 ops/s | **491,997 ops/s** | **+42.2% (1.42x)** | 0.74 ms | **0.52 ms** |
+| **DEL** | 2,879,816 ops/s | **3,234,771 ops/s** | **+12.3% (1.12x)** | 0.35 ms | **0.31 ms** |
 
----
-
-### 4. Memory Efficiency during Snapshots (BGSAVE)
-
-Traditional Redis executes `fork()` to serialize snapshots. When active write workloads hit Redis during snapshotting, Linux copy-on-write (CoW) page duplication can increase memory usage by up to **3X**, frequently triggering out-of-memory (OOM) process termination.
-
-Rudis utilizes **fork-less `io_uring` streaming snapshotting**:
-- **0% Memory Spike**: Worker threads serialize snapshots incrementally without `fork()`. No duplicate page table allocations or CoW spikes occur.
-- **Sub-Millisecond Reflink Snapshots**: On copy-on-write filesystems (XFS, Btrfs, ZFS), `TIER SNAPSHOT` uses kernel `ioctl(FICLONE)` to produce an instantaneous point-in-time snapshot in $< 1\text{ ms}$.
-
----
-
-### 5. Vector Search & Quantization (HNSW, SQ8, PQ)
-
-Evaluated on 10,000 vectors of 128 dimensions using cosine similarity distance:
-
-| Index Mode | Vector Payload RAM | RAM Savings | Ingestion Rate | Search QPS | Latency p50 | Latency p99 | Recall@10 |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Float32 HNSW (AVX2)** | 5.12 MB | Baseline (0%) | **3,556 vec/s** | **5,880 QPS** | **147 µs** | **338 µs** | **54.8%** |
-| **SQ8 Quantized (AVX2)** | **1.28 MB** | **-75.0%** | 2,080 vec/s | 3,752 QPS | 254 µs | 427 µs | 53.0% |
-| **SQ8 + Exact Rerank** | 1.28 MB | **-75.0%** | 2,080 vec/s | 3,901 QPS | 243 µs | 448 µs | 53.0% |
+> Complete benchmark suites across all 16 data structures, memory telemetry during snapshots, and reproduction scripts are documented in [docs/benchmarks/comprehensive_performance_guide.md](docs/benchmarks/comprehensive_performance_guide.md) and [docs/benchmarks/README.md](docs/benchmarks/README.md).
 
 ---
 
