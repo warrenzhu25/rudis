@@ -27,6 +27,14 @@ pub struct ConnectedReplica {
     pub last_ack_time: AtomicU64,
 }
 
+pub struct ShardReplicaFlow {
+    pub client_id: u64,
+    pub shard_id: usize,
+    pub sender: flume::Sender<Vec<u8>>,
+    pub lsn: AtomicU64,
+    pub ack_lsn: AtomicU64,
+}
+
 pub struct ReplicationBacklog {
     pub buffer: Vec<u8>,
     pub write_idx: usize,
@@ -126,6 +134,8 @@ pub struct ReplicationHub {
     pub backlog: RwLock<ReplicationBacklog>,
     pub replicas: RwLock<HashMap<u64, Arc<ConnectedReplica>>>,
     pub cancel_sync: RwLock<Option<flume::Sender<()>>>,
+    pub shard_flows: RwLock<HashMap<usize, HashMap<u64, Arc<ShardReplicaFlow>>>>,
+    pub has_shard_flows: std::sync::atomic::AtomicBool,
 }
 
 impl ReplicationHub {
@@ -154,6 +164,8 @@ impl ReplicationHub {
             backlog: RwLock::new(ReplicationBacklog::new(1024 * 1024)),
             replicas: RwLock::new(HashMap::new()),
             cancel_sync: RwLock::new(None),
+            shard_flows: RwLock::new(HashMap::new()),
+            has_shard_flows: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -255,6 +267,50 @@ impl ReplicationHub {
         }
     }
 
+    pub fn register_shard_flow(
+        &self,
+        shard_id: usize,
+        client_id: u64,
+        sender: flume::Sender<Vec<u8>>,
+    ) -> Arc<ShardReplicaFlow> {
+        let flow = Arc::new(ShardReplicaFlow {
+            client_id,
+            shard_id,
+            sender,
+            lsn: AtomicU64::new(0),
+            ack_lsn: AtomicU64::new(0),
+        });
+        let mut flows = self.shard_flows.write().unwrap();
+        flows
+            .entry(shard_id)
+            .or_default()
+            .insert(client_id, flow.clone());
+        self.has_shard_flows.store(true, Ordering::Release);
+        HAS_ACTIVE_REPLICATION.store(true, Ordering::Release);
+        flow
+    }
+
+    pub fn unregister_shard_flow(&self, shard_id: usize, client_id: u64) {
+        let mut flows = self.shard_flows.write().unwrap();
+        if let Some(map) = flows.get_mut(&shard_id) {
+            map.remove(&client_id);
+            if map.is_empty() {
+                flows.remove(&shard_id);
+            }
+        }
+        let any_left = !flows.is_empty();
+        self.has_shard_flows.store(any_left, Ordering::Release);
+    }
+
+    pub fn update_shard_flow_ack(&self, shard_id: usize, client_id: u64, ack_lsn: u64) {
+        let flows = self.shard_flows.read().unwrap();
+        if let Some(map) = flows.get(&shard_id)
+            && let Some(flow) = map.get(&client_id)
+        {
+            flow.ack_lsn.store(ack_lsn, Ordering::Relaxed);
+        }
+    }
+
     pub fn try_partial_resync(
         &self,
         client_id: u64,
@@ -352,24 +408,105 @@ impl ReplicationHub {
             self.backlog.write().unwrap().append(bytes, new_offset);
         }
 
-        if !self.has_replicas.load(Ordering::Relaxed) {
+        if self.has_replicas.load(Ordering::Relaxed) {
+            let dead: Vec<u64> = {
+                let reps = self.replicas.read().unwrap();
+                let mut to_remove = Vec::new();
+                for (&id, rep) in reps.iter() {
+                    if rep.sender.send(bytes.to_vec()).is_err() {
+                        to_remove.push(id);
+                    }
+                }
+                to_remove
+            };
+            if !dead.is_empty() {
+                let mut reps = self.replicas.write().unwrap();
+                for id in dead {
+                    reps.remove(&id);
+                }
+            }
+        }
+
+        // Also broadcast to all shard flows if generic propagate was called
+        if self.has_shard_flows.load(Ordering::Relaxed) {
+            let dead_flows: Vec<(usize, u64)> = {
+                let flows = self.shard_flows.read().unwrap();
+                let mut dead = Vec::new();
+                for (&sid, map) in flows.iter() {
+                    for (&cid, flow) in map {
+                        flow.lsn.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        if flow.sender.send(bytes.to_vec()).is_err() {
+                            dead.push((sid, cid));
+                        }
+                    }
+                }
+                dead
+            };
+            if !dead_flows.is_empty() {
+                let mut flows = self.shard_flows.write().unwrap();
+                for (sid, cid) in dead_flows {
+                    if let Some(map) = flows.get_mut(&sid) {
+                        map.remove(&cid);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn propagate_shard(&self, shard_id: usize, bytes: &[u8]) {
+        if !self.is_master() {
+            return;
+        }
+        if self.backlog_active.load(Ordering::Relaxed) {
+            let new_offset = self
+                .master_repl_offset
+                .fetch_add(bytes.len() as u64, Ordering::SeqCst)
+                + bytes.len() as u64;
+            self.backlog.write().unwrap().append(bytes, new_offset);
+        }
+        if self.has_replicas.load(Ordering::Relaxed) {
+            let dead: Vec<u64> = {
+                let reps = self.replicas.read().unwrap();
+                let mut to_remove = Vec::new();
+                for (&id, rep) in reps.iter() {
+                    if rep.sender.send(bytes.to_vec()).is_err() {
+                        to_remove.push(id);
+                    }
+                }
+                to_remove
+            };
+            if !dead.is_empty() {
+                let mut reps = self.replicas.write().unwrap();
+                for id in dead {
+                    reps.remove(&id);
+                }
+            }
+        }
+
+        if !self.has_shard_flows.load(Ordering::Relaxed) {
             return;
         }
 
-        let dead: Vec<u64> = {
-            let reps = self.replicas.read().unwrap();
-            let mut to_remove = Vec::new();
-            for (&id, rep) in reps.iter() {
-                if rep.sender.send(bytes.to_vec()).is_err() {
-                    to_remove.push(id);
+        let dead_flows: Vec<u64> = {
+            let flows = self.shard_flows.read().unwrap();
+            let mut dead = Vec::new();
+            if let Some(map) = flows.get(&shard_id) {
+                for (&cid, flow) in map {
+                    flow.lsn.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    if flow.sender.send(bytes.to_vec()).is_err() {
+                        dead.push(cid);
+                    }
                 }
             }
-            to_remove
+            dead
         };
-        if !dead.is_empty() {
-            let mut reps = self.replicas.write().unwrap();
-            for id in dead {
-                reps.remove(&id);
+
+        if !dead_flows.is_empty() {
+            let mut flows = self.shard_flows.write().unwrap();
+            if let Some(map) = flows.get_mut(&shard_id) {
+                for cid in dead_flows {
+                    map.remove(&cid);
+                }
             }
         }
     }
@@ -537,6 +674,15 @@ pub fn propagate_bytes(port: u16, bytes: &[u8]) {
     }
     let hub = get_replication_hub(port);
     hub.propagate(bytes);
+}
+
+#[inline(always)]
+pub fn propagate_shard_bytes(port: u16, shard_id: usize, bytes: &[u8]) {
+    if !HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) {
+        return;
+    }
+    let hub = get_replication_hub(port);
+    hub.propagate_shard(shard_id, bytes);
 }
 
 pub fn record_mutation(
@@ -1165,5 +1311,48 @@ mod tests {
             hub.try_partial_resync(101, tx, &master_replid, 121)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn test_per_shard_parallel_replication_flows() {
+        let hub = ReplicationHub::new(19996);
+        let (tx0, rx0) = flume::bounded(16);
+        let (tx1, rx1) = flume::bounded(16);
+
+        // Register flows for Shard 0 and Shard 1
+        let flow0 = hub.register_shard_flow(0, 100, tx0);
+        let flow1 = hub.register_shard_flow(1, 101, tx1);
+
+        assert!(hub.has_shard_flows.load(Ordering::Relaxed));
+        assert_eq!(flow0.shard_id, 0);
+        assert_eq!(flow1.shard_id, 1);
+
+        // Mutation on Shard 0
+        let cmd0 = b"*3\r\n$3\r\nSET\r\n$4\r\nkey0\r\n$4\r\nval0\r\n";
+        hub.propagate_shard(0, cmd0);
+
+        // Shard 0 flow receives mutation, Shard 1 receives nothing
+        assert_eq!(rx0.try_recv().unwrap(), cmd0.to_vec());
+        assert!(rx1.try_recv().is_err());
+        assert_eq!(flow0.lsn.load(Ordering::Relaxed), cmd0.len() as u64);
+        assert_eq!(flow1.lsn.load(Ordering::Relaxed), 0);
+
+        // Mutation on Shard 1
+        let cmd1 = b"*3\r\n$3\r\nSET\r\n$4\r\nkey1\r\n$4\r\nval1\r\n";
+        hub.propagate_shard(1, cmd1);
+
+        // Shard 1 flow receives mutation, Shard 0 receives nothing
+        assert_eq!(rx1.try_recv().unwrap(), cmd1.to_vec());
+        assert!(rx0.try_recv().is_err());
+        assert_eq!(flow1.lsn.load(Ordering::Relaxed), cmd1.len() as u64);
+
+        // Test ACK tracking
+        hub.update_shard_flow_ack(0, 100, 42);
+        assert_eq!(flow0.ack_lsn.load(Ordering::Relaxed), 42);
+
+        // Unregister flows
+        hub.unregister_shard_flow(0, 100);
+        hub.unregister_shard_flow(1, 101);
+        assert!(!hub.has_shard_flows.load(Ordering::Relaxed));
     }
 }

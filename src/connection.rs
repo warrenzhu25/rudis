@@ -1100,6 +1100,36 @@ pub async fn handle_connection(
                     return;
                 }
 
+                // 2.6 Transition to Shard Replication Flow mode if DFLY FLOW is received
+                if has_special
+                    && let Some(flow_idx) = commands
+                        .iter()
+                        .position(|c| matches!(c, Command::DflyFlow { .. }))
+                {
+                    for c in commands.drain(..flow_idx) {
+                        let _ = execute_command(
+                            c,
+                            &router,
+                            client_id,
+                            &client_registry,
+                            &mut out_buf,
+                            &mut asking,
+                            &mut authenticated,
+                            &mut auth_user,
+                        )
+                        .await;
+                    }
+                    if !out_buf.is_empty() {
+                        let write_chunk = std::mem::take(&mut out_buf);
+                        let _ = stream.write_all(write_chunk).await.0;
+                    }
+                    let flow_cmd = commands.remove(0);
+                    if let Command::DflyFlow { shard_id, lsn, .. } = flow_cmd {
+                        run_shard_replication_flow(stream, client_id, router, shard_id, lsn).await;
+                    }
+                    return;
+                }
+
                 // 3. Execute parsed commands with transaction support and pipeline squashing
                 if !commands.is_empty() {
                     let has_tx = has_special
@@ -2036,6 +2066,87 @@ async fn run_master_replica_stream(
         }
     }
     hub.unregister_replica(client_id);
+}
+
+async fn run_shard_replication_flow(
+    stream: TcpStream,
+    client_id: u64,
+    router: Rc<Router>,
+    shard_id: usize,
+    _lsn: Option<u64>,
+) {
+    let hub = crate::replication::get_replication_hub(router.port);
+    let (mut reader, mut writer) = stream.into_split();
+    let (write_tx, write_rx) = flume::bounded::<Vec<u8>>(4096);
+
+    let _flow = hub.register_shard_flow(shard_id, client_id, write_tx.clone());
+
+    // Fetch this shard's RDB chunk
+    let chunk = if shard_id == router.shard_id {
+        let mut buf = Vec::new();
+        router.local_db.borrow_mut().save_rdb_chunk(&mut buf);
+        buf
+    } else {
+        let (tx, rx) = flume::bounded(1);
+        let msg = crate::shard::ShardMessage::SaveRdbChunk { responder: tx };
+        if router.senders[shard_id].send(msg).is_ok() {
+            rx.recv_async().await.unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    };
+
+    let mut initial_msg = format!("+OK FLOW {}\r\n${}\r\n", shard_id, chunk.len()).into_bytes();
+    initial_msg.extend_from_slice(&chunk);
+    initial_msg.extend_from_slice(b"\r\n");
+    if writer.write_all(initial_msg).await.0.is_err() {
+        hub.unregister_shard_flow(shard_id, client_id);
+        return;
+    }
+
+    let writer_hub = hub.clone();
+    monoio::spawn(async move {
+        while let Ok(data) = write_rx.recv_async().await {
+            if writer.write_all(data).await.0.is_err() {
+                break;
+            }
+        }
+        writer_hub.unregister_shard_flow(shard_id, client_id);
+    });
+
+    let mut read_buf = vec![0u8; READ_BUFFER_SIZE];
+    let mut buf = BytesMut::with_capacity(32768);
+    loop {
+        let (res, returned_buf) = reader.read(read_buf).await;
+        read_buf = returned_buf;
+        match res {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&read_buf[..n]);
+                while !buf.is_empty() {
+                    match crate::resp::parse_command(&mut buf) {
+                        Ok(Some(cmd)) => {
+                            if let Command::Replconf(args) = cmd
+                                && args.len() >= 2
+                                && args[0].eq_ignore_ascii_case(b"ack")
+                                && let Ok(s) = std::str::from_utf8(&args[1])
+                                && let Ok(ack_off) = s.parse::<u64>()
+                            {
+                                hub.update_shard_flow_ack(shard_id, client_id, ack_off);
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(_) => {
+                            buf.clear();
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    hub.unregister_shard_flow(shard_id, client_id);
 }
 
 pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
@@ -3331,6 +3442,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         | Command::XdpPacket(_) => "XDP",
         Command::DflyCluster(_) => "DFLYCLUSTER",
         Command::DflyMigrate(_) => "DFLYMIGRATE",
+        Command::DflyFlow { .. } => "DFLY FLOW",
         Command::Stick(_) => "STICK",
         Command::Unstick(_) => "UNSTICK",
         Command::Sticky(_) => "STICKY",
@@ -4377,7 +4489,22 @@ async fn execute_command(
                 }
                 out.extend_from_slice(b"+OK\r\n");
             } else if args[0].eq_ignore_ascii_case(b"capa") {
-                out.extend_from_slice(b"+OK\r\n");
+                if args.iter().any(|a| a.eq_ignore_ascii_case(b"dragonfly")) {
+                    let hub = crate::replication::get_replication_hub(router.port);
+                    let replid = &hub.master_replid;
+                    let num_shards = router.num_shards;
+                    out.extend_from_slice(
+                        format!(
+                            "*5\r\n${}\r\n{}\r\n$5\r\nSYNC1\r\n:{}\r\n:1\r\n:0\r\n",
+                            replid.len(),
+                            replid,
+                            num_shards
+                        )
+                        .as_bytes(),
+                    );
+                } else {
+                    out.extend_from_slice(b"+OK\r\n");
+                }
             } else if args[0].eq_ignore_ascii_case(b"ack") {
                 if args.len() >= 2
                     && let Ok(s) = std::str::from_utf8(&args[1])
@@ -8233,6 +8360,7 @@ async fn execute_command(
             out.extend_from_slice(b"+OK\r\n");
             false
         }
+        Command::DflyFlow { .. } => false,
     }
 }
 
@@ -8558,7 +8686,7 @@ pub fn execute_local_command(
                         aof_w.borrow_mut().append(&bytes);
                     }
                     if need_rep {
-                        crate::replication::propagate_bytes(db.port, &bytes);
+                        crate::replication::propagate_shard_bytes(db.port, db.shard_id, &bytes);
                     }
                 }
             }
@@ -12556,6 +12684,7 @@ fn is_special_pipeline_cmd(cmd: &Command) -> bool {
             | Command::Psubscribe(_)
             | Command::Ssubscribe(_)
             | Command::Psync { .. }
+            | Command::DflyFlow { .. }
             | Command::Multi
             | Command::Exec
             | Command::Discard

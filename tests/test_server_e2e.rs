@@ -10939,3 +10939,88 @@ fn test_ft_aggregate_multishard_pipeline_e2e() {
     let drop_cmd = format_resp_cmd(&["FT.DROPINDEX", "idx:sales"]);
     assert_eq!(send_and_read(&mut client, &drop_cmd), "+OK\r\n");
 }
+
+#[test]
+fn test_per_shard_parallel_replication_stream_e2e() {
+    let port = 17040;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let format_resp_cmd = |args: &[&str]| -> Vec<u8> {
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for arg in args {
+            out.extend_from_slice(format!("${}\r\n{}\r\n", arg.len(), arg).as_bytes());
+        }
+        out
+    };
+
+    let mut ctrl = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Handshake with REPLCONF capa dragonfly
+    let capa_cmd = format_resp_cmd(&["REPLCONF", "capa", "dragonfly"]);
+    let capa_resp = send_and_read(&mut ctrl, &capa_cmd);
+    // Expect 5-element array: *5\r\n${replid.len()}\r\n{replid}\r\n$5\r\nSYNC1\r\n:4\r\n:1\r\n:0\r\n
+    assert!(
+        capa_resp.starts_with("*5\r\n"),
+        "Expected array response, got: {}",
+        capa_resp
+    );
+    assert!(capa_resp.contains("SYNC1"));
+    assert!(capa_resp.contains(":4\r\n")); // 4 shards
+
+    // 2. Open 4 parallel TCP flow streams for the 4 shards
+    let mut flows = Vec::new();
+    for sid in 0..num_shards {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        let sid_str = sid.to_string();
+        let flow_cmd = format_resp_cmd(&["DFLY", "FLOW", "mock_replid", "SYNC1", &sid_str]);
+        let resp = send_and_read(&mut stream, &flow_cmd);
+        assert!(
+            resp.starts_with(&format!("+OK FLOW {}", sid)),
+            "Got: {}",
+            resp
+        );
+        flows.push(stream);
+    }
+
+    // 3. Find keys that map to shard 0 and shard 1
+    let mut key_shard0 = String::new();
+    let mut key_shard1 = String::new();
+    for i in 0..100 {
+        let k = format!("flow_key:{}", i);
+        let sid = rudis::router::target_shard(k.as_bytes(), num_shards);
+        if sid == 0 && key_shard0.is_empty() {
+            key_shard0 = k;
+        } else if sid == 1 && key_shard1.is_empty() {
+            key_shard1 = k;
+        }
+        if !key_shard0.is_empty() && !key_shard1.is_empty() {
+            break;
+        }
+    }
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 4. Write key_shard0
+    let set_cmd0 = format_resp_cmd(&["SET", &key_shard0, "val0"]);
+    assert_eq!(send_and_read(&mut client, &set_cmd0), "+OK\r\n");
+
+    // Flow 0 receives the streamed mutation
+    let mut buf = [0u8; 512];
+    let n0 = flows[0].read(&mut buf).unwrap();
+    let received0 = String::from_utf8_lossy(&buf[..n0]);
+    assert!(received0.contains("SET") && received0.contains(&key_shard0));
+
+    // 5. Write key_shard1
+    let set_cmd1 = format_resp_cmd(&["SET", &key_shard1, "val1"]);
+    assert_eq!(send_and_read(&mut client, &set_cmd1), "+OK\r\n");
+
+    // Flow 1 receives the streamed mutation
+    let n1 = flows[1].read(&mut buf).unwrap();
+    let received1 = String::from_utf8_lossy(&buf[..n1]);
+    assert!(received1.contains("SET") && received1.contains(&key_shard1));
+
+    // 6. Flow sends ACK
+    let ack_cmd = format_resp_cmd(&["REPLCONF", "ACK", "42"]);
+    flows[0].write_all(&ack_cmd).unwrap();
+}

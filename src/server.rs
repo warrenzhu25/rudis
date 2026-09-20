@@ -127,7 +127,7 @@ pub fn run_shard_worker(
         };
 
         // 2. Pure thread-local Shard DB (no Mutex, no Arc)
-        let local_db = Rc::new(RefCell::new(ShardDb::new(port)));
+        let local_db = Rc::new(RefCell::new(ShardDb::new(port).with_shard(shard_id)));
 
         // 2.5 RDB Snapshot Restore on startup
         // Follow Redis specification: if AOF is enabled, AOF is authoritative; otherwise load RDB.

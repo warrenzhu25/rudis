@@ -577,6 +577,7 @@ pub enum SlotState {
 pub struct ShardDb {
     pub table: crate::table::RudisTable,
     pub port: u16,
+    pub shard_id: usize,
     pub tier_manager: Option<std::rc::Rc<crate::tiering::ShardTierManager>>,
     pub vector_indexes: std::collections::HashMap<String, crate::vector::HnswIndex>,
     pub crdt_store: crate::crdt::CrdtStore,
@@ -591,6 +592,7 @@ impl ShardDb {
         Self {
             table: crate::table::RudisTable::new(),
             port,
+            shard_id: 0,
             tier_manager: None,
             vector_indexes: std::collections::HashMap::new(),
             crdt_store: crate::crdt::CrdtStore::new(port),
@@ -599,6 +601,12 @@ impl ShardDb {
             sticky_keys: hashbrown::HashSet::new(),
             search_indices: std::collections::HashMap::new(),
         }
+    }
+
+    #[inline]
+    pub fn with_shard(mut self, shard_id: usize) -> Self {
+        self.shard_id = shard_id;
+        self
     }
 
     #[inline(always)]

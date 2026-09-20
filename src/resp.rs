@@ -1178,6 +1178,12 @@ pub enum Command {
     // Dragonfly native extensions
     DflyCluster(DflyClusterSubcommand),
     DflyMigrate(DflyMigrateSubcommand),
+    DflyFlow {
+        master_replid: String,
+        sync_id: String,
+        shard_id: usize,
+        lsn: Option<u64>,
+    },
     Stick(Vec<Bytes>),
     Unstick(Vec<Bytes>),
     Sticky(Bytes),
@@ -4891,6 +4897,35 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     DflyClusterSubcommand::SlotMigrationStatus,
                 ))),
                 _ => Err(format!("ERR unknown subcommand '{}' for DFLYCLUSTER", sub)),
+            }
+        }
+        "DFLY" => {
+            if args.len() < 2 {
+                return Err("ERR wrong number of arguments for 'dfly' command".to_string());
+            }
+            let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
+            if sub == "FLOW" {
+                if args.len() < 5 {
+                    return Err("ERR wrong number of arguments for 'dfly flow' command".to_string());
+                }
+                let master_replid = String::from_utf8_lossy(&args[2]).to_string();
+                let sync_id = String::from_utf8_lossy(&args[3]).to_string();
+                let shard_id: usize = String::from_utf8_lossy(&args[4])
+                    .parse()
+                    .map_err(|_| "ERR invalid shard id".to_string())?;
+                let lsn = if args.len() > 5 {
+                    String::from_utf8_lossy(&args[5]).parse::<u64>().ok()
+                } else {
+                    None
+                };
+                Ok(Some(Command::DflyFlow {
+                    master_replid,
+                    sync_id,
+                    shard_id,
+                    lsn,
+                }))
+            } else {
+                Ok(Some(Command::Unknown(format!("DFLY {}", sub))))
             }
         }
         "DFLYMIGRATE" => {
