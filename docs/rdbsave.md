@@ -89,7 +89,8 @@ ioctl(dest_fd, FICLONE, src_fd);
 | :--- | :---: | :---: | :---: |
 | **Snapshot Mechanism** | Process `fork()` + Linux CoW | Fiber-level DashTable versioning | **Sequential `io_uring` + `FICLONE` Reflink** |
 | **Baseline RSS** | ~220 MB | 219.8 MB | **357.6 MB** |
-| **BGSAVE Peak RSS** | > 650 MB (up to 3x) | 263.0 MB | **473.7 MB** |
+| **BGSAVE Peak RSS** | > 650 MB (up to 3x) | 263.0 MB | **473.7 MB (Delta: +116 MB)** |
+| **BGREWRITEAOF Peak RSS** | > 700 MB | N/A | **415.7 MB (Delta: +48 MB)** |
 | **Throughput during BGSAVE** | Stalled / degraded | 1.84M ops/s | **2.18M ops/s (+18.1% vs DF)** |
 | **Main Thread Latency Impact**| 10–200 ms page freeze | Negligible | **Sub-millisecond p99 (0.47 ms)** |
 | **Reflink `FICLONE` Support** | No | No | **Yes (< 1 ms instant checkpoint)** |
