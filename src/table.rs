@@ -1279,11 +1279,14 @@ impl RudisFlatTable {
             while bits != 0 {
                 let offset = bits.trailing_zeros() as usize;
                 let slot_idx = (idx + offset) & self.mask;
-                // SAFETY: slot_idx is masked with self.mask where self.slots.len() == self.capacity == self.mask + 1.
-                if let Some(entry) = unsafe { self.slots.get_unchecked(slot_idx) }
-                    && entry.key.len() == key.len()
-                    && entry.key.as_ref() == key
-                {
+                // SAFETY: A SIMD tag match strictly matches 0..=127, never EMPTY (0xFF) or DELETED (0xFE).
+                let entry = unsafe {
+                    self.slots
+                        .get_unchecked(slot_idx)
+                        .as_ref()
+                        .unwrap_unchecked()
+                };
+                if entry.key.len() == key.len() && entry.key.as_ref() == key {
                     return Some((slot_idx, entry));
                 }
                 bits &= bits - 1;
@@ -1315,11 +1318,14 @@ impl RudisFlatTable {
             while bits != 0 {
                 let offset = bits.trailing_zeros() as usize;
                 let slot_idx = (idx + offset) & self.mask;
-                // SAFETY: slot_idx is masked with self.mask where self.slots.len() == self.capacity == self.mask + 1.
-                if let Some(entry) = unsafe { self.slots.get_unchecked(slot_idx) }
-                    && entry.key.len() == key.len()
-                    && entry.key.as_ref() == key
-                {
+                // SAFETY: A SIMD tag match strictly matches 0..=127, never EMPTY or DELETED.
+                let entry = unsafe {
+                    self.slots
+                        .get_unchecked(slot_idx)
+                        .as_ref()
+                        .unwrap_unchecked()
+                };
+                if entry.key.len() == key.len() && entry.key.as_ref() == key {
                     return true;
                 }
                 bits &= bits - 1;
@@ -1351,14 +1357,21 @@ impl RudisFlatTable {
             while bits != 0 {
                 let offset = bits.trailing_zeros() as usize;
                 let slot_idx = (idx + offset) & self.mask;
-                // SAFETY: slot_idx is masked with self.mask where self.slots.len() == self.capacity == self.mask + 1.
-                if let Some(entry) = unsafe { self.slots.get_unchecked(slot_idx) }
-                    && entry.key.len() == key.len()
-                    && entry.key.as_ref() == key
-                {
+                // SAFETY: A SIMD tag match strictly matches 0..=127, never EMPTY or DELETED.
+                let entry = unsafe {
+                    self.slots
+                        .get_unchecked(slot_idx)
+                        .as_ref()
+                        .unwrap_unchecked()
+                };
+                if entry.key.len() == key.len() && entry.key.as_ref() == key {
                     // SAFETY: slot_idx is valid and within bounds
-                    let entry_mut =
-                        unsafe { self.slots.get_unchecked_mut(slot_idx).as_mut().unwrap() };
+                    let entry_mut = unsafe {
+                        self.slots
+                            .get_unchecked_mut(slot_idx)
+                            .as_mut()
+                            .unwrap_unchecked()
+                    };
                     return Some((slot_idx, entry_mut));
                 }
                 bits &= bits - 1;
@@ -1397,10 +1410,14 @@ impl RudisFlatTable {
             while bits != 0 {
                 let offset = bits.trailing_zeros() as usize;
                 let slot_idx = (idx + offset) & self.mask;
-                if let Some(ref entry) = self.slots[slot_idx]
-                    && entry.key.len() == key.len()
-                    && entry.key.as_ref() == key
-                {
+                // SAFETY: A SIMD tag match strictly matches 0..=127, never EMPTY or DELETED.
+                let entry = unsafe {
+                    self.slots
+                        .get_unchecked(slot_idx)
+                        .as_ref()
+                        .unwrap_unchecked()
+                };
+                if entry.key.len() == key.len() && entry.key.as_ref() == key {
                     return (Some(slot_idx), slot_idx);
                 }
                 bits &= bits - 1;
@@ -2114,11 +2131,19 @@ impl RudisTable {
             return false;
         }
         if self.num_expires == 0 {
-            if let Some((idx, _)) = self.table.find_entry(key, hash) {
-                let entry = self.table.remove_present(idx);
-                let freed = entry.key.len() + entry.val.approx_bytes() + 64;
+            if let Some((idx, entry)) = self.table.find_entry(key, hash) {
+                let val_bytes = match &entry.val {
+                    RudisValue::String(b) => b.len(),
+                    RudisValue::Int(_) => 8,
+                    other => other.approx_bytes(),
+                };
+                let freed = entry.key.len() + val_bytes + 64;
                 self.used_memory = self.used_memory.saturating_sub(freed);
-                self.recycle_value(entry.val);
+                let entry = self.table.remove_present(idx);
+                match entry.val {
+                    RudisValue::String(_) | RudisValue::Int(_) => {}
+                    other => self.recycle_value(other),
+                }
                 return true;
             }
             return false;
@@ -2132,13 +2157,21 @@ impl RudisTable {
                 self.expire_slot(idx);
                 return false;
             }
+            let val_bytes = match &entry.val {
+                RudisValue::String(b) => b.len(),
+                RudisValue::Int(_) => 8,
+                other => other.approx_bytes(),
+            };
+            let freed = entry.key.len() + val_bytes + 64;
+            self.used_memory = self.used_memory.saturating_sub(freed);
             let entry = self.table.remove_present(idx);
             if entry.expire_at.is_some() {
                 self.num_expires = self.num_expires.saturating_sub(1);
             }
-            let freed = entry.key.len() + entry.val.approx_bytes() + 64;
-            self.used_memory = self.used_memory.saturating_sub(freed);
-            self.recycle_value(entry.val);
+            match entry.val {
+                RudisValue::String(_) | RudisValue::Int(_) => {}
+                other => self.recycle_value(other),
+            }
             return true;
         }
         false
