@@ -1096,14 +1096,14 @@ impl Router {
         }
 
         // Wait for all remote shards to complete their writes
-        if descriptor.pending.load(Ordering::Acquire) != 0 {
+        if !descriptor.done.load(Ordering::Acquire) {
             for _ in 0..64 {
                 std::hint::spin_loop();
-                if descriptor.pending.load(Ordering::Acquire) == 0 {
+                if descriptor.done.load(Ordering::Acquire) {
                     break;
                 }
             }
-            if descriptor.pending.load(Ordering::Acquire) != 0 {
+            while !descriptor.done.load(Ordering::Acquire) {
                 let _ = notify_rx.recv_async().await;
             }
         }
@@ -1236,15 +1236,15 @@ impl Router {
             total_keys,
         } = inflight;
 
-        // Wait for all remote shards to complete their writes with spin loop first
-        if descriptor.pending.load(Ordering::Acquire) != 0 {
+        // Wait for all remote shards to complete their writes and finish notify_tx.try_send
+        if !descriptor.done.load(Ordering::Acquire) {
             for _ in 0..256 {
                 std::hint::spin_loop();
-                if descriptor.pending.load(Ordering::Acquire) == 0 {
+                if descriptor.done.load(Ordering::Acquire) {
                     break;
                 }
             }
-            if descriptor.pending.load(Ordering::Acquire) != 0 {
+            while !descriptor.done.load(Ordering::Acquire) {
                 let _ = notify_rx.recv_async().await;
             }
         }
@@ -1402,14 +1402,14 @@ impl Router {
             notify_rx,
         } = inflight;
 
-        if descriptor.pending.load(Ordering::Acquire) != 0 {
+        if !descriptor.done.load(Ordering::Acquire) {
             for _ in 0..64 {
                 std::hint::spin_loop();
-                if descriptor.pending.load(Ordering::Acquire) == 0 {
+                if descriptor.done.load(Ordering::Acquire) {
                     break;
                 }
             }
-            if descriptor.pending.load(Ordering::Acquire) != 0 {
+            while !descriptor.done.load(Ordering::Acquire) {
                 let _ = notify_rx.recv_async().await;
             }
         }

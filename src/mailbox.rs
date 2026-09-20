@@ -26,6 +26,7 @@ impl<T> std::ops::DerefMut for CachePadded<T> {
 pub struct ScatterMgetDescriptor {
     pub results: Box<[CachePadded<UnsafeCell<Option<Bytes>>>]>,
     pub pending: AtomicUsize,
+    pub done: AtomicBool,
     pub notify: CachePadded<UnsafeCell<flume::Sender<()>>>,
     pub recycled_keys: Box<[CachePadded<UnsafeCell<Vec<(usize, Bytes)>>>]>,
 }
@@ -51,6 +52,7 @@ impl ScatterMgetDescriptor {
         Self {
             results: vec.into_boxed_slice(),
             pending: AtomicUsize::new(pending_shards),
+            done: AtomicBool::new(pending_shards == 0),
             notify: CachePadded(UnsafeCell::new(notify)),
             recycled_keys: recycled.into_boxed_slice(),
         }
@@ -58,7 +60,7 @@ impl ScatterMgetDescriptor {
 
     #[inline(always)]
     pub fn reset(&self, total_keys: usize, pending_shards: usize, notify: flume::Sender<()>) {
-        self.pending.store(pending_shards, Ordering::Release);
+        self.done.store(pending_shards == 0, Ordering::Relaxed);
         unsafe {
             *self.notify.get() = notify;
         }
@@ -67,6 +69,7 @@ impl ScatterMgetDescriptor {
                 *self.results[i].get() = None;
             }
         }
+        self.pending.store(pending_shards, Ordering::Release);
     }
 
     #[inline(always)]
@@ -85,9 +88,10 @@ impl ScatterMgetDescriptor {
 
     #[inline(always)]
     pub fn finish_shard(&self) {
-        if self.pending.fetch_sub(1, Ordering::Release) == 1 {
+        if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
             let tx = unsafe { &*self.notify.get() };
             let _ = tx.try_send(());
+            self.done.store(true, Ordering::Release);
         }
     }
 
@@ -119,6 +123,7 @@ impl ScatterMgetDescriptor {
 /// Shared-memory Scatter-Gather Descriptor for multi-shard MSET.
 pub struct ScatterMsetDescriptor {
     pub pending: AtomicUsize,
+    pub done: AtomicBool,
     pub notify: CachePadded<UnsafeCell<flume::Sender<()>>>,
     pub recycled_pairs: Box<[CachePadded<UnsafeCell<Vec<(Bytes, Bytes)>>>]>,
 }
@@ -134,6 +139,7 @@ impl ScatterMsetDescriptor {
         }
         Self {
             pending: AtomicUsize::new(pending_shards),
+            done: AtomicBool::new(pending_shards == 0),
             notify: CachePadded(UnsafeCell::new(notify)),
             recycled_pairs: recycled.into_boxed_slice(),
         }
@@ -141,10 +147,11 @@ impl ScatterMsetDescriptor {
 
     #[inline(always)]
     pub fn reset(&self, pending_shards: usize, notify: flume::Sender<()>) {
-        self.pending.store(pending_shards, Ordering::Release);
+        self.done.store(pending_shards == 0, Ordering::Relaxed);
         unsafe {
             *self.notify.get() = notify;
         }
+        self.pending.store(pending_shards, Ordering::Release);
     }
 
     #[inline(always)]
@@ -156,9 +163,10 @@ impl ScatterMsetDescriptor {
 
     #[inline(always)]
     pub fn finish_shard(&self) {
-        if self.pending.fetch_sub(1, Ordering::Release) == 1 {
+        if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
             let tx = unsafe { &*self.notify.get() };
             let _ = tx.try_send(());
+            self.done.store(true, Ordering::Release);
         }
     }
 
