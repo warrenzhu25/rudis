@@ -544,9 +544,17 @@ pub enum Command {
         channel: Bytes,
         message: Bytes,
     },
+    Spublish {
+        channel: Bytes,
+        message: Bytes,
+    },
+    Ssubscribe(Vec<Bytes>),
+    Sunsubscribe(Vec<Bytes>),
     PubsubChannels(Option<Bytes>),
     PubsubNumsub(Vec<Bytes>),
     PubsubNumpat,
+    PubsubShardchannels(Option<Bytes>),
+    PubsubShardnumsub(Vec<Bytes>),
     // KEYSPACE INSPECTION
     Keys(Bytes),
     Scan {
@@ -5064,6 +5072,22 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 message: args[2].clone(),
             }))
         }
+        "SPUBLISH" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'spublish' command".to_string());
+            }
+            Ok(Some(Command::Spublish {
+                channel: args[1].clone(),
+                message: args[2].clone(),
+            }))
+        }
+        "SSUBSCRIBE" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'ssubscribe' command".to_string());
+            }
+            Ok(Some(Command::Ssubscribe(args[1..].to_vec())))
+        }
+        "SUNSUBSCRIBE" => Ok(Some(Command::Sunsubscribe(args[1..].to_vec()))),
         "PUBSUB" => {
             if args.len() < 2 {
                 return Err("wrong number of arguments for 'pubsub' command".to_string());
@@ -5087,6 +5111,22 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     Ok(Some(Command::PubsubNumsub(channels)))
                 }
                 "NUMPAT" => Ok(Some(Command::PubsubNumpat)),
+                "SHARDCHANNELS" => {
+                    let pat = if args.len() > 2 {
+                        Some(args[2].clone())
+                    } else {
+                        None
+                    };
+                    Ok(Some(Command::PubsubShardchannels(pat)))
+                }
+                "SHARDNUMSUB" => {
+                    let channels = if args.len() > 2 {
+                        args[2..].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(Some(Command::PubsubShardnumsub(channels)))
+                }
                 _ => Ok(Some(Command::Unknown(format!("PUBSUB {}", sub)))),
             }
         }

@@ -1481,8 +1481,43 @@ pub fn run_shard_worker(
                         let count = cross_shard_pubsub.borrow().publish(&channel, &message);
                         let _ = responder.send(count);
                     }
+                    ShardMessage::Spublish {
+                        channel,
+                        message,
+                        responder,
+                    } => {
+                        let count = cross_shard_pubsub.borrow().spublish(&channel, &message);
+                        let _ = responder.send(count);
+                    }
+                    ShardMessage::Ssubscribe {
+                        client_id,
+                        channel,
+                        sender,
+                        is_resp3,
+                        responder,
+                    } => {
+                        cross_shard_pubsub
+                            .borrow_mut()
+                            .ssubscribe(client_id, channel, sender, is_resp3);
+                        let _ = responder.send(());
+                    }
+                    ShardMessage::Sunsubscribe {
+                        client_id,
+                        channel,
+                        responder,
+                    } => {
+                        cross_shard_pubsub
+                            .borrow_mut()
+                            .sunsubscribe(client_id, &channel);
+                        let _ = responder.send(());
+                    }
                     ShardMessage::PubsubChannels { pattern, responder } => {
                         let channels = cross_shard_pubsub.borrow().channels(pattern.as_deref());
+                        let _ = responder.send(channels);
+                    }
+                    ShardMessage::PubsubShardchannels { pattern, responder } => {
+                        let channels =
+                            cross_shard_pubsub.borrow().shard_channels(pattern.as_deref());
                         let _ = responder.send(channels);
                     }
                     ShardMessage::PubsubNumsub {
@@ -1499,9 +1534,28 @@ pub fn run_shard_worker(
                             .collect();
                         let _ = responder.send(counts);
                     }
+                    ShardMessage::PubsubShardnumsub {
+                        channels,
+                        responder,
+                    } => {
+                        let hub = cross_shard_pubsub.borrow();
+                        let counts = channels
+                            .into_iter()
+                            .map(|ch| {
+                                let cnt = hub.shard_numsub(&ch);
+                                (ch, cnt)
+                            })
+                            .collect();
+                        let _ = responder.send(counts);
+                    }
                     ShardMessage::PubsubNumpat { responder } => {
                         let cnt = cross_shard_pubsub.borrow().numpat();
                         let _ = responder.send(cnt);
+                    }
+                    ShardMessage::RemoveClientPubSub { client_id } => {
+                        cross_shard_pubsub
+                            .borrow_mut()
+                            .remove_client_with_presence(client_id, None);
                     }
                     ShardMessage::InitSearchIndex { schema, responder } => {
                         cross_shard_db.borrow_mut().init_search_index(schema);

@@ -891,6 +891,13 @@ pub async fn handle_connection(
                     self.client_id,
                     Some((self.router.shard_id, &self.router.presence_table)),
                 );
+                for (sid, sender) in self.router.senders.iter().enumerate() {
+                    if sid != self.router.shard_id {
+                        let _ = sender.send(crate::shard::ShardMessage::RemoveClientPubSub {
+                            client_id: self.client_id,
+                        });
+                    }
+                }
             }
             unregister_client_tracking(self.port, self.client_id);
             if crate::block::has_blocked_waiters(self.port) {
@@ -1018,11 +1025,14 @@ pub async fn handle_connection(
                     }
                 }
 
-                // 2. Transition to Pub/Sub mode if SUBSCRIBE or PSUBSCRIBE is received
+                // 2. Transition to Pub/Sub mode if SUBSCRIBE, PSUBSCRIBE, or SSUBSCRIBE is received
                 if has_special
-                    && let Some(sub_idx) = commands
-                        .iter()
-                        .position(|c| matches!(c, Command::Subscribe(_) | Command::Psubscribe(_)))
+                    && let Some(sub_idx) = commands.iter().position(|c| {
+                        matches!(
+                            c,
+                            Command::Subscribe(_) | Command::Psubscribe(_) | Command::Ssubscribe(_)
+                        )
+                    })
                 {
                     for c in commands.drain(..sub_idx) {
                         let _ = execute_command(
@@ -1595,12 +1605,21 @@ async fn run_pubsub_loop(
 
     let mut read_buf = vec![0u8; READ_BUFFER_SIZE];
 
-    let handle_cmd = |cmd: Command, out: &mut Vec<u8>| -> bool {
+    async fn handle_pubsub_cmd(
+        cmd: Command,
+        router: &Router,
+        client_id: u64,
+        client_registry: &Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
+        write_tx: &flume::Sender<Bytes>,
+        out: &mut Vec<u8>,
+    ) -> bool {
         let cmd_name = match &cmd {
             Command::Subscribe(_) => "SUBSCRIBE",
             Command::Unsubscribe(_) => "UNSUBSCRIBE",
             Command::Psubscribe(_) => "PSUBSCRIBE",
             Command::Punsubscribe(_) => "PUNSUBSCRIBE",
+            Command::Ssubscribe(_) => "SSUBSCRIBE",
+            Command::Sunsubscribe(_) => "SUNSUBSCRIBE",
             Command::Ping(_) => "PING",
             Command::Quit => "QUIT",
             _ => "OTHER",
@@ -1738,6 +1757,58 @@ async fn run_pubsub_loop(
                 }
                 false
             }
+            Command::Ssubscribe(channels) => {
+                for ch in channels {
+                    let count = router
+                        .ssubscribe(client_id, ch.clone(), write_tx.clone(), is_resp3)
+                        .await;
+                    out.extend_from_slice(prefix);
+                    out.extend_from_slice(b"$10\r\nssubscribe\r\n$");
+                    out.extend_from_slice(ch.len().to_string().as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                    out.extend_from_slice(&ch);
+                    out.extend_from_slice(b"\r\n:");
+                    out.extend_from_slice(count.to_string().as_bytes());
+                    out.extend_from_slice(b"\r\n");
+                }
+                false
+            }
+            Command::Sunsubscribe(channels) => {
+                if channels.is_empty() {
+                    let unsubs = router.sunsubscribe_all(client_id).await;
+                    if unsubs.is_empty() {
+                        let total = router.pubsub.borrow().total_subscriptions(client_id);
+                        out.extend_from_slice(prefix);
+                        out.extend_from_slice(
+                            format!("$12\r\nsunsubscribe\r\n$-1\r\n:{}\r\n", total).as_bytes(),
+                        );
+                    } else {
+                        for (ch, remaining) in unsubs {
+                            out.extend_from_slice(prefix);
+                            out.extend_from_slice(b"$12\r\nsunsubscribe\r\n$");
+                            out.extend_from_slice(ch.len().to_string().as_bytes());
+                            out.extend_from_slice(b"\r\n");
+                            out.extend_from_slice(&ch);
+                            out.extend_from_slice(b"\r\n:");
+                            out.extend_from_slice(remaining.to_string().as_bytes());
+                            out.extend_from_slice(b"\r\n");
+                        }
+                    }
+                } else {
+                    for ch in channels {
+                        let remaining = router.sunsubscribe(client_id, ch.clone()).await;
+                        out.extend_from_slice(prefix);
+                        out.extend_from_slice(b"$12\r\nsunsubscribe\r\n$");
+                        out.extend_from_slice(ch.len().to_string().as_bytes());
+                        out.extend_from_slice(b"\r\n");
+                        out.extend_from_slice(&ch);
+                        out.extend_from_slice(b"\r\n:");
+                        out.extend_from_slice(remaining.to_string().as_bytes());
+                        out.extend_from_slice(b"\r\n");
+                    }
+                }
+                false
+            }
             Command::Ping(msg) => {
                 match msg {
                     Some(m) => {
@@ -1760,6 +1831,7 @@ async fn run_pubsub_loop(
             other => {
                 let name = match &other {
                     Command::Publish { .. } => "PUBLISH",
+                    Command::Spublish { .. } => "SPUBLISH",
                     Command::Get(_) => "GET",
                     Command::Set { .. } => "SET",
                     _ => "UNKNOWN",
@@ -1770,10 +1842,18 @@ async fn run_pubsub_loop(
                 false
             }
         }
-    };
+    }
 
     let mut out = Vec::new();
-    let q = handle_cmd(initial_sub, &mut out);
+    let q = handle_pubsub_cmd(
+        initial_sub,
+        &router,
+        client_id,
+        &client_registry,
+        &write_tx,
+        &mut out,
+    )
+    .await;
     if !out.is_empty() {
         let _ = write_tx.send(Bytes::from(out));
     }
@@ -1783,7 +1863,15 @@ async fn run_pubsub_loop(
 
     for cmd in pending_cmds {
         let mut out = Vec::new();
-        let q = handle_cmd(cmd, &mut out);
+        let q = handle_pubsub_cmd(
+            cmd,
+            &router,
+            client_id,
+            &client_registry,
+            &write_tx,
+            &mut out,
+        )
+        .await;
         if !out.is_empty() {
             let _ = write_tx.send(Bytes::from(out));
         }
@@ -1796,7 +1884,15 @@ async fn run_pubsub_loop(
         match parse_command(&mut buf) {
             Ok(Some(cmd)) => {
                 let mut out = Vec::new();
-                let q = handle_cmd(cmd, &mut out);
+                let q = handle_pubsub_cmd(
+                    cmd,
+                    &router,
+                    client_id,
+                    &client_registry,
+                    &write_tx,
+                    &mut out,
+                )
+                .await;
                 if !out.is_empty() {
                     let _ = write_tx.send(Bytes::from(out));
                 }
@@ -1825,7 +1921,15 @@ async fn run_pubsub_loop(
                     match parse_command(&mut buf) {
                         Ok(Some(cmd)) => {
                             let mut out = Vec::new();
-                            let q = handle_cmd(cmd, &mut out);
+                            let q = handle_pubsub_cmd(
+                                cmd,
+                                &router,
+                                client_id,
+                                &client_registry,
+                                &write_tx,
+                                &mut out,
+                            )
+                            .await;
                             if !out.is_empty() {
                                 let _ = write_tx.send(Bytes::from(out));
                             }
@@ -3099,9 +3203,14 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Unsubscribe(_) => "UNSUBSCRIBE",
         Command::Psubscribe(_) => "PSUBSCRIBE",
         Command::Punsubscribe(_) => "PUNSUBSCRIBE",
+        Command::Ssubscribe(_) => "SSUBSCRIBE",
+        Command::Sunsubscribe(_) => "SUNSUBSCRIBE",
         Command::Publish { .. } => "PUBLISH",
+        Command::Spublish { .. } => "SPUBLISH",
         Command::PubsubChannels(_) => "PUBSUB CHANNELS",
+        Command::PubsubShardchannels(_) => "PUBSUB SHARDCHANNELS",
         Command::PubsubNumsub(_) => "PUBSUB NUMSUB",
+        Command::PubsubShardnumsub(_) => "PUBSUB SHARDNUMSUB",
         Command::PubsubNumpat => "PUBSUB NUMPAT",
         Command::Keys(_) => "KEYS",
         Command::Scan { .. } => "SCAN",
@@ -7130,7 +7239,7 @@ async fn execute_command(
             out.extend_from_slice(b"+OK\r\n");
             false
         }
-        Command::Subscribe(_) | Command::Psubscribe(_) => false,
+        Command::Subscribe(_) | Command::Psubscribe(_) | Command::Ssubscribe(_) => false,
         Command::Unsubscribe(channels) => {
             if channels.is_empty() {
                 out.extend_from_slice(b"*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:0\r\n");
@@ -7139,6 +7248,23 @@ async fn execute_command(
                     out.extend_from_slice(
                         format!(
                             "*3\r\n$11\r\nunsubscribe\r\n${}\r\n{}\r\n:0\r\n",
+                            ch.len(),
+                            String::from_utf8_lossy(&ch)
+                        )
+                        .as_bytes(),
+                    );
+                }
+            }
+            false
+        }
+        Command::Sunsubscribe(channels) => {
+            if channels.is_empty() {
+                out.extend_from_slice(b"*3\r\n$12\r\nsunsubscribe\r\n$-1\r\n:0\r\n");
+            } else {
+                for ch in channels {
+                    out.extend_from_slice(
+                        format!(
+                            "*3\r\n$12\r\nsunsubscribe\r\n${}\r\n{}\r\n:0\r\n",
                             ch.len(),
                             String::from_utf8_lossy(&ch)
                         )
@@ -7170,6 +7296,11 @@ async fn execute_command(
             out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
             false
         }
+        Command::Spublish { channel, message } => {
+            let count = router.spublish(channel, message).await;
+            out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+            false
+        }
         Command::PubsubChannels(pattern) => {
             let channels = router.pubsub_channels(pattern).await;
             out.extend_from_slice(format!("*{}\r\n", channels.len()).as_bytes());
@@ -7180,8 +7311,29 @@ async fn execute_command(
             }
             false
         }
+        Command::PubsubShardchannels(pattern) => {
+            let channels = router.pubsub_shardchannels(pattern).await;
+            out.extend_from_slice(format!("*{}\r\n", channels.len()).as_bytes());
+            for ch in channels {
+                out.extend_from_slice(format!("${}\r\n", ch.len()).as_bytes());
+                out.extend_from_slice(&ch);
+                out.extend_from_slice(b"\r\n");
+            }
+            false
+        }
         Command::PubsubNumsub(channels) => {
             let counts = router.pubsub_numsub(channels).await;
+            out.extend_from_slice(format!("*{}\r\n", counts.len() * 2).as_bytes());
+            for (ch, cnt) in counts {
+                out.extend_from_slice(format!("${}\r\n", ch.len()).as_bytes());
+                out.extend_from_slice(&ch);
+                out.extend_from_slice(b"\r\n");
+                out.extend_from_slice(format!(":{}\r\n", cnt).as_bytes());
+            }
+            false
+        }
+        Command::PubsubShardnumsub(channels) => {
+            let counts = router.pubsub_shardnumsub(channels).await;
             out.extend_from_slice(format!("*{}\r\n", counts.len() * 2).as_bytes());
             for (ch, cnt) in counts {
                 out.extend_from_slice(format!("${}\r\n", ch.len()).as_bytes());
@@ -12379,6 +12531,7 @@ fn is_special_pipeline_cmd(cmd: &Command) -> bool {
         cmd,
         Command::Subscribe(_)
             | Command::Psubscribe(_)
+            | Command::Ssubscribe(_)
             | Command::Psync { .. }
             | Command::Multi
             | Command::Exec

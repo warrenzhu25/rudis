@@ -10583,3 +10583,102 @@ fn test_pubsub_presence_table_selective_fanout_e2e() {
     let n2 = sub2.read(&mut buf).unwrap();
     assert!(String::from_utf8_lossy(&buf[..n2]).contains("second_msg"));
 }
+
+#[test]
+fn test_sharded_pubsub_slot_bound_e2e() {
+    let port = 17025;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut sub1 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let resp1 = send_and_read(&mut sub1, b"SSUBSCRIBE shard:orders:1\r\n");
+    assert_eq!(
+        resp1,
+        "*3\r\n$10\r\nssubscribe\r\n$14\r\nshard:orders:1\r\n:1\r\n"
+    );
+
+    let mut sub2 = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let resp2 = send_and_read(&mut sub2, b"SSUBSCRIBE shard:orders:1 shard:orders:2\r\n");
+    assert_eq!(
+        resp2,
+        "*3\r\n$10\r\nssubscribe\r\n$14\r\nshard:orders:1\r\n:1\r\n*3\r\n$10\r\nssubscribe\r\n$14\r\nshard:orders:2\r\n:2\r\n"
+    );
+
+    let mut pub_client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. SPUBLISH to shard:orders:1 should reach both subscribers (sub1 and sub2)
+    let resp = send_and_read(
+        &mut pub_client,
+        b"SPUBLISH shard:orders:1 payload_alpha\r\n",
+    );
+    assert_eq!(resp, ":2\r\n");
+
+    let mut buf = [0u8; 512];
+    let n1 = sub1.read(&mut buf).unwrap();
+    assert_eq!(
+        &buf[..n1],
+        b"*3\r\n$8\r\nsmessage\r\n$14\r\nshard:orders:1\r\n$13\r\npayload_alpha\r\n"
+    );
+
+    let n2 = sub2.read(&mut buf).unwrap();
+    assert_eq!(
+        &buf[..n2],
+        b"*3\r\n$8\r\nsmessage\r\n$14\r\nshard:orders:1\r\n$13\r\npayload_alpha\r\n"
+    );
+
+    // 2. SPUBLISH to shard:orders:2 should only reach sub2
+    let resp = send_and_read(&mut pub_client, b"SPUBLISH shard:orders:2 payload_beta\r\n");
+    assert_eq!(resp, ":1\r\n");
+
+    let n2 = sub2.read(&mut buf).unwrap();
+    assert_eq!(
+        &buf[..n2],
+        b"*3\r\n$8\r\nsmessage\r\n$14\r\nshard:orders:2\r\n$12\r\npayload_beta\r\n"
+    );
+
+    // 3. SPUBLISH to un-subscribed channel returns 0
+    let resp = send_and_read(&mut pub_client, b"SPUBLISH shard:unsubscribed none\r\n");
+    assert_eq!(resp, ":0\r\n");
+
+    // 4. PUBSUB SHARDCHANNELS
+    let channels_resp = send_and_read(&mut pub_client, b"PUBSUB SHARDCHANNELS\r\n");
+    assert!(channels_resp.contains("shard:orders:1"));
+    assert!(channels_resp.contains("shard:orders:2"));
+
+    // 5. PUBSUB SHARDNUMSUB
+    let numsub_resp = send_and_read(
+        &mut pub_client,
+        b"PUBSUB SHARDNUMSUB shard:orders:1 shard:orders:2 shard:non_existent\r\n",
+    );
+    assert_eq!(
+        numsub_resp,
+        "*6\r\n$14\r\nshard:orders:1\r\n:2\r\n$14\r\nshard:orders:2\r\n:1\r\n$18\r\nshard:non_existent\r\n:0\r\n"
+    );
+
+    // 6. Subscribed mode restrictions: sub1 cannot execute GET or SET
+    let err_resp = send_and_read(&mut sub1, b"GET key\r\n");
+    assert!(err_resp.contains("ERR Can't execute 'GET' in subscribed mode"));
+
+    let pong_resp = send_and_read(&mut sub1, b"PING\r\n");
+    assert_eq!(pong_resp, "*2\r\n$4\r\npong\r\n$0\r\n\r\n");
+
+    // 7. SUNSUBSCRIBE
+    let un_resp = send_and_read(&mut sub1, b"SUNSUBSCRIBE shard:orders:1\r\n");
+    assert_eq!(
+        un_resp,
+        "*3\r\n$12\r\nsunsubscribe\r\n$14\r\nshard:orders:1\r\n:0\r\n"
+    );
+
+    // Next SPUBLISH to shard:orders:1 only reaches sub2
+    let resp = send_and_read(
+        &mut pub_client,
+        b"SPUBLISH shard:orders:1 payload_gamma\r\n",
+    );
+    assert_eq!(resp, ":1\r\n");
+
+    let n2 = sub2.read(&mut buf).unwrap();
+    assert_eq!(
+        &buf[..n2],
+        b"*3\r\n$8\r\nsmessage\r\n$14\r\nshard:orders:1\r\n$13\r\npayload_gamma\r\n"
+    );
+}

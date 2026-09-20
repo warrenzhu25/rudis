@@ -421,7 +421,28 @@ pub enum ShardMessage {
         message: Bytes,
         responder: flume::Sender<usize>,
     },
+    Spublish {
+        channel: Bytes,
+        message: Bytes,
+        responder: flume::Sender<usize>,
+    },
+    Ssubscribe {
+        client_id: u64,
+        channel: Bytes,
+        sender: flume::Sender<Bytes>,
+        is_resp3: bool,
+        responder: flume::Sender<()>,
+    },
+    Sunsubscribe {
+        client_id: u64,
+        channel: Bytes,
+        responder: flume::Sender<()>,
+    },
     PubsubChannels {
+        pattern: Option<Bytes>,
+        responder: flume::Sender<Vec<Bytes>>,
+    },
+    PubsubShardchannels {
         pattern: Option<Bytes>,
         responder: flume::Sender<Vec<Bytes>>,
     },
@@ -429,8 +450,15 @@ pub enum ShardMessage {
         channels: Vec<Bytes>,
         responder: flume::Sender<Vec<(Bytes, usize)>>,
     },
+    PubsubShardnumsub {
+        channels: Vec<Bytes>,
+        responder: flume::Sender<Vec<(Bytes, usize)>>,
+    },
     PubsubNumpat {
         responder: flume::Sender<usize>,
+    },
+    RemoveClientPubSub {
+        client_id: u64,
     },
     InitSearchIndex {
         schema: crate::search::IndexSchema,

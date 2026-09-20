@@ -2204,6 +2204,171 @@ impl Router {
         total
     }
 
+    pub async fn spublish(&self, channel: Bytes, message: Bytes) -> usize {
+        let slot = key_slot(&channel);
+        let target = slot_to_shard(slot, self.num_shards);
+        if target == self.shard_id {
+            self.pubsub.borrow().spublish(&channel, &message)
+        } else {
+            let (tx, rx) = flume::bounded(1);
+            let msg = ShardMessage::Spublish {
+                channel,
+                message,
+                responder: tx,
+            };
+            if self.senders[target].send(msg).is_ok() {
+                rx.recv_async().await.unwrap_or(0)
+            } else {
+                0
+            }
+        }
+    }
+
+    pub async fn ssubscribe(
+        &self,
+        client_id: u64,
+        channel: Bytes,
+        tx: flume::Sender<Bytes>,
+        is_resp3: bool,
+    ) -> usize {
+        let slot = key_slot(&channel);
+        let target = slot_to_shard(slot, self.num_shards);
+        if target == self.shard_id {
+            self.pubsub
+                .borrow_mut()
+                .ssubscribe(client_id, channel, tx, is_resp3)
+        } else {
+            let (resp_tx, resp_rx) = flume::bounded(1);
+            let msg = ShardMessage::Ssubscribe {
+                client_id,
+                channel: channel.clone(),
+                sender: tx,
+                is_resp3,
+                responder: resp_tx,
+            };
+            if self.senders[target].send(msg).is_ok() {
+                let _ = resp_rx.recv_async().await;
+            }
+            let mut hub = self.pubsub.borrow_mut();
+            hub.client_shard_channels
+                .entry(client_id)
+                .or_default()
+                .insert(channel);
+            hub.total_subscriptions(client_id)
+        }
+    }
+
+    pub async fn sunsubscribe(&self, client_id: u64, channel: Bytes) -> usize {
+        let slot = key_slot(&channel);
+        let target = slot_to_shard(slot, self.num_shards);
+        if target == self.shard_id {
+            self.pubsub.borrow_mut().sunsubscribe(client_id, &channel)
+        } else {
+            let (resp_tx, resp_rx) = flume::bounded(1);
+            let msg = ShardMessage::Sunsubscribe {
+                client_id,
+                channel: channel.clone(),
+                responder: resp_tx,
+            };
+            if self.senders[target].send(msg).is_ok() {
+                let _ = resp_rx.recv_async().await;
+            }
+            let mut hub = self.pubsub.borrow_mut();
+            if let Some(ch_set) = hub.client_shard_channels.get_mut(&client_id) {
+                ch_set.remove(&channel);
+                if ch_set.is_empty() {
+                    hub.client_shard_channels.remove(&client_id);
+                }
+            }
+            hub.total_subscriptions(client_id)
+        }
+    }
+
+    pub async fn sunsubscribe_all(&self, client_id: u64) -> Vec<(Bytes, usize)> {
+        let channels: Vec<Bytes> = self
+            .pubsub
+            .borrow()
+            .client_shard_channels
+            .get(&client_id)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+        let mut res = Vec::new();
+        for ch in channels {
+            let remaining = self.sunsubscribe(client_id, ch.clone()).await;
+            res.push((ch, remaining));
+        }
+        res
+    }
+
+    pub async fn pubsub_shardchannels(&self, pattern: Option<Bytes>) -> Vec<Bytes> {
+        let mut set = hashbrown::HashSet::new();
+        for ch in self.pubsub.borrow().shard_channels(pattern.as_deref()) {
+            set.insert(ch);
+        }
+        let mut pending = Vec::new();
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::PubsubShardchannels {
+                    pattern: pattern.clone(),
+                    responder: tx,
+                };
+                if sender.send(msg).is_ok() {
+                    pending.push(rx);
+                }
+            }
+        }
+        for rx in pending {
+            if let Ok(channels) = rx.recv_async().await {
+                for ch in channels {
+                    set.insert(ch);
+                }
+            }
+        }
+        let mut list: Vec<Bytes> = set.into_iter().collect();
+        list.sort();
+        list
+    }
+
+    pub async fn pubsub_shardnumsub(&self, channels: Vec<Bytes>) -> Vec<(Bytes, usize)> {
+        let mut counts: hashbrown::HashMap<Bytes, usize> = hashbrown::HashMap::new();
+        let mut shard_channels: hashbrown::HashMap<usize, Vec<Bytes>> = hashbrown::HashMap::new();
+        for ch in &channels {
+            let slot = key_slot(ch);
+            let target = slot_to_shard(slot, self.num_shards);
+            if target == self.shard_id {
+                counts.insert(ch.clone(), self.pubsub.borrow().shard_numsub(ch));
+            } else {
+                shard_channels.entry(target).or_default().push(ch.clone());
+            }
+        }
+        let mut pending = Vec::new();
+        for (target, chs) in shard_channels {
+            let (tx, rx) = flume::bounded(1);
+            let msg = ShardMessage::PubsubShardnumsub {
+                channels: chs,
+                responder: tx,
+            };
+            if self.senders[target].send(msg).is_ok() {
+                pending.push(rx);
+            }
+        }
+        for rx in pending {
+            if let Ok(shard_counts) = rx.recv_async().await {
+                for (ch, cnt) in shard_counts {
+                    counts.insert(ch, cnt);
+                }
+            }
+        }
+        channels
+            .into_iter()
+            .map(|ch| {
+                let cnt = counts.get(&ch).copied().unwrap_or(0);
+                (ch, cnt)
+            })
+            .collect()
+    }
+
     pub fn has_search_index(&self, name: &str) -> bool {
         self.local_db.borrow().search_indices.contains_key(name)
             || crate::search::get_search_index(name).is_some()

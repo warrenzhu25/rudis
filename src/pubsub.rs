@@ -158,9 +158,11 @@ pub fn get_presence_table(port: u16) -> Arc<ShardedPresenceTable> {
 pub struct PubSubHub {
     pub channels: hashbrown::HashMap<Bytes, hashbrown::HashSet<u64>>,
     pub patterns: hashbrown::HashMap<Bytes, hashbrown::HashSet<u64>>,
+    pub shard_channels: hashbrown::HashMap<Bytes, hashbrown::HashSet<u64>>,
     pub clients: hashbrown::HashMap<u64, flume::Sender<Bytes>>,
     pub client_channels: hashbrown::HashMap<u64, hashbrown::HashSet<Bytes>>,
     pub client_patterns: hashbrown::HashMap<u64, hashbrown::HashSet<Bytes>>,
+    pub client_shard_channels: hashbrown::HashMap<u64, hashbrown::HashSet<Bytes>>,
     pub client_resp3: hashbrown::HashSet<u64>,
     pub stripe_counts: [usize; PUBSUB_STRIPES],
     pub total_patterns: usize,
@@ -182,7 +184,12 @@ impl PubSubHub {
             .get(&client_id)
             .map(|s| s.len())
             .unwrap_or(0);
-        ch_count + pat_count
+        let shard_count = self
+            .client_shard_channels
+            .get(&client_id)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        ch_count + pat_count + shard_count
     }
 
     pub fn subscribe_with_presence(
@@ -478,6 +485,99 @@ impl PubSubHub {
         count
     }
 
+    pub fn ssubscribe(
+        &mut self,
+        client_id: u64,
+        channel: Bytes,
+        tx: flume::Sender<Bytes>,
+        is_resp3: bool,
+    ) -> usize {
+        self.clients.insert(client_id, tx);
+        if is_resp3 {
+            self.client_resp3.insert(client_id);
+        } else {
+            self.client_resp3.remove(&client_id);
+        }
+        self.shard_channels
+            .entry(channel.clone())
+            .or_default()
+            .insert(client_id);
+        self.client_shard_channels
+            .entry(client_id)
+            .or_default()
+            .insert(channel);
+        self.total_subscriptions(client_id)
+    }
+
+    pub fn sunsubscribe(&mut self, client_id: u64, channel: &[u8]) -> usize {
+        if let Some(set) = self.shard_channels.get_mut(channel) {
+            set.remove(&client_id);
+            if set.is_empty() {
+                self.shard_channels.remove(channel);
+            }
+        }
+        if let Some(ch_set) = self.client_shard_channels.get_mut(&client_id) {
+            ch_set.remove(channel);
+            if ch_set.is_empty() {
+                self.client_shard_channels.remove(&client_id);
+            }
+        }
+        let total = self.total_subscriptions(client_id);
+        if total == 0 {
+            self.clients.remove(&client_id);
+            self.client_resp3.remove(&client_id);
+        }
+        total
+    }
+
+    pub fn sunsubscribe_all(&mut self, client_id: u64) -> Vec<(Bytes, usize)> {
+        let mut res = Vec::new();
+        if let Some(ch_set) = self.client_shard_channels.remove(&client_id) {
+            for ch in ch_set {
+                if let Some(set) = self.shard_channels.get_mut(&ch) {
+                    set.remove(&client_id);
+                    if set.is_empty() {
+                        self.shard_channels.remove(&ch);
+                    }
+                }
+                let total = self.total_subscriptions(client_id);
+                res.push((ch, total));
+            }
+        }
+        if self.total_subscriptions(client_id) == 0 {
+            self.clients.remove(&client_id);
+            self.client_resp3.remove(&client_id);
+        }
+        res
+    }
+
+    pub fn spublish(&self, channel: &[u8], message: &[u8]) -> usize {
+        let mut count = 0;
+        if let Some(subscribers) = self.shard_channels.get(channel) {
+            let mut frame_resp2: Option<Bytes> = None;
+            let mut frame_resp3: Option<Bytes> = None;
+
+            for client_id in subscribers {
+                let is_resp3 = self.client_resp3.contains(client_id);
+                let frame = if is_resp3 {
+                    frame_resp3.get_or_insert_with(|| {
+                        build_pubsub_frame(b"smessage", channel, message, true)
+                    })
+                } else {
+                    frame_resp2.get_or_insert_with(|| {
+                        build_pubsub_frame(b"smessage", channel, message, false)
+                    })
+                };
+                if let Some(tx) = self.clients.get(client_id)
+                    && tx.try_send(frame.clone()).is_ok()
+                {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
     pub fn remove_client_with_presence(
         &mut self,
         client_id: u64,
@@ -485,7 +585,9 @@ impl PubSubHub {
     ) {
         self.unsubscribe_all_with_presence(client_id, presence_info);
         self.punsubscribe_all_with_presence(client_id, presence_info);
+        self.sunsubscribe_all(client_id);
         self.client_resp3.remove(&client_id);
+        self.clients.remove(&client_id);
     }
 
     pub fn remove_client(&mut self, client_id: u64) {
@@ -506,8 +608,29 @@ impl PubSubHub {
         list
     }
 
+    pub fn shard_channels(&self, pattern: Option<&[u8]>) -> Vec<Bytes> {
+        let mut list = Vec::new();
+        for ch in self.shard_channels.keys() {
+            if let Some(pat) = pattern {
+                if glob_match(pat, ch) {
+                    list.push(ch.clone());
+                }
+            } else {
+                list.push(ch.clone());
+            }
+        }
+        list
+    }
+
     pub fn numsub(&self, channel: &[u8]) -> usize {
         self.channels.get(channel).map(|s| s.len()).unwrap_or(0)
+    }
+
+    pub fn shard_numsub(&self, channel: &[u8]) -> usize {
+        self.shard_channels
+            .get(channel)
+            .map(|s| s.len())
+            .unwrap_or(0)
     }
 
     pub fn numpat(&self) -> usize {
@@ -661,5 +784,66 @@ mod tests {
         // Unsubscribe pattern clears pattern presence
         hub_shard0.punsubscribe_with_presence(3, b"news.*", Some((0, &presence)));
         assert_eq!(presence.interested_shards(b"any_channel") & (1 << 0), 0);
+    }
+
+    #[test]
+    fn test_sharded_pubsub_hub_ssubscribe_spublish_sunsubscribe() {
+        let mut hub = PubSubHub::new();
+        let (tx1, rx1) = flume::unbounded();
+        let (tx2, rx2) = flume::unbounded();
+        let (tx_pat, rx_pat) = flume::unbounded();
+
+        // Client 1: RESP2 subscriber to shard channel "orders:eu"
+        let count1 = hub.ssubscribe(1, Bytes::from_static(b"orders:eu"), tx1, false);
+        assert_eq!(count1, 1);
+
+        // Client 2: RESP3 subscriber to shard channel "orders:eu"
+        let count2 = hub.ssubscribe(2, Bytes::from_static(b"orders:eu"), tx2, true);
+        assert_eq!(count2, 1);
+
+        // Client 3: pattern subscriber to "orders:*"
+        hub.psubscribe(3, Bytes::from_static(b"orders:*"), tx_pat, false);
+
+        // SPUBLISH to "orders:eu"
+        let recv_count = hub.spublish(b"orders:eu", b"payload_123");
+        // Only the 2 direct shard subscribers receive it; pattern subscriber does not!
+        assert_eq!(recv_count, 2);
+
+        // Check client 1 received RESP2 smessage frame: *3\r\n$8\r\nsmessage\r\n...
+        let msg1 = rx1.try_recv().unwrap();
+        assert_eq!(
+            msg1,
+            Bytes::from_static(
+                b"*3\r\n$8\r\nsmessage\r\n$9\r\norders:eu\r\n$11\r\npayload_123\r\n"
+            )
+        );
+
+        // Check client 2 received RESP3 smessage frame: >3\r\n$8\r\nsmessage\r\n...
+        let msg2 = rx2.try_recv().unwrap();
+        assert_eq!(
+            msg2,
+            Bytes::from_static(
+                b">3\r\n$8\r\nsmessage\r\n$9\r\norders:eu\r\n$11\r\npayload_123\r\n"
+            )
+        );
+
+        // Check pattern subscriber received nothing
+        assert!(rx_pat.try_recv().is_err());
+
+        // Test shard_channels and shard_numsub
+        let active = hub.shard_channels(None);
+        assert_eq!(active, vec![Bytes::from_static(b"orders:eu")]);
+        assert_eq!(hub.shard_numsub(b"orders:eu"), 2);
+        assert_eq!(hub.shard_numsub(b"orders:us"), 0);
+
+        // SUNSUBSCRIBE
+        let remaining1 = hub.sunsubscribe(1, b"orders:eu");
+        assert_eq!(remaining1, 0);
+        assert_eq!(hub.shard_numsub(b"orders:eu"), 1);
+
+        let remaining2 = hub.sunsubscribe(2, b"orders:eu");
+        assert_eq!(remaining2, 0);
+        assert_eq!(hub.shard_numsub(b"orders:eu"), 0);
+        assert!(hub.shard_channels(None).is_empty());
     }
 }
