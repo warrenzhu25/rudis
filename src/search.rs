@@ -160,6 +160,8 @@ pub struct InvertedIndex {
     pub key_to_id: HashMap<Bytes, DocId>,
     // doc_id -> metadata
     pub id_to_meta: HashMap<DocId, DocMeta>,
+    // vector field -> HnswIndex for logarithmic vector beam search
+    pub vector_indices: HashMap<String, crate::vector::HnswIndex>,
     pub next_doc_id: DocId,
     pub free_ids: Vec<DocId>,
     pub total_docs: usize,
@@ -438,6 +440,7 @@ impl InvertedIndex {
             numeric_trees: HashMap::new(),
             key_to_id: HashMap::new(),
             id_to_meta: HashMap::new(),
+            vector_indices: HashMap::new(),
             next_doc_id: 1,
             free_ids: Vec::new(),
             total_docs: 0,
@@ -558,6 +561,26 @@ impl InvertedIndex {
             }
         }
 
+        for (field_name, vec) in &vector_fields {
+            let dim = vec.len();
+            let metric = match schema.fields.get(field_name) {
+                Some(FieldType::Vector {
+                    distance_metric, ..
+                }) => match distance_metric.to_uppercase().as_str() {
+                    "L2" => crate::vector::VectorMetric::L2,
+                    "IP" => crate::vector::VectorMetric::IP,
+                    _ => crate::vector::VectorMetric::Cosine,
+                },
+                _ => crate::vector::VectorMetric::Cosine,
+            };
+            let idx_name = schema.name.clone();
+            let hnsw = self
+                .vector_indices
+                .entry(field_name.clone())
+                .or_insert_with(|| crate::vector::HnswIndex::new(idx_name, dim, metric));
+            let _ = hnsw.add(key_bytes.clone(), vec.clone());
+        }
+
         for (field_name, &num_val) in &numeric_fields {
             self.numeric_trees
                 .entry(field_name.clone())
@@ -610,6 +633,13 @@ impl InvertedIndex {
                     if tree.is_empty() {
                         self.numeric_trees.remove(field_name);
                     }
+                }
+            }
+
+            // Remove from vector indices
+            for field_name in meta.vector_fields.keys() {
+                if let Some(hnsw) = self.vector_indices.get_mut(field_name) {
+                    hnsw.remove(&meta.key);
                 }
             }
         }
@@ -1260,26 +1290,45 @@ fn evaluate_ast(
                 Vec::new()
             };
 
-            let mut vector_dists = Vec::new();
+            let mut map = HashMap::new();
             if !effective_vec.is_empty() {
-                for (&doc_id, doc) in &index.id_to_meta {
-                    let vec_opt = doc.vector_fields.get(field).or_else(|| {
-                        field
-                            .strip_prefix("$.")
-                            .and_then(|f| doc.vector_fields.get(f))
-                    });
-                    if let Some(doc_vec) = vec_opt
-                        && effective_vec.len() == doc_vec.len()
-                    {
-                        let sim = cosine_similarity(&effective_vec, doc_vec);
-                        vector_dists.push((doc_id, sim));
+                let hnsw_opt = index.vector_indices.get(field).or_else(|| {
+                    field
+                        .strip_prefix("$.")
+                        .and_then(|f| index.vector_indices.get(f))
+                });
+                if let Some(hnsw) = hnsw_opt {
+                    let results = hnsw.search(&effective_vec, *k);
+                    for (doc_key, dist) in results {
+                        if let Some(doc_id) = index.key_to_id.get(&doc_key) {
+                            let sim = match hnsw.metric {
+                                crate::vector::VectorMetric::Cosine => (1.0 - dist).max(0.0) as f64,
+                                _ => (1.0 / (1.0 + dist)) as f64,
+                            };
+                            map.insert(*doc_id, sim);
+                        }
+                    }
+                } else {
+                    let mut vector_dists = Vec::new();
+                    for (&doc_id, doc) in &index.id_to_meta {
+                        let vec_opt = doc.vector_fields.get(field).or_else(|| {
+                            field
+                                .strip_prefix("$.")
+                                .and_then(|f| doc.vector_fields.get(f))
+                        });
+                        if let Some(doc_vec) = vec_opt
+                            && effective_vec.len() == doc_vec.len()
+                        {
+                            let sim = cosine_similarity(&effective_vec, doc_vec);
+                            vector_dists.push((doc_id, sim));
+                        }
+                    }
+                    vector_dists
+                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    for (id, sim) in vector_dists.into_iter().take(*k) {
+                        map.insert(id, sim as f64);
                     }
                 }
-            }
-            vector_dists.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            let mut map = HashMap::new();
-            for (id, sim) in vector_dists.into_iter().take(*k) {
-                map.insert(id, sim as f64);
             }
             map
         }

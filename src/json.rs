@@ -610,6 +610,49 @@ impl JsonStore {
         }
     }
 
+    /// JSON.NUMMULTBY <key> <path> <factor>
+    pub fn json_nummultby(
+        &mut self,
+        key: &[u8],
+        path: &str,
+        factor: f64,
+    ) -> Result<String, String> {
+        let key_bytes = Bytes::copy_from_slice(key);
+        let doc = self
+            .docs
+            .get_mut(&key_bytes)
+            .ok_or("ERR could not find key")?;
+        let segments = parse_json_path(path)?;
+        let matches = query_json_path_mut(doc, &segments);
+        if matches.is_empty() {
+            return Err("ERR path does not exist".to_string());
+        }
+
+        let mut results = Vec::new();
+        for val in matches {
+            if let Value::Number(num) = val {
+                let cur = num.as_f64().unwrap_or(0.0);
+                let new_num = cur * factor;
+                if let Some(n) = Number::from_f64(new_num) {
+                    *val = Value::Number(n);
+                    results.push(new_num.to_string());
+                } else {
+                    let int_val = new_num.round() as i64;
+                    *val = json!(int_val);
+                    results.push(int_val.to_string());
+                }
+            } else {
+                return Err("ERR value at path is not a number".to_string());
+            }
+        }
+
+        if results.len() == 1 {
+            Ok(results[0].clone())
+        } else {
+            Ok(format!("[{}]", results.join(",")))
+        }
+    }
+
     /// JSON.STRAPPEND <key> [path] <string>
     pub fn json_strappend(
         &mut self,
@@ -927,5 +970,21 @@ mod tests {
         assert!(res_slice.contains("10"));
         assert!(res_slice.contains("20"));
         assert!(!res_slice.contains("30"));
+    }
+
+    #[test]
+    fn test_json_nummultby_multi_match() {
+        let mut store = JsonStore::new();
+        let key = b"products";
+        let doc = r#"{"items":[{"price":10},{"price":25},{"price":50}]}"#;
+        store.json_set(key, "$", doc, false, false).unwrap();
+
+        let mult_res = store.json_nummultby(key, "$.items[*].price", 2.0).unwrap();
+        assert_eq!(mult_res, "[20,50,100]");
+
+        let get_res = store.json_get(key, &["$.items[*].price"]).unwrap();
+        assert!(get_res.contains("20"));
+        assert!(get_res.contains("50"));
+        assert!(get_res.contains("100"));
     }
 }

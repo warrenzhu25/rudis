@@ -818,6 +818,7 @@ impl PartialOrd for FurthestCandidate {
 }
 
 /// Hierarchical Navigable Small World (HNSW) Vector Index
+#[derive(Debug, Clone)]
 pub struct HnswIndex {
     pub name: String,
     pub dim: usize,

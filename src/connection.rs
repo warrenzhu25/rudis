@@ -12307,23 +12307,13 @@ pub fn execute_local_command(
             false
         }
         Command::JsonNumMultBy { key, path, factor } => {
-            match db.json_store.json_numincrby(key, path, 0.0) {
-                Ok(cur_str) => {
-                    if let Ok(cur) = cur_str.parse::<f64>() {
-                        let new_num = cur * factor;
-                        let delta = new_num - cur;
-                        let _ = db.json_store.json_numincrby(key, path, delta);
-                        record_change!(cmd);
-                        if let Some(doc) = db.json_store.get(key) {
-                            crate::search::index_json_document_hook(
-                                &String::from_utf8_lossy(key),
-                                doc,
-                            );
-                        }
-                        write_resp_bulk(out, new_num.to_string().as_bytes());
-                    } else {
-                        out.extend_from_slice(b"-ERR value at path is not a number\r\n");
+            match db.json_store.json_nummultby(key, path, *factor) {
+                Ok(res) => {
+                    record_change!(cmd);
+                    if let Some(doc) = db.json_store.get(key) {
+                        crate::search::index_json_document_hook(&String::from_utf8_lossy(key), doc);
                     }
+                    write_resp_bulk(out, res.as_bytes());
                 }
                 Err(err) => {
                     write_resp_err(out, err);
