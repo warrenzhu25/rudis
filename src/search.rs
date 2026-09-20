@@ -58,11 +58,104 @@ pub struct DocMeta {
     pub terms: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OrderedF64(pub f64);
+
+impl Eq for OrderedF64 {}
+
+impl PartialOrd for OrderedF64 {
+    #[inline(always)]
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedF64 {
+    #[inline(always)]
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+/// Balanced interval index for O(log N + K) numeric range search, inspired by Dragonfly's RangeTree.
+#[derive(Debug, Default, Clone)]
+pub struct RangeTree {
+    pub entries: std::collections::BTreeMap<OrderedF64, Vec<DocId>>,
+    pub total_entries: usize,
+}
+
+impl RangeTree {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.total_entries
+    }
+
+    #[inline]
+    pub fn add(&mut self, doc_id: DocId, value: f64) {
+        let key = OrderedF64(value);
+        let list = self.entries.entry(key).or_default();
+        if let Err(pos) = list.binary_search(&doc_id) {
+            list.insert(pos, doc_id);
+            self.total_entries += 1;
+        }
+    }
+
+    #[inline]
+    pub fn remove(&mut self, doc_id: DocId, value: f64) {
+        let key = OrderedF64(value);
+        if let Some(list) = self.entries.get_mut(&key) {
+            if let Ok(pos) = list.binary_search(&doc_id) {
+                list.remove(pos);
+                self.total_entries = self.total_entries.saturating_sub(1);
+            }
+            if list.is_empty() {
+                self.entries.remove(&key);
+            }
+        }
+    }
+
+    /// Performs a balanced B-tree range scan in O(log N + K) time.
+    #[inline]
+    pub fn range(&self, min: f64, max: f64) -> Vec<DocId> {
+        if min > max {
+            return Vec::new();
+        }
+        let start = OrderedF64(min);
+        let end = OrderedF64(max);
+        let mut results = Vec::new();
+        for (_val, doc_ids) in self.entries.range(start..=end) {
+            results.extend_from_slice(doc_ids);
+        }
+        results
+    }
+
+    #[inline]
+    pub fn min(&self) -> Option<f64> {
+        self.entries.first_key_value().map(|(k, _)| k.0)
+    }
+
+    #[inline]
+    pub fn max(&self) -> Option<f64> {
+        self.entries.last_key_value().map(|(k, _)| k.0)
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct InvertedIndex {
     pub schema: Option<IndexSchema>,
     // term -> list of postings
     pub inverted: HashMap<String, Vec<Posting>>,
+    // numeric field -> balanced RangeTree
+    pub numeric_trees: HashMap<String, RangeTree>,
     // key -> dense DocId
     pub key_to_id: HashMap<Bytes, DocId>,
     // doc_id -> metadata
@@ -71,6 +164,24 @@ pub struct InvertedIndex {
     pub free_ids: Vec<DocId>,
     pub total_docs: usize,
     pub total_terms: usize,
+}
+
+#[inline]
+pub fn get_numeric_tree<'a>(index: &'a InvertedIndex, field: &str) -> Option<&'a RangeTree> {
+    if let Some(tree) = index.numeric_trees.get(field) {
+        return Some(tree);
+    }
+    if let Some(stripped) = field.strip_prefix("$.") {
+        if let Some(tree) = index.numeric_trees.get(stripped) {
+            return Some(tree);
+        }
+    } else {
+        let with_prefix = format!("$.{}", field);
+        if let Some(tree) = index.numeric_trees.get(&with_prefix) {
+            return Some(tree);
+        }
+    }
+    None
 }
 
 static ENGLISH_STOP_WORDS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
@@ -324,6 +435,7 @@ impl InvertedIndex {
         Self {
             schema: Some(schema),
             inverted: HashMap::new(),
+            numeric_trees: HashMap::new(),
             key_to_id: HashMap::new(),
             id_to_meta: HashMap::new(),
             next_doc_id: 1,
@@ -446,6 +558,13 @@ impl InvertedIndex {
             }
         }
 
+        for (field_name, &num_val) in &numeric_fields {
+            self.numeric_trees
+                .entry(field_name.clone())
+                .or_default()
+                .add(doc_id, num_val);
+        }
+
         let doc_meta = DocMeta {
             key: key_bytes.clone(),
             doc_len,
@@ -480,6 +599,16 @@ impl InvertedIndex {
                     postings.retain(|p| p.doc_id != doc_id);
                     if postings.is_empty() {
                         self.inverted.remove(term);
+                    }
+                }
+            }
+
+            // O(log N) removal directed by the document's numeric fields
+            for (field_name, &num_val) in &meta.numeric_fields {
+                if let Some(tree) = self.numeric_trees.get_mut(field_name) {
+                    tree.remove(doc_id, num_val);
+                    if tree.is_empty() {
+                        self.numeric_trees.remove(field_name);
                     }
                 }
             }
@@ -1013,17 +1142,23 @@ fn evaluate_ast(
         }
         QueryAst::NumericRange { field, min, max } => {
             let mut map = HashMap::new();
-            for (&doc_id, doc) in &index.id_to_meta {
-                let num_val = doc.numeric_fields.get(field).copied().or_else(|| {
-                    field
-                        .strip_prefix("$.")
-                        .and_then(|f| doc.numeric_fields.get(f).copied())
-                });
-                if let Some(val) = num_val
-                    && val >= *min
-                    && val <= *max
-                {
+            if let Some(tree) = get_numeric_tree(index, field) {
+                for doc_id in tree.range(*min, *max) {
                     map.insert(doc_id, 1.0);
+                }
+            } else {
+                for (&doc_id, doc) in &index.id_to_meta {
+                    let num_val = doc.numeric_fields.get(field).copied().or_else(|| {
+                        field
+                            .strip_prefix("$.")
+                            .and_then(|f| doc.numeric_fields.get(f).copied())
+                    });
+                    if let Some(val) = num_val
+                        && val >= *min
+                        && val <= *max
+                    {
+                        map.insert(doc_id, 1.0);
+                    }
                 }
             }
             map
@@ -1612,5 +1747,106 @@ mod tests {
         idx.add_document("doc:3", d3, None);
         let id3 = idx.doc_id_of(b"doc:3").expect("doc:3 has id");
         assert_eq!(id3, id1, "doc:3 should reuse recycled doc_id");
+    }
+
+    #[test]
+    fn test_balanced_range_tree_numeric_index() {
+        // 1. Test standalone RangeTree operations
+        let mut tree = RangeTree::new();
+        assert!(tree.is_empty());
+        assert_eq!(tree.len(), 0);
+
+        tree.add(1, 10.5);
+        tree.add(2, 25.0);
+        tree.add(3, 50.0);
+        tree.add(4, 50.0); // Duplicate value test
+        tree.add(5, 100.0);
+
+        assert_eq!(tree.len(), 5);
+        assert_eq!(tree.min(), Some(10.5));
+        assert_eq!(tree.max(), Some(100.0));
+
+        // Range [20, 60] should include doc 2 (25.0), doc 3 (50.0), and doc 4 (50.0)
+        let r1 = tree.range(20.0, 60.0);
+        assert_eq!(r1, vec![2, 3, 4]);
+
+        // Range [50, 50] exact point match
+        let r2 = tree.range(50.0, 50.0);
+        assert_eq!(r2, vec![3, 4]);
+
+        // Range with min > max returns empty
+        assert!(tree.range(60.0, 20.0).is_empty());
+
+        // Range out of bounds
+        assert!(tree.range(200.0, 300.0).is_empty());
+
+        // Remove doc 3 (one of the 50.0 entries)
+        tree.remove(3, 50.0);
+        assert_eq!(tree.len(), 4);
+        assert_eq!(tree.range(50.0, 50.0), vec![4]);
+
+        // Remove doc 4 (remaining 50.0 entry)
+        tree.remove(4, 50.0);
+        assert_eq!(tree.len(), 3);
+        assert!(tree.range(50.0, 50.0).is_empty());
+
+        // 2. Test InvertedIndex integrated RangeTree numeric queries
+        let mut fields = HashMap::new();
+        fields.insert(
+            "title".to_string(),
+            FieldType::Text {
+                weight: 1.0,
+                sortable: false,
+                nostem: false,
+            },
+        );
+        fields.insert("price".to_string(), FieldType::Numeric { sortable: true });
+
+        let schema = IndexSchema {
+            name: "idx:range_test".to_string(),
+            on_type: "HASH".to_string(),
+            prefixes: vec!["prod:".to_string()],
+            fields,
+            schema_fields: Vec::new(),
+        };
+        let mut idx = InvertedIndex::new(schema);
+
+        let mut p1 = HashMap::new();
+        p1.insert("title".to_string(), "keyboard".to_string());
+        p1.insert("price".to_string(), "45.0".to_string());
+        idx.add_document("prod:1", p1, None);
+
+        let mut p2 = HashMap::new();
+        p2.insert("title".to_string(), "mouse".to_string());
+        p2.insert("price".to_string(), "25.5".to_string());
+        idx.add_document("prod:2", p2, None);
+
+        let mut p3 = HashMap::new();
+        p3.insert("title".to_string(), "monitor".to_string());
+        p3.insert("price".to_string(), "299.99".to_string());
+        idx.add_document("prod:3", p3, None);
+
+        // Verify RangeTree is populated in idx.numeric_trees
+        let price_tree = idx.numeric_trees.get("price").expect("price tree exists");
+        assert_eq!(price_tree.len(), 3);
+
+        // Query @price:[20 50]
+        let ast = parse_query("@price:[20 50]");
+        let (total, hits) = execute_search(&idx, &ast, &SearchOptions::default());
+        assert_eq!(total, 2);
+        let hit_ids: Vec<&str> = hits.iter().map(|h| h.doc_id.as_str()).collect();
+        assert!(hit_ids.contains(&"prod:1"));
+        assert!(hit_ids.contains(&"prod:2"));
+        assert!(!hit_ids.contains(&"prod:3"));
+
+        // Delete prod:2
+        idx.remove_document("prod:2");
+        let price_tree = idx.numeric_trees.get("price").expect("price tree exists");
+        assert_eq!(price_tree.len(), 2);
+
+        // Re-query @price:[20 50]
+        let (total2, hits2) = execute_search(&idx, &ast, &SearchOptions::default());
+        assert_eq!(total2, 1);
+        assert_eq!(hits2[0].doc_id, "prod:1");
     }
 }

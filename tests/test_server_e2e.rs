@@ -10682,3 +10682,111 @@ fn test_sharded_pubsub_slot_bound_e2e() {
         b"*3\r\n$8\r\nsmessage\r\n$14\r\nshard:orders:1\r\n$13\r\npayload_gamma\r\n"
     );
 }
+
+#[test]
+fn test_numeric_range_search_across_shards_e2e() {
+    let port = 17030;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Create index with TEXT and NUMERIC fields
+    let create_resp = send_and_read(
+        &mut client,
+        b"FT.CREATE idx:catalog ON HASH PREFIX 1 item: SCHEMA title TEXT price NUMERIC SORTABLE stock NUMERIC SORTABLE\r\n",
+    );
+    assert_eq!(create_resp, "+OK\r\n");
+
+    // 2. Insert items spanning across the 4 shards
+    let items = [
+        ("item:1", "item gaming mouse", "29.99", "100"),
+        ("item:2", "item mechanical keyboard", "89.50", "45"),
+        ("item:3", "item usb-c cable", "9.99", "250"),
+        ("item:4", "item 4k monitor", "299.00", "15"),
+        ("item:5", "item desk mat", "19.99", "80"),
+        ("item:6", "item noise canceling headphones", "149.00", "30"),
+        ("item:7", "item webcam pro", "69.99", "50"),
+        ("item:8", "item microphone arm", "39.99", "60"),
+    ];
+
+    for (key, title, price, stock) in items {
+        let cmd = format!(
+            "*8\r\n$4\r\nHSET\r\n${}\r\n{}\r\n$5\r\ntitle\r\n${}\r\n{}\r\n$5\r\nprice\r\n${}\r\n{}\r\n$5\r\nstock\r\n${}\r\n{}\r\n",
+            key.len(),
+            key,
+            title.len(),
+            title,
+            price.len(),
+            price,
+            stock.len(),
+            stock
+        );
+        let resp = send_and_read(&mut client, cmd.as_bytes());
+        assert_eq!(resp, ":3\r\n");
+    }
+
+    // Helper to format RESP command with automatic length calculation
+    let format_resp_cmd = |args: &[&str]| -> Vec<u8> {
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for arg in args {
+            out.extend_from_slice(format!("${}\r\n{}\r\n", arg.len(), arg).as_bytes());
+        }
+        out
+    };
+
+    // 3. Search numeric range @price:[20 75] NOCONTENT
+    // Should match: item:1 (29.99), item:7 (69.99), item:8 (39.99) -> 3 items
+    let q1 = format_resp_cmd(&["FT.SEARCH", "idx:catalog", "@price:[20 75]", "NOCONTENT"]);
+    let search_resp = send_and_read(&mut client, &q1);
+    assert!(
+        search_resp.contains(":3\r\n"),
+        "Expected 3 matches, got: {}",
+        search_resp
+    );
+    assert!(search_resp.contains("item:1"));
+    assert!(search_resp.contains("item:7"));
+    assert!(search_resp.contains("item:8"));
+    assert!(!search_resp.contains("item:3")); // 9.99 < 20
+    assert!(!search_resp.contains("item:2")); // 89.50 > 75
+
+    // 4. Combined text + numeric range: @price:[50 300] with word "item"
+    // Should match: item:2 (89.50), item:4 (299.00), item:6 (149.00), item:7 (69.99) -> 4 items
+    let q2 = format_resp_cmd(&[
+        "FT.SEARCH",
+        "idx:catalog",
+        "item @price:[50 300]",
+        "NOCONTENT",
+    ]);
+    let search_resp2 = send_and_read(&mut client, &q2);
+    assert!(
+        search_resp2.contains(":4\r\n"),
+        "Expected 4 matches, got: {}",
+        search_resp2
+    );
+    assert!(search_resp2.contains("item:2"));
+    assert!(search_resp2.contains("item:4"));
+    assert!(search_resp2.contains("item:6"));
+    assert!(search_resp2.contains("item:7"));
+
+    // 5. Delete item:7 (69.99)
+    assert_eq!(send_and_read(&mut client, b"DEL item:7\r\n"), ":1\r\n");
+
+    // 6. Re-search @price:[20 75] NOCONTENT -> only 2 items remain
+    let q3 = format_resp_cmd(&["FT.SEARCH", "idx:catalog", "@price:[20 75]", "NOCONTENT"]);
+    let search_after_del = send_and_read(&mut client, &q3);
+    assert!(
+        search_after_del.contains(":2\r\n"),
+        "Expected 2 matches, got: {}",
+        search_after_del
+    );
+    assert!(!search_after_del.contains("item:7"));
+    assert!(search_after_del.contains("item:1"));
+    assert!(search_after_del.contains("item:8"));
+
+    // Cleanup: Drop index
+    assert_eq!(
+        send_and_read(&mut client, b"FT.DROPINDEX idx:catalog\r\n"),
+        "+OK\r\n"
+    );
+}
