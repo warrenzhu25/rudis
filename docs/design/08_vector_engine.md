@@ -1,36 +1,30 @@
-# Component 08: Vector Search Engine: HNSW, SQ8 & Product Quantization (Design)
+# Component 08: Vector Search Engine: HNSW, SQ8 & Product Quantization (High-Level Design & Architecture Guide)
 
-> **Source Files**: `src/vector.rs`
-
-
----
-
-### 1. Architectural Purpose & Scope
-
-`src/vector.rs` implements an in-memory approximate nearest-neighbor (ANN) vector index:
-a **Hierarchical Navigable Small World (HNSW)** graph (`HnswIndex`), an **8-bit scalar
-quantization** scheme (`QuantizedVector`), and a **Product Quantization with Asymmetric
-Distance Computation** scheme (`ProductQuantizer`/`PQVector`). It is exposed to clients
-through five bespoke commands parsed in `src/resp.rs` and dispatched in `src/connection.rs`:
-`VADD`, `VQUERY`, `VSIM`, `VDEL`, `VINFO`. There is no `FT.SEARCH ... KNN` integration —
-that syntax does not exist anywhere in this codebase; full-text search (`src/search.rs`,
-Component 09) is a separate engine with no code-level link to this one.
-
-**Each shard owns a completely independent set of named indexes** (`ShardDb.vector_indexes:
-HashMap<String, HnswIndex>`), and every vector command only ever touches
-`router.local_db` — there is no cross-shard routing for `VADD`/`VQUERY`/`VSIM`/`VDEL`/`VINFO`
-at all (confirmed: none of the five appear in `target_shard_of_cmd`, and none of `Router`'s
-methods reference the vector engine). This means an index named `"products"` on shard 0 and
-an index named `"products"` on shard 1 are two entirely separate, unrelated HNSW graphs —
-which shard a given connection lands on (decided by the kernel via `SO_REUSEPORT`, per
-Component 01) silently determines which index a `VADD`/`VQUERY` actually reads or writes.
-There is no fan-out, no merge, and no consistency check across shards. Treat this as the
-single most important operational caveat for this subsystem.
+> **Subsystem Scope**: `src/vector.rs`  
+> **Implementation Reference**: [`docs/internal/08_vector_engine.md`](../internal/08_vector_engine.md)  
+> **Consolidated Design Spec**: [`docs/design/components.md`](components.md)
 
 ---
 
-### 2. Key Invariants & Concurrency Constraints
+## 1. Executive Summary & Problem Statement
 
+### 1.1 The Problem
+Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+
+### 1.2 The Rudis Solution
+Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+
+---
+
+## 2. Contributor Mental Model & Architectural Principles
+
+### 2.1 The Mental Model
+High-dimensional vector indexing using Hierarchical Navigable Small World (HNSW) graphs. SIMD-accelerated distance metrics (AVX2/SSE2) with optional SQ8 scalar quantization and Product Quantization.
+
+### 2.2 Design Rationale (The "Why")
+Float32 vectors consume massive memory (5.12MB per 10k 128-dim vectors). SQ8 quantization compresses vectors by 75% with negligible recall loss, fitting multi-million embedding datasets into standard instances.
+
+### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
 1. **Thread-local, not cross-shard**: consistent with the rest of the codebase, `HnswIndex`
    instances live inside one shard's `ShardDb` with no locks — but unlike the key-value
    store, there is no `ShardMessage` variant to reach a vector index on another shard at all
@@ -60,7 +54,19 @@ single most important operational caveat for this subsystem.
 
 ---
 
-### 3. Performance Characteristics
+## 3. High-Level Architecture & Workflow Diagram
+
+```
+Layer 2:  [Node A] ───────────────────────► [Node D]
+                      │                                 │
+       Layer 1:  [Node A] ──────► [Node B] ──────► [Node D]
+                      │              │                  │
+       Layer 0:  [Node A] ─► [N1] ─► [Node B] ─► [N2] ─► [Node D]
+```
+
+---
+
+## 4. Performance Guarantees & Theoretical Complexity
 
 - Distance kernels are genuinely AVX2+FMA accelerated at 16 floats/iteration when the CPU
   supports it, with a correct portable fallback otherwise — no unconditional `unsafe` on
@@ -74,3 +80,9 @@ single most important operational caveat for this subsystem.
   the one ratio derivable directly from the type definitions, not from measurement.
 
 ---
+
+## 5. Implementation References & Contributor Guide
+
+For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
+* [**`docs/internal/08_vector_engine.md`**](../internal/08_vector_engine.md): Low-level implementation and code reference.
+* **Source Files**: `src/vector.rs`

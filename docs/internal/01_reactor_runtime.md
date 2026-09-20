@@ -1,7 +1,17 @@
-# Component 01: Reactor Runtime & Server Lifecycle (Implementation)
+# Component 01: Reactor Runtime & Server Lifecycle (Implementation Deep-Dive & Code Reference)
 
-> **Source Files**: `src/main.rs`, `src/server.rs`
+> **Source Files**: `src/main.rs, src/server.rs`  
+> **High-Level Design Spec**: [`docs/design/01_reactor_runtime.md`](../design/01_reactor_runtime.md)  
+> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
 
+---
+
+## 1. Source Module Map & Responsibilities
+
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/main.rs` | Core implementation and logic | Primary data structures and algorithms |
+| `src/server.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -234,3 +244,22 @@ stream)` (a real `rustls` handshake driven over the `monoio` stream) *before* be
 
 ---
 ---
+
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Never introduce Arc<Mutex<_>> or cross-thread handles to ShardDb. ShardDb is strictly !Send.
+* **Gotcha 2**: Always check that new sockets set SO_REUSEPORT and SO_REUSEADDR.
+* **Gotcha 3**: Transparent Huge Pages (THP) are disabled on boot via prctl(PR_SET_THP_DISABLE, 1) to prevent 512x COW amplification.
+* **Gotcha 4**: The cross-shard receiver loop drains up to 64 messages per wakeup via rx.try_recv() to amortize async polling.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```

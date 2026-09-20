@@ -1,7 +1,17 @@
-# Component 04: Sharding Architecture & Cross-Core Mesh (Implementation)
+# Component 04: Sharding Architecture & Cross-Core Mesh (Implementation Deep-Dive & Code Reference)
 
-> **Source Files**: `src/router.rs`, `src/shard.rs`
+> **Source Files**: `src/router.rs, src/shard.rs`  
+> **High-Level Design Spec**: [`docs/design/04_sharding_mesh.md`](../design/04_sharding_mesh.md)  
+> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
 
+---
+
+## 1. Source Module Map & Responsibilities
+
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/router.rs` | Core implementation and logic | Primary data structures and algorithms |
+| `src/shard.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -477,3 +487,21 @@ simple mutual-exclusion lock per shard, not a full multi-version scheduler.
 
 ---
 ---
+
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Router slot_states uses sparse HashMap<u16, SlotState> to avoid 8.4MB of redundant dense vectors across shards.
+* **Gotcha 2**: SPSC queue ring capacity is 256 with an overflow queue for extreme traffic bursts.
+* **Gotcha 3**: Multi-key commands (MGET, MSET, DEL) execute parallel scatter-gather across destination shards.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```

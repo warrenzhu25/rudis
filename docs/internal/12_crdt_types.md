@@ -1,7 +1,16 @@
-# Component 12: CRDT Data Types & Manual Multi-Region Sync (Implementation)
+# Component 12: CRDT Data Types & Manual Multi-Region Sync (Implementation Deep-Dive & Code Reference)
 
-> **Source Files**: `src/crdt.rs`
+> **Source Files**: `src/crdt.rs`  
+> **High-Level Design Spec**: [`docs/design/12_crdt_types.md`](../design/12_crdt_types.md)  
+> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
 
+---
+
+## 1. Source Module Map & Responsibilities
+
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/crdt.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -217,3 +226,21 @@ anywhere in `server.rs` — it's an on-demand command.
 
 ---
 ---
+
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Hybrid Logical Clocks combine 48-bit physical milliseconds with 16-bit logical counters.
+* **Gotcha 2**: Observed-Remove Sets (OR-Set) track unique add tags per element.
+* **Gotcha 3**: Tombstones are cleaned up via periodic garbage collection.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```

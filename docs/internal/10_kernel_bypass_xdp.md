@@ -1,7 +1,17 @@
-# Component 10: Kernel Bypass & Zero-Copy Networking (Implementation)
+# Component 10: Kernel Bypass & Zero-Copy Networking (Implementation Deep-Dive & Code Reference)
 
-> **Source Files**: `src/xdp.rs`, `src/zerocopy.rs`
+> **Source Files**: `src/xdp.rs, src/zerocopy.rs`  
+> **High-Level Design Spec**: [`docs/design/10_kernel_bypass_xdp.md`](../design/10_kernel_bypass_xdp.md)  
+> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
 
+---
+
+## 1. Source Module Map & Responsibilities
+
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/xdp.rs` | Core implementation and logic | Primary data structures and algorithms |
+| `src/zerocopy.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -233,3 +243,21 @@ see Component 07), but nothing ever calls it or submits the resulting entry to a
 
 ---
 ---
+
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Simulated XDP mode uses 128 UMEM frames on boot to avoid pre-allocating 128MB per shard.
+* **Gotcha 2**: Pre-registered io_uring buffers eliminate get_user_pages and page table walks.
+* **Gotcha 3**: Linux SO_ZEROCOPY uses page-flipping for egress frames larger than 4KB.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```

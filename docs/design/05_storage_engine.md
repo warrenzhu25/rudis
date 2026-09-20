@@ -1,29 +1,30 @@
-# Component 05: Storage Engine & Compact Encodings (Design)
+# Component 05: Storage Engine & Compact Encodings (High-Level Design & Architecture Guide)
 
-> **Source Files**: `src/table.rs`
-
-
----
-
-### 1. Architectural Purpose & Scope
-
-`src/table.rs` is Rudis's core in-memory associative storage engine. It provides the
-dictionary implementation (`RudisTable`), the definitions and per-command logic for every
-`RudisValue` data type (strings, hashes, lists, sets, sorted sets, streams, bitmaps-as-strings,
-HyperLogLog), active/passive key expiration, and the bookkeeping hooks that let
-`src/tiering.rs` move cold values out to NVMe storage and back.
-
-The dictionary itself is still the custom SIMD flat hash table (`RudisFlatTable`) originally
-designed for this project — it has **not** been replaced by `hashbrown` or any Listpack/
-Intset/skiplist-based structure. What has grown substantially since the original design is
-everything built on top of it: `RudisValue` now has 11 variants instead of 2, several of
-which have their own adaptive small/full representations, and `RudisTable` now tracks live
-memory usage and NVMe-tiering state per key.
+> **Subsystem Scope**: `src/table.rs`  
+> **Implementation Reference**: [`docs/internal/05_storage_engine.md`](../internal/05_storage_engine.md)  
+> **Consolidated Design Spec**: [`docs/design/components.md`](components.md)
 
 ---
 
-### 2. Key Invariants & Concurrency Constraints
+## 1. Executive Summary & Problem Statement
 
+### 1.1 The Problem
+Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+
+### 1.2 The Rudis Solution
+Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+
+---
+
+## 2. Contributor Mental Model & Architectural Principles
+
+### 2.1 The Mental Model
+RudisTable is a custom in-memory hash table designed for 64-byte CPU cache lines with 1-byte SIMD group probing. Each entry contains the key, value, and optional TTL in a single cache-conscious 88-byte RudisEntry.
+
+### 2.2 Design Rationale (The "Why")
+Standard hash tables (dict.c or hashbrown) suffer from pointer chasing and decoupled TTL tables requiring multiple lookups. RudisTable packs key, value, and expiration into an aligned 88-byte slot with SIMD probe acceleration.
+
+### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
 1. **Thread-Isolation**: Each `RudisTable` belongs to a single shard thread. It contains
    **no mutexes, atomic operations for its own data, or lock-free concurrency wrappers**
    (the two global counters described in §5 are process-wide atomics, but they're simple
@@ -46,7 +47,19 @@ memory usage and NVMe-tiering state per key.
 
 ---
 
-### 3. Performance Characteristics
+## 3. High-Level Architecture & Workflow Diagram
+
+```
+RudisEntry (88 Bytes Total)
+  ┌─────────────────────────┬─────────────────────────┬─────────────────────────┐
+  │      key: Bytes         │   val: RudisValue       │  expire_at: Option<Inst>│
+  │       (24 Bytes)        │       (40 Bytes)        │       (24 Bytes)        │
+  └─────────────────────────┴─────────────────────────┴─────────────────────────┘
+```
+
+---
+
+## 4. Performance Guarantees & Theoretical Complexity
 
 - **SIMD group probing is unchanged**: still one 128-bit load and compare per 16-slot group,
   triangular-step probing to avoid primary clustering.
@@ -66,3 +79,9 @@ memory usage and NVMe-tiering state per key.
   measurement.
 
 ---
+
+## 5. Implementation References & Contributor Guide
+
+For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
+* [**`docs/internal/05_storage_engine.md`**](../internal/05_storage_engine.md): Low-level implementation and code reference.
+* **Source Files**: `src/table.rs`

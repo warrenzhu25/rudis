@@ -1,7 +1,16 @@
-# Component 03: RESP Protocol Engine & Command Parser (Implementation)
+# Component 03: RESP Protocol Engine & Command Parser (Implementation Deep-Dive & Code Reference)
 
-> **Source Files**: `src/resp.rs`
+> **Source Files**: `src/resp.rs`  
+> **High-Level Design Spec**: [`docs/design/03_resp_engine.md`](../design/03_resp_engine.md)  
+> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
 
+---
+
+## 1. Source Module Map & Responsibilities
+
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/resp.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -295,3 +304,21 @@ here (see the storage engine's SIMD control-byte matching in Part 1 of
 
 ---
 ---
+
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Inline commands split on whitespace; commands with spaces inside arguments must be formatted as RESP bulk arrays.
+* **Gotcha 2**: RESP3 push frames use '>' prefix (e.g. >3\r\n for Pub/Sub smessage).
+* **Gotcha 3**: Fast-path parsers exist for GET, SET, INCR, DEL, EXISTS, MGET, MSET.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```

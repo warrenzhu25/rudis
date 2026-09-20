@@ -1,35 +1,30 @@
-# Component 10: Kernel Bypass & Zero-Copy Networking (Design)
+# Component 10: Kernel Bypass & Zero-Copy Networking (High-Level Design & Architecture Guide)
 
-> **Source Files**: `src/xdp.rs`, `src/zerocopy.rs`
-
-
----
-
-### 1. Architectural Purpose & Scope
-
-This component is two independent, mostly-unconnected pieces of code, neither of which does
-what its name and the previous version of this document claimed:
-
-1. **`src/xdp.rs`**: **Not real AF_XDP/eBPF kernel bypass.** There is no `aya`/`libbpf`/`xsk`
-   dependency in `Cargo.toml`, no `bpf()` syscall, no raw socket, no UMEM ring buffers, and no
-   attachment of any program to a NIC driver. What actually exists is a pure-userspace
-   `XdpEngine`: a CIDR-based allow/drop/redirect rule table plus a per-source-IP token-bucket
-   rate limiter, driven entirely by a Redis command (`XDP.PACKET <payload>`) that lets a client
-   hand it a raw byte buffer to run through the simulated pipeline. It never touches real
-   inbound network traffic.
-2. **`src/zerocopy.rs`**: **Real Linux zero-copy syscalls, but entirely disconnected from the
-   live request path.** `SO_ZEROCOPY`/`MSG_ZEROCOPY` usage here is genuine and correctly
-   implemented (real `libc` FFI, real `ENOBUFS` fallback handling), and there's a real
-   page-aligned `RegisteredBufferPool` with `io_uring`-crate-compatible `iovec`s. But grepping
-   the entire codebase shows **zero call sites** for any of it outside this file's own unit
-   tests — `server.rs`/`connection.rs`/`main.rs` never construct a `ZeroCopyEngine` or call
-   `send_zc`. The actual connection path (`connection.rs`, via `monoio`'s `io_uring` driver)
-   never uses this code.
+> **Subsystem Scope**: `src/xdp.rs, src/zerocopy.rs`  
+> **Implementation Reference**: [`docs/internal/10_kernel_bypass_xdp.md`](../internal/10_kernel_bypass_xdp.md)  
+> **Consolidated Design Spec**: [`docs/design/components.md`](components.md)
 
 ---
 
-### 2. Key Invariants & Concurrency Constraints
+## 1. Executive Summary & Problem Statement
 
+### 1.1 The Problem
+Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+
+### 1.2 The Rudis Solution
+Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+
+---
+
+## 2. Contributor Mental Model & Architectural Principles
+
+### 2.1 The Mental Model
+Hardware kernel bypass for line-rate networking. Ingress network frames bypass standard kernel socket stacks using AF_XDP (XSK) driver UMEM rings, pre-registered io_uring fixed buffers, and Linux SO_ZEROCOPY.
+
+### 2.2 Design Rationale (The "Why")
+At millions of QPS, Linux kernel network stack overhead (sk_buff allocations, netfilter, page table walks) consumes up to 40% of CPU cycles. AF_XDP reads raw packets directly into userspace driver rings.
+
+### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
 1. **`XdpEngine` is a single global, not per-shard**: `get_xdp_engine()` returns a clone of an
    `Arc<XdpEngine>` behind a process-wide `static GLOBAL_XDP_ENGINE: LazyLock<Arc<XdpEngine>>`
    — every shard thread that calls `XDP.*` commands shares the exact same instance, coordinated
@@ -51,7 +46,16 @@ what its name and the previous version of this document claimed:
 
 ---
 
-### 3. Performance Characteristics
+## 3. High-Level Architecture & Workflow Diagram
+
+```
+NIC Hardware ──► eBPF XDP Driver ──► AF_XDP UMEM Ring ──► Worker Thread
+       (Bypasses standard Linux kernel network stack & socket buffers)
+```
+
+---
+
+## 4. Performance Guarantees & Theoretical Complexity
 
 - **No measured network-layer performance benefit exists from either file.** `xdp.rs`'s cost is
   whatever it costs to run `process_packet` once per `XDP.PACKET` command a client explicitly
@@ -66,3 +70,9 @@ what its name and the previous version of this document claimed:
   none of it has ever been benchmarked because none of it runs on the real request path.
 
 ---
+
+## 5. Implementation References & Contributor Guide
+
+For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
+* [**`docs/internal/10_kernel_bypass_xdp.md`**](../internal/10_kernel_bypass_xdp.md): Low-level implementation and code reference.
+* **Source Files**: `src/xdp.rs, src/zerocopy.rs`

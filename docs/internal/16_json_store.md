@@ -1,7 +1,16 @@
-# Component 16: JSON Document Store & JSONPath Engine (Implementation)
+# Component 16: JSON Document Store & JSONPath Engine (Implementation Deep-Dive & Code Reference)
 
-> **Source Files**: `src/json.rs`
+> **Source Files**: `src/json.rs`  
+> **High-Level Design Spec**: [`docs/design/16_json_store.md`](../design/16_json_store.md)  
+> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
 
+---
+
+## 1. Source Module Map & Responsibilities
+
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/json.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -152,3 +161,21 @@ plain `MGET`, `JsonMget` was never given the bucket-by-shard-then-fan-out treatm
 
 ---
 ---
+
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: JSON numbers, strings, arrays, and objects mutate in-place in DRAM.
+* **Gotcha 2**: JSONPath queries support recursive descent ($..key) and bracket notation.
+* **Gotcha 3**: JSON documents can be indexed in RediSearch schema fields.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```

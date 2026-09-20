@@ -1,27 +1,30 @@
-# Component 17: Geospatial Commands (Design)
+# Component 17: Geospatial Commands (High-Level Design & Architecture Guide)
 
-> **Source Files**: `src/geo.rs`
-
-
----
-
-### 1. Architectural Purpose & Scope
-
-`src/geo.rs` is pure math and reply-formatting — it owns **no storage of its own**. Every
-`GEOADD`/`GEODIST`/`GEOPOS`/`GEOHASH`/`GEORADIUS`/`GEORADIUSBYMEMBER`/`GEOSEARCH` command is
-implemented directly in `src/connection.rs` on top of the existing sorted-set (`RudisZSet`,
-Component 05) API — `GEOADD` is a `ZADD` whose "score" is a 52-bit interleaved geohash encoding
-of (longitude, latitude), and every other geo command decodes that score back into
-coordinates. This is architecturally identical to how real Redis implements its own `GEO*`
-command family as a thin layer over `ZSET`, and it means `ZRANGE`/`ZSCORE`/any other ZSET
-command works unmodified against a "geo set" key too — a real compatibility feature and a real
-footgun (an arbitrary `ZADD` against a geo key can insert a member with a score that isn't a
-valid geohash at all, and nothing rejects it).
+> **Subsystem Scope**: `src/geo.rs`  
+> **Implementation Reference**: [`docs/internal/17_geospatial.md`](../internal/17_geospatial.md)  
+> **Consolidated Design Spec**: [`docs/design/components.md`](components.md)
 
 ---
 
-### 2. Key Invariants & Concurrency Constraints
+## 1. Executive Summary & Problem Statement
 
+### 1.1 The Problem
+Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+
+### 1.2 The Rudis Solution
+Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+
+---
+
+## 2. Contributor Mental Model & Architectural Principles
+
+### 2.1 The Mental Model
+Geospatial indexing using 52-bit integer geohashes. Coordinates (longitude, latitude) map to 52-bit integers stored as scores in Sorted Sets (ZSet). Distance queries use the Haversine spherical formula.
+
+### 2.2 Design Rationale (The "Why")
+Geohashes map 2D coordinates into 1D space, enabling standard B-tree / skip-list range queries to find nearby entities with zero specialized spatial index overhead.
+
+### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
 1. **Encoding is 52-bit interleaved (26 bits longitude + 26 bits latitude), matching real
    Redis's internal encoding** — not the 5-bit-alphabet, 11-character textual geohash;
    that (`geohash_to_base32`) is only computed on demand for the `GEOHASH` command's text
@@ -41,7 +44,15 @@ valid geohash at all, and nothing rejects it).
 
 ---
 
-### 3. Performance Characteristics
+## 3. High-Level Architecture & Workflow Diagram
+
+```
+(Longitude, Latitude) ──► 52-Bit Integer Geohash ──► ZSet Score (B-Tree)
+```
+
+---
+
+## 4. Performance Guarantees & Theoretical Complexity
 
 - **`GEOADD`/`GEODIST`/`GEOPOS` are O(1)-ish**, bounded by the underlying `ZADD`/`ZSCORE` cost
   (Component 05) plus a fixed amount of bit-interleaving/Haversine math — no scan involved.
@@ -54,3 +65,9 @@ valid geohash at all, and nothing rejects it).
   trigonometry, which dominates.
 
 ---
+
+## 5. Implementation References & Contributor Guide
+
+For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
+* [**`docs/internal/17_geospatial.md`**](../internal/17_geospatial.md): Low-level implementation and code reference.
+* **Source Files**: `src/geo.rs`

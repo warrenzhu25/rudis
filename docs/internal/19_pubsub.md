@@ -1,7 +1,16 @@
-# Component 19: Pub/Sub Messaging Hub (Implementation)
+# Component 19: Pub/Sub Messaging Hub (Implementation Deep-Dive & Code Reference)
 
-> **Source Files**: `src/pubsub.rs`
+> **Source Files**: `src/pubsub.rs`  
+> **High-Level Design Spec**: [`docs/design/19_pubsub.md`](../design/19_pubsub.md)  
+> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
 
+---
+
+## 1. Source Module Map & Responsibilities
+
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/pubsub.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -145,3 +154,21 @@ tears down every channel and pattern subscription for that client in one call, r
 
 ---
 ---
+
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: ShardedPresenceTable uses [AtomicU64; 16] stripes to track active subscriber shards.
+* **Gotcha 2**: SPUBLISH routes directly to the shard owning CRC16(channel) % 16384.
+* **Gotcha 3**: Messages are delivered as zero-copy bytes::Bytes buffers with bounded queue backpressure.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```

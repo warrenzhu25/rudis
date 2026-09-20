@@ -1,7 +1,16 @@
-# Component 02: Connection Lifecycle & Command Execution (Implementation)
+# Component 02: Connection Lifecycle & Command Execution (Implementation Deep-Dive & Code Reference)
 
-> **Source Files**: `src/connection.rs`
+> **Source Files**: `src/connection.rs`  
+> **High-Level Design Spec**: [`docs/design/02_connection_lifecycle.md`](../design/02_connection_lifecycle.md)  
+> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
 
+---
+
+## 1. Source Module Map & Responsibilities
+
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/connection.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -506,3 +515,21 @@ and RESP3's native `,<double>\r\n` double type depending on `CURRENT_CLIENT_RESP
 
 ---
 ---
+
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Connections auto-detect Memcached text protocol on first byte read ('s', 'g', 'a', 'r', 'd', 'i', 'v', 'q').
+* **Gotcha 2**: Reusable ShardSenderPool avoids allocating new flume channels on every squashed pipeline execution.
+* **Gotcha 3**: Socket write batching accumulates responses in a 64KB vectored buffer before flushing to io_uring.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```

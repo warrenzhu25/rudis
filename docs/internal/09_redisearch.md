@@ -1,7 +1,16 @@
-# Component 09: RediSearch Full-Text Engine & Reciprocal Rank Fusion (Implementation)
+# Component 09: RediSearch Full-Text Engine & Reciprocal Rank Fusion (Implementation Deep-Dive & Code Reference)
 
-> **Source Files**: `src/search.rs`
+> **Source Files**: `src/search.rs`  
+> **High-Level Design Spec**: [`docs/design/09_redisearch.md`](../design/09_redisearch.md)  
+> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
 
+---
+
+## 1. Source Module Map & Responsibilities
+
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/search.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -270,3 +279,21 @@ that constructs both hit lists manually rather than through a real KNN search.
 
 ---
 ---
+
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: DocIds are dense 32-bit integers, enabling O(1) term-directed deletion without vocabulary scans.
+* **Gotcha 2**: Numeric queries use OrderedF64 B-trees, replacing naive linear filter scans.
+* **Gotcha 3**: FT.AGGREGATE pipelines execute parallel scatter-gather across shards with top-K heap merging.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```

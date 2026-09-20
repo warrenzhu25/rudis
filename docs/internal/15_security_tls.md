@@ -1,7 +1,18 @@
-# Component 15: Security, Memory Allocator & TLS (Implementation)
+# Component 15: Security, Memory Allocator & TLS (Implementation Deep-Dive & Code Reference)
 
-> **Source Files**: `src/acl.rs`, `src/allocator.rs`, `src/tls.rs`
+> **Source Files**: `src/acl.rs, src/allocator.rs, src/tls.rs`  
+> **High-Level Design Spec**: [`docs/design/15_security_tls.md`](../design/15_security_tls.md)  
+> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
 
+---
+
+## 1. Source Module Map & Responsibilities
+
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/acl.rs` | Core implementation and logic | Primary data structures and algorithms |
+| `src/allocator.rs` | Core implementation and logic | Primary data structures and algorithms |
+| `src/tls.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -318,3 +329,21 @@ is just never set to `true` by a bare `TCP_ULP` success, and the code always tak
 
 ---
 ---
+
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: AclManager is shared per port via Arc<RwLock<AclManager>>.
+* **Gotcha 2**: Passwords use salted SHA1 hashing with constant-time verification.
+* **Gotcha 3**: jemalloc telemetry is accessed via tikv-jemalloc-ctl in INFO memory.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```

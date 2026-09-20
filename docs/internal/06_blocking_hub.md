@@ -1,7 +1,16 @@
-# Component 06: Blocking Operations & The Reactive Event Hub (Implementation)
+# Component 06: Blocking Operations & The Reactive Event Hub (Implementation Deep-Dive & Code Reference)
 
-> **Source Files**: `src/block.rs`
+> **Source Files**: `src/block.rs`  
+> **High-Level Design Spec**: [`docs/design/06_blocking_hub.md`](../design/06_blocking_hub.md)  
+> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
 
+---
+
+## 1. Source Module Map & Responsibilities
+
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/block.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -302,3 +311,21 @@ every key queue it was registered under.
 
 ---
 ---
+
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: BlockHub is one of the few shared-mutex structures in Rudis, accessed only on blocking commands.
+* **Gotcha 2**: Client disconnects automatically cancel registered waiters to prevent leak.
+* **Gotcha 3**: Timeouts are managed via priority queues ordered by expiration instant.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```

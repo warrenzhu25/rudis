@@ -1,7 +1,17 @@
-# Component 07: NVMe SSD Tiered Storage Engine (Implementation)
+# Component 07: NVMe SSD Tiered Storage Engine (Implementation Deep-Dive & Code Reference)
 
-> **Source Files**: `src/tiering.rs`
+> **Source Files**: `src/tiering.rs, src/tiering/`  
+> **High-Level Design Spec**: [`docs/design/07_nvme_tiering.md`](../design/07_nvme_tiering.md)  
+> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
 
+---
+
+## 1. Source Module Map & Responsibilities
+
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/tiering.rs` | Core implementation and logic | Primary data structures and algorithms |
+| `src/tiering/` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -254,3 +264,21 @@ userspace round-trip) → a plain buffered `std::fs::copy`.
 
 ---
 ---
+
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Direct I/O requires 4096-byte memory alignment for both buffer pointers and disk offsets.
+* **Gotcha 2**: fallocate(FALLOC_FL_PUNCH_HOLE) reclaims freed disk space without file fragmentation.
+* **Gotcha 3**: Sub-millisecond checkpoints use ioctl(FICLONE) reflink cloning on XFS/Btrfs.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```

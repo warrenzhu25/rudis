@@ -1,7 +1,16 @@
-# Component 08: Vector Search Engine: HNSW, SQ8 & Product Quantization (Implementation)
+# Component 08: Vector Search Engine: HNSW, SQ8 & Product Quantization (Implementation Deep-Dive & Code Reference)
 
-> **Source Files**: `src/vector.rs`
+> **Source Files**: `src/vector.rs`  
+> **High-Level Design Spec**: [`docs/design/08_vector_engine.md`](../design/08_vector_engine.md)  
+> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
 
+---
+
+## 1. Source Module Map & Responsibilities
+
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/vector.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -230,3 +239,21 @@ central node, just the first surviving slot.
 
 ---
 ---
+
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Distance kernels use explicit AVX2 FMA instructions for cosine and L2 distance.
+* **Gotcha 2**: Exact float reranking can be combined with quantized search for optimal recall.
+* **Gotcha 3**: Vector deletion rewires neighbor graph edges incrementally.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```

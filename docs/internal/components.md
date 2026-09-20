@@ -15,8 +15,8 @@ For high-level architectural rationale and invariants, see [`docs/design/compone
 - [04. Sharding Architecture & Cross-Core Mesh](#component-04) (`src/router.rs, src/shard.rs`)
 - [05. Storage Engine & Compact Encodings](#component-05) (`src/table.rs`)
 - [06. Blocking Operations & The Reactive Event Hub](#component-06) (`src/block.rs`)
-- [07. NVMe SSD Tiered Storage Engine](#component-07) (`src/tiering.rs`)
-- [08. Vector Search Engine: HNSW, SQ8 & PQ](#component-08) (`src/vector.rs`)
+- [07. NVMe SSD Tiered Storage Engine](#component-07) (`src/tiering.rs, src/tiering/`)
+- [08. Vector Search Engine: HNSW, SQ8 & Product Quantization](#component-08) (`src/vector.rs`)
 - [09. RediSearch Full-Text Engine & Reciprocal Rank Fusion](#component-09) (`src/search.rs`)
 - [10. Kernel Bypass & Zero-Copy Networking](#component-10) (`src/xdp.rs, src/zerocopy.rs`)
 - [11. Redis Cluster Topology & Gossip Protocol](#component-11) (`src/cluster.rs`)
@@ -33,8 +33,12 @@ For high-level architectural rationale and invariants, see [`docs/design/compone
 
 ## Component 01: Reactor Runtime & Server Lifecycle
 
-> **Source Files**: `src/main.rs, src/server.rs` | **High-Level Design**: [`docs/design/01_reactor_runtime.md`](../design/01_reactor_runtime.md)
+## 1. Source Module Map & Responsibilities
 
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/main.rs` | Core implementation and logic | Primary data structures and algorithms |
+| `src/server.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -107,8 +111,6 @@ pub fn run_shard_worker(
 
 Every shard gets a clone of the full `senders` vector (so it can reach any other shard) but
 only its own `rx`, plus its own clone of the optional `tls_config`.
-
----
 
 ---
 
@@ -245,8 +247,6 @@ stream)` (a real `rustls` handshake driven over the `monoio` stream) *before* be
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/connection.rs`**: every accepted socket is handed off as `handle_connection(...)`, spawned as a task on this shard's runtime. See Component 02.
@@ -257,8 +257,6 @@ stream)` (a real `rustls` handshake driven over the `monoio` stream) *before* be
 - **`src/block.rs`**: `get_block_hub_for_port(port)` is consulted both for `CLIENT LIST`'s blocked-flag and for `ShardMessage::NotifyList` wakeups — the one place this subsystem reaches for a real, shared mutex instead of thread-local state.
 - **`src/pubsub.rs`**: `PubSubHub` is created per-shard but `Publish`/`PubsubChannels`/`PubsubNumsub`/`PubsubNumpat` are also reachable as `ShardMessage` variants so a publish on one shard can fan out to subscribers connected via other shards.
 - **`src/tls.rs`** (Component 15 — no longer dead code): `TlsWorkerConfig`, `TlsSession::new`/`handshake_monoio`, and the cert-loading/self-signed-generation functions are now genuinely called from here when `--tls-port` is set; `crate::connection::handle_tls_connection` is the TLS-specific counterpart to the plain loop's `handle_connection`.
-
----
 
 ---
 
@@ -274,12 +272,35 @@ stream)` (a real `rustls` handshake driven over the `monoio` stream) *before* be
 ---
 ---
 
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Never introduce Arc<Mutex<_>> or cross-thread handles to ShardDb. ShardDb is strictly !Send.
+* **Gotcha 2**: Always check that new sockets set SO_REUSEPORT and SO_REUSEADDR.
+* **Gotcha 3**: Transparent Huge Pages (THP) are disabled on boot via prctl(PR_SET_THP_DISABLE, 1) to prevent 512x COW amplification.
+* **Gotcha 4**: The cross-shard receiver loop drains up to 64 messages per wakeup via rx.try_recv() to amortize async polling.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```
+
+
 ---
 
 ## Component 02: Connection Lifecycle & Command Execution
 
-> **Source Files**: `src/connection.rs` | **High-Level Design**: [`docs/design/02_connection_lifecycle.md`](../design/02_connection_lifecycle.md)
+## 1. Source Module Map & Responsibilities
 
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/connection.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -379,8 +400,6 @@ pub type ResponderChannel = (
 (`CompactResp`, defined in `src/shard.rs`, has replaced the plain `Vec<u8>` response payload
 used previously — a memory-compacted reply representation, not documented here since it
 belongs to `src/shard.rs`.)
-
----
 
 ---
 
@@ -745,8 +764,6 @@ and RESP3's native `,<double>\r\n` double type depending on `CURRENT_CLIENT_RESP
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/resp.rs`**: Supplies `parse_command`, decoding buffered bytes into `Command` values.
@@ -776,8 +793,6 @@ and RESP3's native `,<double>\r\n` double type depending on `CURRENT_CLIENT_RESP
 
 ---
 
----
-
 ### 7. Future Improvements
 
 - ~~High — fix `MGET`/`MSET` to bucket-and-fan-out instead of one round-trip per key.~~ **Resolved.** `Router::mget`/`mset` (§4.6) now bucket by shard via `slot_owners`, dispatch via pooled channels, and harvest with a spin-then-block loop. Replaced by two new findings below, both verified in the shipped fan-out code itself.
@@ -791,12 +806,34 @@ and RESP3's native `,<double>\r\n` double type depending on `CURRENT_CLIENT_RESP
 ---
 ---
 
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Connections auto-detect Memcached text protocol on first byte read ('s', 'g', 'a', 'r', 'd', 'i', 'v', 'q').
+* **Gotcha 2**: Reusable ShardSenderPool avoids allocating new flume channels on every squashed pipeline execution.
+* **Gotcha 3**: Socket write batching accumulates responses in a 64KB vectored buffer before flushing to io_uring.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```
+
+
 ---
 
 ## Component 03: RESP Protocol Engine & Command Parser
 
-> **Source Files**: `src/resp.rs` | **High-Level Design**: [`docs/design/03_resp_engine.md`](../design/03_resp_engine.md)
+## 1. Source Module Map & Responsibilities
 
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/resp.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -861,8 +898,6 @@ constraint of the type, not an oversight.
 The enum's category list above comes directly from the file's own `// SECTION NAME` comments
 (`grep -n "^    // [A-Z]" src/resp.rs`), which is the fastest way to get an up-to-date map of
 what's supported without reading all ~1,000 lines of variant declarations.
-
----
 
 ---
 
@@ -1070,8 +1105,6 @@ here (see the storage engine's SIMD control-byte matching in Part 1 of
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/connection.rs`**: The sole consumer of `parse_command`. All reply serialization
@@ -1085,8 +1118,6 @@ here (see the storage engine's SIMD control-byte matching in Part 1 of
 
 ---
 
----
-
 ### 7. Future Improvements
 
 - **High — enforce a maximum bulk-string/array length (§8's "No maximum frame/argument size enforcement").** `parse_resp_array` trusts `arg_len` straight off the wire with no upper bound, so a client claiming a multi-gigabyte bulk string makes the server attempt to buffer that much data before giving up. A `proto-max-bulk-len`-equivalent check (reject the frame early if the declared length exceeds a configurable cap) is a small, high-value change given this is the very first thing untrusted input touches.
@@ -1097,12 +1128,35 @@ here (see the storage engine's SIMD control-byte matching in Part 1 of
 ---
 ---
 
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Inline commands split on whitespace; commands with spaces inside arguments must be formatted as RESP bulk arrays.
+* **Gotcha 2**: RESP3 push frames use '>' prefix (e.g. >3\r\n for Pub/Sub smessage).
+* **Gotcha 3**: Fast-path parsers exist for GET, SET, INCR, DEL, EXISTS, MGET, MSET.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```
+
+
 ---
 
 ## Component 04: Sharding Architecture & Cross-Core Mesh
 
-> **Source Files**: `src/router.rs, src/shard.rs` | **High-Level Design**: [`docs/design/04_sharding_mesh.md`](../design/04_sharding_mesh.md)
+## 1. Source Module Map & Responsibilities
 
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/router.rs` | Core implementation and logic | Primary data structures and algorithms |
+| `src/shard.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -1251,8 +1305,6 @@ pub struct ShardDb {
 when overwriting or deleting a key that currently lives (partially) on NVMe — the
 storage engine (`RudisTable`, documented in Component 05) and the tiering engine have to
 stay in sync on every mutation, and `ShardDb::set`/`del` is where that happens.
-
----
 
 ---
 
@@ -1538,8 +1590,6 @@ simple mutual-exclusion lock per shard, not a full multi-version scheduler.
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/connection.rs`** (Component 02): calls `target_shard_of_cmd`/`Router` methods to
@@ -1571,8 +1621,6 @@ simple mutual-exclusion lock per shard, not a full multi-version scheduler.
 
 ---
 
----
-
 ### 7. Future Improvements
 
 - **High — unify `slot_owners` and `slot_states`/`ClusterHub.my_slots` into one slot-authority mechanism (§4.4). Now more urgent, not less.** The `MGET`/`MSET` fan-out fix (§4.3) made this worse in one specific way: `mget`/`mset` now route via `slot_owners` while every single-key command still routes via the static `target_shard()` free function, so the two families of commands can now genuinely disagree about slot ownership during a live migration, not just theoretically. Pick one source of truth (most likely `slot_states`/`ClusterHub`, since that's the one wired into `-MOVED`/`-ASK` redirection) and route every command — single-key and multi-key alike — through it.
@@ -1585,12 +1633,34 @@ simple mutual-exclusion lock per shard, not a full multi-version scheduler.
 ---
 ---
 
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Router slot_states uses sparse HashMap<u16, SlotState> to avoid 8.4MB of redundant dense vectors across shards.
+* **Gotcha 2**: SPSC queue ring capacity is 256 with an overflow queue for extreme traffic bursts.
+* **Gotcha 3**: Multi-key commands (MGET, MSET, DEL) execute parallel scatter-gather across destination shards.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```
+
+
 ---
 
 ## Component 05: Storage Engine & Compact Encodings
 
-> **Source Files**: `src/table.rs` | **High-Level Design**: [`docs/design/05_storage_engine.md`](../design/05_storage_engine.md)
+## 1. Source Module Map & Responsibilities
 
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/table.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -1665,8 +1735,6 @@ Two cursors, not one: `sample_cursor` drives active TTL expiration (unchanged, �
 `used_memory` is a running estimate of live value bytes, updated on every insert, mutation,
 delete, and expiration — it did not exist in the original design and exists to give
 `src/tiering.rs` a cheap signal for memory-pressure decisions without walking the table.
-
----
 
 ---
 
@@ -1805,8 +1873,6 @@ unconditionally here. There is no sparse encoding for small cardinalities.
 
 ---
 
----
-
 ### 5. Expiration & Memory Management
 
 #### 5.1 Passive expiration on read — now with a global bypass and stat counter
@@ -1895,8 +1961,6 @@ the start every time.
 
 ---
 
----
-
 ### 6. Cluster Slot Indexing (architecture change from the original design)
 
 The original design maintained a full reverse index, `slot_to_keys: HashMap<u16,
@@ -1933,8 +1997,6 @@ before.
 
 ---
 
----
-
 ### 8. Future Improvements
 
 - **High — implement the original segmented/incremental resize design (§4's Phase 2, still not started).** `RudisFlatTable::resize` is still a monolithic doubling rehash of the *entire* table (§7) — the exact tail-latency spike the original design document (§1) was written to eliminate. This remains the single highest-value structural change to this file if p99.9 write latency at large key counts ever becomes a measured problem.
@@ -1946,12 +2008,34 @@ before.
 ---
 ---
 
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: RudisValue is shrunk to 40 bytes by boxing collection variants (Hash, Set, ZSet, Stream).
+* **Gotcha 2**: RudisEntry is 88 bytes total (24B key + 40B val + 24B Option<Instant>), doubling cache line density.
+* **Gotcha 3**: Active expiration cycles sample random buckets periodically without locking.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```
+
+
 ---
 
 ## Component 06: Blocking Operations & The Reactive Event Hub
 
-> **Source Files**: `src/block.rs` | **High-Level Design**: [`docs/design/06_blocking_hub.md`](../design/06_blocking_hub.md)
+## 1. Source Module Map & Responsibilities
 
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/block.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -2026,8 +2110,6 @@ pub struct BlockHub {
 There is no unified `Waiter`/`WaiterType`/`BlockedPopResult` type — list, zset, and stream
 waiters are three separate types with three separate queues and three separate result enums,
 and channels are `flume::Sender`, not `oneshot::Sender`.
-
----
 
 ---
 
@@ -2226,8 +2308,6 @@ every key queue it was registered under.
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/server.rs`**: the cross-shard receiver's `ShardMessage::NotifyList { keys }` handler
@@ -2247,8 +2327,6 @@ every key queue it was registered under.
 
 ---
 
----
-
 ### 7. Future Improvements
 
 - **Medium — replace `wait_for_blocked_result`'s active ≤20ms polling with real readiness notification (§4.2).** Polling `libc::poll`/`MSG_PEEK` every tick to detect a vanished client works but costs a syscall per blocked client per tick even when nothing has happened; since `monoio`'s `io_uring` driver already knows how to wait on fd readiness/hangup without polling, registering an explicit disconnect-watch operation on the ring (if `monoio` exposes one) would remove this cost and also lower worst-case disconnect-detection latency below the current 20ms cap.
@@ -2259,12 +2337,35 @@ every key queue it was registered under.
 ---
 ---
 
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: BlockHub is one of the few shared-mutex structures in Rudis, accessed only on blocking commands.
+* **Gotcha 2**: Client disconnects automatically cancel registered waiters to prevent leak.
+* **Gotcha 3**: Timeouts are managed via priority queues ordered by expiration instant.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```
+
+
 ---
 
 ## Component 07: NVMe SSD Tiered Storage Engine
 
-> **Source Files**: `src/tiering.rs` | **High-Level Design**: [`docs/design/07_nvme_tiering.md`](../design/07_nvme_tiering.md)
+## 1. Source Module Map & Responsibilities
 
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/tiering.rs` | Core implementation and logic | Primary data structures and algorithms |
+| `src/tiering/` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -2337,8 +2438,6 @@ pub struct OpManager {
 `offload_threshold_pct` (default 60), `upload_threshold_pct` (default 80), ...) — all
 `AtomicU64`, updated from `router.rs`'s tiering methods (Component 04) and read by whatever
 reports tiering stats (`INFO`-style output, not shown in this file).
-
----
 
 ---
 
@@ -2485,8 +2584,6 @@ userspace round-trip) → a plain buffered `std::fs::copy`.
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/table.rs`** (Component 05): owns the `RudisValue::Tiered`/`RudisValue::Cooled`
@@ -2512,8 +2609,6 @@ userspace round-trip) → a plain buffered `std::fs::copy`.
 
 ---
 
----
-
 ### 7. Future Improvements
 
 - **Medium — add a `Cooled → Hot` transition (§4.4).** Today `Cooled` is a one-way permanent write-through layer: once a key has ever been tiered, every future read/write pays the bookkeeping overhead of maintaining a `TieredPointer` alongside the RAM value, even if the key becomes consistently hot again. A simple heuristic (e.g. N consecutive accesses without a re-spill, or a periodic sweep during low memory pressure) that fully promotes a long-stable `Cooled` entry back to a bare hot value — freeing the disk pointer and its GC bookkeeping — would avoid permanently taxing keys that were only cold briefly.
@@ -2524,12 +2619,34 @@ userspace round-trip) → a plain buffered `std::fs::copy`.
 ---
 ---
 
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Direct I/O requires 4096-byte memory alignment for both buffer pointers and disk offsets.
+* **Gotcha 2**: fallocate(FALLOC_FL_PUNCH_HOLE) reclaims freed disk space without file fragmentation.
+* **Gotcha 3**: Sub-millisecond checkpoints use ioctl(FICLONE) reflink cloning on XFS/Btrfs.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```
+
+
 ---
 
-## Component 08: Vector Search Engine: HNSW, SQ8 & PQ
+## Component 08: Vector Search Engine: HNSW, SQ8 & Product Quantization
 
-> **Source Files**: `src/vector.rs` | **High-Level Design**: [`docs/design/08_vector_engine.md`](../design/08_vector_engine.md)
+## 1. Source Module Map & Responsibilities
 
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/vector.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -2612,8 +2729,6 @@ Note the node always keeps its full `Vec<f32>` regardless of whether SQ8/PQ is a
 enabled — quantization here is an additional fast-path structure for candidate scoring,
 not a memory-savings replacement for the raw vector (the "reranking" pass in §4.3 depends
 on the exact float vector still being present).
-
----
 
 ---
 
@@ -2732,8 +2847,6 @@ central node, just the first surviving slot.
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/resp.rs`**: parses `VADD`/`VQUERY`/`VSIM`/`VDEL`/`VINFO` into `Command` variants;
@@ -2752,8 +2865,6 @@ central node, just the first surviving slot.
 
 ---
 
----
-
 ### 7. Future Improvements
 
 - **High — give vector indexes cross-shard reach (§1).** This is the single most important gap in this subsystem: an index name is currently silently scoped to whichever shard happened to receive the `VADD`/`VQUERY` connection, with no fan-out, no merge, and no error telling the caller their view is partial. At minimum, either (a) route all vector commands for a given index name to one designated "owner" shard (hash the index name, forward via a new `ShardMessage::Vector*` variant, mirroring how `src/block.rs`/`src/search.rs` already accept a narrow cross-shard exception for subsystems that need global visibility), or (b) document loudly at the protocol level (a startup warning, or a real error if `VADD`/`VQUERY` land on different shards for the same index) so this isn't a silent correctness surprise.
@@ -2765,12 +2876,34 @@ central node, just the first surviving slot.
 ---
 ---
 
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Distance kernels use explicit AVX2 FMA instructions for cosine and L2 distance.
+* **Gotcha 2**: Exact float reranking can be combined with quantized search for optimal recall.
+* **Gotcha 3**: Vector deletion rewires neighbor graph edges incrementally.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```
+
+
 ---
 
 ## Component 09: RediSearch Full-Text Engine & Reciprocal Rank Fusion
 
-> **Source Files**: `src/search.rs` | **High-Level Design**: [`docs/design/09_redisearch.md`](../design/09_redisearch.md)
+## 1. Source Module Map & Responsibilities
 
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/search.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -2843,8 +2976,6 @@ There is **no `vector_index: Option<HnswIndex>` field anywhere** — vectors are
 as plain `Vec<f32>` inside `DocMeta.vector_fields`, and KNN search (§4.4) is a brute-force linear
 scan, not an HNSW lookup. `src/vector.rs`'s `HnswIndex` (Component 08) is a completely separate
 data structure used only by the standalone `VECTOR.*`-style commands, not by this file.
-
----
 
 ---
 
@@ -3007,8 +3138,6 @@ that constructs both hit lists manually rather than through a real KNN search.
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/connection.rs`**: `Command::FtCreate/FtSearch/FtInfo/FtDropIndex/FtExplain/FtAdd`
@@ -3032,8 +3161,6 @@ that constructs both hit lists manually rather than through a real KNN search.
 
 ---
 
----
-
 ### 7. Future Improvements
 
 - **RESOLVED — `PARAMS`-supplied vectors are now wired into `QueryAst::KnnVector` (§4.3).** Fixed by adding a `param_name` field captured at parse time, resolving it against `opts.params` (bare or `$`-prefixed) at execution time via the new `parse_vector_blob`, and — the other half of the same underlying gap — teaching the auto-indexing path (`add_document`) to populate `vector_fields` from a `Vector`-typed field's stored string value using the same decoder, since `index_document_hook` never supplied a `vectors` map directly. Verified by a new passing test (`test_knn_vector_search_with_params`). Hybrid keyword+vector search via `FT.SEARCH`'s KNN syntax is now real end to end, still brute-force (§4.4), not ANN-accelerated.
@@ -3046,12 +3173,35 @@ that constructs both hit lists manually rather than through a real KNN search.
 ---
 ---
 
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: DocIds are dense 32-bit integers, enabling O(1) term-directed deletion without vocabulary scans.
+* **Gotcha 2**: Numeric queries use OrderedF64 B-trees, replacing naive linear filter scans.
+* **Gotcha 3**: FT.AGGREGATE pipelines execute parallel scatter-gather across shards with top-K heap merging.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```
+
+
 ---
 
 ## Component 10: Kernel Bypass & Zero-Copy Networking
 
-> **Source Files**: `src/xdp.rs, src/zerocopy.rs` | **High-Level Design**: [`docs/design/10_kernel_bypass_xdp.md`](../design/10_kernel_bypass_xdp.md)
+## 1. Source Module Map & Responsibilities
 
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/xdp.rs` | Core implementation and logic | Primary data structures and algorithms |
+| `src/zerocopy.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -3167,8 +3317,6 @@ does).
 
 ---
 
----
-
 ### 4. Execution Algorithms & Code Logic
 
 #### 4.1 `XdpEngine::process_packet` — manual, CPU-side Ethernet/IPv4 parsing
@@ -3261,8 +3409,6 @@ see Component 07), but nothing ever calls it or submits the resulting entry to a
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/connection.rs`**: the only real integration point — six `Xdp*` `Command` variants
@@ -3278,8 +3424,6 @@ see Component 07), but nothing ever calls it or submits the resulting entry to a
 
 ---
 
----
-
 ### 7. Future Improvements
 
 - **High-priority decision, not a fix: decide whether either file has a real future, and act accordingly.** Both are currently fully-implemented-but-disconnected code with real maintenance cost (they compile, they have tests, they need to keep compiling as the rest of the codebase changes) and zero runtime value. Concretely: (a) wire `zerocopy.rs`'s `send_zc`/`RegisteredBufferPool` into `connection.rs`'s large-reply write path (e.g. big `HGETALL`/`SMEMBERS`/`FT.SEARCH` responses above a size threshold) where zero-copy send could plausibly help, since `monoio`'s socket file descriptors would need to be exposed for this to even be possible — or (b) delete it and its tests if there's no near-term plan to integrate it. The same either/or applies to `xdp.rs`, except the honest path there is narrower: real AF_XDP kernel bypass is a large undertaking (a genuine `aya`/`xsk` dependency, root/capabilities, NIC driver support) — if that's not the actual goal, rename this module to reflect what it really is (a testable packet-filter/rate-limiter simulation) rather than implying kernel bypass.
@@ -3290,12 +3434,34 @@ see Component 07), but nothing ever calls it or submits the resulting entry to a
 ---
 ---
 
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Simulated XDP mode uses 128 UMEM frames on boot to avoid pre-allocating 128MB per shard.
+* **Gotcha 2**: Pre-registered io_uring buffers eliminate get_user_pages and page table walks.
+* **Gotcha 3**: Linux SO_ZEROCOPY uses page-flipping for egress frames larger than 4KB.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```
+
+
 ---
 
 ## Component 11: Redis Cluster Topology & Gossip Protocol
 
-> **Source Files**: `src/cluster.rs` | **High-Level Design**: [`docs/design/11_cluster_topology.md`](../design/11_cluster_topology.md)
+## 1. Source Module Map & Responsibilities
 
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/cluster.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -3369,8 +3535,6 @@ commands (`dfly_migrate_init`/`dfly_migrate_flow`/`dfly_migrate_ack`/
 string, a counter incremented by whatever `flow_id` value is passed in) rather
 than any real data-transfer protocol; no keys are actually copied between nodes
 by this code.
-
----
 
 ---
 
@@ -3504,8 +3668,6 @@ path at all; don't conflate the two.
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/connection.rs`**: reads `router.slot_states` and `get_cluster_hub(port)`
@@ -3527,8 +3689,6 @@ path at all; don't conflate the two.
 
 ---
 
----
-
 ### 7. Future Improvements
 
 - **RESOLVED — quorum-based PFAIL corroboration and FAIL escalation (§2.4).** `pfail_reports` records peer PFAIL opinions piggybacked via gossip, retracts them upon successful ping, and strictly enforces majority quorum consensus (`total_votes >= quorum`) without unilateral timeout bypass before escalating to `"fail"` and broadcasting `FAIL <node_id>`. Verified by `test_cluster_quorum_pfail_to_fail_escalation` and `test_cluster_quorum_failure_detection_and_gossip_e2e`.
@@ -3540,12 +3700,34 @@ path at all; don't conflate the two.
 ---
 ---
 
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Strict majority quorum consensus is required for PFAIL to FAIL node escalation.
+* **Gotcha 2**: Cluster bus runs on a single background task on Shard 0.
+* **Gotcha 3**: DFLYMIGRATE supports multi-shard concurrent slot migration.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```
+
+
 ---
 
 ## Component 12: CRDT Data Types & Manual Multi-Region Sync
 
-> **Source Files**: `src/crdt.rs` | **High-Level Design**: [`docs/design/12_crdt_types.md`](../design/12_crdt_types.md)
+## 1. Source Module Map & Responsibilities
 
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/crdt.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -3620,8 +3802,6 @@ claimed: `LwwRegister`/`OrSet` are concretely `Bytes`-keyed (not generic `<T>`),
 tracks per-element `HashSet<HlcTimestamp>` tags directly (no separate UUID type), and
 `PnCounter`'s fields are named `p`/`n` (not `increments`/`decrements`) and store signed
 `i64` per-node deltas rather than only-positive `u64` add/remove counts.
-
----
 
 ---
 
@@ -3732,8 +3912,6 @@ anywhere in `server.rs` — it's an on-demand command.
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/shard.rs`**: `ShardDb.crdt_store: CrdtStore` plus thin `#[inline]` wrappers
@@ -3756,8 +3934,6 @@ anywhere in `server.rs` — it's an on-demand command.
 
 ---
 
----
-
 ### 7. Future Improvements
 
 - **RESOLVED — route CRDT commands through the normal key-slot mechanism (§1's update).** Fixed: single-key `Command::Crdt*` variants now go through `target_shard_of_cmd`/`execute_remote`, and `CrdtDump`/`CrdtMerge`/`CrdtGc` now fan out to every shard and aggregate, so `CrdtStore` is presented as one logical whole-node store instead of silently-independent per-shard state.
@@ -3768,12 +3944,34 @@ anywhere in `server.rs` — it's an on-demand command.
 ---
 ---
 
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Hybrid Logical Clocks combine 48-bit physical milliseconds with 16-bit logical counters.
+* **Gotcha 2**: Observed-Remove Sets (OR-Set) track unique add tags per element.
+* **Gotcha 3**: Tombstones are cleaned up via periodic garbage collection.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```
+
+
 ---
 
 ## Component 13: Lua Scripting & Redis 7 Functions Engine
 
-> **Source Files**: `src/scripting.rs` | **High-Level Design**: [`docs/design/13_scripting_functions.md`](../design/13_scripting_functions.md)
+## 1. Source Module Map & Responsibilities
 
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/scripting.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -3834,8 +4032,6 @@ pub struct FunctionLib {
 the source with `lua.load(script_content)` on every single call, since the VM itself is
 recreated each time). `FunctionLib` has no `read_only`/`description` fields the old doc
 claimed; it just tracks which top-level function names a library registered.
-
----
 
 ---
 
@@ -3978,8 +4174,6 @@ match the old doc's description, modulo the exact function names.
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/connection.rs`** (Component 02): owns all `SCRIPT_CACHE`/`FUNCTION_LIBS` mutation
@@ -3997,8 +4191,6 @@ match the old doc's description, modulo the exact function names.
 
 ---
 
----
-
 ### 7. Future Improvements
 
 - **RESOLVED — `FCALL`'s hardcoded `None` AOF argument (§4.4).** Fixed: `connection.rs`'s `Fcall` arm now passes `router.aof.as_deref()`, the same as `EVAL`/`EVALSHA`, and a new unit test (`test_fcall_with_aof_writer`) verifies `FCALL` writes land in the AOF buffer. `FCALL` writes are also now covered by an E2E integration test per the commit history (`test(scripting): add unit and E2E integration tests for FCALL mutating AOF persistence`).
@@ -4010,12 +4202,35 @@ match the old doc's description, modulo the exact function names.
 ---
 ---
 
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Scripts execute synchronously within the calling shard worker runtime.
+* **Gotcha 2**: redis.call bridge translates Redis RESP types to Lua types automatically.
+* **Gotcha 3**: Function libraries are persisted into RDB snapshots and AOF logs.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```
+
+
 ---
 
 ## Component 14: Persistence & Replication Engines
 
-> **Source Files**: `src/replication.rs, src/aof.rs` | **High-Level Design**: [`docs/design/14_persistence_replication.md`](../design/14_persistence_replication.md)
+## 1. Source Module Map & Responsibilities
 
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/replication.rs` | Core implementation and logic | Primary data structures and algorithms |
+| `src/aof.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -4144,8 +4359,6 @@ not on `has_replicas`. This matters precisely because partial resync needs histo
 connected, every replica that fully disconnected and came back would find an empty/stale
 backlog and be forced into a full resync anyway, defeating the point. `has_connected_replicas`
 now also reports `true` whenever `backlog_active` is set, even with zero live replicas.
-
----
 
 ---
 
@@ -4320,8 +4533,6 @@ state currently is at request time.
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/router.rs`** (Component 04): `Router::del`/`set`/`incr_by`/`expire`/`persist` (the
@@ -4343,8 +4554,6 @@ state currently is at request time.
 
 ---
 
----
-
 ### 7. Future Improvements
 
 - **RESOLVED — AOF rewrite and compaction via `BGREWRITEAOF` (§4.1).** `rewrite_shard_aof` snapshots live state across shards (strings, hashes, lists, sets, zsets, streams, hyperloglog, json) with TTL preservation into an atomic temporary file, and `AofWriter::reopen_after_rewrite` live-reopens the compacted file across coordinator and worker shards so subsequent write traffic continues uninterrupted. Verified by `test_aof_compaction_and_rewrite`, `test_aof_writer_reopen_and_continuous_logging`, and `test_aof_bgrewriteaof_compaction_e2e`.
@@ -4355,12 +4564,36 @@ state currently is at request time.
 ---
 ---
 
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: BGSAVE streams shard RDB chunks sequentially one-by-one to keep peak memory minimal (<475MB).
+* **Gotcha 2**: BGREWRITEAOF uses a 64KB BufWriter to stream AOF files without allocating large heap buffers.
+* **Gotcha 3**: DFLY FLOW establishes dedicated per-shard streaming sockets direct to worker threads.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```
+
+
 ---
 
 ## Component 15: Security, Memory Allocator & TLS
 
-> **Source Files**: `src/acl.rs, src/allocator.rs, src/tls.rs` | **High-Level Design**: [`docs/design/15_security_tls.md`](../design/15_security_tls.md)
+## 1. Source Module Map & Responsibilities
 
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/acl.rs` | Core implementation and logic | Primary data structures and algorithms |
+| `src/allocator.rs` | Core implementation and logic | Primary data structures and algorithms |
+| `src/tls.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -4444,8 +4677,6 @@ pub struct AllocatorStats {
 ```
 
 (`fragmentation_ratio` is derived as `resident / allocated`, not a jemalloc-native field.)
-
----
 
 ---
 
@@ -4660,16 +4891,12 @@ is just never set to `true` by a bare `TCP_ULP` success, and the code always tak
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/connection.rs`**: `get_acl_for_port` backs both the `AUTH`/`ACL *` command handlers and the new per-command/per-key enforcement in `execute_command`/`execute_commands_squashed` (§4.1); `allocator::format_memory_info` is called via `INFO`; and, new, `handle_tls_connection` is a second connection-handling entry point (alongside plain `handle_connection`) that routes all I/O through a `TlsSession` (§4.4).
 - **`src/server.rs`** (Component 01): now conditionally binds a second `SO_REUSEPORT` listener on `--tls-port` and spawns a dedicated TLS accept loop per shard (§4.4), in addition to everything it did before.
 - **`src/main.rs`**: parses the new `--tls-port`/`--tls-cert-file`/`--tls-key-file` CLI flags, builds a `rustls::ServerConfig` once (via `tls::create_server_config` or `tls::generate_self_signed_cert` if no cert/key files are given) before spawning any shard thread, and passes it down as `TlsWorkerConfig`.
 - **`src/tiering.rs`**: does not call `allocator::get_allocator_stats()` — memory-pressure decisions for auto-tiering are driven by a separately tracked `used_memory` estimate on `RudisTable` (see Component 05), not by live jemalloc RSS figures. Unchanged by this update.
-
----
 
 ---
 
@@ -4684,12 +4911,34 @@ is just never set to `true` by a bare `TCP_ULP` success, and the code always tak
 ---
 ---
 
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: AclManager is shared per port via Arc<RwLock<AclManager>>.
+* **Gotcha 2**: Passwords use salted SHA1 hashing with constant-time verification.
+* **Gotcha 3**: jemalloc telemetry is accessed via tikv-jemalloc-ctl in INFO memory.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```
+
+
 ---
 
 ## Component 16: JSON Document Store & JSONPath Engine
 
-> **Source Files**: `src/json.rs` | **High-Level Design**: [`docs/design/16_json_store.md`](../design/16_json_store.md)
+## 1. Source Module Map & Responsibilities
 
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/json.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -4731,8 +4980,6 @@ pub struct JsonStore {
 There is no bespoke JSON representation — every stored document is a plain `serde_json::Value`
 (the same enum `Value::{Null, Bool, Number, String, Array, Object}` any `serde_json` consumer
 would use), not a Redis-specific compact encoding.
-
----
 
 ---
 
@@ -4814,8 +5061,6 @@ plain `MGET`, `JsonMget` was never given the bucket-by-shard-then-fan-out treatm
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/connection.rs`** (Component 02): dispatches every single-key `Command::Json*` through
@@ -4835,8 +5080,6 @@ plain `MGET`, `JsonMget` was never given the bucket-by-shard-then-fan-out treatm
 
 ---
 
----
-
 ### 7. Future Improvements
 
 - **Medium — give `JSON.MGET` the same bucket-and-fan-out treatment `MGET`/`MSET` already got (§4.5).** The building blocks are identical to Component 02/04's fix: bucket the requested keys by target shard, dispatch one batched request per remote shard, await all in parallel, reassemble in original order. Until then, `JSON.MGET` is the one JSON command that doesn't benefit from the cross-shard parallelism the rest of this subsystem already has.
@@ -4847,12 +5090,34 @@ plain `MGET`, `JsonMget` was never given the bucket-by-shard-then-fan-out treatm
 ---
 ---
 
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: JSON numbers, strings, arrays, and objects mutate in-place in DRAM.
+* **Gotcha 2**: JSONPath queries support recursive descent ($..key) and bracket notation.
+* **Gotcha 3**: JSON documents can be indexed in RediSearch schema fields.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```
+
+
 ---
 
 ## Component 17: Geospatial Commands
 
-> **Source Files**: `src/geo.rs` | **High-Level Design**: [`docs/design/17_geospatial.md`](../design/17_geospatial.md)
+## 1. Source Module Map & Responsibilities
 
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/geo.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -4895,8 +5160,6 @@ pub struct GeoItemResult {
 `GeoItemResult` + `format_geo_results` unify the reply-formatting for every command that can
 return `WITHCOORD`/`WITHDIST`/`WITHHASH` options (`GEORADIUS`, `GEORADIUSBYMEMBER`,
 `GEOSEARCH`) — one shared formatter rather than three separately hand-written reply encoders.
-
----
 
 ---
 
@@ -4977,8 +5240,6 @@ precise at very large box dimensions.
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/table.rs`** (Component 05): every geo command is built entirely on `RudisTable`'s
@@ -4993,8 +5254,6 @@ precise at very large box dimensions.
 
 ---
 
----
-
 ### 7. Future Improvements
 
 - **Medium — narrow `GEORADIUS`/`GEORADIUSBYMEMBER`/`GEOSEARCH`'s scan using geohash-neighborhood pruning instead of a full O(N) scan (§4.4).** Since scores are already geohash-ordered when read via a range on the sorted structure, computing the target radius/box's covering geohash cell(s) and querying only score ranges near them (real Redis's approach) would turn this into roughly O(log N + matches) instead of O(N) — the highest-value fix here for any geo set large enough to matter.
@@ -5005,12 +5264,34 @@ precise at very large box dimensions.
 ---
 ---
 
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Longitude is bound to [-180, 180], latitude to [-85.05112878, 85.05112878].
+* **Gotcha 2**: GEOSEARCH supports BYRADIUS and BYBOX bounding queries.
+* **Gotcha 3**: Haversine formula uses WGS84 Earth radius (6372797.560856 meters).
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```
+
+
 ---
 
 ## Component 18: Probabilistic Data Structures
 
-> **Source Files**: `src/probabilistic.rs` | **High-Level Design**: [`docs/design/18_probabilistic.md`](../design/18_probabilistic.md)
+## 1. Source Module Map & Responsibilities
 
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/probabilistic.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -5057,8 +5338,6 @@ for a Bloom filter and a key of the same name used for a Cuckoo filter would be 
 independent entries (in different maps), not a naming collision, since the command layer
 (`connection.rs`) dispatches to the right map by command family (`BF.*` vs `CF.*` vs...), not
 by inspecting what's already stored under that key.
-
----
 
 ---
 
@@ -5147,8 +5426,6 @@ a larger-scale Space-Saving implementation would use.
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/connection.rs`** (Component 02): dispatches every `BF.*`/`CF.*`/`CMS.*`/`TOPK.*`
@@ -5166,8 +5443,6 @@ a larger-scale Space-Saving implementation would use.
 
 ---
 
----
-
 ### 7. Future Improvements
 
 - **Medium — include these four structures in RDB save/restore (§5)** — the same cross-cutting durability gap already flagged for `JsonStore` (Component 16) and vector indexes (Component 08): a restart silently discards all Bloom/Cuckoo/CMS/Top-K state with no warning.
@@ -5178,12 +5453,34 @@ a larger-scale Space-Saving implementation would use.
 ---
 ---
 
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Cuckoo filters use 4-slot bucket tables with fingerprint-based partial key cuckoo hashing.
+* **Gotcha 2**: Count-Min Sketch uses conservative update to minimize frequency over-estimation.
+* **Gotcha 3**: Top-K uses Space-Saving streaming algorithm with O(1) item updates.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```
+
+
 ---
 
 ## Component 19: Pub/Sub Messaging Hub
 
-> **Source Files**: `src/pubsub.rs` | **High-Level Design**: [`docs/design/19_pubsub.md`](../design/19_pubsub.md)
+## 1. Source Module Map & Responsibilities
 
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/pubsub.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -5224,8 +5521,6 @@ Two reverse indices (`client_channels`/`client_patterns`) exist purely so
 `unsubscribe_all`/`punsubscribe_all`/`total_subscriptions`/connection-drop cleanup don't have
 to scan every channel/pattern in the hub looking for a given client — a real, deliberate
 O(subscriptions for this client) design instead of O(all channels/patterns).
-
----
 
 ---
 
@@ -5301,8 +5596,6 @@ tears down every channel and pattern subscription for that client in one call, r
 
 ---
 
----
-
 ### 5. Cross-Component Interactions
 
 - **`src/connection.rs`** (Component 02): `run_pubsub_loop` is the sole caller of
@@ -5322,8 +5615,6 @@ tears down every channel and pattern subscription for that client in one call, r
 
 ---
 
----
-
 ### 7. Future Improvements
 
 - **Medium — send RESP3 push-type frames (`>`) to RESP3-negotiated subscribers instead of always RESP2 arrays (§2.4).** This is a real, verified protocol-compliance gap: a client that sent `HELLO 3` and is tracked as `is_resp3` elsewhere in the codebase (Component 02) still receives plain `*3\r\n...`/`*4\r\n...` array frames for `message`/`pmessage` delivery here, not the RESP3 push type real Redis switches to. Since one frame is currently built once and cloned to every subscriber (§4.2, a real performance benefit), fixing this requires either building two frame variants up front (RESP2 and RESP3) and picking per-subscriber based on a tracked protocol flag, or moving per-subscriber protocol awareness into `PubSubHub` itself (currently it has none).
@@ -5333,3 +5624,22 @@ tears down every channel and pattern subscription for that client in one call, r
 
 ---
 ---
+
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: ShardedPresenceTable uses [AtomicU64; 16] stripes to track active subscriber shards.
+* **Gotcha 2**: SPUBLISH routes directly to the shard owning CRC16(channel) % 16384.
+* **Gotcha 3**: Messages are delivered as zero-copy bytes::Bytes buffers with bounded queue backpressure.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```
+

@@ -1,52 +1,30 @@
-# Component 12: CRDT Data Types & Manual Multi-Region Sync (Design)
+# Component 12: CRDT Data Types & Manual Multi-Region Sync (High-Level Design & Architecture Guide)
 
-> **Source Files**: `src/crdt.rs`
-
-
----
-
-### 1. Architectural Purpose & Scope
-
-`src/crdt.rs` (645 lines) implements a small, self-contained library of three
-**Conflict-Free Replicated Data Types (CRDTs)** — a Last-Write-Wins Register, an
-Observed-Remove Set, and a Positive-Negative Counter — each ordered by a **Hybrid Logical
-Clock (HLC)**, plus a binary export/import format for merging one instance's CRDT state
-into another's.
-
-**What this is not**: there is no automatic cross-region network replication. There is no
-peer/region configuration anywhere in `main.rs`, no background sync task, and no wiring
-into `src/replication.rs` (which handles the unrelated primary/replica `PSYNC` stream).
-`CRDT.MERGE` takes its payload as a plain command argument (`Command::CrdtMerge(Bytes)`),
-which means getting CRDT state from one Rudis instance to another is entirely
-operator/client-driven: read it out with `CRDT.DUMP`, transport those bytes yourself
-(script, sidecar, whatever), and feed them into the target instance with `CRDT.MERGE
-<payload>`. The "multi-region" framing in this file's doc comments describes the
-data types' *convergence properties*, not a built network protocol.
-
-**Update — the routing gap below is now fixed.** An earlier version of this document found
-that every `Command::Crdt*` handler called `router.local_db.borrow_mut().crdt_*(...)`
-directly, bypassing normal key-based routing entirely, so the same key name could hold
-completely independent state on different shards. As of the current source, the single-key
-CRDT commands (`CrdtSet`/`CrdtGet`/`CrdtDel`/`CrdtIncrby`/`CrdtSadd`/`CrdtSmembers`/
-`CrdtSrem`) are now included in both `cmd_primary_key` and `target_shard_of_cmd`
-(`connection.rs`) and dispatch through the same local-vs-`execute_remote` fork every other
-keyed command uses — a `CRDT.SET foo bar` now always lands on the one shard `foo` actually
-hashes to, regardless of which shard's connection issued it. Separately, `CRDT.DUMP`,
-`CRDT.MERGE`, and `CRDT.GC` — which operate on an entire store, not one key — now
-explicitly fan out to *every* shard (`for sid in 0..router.num_shards { ... }`, via
-`router.execute_remote`) and aggregate the results: `CrdtDump` concatenates every shard's
-exported payload into one response, `CrdtMerge` sums the per-shard merged-item counts, and
-`CrdtGc` sums the per-shard tombstones-pruned counts. In effect, `CrdtStore` is still a
-genuinely separate `CrdtStore` instance per shard (the underlying data structure hasn't
-changed — see §3), but the command layer now presents it as one logical whole-node store:
-single-key operations are correctly routed to the one shard that owns the key, and
-whole-store operations correctly touch every shard rather than just the connection's local
-one.
+> **Subsystem Scope**: `src/crdt.rs`  
+> **Implementation Reference**: [`docs/internal/12_crdt_types.md`](../internal/12_crdt_types.md)  
+> **Consolidated Design Spec**: [`docs/design/components.md`](components.md)
 
 ---
 
-### 2. Key Invariants & Concurrency Constraints
+## 1. Executive Summary & Problem Statement
 
+### 1.1 The Problem
+Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+
+### 1.2 The Rudis Solution
+Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+
+---
+
+## 2. Contributor Mental Model & Architectural Principles
+
+### 2.1 The Mental Model
+Conflict-Free Replicated Data Types for active-active multi-region replication. Hybrid Logical Clocks (HLC) provide causal ordering without dependency on synchronized physical clocks.
+
+### 2.2 Design Rationale (The "Why")
+Cross-region replication cannot rely on global consensus without incurring multi-hundred-millisecond write latencies. CRDTs allow local writes to commit instantly and merge deterministically across regions.
+
+### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
 1. **Deterministic Convergence (real, and tested)**: `LwwRegister::merge`, `OrSet::merge`,
    and `PnCounter::merge` are each commutative/idempotent by construction (see §4) — the
    file's own `#[cfg(test)]` module (`test_lww_register_convergence`,
@@ -64,7 +42,17 @@ one.
 
 ---
 
-### 3. Performance Characteristics
+## 3. High-Level Architecture & Workflow Diagram
+
+```
+Region US-East (Write k=v1 at HLC_1) ──┐
+                                              ├──► Deterministic LWW Merge
+       Region EU-West (Write k=v2 at HLC_2) ──┘    (HLC_2 > HLC_1 wins)
+```
+
+---
+
+## 4. Performance Guarantees & Theoretical Complexity
 
 - **Lock-free clock advancement**: `HybridLogicalClock::now`/`update` use CAS retry loops,
   not a mutex — cheap even under contention from multiple connections on the same shard.
@@ -76,3 +64,9 @@ one.
   entirely in whatever external process actually transports the dump/merge payloads.
 
 ---
+
+## 5. Implementation References & Contributor Guide
+
+For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
+* [**`docs/internal/12_crdt_types.md`**](../internal/12_crdt_types.md): Low-level implementation and code reference.
+* **Source Files**: `src/crdt.rs`

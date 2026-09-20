@@ -1,23 +1,30 @@
-# Component 13: Lua Scripting & Redis 7 Functions Engine (Design)
+# Component 13: Lua Scripting & Redis 7 Functions Engine (High-Level Design & Architecture Guide)
 
-> **Source Files**: `src/scripting.rs`
-
-
----
-
-### 1. Architectural Purpose & Scope
-
-`src/scripting.rs` embeds Lua via `mlua` (`lua54`, vendored) to run `EVAL`/`EVALSHA`/`SCRIPT
-LOAD`/`SCRIPT EXISTS`/`SCRIPT FLUSH` and Redis 7 Functions (`FUNCTION LOAD`, `FCALL`,
-`FUNCTION LIST`, `FUNCTION DELETE`, `FUNCTION FLUSH`). There is no persistent `ScriptEngine`
-struct — every `EVAL`/`EVALSHA`/`FCALL` call creates a **brand-new `mlua::Lua` instance**,
-runs once, and drops it. Script *source* is cached (by SHA1, and by function-library name);
-compiled bytecode and the Lua VM itself are not.
+> **Subsystem Scope**: `src/scripting.rs`  
+> **Implementation Reference**: [`docs/internal/13_scripting_functions.md`](../internal/13_scripting_functions.md)  
+> **Consolidated Design Spec**: [`docs/design/components.md`](components.md)
 
 ---
 
-### 2. Key Invariants & Concurrency Constraints
+## 1. Executive Summary & Problem Statement
 
+### 1.1 The Problem
+Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+
+### 1.2 The Rudis Solution
+Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+
+---
+
+## 2. Contributor Mental Model & Architectural Principles
+
+### 2.1 The Mental Model
+Embedded Lua 5.4 runtime via mlua. Supports transient scripts (EVAL, EVALSHA) and persistent Redis 7 function libraries (FUNCTION LOAD, FCALL) with sandboxed standard library.
+
+### 2.2 Design Rationale (The "Why")
+Atomic multi-operation transactions and server-side business logic require script execution without client round-trips. Redis 7 functions provide first-class, versioned library management.
+
+### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
 1. **Fresh interpreter per call, no persistent VM or bytecode cache.** `eval_script` and
    `call_function` both call `Lua::new()` at the top and let it drop at the end of the
    function. There is nothing analogous to the old doc's `ScriptEngine`/`script_cache:
@@ -43,7 +50,15 @@ compiled bytecode and the Lua VM itself are not.
 
 ---
 
-### 3. Performance Characteristics
+## 3. High-Level Architecture & Workflow Diagram
+
+```
+Client ──► FCALL my_lib:my_func ──► Lua 5.4 VM (mlua) ──► redis.call() ──► ShardDb
+```
+
+---
+
+## 4. Performance Guarantees & Theoretical Complexity
 
 - **No bytecode caching, despite the SHA1 cache's name.** `SCRIPT_CACHE` only saves
   re-transmission of the script *text* for `EVALSHA`; Lua source is re-parsed by `mlua` on
@@ -60,3 +75,9 @@ compiled bytecode and the Lua VM itself are not.
   design, shared with the `BlockHub` exception documented in Component 06/01.
 
 ---
+
+## 5. Implementation References & Contributor Guide
+
+For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
+* [**`docs/internal/13_scripting_functions.md`**](../internal/13_scripting_functions.md): Low-level implementation and code reference.
+* **Source Files**: `src/scripting.rs`

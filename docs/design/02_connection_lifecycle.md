@@ -1,27 +1,30 @@
-# Component 02: Connection Lifecycle & Command Execution (Design)
+# Component 02: Connection Lifecycle & Command Execution (High-Level Design & Architecture Guide)
 
-> **Source Files**: `src/connection.rs`
-
-
----
-
-### 1. Architectural Purpose & Scope
-
-`src/connection.rs` is the single largest module in Rudis (~10,600 lines) and the central
-coordination layer for every client session. It owns the per-connection read/parse/execute/write
-loop, protocol-mode transitions (Pub/Sub, replica streaming via `PSYNC`), RESP2/RESP3 reply
-formatting and client-side caching invalidation, Redis transactions (`MULTI`/`EXEC`/`WATCH`),
-blocking commands (`BLPOP`/`BZPOPMIN`/blocking `XREAD`), Redis Cluster slot-migration
-redirection (`MOVED`/`ASK`/`ASKING`), ACL authentication gating, and the local-vs-remote
-routing decision — plus command-specific execution logic for the full command surface (strings,
-hashes, lists, sets, sorted sets, streams with consumer groups, HyperLogLog, bitmaps, geo,
-probabilistic structures, JSON, vector search, Lua scripting, and a Memcached text-protocol
-gateway). It is genuinely the busiest file in the codebase, not a thin dispatcher.
+> **Subsystem Scope**: `src/connection.rs`  
+> **Implementation Reference**: [`docs/internal/02_connection_lifecycle.md`](../internal/02_connection_lifecycle.md)  
+> **Consolidated Design Spec**: [`docs/design/components.md`](components.md)
 
 ---
 
-### 2. Key Invariants & Concurrency Constraints
+## 1. Executive Summary & Problem Statement
 
+### 1.1 The Problem
+Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+
+### 1.2 The Rudis Solution
+Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+
+---
+
+## 2. Contributor Mental Model & Architectural Principles
+
+### 2.1 The Mental Model
+A connection spends its entire lifetime pinned to the worker core that accepted it. It reads RESP command frames in batches, groups them by destination shard (pipeline squashing), and executes local commands inline with zero channel hops.
+
+### 2.2 Design Rationale (The "Why")
+In pipelined workloads, dispatching requests key-by-key across threads incurs O(K) inter-thread round-trips. Pipeline squashing buckets commands by target shard and sends one single batched message per remote core, slashing channel hops and socket write syscalls.
+
+### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
 1. **Pure Single-Threaded Client State**: Every connection is handled exclusively by the
    core that accepted it (`handle_connection`'s locals — `in_multi`, `tx_queue`, `asking`,
    `authenticated`, `auth_user` — are plain stack variables, no `Arc`/`Mutex`).
@@ -43,7 +46,26 @@ gateway). It is genuinely the busiest file in the codebase, not a thin dispatche
 
 ---
 
-### 3. Performance Characteristics
+## 3. High-Level Architecture & Workflow Diagram
+
+```
+Client Pipelined Stream: [GET k1, SET k2, GET k3]
+                               │
+                In-Place Pipeline Parser
+                               │
+                ┌──────────────┴──────────────┐
+                ▼                             ▼
+        Local Shard (k1, k3)          Remote Shard (k2)
+        Execute Inline (0 hops)       Single Batched SPSC Hop
+                │                             │
+                └──────────────┬──────────────┘
+                               ▼
+               Vectored Write Coalescing to Socket
+```
+
+---
+
+## 4. Performance Guarantees & Theoretical Complexity
 
 - **Pre-allocated responder pool, not one-shot channels**: `ResponderChannel`s are built once
   per connection (`(0..router.num_shards).map(|_| flume::bounded(1))`) and reused for every
@@ -69,3 +91,9 @@ gateway). It is genuinely the busiest file in the codebase, not a thin dispatche
   back to a real `.await`.
 
 ---
+
+## 5. Implementation References & Contributor Guide
+
+For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
+* [**`docs/internal/02_connection_lifecycle.md`**](../internal/02_connection_lifecycle.md): Low-level implementation and code reference.
+* **Source Files**: `src/connection.rs`

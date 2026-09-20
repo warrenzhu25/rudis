@@ -1,23 +1,30 @@
-# Component 06: Blocking Operations & The Reactive Event Hub (Design)
+# Component 06: Blocking Operations & The Reactive Event Hub (High-Level Design & Architecture Guide)
 
-> **Source Files**: `src/block.rs`
-
-
----
-
-### 1. Architectural Purpose & Scope
-
-`src/block.rs` implements Rudis's waiter registration and wakeup engine (**`BlockHub`**). It
-powers the blocking list/zset/stream commands — `BLPOP`, `BRPOP`, `BLMOVE`, `BRPOPLPOP`-style
-moves, `BZPOPMIN`, `BZPOPMAX`, `BZMPOP`, and `XREAD ... BLOCK` — plus `CLIENT UNBLOCK` and the
-blocked-flag reported by `CLIENT LIST`/`CLIENT INFO`. Unlike the rest of Rudis, `BlockHub` is
-**not** thread-local: it is one process-wide, mutex-guarded structure per listening port, shared
-by every shard thread serving that port.
+> **Subsystem Scope**: `src/block.rs`  
+> **Implementation Reference**: [`docs/internal/06_blocking_hub.md`](../internal/06_blocking_hub.md)  
+> **Consolidated Design Spec**: [`docs/design/components.md`](components.md)
 
 ---
 
-### 2. Key Invariants & Concurrency Constraints
+## 1. Executive Summary & Problem Statement
 
+### 1.1 The Problem
+Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+
+### 1.2 The Rudis Solution
+Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+
+---
+
+## 2. Contributor Mental Model & Architectural Principles
+
+### 2.1 The Mental Model
+A thread-safe reactive registry for blocking operations (BLPOP, BRPOP, BZPOPMIN, XREAD BLOCK). When a key receives a push on any shard, BlockHub signals the waiting connection without polling.
+
+### 2.2 Design Rationale (The "Why")
+In shared-nothing architectures, blocking operations require cross-shard coordination because a producer on Core 0 can unblock a consumer waiting on Core 3. BlockHub provides this narrow, locked coordination layer.
+
+### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
 1. **The one deliberate exception to "zero locks."** `BlockHub` lives behind a real
    `std::sync::Mutex`, reachable from any shard via `get_block_hub_for_port(port)`:
    ```rust
@@ -52,7 +59,17 @@ by every shard thread serving that port.
 
 ---
 
-### 3. Performance Characteristics
+## 3. High-Level Architecture & Workflow Diagram
+
+```
+Consumer on Core 0 (BLPOP list 10)  ──► Registers in BlockHub
+                                                     ▲
+       Producer on Core 1 (LPUSH list "x") ──► Unblocks waiting Core 0
+```
+
+---
+
+## 4. Performance Guarantees & Theoretical Complexity
 
 - **Not zero-overhead while blocked**: unlike a pure channel-based design, each blocked client
   costs a wakeup-and-poll cycle at most every 20ms (`wait_for_blocked_result`'s cap) purely to
@@ -68,3 +85,9 @@ by every shard thread serving that port.
   processed once, after the transaction (and any cross-shard lock release) fully completes.
 
 ---
+
+## 5. Implementation References & Contributor Guide
+
+For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
+* [**`docs/internal/06_blocking_hub.md`**](../internal/06_blocking_hub.md): Low-level implementation and code reference.
+* **Source Files**: `src/block.rs`

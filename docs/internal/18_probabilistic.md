@@ -1,7 +1,16 @@
-# Component 18: Probabilistic Data Structures (Implementation)
+# Component 18: Probabilistic Data Structures (Implementation Deep-Dive & Code Reference)
 
-> **Source Files**: `src/probabilistic.rs`
+> **Source Files**: `src/probabilistic.rs`  
+> **High-Level Design Spec**: [`docs/design/18_probabilistic.md`](../design/18_probabilistic.md)  
+> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
 
+---
+
+## 1. Source Module Map & Responsibilities
+
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/probabilistic.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -162,3 +171,21 @@ a larger-scale Space-Saving implementation would use.
 
 ---
 ---
+
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Cuckoo filters use 4-slot bucket tables with fingerprint-based partial key cuckoo hashing.
+* **Gotcha 2**: Count-Min Sketch uses conservative update to minimize frequency over-estimation.
+* **Gotcha 3**: Top-K uses Space-Saving streaming algorithm with O(1) item updates.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```

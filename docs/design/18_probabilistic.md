@@ -1,27 +1,30 @@
-# Component 18: Probabilistic Data Structures (Design)
+# Component 18: Probabilistic Data Structures (High-Level Design & Architecture Guide)
 
-> **Source Files**: `src/probabilistic.rs`
-
-
----
-
-### 1. Architectural Purpose & Scope
-
-`src/probabilistic.rs` implements four independent approximate-membership/frequency data
-structures — a **Bloom Filter**, a **Cuckoo Filter**, a **Count-Min Sketch**, and a **Top-K
-frequency tracker** (Space-Saving algorithm) — exposed via RedisBloom-compatible commands
-(`BF.*`, `CF.*`, `CMS.*`, `TOPK.*`). Each structure type has its own per-key map inside
-`ProbabilisticStore`, which lives in `ShardDb` alongside `vector_indexes`/`crdt_store`/
-`json_store`. Like `src/json.rs` (Component 16) and `src/geo.rs` (Component 17) and unlike
-`src/vector.rs` (Component 08), every single-key command here is genuinely routed per-key
-across shards — confirmed directly in `connection.rs`: `BfAdd`/`CfAdd`/`CmsIncrby`/`TopkAdd`/
-etc. all appear in the same `target_shard_of_cmd`/local-vs-`execute_remote` dispatch arm as
-ordinary keyed commands.
+> **Subsystem Scope**: `src/probabilistic.rs`  
+> **Implementation Reference**: [`docs/internal/18_probabilistic.md`](../internal/18_probabilistic.md)  
+> **Consolidated Design Spec**: [`docs/design/components.md`](components.md)
 
 ---
 
-### 2. Key Invariants & Concurrency Constraints
+## 1. Executive Summary & Problem Statement
 
+### 1.1 The Problem
+Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+
+### 1.2 The Rudis Solution
+Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+
+---
+
+## 2. Contributor Mental Model & Architectural Principles
+
+### 2.1 The Mental Model
+Constant-memory probabilistic data structures: Bloom Filters (membership testing), Cuckoo Filters (membership with deletion), Count-Min Sketch (frequency estimation), and Top-K (Space-Saving heavy hitters).
+
+### 2.2 Design Rationale (The "Why")
+Tracking unique users or heavy hitters over billions of events in exact hash sets exhausts gigabytes of memory. Probabilistic structures provide bounded-error answers in kilobytes of RAM.
+
+### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
 1. **A single custom hash function underlies all four structures.** `fnv1a_hash` (a
    seeded 64-bit FNV-1a) and `double_hash` (two independent FNV-1a calls with different fixed
    seeds, used for Kirsch-Mitzenmacher double-hashing) are shared by the Bloom filter, Cuckoo
@@ -54,7 +57,15 @@ ordinary keyed commands.
 
 ---
 
-### 3. Performance Characteristics
+## 3. High-Level Architecture & Workflow Diagram
+
+```
+Item ──► MurmurHash3 Hash Seeds ──► Bitmask Indexing (Bloom / Cuckoo / CMS / Top-K)
+```
+
+---
+
+## 4. Performance Guarantees & Theoretical Complexity
 
 - **Bloom/Cuckoo `add`/`contains` are O(num_hashes) / O(1)** respectively — a Bloom filter
   check costs up to 30 bit-array probes (bounded, per §2.2's clamp), a Cuckoo filter check is
@@ -69,3 +80,9 @@ ordinary keyed commands.
   small `k`, would matter if `TOPK.RESERVE` were ever used with a very large `k`.
 
 ---
+
+## 5. Implementation References & Contributor Guide
+
+For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
+* [**`docs/internal/18_probabilistic.md`**](../internal/18_probabilistic.md): Low-level implementation and code reference.
+* **Source Files**: `src/probabilistic.rs`

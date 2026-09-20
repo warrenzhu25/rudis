@@ -1,7 +1,16 @@
-# Component 11: Redis Cluster Topology & Gossip Protocol (Implementation)
+# Component 11: Redis Cluster Topology & Gossip Protocol (Implementation Deep-Dive & Code Reference)
 
-> **Source Files**: `src/cluster.rs`
+> **Source Files**: `src/cluster.rs`  
+> **High-Level Design Spec**: [`docs/design/11_cluster_topology.md`](../design/11_cluster_topology.md)  
+> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
 
+---
+
+## 1. Source Module Map & Responsibilities
+
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/cluster.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -239,3 +248,21 @@ path at all; don't conflate the two.
 
 ---
 ---
+
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Strict majority quorum consensus is required for PFAIL to FAIL node escalation.
+* **Gotcha 2**: Cluster bus runs on a single background task on Shard 0.
+* **Gotcha 3**: DFLYMIGRATE supports multi-shard concurrent slot migration.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```

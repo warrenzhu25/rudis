@@ -1,7 +1,16 @@
-# Component 17: Geospatial Commands (Implementation)
+# Component 17: Geospatial Commands (Implementation Deep-Dive & Code Reference)
 
-> **Source Files**: `src/geo.rs`
+> **Source Files**: `src/geo.rs`  
+> **High-Level Design Spec**: [`docs/design/17_geospatial.md`](../design/17_geospatial.md)  
+> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
 
+---
+
+## 1. Source Module Map & Responsibilities
+
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/geo.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -147,3 +156,21 @@ precise at very large box dimensions.
 
 ---
 ---
+
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Longitude is bound to [-180, 180], latitude to [-85.05112878, 85.05112878].
+* **Gotcha 2**: GEOSEARCH supports BYRADIUS and BYBOX bounding queries.
+* **Gotcha 3**: Haversine formula uses WGS84 Earth radius (6372797.560856 meters).
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```

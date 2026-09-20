@@ -1,27 +1,30 @@
-# Component 16: JSON Document Store & JSONPath Engine (Design)
+# Component 16: JSON Document Store & JSONPath Engine (High-Level Design & Architecture Guide)
 
-> **Source Files**: `src/json.rs`
-
-
----
-
-### 1. Architectural Purpose & Scope
-
-`src/json.rs` implements a RedisJSON-compatible document store: a hand-written JSONPath
-parser/evaluator operating directly on `serde_json::Value` trees, plus `JsonStore`, the
-per-shard map of key → JSON document that backs `JSON.SET`/`GET`/`DEL`/`TYPE`/`NUMINCRBY`/
-`STRAPPEND`/`STRLEN`/`ARRAPPEND`/`ARRLEN`/`ARRPOP`/`OBJKEYS`/`OBJLEN`/`TOGGLE`/`CLEAR`/`MGET`.
-Unlike `src/vector.rs` (Component 08) and unlike `src/crdt.rs` before its fix (Component 12),
-single-key JSON commands are **genuinely routed per-key across shards** — verified directly
-in `connection.rs`: every `Command::Json*` variant (except `JsonMget`, see §4.5) appears in
-the same `target_shard_of_cmd`/local-vs-`execute_remote` dispatch arm as ordinary string/hash/
-list commands, so a `JSON.SET`/`GET` on a given key always lands on the one shard that key
-actually hashes to, regardless of which shard's connection issued it.
+> **Subsystem Scope**: `src/json.rs`  
+> **Implementation Reference**: [`docs/internal/16_json_store.md`](../internal/16_json_store.md)  
+> **Consolidated Design Spec**: [`docs/design/components.md`](components.md)
 
 ---
 
-### 2. Key Invariants & Concurrency Constraints
+## 1. Executive Summary & Problem Statement
 
+### 1.1 The Problem
+Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+
+### 1.2 The Rudis Solution
+Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+
+---
+
+## 2. Contributor Mental Model & Architectural Principles
+
+### 2.1 The Mental Model
+Native RFC 8259 document store. Supports recursive JSONPath selectors ($..*, [*], array slices) and in-place atomic mutations without full document deserialization.
+
+### 2.2 Design Rationale (The "Why")
+External JSON modules in Redis require dynamic C loading. Rudis natively supports JSON.SET, JSON.GET, and sub-path mutations with zero proxy latency.
+
+### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
 1. **A real, but partial, JSONPath implementation.** `parse_json_path` hand-parses `$`, bare
    `.field` traversal, `[idx]` (including negative indices), `[*]` wildcards, `[start:end]`
    slices (including negative/omitted bounds), and `["quoted"]`/`['quoted']` field names. There
@@ -47,7 +50,15 @@ actually hashes to, regardless of which shard's connection issued it.
 
 ---
 
-### 3. Performance Characteristics
+## 3. High-Level Architecture & Workflow Diagram
+
+```
+Client ──► JSON.NUMINCRBY user:1 $.stats.views 1 ──► In-Place Mutation in ShardDb
+```
+
+---
+
+## 4. Performance Guarantees & Theoretical Complexity
 
 - **`JSON.GET` cost scales with matched-subtree size, not query specificity** — every call
   does a fresh `serde_json::to_string` of whatever `query_json_path` returned, with no
@@ -60,3 +71,9 @@ actually hashes to, regardless of which shard's connection issued it.
   multi-key JSON reads spread across shards — see Future Improvements.
 
 ---
+
+## 5. Implementation References & Contributor Guide
+
+For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
+* [**`docs/internal/16_json_store.md`**](../internal/16_json_store.md): Low-level implementation and code reference.
+* **Source Files**: `src/json.rs`

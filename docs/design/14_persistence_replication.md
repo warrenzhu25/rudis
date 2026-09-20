@@ -1,37 +1,30 @@
-# Component 14: Persistence & Replication Engines (Design)
+# Component 14: Persistence & Replication Engines (High-Level Design & Architecture Guide)
 
-> **Source Files**: `src/replication.rs`, `src/aof.rs`
-
-
----
-
-### 1. Architectural Purpose & Scope
-
-This subsystem covers two related but independent durability mechanisms:
-
-1. **Append-Only File (AOF) Engine (`src/aof.rs`)**: converts mutating `Command`s back into
-   RESP bytes (`command_to_resp`) and appends them to a per-shard file via a buffered,
-   periodically-flushed `AofWriter`. On restart, `replay_aof` re-parses the file and replays
-   every command through the normal command-execution path.
-2. **Replication Hub (`src/replication.rs`)**: a per-port, process-wide `ReplicationHub`
-   (master or slave role) that fans out every mutating command to connected replicas over
-   plain `flume` channels. The master side now supports **real partial resync** (`+CONTINUE`
-   from the backlog) when a reconnecting client presents a valid replid+offset, falling back
-   to a full RDB snapshot otherwise — see §4.3 for the update to this (this doc previously,
-   correctly, documented this as entirely unimplemented; it has since been built).
-
-**Update**: AOF rewrite/compaction via `BGREWRITEAOF` is fully implemented across shards
-(§4.1), snapshotting non-expired table entries, JSON documents, sets, lists, hashes, streams,
-and preserving TTLs, with atomic temp-file rename and live reopen on active writers. Partial
-resynchronization is real on both the **master** and **replica** sides
-(§4.3) — `run_replica_worker` tracks its `master_replid` and `master_repl_offset`,
-reconnects automatically with `PSYNC <replid> <offset>`, and applies `+CONTINUE` diffs
-without full RDB snapshots.
+> **Subsystem Scope**: `src/replication.rs, src/aof.rs`  
+> **Implementation Reference**: [`docs/internal/14_persistence_replication.md`](../internal/14_persistence_replication.md)  
+> **Consolidated Design Spec**: [`docs/design/components.md`](components.md)
 
 ---
 
-### 2. Key Invariants & Concurrency Constraints
+## 1. Executive Summary & Problem Statement
 
+### 1.1 The Problem
+Traditional in-memory datastores encounter severe scalability barriers on modern multi-core, high-throughput cloud hardware. Single-threaded architectures (such as Redis) saturate a single CPU core while leaving the remaining 95%+ of server cores idle. Multi-threaded mutex architectures (such as Memcached) suffer from heavy spinlock contention, CPU cache line bouncing, and global memory allocator lock bottlenecks.
+
+### 1.2 The Rudis Solution
+Rudis implements the **Thread-Per-Core (Shared-Nothing)** architectural paradigm natively on Linux `io_uring` via Monoio. Each physical CPU core owns its own isolated event loop, its own thread-local memory database, and its own kernel `SO_REUSEPORT` listener. Operations on local keys execute in nanoseconds with zero locks, zero atomic operations, and zero cross-core cache invalidations.
+
+---
+
+## 2. Contributor Mental Model & Architectural Principles
+
+### 2.1 The Mental Model
+Fork-less streaming snapshots and parallel multi-flow TCP replication. Replicas open N parallel TCP connections (DFLY FLOW), streaming mutations directly from worker cores with zero locks.
+
+### 2.2 Design Rationale (The "Why")
+Redis fork() triggers catastrophic copy-on-write memory doubling and main thread stalls. Funneling replication through a single TCP socket bottlenecks multi-core servers. Rudis streams snapshots sequentially and replicates in parallel.
+
+### 2.3 Key Invariants & Concurrency Constraints (Non-Negotiable Rules)
 1. **AOF compaction via `BGREWRITEAOF` is supported.** `AofWriter::append` grows `self.buffer`
    (later flushed to disk via `write_all_at` at the current end-of-file `offset`). Periodic
    or explicit `BGREWRITEAOF` snapshots memory state to a temporary file, syncs it, atomically
@@ -66,7 +59,17 @@ without full RDB snapshots.
 
 ---
 
-### 3. Performance Characteristics
+## 3. High-Level Architecture & Workflow Diagram
+
+```
+Master Worker Core 0 ──(DFLY FLOW 0)──► Replica Worker Core 0
+       Master Worker Core 1 ──(DFLY FLOW 1)──► Replica Worker Core 1
+       (Parallel zero-lock streaming direct from worker cores)
+```
+
+---
+
+## 4. Performance Guarantees & Theoretical Complexity
 
 - **AOF write cost is O(1) amortized per command**, bounded by the 50ms/~1s flush-fsync
   cadence — but **AOF file size and restart replay time are both unbounded** relative to
@@ -83,3 +86,9 @@ without full RDB snapshots.
   loop of non-blocking `flume` sends per mutating command, independent of dataset size.
 
 ---
+
+## 5. Implementation References & Contributor Guide
+
+For concrete struct definitions, memory layout diagrams, step-by-step function walkthroughs, and code-level technical debt:
+* [**`docs/internal/14_persistence_replication.md`**](../internal/14_persistence_replication.md): Low-level implementation and code reference.
+* **Source Files**: `src/replication.rs, src/aof.rs`

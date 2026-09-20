@@ -1,7 +1,17 @@
-# Component 14: Persistence & Replication Engines (Implementation)
+# Component 14: Persistence & Replication Engines (Implementation Deep-Dive & Code Reference)
 
-> **Source Files**: `src/replication.rs`, `src/aof.rs`
+> **Source Files**: `src/replication.rs, src/aof.rs`  
+> **High-Level Design Spec**: [`docs/design/14_persistence_replication.md`](../design/14_persistence_replication.md)  
+> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
 
+---
+
+## 1. Source Module Map & Responsibilities
+
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/replication.rs` | Core implementation and logic | Primary data structures and algorithms |
+| `src/aof.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -334,3 +344,21 @@ state currently is at request time.
 
 ---
 ---
+
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: BGSAVE streams shard RDB chunks sequentially one-by-one to keep peak memory minimal (<475MB).
+* **Gotcha 2**: BGREWRITEAOF uses a 64KB BufWriter to stream AOF files without allocating large heap buffers.
+* **Gotcha 3**: DFLY FLOW establishes dedicated per-shard streaming sockets direct to worker threads.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```

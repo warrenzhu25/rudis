@@ -1,7 +1,16 @@
-# Component 13: Lua Scripting & Redis 7 Functions Engine (Implementation)
+# Component 13: Lua Scripting & Redis 7 Functions Engine (Implementation Deep-Dive & Code Reference)
 
-> **Source Files**: `src/scripting.rs`
+> **Source Files**: `src/scripting.rs`  
+> **High-Level Design Spec**: [`docs/design/13_scripting_functions.md`](../design/13_scripting_functions.md)  
+> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
 
+---
+
+## 1. Source Module Map & Responsibilities
+
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/scripting.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -231,3 +240,21 @@ match the old doc's description, modulo the exact function names.
 
 ---
 ---
+
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: Scripts execute synchronously within the calling shard worker runtime.
+* **Gotcha 2**: redis.call bridge translates Redis RESP types to Lua types automatically.
+* **Gotcha 3**: Function libraries are persisted into RDB snapshots and AOF logs.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```

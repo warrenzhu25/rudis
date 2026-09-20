@@ -1,7 +1,16 @@
-# Component 05: Storage Engine & Compact Encodings (Implementation)
+# Component 05: Storage Engine & Compact Encodings (Implementation Deep-Dive & Code Reference)
 
-> **Source Files**: `src/table.rs`
+> **Source Files**: `src/table.rs`  
+> **High-Level Design Spec**: [`docs/design/05_storage_engine.md`](../design/05_storage_engine.md)  
+> **Consolidated Implementation Spec**: [`docs/internal/components.md`](components.md)
 
+---
+
+## 1. Source Module Map & Responsibilities
+
+| File | Subsystem Role | Key Functions / Structs |
+| :--- | :--- | :--- |
+| `src/table.rs` | Core implementation and logic | Primary data structures and algorithms |
 
 ---
 
@@ -348,3 +357,21 @@ before.
 
 ---
 ---
+
+## Contributor Gotchas, Invariants & Debugging Guide
+
+* **Gotcha 1**: RudisValue is shrunk to 40 bytes by boxing collection variants (Hash, Set, ZSet, Stream).
+* **Gotcha 2**: RudisEntry is 88 bytes total (24B key + 40B val + 24B Option<Instant>), doubling cache line density.
+* **Gotcha 3**: Active expiration cycles sample random buckets periodically without locking.
+
+### How to Verify Changes
+```bash
+# 1. Format check
+cargo fmt --check
+
+# 2. Clippy verification with zero warnings
+cargo clippy --all-targets -- -D warnings
+
+# 3. Run unit tests
+cargo test --lib -- --test-threads=1
+```
