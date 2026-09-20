@@ -56,21 +56,55 @@ Fully wire-compatible with **Redis (RESP2 and RESP3)** and **Memcached** text pr
 ## Architecture Overview
 
 ```
-                      Client Connections
-                              │
-               (SO_REUSEPORT Kernel Balancing)
-                 ┌────────────┴────────────┐
-                 ▼                         ▼
-         ┌───────────────┐         ┌───────────────┐
-         │    Core 0     │         │    Core 1     │
-         │ Monoio Runtime│         │ Monoio Runtime│
-         │ (io_uring)    │         │ (io_uring)    │
-         ├───────────────┤         ├───────────────┤
-         │    Shard 0    │         │    Shard 1    │
-         │ Local HashMap │         │ Local HashMap │
-         └───────┬───────┘         └───────┬───────┘
-                 │     Cross-Shard Mesh    │
-                 └────────◄ Channels ►─────┘
+                     Client Requests (RESP2 / RESP3 / Memcached)
+                                          │
+           ┌──────────────────────────────┴──────────────────────────────┐
+           │                Linux Kernel Networking Layer                │
+           │   • SO_REUSEPORT Connection Balancing (Zero Userspace Hop)  │
+           │   • AF_XDP (XSK) Zero-Copy UMEM Rings & eBPF XDP Filtering  │
+           │   • Hardware Kernel TLS Acceleration (kTLS / TCP_ULP)       │
+           └──────────────┬──────────────────────────────┬───────────────┘
+                          │                              │
+         ┌────────────────▼─────────────┐      ┌─────────▼────────────────────┐
+         │       Core 0 (Shard 0)       │      │     Core N-1 (Shard N-1)     │
+         │  ┌────────────────────────┐  │      │  ┌────────────────────────┐  │
+         │  │ Monoio Runtime         │  │      │  │ Monoio Runtime         │  │
+         │  │ (Independent io_uring) │  │      │  │ (Independent io_uring) │  │
+         │  └───────────┬────────────┘  │      │  └───────────┬────────────┘  │
+         │              ▼               │      │              ▼               │
+         │  ┌────────────────────────┐  │      │  ┌────────────────────────┐  │
+         │  │ Connection & Protocol  │  │      │  │ Connection & Protocol  │  │
+         │  │ • Zero-Copy RESP Parser│  │      │  │ • Zero-Copy RESP Parser│  │
+         │  │ • Memcached Gateway    │  │      │  │ • Memcached Gateway    │  │
+         │  └───────────┬────────────┘  │      │  └───────────┬────────────┘  │
+         │              ▼               │      │              ▼               │
+         │  ┌────────────────────────┐  │      │  ┌────────────────────────┐  │
+         │  │ Local Thread Storage   │  │      │  │ Local Thread Storage   │  │
+         │  │ • In-Memory RudisTable │  │      │  │ • In-Memory RudisTable │  │
+         │  │ • RangeTree & Search   │  │      │  │ • RangeTree & Search   │  │
+         │  │ • HNSW (SQ8/PQ Vectors)│  │      │  │ • HNSW (SQ8/PQ Vectors)│  │
+         │  │ • RedisJSON / Streams  │  │      │  │ • RedisJSON / Streams  │  │
+         │  └───────────┬────────────┘  │      │  └───────────┬────────────┘  │
+         │              ▼               │      │              ▼               │
+         │  ┌────────────────────────┐  │      │  ┌────────────────────────┐  │
+         │  │ NVMe Tiering SmallBins │  │      │  │ NVMe Tiering SmallBins │  │
+         │  │ • Direct I/O (O_DIRECT)│  │      │  │ • Direct I/O (O_DIRECT)│  │
+         │  └────────────────────────┘  │      │  └────────────────────────┘  │
+         └──────────────┬───────────────┘      └──────────────┬───────────────┘
+                        │                                     │
+           ┌────────────▼─────────────────────────────────────▼──────────┐
+           │                  Lock-Free Cross-Shard Mesh                 │
+           │   • SPSC Channel Rings with EventFD Cross-Core Wakers       │
+           │   • Striped Shard Presence Bitmask (Redis 7 Sharded Pub/Sub)│
+           │   • Parallel Pipeline Squashing (Batched Multi-Key Dispatch)│
+           └────────────┬─────────────────────────────────────┬──────────┘
+                        │                                     │
+                        ▼                                     ▼
+         ┌──────────────────────────────┐      ┌──────────────────────────────┐
+         │ Per-Shard Parallel TCP Flow  │      │ Fork-less io_uring Snapshots │
+         │ • Dedicated DFLY FLOW Socket │      │ • Streaming Sequential RDB   │
+         │ • Direct Worker Streaming    │      │ • ioctl(FICLONE) Reflink     │
+         └──────────────────────────────┘      └──────────────────────────────┘
 ```
 
 Rudis employs a **Thread-Per-Core (Shared-Nothing)** architecture inspired by modern high-throughput engines like Dragonfly and ScyllaDB/Seastar:
