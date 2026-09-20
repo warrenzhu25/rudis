@@ -286,7 +286,7 @@ impl ClusterHub {
 
         let total_masters = nodes
             .values()
-            .filter(|n| n.flags.contains("master"))
+            .filter(|n| n.master_id == "-" || (!n.flags.contains("slave") && !n.flags.is_empty()))
             .count()
             + if *self.role.read().unwrap() == "master" {
                 1
@@ -473,6 +473,11 @@ impl ClusterHub {
     pub fn cluster_forget(&self, node_id: &str) -> Result<(), String> {
         let mut nodes = self.nodes.write().unwrap();
         nodes.remove(node_id);
+        let mut pfail = self.pfail_reports.write().unwrap();
+        pfail.remove(node_id);
+        for reports in pfail.values_mut() {
+            reports.remove(node_id);
+        }
         Ok(())
     }
 
@@ -909,8 +914,9 @@ impl ClusterHub {
         };
         for (ip, cport) in peers {
             let addr = format!("{}:{}", ip, cport);
-            if let Ok(mut stream) =
-                TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_millis(200))
+            if let Ok(parsed) = addr.parse::<SocketAddr>()
+                && let Ok(mut stream) =
+                    TcpStream::connect_timeout(&parsed, Duration::from_millis(200))
             {
                 let _ = stream.write_all(msg.as_bytes());
             }
@@ -1906,7 +1912,7 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
             .collect();
         let total_masters = nodes
             .values()
-            .filter(|n| n.flags.contains("master"))
+            .filter(|n| n.master_id == "-" || (!n.flags.contains("slave") && !n.flags.is_empty()))
             .count()
             + if *hub.role.read().unwrap() == "master" {
                 1
@@ -2028,7 +2034,7 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
                             .map(|s| s.len())
                             .unwrap_or(0);
                         let total_votes = pfail_count + 1;
-                        if total_votes >= quorum || elapsed > 15000 {
+                        if total_votes >= quorum {
                             node.flags = "fail".to_string();
                             node.link_state = "disconnected".to_string();
                             hub.broadcast_to_peers(&format!("FAIL {}\r\n", node.id));
@@ -2051,7 +2057,7 @@ fn cluster_bus_tick(hub: &Arc<ClusterHub>) {
                     .map(|s| s.len())
                     .unwrap_or(0);
                 let total_votes = pfail_count + 1;
-                if total_votes >= quorum || elapsed > 15000 {
+                if total_votes >= quorum {
                     node.flags = "fail".to_string();
                     node.link_state = "disconnected".to_string();
                     hub.broadcast_to_peers(&format!("FAIL {}\r\n", node.id));
@@ -2157,6 +2163,43 @@ mod tests {
         assert!(
             nodes_output_escalated.contains(&format!("{} 127.0.0.1:7001@17001 fail", node2_id))
         );
+
+        // 3. Node 3 retracts report
+        hub.pfail_reports
+            .write()
+            .unwrap()
+            .get_mut(&node2_id)
+            .unwrap()
+            .remove(&node3_id);
+        {
+            let mut nodes = hub.nodes.write().unwrap();
+            nodes.get_mut(&node2_id).unwrap().flags = "master".to_string();
+        }
+        let nodes_output_retracted = hub.cluster_nodes();
+        assert!(
+            nodes_output_retracted.contains(&format!("{} 127.0.0.1:7001@17001 fail?", node2_id))
+        );
+        assert!(
+            !nodes_output_retracted.contains(&format!("{} 127.0.0.1:7001@17001 fail ", node2_id))
+        );
+
+        // 4. Test cluster_forget cleans up pfail_reports
+        hub.pfail_reports
+            .write()
+            .unwrap()
+            .entry(node2_id.clone())
+            .or_default()
+            .insert(node3_id.clone());
+        assert!(
+            !hub.pfail_reports
+                .read()
+                .unwrap()
+                .get(&node2_id)
+                .unwrap()
+                .is_empty()
+        );
+        hub.cluster_forget(&node2_id).unwrap();
+        assert!(!hub.pfail_reports.read().unwrap().contains_key(&node2_id));
     }
 
     #[test]

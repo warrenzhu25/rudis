@@ -46,7 +46,7 @@ own number as a `##` section in this file.
 | **08** | **Vector Search Engine: HNSW, SQ8, PQ & ADC** | `src/vector.rs` | Real HNSW/SQ8/PQ+ADC with AVX2+FMA SIMD (no NEON path). PQ codebooks are a fixed deterministic basis, not trained on data. Vector indexes are per-shard-local with no cross-shard fan-out. |
 | **09** | **RediSearch Full-Text Engine & RRF** | `src/search.rs` | Real BM25 (k1=1.2, b=0.75) and RRF scoring, a real query DSL. Index registry is process-wide shared state, not thread-local. `KNN`/hybrid search now genuinely works end-to-end — `PARAMS`-supplied query vectors are wired into execution, and auto-indexed documents' vector fields are now actually parsed and stored. |
 | **10** | **Kernel Bypass & Zero-Copy Networking** | `src/xdp.rs`, `src/zerocopy.rs` | No real AF_XDP/eBPF — a userspace-simulated packet pipeline reachable only via `XDP.*` commands, never real NIC ingress. Real `SO_ZEROCOPY`/`MSG_ZEROCOPY` code exists but has zero callers anywhere — dead code. |
-| **11** | **Redis Cluster Topology & Gossip Protocol** | `src/cluster.rs` | Plain-text line gossip protocol (not binary), full-state resend every 500ms, unilateral (non-quorum) failure detection, a real majority-vote replica election. Slot redirection is genuinely wired into the command path via `connection.rs` + `ClusterHub`, now including the pipelined squashed-command path. |
+| **11** | **Redis Cluster Topology & Gossip Protocol** | `src/cluster.rs` | Plain-text line gossip protocol (not binary), full-state resend every 500ms, quorum-based PFAIL→FAIL failure detection with distributed gossip corroboration, a real majority-vote replica election. Slot redirection is genuinely wired into the command path via `connection.rs` + `ClusterHub`, now including the pipelined squashed-command path. |
 | **12** | **CRDT Data Types & Manual Multi-Region Sync** | `src/crdt.rs` | Real LWW-Register/OR-Set/PN-Counter CRDTs with a CAS-based Hybrid Logical Clock. Single-key commands now correctly route through the normal key-slot mechanism, and `CRDT.DUMP`/`MERGE`/`GC` now fan out to every shard — but sync between separate Rudis *instances* is still entirely manual, no automatic network transport. |
 | **13** | **Lua Scripting & Redis 7 Functions Engine** | `src/scripting.rs` | A fresh `mlua::Lua` VM per call (no persistent interpreter or bytecode cache), SHA1-cached script/library *source text*, real `redis.call`/`redis.pcall` via the normal command-execution path. `FCALL`'s AOF-bypass bug is now fixed. |
 | **14** | **Persistence & Replication Engines** | `src/replication.rs`, `src/aof.rs` | AOF rewrite and compaction via `BGREWRITEAOF` is fully implemented across shards with atomic swap and live reopen. Partial `PSYNC` resync (`+CONTINUE`) is fully supported on both master and replica sides with automated reconnect and PSYNC2 failover handover. A real custom RDB binary format with a CRC64 trailer. |
@@ -3813,13 +3813,12 @@ shard-0 worker thread ever starts the cluster-bus listener for that port
    `std::net::TcpStream`/`TcpListener` with short (200-500ms) read/write
    timeouts — completely separate from the rest of Rudis's async, io_uring-based
    networking. Each inbound connection also gets its own `std::thread::spawn`.
-4. **Unilateral failure detection, not quorum-based**: a peer is marked `"fail?"`
-   after 5s of silence and `"fail"` after 10s, decided independently by each node
-   from its own `pong_recv` timestamps. The `pfail_reports: HashMap<String,
-   HashSet<String>>` field that `cluster_nodes()` reads to check "has anyone else
-   reported this node as failing" is **never written to** anywhere in the file
-   except being cleared on `CLUSTER RESET` — there is no real distributed PFAIL→FAIL
-   consensus, despite the data structure existing for it.
+4. **Quorum-based failure detection with distributed gossip corroboration**: a peer is
+   locally marked `"fail?"` (PFAIL) after 5s of missed PONGs. That opinion is piggybacked
+   in gossip payloads to peer nodes, which record it in `pfail_reports: HashMap<String, HashSet<String>>`.
+   Escalation to confirmed `"fail"` requires corroborating PFAIL votes from a strict majority
+   of masters (`total_votes >= quorum`), at which point a `FAIL <node_id>` broadcast is sent to
+   notify all peers. If connectivity recovers, PFAIL opinions are retracted via gossip.
 5. **Replica election *is* a real majority vote**: `start_election` does send
    `FAILOVER_AUTH_REQUEST` to every known master and only promotes itself after
    collecting `>= (total_masters / 2) + 1` `FAILOVER_AUTH_ACK` replies, gated by
@@ -4075,7 +4074,7 @@ path at all; don't conflate the two.
 
 ### 7. Future Improvements
 
-- **High — wire up real PFAIL corroboration instead of unilateral failure marking (§2.4).** `pfail_reports` already exists as a field on `ClusterHub` and is read by `cluster_nodes()`, but nothing ever writes to it — a single node's missed-PONG timer alone flips a peer to `"fail"`. A transient network blip to just one node in the cluster can currently trigger a failover that a real quorum-based PFAIL→FAIL promotion would have prevented. Implementing this is mostly plumbing that's already half-built: when a node locally marks a peer `"fail?"`, gossip that opinion to other nodes (piggybacked on the existing PING gossip payload) and only escalate to `"fail"` once enough peers agree.
+- **RESOLVED — quorum-based PFAIL corroboration and FAIL escalation (§2.4).** `pfail_reports` records peer PFAIL opinions piggybacked via gossip, retracts them upon successful ping, and strictly enforces majority quorum consensus (`total_votes >= quorum`) without unilateral timeout bypass before escalating to `"fail"` and broadcasting `FAIL <node_id>`. Verified by `test_cluster_quorum_pfail_to_fail_escalation` and `test_cluster_quorum_failure_detection_and_gossip_e2e`.
 - **High — unify with Component 04's `slot_owners` (see that doc's §7) rather than maintaining two independent slot-authority systems.** This file's `ClusterHub.my_slots`/`.nodes` is the one actually consulted by the real `-MOVED` redirect path (§4.5); `router.rs`'s `slot_owners` is a parallel, mostly-unread mechanism. Consolidating avoids a future bug where the two disagree.
 - **Medium — replace full-state gossip with incremental/randomized-sample gossip (§6)** if cluster sizes beyond a handful of nodes become a real target — the current O(peers²)-per-tick full node-table resend every 500ms is fine at small scale but won't hold up at real Redis Cluster-scale membership counts.
 - ~~**Medium — extend the slot-state check (§4.5) to the pipelined squashed-command path**~~ **Resolved** — the squash-eligibility gate now also checks whether this node still owns a `Stable` slot per this file's `ClusterHub.my_slots`/`.nodes` gossip table (not just `slot_states`'s `Migrating`/`Importing`/`Moved`), confirmed by a new E2E test (`test_cluster_pipelined_squashed_moved_redirect_e2e`) — see Component 02 §7 and Component 04 §7 for the full correction (the `Migrating`/`Importing`/`Moved` half of this check already existed before; the gossip-ownership half was the genuinely new piece).
