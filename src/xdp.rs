@@ -345,11 +345,15 @@ pub struct XdpEngine {
 
 impl XdpEngine {
     pub fn new(ifname: &str, mode: XdpMode) -> Self {
+        let num_frames = match mode {
+            XdpMode::Simulated => 128,
+            _ => 4096,
+        };
         Self {
             ifname: ifname.to_string(),
             mode,
             frame_size: 2048,
-            num_frames: 4096,
+            num_frames,
             rules: RwLock::new(Vec::new()),
             next_rule_id: AtomicU32::new(1),
             rate_limiters: RwLock::new(HashMap::new()),
