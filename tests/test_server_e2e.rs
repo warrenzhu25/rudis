@@ -11137,3 +11137,51 @@ fn test_client_output_buffer_limit_and_slow_consumer_e2e() {
         b"CONFIG SET client-output-buffer-limit \"normal 0 0 0\"\r\n",
     );
 }
+
+#[test]
+fn test_config_rewrite_and_dynamic_configuration_e2e() {
+    let port = 17055;
+    let temp_dir = std::env::temp_dir().join(format!("rudis-e2e-cfg-{}", port));
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let cfg_path = temp_dir.join("rudis.conf");
+
+    // Pre-create initial config file
+    std::fs::write(&cfg_path, "# Initial config\nmaxclients 1000\n").unwrap();
+    *rudis::config::ACTIVE_CONFIG_FILE.write().unwrap() = Some(cfg_path.clone());
+
+    start_test_server(port, 2);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Dynamic CONFIG SET
+    assert_eq!(
+        send_and_read(&mut client, b"CONFIG SET maxclients 2500\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"CONFIG SET requirepass p@ssw0rd\r\n"),
+        "+OK\r\n"
+    );
+
+    // 2. Dynamic CONFIG GET
+    let mc_resp = send_and_read(&mut client, b"CONFIG GET maxclients\r\n");
+    assert!(mc_resp.contains("2500"));
+
+    let rp_resp = send_and_read(&mut client, b"CONFIG GET requirepass\r\n");
+    assert!(rp_resp.contains("p@ssw0rd"));
+
+    // 3. Trigger CONFIG REWRITE
+    assert_eq!(send_and_read(&mut client, b"CONFIG REWRITE\r\n"), "+OK\r\n");
+
+    // 4. Verify persisted file contents
+    let content = std::fs::read_to_string(&cfg_path).unwrap();
+    assert!(content.contains("maxclients 2500"));
+    assert!(content.contains("requirepass p@ssw0rd"));
+
+    // Clean up requirepass and files
+    assert_eq!(
+        send_and_read(&mut client, b"CONFIG SET requirepass \"\"\r\n"),
+        "+OK\r\n"
+    );
+    let _ = std::fs::remove_file(&cfg_path);
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

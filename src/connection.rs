@@ -141,10 +141,8 @@ pub fn set_client_output_buffer_limit_str(val: &str) -> Result<(), &'static str>
             "pubsub" => ClientClass::Pubsub,
             _ => return Err("-ERR Invalid client class for client-output-buffer-limit\r\n"),
         };
-        let hard =
-            parse_limit_bytes(chunk[1]).ok_or("-ERR Error parsing hard limit\r\n")?;
-        let soft =
-            parse_limit_bytes(chunk[2]).ok_or("-ERR Error parsing soft limit\r\n")?;
+        let hard = parse_limit_bytes(chunk[1]).ok_or("-ERR Error parsing hard limit\r\n")?;
+        let soft = parse_limit_bytes(chunk[2]).ok_or("-ERR Error parsing soft limit\r\n")?;
         let secs = chunk[3]
             .parse::<u64>()
             .map_err(|_| "-ERR Error parsing soft_seconds\r\n")?;
@@ -5025,26 +5023,75 @@ async fn execute_command(
                     val
                 );
                 out.extend_from_slice(resp.as_bytes());
+            } else if p_str == "requirepass" {
+                let acl = crate::acl::get_acl_for_port(router.port);
+                let pass = acl
+                    .read()
+                    .unwrap()
+                    .get_user("default")
+                    .and_then(|u| u.passwords.first().cloned())
+                    .unwrap_or_default();
+                let resp = format!(
+                    "*2\r\n$11\r\nrequirepass\r\n${}\r\n{}\r\n",
+                    pass.len(),
+                    pass
+                );
+                out.extend_from_slice(resp.as_bytes());
+            } else if p_str == "appendonly" {
+                let val = if router.aof.is_some() { "yes" } else { "no" };
+                let resp = format!("*2\r\n$10\r\nappendonly\r\n${}\r\n{}\r\n", val.len(), val);
+                out.extend_from_slice(resp.as_bytes());
             } else if p_str == "*" {
                 let max_mem = crate::tiering::get_max_memory(router.port).to_string();
                 let offload = crate::tiering::get_offload_threshold_pct(router.port).to_string();
                 let upload = crate::tiering::get_upload_threshold_pct(router.port).to_string();
                 let max_c = get_max_clients().to_string();
                 let policy = get_max_memory_policy();
-                let resp = format!(
-                    "*10\r\n$9\r\nmaxmemory\r\n${}\r\n{}\r\n$24\r\ntiered-offload-threshold\r\n${}\r\n{}\r\n$23\r\ntiered-upload-threshold\r\n${}\r\n{}\r\n$10\r\nmaxclients\r\n${}\r\n{}\r\n$16\r\nmaxmemory-policy\r\n${}\r\n{}\r\n",
-                    max_mem.len(),
-                    max_mem,
-                    offload.len(),
-                    offload,
-                    upload.len(),
-                    upload,
-                    max_c.len(),
-                    max_c,
-                    policy.len(),
-                    policy
-                );
-                out.extend_from_slice(resp.as_bytes());
+                let slow_than = crate::slowlog::SLOWLOG_LOG_SLOWER_THAN
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .to_string();
+                let slow_len = crate::slowlog::SLOWLOG_MAX_LEN
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .to_string();
+                let slow_argc = crate::slowlog::SLOWLOG_ENTRY_MAX_ARGC
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .to_string();
+                let slow_str = crate::slowlog::SLOWLOG_ENTRY_MAX_STRING_LEN
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .to_string();
+                let obuf = format_client_output_buffer_limit_config();
+                let acl = crate::acl::get_acl_for_port(router.port);
+                let pass = acl
+                    .read()
+                    .unwrap()
+                    .get_user("default")
+                    .and_then(|u| u.passwords.first().cloned())
+                    .unwrap_or_default();
+                let app = if router.aof.is_some() {
+                    "yes".to_string()
+                } else {
+                    "no".to_string()
+                };
+
+                let pairs = [
+                    ("maxmemory", max_mem),
+                    ("tiered-offload-threshold", offload),
+                    ("tiered-upload-threshold", upload),
+                    ("maxclients", max_c),
+                    ("maxmemory-policy", policy),
+                    ("slowlog-log-slower-than", slow_than),
+                    ("slowlog-max-len", slow_len),
+                    ("slowlog-entry-max-argc", slow_argc),
+                    ("slowlog-entry-max-string-len", slow_str),
+                    ("client-output-buffer-limit", obuf),
+                    ("requirepass", pass),
+                    ("appendonly", app),
+                ];
+                out.extend_from_slice(format!("*{}\r\n", pairs.len() * 2).as_bytes());
+                for (k, v) in pairs {
+                    out.extend_from_slice(format!("${}\r\n{}\r\n", k.len(), k).as_bytes());
+                    out.extend_from_slice(format!("${}\r\n{}\r\n", v.len(), v).as_bytes());
+                }
             } else {
                 out.extend_from_slice(b"*0\r\n");
             }
@@ -5159,6 +5206,23 @@ async fn execute_command(
             } else if p_str == "maxmemory-policy" {
                 set_max_memory_policy(&val_str);
                 out.extend_from_slice(b"+OK\r\n");
+            } else if p_str == "requirepass" {
+                let acl = crate::acl::get_acl_for_port(router.port);
+                let mut acl_guard = acl.write().unwrap();
+                if let Some(user) = acl_guard.get_user_mut("default") {
+                    user.passwords.clear();
+                    if !val_str.is_empty() {
+                        user.passwords.push(val_str.to_string());
+                    }
+                }
+                out.extend_from_slice(b"+OK\r\n");
+            } else if p_str == "appendonly" {
+                out.extend_from_slice(b"+OK\r\n");
+            } else if p_str == "rewrite" {
+                match crate::config::rewrite_config_file(router.port) {
+                    Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                    Err(e) => out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes()),
+                }
             } else {
                 out.extend_from_slice(b"+OK\r\n");
             }

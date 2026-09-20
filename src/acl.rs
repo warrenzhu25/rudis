@@ -224,6 +224,10 @@ impl AclManager {
         self.users.get(username).cloned()
     }
 
+    pub fn get_user_mut(&mut self, username: &str) -> Option<&mut AclUser> {
+        self.users.get_mut(username)
+    }
+
     pub fn set_user(&mut self, username: &str, rules: &[String]) -> Result<(), String> {
         HAS_CUSTOM_ACL.store(true, Ordering::Release);
         let user = self
