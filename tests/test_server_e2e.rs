@@ -11096,3 +11096,44 @@ fn test_slowlog_operational_observability_e2e() {
     assert_eq!(send_and_read(&mut client, b"SLOWLOG RESET\r\n"), "+OK\r\n");
     assert_eq!(send_and_read(&mut client, b"SLOWLOG LEN\r\n"), ":0\r\n");
 }
+
+#[test]
+fn test_client_output_buffer_limit_and_slow_consumer_e2e() {
+    let port = 17050;
+    start_test_server(port, 2);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. Check CONFIG GET client-output-buffer-limit
+    let cfg_resp = send_and_read(&mut client, b"CONFIG GET client-output-buffer-limit\r\n");
+    assert!(cfg_resp.contains("client-output-buffer-limit"));
+    assert!(cfg_resp.contains("normal"));
+    assert!(cfg_resp.contains("slave"));
+    assert!(cfg_resp.contains("pubsub"));
+
+    // 2. Test CONFIG SET validations
+    let err1 = send_and_read(
+        &mut client,
+        b"CONFIG SET client-output-buffer-limit \"invalid 10mb 10mb 60\"\r\n",
+    );
+    assert!(err1.contains("ERR"));
+
+    // 3. Set valid limits
+    let ok_resp = send_and_read(
+        &mut client,
+        b"CONFIG SET client-output-buffer-limit \"normal 100000 0 0\"\r\n",
+    );
+    assert_eq!(ok_resp, "+OK\r\n");
+
+    let cfg_check = send_and_read(&mut client, b"CONFIG GET client-output-buffer-limit\r\n");
+    assert!(cfg_check.contains("normal 100000 0 0"));
+
+    // 4. Test client list reports omem
+    let list_resp = send_and_read(&mut client, b"CLIENT LIST\r\n");
+    assert!(list_resp.contains("omem="));
+
+    // Reset limit
+    let _ = send_and_read(
+        &mut client,
+        b"CONFIG SET client-output-buffer-limit \"normal 0 0 0\"\r\n",
+    );
+}

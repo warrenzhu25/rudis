@@ -5055,12 +5055,35 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     Ok(Some(Command::ConfigGet(args[2].clone())))
                 }
                 "SET" => {
-                    if args.len() != 4 {
+                    if args.len() < 4 {
                         return Err(
                             "wrong number of arguments for 'config set' command".to_string()
                         );
                     }
-                    Ok(Some(Command::ConfigSet(args[2].clone(), args[3].clone())))
+                    let val = if args.len() == 4 {
+                        let mut v = args[3].clone();
+                        if (v.starts_with(b"\"") && v.ends_with(b"\""))
+                            || (v.starts_with(b"'") && v.ends_with(b"'"))
+                        {
+                            v = v.slice(1..v.len() - 1);
+                        }
+                        v
+                    } else {
+                        let mut combined = Vec::new();
+                        for (i, a) in args[3..].iter().enumerate() {
+                            if i > 0 {
+                                combined.push(b' ');
+                            }
+                            combined.extend_from_slice(a);
+                        }
+                        if (combined.starts_with(b"\"") && combined.ends_with(b"\""))
+                            || (combined.starts_with(b"'") && combined.ends_with(b"'"))
+                        {
+                            combined = combined[1..combined.len() - 1].to_vec();
+                        }
+                        Bytes::from(combined)
+                    };
+                    Ok(Some(Command::ConfigSet(args[2].clone(), val)))
                 }
                 "RESETSTAT" => Ok(Some(Command::ConfigSet(
                     Bytes::from_static(b"resetstat"),

@@ -34,6 +34,131 @@ pub struct ClientInfo {
     pub is_resp3: bool,
     pub track_tx: Option<flume::Sender<Vec<u8>>>,
     pub raw_fd: std::os::unix::io::RawFd,
+    pub omem: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BufferLimit {
+    pub hard_limit: u64,
+    pub soft_limit: u64,
+    pub soft_seconds: u64,
+}
+
+impl BufferLimit {
+    pub const fn new(hard: u64, soft: u64, secs: u64) -> Self {
+        Self {
+            hard_limit: hard,
+            soft_limit: soft,
+            soft_seconds: secs,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientClass {
+    Normal,
+    Replica,
+    Pubsub,
+}
+
+pub static NORMAL_BUFFER_LIMIT: std::sync::RwLock<BufferLimit> =
+    std::sync::RwLock::new(BufferLimit::new(0, 0, 0));
+pub static SLAVE_BUFFER_LIMIT: std::sync::RwLock<BufferLimit> =
+    std::sync::RwLock::new(BufferLimit::new(268435456, 67108864, 60));
+pub static PUBSUB_BUFFER_LIMIT: std::sync::RwLock<BufferLimit> =
+    std::sync::RwLock::new(BufferLimit::new(33554432, 8388608, 60));
+
+pub fn get_client_output_buffer_limit(class: ClientClass) -> BufferLimit {
+    match class {
+        ClientClass::Normal => *NORMAL_BUFFER_LIMIT.read().unwrap(),
+        ClientClass::Replica => *SLAVE_BUFFER_LIMIT.read().unwrap(),
+        ClientClass::Pubsub => *PUBSUB_BUFFER_LIMIT.read().unwrap(),
+    }
+}
+
+pub fn format_client_output_buffer_limit_config() -> String {
+    let norm = *NORMAL_BUFFER_LIMIT.read().unwrap();
+    let slv = *SLAVE_BUFFER_LIMIT.read().unwrap();
+    let ps = *PUBSUB_BUFFER_LIMIT.read().unwrap();
+    format!(
+        "normal {} {} {} slave {} {} {} pubsub {} {} {}",
+        norm.hard_limit,
+        norm.soft_limit,
+        norm.soft_seconds,
+        slv.hard_limit,
+        slv.soft_limit,
+        slv.soft_seconds,
+        ps.hard_limit,
+        ps.soft_limit,
+        ps.soft_seconds
+    )
+}
+
+pub fn parse_limit_bytes(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let lower = s.to_lowercase();
+    let (num_str, multiplier) = if lower.ends_with("gb") {
+        (&lower[..lower.len() - 2], 1024 * 1024 * 1024u64)
+    } else if lower.ends_with("g") {
+        (&lower[..lower.len() - 1], 1024 * 1024 * 1024u64)
+    } else if lower.ends_with("mb") {
+        (&lower[..lower.len() - 2], 1024 * 1024u64)
+    } else if lower.ends_with("m") {
+        (&lower[..lower.len() - 1], 1024 * 1024u64)
+    } else if lower.ends_with("kb") {
+        (&lower[..lower.len() - 2], 1024u64)
+    } else if lower.ends_with("k") {
+        (&lower[..lower.len() - 1], 1024u64)
+    } else if lower.ends_with("b") {
+        (&lower[..lower.len() - 1], 1u64)
+    } else {
+        (lower.as_str(), 1u64)
+    };
+
+    if let Ok(n) = num_str.trim().parse::<u64>() {
+        Some(n.saturating_mul(multiplier))
+    } else if num_str.trim().chars().all(|c| c.is_ascii_digit()) {
+        Some(u64::MAX)
+    } else {
+        None
+    }
+}
+
+pub fn set_client_output_buffer_limit_str(val: &str) -> Result<(), &'static str> {
+    let tokens: Vec<&str> = val.split_whitespace().collect();
+    if tokens.is_empty() || !tokens.len().is_multiple_of(4) {
+        return Err("-ERR Wrong number of arguments for client-output-buffer-limit\r\n");
+    }
+
+    let mut updates = Vec::new();
+    for chunk in tokens.chunks(4) {
+        let class = match chunk[0].to_lowercase().as_str() {
+            "normal" => ClientClass::Normal,
+            "slave" | "replica" => ClientClass::Replica,
+            "pubsub" => ClientClass::Pubsub,
+            _ => return Err("-ERR Invalid client class for client-output-buffer-limit\r\n"),
+        };
+        let hard =
+            parse_limit_bytes(chunk[1]).ok_or("-ERR Error parsing hard limit\r\n")?;
+        let soft =
+            parse_limit_bytes(chunk[2]).ok_or("-ERR Error parsing soft limit\r\n")?;
+        let secs = chunk[3]
+            .parse::<u64>()
+            .map_err(|_| "-ERR Error parsing soft_seconds\r\n")?;
+        updates.push((class, BufferLimit::new(hard, soft, secs)));
+    }
+
+    for (class, limit) in updates {
+        match class {
+            ClientClass::Normal => *NORMAL_BUFFER_LIMIT.write().unwrap() = limit,
+            ClientClass::Replica => *SLAVE_BUFFER_LIMIT.write().unwrap() = limit,
+            ClientClass::Pubsub => *PUBSUB_BUFFER_LIMIT.write().unwrap() = limit,
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -747,6 +872,7 @@ pub async fn handle_tls_connection(
             is_resp3: false,
             track_tx: None,
             raw_fd,
+            omem: 0,
         },
     );
 
@@ -872,6 +998,7 @@ pub async fn handle_connection(
             is_resp3: false,
             track_tx: Some(track_tx),
             raw_fd,
+            omem: 0,
         },
     );
 
@@ -935,6 +1062,7 @@ pub async fn handle_connection(
             .unwrap()
             .is_auth_required_for_default();
     let mut auth_user = "default".to_string();
+    let mut soft_limit_start: Option<Instant> = None;
 
     const MIN_READ_SPARE: usize = 16 * 1024;
     loop {
@@ -1478,6 +1606,28 @@ pub async fn handle_connection(
                         out_buf.extend_from_slice(&inval);
                     }
                 }
+                if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                    c.omem = out_buf.len();
+                }
+
+                // Check normal client output buffer limit
+                let norm_limits = get_client_output_buffer_limit(ClientClass::Normal);
+                if norm_limits.hard_limit > 0 && out_buf.len() as u64 >= norm_limits.hard_limit {
+                    break;
+                }
+                if norm_limits.soft_limit > 0 && out_buf.len() as u64 >= norm_limits.soft_limit {
+                    let now = Instant::now();
+                    if let Some(st) = soft_limit_start {
+                        if now.duration_since(st).as_secs() >= norm_limits.soft_seconds {
+                            break;
+                        }
+                    } else {
+                        soft_limit_start = Some(now);
+                    }
+                } else {
+                    soft_limit_start = None;
+                }
+
                 if !out_buf.is_empty() {
                     let len = out_buf.len();
                     let send_ret = unsafe {
@@ -1505,6 +1655,10 @@ pub async fn handle_connection(
                             break;
                         }
                     }
+                }
+
+                if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                    c.omem = out_buf.len();
                 }
 
                 if should_quit {
@@ -1625,10 +1779,40 @@ async fn run_pubsub_loop(
     let (mut reader, mut writer) = stream.into_split();
     let (write_tx, write_rx) = flume::bounded::<Bytes>(4096);
 
+    let reg_writer = client_registry.clone();
     monoio::spawn(async move {
+        let mut queued_bytes = 0usize;
+        let mut soft_start: Option<Instant> = None;
         while let Ok(data) = write_rx.recv_async().await {
+            let data_len = data.len();
+            queued_bytes += data_len;
+            if let Some(c) = reg_writer.borrow_mut().get_mut(&client_id) {
+                c.omem = queued_bytes;
+            }
+
+            let ps_limits = get_client_output_buffer_limit(ClientClass::Pubsub);
+            if ps_limits.hard_limit > 0 && queued_bytes as u64 >= ps_limits.hard_limit {
+                break;
+            }
+            if ps_limits.soft_limit > 0 && queued_bytes as u64 >= ps_limits.soft_limit {
+                let now = Instant::now();
+                if let Some(st) = soft_start {
+                    if now.duration_since(st).as_secs() >= ps_limits.soft_seconds {
+                        break;
+                    }
+                } else {
+                    soft_start = Some(now);
+                }
+            } else {
+                soft_start = None;
+            }
+
             if writer.write_all(data).await.0.is_err() {
                 break;
+            }
+            queued_bytes = queued_bytes.saturating_sub(data_len);
+            if let Some(c) = reg_writer.borrow_mut().get_mut(&client_id) {
+                c.omem = queued_bytes;
             }
         }
     });
@@ -4833,6 +5017,14 @@ async fn execute_command(
                     val
                 );
                 out.extend_from_slice(resp.as_bytes());
+            } else if p_str == "client-output-buffer-limit" {
+                let val = format_client_output_buffer_limit_config();
+                let resp = format!(
+                    "*2\r\n$26\r\nclient-output-buffer-limit\r\n${}\r\n{}\r\n",
+                    val.len(),
+                    val
+                );
+                out.extend_from_slice(resp.as_bytes());
             } else if p_str == "*" {
                 let max_mem = crate::tiering::get_max_memory(router.port).to_string();
                 let offload = crate::tiering::get_offload_threshold_pct(router.port).to_string();
@@ -4947,6 +5139,11 @@ async fn execute_command(
                     }
                 } else {
                     out.extend_from_slice(b"-ERR argument must be between 1 and 2147483647\r\n");
+                }
+            } else if p_str == "client-output-buffer-limit" {
+                match set_client_output_buffer_limit_str(&val_str) {
+                    Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                    Err(err) => out.extend_from_slice(err.as_bytes()),
                 }
             } else if p_str == "resetstat" {
                 router.reset_command_stats().await;
@@ -5336,7 +5533,7 @@ async fn execute_command(
                             .is_blocked(c.id);
                         let flags = if is_blocked { "b" } else { "N" };
                         let info = format!(
-                            "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=20448 argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem=0 omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name= lib-ver= io-thread=0 tot-net-in=0 tot-net-out=0 tot-cmds=0 read-events=0 avg-pipeline-len-sum=0 avg-pipeline-len-cnt=0\n",
+                            "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=20448 argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name= lib-ver= io-thread=0 tot-net-in=0 tot-net-out=0 tot-cmds=0 read-events=0 avg-pipeline-len-sum=0 avg-pipeline-len-cnt=0\n",
                             c.id,
                             c.addr,
                             router.port,
@@ -5344,6 +5541,7 @@ async fn execute_command(
                             age,
                             idle,
                             flags,
+                            c.omem,
                             c.last_cmd.to_lowercase()
                         );
                         out.extend_from_slice(format!("${}\r\n", info.len()).as_bytes());
@@ -14243,5 +14441,38 @@ mod tests {
             "+OK\r\n$2\r\nv1\r\n:1\r\n:5\r\n:1\r\n:0\r\n"
         );
         recycle_conn_scratch(scratch);
+    }
+
+    #[test]
+    fn test_client_output_buffer_limit_parsing_and_config() {
+        assert_eq!(parse_limit_bytes("10mb").unwrap(), 10 * 1024 * 1024);
+        assert_eq!(parse_limit_bytes("2gb").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_limit_bytes("500kb").unwrap(), 500 * 1024);
+        assert_eq!(parse_limit_bytes("1024").unwrap(), 1024);
+
+        // Validation errors
+        assert!(set_client_output_buffer_limit_str("wrong number").is_err());
+        assert!(set_client_output_buffer_limit_str("invalid_class 10mb 10mb 60").is_err());
+        assert!(set_client_output_buffer_limit_str("normal 10mbs 10mb 60").is_err());
+        assert!(set_client_output_buffer_limit_str("replica 10mb 10mbs 60").is_err());
+        assert!(set_client_output_buffer_limit_str("pubsub 10mb 10mb 60s").is_err());
+
+        // Valid multi-class set
+        assert!(
+            set_client_output_buffer_limit_str(
+                "normal 1mb 2mb 60 replica 3mb 4mb 70 pubsub 5mb 6mb 80"
+            )
+            .is_ok()
+        );
+        let cfg = format_client_output_buffer_limit_config();
+        assert_eq!(
+            cfg,
+            "normal 1048576 2097152 60 slave 3145728 4194304 70 pubsub 5242880 6291456 80"
+        );
+
+        // Reset to default
+        let _ = set_client_output_buffer_limit_str(
+            "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60",
+        );
     }
 }
