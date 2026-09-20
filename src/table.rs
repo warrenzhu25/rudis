@@ -2105,9 +2105,21 @@ impl RudisTable {
 
     #[inline(always)]
     pub fn del_with_hash(&mut self, key: &[u8], hash: u64) -> bool {
+        if self.table.items == 0 {
+            return false;
+        }
+        if self.num_expires == 0 {
+            if let Some((idx, _)) = self.table.find_entry(key, hash) {
+                let entry = self.table.remove_present(idx);
+                let freed = entry.key.len() + entry.val.approx_bytes() + 64;
+                self.used_memory = self.used_memory.saturating_sub(freed);
+                self.recycle_value(entry.val);
+                return true;
+            }
+            return false;
+        }
         if let Some((idx, entry)) = self.table.find_entry(key, hash) {
-            if self.num_expires > 0
-                && let Some(expire_at) = entry.expire_at
+            if let Some(expire_at) = entry.expire_at
                 && !crate::connection::ALLOW_ACCESS_EXPIRED
                     .load(std::sync::atomic::Ordering::Relaxed)
                 && Instant::now() >= expire_at
@@ -2116,7 +2128,7 @@ impl RudisTable {
                 return false;
             }
             let entry = self.table.remove_present(idx);
-            if self.num_expires > 0 && entry.expire_at.is_some() {
+            if entry.expire_at.is_some() {
                 self.num_expires = self.num_expires.saturating_sub(1);
             }
             let freed = entry.key.len() + entry.val.approx_bytes() + 64;
