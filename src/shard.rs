@@ -357,7 +357,6 @@ pub enum ShardMessage {
     },
     Batch {
         items: Vec<(usize, u64, Command)>,
-        results: Vec<(usize, CompactResp)>,
         responder: std::sync::Arc<crate::mailbox::BatchResponder>,
         is_resp3: bool,
     },

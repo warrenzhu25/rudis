@@ -2052,36 +2052,29 @@ impl Router {
             .borrow_mut()
             .pop()
             .unwrap_or_else(|| std::sync::Arc::new(crate::mailbox::BatchResponder::new()));
+        let mut slot = crate::shard::CompactResp::empty();
+        responder.prepare(&mut slot as *mut _);
         let h = crate::connection::cmd_primary_key(&cmd)
             .map(|k| crate::table::hash_key(k))
             .unwrap_or(0);
         let msg = ShardMessage::Batch {
             items: vec![(0, h, cmd)],
-            results: Vec::with_capacity(1),
             responder: responder.clone(),
             is_resp3,
         };
         let res = if self.senders[target].send(msg).is_ok() {
-            let mut got = None;
+            let mut completed = false;
             for _spin in 0..48 {
-                if let Some((_recycled_items, mut res)) = responder.try_take() {
-                    got = res.pop().map(|(_, out)| out.into_vec());
+                if responder.try_take().is_some() {
+                    completed = true;
                     break;
                 }
                 std::hint::spin_loop();
             }
-            if got.is_none() {
-                while got.is_none() {
-                    if let Some((_recycled_items, mut res)) = responder.try_take() {
-                        got = res.pop().map(|(_, out)| out.into_vec());
-                        break;
-                    }
-                    if responder.notify_rx.recv_async().await.is_err() {
-                        break;
-                    }
-                }
+            if !completed {
+                let _ = responder.wait_take().await;
             }
-            got.unwrap_or_else(|| b"-ERR internal shard routing error\r\n".to_vec())
+            slot.into_vec()
         } else {
             b"-ERR internal shard routing error\r\n".to_vec()
         };
@@ -3490,16 +3483,16 @@ mod tests {
                     }
                     ShardMessage::Batch {
                         mut items,
-                        mut results,
                         responder,
                         ..
                     } => {
-                        results.clear();
                         for (idx, _h, _cmd) in items.drain(..) {
-                            results
-                                .push((idx, crate::shard::CompactResp::from_slice(b"+PONG\r\n")));
+                            responder.write_slot(
+                                idx,
+                                crate::shard::CompactResp::from_slice(b"+PONG\r\n"),
+                            );
                         }
-                        responder.finish(items, results);
+                        responder.finish(items);
                     }
                     _ => break,
                 }

@@ -1911,6 +1911,27 @@ impl RudisFlatTable {
     }
 
     #[inline(always)]
+    pub fn cursor_bound(&self) -> usize {
+        if self.segments.len() == 1 {
+            self.segments[0].slots.len()
+        } else {
+            self.segments.len() * (SEG_CAP + STASH_CAP)
+        }
+    }
+
+    #[inline(always)]
+    pub fn cursor_to_global_idx(&self, cursor: usize) -> usize {
+        if self.segments.len() == 1 {
+            cursor
+        } else {
+            let stride = SEG_CAP + STASH_CAP;
+            let seg_id = cursor / stride;
+            let local_idx = cursor % stride;
+            (seg_id << GLOBAL_IDX_SHIFT) | local_idx
+        }
+    }
+
+    #[inline(always)]
     pub fn clear(&mut self) {
         let seg = RawSegment::new(64, 0);
         self.segments.clear();
@@ -2155,8 +2176,8 @@ impl RudisTable {
     /// Attempts to evict one key under the specified eviction policy (allkeys-lru, volatile-lru, volatile-ttl, allkeys-random).
     /// Returns the number of bytes freed, or None if no evictable key was found.
     pub fn try_evict_one_key(&mut self, policy: &str) -> Option<usize> {
-        let cap = self.table.capacity();
-        if cap == 0 || self.table.is_empty() {
+        let bound = self.table.cursor_bound();
+        if bound == 0 || self.table.is_empty() {
             return None;
         }
 
@@ -2169,10 +2190,11 @@ impl RudisTable {
         let mut checked = 0;
         let mut attempts = 0;
 
-        while checked < 10 && attempts < cap {
-            let idx = self.sample_cursor % cap;
-            self.sample_cursor = (self.sample_cursor + 1) % cap;
+        while checked < 10 && attempts < bound {
+            let cur = self.sample_cursor % bound;
+            self.sample_cursor = (self.sample_cursor + 1) % bound;
             attempts += 1;
+            let idx = self.table.cursor_to_global_idx(cur);
 
             if let Some(entry) = self.table.get_slot(idx) {
                 // If volatile policy, key must have an expiration
@@ -2198,6 +2220,9 @@ impl RudisTable {
         if let Some(slot_idx) = best_slot
             && let Some(removed) = self.table.remove(slot_idx)
         {
+            if removed.expire_at.is_some() {
+                self.num_expires = self.num_expires.saturating_sub(1);
+            }
             let freed = removed.key.len() + removed.val.approx_bytes() + 64;
             self.used_memory = self.used_memory.saturating_sub(freed);
             inc_evicted_keys();
@@ -2802,13 +2827,14 @@ impl RudisTable {
         pattern: Option<&[u8]>,
         count: usize,
     ) -> (usize, Vec<Bytes>) {
-        let cap = self.table.capacity();
-        if cursor >= cap || cap == 0 {
+        let bound = self.table.cursor_bound();
+        if cursor >= bound || bound == 0 {
             return (0, Vec::new());
         }
         let mut res = Vec::new();
-        let mut idx = cursor;
-        while idx < cap {
+        let mut cur = cursor;
+        while cur < bound {
+            let idx = self.table.cursor_to_global_idx(cur);
             if !self.check_expired_slot(idx)
                 && let Some(entry) = self.table.get_slot(idx)
             {
@@ -2820,24 +2846,25 @@ impl RudisTable {
                     res.push(entry.key.clone());
                 }
             }
-            idx += 1;
+            cur += 1;
             if res.len() >= count {
                 break;
             }
         }
-        let next_cursor = if idx >= cap { 0 } else { idx };
+        let next_cursor = if cur >= bound { 0 } else { cur };
         (next_cursor, res)
     }
 
     pub fn random_key(&mut self) -> Option<Bytes> {
-        let cap = self.table.capacity();
-        if self.table.is_empty() || cap == 0 {
+        let bound = self.table.cursor_bound();
+        if self.table.is_empty() || bound == 0 {
             return None;
         }
-        self.sample_cursor = (self.sample_cursor + 17) & (cap - 1);
+        self.sample_cursor = (self.sample_cursor + 17) % bound;
         let start = self.sample_cursor;
-        for i in 0..cap {
-            let idx = (start + i) & (cap - 1);
+        for i in 0..bound {
+            let cur = (start + i) % bound;
+            let idx = self.table.cursor_to_global_idx(cur);
             if self.check_expired_slot(idx) {
                 continue;
             }
@@ -3024,25 +3051,26 @@ impl RudisTable {
 
     pub fn get_hot_keys_for_spill(&mut self, limit: usize) -> Vec<Bytes> {
         let mut hot = Vec::with_capacity(limit);
-        let total_slots = self.table.capacity();
+        let total_slots = self.table.cursor_bound();
         if total_slots == 0 {
             return hot;
         }
         let start = self.spill_cursor % total_slots;
-        let mut idx = start;
+        let mut cur = start;
         for _ in 0..total_slots {
+            let idx = self.table.cursor_to_global_idx(cur);
             if let Some(entry) = self.table.get_slot(idx)
                 && !matches!(entry.val, RudisValue::Tiered(_) | RudisValue::Cooled { .. })
             {
                 hot.push(entry.key.clone());
                 if hot.len() >= limit {
-                    self.spill_cursor = (idx + 1) % total_slots;
+                    self.spill_cursor = (cur + 1) % total_slots;
                     return hot;
                 }
             }
-            idx = (idx + 1) % total_slots;
+            cur = (cur + 1) % total_slots;
         }
-        self.spill_cursor = idx;
+        self.spill_cursor = cur;
         hot
     }
 
@@ -8090,19 +8118,20 @@ impl RudisTable {
 
     /// Active sampling cycle: samples up to 20 slots starting from cursor and evicts expired keys.
     pub fn active_expire_cycle(&mut self) -> usize {
-        if self.table.is_rehashing() {
-            self.table.rehash_step(16);
+        if self.num_expires == 0 || self.table.is_empty() {
+            return 0;
         }
-        let cap = self.table.capacity();
-        if cap == 0 || self.table.is_empty() {
+        let bound = self.table.cursor_bound();
+        if bound == 0 {
             return 0;
         }
 
         let mut expired_count = 0;
         let mut checked = 0;
         while checked < 20 {
-            let idx = self.sample_cursor % cap;
-            self.sample_cursor = (self.sample_cursor + 1) % cap;
+            let cur = self.sample_cursor % bound;
+            self.sample_cursor = (self.sample_cursor + 1) % bound;
+            let idx = self.table.cursor_to_global_idx(cur);
             if self.check_expired_slot(idx) {
                 expired_count += 1;
             }

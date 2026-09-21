@@ -589,7 +589,6 @@ pub fn run_shard_worker(
                     }
                     ShardMessage::Batch {
                         mut items,
-                        mut results,
                         responder,
                         is_resp3,
                     } => {
@@ -608,7 +607,6 @@ pub fn run_shard_worker(
                             let aof_ref = cross_shard_aof.clone();
                             monoio::spawn(async move {
                                 crate::connection::CURRENT_CLIENT_RESP3.set(is_resp3);
-                                results.clear();
                                 let mut temp_buf = Vec::new();
                                 let mut has_writes = false;
                                 for (idx, key_hash, cmd) in items.drain(..) {
@@ -621,7 +619,7 @@ pub fn run_shard_worker(
                                             .get_compact_with_hash(key.as_ref(), key_hash);
                                         match compact_res {
                                             Ok(Some(resp)) => {
-                                                results.push((idx, resp));
+                                                responder.write_slot(idx, resp);
                                                 continue;
                                             }
                                             Ok(None) => {
@@ -629,12 +627,12 @@ pub fn run_shard_worker(
                                                     && r.local_db.borrow_mut().table.is_tiered(key).is_some();
                                                 if is_tiered {
                                                     if let Some(v) = r.stream_cold_read_local(key).await {
-                                                        results.push((idx, crate::shard::CompactResp::Bulk(v)));
+                                                        responder.write_slot(idx, crate::shard::CompactResp::Bulk(v));
                                                     } else {
-                                                        results.push((idx, crate::shard::CompactResp::NULL));
+                                                        responder.write_slot(idx, crate::shard::CompactResp::NULL);
                                                     }
                                                 } else {
-                                                    results.push((idx, crate::shard::CompactResp::NULL));
+                                                    responder.write_slot(idx, crate::shard::CompactResp::NULL);
                                                 }
                                                 continue;
                                             }
@@ -662,7 +660,7 @@ pub fn run_shard_worker(
                                             crate::connection::notify_key_invalidation(r.port, key.as_ref(), 0);
                                         }
                                         r.local_db.borrow_mut().table.set_with_hash(key, key_hash, value, expire_in);
-                                        results.push((idx, crate::shard::CompactResp::OK));
+                                        responder.write_slot(idx, crate::shard::CompactResp::OK);
                                         continue;
                                     } else if aof_ref.is_none()
                                         && !crate::replication::has_connected_replicas(r.port)
@@ -675,11 +673,11 @@ pub fn run_shard_worker(
                                                     crate::connection::touch_watched_key(r.port, key.as_ref());
                                                 }
                                                 if val == 1 {
-                                                    results.push((idx, crate::shard::CompactResp::INT_1));
+                                                    responder.write_slot(idx, crate::shard::CompactResp::INT_1);
                                                 } else if val == 0 {
-                                                    results.push((idx, crate::shard::CompactResp::INT_0));
+                                                    responder.write_slot(idx, crate::shard::CompactResp::INT_0);
                                                 } else {
-                                                    results.push((idx, crate::shard::CompactResp::from_integer(val)));
+                                                    responder.write_slot(idx, crate::shard::CompactResp::from_integer(val));
                                                 }
                                                 continue;
                                             }
@@ -689,7 +687,7 @@ pub fn run_shard_worker(
                                         }
                                     } else if let Command::Exists(ref keys) = cmd && keys.len() == 1 {
                                         let exists = r.local_db.borrow_mut().table.exists_with_hash(keys[0].as_ref(), key_hash);
-                                        results.push((idx, if exists { crate::shard::CompactResp::INT_1 } else { crate::shard::CompactResp::INT_0 }));
+                                        responder.write_slot(idx, if exists { crate::shard::CompactResp::INT_1 } else { crate::shard::CompactResp::INT_0 });
                                         continue;
                                     } else if aof_ref.is_none()
                                         && !crate::replication::has_connected_replicas(r.port)
@@ -702,15 +700,15 @@ pub fn run_shard_worker(
                                             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                 crate::connection::touch_watched_key(r.port, keys[0].as_ref());
                                             }
-                                            results.push((idx, crate::shard::CompactResp::INT_1));
+                                            responder.write_slot(idx, crate::shard::CompactResp::INT_1);
                                         } else {
-                                            results.push((idx, crate::shard::CompactResp::INT_0));
+                                            responder.write_slot(idx, crate::shard::CompactResp::INT_0);
                                         }
                                         continue;
                                     } else if let Command::Hget { ref key, ref field } = cmd {
                                         match r.local_db.borrow_mut().table.hget_compact_with_hash(key.as_ref(), key_hash, field.as_ref()) {
                                             Ok(resp) => {
-                                                results.push((idx, resp));
+                                                responder.write_slot(idx, resp);
                                                 continue;
                                             }
                                             Err(err) => {
@@ -735,11 +733,11 @@ pub fn run_shard_worker(
                                                     crate::connection::touch_watched_key(r.port, key.as_ref());
                                                 }
                                                 if count == 1 {
-                                                    results.push((idx, crate::shard::CompactResp::INT_1));
+                                                    responder.write_slot(idx, crate::shard::CompactResp::INT_1);
                                                 } else if count == 0 {
-                                                    results.push((idx, crate::shard::CompactResp::INT_0));
+                                                    responder.write_slot(idx, crate::shard::CompactResp::INT_0);
                                                 } else {
-                                                    results.push((idx, crate::shard::CompactResp::from_integer(count as i64)));
+                                                    responder.write_slot(idx, crate::shard::CompactResp::from_integer(count as i64));
                                                 }
                                                 continue;
                                             }
@@ -750,7 +748,7 @@ pub fn run_shard_worker(
                                     } else if let Command::Sismember { ref key, ref member } = cmd {
                                         match r.local_db.borrow_mut().table.sismember_compact_with_hash(key.as_ref(), key_hash, member.as_ref()) {
                                             Ok(resp) => {
-                                                results.push((idx, resp));
+                                                responder.write_slot(idx, resp);
                                                 continue;
                                             }
                                             Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
@@ -771,11 +769,11 @@ pub fn run_shard_worker(
                                                     crate::connection::touch_watched_key(r.port, key.as_ref());
                                                 }
                                                 if count == 1 {
-                                                    results.push((idx, crate::shard::CompactResp::INT_1));
+                                                    responder.write_slot(idx, crate::shard::CompactResp::INT_1);
                                                 } else if count == 0 {
-                                                    results.push((idx, crate::shard::CompactResp::INT_0));
+                                                    responder.write_slot(idx, crate::shard::CompactResp::INT_0);
                                                 } else {
-                                                    results.push((idx, crate::shard::CompactResp::from_integer(count as i64)));
+                                                    responder.write_slot(idx, crate::shard::CompactResp::from_integer(count as i64));
                                                 }
                                                 continue;
                                             }
@@ -795,11 +793,11 @@ pub fn run_shard_worker(
                                                     crate::connection::touch_watched_key(r.port, key.as_ref());
                                                 }
                                                 if len == 1 {
-                                                    results.push((idx, crate::shard::CompactResp::INT_1));
+                                                    responder.write_slot(idx, crate::shard::CompactResp::INT_1);
                                                 } else if len == 0 {
-                                                    results.push((idx, crate::shard::CompactResp::INT_0));
+                                                    responder.write_slot(idx, crate::shard::CompactResp::INT_0);
                                                 } else {
-                                                    results.push((idx, crate::shard::CompactResp::from_integer(len as i64)));
+                                                    responder.write_slot(idx, crate::shard::CompactResp::from_integer(len as i64));
                                                 }
                                                 continue;
                                             }
@@ -818,11 +816,11 @@ pub fn run_shard_worker(
                                                     if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                         crate::connection::touch_watched_key(r.port, key.as_ref());
                                                     }
-                                                    results.push((idx, crate::shard::CompactResp::from_owned_bulk(v)));
+                                                    responder.write_slot(idx, crate::shard::CompactResp::from_owned_bulk(v));
                                                     continue;
                                                 }
                                                 Ok(None) => {
-                                                    results.push((idx, crate::shard::CompactResp::NULL));
+                                                    responder.write_slot(idx, crate::shard::CompactResp::NULL);
                                                     continue;
                                                 }
                                                 Err(err) => {
@@ -855,11 +853,11 @@ pub fn run_shard_worker(
                                                     if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                         crate::connection::touch_watched_key(r.port, key.as_ref());
                                                     }
-                                                    results.push((idx, crate::shard::CompactResp::from_owned_bulk(v)));
+                                                    responder.write_slot(idx, crate::shard::CompactResp::from_owned_bulk(v));
                                                     continue;
                                                 }
                                                 Ok(None) => {
-                                                    results.push((idx, crate::shard::CompactResp::NULL));
+                                                    responder.write_slot(idx, crate::shard::CompactResp::NULL);
                                                     continue;
                                                 }
                                                 Err(err) => {
@@ -884,7 +882,7 @@ pub fn run_shard_worker(
                                     } else if let Command::Lrange { ref key, start, stop } = cmd {
                                         match r.local_db.borrow_mut().table.lrange_compact_with_hash(key.as_ref(), key_hash, start, stop, &mut temp_buf) {
                                             Ok(resp) => {
-                                                results.push((idx, resp));
+                                                responder.write_slot(idx, resp);
                                                 continue;
                                             }
                                             Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
@@ -892,7 +890,7 @@ pub fn run_shard_worker(
                                     } else if let Command::Zrange { ref key, ref opts } = cmd {
                                         match r.local_db.borrow_mut().table.zrange_compact_with_hash(key.as_ref(), key_hash, opts, is_resp3, &mut temp_buf) {
                                             Ok(resp) => {
-                                                results.push((idx, resp));
+                                                responder.write_slot(idx, resp);
                                                 continue;
                                             }
                                             Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
@@ -914,13 +912,13 @@ pub fn run_shard_worker(
                                                     } else {
                                                         crate::connection::write_resp_null(&mut temp_buf);
                                                     }
-                                                    results.push((idx, crate::shard::CompactResp::from_slice(&temp_buf)));
+                                                    responder.write_slot(idx, crate::shard::CompactResp::from_slice(&temp_buf));
                                                 } else if count == 1 {
-                                                    results.push((idx, crate::shard::CompactResp::INT_1));
+                                                    responder.write_slot(idx, crate::shard::CompactResp::INT_1);
                                                 } else if count == 0 {
-                                                    results.push((idx, crate::shard::CompactResp::INT_0));
+                                                    responder.write_slot(idx, crate::shard::CompactResp::INT_0);
                                                 } else {
-                                                    results.push((idx, crate::shard::CompactResp::from_integer(count as i64)));
+                                                    responder.write_slot(idx, crate::shard::CompactResp::from_integer(count as i64));
                                                 }
                                                 continue;
                                             }
@@ -935,17 +933,16 @@ pub fn run_shard_worker(
                                         let mut db = r.local_db.borrow_mut();
                                         let _ = execute_local_command(&cmd, &mut db, &mut temp_buf, aof_ref.as_deref());
                                     }
-                                    results.push((idx, crate::shard::CompactResp::from_slice(&temp_buf)));
+                                    responder.write_slot(idx, crate::shard::CompactResp::from_slice(&temp_buf));
                                 }
                                 if has_writes {
                                     r.check_auto_tier_after_write();
                                 }
-                                responder.finish(items, results);
+                                responder.finish(items);
                             });
                         } else {
                             crate::connection::CURRENT_CLIENT_RESP3.set(is_resp3);
                             let mut db = cross_shard_db.borrow_mut();
-                            results.clear();
                             let aof_ref = cross_shard_aof.as_deref();
                             let mut temp_buf = Vec::new();
                             let mut has_writes = false;
@@ -954,11 +951,11 @@ pub fn run_shard_worker(
                                 if let Command::Get(ref key) = cmd {
                                     match db.table.get_compact_with_hash(key.as_ref(), key_hash) {
                                         Ok(Some(resp)) => {
-                                            results.push((idx, resp));
+                                            responder.write_slot(idx, resp);
                                             continue;
                                         }
                                         Ok(None) => {
-                                            results.push((idx, crate::shard::CompactResp::NULL));
+                                            responder.write_slot(idx, crate::shard::CompactResp::NULL);
                                             continue;
                                         }
                                         Err(err) => {
@@ -985,7 +982,7 @@ pub fn run_shard_worker(
                                         crate::connection::notify_key_invalidation(cross_shard_router.port, key.as_ref(), 0);
                                     }
                                     db.table.set_with_hash(key, key_hash, value, expire_in);
-                                    results.push((idx, crate::shard::CompactResp::OK));
+                                    responder.write_slot(idx, crate::shard::CompactResp::OK);
                                     continue;
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
@@ -998,11 +995,11 @@ pub fn run_shard_worker(
                                                 crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
                                             }
                                             if val == 1 {
-                                                results.push((idx, crate::shard::CompactResp::INT_1));
+                                                responder.write_slot(idx, crate::shard::CompactResp::INT_1);
                                             } else if val == 0 {
-                                                results.push((idx, crate::shard::CompactResp::INT_0));
+                                                responder.write_slot(idx, crate::shard::CompactResp::INT_0);
                                             } else {
-                                                results.push((idx, crate::shard::CompactResp::from_integer(val)));
+                                                responder.write_slot(idx, crate::shard::CompactResp::from_integer(val));
                                             }
                                             continue;
                                         }
@@ -1012,7 +1009,7 @@ pub fn run_shard_worker(
                                     }
                                 } else if let Command::Exists(ref keys) = cmd && keys.len() == 1 {
                                     let exists = db.table.exists_with_hash(keys[0].as_ref(), key_hash);
-                                    results.push((idx, if exists { crate::shard::CompactResp::INT_1 } else { crate::shard::CompactResp::INT_0 }));
+                                    responder.write_slot(idx, if exists { crate::shard::CompactResp::INT_1 } else { crate::shard::CompactResp::INT_0 });
                                     continue;
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
@@ -1025,15 +1022,15 @@ pub fn run_shard_worker(
                                         if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                             crate::connection::touch_watched_key(cross_shard_router.port, keys[0].as_ref());
                                         }
-                                        results.push((idx, crate::shard::CompactResp::INT_1));
+                                        responder.write_slot(idx, crate::shard::CompactResp::INT_1);
                                     } else {
-                                        results.push((idx, crate::shard::CompactResp::INT_0));
+                                        responder.write_slot(idx, crate::shard::CompactResp::INT_0);
                                     }
                                     continue;
                                 } else if let Command::Hget { ref key, ref field } = cmd {
                                     match db.table.hget_compact_with_hash(key.as_ref(), key_hash, field.as_ref()) {
                                         Ok(resp) => {
-                                            results.push((idx, resp));
+                                            responder.write_slot(idx, resp);
                                             continue;
                                         }
                                         Err(err) => {
@@ -1058,11 +1055,11 @@ pub fn run_shard_worker(
                                                 crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
                                             }
                                             if count == 1 {
-                                                results.push((idx, crate::shard::CompactResp::INT_1));
+                                                responder.write_slot(idx, crate::shard::CompactResp::INT_1);
                                             } else if count == 0 {
-                                                results.push((idx, crate::shard::CompactResp::INT_0));
+                                                responder.write_slot(idx, crate::shard::CompactResp::INT_0);
                                             } else {
-                                                results.push((idx, crate::shard::CompactResp::from_integer(count as i64)));
+                                                responder.write_slot(idx, crate::shard::CompactResp::from_integer(count as i64));
                                             }
                                             continue;
                                         }
@@ -1073,7 +1070,7 @@ pub fn run_shard_worker(
                                 } else if let Command::Sismember { ref key, ref member } = cmd {
                                     match db.table.sismember_compact_with_hash(key.as_ref(), key_hash, member.as_ref()) {
                                         Ok(resp) => {
-                                            results.push((idx, resp));
+                                            responder.write_slot(idx, resp);
                                             continue;
                                         }
                                         Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
@@ -1094,11 +1091,11 @@ pub fn run_shard_worker(
                                                 crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
                                             }
                                             if count == 1 {
-                                                results.push((idx, crate::shard::CompactResp::INT_1));
+                                                responder.write_slot(idx, crate::shard::CompactResp::INT_1);
                                             } else if count == 0 {
-                                                results.push((idx, crate::shard::CompactResp::INT_0));
+                                                responder.write_slot(idx, crate::shard::CompactResp::INT_0);
                                             } else {
-                                                results.push((idx, crate::shard::CompactResp::from_integer(count as i64)));
+                                                responder.write_slot(idx, crate::shard::CompactResp::from_integer(count as i64));
                                             }
                                             continue;
                                         }
@@ -1118,11 +1115,11 @@ pub fn run_shard_worker(
                                                 crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
                                             }
                                             if len == 1 {
-                                                results.push((idx, crate::shard::CompactResp::INT_1));
+                                                responder.write_slot(idx, crate::shard::CompactResp::INT_1);
                                             } else if len == 0 {
-                                                results.push((idx, crate::shard::CompactResp::INT_0));
+                                                responder.write_slot(idx, crate::shard::CompactResp::INT_0);
                                             } else {
-                                                results.push((idx, crate::shard::CompactResp::from_integer(len as i64)));
+                                                responder.write_slot(idx, crate::shard::CompactResp::from_integer(len as i64));
                                             }
                                             continue;
                                         }
@@ -1141,11 +1138,11 @@ pub fn run_shard_worker(
                                                 if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                     crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
                                                 }
-                                                results.push((idx, crate::shard::CompactResp::from_owned_bulk(v)));
+                                                responder.write_slot(idx, crate::shard::CompactResp::from_owned_bulk(v));
                                                 continue;
                                             }
                                             Ok(None) => {
-                                                results.push((idx, crate::shard::CompactResp::NULL));
+                                                responder.write_slot(idx, crate::shard::CompactResp::NULL);
                                                 continue;
                                             }
                                             Err(err) => {
@@ -1178,11 +1175,11 @@ pub fn run_shard_worker(
                                                 if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                                     crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
                                                 }
-                                                results.push((idx, crate::shard::CompactResp::from_owned_bulk(v)));
+                                                responder.write_slot(idx, crate::shard::CompactResp::from_owned_bulk(v));
                                                 continue;
                                             }
                                             Ok(None) => {
-                                                results.push((idx, crate::shard::CompactResp::NULL));
+                                                responder.write_slot(idx, crate::shard::CompactResp::NULL);
                                                 continue;
                                             }
                                             Err(err) => {
@@ -1207,7 +1204,7 @@ pub fn run_shard_worker(
                                 } else if let Command::Lrange { ref key, start, stop } = cmd {
                                     match db.table.lrange_compact_with_hash(key.as_ref(), key_hash, start, stop, &mut temp_buf) {
                                         Ok(resp) => {
-                                            results.push((idx, resp));
+                                            responder.write_slot(idx, resp);
                                             continue;
                                         }
                                         Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
@@ -1215,7 +1212,7 @@ pub fn run_shard_worker(
                                 } else if let Command::Zrange { ref key, ref opts } = cmd {
                                     match db.table.zrange_compact_with_hash(key.as_ref(), key_hash, opts, is_resp3, &mut temp_buf) {
                                         Ok(resp) => {
-                                            results.push((idx, resp));
+                                            responder.write_slot(idx, resp);
                                             continue;
                                         }
                                         Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
@@ -1237,13 +1234,13 @@ pub fn run_shard_worker(
                                                 } else {
                                                     crate::connection::write_resp_null(&mut temp_buf);
                                                 }
-                                                results.push((idx, crate::shard::CompactResp::from_slice(&temp_buf)));
+                                                responder.write_slot(idx, crate::shard::CompactResp::from_slice(&temp_buf));
                                             } else if count == 1 {
-                                                results.push((idx, crate::shard::CompactResp::INT_1));
+                                                responder.write_slot(idx, crate::shard::CompactResp::INT_1);
                                             } else if count == 0 {
-                                                results.push((idx, crate::shard::CompactResp::INT_0));
+                                                responder.write_slot(idx, crate::shard::CompactResp::INT_0);
                                             } else {
-                                                results.push((idx, crate::shard::CompactResp::from_integer(count as i64)));
+                                                responder.write_slot(idx, crate::shard::CompactResp::from_integer(count as i64));
                                             }
                                             continue;
                                         }
@@ -1257,13 +1254,13 @@ pub fn run_shard_worker(
                                     }
                                     let _ = execute_local_command(&cmd, &mut db, &mut temp_buf, aof_ref);
                                 }
-                                results.push((idx, crate::shard::CompactResp::from_slice(&temp_buf)));
+                                responder.write_slot(idx, crate::shard::CompactResp::from_slice(&temp_buf));
                             }
                             drop(db);
                             if has_writes {
                                 cross_shard_router.check_auto_tier_after_write();
                             }
-                            responder.finish(items, results);
+                            responder.finish(items);
                         }
                     }
                     ShardMessage::Mget { mut keys, responder } => {

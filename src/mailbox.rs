@@ -324,17 +324,12 @@ impl FastSetDescriptor {
 }
 
 /// Direct shared-memory slot for cross-shard squashed batch responses.
-/// Completely eliminates Flume mutex contention during multi-core spin-waits.
+/// Remote shards write responses directly into the caller's `responses` slice via `responses_ptr`,
+/// and signal completion via the 3-state Parker handshake without Flume mutex contention.
 pub struct BatchResponder {
-    pub ready: CachePadded<AtomicBool>,
-    pub payload: CachePadded<
-        UnsafeCell<
-            Option<(
-                Vec<(usize, u64, crate::resp::Command)>,
-                Vec<(usize, crate::shard::CompactResp)>,
-            )>,
-        >,
-    >,
+    pub state: CachePadded<std::sync::atomic::AtomicU8>,
+    pub responses_ptr: std::sync::atomic::AtomicPtr<crate::shard::CompactResp>,
+    pub recycled_items: CachePadded<UnsafeCell<Option<Vec<(usize, u64, crate::resp::Command)>>>>,
     pub notify_tx: flume::Sender<()>,
     pub notify_rx: flume::Receiver<()>,
 }
@@ -342,44 +337,80 @@ pub struct BatchResponder {
 unsafe impl Send for BatchResponder {}
 unsafe impl Sync for BatchResponder {}
 
+pub const BATCH_IDLE: u8 = 0;
+pub const BATCH_RUNNING: u8 = 1;
+pub const BATCH_SLEEPING: u8 = 2;
+pub const BATCH_COMPLETED: u8 = 3;
+
 impl BatchResponder {
     pub fn new() -> Self {
         let (tx, rx) = flume::bounded(1);
         Self {
-            ready: CachePadded(AtomicBool::new(false)),
-            payload: CachePadded(UnsafeCell::new(None)),
+            state: CachePadded(std::sync::atomic::AtomicU8::new(BATCH_IDLE)),
+            responses_ptr: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+            recycled_items: CachePadded(UnsafeCell::new(None)),
             notify_tx: tx,
             notify_rx: rx,
         }
     }
 
     #[inline(always)]
-    pub fn finish(
-        &self,
-        items: Vec<(usize, u64, crate::resp::Command)>,
-        results: Vec<(usize, crate::shard::CompactResp)>,
-    ) {
-        unsafe {
-            *self.payload.get() = Some((items, results));
-        }
-        self.ready.store(true, Ordering::Release);
-        let _ = self.notify_tx.try_send(());
+    pub fn is_idle(&self) -> bool {
+        self.state.0.load(Ordering::Acquire) == BATCH_IDLE
     }
 
     #[inline(always)]
-    pub fn try_take(
-        &self,
-    ) -> Option<(
-        Vec<(usize, u64, crate::resp::Command)>,
-        Vec<(usize, crate::shard::CompactResp)>,
-    )> {
-        if self.ready.load(Ordering::Acquire) {
-            self.ready.store(false, Ordering::Relaxed);
-            let _ = self.notify_rx.try_recv();
-            unsafe { (*self.payload.get()).take() }
+    pub fn prepare(&self, responses_ptr: *mut crate::shard::CompactResp) {
+        self.responses_ptr.store(responses_ptr, Ordering::Relaxed);
+        self.state.0.store(BATCH_RUNNING, Ordering::Release);
+    }
+
+    #[inline(always)]
+    pub fn write_slot(&self, idx: usize, resp: crate::shard::CompactResp) {
+        unsafe {
+            let ptr = self.responses_ptr.load(Ordering::Relaxed);
+            *ptr.add(idx) = resp;
+        }
+    }
+
+    #[inline(always)]
+    pub fn finish(&self, items: Vec<(usize, u64, crate::resp::Command)>) {
+        unsafe {
+            *self.recycled_items.get() = Some(items);
+        }
+        if self.state.0.swap(BATCH_COMPLETED, Ordering::AcqRel) == BATCH_SLEEPING {
+            let _ = self.notify_tx.try_send(());
+        }
+    }
+
+    #[inline(always)]
+    pub fn try_take(&self) -> Option<Vec<(usize, u64, crate::resp::Command)>> {
+        if self.state.0.load(Ordering::Acquire) == BATCH_COMPLETED {
+            self.state.0.store(BATCH_IDLE, Ordering::Relaxed);
+            unsafe { (*self.recycled_items.get()).take() }
         } else {
             None
         }
+    }
+
+    #[inline(always)]
+    pub async fn wait_take(&self) -> Option<Vec<(usize, u64, crate::resp::Command)>> {
+        if self.state.0.load(Ordering::Acquire) != BATCH_COMPLETED
+            && self
+                .state
+                .0
+                .compare_exchange(
+                    BATCH_RUNNING,
+                    BATCH_SLEEPING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        {
+            let _ = self.notify_rx.recv_async().await;
+        }
+        self.state.0.store(BATCH_IDLE, Ordering::Relaxed);
+        unsafe { (*self.recycled_items.get()).take() }
     }
 }
 

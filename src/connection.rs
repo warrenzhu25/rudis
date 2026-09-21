@@ -1873,9 +1873,10 @@ fn recycle_conn_scratch(mut s: ConnScratch) {
     // leave a stale ready=true that desyncs the new harvest loop. Only pool scratch
     // whose responders are provably unreferenced and idle; otherwise drop it and let
     // the straggling shard release the Arc normally.
-    let reusable = s.responders.iter().all(|r| {
-        std::sync::Arc::strong_count(r) == 1 && !r.ready.load(std::sync::atomic::Ordering::Acquire)
-    });
+    let reusable = s
+        .responders
+        .iter()
+        .all(|r| std::sync::Arc::strong_count(r) == 1 && r.is_idle());
     if !reusable {
         return;
     }
@@ -14069,16 +14070,17 @@ async fn execute_commands_squashed(
     }
 
     // 2. Dispatch batched hops to all remote shards in parallel using pre-allocated channels
+    let _ = results_pool;
+    let resp_base_ptr = responses.as_mut_ptr();
     let mut pending: smallvec::SmallVec<[&std::sync::Arc<crate::mailbox::BatchResponder>; 32]> =
         smallvec::SmallVec::new();
     for (target_shard, items) in remote_batches.iter_mut().enumerate() {
         if !items.is_empty() {
             let responder = &responders[target_shard];
+            responder.prepare(resp_base_ptr);
             let next_items = items_pool.pop().unwrap_or_else(|| Vec::with_capacity(64));
-            let results = results_pool.pop().unwrap_or_else(|| Vec::with_capacity(64));
             let msg = ShardMessage::Batch {
                 items: std::mem::replace(items, next_items),
-                results,
                 responder: responder.clone(),
                 is_resp3,
             };
@@ -14094,12 +14096,8 @@ async fn execute_commands_squashed(
             break;
         }
         pending.retain(|responder| {
-            if let Some((recycled_items, mut results)) = responder.try_take() {
-                for (idx, resp) in results.drain(..) {
-                    responses[idx] = resp;
-                }
+            if let Some(recycled_items) = responder.try_take() {
                 items_pool.push(recycled_items);
-                results_pool.push(results);
                 false
             } else {
                 true
@@ -14111,18 +14109,8 @@ async fn execute_commands_squashed(
         std::hint::spin_loop();
     }
     for responder in pending {
-        loop {
-            if let Some((recycled_items, mut results)) = responder.try_take() {
-                for (idx, resp) in results.drain(..) {
-                    responses[idx] = resp;
-                }
-                items_pool.push(recycled_items);
-                results_pool.push(results);
-                break;
-            }
-            if responder.notify_rx.recv_async().await.is_err() {
-                break;
-            }
+        if let Some(recycled_items) = responder.wait_take().await {
+            items_pool.push(recycled_items);
         }
     }
 
@@ -14634,9 +14622,10 @@ mod tests {
 
         // 3. Scratch carrying an unharvested ready=true payload must also be rejected.
         let stale = take_conn_scratch(4);
-        stale.responders[1]
-            .ready
-            .store(true, std::sync::atomic::Ordering::Release);
+        stale.responders[1].state.0.store(
+            crate::mailbox::BATCH_COMPLETED,
+            std::sync::atomic::Ordering::Release,
+        );
         recycle_conn_scratch(stale);
         CONN_SCRATCH_POOL.with(|p| {
             assert!(
