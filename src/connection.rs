@@ -2667,6 +2667,10 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::MemcachedIncr { key, .. }
         | Command::MemcachedDecr { key, .. } => Some(key),
         Command::MemcachedGet { keys } => keys.first(),
+        Command::Object(crate::resp::ObjectSubcommand::Encoding(key))
+        | Command::Object(crate::resp::ObjectSubcommand::Freq(key))
+        | Command::Object(crate::resp::ObjectSubcommand::Idletime(key))
+        | Command::Object(crate::resp::ObjectSubcommand::Refcount(key)) => Some(key),
         _ => None,
     }
 }
@@ -2938,6 +2942,10 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
         }
 
         Command::Hmget { key, .. } | Command::Hdel { key, .. } => f(key.as_ref()),
+        Command::Object(crate::resp::ObjectSubcommand::Encoding(k))
+        | Command::Object(crate::resp::ObjectSubcommand::Freq(k))
+        | Command::Object(crate::resp::ObjectSubcommand::Idletime(k))
+        | Command::Object(crate::resp::ObjectSubcommand::Refcount(k)) => f(k.as_ref()),
         Command::Eval { keys, .. } | Command::Evalsha { keys, .. } => {
             for k in keys {
                 f(k.as_ref());
@@ -3778,6 +3786,11 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::MemcachedQuit => "MEMCACHED_QUIT",
         Command::Memory(_) => "MEMORY",
         Command::Debug(_) => "DEBUG",
+        Command::Readonly => "READONLY",
+        Command::Readwrite => "READWRITE",
+        Command::Wait { .. } => "WAIT",
+        Command::WaitAof { .. } => "WAITAOF",
+        Command::Object(_) => "OBJECT",
         Command::Unknown(_) => "UNKNOWN",
     }
 }
@@ -5178,6 +5191,14 @@ async fn execute_command(
                 let val = if router.aof.is_some() { "yes" } else { "no" };
                 let resp = format!("*2\r\n$10\r\nappendonly\r\n${}\r\n{}\r\n", val.len(), val);
                 out.extend_from_slice(resp.as_bytes());
+            } else if p_str == "proto-max-bulk-len" {
+                let val = crate::resp::get_proto_max_bulk_len().to_string();
+                let resp = format!(
+                    "*2\r\n$18\r\nproto-max-bulk-len\r\n${}\r\n{}\r\n",
+                    val.len(),
+                    val
+                );
+                out.extend_from_slice(resp.as_bytes());
             } else if p_str == "*" {
                 let max_mem = crate::tiering::get_max_memory(router.port).to_string();
                 let offload = crate::tiering::get_offload_threshold_pct(router.port).to_string();
@@ -5209,6 +5230,7 @@ async fn execute_command(
                 } else {
                     "no".to_string()
                 };
+                let proto_bulk = crate::resp::get_proto_max_bulk_len().to_string();
 
                 let pairs = [
                     ("maxmemory", max_mem),
@@ -5223,6 +5245,7 @@ async fn execute_command(
                     ("client-output-buffer-limit", obuf),
                     ("requirepass", pass),
                     ("appendonly", app),
+                    ("proto-max-bulk-len", proto_bulk),
                 ];
                 out.extend_from_slice(format!("*{}\r\n", pairs.len() * 2).as_bytes());
                 for (k, v) in pairs {
@@ -5237,7 +5260,16 @@ async fn execute_command(
         Command::ConfigSet(param, val) => {
             let p_str = String::from_utf8_lossy(&param).to_lowercase();
             let val_str = String::from_utf8_lossy(&val);
-            if p_str == "maxmemory" {
+            if p_str == "proto-max-bulk-len" {
+                if let Ok(n) = val_str.parse::<usize>() {
+                    crate::resp::set_proto_max_bulk_len(n);
+                    out.extend_from_slice(b"+OK\r\n");
+                } else {
+                    out.extend_from_slice(
+                        b"-ERR Invalid argument for CONFIG SET proto-max-bulk-len\r\n",
+                    );
+                }
+            } else if p_str == "maxmemory" {
                 if let Some(bytes) = crate::tiering::parse_memory_bytes(&val_str) {
                     crate::tiering::set_max_memory(router.port, bytes);
                     out.extend_from_slice(b"+OK\r\n");
@@ -5975,7 +6007,11 @@ async fn execute_command(
         | Command::CrdtIncrby { .. }
         | Command::CrdtSadd { .. }
         | Command::CrdtSmembers(_)
-        | Command::CrdtSrem { .. } => {
+        | Command::CrdtSrem { .. }
+        | Command::Object(crate::resp::ObjectSubcommand::Encoding(_))
+        | Command::Object(crate::resp::ObjectSubcommand::Freq(_))
+        | Command::Object(crate::resp::ObjectSubcommand::Idletime(_))
+        | Command::Object(crate::resp::ObjectSubcommand::Refcount(_)) => {
             if let Some(target) = target_shard_of_cmd(&cmd, router.num_shards) {
                 if target == router.shard_id {
                     execute_local_command(
@@ -8889,6 +8925,41 @@ async fn execute_command(
             out.extend_from_slice(b"+OK\r\n");
             true
         }
+        Command::Readonly | Command::Readwrite => {
+            out.extend_from_slice(b"+OK\r\n");
+            false
+        }
+        Command::Wait {
+            numreplicas,
+            timeout,
+        } => {
+            let count = crate::replication::wait_replicas(router.port, numreplicas, timeout).await;
+            write_resp_integer(out, count as i64);
+            false
+        }
+        Command::WaitAof {
+            numlocal: _,
+            numreplicas,
+            timeout,
+        } => {
+            let count = crate::replication::wait_replicas(router.port, numreplicas, timeout).await;
+            out.extend_from_slice(format!("*2\r\n:1\r\n:{}\r\n", count).as_bytes());
+            false
+        }
+        Command::Object(crate::resp::ObjectSubcommand::Help) => {
+            let help_items = [
+                "ENCODING <key> -- Return the kind of internal representation used in the object stored at <key>.",
+                "FREQ <key> -- Return the logarithmic access frequency counter of the object stored at <key>.",
+                "IDLETIME <key> -- Return the idle time of the object stored at <key>, in seconds.",
+                "REFCOUNT <key> -- Return the number of references of the value at <key>.",
+                "HELP -- Print this help.",
+            ];
+            write_resp_array_header(out, help_items.len());
+            for item in help_items {
+                write_resp_bulk(out, item.as_bytes());
+            }
+            false
+        }
         Command::Quit => {
             out.extend_from_slice(b"+OK\r\n");
             true
@@ -9136,7 +9207,13 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::CrdtIncrby { key, .. }
         | Command::CrdtSadd { key, .. }
         | Command::CrdtSmembers(key)
-        | Command::CrdtSrem { key, .. } => Some(target_shard(key, num_shards)),
+        | Command::CrdtSrem { key, .. }
+        | Command::Object(crate::resp::ObjectSubcommand::Encoding(key))
+        | Command::Object(crate::resp::ObjectSubcommand::Freq(key))
+        | Command::Object(crate::resp::ObjectSubcommand::Idletime(key))
+        | Command::Object(crate::resp::ObjectSubcommand::Refcount(key)) => {
+            Some(target_shard(key, num_shards))
+        }
         Command::Smove {
             source,
             destination,
@@ -10849,6 +10926,56 @@ pub fn execute_local_command(
         Command::Type(key) => {
             let t = db.type_of(key);
             out.extend_from_slice(format!("+{}\r\n", t).as_bytes());
+            false
+        }
+        Command::Object(sub) => {
+            match sub {
+                crate::resp::ObjectSubcommand::Encoding(key) => {
+                    if let Some(enc) = db.object_encoding(key) {
+                        write_resp_bulk(out, enc.as_bytes());
+                    } else {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+                crate::resp::ObjectSubcommand::Freq(key) => {
+                    if db.exists(key) {
+                        out.extend_from_slice(b":0\r\n");
+                    } else {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+                crate::resp::ObjectSubcommand::Idletime(key) => {
+                    if db.exists(key) {
+                        out.extend_from_slice(b":0\r\n");
+                    } else {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+                crate::resp::ObjectSubcommand::Refcount(key) => {
+                    if db.exists(key) {
+                        out.extend_from_slice(b":1\r\n");
+                    } else {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+                crate::resp::ObjectSubcommand::Help => {
+                    let help_items = [
+                        "ENCODING <key> -- Return the kind of internal representation used in the object stored at <key>.",
+                        "FREQ <key> -- Return the logarithmic access frequency counter of the object stored at <key>.",
+                        "IDLETIME <key> -- Return the idle time of the object stored at <key>, in seconds.",
+                        "REFCOUNT <key> -- Return the number of references of the value at <key>.",
+                        "HELP -- Print this help.",
+                    ];
+                    write_resp_array_header(out, help_items.len());
+                    for item in help_items {
+                        write_resp_bulk(out, item.as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::Readonly | Command::Readwrite => {
+            out.extend_from_slice(b"+OK\r\n");
             false
         }
         Command::Dbsize => {
@@ -13364,6 +13491,8 @@ fn is_special_pipeline_cmd(cmd: &Command) -> bool {
             | Command::MemcachedStats
             | Command::MemcachedVersion
             | Command::MemcachedQuit
+            | Command::Wait { .. }
+            | Command::WaitAof { .. }
     )
 }
 
@@ -13474,6 +13603,8 @@ async fn execute_commands_squashed(
                                 | Command::Quit
                                 | Command::Time
                                 | Command::Echo(_)
+                                | Command::Readonly
+                                | Command::Readwrite
                         )
                     {
                         can_squash = false;
@@ -14777,5 +14908,111 @@ mod tests {
             check_mask &= check_mask - 1;
         }
         assert_eq!(pending_mask, 0b100); // only shard 2 remaining
+    }
+
+    #[monoio::test]
+    async fn test_readonly_readwrite_object_and_config() {
+        let mut db = crate::shard::ShardDb::new(6398);
+        db.set(
+            bytes::Bytes::from("strkey"),
+            bytes::Bytes::from("hello"),
+            None,
+        );
+        let _ = db.hset(
+            bytes::Bytes::from("hashkey"),
+            vec![(bytes::Bytes::from("f"), bytes::Bytes::from("v"))],
+        );
+
+        let mut out = Vec::new();
+
+        // READONLY & READWRITE
+        execute_local_command(&Command::Readonly, &mut db, &mut out, None);
+        assert_eq!(&out[..], b"+OK\r\n");
+        out.clear();
+
+        execute_local_command(&Command::Readwrite, &mut db, &mut out, None);
+        assert_eq!(&out[..], b"+OK\r\n");
+        out.clear();
+
+        // OBJECT ENCODING
+        execute_local_command(
+            &Command::Object(crate::resp::ObjectSubcommand::Encoding(bytes::Bytes::from(
+                "strkey",
+            ))),
+            &mut db,
+            &mut out,
+            None,
+        );
+        assert_eq!(&out[..], b"$3\r\nraw\r\n");
+        out.clear();
+
+        execute_local_command(
+            &Command::Object(crate::resp::ObjectSubcommand::Encoding(bytes::Bytes::from(
+                "hashkey",
+            ))),
+            &mut db,
+            &mut out,
+            None,
+        );
+        assert!(
+            std::str::from_utf8(&out).unwrap().contains("listpack")
+                || std::str::from_utf8(&out).unwrap().contains("hashtable")
+        );
+        out.clear();
+
+        execute_local_command(
+            &Command::Object(crate::resp::ObjectSubcommand::Encoding(bytes::Bytes::from(
+                "missing",
+            ))),
+            &mut db,
+            &mut out,
+            None,
+        );
+        assert_eq!(&out[..], b"$-1\r\n");
+        out.clear();
+
+        // OBJECT IDLETIME / REFCOUNT / FREQ
+        execute_local_command(
+            &Command::Object(crate::resp::ObjectSubcommand::Idletime(bytes::Bytes::from(
+                "strkey",
+            ))),
+            &mut db,
+            &mut out,
+            None,
+        );
+        assert_eq!(&out[..], b":0\r\n");
+        out.clear();
+
+        execute_local_command(
+            &Command::Object(crate::resp::ObjectSubcommand::Refcount(bytes::Bytes::from(
+                "strkey",
+            ))),
+            &mut db,
+            &mut out,
+            None,
+        );
+        assert_eq!(&out[..], b":1\r\n");
+        out.clear();
+
+        execute_local_command(
+            &Command::Object(crate::resp::ObjectSubcommand::Freq(bytes::Bytes::from(
+                "strkey",
+            ))),
+            &mut db,
+            &mut out,
+            None,
+        );
+        assert_eq!(&out[..], b":0\r\n");
+        out.clear();
+
+        // OBJECT HELP
+        execute_local_command(
+            &Command::Object(crate::resp::ObjectSubcommand::Help),
+            &mut db,
+            &mut out,
+            None,
+        );
+        assert!(std::str::from_utf8(&out).unwrap().contains("ENCODING"));
+        out.clear();
     }
 }

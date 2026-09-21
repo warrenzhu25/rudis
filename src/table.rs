@@ -1139,6 +1139,31 @@ impl RudisValue {
             RudisValue::Cooled { val, .. } => 24 + val.approx_bytes(),
         }
     }
+
+    pub fn encoding_str(&self) -> &'static str {
+        match self {
+            RudisValue::String(_) => "raw",
+            RudisValue::Int(_) => "int",
+            RudisValue::SmallHash(_) => "listpack",
+            RudisValue::Hash(_) => "hashtable",
+            RudisValue::List(_) => "quicklist",
+            RudisValue::Set(_) => "hashtable",
+            RudisValue::ZSet(_) => "skiplist",
+            RudisValue::HyperLogLog(_) => "raw",
+            RudisValue::Stream(_) => "stream",
+            RudisValue::Tiered(ptr) => match ptr.value_type {
+                0 => "raw",
+                1 => "quicklist",
+                2 => "hashtable",
+                3 => "skiplist",
+                4 => "hashtable",
+                5 => "raw",
+                6 => "stream",
+                _ => "raw",
+            },
+            RudisValue::Cooled { val, .. } => val.encoding_str(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

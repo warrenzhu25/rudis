@@ -10982,6 +10982,9 @@ fn test_per_shard_parallel_replication_stream_e2e() {
         );
         flows.push(stream);
     }
+    for f in &flows {
+        f.set_read_timeout(Some(Duration::from_millis(1000))).unwrap();
+    }
 
     // 3. Find keys that map to shard 0 and shard 1
     let mut key_shard0 = String::new();
@@ -11007,8 +11010,19 @@ fn test_per_shard_parallel_replication_stream_e2e() {
 
     // Flow 0 receives the streamed mutation
     let mut buf = [0u8; 512];
-    let n0 = flows[0].read(&mut buf).unwrap();
-    let received0 = String::from_utf8_lossy(&buf[..n0]);
+    let deadline0 = std::time::Instant::now() + Duration::from_millis(2000);
+    let mut received0 = String::new();
+    while std::time::Instant::now() < deadline0 {
+        if let Ok(n0) = flows[0].read(&mut buf) {
+            if n0 > 0 {
+                received0.push_str(&String::from_utf8_lossy(&buf[..n0]));
+                if received0.contains("SET") && received0.contains(&key_shard0) {
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert!(received0.contains("SET") && received0.contains(&key_shard0));
 
     // 5. Write key_shard1
@@ -11016,8 +11030,19 @@ fn test_per_shard_parallel_replication_stream_e2e() {
     assert_eq!(send_and_read(&mut client, &set_cmd1), "+OK\r\n");
 
     // Flow 1 receives the streamed mutation
-    let n1 = flows[1].read(&mut buf).unwrap();
-    let received1 = String::from_utf8_lossy(&buf[..n1]);
+    let deadline1 = std::time::Instant::now() + Duration::from_millis(2000);
+    let mut received1 = String::new();
+    while std::time::Instant::now() < deadline1 {
+        if let Ok(n1) = flows[1].read(&mut buf) {
+            if n1 > 0 {
+                received1.push_str(&String::from_utf8_lossy(&buf[..n1]));
+                if received1.contains("SET") && received1.contains(&key_shard1) {
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     assert!(received1.contains("SET") && received1.contains(&key_shard1));
 
     // 6. Flow sends ACK
@@ -11365,4 +11390,76 @@ fn test_squashed_batch_set_watch_and_tracking_invalidation_e2e() {
     }
     assert!(next_resp.contains("invalidate"));
     assert!(next_resp.contains("track_squash_k"));
+}
+
+#[test]
+fn test_e2e_unlink_readonly_wait_object_and_proto_max() {
+    let port = 17060;
+    start_test_server(port, 2);
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    // 1. UNLINK
+    assert_eq!(
+        send_and_read(&mut stream, b"SET unlink_k hello\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"UNLINK unlink_k nonexistent\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(send_and_read(&mut stream, b"EXISTS unlink_k\r\n"), ":0\r\n");
+
+    // 2. READONLY and READWRITE
+    assert_eq!(send_and_read(&mut stream, b"READONLY\r\n"), "+OK\r\n");
+    assert_eq!(send_and_read(&mut stream, b"READWRITE\r\n"), "+OK\r\n");
+
+    // 3. WAIT and WAITAOF
+    assert_eq!(send_and_read(&mut stream, b"WAIT 1 50\r\n"), ":0\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"WAITAOF 1 1 50\r\n"),
+        "*2\r\n:1\r\n:0\r\n"
+    );
+
+    // 4. OBJECT ENCODING, IDLETIME, REFCOUNT, FREQ, HELP
+    assert_eq!(
+        send_and_read(&mut stream, b"SET obj_k world\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"OBJECT ENCODING obj_k\r\n"),
+        "$3\r\nraw\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"OBJECT ENCODING nonexistent\r\n"),
+        "$-1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"OBJECT IDLETIME obj_k\r\n"),
+        ":0\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"OBJECT REFCOUNT obj_k\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"OBJECT FREQ obj_k\r\n"),
+        ":0\r\n"
+    );
+    let help_resp = send_and_read(&mut stream, b"OBJECT HELP\r\n");
+    assert!(help_resp.contains("ENCODING"));
+
+    // 5. CONFIG GET / SET proto-max-bulk-len
+    let cfg_get = send_and_read(&mut stream, b"CONFIG GET proto-max-bulk-len\r\n");
+    assert!(cfg_get.contains("proto-max-bulk-len"));
+    assert_eq!(
+        send_and_read(&mut stream, b"CONFIG SET proto-max-bulk-len 1048576\r\n"),
+        "+OK\r\n"
+    );
+    let cfg_get2 = send_and_read(&mut stream, b"CONFIG GET proto-max-bulk-len\r\n");
+    assert!(cfg_get2.contains("1048576"));
+    // Reset to default 512MB
+    assert_eq!(
+        send_and_read(&mut stream, b"CONFIG SET proto-max-bulk-len 536870912\r\n"),
+        "+OK\r\n"
+    );
 }

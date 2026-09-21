@@ -170,7 +170,17 @@ pub enum AclSubcommand {
 }
 
 #[derive(Debug, PartialEq, Clone)]
+pub enum ObjectSubcommand {
+    Encoding(Bytes),
+    Freq(Bytes),
+    Idletime(Bytes),
+    Refcount(Bytes),
+    Help,
+}
+
+#[derive(Debug, PartialEq, Clone)]
 pub enum Command {
+    Object(ObjectSubcommand),
     Auth {
         username: Option<String>,
         password: String,
@@ -216,6 +226,17 @@ pub enum Command {
     Cluster(ClusterSubcommand),
     Client(ClientSubcommand),
     Asking,
+    Readonly,
+    Readwrite,
+    Wait {
+        numreplicas: usize,
+        timeout: u64,
+    },
+    WaitAof {
+        numlocal: usize,
+        numreplicas: usize,
+        timeout: u64,
+    },
     Migrate {
         host: String,
         port: u16,
@@ -1383,6 +1404,18 @@ pub fn bytes_to_uppercase_ascii<'a>(
     }
 }
 
+pub static PROTO_MAX_BULK_LEN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(512 * 1024 * 1024);
+
+#[inline(always)]
+pub fn get_proto_max_bulk_len() -> usize {
+    PROTO_MAX_BULK_LEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_proto_max_bulk_len(val: usize) {
+    PROTO_MAX_BULK_LEN.store(val, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
     let newline_pos = match find_crlf(buf) {
         Some(pos) => pos,
@@ -1419,6 +1452,10 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
             Some(len) => len,
             None => return Err("Invalid bulk string length".to_string()),
         };
+
+        if arg_len > get_proto_max_bulk_len() {
+            return Err("Protocol error: excessive bulk string length".to_string());
+        }
 
         let data_start = next_crlf + 2;
         let data_end = data_start + arg_len;
@@ -1623,14 +1660,37 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
                             },
                         }));
                     }
+                    if cmd_bytes.eq_ignore_ascii_case(b"UNLINK") && num_args >= 2 {
+                        let (k_start, k_len) = offsets[1];
+                        if num_args == 2 {
+                            return Ok(Some(Command::Del(smallvec![
+                                frame.slice(k_start..k_start + k_len),
+                            ])));
+                        }
+                        let mut keys = SmallVec::with_capacity(num_args - 1);
+                        for &(k_s, k_l) in offsets[1..num_args].iter() {
+                            keys.push(frame.slice(k_s..k_s + k_l));
+                        }
+                        return Ok(Some(Command::Del(keys)));
+                    }
                 }
-                9 if cmd_bytes.eq_ignore_ascii_case(b"SISMEMBER") && num_args == 3 => {
-                    let (k_start, k_len) = offsets[1];
-                    let (m_start, m_len) = offsets[2];
-                    return Ok(Some(Command::Sismember {
-                        key: frame.slice(k_start..k_start + k_len),
-                        member: frame.slice(m_start..m_start + m_len),
-                    }));
+                8 => {
+                    if cmd_bytes.eq_ignore_ascii_case(b"READONLY") && num_args == 1 {
+                        return Ok(Some(Command::Readonly));
+                    }
+                }
+                9 => {
+                    if cmd_bytes.eq_ignore_ascii_case(b"READWRITE") && num_args == 1 {
+                        return Ok(Some(Command::Readwrite));
+                    }
+                    if cmd_bytes.eq_ignore_ascii_case(b"SISMEMBER") && num_args == 3 {
+                        let (k_start, k_len) = offsets[1];
+                        let (m_start, m_len) = offsets[2];
+                        return Ok(Some(Command::Sismember {
+                            key: frame.slice(k_start..k_start + k_len),
+                            member: frame.slice(m_start..m_start + m_len),
+                        }));
+                    }
                 }
                 _ => {}
             }
@@ -2238,7 +2298,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 with_match_len,
             }))
         }
-        "DEL" | "DELETE" => {
+        "DEL" | "DELETE" | "UNLINK" => {
             if args.len() < 2 {
                 return Err("wrong number of arguments for 'del' command".to_string());
             }
@@ -2251,6 +2311,97 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             } else {
                 args.remove(0);
                 Ok(Some(Command::Del(SmallVec::from_vec(args))))
+            }
+        }
+        "READONLY" => Ok(Some(Command::Readonly)),
+        "READWRITE" => Ok(Some(Command::Readwrite)),
+        "WAIT" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'wait' command".to_string());
+            }
+            let numreplicas: usize = std::str::from_utf8(&args[1])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            let timeout: u64 = std::str::from_utf8(&args[2])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            Ok(Some(Command::Wait {
+                numreplicas,
+                timeout,
+            }))
+        }
+        "WAITAOF" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'waitaof' command".to_string());
+            }
+            let numlocal: usize = std::str::from_utf8(&args[1])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            let numreplicas: usize = std::str::from_utf8(&args[2])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            let timeout: u64 = std::str::from_utf8(&args[3])
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            Ok(Some(Command::WaitAof {
+                numlocal,
+                numreplicas,
+                timeout,
+            }))
+        }
+        "OBJECT" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'object' command".to_string());
+            }
+            let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
+            match sub.as_str() {
+                "ENCODING" => {
+                    if args.len() < 3 {
+                        return Err(
+                            "wrong number of arguments for 'object encoding' command".to_string()
+                        );
+                    }
+                    Ok(Some(Command::Object(ObjectSubcommand::Encoding(
+                        args[2].clone(),
+                    ))))
+                }
+                "FREQ" => {
+                    if args.len() < 3 {
+                        return Err(
+                            "wrong number of arguments for 'object freq' command".to_string()
+                        );
+                    }
+                    Ok(Some(Command::Object(ObjectSubcommand::Freq(
+                        args[2].clone(),
+                    ))))
+                }
+                "IDLETIME" => {
+                    if args.len() < 3 {
+                        return Err(
+                            "wrong number of arguments for 'object idletime' command".to_string()
+                        );
+                    }
+                    Ok(Some(Command::Object(ObjectSubcommand::Idletime(
+                        args[2].clone(),
+                    ))))
+                }
+                "REFCOUNT" => {
+                    if args.len() < 3 {
+                        return Err(
+                            "wrong number of arguments for 'object refcount' command".to_string()
+                        );
+                    }
+                    Ok(Some(Command::Object(ObjectSubcommand::Refcount(
+                        args[2].clone(),
+                    ))))
+                }
+                "HELP" => Ok(Some(Command::Object(ObjectSubcommand::Help))),
+                _ => Ok(Some(Command::Unknown(format!("OBJECT {}", sub)))),
             }
         }
         "EXISTS" => {
@@ -4703,7 +4854,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::Replconf(args[1..].to_vec())))
         }
         "ROLE" => Ok(Some(Command::Role)),
-        "EVAL" => {
+        "EVAL" | "EVAL_RO" => {
             if args.len() < 3 {
                 return Err("wrong number of arguments for 'eval' command".to_string());
             }
@@ -4726,7 +4877,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 args: script_args,
             }))
         }
-        "EVALSHA" => {
+        "EVALSHA" | "EVALSHA_RO" => {
             if args.len() < 3 {
                 return Err("wrong number of arguments for 'evalsha' command".to_string());
             }
@@ -6882,7 +7033,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 _ => Ok(Some(Command::Unknown(format!("FUNCTION {}", sub)))),
             }
         }
-        "FCALL" => {
+        "FCALL" | "FCALL_RO" => {
             if args.len() < 3 {
                 return Err("wrong number of arguments for 'fcall' command".to_string());
             }
@@ -7189,7 +7340,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let members = args[2..].to_vec();
             Ok(Some(Command::Geohash { key, members }))
         }
-        "GEORADIUS" => {
+        "GEORADIUS" | "GEORADIUS_RO" => {
             if args.len() < 6 {
                 return Err("wrong number of arguments for 'georadius' command".to_string());
             }
@@ -7249,7 +7400,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 asc,
             }))
         }
-        "GEORADIUSBYMEMBER" => {
+        "GEORADIUSBYMEMBER" | "GEORADIUSBYMEMBER_RO" => {
             if args.len() < 5 {
                 return Err("wrong number of arguments for 'georadiusbymember' command".to_string());
             }
@@ -9155,5 +9306,74 @@ mod tests {
             }
             _ => panic!("Expected Mset command"),
         }
+    }
+
+    #[test]
+    fn test_unlink_readonly_wait_object_commands() {
+        // UNLINK
+        let mut buf = BytesMut::from("*3\r\n$6\r\nUNLINK\r\n$2\r\nk1\r\n$2\r\nk2\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        match cmd {
+            Command::Del(keys) => {
+                assert_eq!(keys.len(), 2);
+                assert_eq!(keys[0], Bytes::from_static(b"k1"));
+                assert_eq!(keys[1], Bytes::from_static(b"k2"));
+            }
+            _ => panic!("Expected Del command for UNLINK"),
+        }
+
+        // READONLY
+        let mut buf = BytesMut::from("*1\r\n$8\r\nREADONLY\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(cmd, Command::Readonly);
+
+        // READWRITE
+        let mut buf = BytesMut::from("*1\r\n$9\r\nREADWRITE\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(cmd, Command::Readwrite);
+
+        // WAIT
+        let mut buf = BytesMut::from("*3\r\n$4\r\nWAIT\r\n$1\r\n2\r\n$4\r\n1000\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::Wait {
+                numreplicas: 2,
+                timeout: 1000,
+            }
+        );
+
+        // WAITAOF
+        let mut buf = BytesMut::from("*4\r\n$7\r\nWAITAOF\r\n$1\r\n1\r\n$1\r\n2\r\n$4\r\n1000\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::WaitAof {
+                numlocal: 1,
+                numreplicas: 2,
+                timeout: 1000,
+            }
+        );
+
+        // OBJECT ENCODING
+        let mut buf = BytesMut::from("*3\r\n$6\r\nOBJECT\r\n$8\r\nENCODING\r\n$5\r\nmykey\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::Object(ObjectSubcommand::Encoding(Bytes::from_static(b"mykey")))
+        );
+
+        // OBJECT HELP
+        let mut buf = BytesMut::from("*2\r\n$6\r\nOBJECT\r\n$4\r\nHELP\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(cmd, Command::Object(ObjectSubcommand::Help));
+
+        // PROTO MAX BULK LEN
+        let old = get_proto_max_bulk_len();
+        set_proto_max_bulk_len(5);
+        let mut buf = BytesMut::from("*2\r\n$4\r\nECHO\r\n$6\r\n123456\r\n");
+        let err = parse_command(&mut buf).unwrap_err();
+        assert!(err.contains("excessive bulk string length"));
+        set_proto_max_bulk_len(old);
     }
 }

@@ -668,6 +668,52 @@ pub fn has_connected_replicas(port: u16) -> bool {
 }
 
 #[inline(always)]
+pub fn get_connected_replicas_count(port: u16) -> usize {
+    if !HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) {
+        return 0;
+    }
+    let hubs = REPLICATION_HUBS.read().unwrap();
+    if let Some(hub) = hubs.get(&port) {
+        if hub.has_replicas.load(Ordering::Relaxed) {
+            hub.replicas.read().unwrap().len()
+        } else {
+            0
+        }
+    } else {
+        0
+    }
+}
+
+pub async fn wait_replicas(port: u16, numreplicas: usize, timeout_ms: u64) -> usize {
+    if !HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) {
+        return 0;
+    }
+    let hub = get_replication_hub(port);
+    let start = std::time::Instant::now();
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    let target_offset = hub.master_repl_offset.load(Ordering::SeqCst);
+    loop {
+        let count = {
+            let reps = hub.replicas.read().unwrap();
+            if reps.is_empty() {
+                return 0;
+            }
+            if target_offset == 0 {
+                reps.len()
+            } else {
+                reps.values()
+                    .filter(|r| r.ack_offset.load(Ordering::SeqCst) >= target_offset)
+                    .count()
+            }
+        };
+        if count >= numreplicas || timeout_ms == 0 || start.elapsed() >= timeout {
+            return count;
+        }
+        monoio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+}
+
+#[inline(always)]
 pub fn propagate_bytes(port: u16, bytes: &[u8]) {
     if !HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) {
         return;
