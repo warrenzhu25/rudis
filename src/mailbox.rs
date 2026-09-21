@@ -103,11 +103,11 @@ impl ScatterMgetDescriptor {
 
     #[inline(always)]
     pub fn finish_shard(&self) {
-        if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let tx = unsafe { (*self.notify.get()).clone() };
-            if self.state.swap(DESC_COMPLETED, Ordering::AcqRel) == DESC_SLEEPING {
-                let _ = tx.try_send(());
-            }
+        if self.pending.fetch_sub(1, Ordering::AcqRel) == 1
+            && self.state.swap(DESC_COMPLETED, Ordering::AcqRel) == DESC_SLEEPING
+        {
+            let tx = unsafe { &*self.notify.get() };
+            let _ = tx.try_send(());
         }
     }
 
@@ -214,11 +214,11 @@ impl ScatterMsetDescriptor {
 
     #[inline(always)]
     pub fn finish_shard(&self) {
-        if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let tx = unsafe { (*self.notify.get()).clone() };
-            if self.state.swap(DESC_COMPLETED, Ordering::AcqRel) == DESC_SLEEPING {
-                let _ = tx.try_send(());
-            }
+        if self.pending.fetch_sub(1, Ordering::AcqRel) == 1
+            && self.state.swap(DESC_COMPLETED, Ordering::AcqRel) == DESC_SLEEPING
+        {
+            let tx = unsafe { &*self.notify.get() };
+            let _ = tx.try_send(());
         }
     }
 

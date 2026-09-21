@@ -1233,17 +1233,7 @@ impl Router {
         self.mget_batch_pool.borrow_mut().push(recycled);
         self.release_notify_channel(notify_tx, notify_rx);
 
-        let mut total_bytes = 16;
-        unsafe {
-            for i in 0..total_keys {
-                if let Some(v) = &*descriptor.results[i].get() {
-                    total_bytes += v.len() + 16;
-                } else {
-                    total_bytes += 5;
-                }
-            }
-        }
-        out.reserve(total_bytes);
+        out.reserve(total_keys * 32 + 16);
         crate::connection::write_resp_array_header(out, total_keys);
         unsafe {
             for i in 0..total_keys {
