@@ -1901,6 +1901,28 @@ impl ShardDb {
     }
 
     #[inline]
+    pub fn xinfo_stream(&mut self, key: &[u8]) -> Result<crate::table::StreamInfo, &'static str> {
+        self.table.xinfo_stream(key)
+    }
+
+    #[inline]
+    pub fn xinfo_groups(
+        &mut self,
+        key: &[u8],
+    ) -> Result<Vec<crate::table::StreamGroupInfo>, &'static str> {
+        self.table.xinfo_groups(key)
+    }
+
+    #[inline]
+    pub fn xinfo_consumers(
+        &mut self,
+        key: &[u8],
+        group: &[u8],
+    ) -> Result<Vec<crate::table::StreamConsumerInfo>, &'static str> {
+        self.table.xinfo_consumers(key, group)
+    }
+
+    #[inline]
     pub fn save_rdb_chunk(&mut self, buf: &mut Vec<u8>) {
         let now = std::time::Instant::now();
         let unix_now = std::time::SystemTime::now()

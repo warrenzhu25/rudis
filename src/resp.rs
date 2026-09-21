@@ -179,8 +179,19 @@ pub enum ObjectSubcommand {
 }
 
 #[derive(Debug, PartialEq, Clone)]
+pub enum XinfoSubcommand {
+    Stream(Bytes),
+    Groups(Bytes),
+    Consumers { key: Bytes, group: Bytes },
+    Help,
+}
+
+#[derive(Debug, PartialEq, Clone)]
 pub enum Command {
     Object(ObjectSubcommand),
+    Xinfo(XinfoSubcommand),
+    CommandCount,
+    CommandList,
     Auth {
         username: Option<String>,
         password: String,
@@ -4815,7 +4826,18 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
         "BGSAVE" => Ok(Some(Command::Bgsave)),
         "BGREWRITEAOF" => Ok(Some(Command::Bgrewriteaof)),
         "LASTSAVE" => Ok(Some(Command::Lastsave)),
-        "COMMAND" => Ok(Some(Command::CommandDocs)),
+        "COMMAND" => {
+            if args.len() == 1 {
+                Ok(Some(Command::CommandDocs))
+            } else {
+                let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
+                match sub.as_str() {
+                    "COUNT" => Ok(Some(Command::CommandCount)),
+                    "LIST" => Ok(Some(Command::CommandList)),
+                    _ => Ok(Some(Command::CommandDocs)),
+                }
+            }
+        }
         "INFO" => {
             let section = if args.len() > 1 {
                 Some(args[1].clone())
@@ -6109,6 +6131,47 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     group,
                     range: Some((start, end, count, consumer)),
                 }))
+            }
+        }
+        "XINFO" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'xinfo' command".to_string());
+            }
+            let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
+            match sub.as_str() {
+                "STREAM" => {
+                    if args.len() < 3 {
+                        return Err(
+                            "wrong number of arguments for 'xinfo stream' command".to_string()
+                        );
+                    }
+                    let key = args[2].clone();
+                    Ok(Some(Command::Xinfo(XinfoSubcommand::Stream(key))))
+                }
+                "GROUPS" => {
+                    if args.len() < 3 {
+                        return Err(
+                            "wrong number of arguments for 'xinfo groups' command".to_string()
+                        );
+                    }
+                    let key = args[2].clone();
+                    Ok(Some(Command::Xinfo(XinfoSubcommand::Groups(key))))
+                }
+                "CONSUMERS" => {
+                    if args.len() < 4 {
+                        return Err(
+                            "wrong number of arguments for 'xinfo consumers' command".to_string()
+                        );
+                    }
+                    let key = args[2].clone();
+                    let group = args[3].clone();
+                    Ok(Some(Command::Xinfo(XinfoSubcommand::Consumers {
+                        key,
+                        group,
+                    })))
+                }
+                "HELP" => Ok(Some(Command::Xinfo(XinfoSubcommand::Help))),
+                _ => Ok(Some(Command::Unknown(format!("XINFO {}", sub)))),
             }
         }
         "HELLO" => {
@@ -9375,5 +9438,47 @@ mod tests {
         let err = parse_command(&mut buf).unwrap_err();
         assert!(err.contains("excessive bulk string length"));
         set_proto_max_bulk_len(old);
+
+        // XINFO STREAM
+        let mut buf = BytesMut::from("*3\r\n$5\r\nXINFO\r\n$6\r\nSTREAM\r\n$8\r\nmystream\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::Xinfo(XinfoSubcommand::Stream(Bytes::from_static(b"mystream")))
+        );
+
+        // XINFO GROUPS
+        let mut buf = BytesMut::from("*3\r\n$5\r\nXINFO\r\n$6\r\nGROUPS\r\n$8\r\nmystream\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::Xinfo(XinfoSubcommand::Groups(Bytes::from_static(b"mystream")))
+        );
+
+        // XINFO CONSUMERS
+        let mut buf =
+            BytesMut::from("*4\r\n$5\r\nXINFO\r\n$9\r\nCONSUMERS\r\n$8\r\nmystream\r\n$7\r\nmygroup\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::Xinfo(XinfoSubcommand::Consumers {
+                key: Bytes::from_static(b"mystream"),
+                group: Bytes::from_static(b"mygroup"),
+            })
+        );
+
+        // XINFO HELP
+        let mut buf = BytesMut::from("*2\r\n$5\r\nXINFO\r\n$4\r\nHELP\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(cmd, Command::Xinfo(XinfoSubcommand::Help));
+
+        // COMMAND COUNT / LIST
+        let mut buf = BytesMut::from("*2\r\n$7\r\nCOMMAND\r\n$5\r\nCOUNT\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(cmd, Command::CommandCount);
+
+        let mut buf = BytesMut::from("*2\r\n$7\r\nCOMMAND\r\n$4\r\nLIST\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(cmd, Command::CommandList);
     }
 }

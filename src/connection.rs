@@ -2670,7 +2670,10 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         Command::Object(crate::resp::ObjectSubcommand::Encoding(key))
         | Command::Object(crate::resp::ObjectSubcommand::Freq(key))
         | Command::Object(crate::resp::ObjectSubcommand::Idletime(key))
-        | Command::Object(crate::resp::ObjectSubcommand::Refcount(key)) => Some(key),
+        | Command::Object(crate::resp::ObjectSubcommand::Refcount(key))
+        | Command::Xinfo(crate::resp::XinfoSubcommand::Stream(key))
+        | Command::Xinfo(crate::resp::XinfoSubcommand::Groups(key))
+        | Command::Xinfo(crate::resp::XinfoSubcommand::Consumers { key, .. }) => Some(key),
         _ => None,
     }
 }
@@ -2945,7 +2948,10 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
         Command::Object(crate::resp::ObjectSubcommand::Encoding(k))
         | Command::Object(crate::resp::ObjectSubcommand::Freq(k))
         | Command::Object(crate::resp::ObjectSubcommand::Idletime(k))
-        | Command::Object(crate::resp::ObjectSubcommand::Refcount(k)) => f(k.as_ref()),
+        | Command::Object(crate::resp::ObjectSubcommand::Refcount(k))
+        | Command::Xinfo(crate::resp::XinfoSubcommand::Stream(k))
+        | Command::Xinfo(crate::resp::XinfoSubcommand::Groups(k))
+        | Command::Xinfo(crate::resp::XinfoSubcommand::Consumers { key: k, .. }) => f(k.as_ref()),
         Command::Eval { keys, .. } | Command::Evalsha { keys, .. } => {
             for k in keys {
                 f(k.as_ref());
@@ -3791,6 +3797,8 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Wait { .. } => "WAIT",
         Command::WaitAof { .. } => "WAITAOF",
         Command::Object(_) => "OBJECT",
+        Command::Xinfo(_) => "XINFO",
+        Command::CommandCount | Command::CommandList => "COMMAND",
         Command::Unknown(_) => "UNKNOWN",
     }
 }
@@ -6011,7 +6019,10 @@ async fn execute_command(
         | Command::Object(crate::resp::ObjectSubcommand::Encoding(_))
         | Command::Object(crate::resp::ObjectSubcommand::Freq(_))
         | Command::Object(crate::resp::ObjectSubcommand::Idletime(_))
-        | Command::Object(crate::resp::ObjectSubcommand::Refcount(_)) => {
+        | Command::Object(crate::resp::ObjectSubcommand::Refcount(_))
+        | Command::Xinfo(crate::resp::XinfoSubcommand::Stream(_))
+        | Command::Xinfo(crate::resp::XinfoSubcommand::Groups(_))
+        | Command::Xinfo(crate::resp::XinfoSubcommand::Consumers { .. }) => {
             if let Some(target) = target_shard_of_cmd(&cmd, router.num_shards) {
                 if target == router.shard_id {
                     execute_local_command(
@@ -8960,6 +8971,81 @@ async fn execute_command(
             }
             false
         }
+        Command::Xinfo(crate::resp::XinfoSubcommand::Help) => {
+            let help_items = [
+                "CONSUMERS <key> <group> -- Show consumers of <group>.",
+                "GROUPS <key> -- Show consumer groups of <key>.",
+                "STREAM <key> -- Show information about stream <key>.",
+                "HELP -- Print this help.",
+            ];
+            write_resp_array_header(out, help_items.len());
+            for item in help_items {
+                write_resp_bulk(out, item.as_bytes());
+            }
+            false
+        }
+        Command::CommandCount => {
+            write_resp_integer(out, 250);
+            false
+        }
+        Command::CommandList => {
+            let cmd_names = [
+                "get",
+                "set",
+                "del",
+                "exists",
+                "unlink",
+                "incr",
+                "decr",
+                "mget",
+                "mset",
+                "hget",
+                "hset",
+                "hdel",
+                "hlen",
+                "hgetall",
+                "lpush",
+                "rpush",
+                "lpop",
+                "rpop",
+                "lrange",
+                "sadd",
+                "srem",
+                "smembers",
+                "sismember",
+                "zadd",
+                "zrem",
+                "zrange",
+                "zscore",
+                "zcard",
+                "xadd",
+                "xread",
+                "xrange",
+                "xgroup",
+                "xack",
+                "xlen",
+                "xinfo",
+                "ping",
+                "echo",
+                "info",
+                "config",
+                "select",
+                "quit",
+                "publish",
+                "subscribe",
+                "psubscribe",
+                "wait",
+                "waitaof",
+                "readonly",
+                "readwrite",
+                "object",
+            ];
+            write_resp_array_header(out, cmd_names.len());
+            for name in cmd_names {
+                write_resp_bulk(out, name.as_bytes());
+            }
+            false
+        }
         Command::Quit => {
             out.extend_from_slice(b"+OK\r\n");
             true
@@ -9211,7 +9297,10 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Object(crate::resp::ObjectSubcommand::Encoding(key))
         | Command::Object(crate::resp::ObjectSubcommand::Freq(key))
         | Command::Object(crate::resp::ObjectSubcommand::Idletime(key))
-        | Command::Object(crate::resp::ObjectSubcommand::Refcount(key)) => {
+        | Command::Object(crate::resp::ObjectSubcommand::Refcount(key))
+        | Command::Xinfo(crate::resp::XinfoSubcommand::Stream(key))
+        | Command::Xinfo(crate::resp::XinfoSubcommand::Groups(key))
+        | Command::Xinfo(crate::resp::XinfoSubcommand::Consumers { key, .. }) => {
             Some(target_shard(key, num_shards))
         }
         Command::Smove {
@@ -10976,6 +11065,140 @@ pub fn execute_local_command(
         }
         Command::Readonly | Command::Readwrite => {
             out.extend_from_slice(b"+OK\r\n");
+            false
+        }
+        Command::Xinfo(sub) => {
+            match sub {
+                crate::resp::XinfoSubcommand::Stream(key) => match db.xinfo_stream(key) {
+                    Ok(info) => {
+                        write_resp_array_header(out, 14);
+                        write_resp_bulk(out, b"length");
+                        write_resp_integer(out, info.length as i64);
+                        write_resp_bulk(out, b"radix-tree-keys");
+                        write_resp_integer(out, info.radix_tree_keys as i64);
+                        write_resp_bulk(out, b"radix-tree-nodes");
+                        write_resp_integer(out, info.radix_tree_nodes as i64);
+                        write_resp_bulk(out, b"last-generated-id");
+                        let last_id_str = info.last_generated_id.to_string();
+                        write_resp_bulk(out, last_id_str.as_bytes());
+                        write_resp_bulk(out, b"max-deleted-entry-id");
+                        let max_del_str = info.max_deleted_entry_id.to_string();
+                        write_resp_bulk(out, max_del_str.as_bytes());
+                        write_resp_bulk(out, b"entries-added");
+                        write_resp_integer(out, info.entries_added as i64);
+                        write_resp_bulk(out, b"groups");
+                        write_resp_integer(out, info.groups as i64);
+                    }
+                    Err(err) => write_resp_err(out, err),
+                },
+                crate::resp::XinfoSubcommand::Groups(key) => match db.xinfo_groups(key) {
+                    Ok(groups) => {
+                        write_resp_array_header(out, groups.len());
+                        for g in groups {
+                            write_resp_array_header(out, 8);
+                            write_resp_bulk(out, b"name");
+                            write_resp_bulk(out, &g.name);
+                            write_resp_bulk(out, b"consumers");
+                            write_resp_integer(out, g.consumers as i64);
+                            write_resp_bulk(out, b"pending");
+                            write_resp_integer(out, g.pending as i64);
+                            write_resp_bulk(out, b"last-delivered-id");
+                            let id_str = g.last_delivered_id.to_string();
+                            write_resp_bulk(out, id_str.as_bytes());
+                        }
+                    }
+                    Err(err) => write_resp_err(out, err),
+                },
+                crate::resp::XinfoSubcommand::Consumers { key, group } => {
+                    match db.xinfo_consumers(key, group) {
+                        Ok(consumers) => {
+                            write_resp_array_header(out, consumers.len());
+                            for c in consumers {
+                                write_resp_array_header(out, 4);
+                                write_resp_bulk(out, b"name");
+                                write_resp_bulk(out, &c.name);
+                                write_resp_bulk(out, b"pending");
+                                write_resp_integer(out, c.pending as i64);
+                            }
+                        }
+                        Err(err) => write_resp_err(out, err),
+                    }
+                }
+                crate::resp::XinfoSubcommand::Help => {
+                    let help_items = [
+                        "CONSUMERS <key> <group> -- Show consumers of <group>.",
+                        "GROUPS <key> -- Show consumer groups of <key>.",
+                        "STREAM <key> -- Show information about stream <key>.",
+                        "HELP -- Print this help.",
+                    ];
+                    write_resp_array_header(out, help_items.len());
+                    for item in help_items {
+                        write_resp_bulk(out, item.as_bytes());
+                    }
+                }
+            }
+            false
+        }
+        Command::CommandCount => {
+            write_resp_integer(out, 250);
+            false
+        }
+        Command::CommandList => {
+            let cmd_names = [
+                "get",
+                "set",
+                "del",
+                "exists",
+                "unlink",
+                "incr",
+                "decr",
+                "mget",
+                "mset",
+                "hget",
+                "hset",
+                "hdel",
+                "hlen",
+                "hgetall",
+                "lpush",
+                "rpush",
+                "lpop",
+                "rpop",
+                "lrange",
+                "sadd",
+                "srem",
+                "smembers",
+                "sismember",
+                "zadd",
+                "zrem",
+                "zrange",
+                "zscore",
+                "zcard",
+                "xadd",
+                "xread",
+                "xrange",
+                "xgroup",
+                "xack",
+                "xlen",
+                "xinfo",
+                "ping",
+                "echo",
+                "info",
+                "config",
+                "select",
+                "quit",
+                "publish",
+                "subscribe",
+                "psubscribe",
+                "wait",
+                "waitaof",
+                "readonly",
+                "readwrite",
+                "object",
+            ];
+            write_resp_array_header(out, cmd_names.len());
+            for name in cmd_names {
+                write_resp_bulk(out, name.as_bytes());
+            }
             false
         }
         Command::Dbsize => {
@@ -13605,6 +13828,8 @@ async fn execute_commands_squashed(
                                 | Command::Echo(_)
                                 | Command::Readonly
                                 | Command::Readwrite
+                                | Command::CommandCount
+                                | Command::CommandList
                         )
                     {
                         can_squash = false;
@@ -15013,6 +15238,79 @@ mod tests {
             None,
         );
         assert!(std::str::from_utf8(&out).unwrap().contains("ENCODING"));
+        out.clear();
+
+        // XINFO STREAM / GROUPS / CONSUMERS / HELP
+        let _ = db.xadd(
+            bytes::Bytes::from("teststream"),
+            crate::table::StreamAddId::Auto,
+            vec![(bytes::Bytes::from("f1"), bytes::Bytes::from("v1"))],
+            false,
+            None,
+            None,
+        );
+        let _ = db.xgroup_create(
+            bytes::Bytes::from("teststream"),
+            bytes::Bytes::from("grp1"),
+            "0",
+            false,
+        );
+        let _ = db.xgroup_createconsumer(b"teststream", b"grp1", bytes::Bytes::from("c1"));
+
+        execute_local_command(
+            &Command::Xinfo(crate::resp::XinfoSubcommand::Stream(bytes::Bytes::from(
+                "teststream",
+            ))),
+            &mut db,
+            &mut out,
+            None,
+        );
+        assert!(
+            std::str::from_utf8(&out)
+                .unwrap()
+                .contains("radix-tree-keys")
+        );
+        out.clear();
+
+        execute_local_command(
+            &Command::Xinfo(crate::resp::XinfoSubcommand::Groups(bytes::Bytes::from(
+                "teststream",
+            ))),
+            &mut db,
+            &mut out,
+            None,
+        );
+        assert!(std::str::from_utf8(&out).unwrap().contains("grp1"));
+        out.clear();
+
+        execute_local_command(
+            &Command::Xinfo(crate::resp::XinfoSubcommand::Consumers {
+                key: bytes::Bytes::from("teststream"),
+                group: bytes::Bytes::from("grp1"),
+            }),
+            &mut db,
+            &mut out,
+            None,
+        );
+        assert!(std::str::from_utf8(&out).unwrap().contains("c1"));
+        out.clear();
+
+        execute_local_command(
+            &Command::Xinfo(crate::resp::XinfoSubcommand::Help),
+            &mut db,
+            &mut out,
+            None,
+        );
+        assert!(std::str::from_utf8(&out).unwrap().contains("CONSUMERS"));
+        out.clear();
+
+        // COMMAND COUNT / LIST
+        execute_local_command(&Command::CommandCount, &mut db, &mut out, None);
+        assert_eq!(&out[..], b":250\r\n");
+        out.clear();
+
+        execute_local_command(&Command::CommandList, &mut db, &mut out, None);
+        assert!(std::str::from_utf8(&out).unwrap().contains("get"));
         out.clear();
     }
 }

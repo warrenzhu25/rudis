@@ -9998,6 +9998,138 @@ impl RudisTable {
             _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
         }
     }
+
+    pub fn xinfo_stream(&mut self, key: &[u8]) -> Result<StreamInfo, &'static str> {
+        let h = hash_key(key);
+        let idx = match self.table.find(key, h) {
+            Some(i) => {
+                if self.check_expired_slot(i) {
+                    return Err("ERR no such key");
+                }
+                i
+            }
+            None => return Err("ERR no such key"),
+        };
+        let entry = self.table.get_slot_mut(idx).unwrap();
+        match &entry.val {
+            RudisValue::Stream(s) => {
+                let first_entry = s.entries.iter().next().map(|(id, f)| (*id, f.clone()));
+                let last_entry = s.entries.iter().next_back().map(|(id, f)| (*id, f.clone()));
+                Ok(StreamInfo {
+                    length: s.entries.len(),
+                    radix_tree_keys: 1,
+                    radix_tree_nodes: 2,
+                    last_generated_id: s.last_id,
+                    max_deleted_entry_id: StreamId::default(),
+                    entries_added: s.entries.len() as u64,
+                    recorded_first_entry_id: first_entry.as_ref().map(|(id, _)| *id),
+                    groups: s.groups.len(),
+                    first_entry,
+                    last_entry,
+                })
+            }
+            _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        }
+    }
+
+    pub fn xinfo_groups(&mut self, key: &[u8]) -> Result<Vec<StreamGroupInfo>, &'static str> {
+        let h = hash_key(key);
+        let idx = match self.table.find(key, h) {
+            Some(i) => {
+                if self.check_expired_slot(i) {
+                    return Err("ERR no such key");
+                }
+                i
+            }
+            None => return Err("ERR no such key"),
+        };
+        let entry = self.table.get_slot_mut(idx).unwrap();
+        match &entry.val {
+            RudisValue::Stream(s) => {
+                let mut res = Vec::with_capacity(s.groups.len());
+                for (name, grp) in &s.groups {
+                    res.push(StreamGroupInfo {
+                        name: name.clone(),
+                        consumers: grp.consumers.len(),
+                        pending: grp.pel.len(),
+                        last_delivered_id: grp.last_delivered_id,
+                    });
+                }
+                Ok(res)
+            }
+            _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        }
+    }
+
+    pub fn xinfo_consumers(
+        &mut self,
+        key: &[u8],
+        group: &[u8],
+    ) -> Result<Vec<StreamConsumerInfo>, &'static str> {
+        let h = hash_key(key);
+        let idx = match self.table.find(key, h) {
+            Some(i) => {
+                if self.check_expired_slot(i) {
+                    return Err("ERR no such key");
+                }
+                i
+            }
+            None => return Err("ERR no such key"),
+        };
+        let entry = self.table.get_slot_mut(idx).unwrap();
+        match &entry.val {
+            RudisValue::Stream(s) => {
+                let grp = s
+                    .groups
+                    .get(group)
+                    .ok_or("NOGROUP No such key or consumer group")?;
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let mut res = Vec::with_capacity(grp.consumers.len());
+                for (name, cons) in &grp.consumers {
+                    let idle = now.saturating_sub(cons.seen_time_ms);
+                    res.push(StreamConsumerInfo {
+                        name: name.clone(),
+                        pending: cons.pel.len(),
+                        idle_ms: idle,
+                    });
+                }
+                Ok(res)
+            }
+            _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamInfo {
+    pub length: usize,
+    pub radix_tree_keys: usize,
+    pub radix_tree_nodes: usize,
+    pub last_generated_id: StreamId,
+    pub max_deleted_entry_id: StreamId,
+    pub entries_added: u64,
+    pub recorded_first_entry_id: Option<StreamId>,
+    pub groups: usize,
+    pub first_entry: Option<(StreamId, Vec<(Bytes, Bytes)>)>,
+    pub last_entry: Option<(StreamId, Vec<(Bytes, Bytes)>)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamGroupInfo {
+    pub name: Bytes,
+    pub consumers: usize,
+    pub pending: usize,
+    pub last_delivered_id: StreamId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamConsumerInfo {
+    pub name: Bytes,
+    pub pending: usize,
+    pub idle_ms: u64,
 }
 
 pub fn crc64_update(mut crc: u64, data: &[u8]) -> u64 {

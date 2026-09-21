@@ -10983,7 +10983,8 @@ fn test_per_shard_parallel_replication_stream_e2e() {
         flows.push(stream);
     }
     for f in &flows {
-        f.set_read_timeout(Some(Duration::from_millis(1000))).unwrap();
+        f.set_read_timeout(Some(Duration::from_millis(1000)))
+            .unwrap();
     }
 
     // 3. Find keys that map to shard 0 and shard 1
@@ -11013,12 +11014,12 @@ fn test_per_shard_parallel_replication_stream_e2e() {
     let deadline0 = std::time::Instant::now() + Duration::from_millis(2000);
     let mut received0 = String::new();
     while std::time::Instant::now() < deadline0 {
-        if let Ok(n0) = flows[0].read(&mut buf) {
-            if n0 > 0 {
-                received0.push_str(&String::from_utf8_lossy(&buf[..n0]));
-                if received0.contains("SET") && received0.contains(&key_shard0) {
-                    break;
-                }
+        if let Ok(n0) = flows[0].read(&mut buf)
+            && n0 > 0
+        {
+            received0.push_str(&String::from_utf8_lossy(&buf[..n0]));
+            if received0.contains("SET") && received0.contains(&key_shard0) {
+                break;
             }
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -11033,12 +11034,12 @@ fn test_per_shard_parallel_replication_stream_e2e() {
     let deadline1 = std::time::Instant::now() + Duration::from_millis(2000);
     let mut received1 = String::new();
     while std::time::Instant::now() < deadline1 {
-        if let Ok(n1) = flows[1].read(&mut buf) {
-            if n1 > 0 {
-                received1.push_str(&String::from_utf8_lossy(&buf[..n1]));
-                if received1.contains("SET") && received1.contains(&key_shard1) {
-                    break;
-                }
+        if let Ok(n1) = flows[1].read(&mut buf)
+            && n1 > 0
+        {
+            received1.push_str(&String::from_utf8_lossy(&buf[..n1]));
+            if received1.contains("SET") && received1.contains(&key_shard1) {
+                break;
             }
         }
         std::thread::sleep(Duration::from_millis(10));
@@ -11462,4 +11463,38 @@ fn test_e2e_unlink_readonly_wait_object_and_proto_max() {
         send_and_read(&mut stream, b"CONFIG SET proto-max-bulk-len 536870912\r\n"),
         "+OK\r\n"
     );
+
+    // 6. XINFO STREAM, GROUPS, CONSUMERS, HELP
+    assert!(!send_and_read(&mut stream, b"XADD e2e_stream * sensor 42\r\n").starts_with('-'));
+    assert_eq!(
+        send_and_read(&mut stream, b"XGROUP CREATE e2e_stream e2e_grp 0\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            b"XGROUP CREATECONSUMER e2e_stream e2e_grp e2e_c1\r\n"
+        ),
+        ":1\r\n"
+    );
+
+    let xinfo_stream_resp = send_and_read(&mut stream, b"XINFO STREAM e2e_stream\r\n");
+    assert!(xinfo_stream_resp.contains("radix-tree-keys"));
+    assert!(xinfo_stream_resp.contains("groups"));
+
+    let xinfo_groups_resp = send_and_read(&mut stream, b"XINFO GROUPS e2e_stream\r\n");
+    assert!(xinfo_groups_resp.contains("e2e_grp"));
+
+    let xinfo_consumers_resp =
+        send_and_read(&mut stream, b"XINFO CONSUMERS e2e_stream e2e_grp\r\n");
+    assert!(xinfo_consumers_resp.contains("e2e_c1"));
+
+    let xinfo_help_resp = send_and_read(&mut stream, b"XINFO HELP\r\n");
+    assert!(xinfo_help_resp.contains("CONSUMERS"));
+
+    // 7. COMMAND COUNT and COMMAND LIST
+    assert_eq!(send_and_read(&mut stream, b"COMMAND COUNT\r\n"), ":250\r\n");
+    let cmd_list_resp = send_and_read(&mut stream, b"COMMAND LIST\r\n");
+    assert!(cmd_list_resp.contains("xinfo"));
+    assert!(cmd_list_resp.contains("unlink"));
 }
