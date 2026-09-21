@@ -14072,8 +14072,7 @@ async fn execute_commands_squashed(
     // 2. Dispatch batched hops to all remote shards in parallel using pre-allocated channels
     let _ = results_pool;
     let resp_base_ptr = responses.as_mut_ptr();
-    let mut pending: smallvec::SmallVec<[&std::sync::Arc<crate::mailbox::BatchResponder>; 32]> =
-        smallvec::SmallVec::new();
+    let mut pending_mask: u64 = 0;
     for (target_shard, items) in remote_batches.iter_mut().enumerate() {
         if !items.is_empty() {
             let responder = &responders[target_shard];
@@ -14085,33 +14084,38 @@ async fn execute_commands_squashed(
                 is_resp3,
             };
             if router.senders[target_shard].send(msg).is_ok() {
-                pending.push(responder);
+                pending_mask |= 1u64 << target_shard;
             }
         }
     }
 
     // 3. Await parallel responses from all remote shards with lock-free spin-wait before async yield
     for _spin in 0..256 {
-        if pending.is_empty() {
+        if pending_mask == 0 {
             break;
         }
-        pending.retain(|responder| {
+        let mut check_mask = pending_mask;
+        while check_mask != 0 {
+            let target_shard = check_mask.trailing_zeros() as usize;
+            let responder = &responders[target_shard];
             if let Some(recycled_items) = responder.try_take() {
                 items_pool.push(recycled_items);
-                false
-            } else {
-                true
+                pending_mask &= !(1u64 << target_shard);
             }
-        });
-        if pending.is_empty() {
+            check_mask &= check_mask - 1;
+        }
+        if pending_mask == 0 {
             break;
         }
         std::hint::spin_loop();
     }
-    for responder in pending {
+    while pending_mask != 0 {
+        let target_shard = pending_mask.trailing_zeros() as usize;
+        let responder = &responders[target_shard];
         if let Some(recycled_items) = responder.wait_take().await {
             items_pool.push(recycled_items);
         }
+        pending_mask &= !(1u64 << target_shard);
     }
 
     // 4. Gather the cross-shard MGET/MSET replies that were dispatched in step 1.
@@ -14748,5 +14752,30 @@ mod tests {
         let _ = set_client_output_buffer_limit_str(
             "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60",
         );
+    }
+
+    #[test]
+    fn test_squashed_pending_bitmask_polling() {
+        let responder = std::sync::Arc::new(crate::mailbox::BatchResponder::new());
+        let mut resp_slot = [crate::shard::CompactResp::NULL; 4];
+        responder.prepare(resp_slot.as_mut_ptr());
+
+        let mut pending_mask: u64 = 0b101; // shards 0 and 2
+        let responders = [responder.clone(), responder.clone(), responder.clone()];
+
+        // Finish shard 0
+        responder.finish(vec![]);
+        let mut check_mask = pending_mask;
+        while check_mask != 0 {
+            let target_shard = check_mask.trailing_zeros() as usize;
+            if target_shard == 0 {
+                let r = &responders[target_shard];
+                if let Some(_items) = r.try_take() {
+                    pending_mask &= !(1u64 << target_shard);
+                }
+            }
+            check_mask &= check_mask - 1;
+        }
+        assert_eq!(pending_mask, 0b100); // only shard 2 remaining
     }
 }
