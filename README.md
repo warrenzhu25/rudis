@@ -11,7 +11,7 @@
   <a href="https://kernel.dk/io_uring.pdf"><img src="https://img.shields.io/badge/Linux-io__uring-orange.svg" alt="Linux io_uring"></a>
 </p>
 
-[Architecture Overview](#architecture-overview) • [Benchmarks](#benchmarks) • [Quick Start](#quick-start) • [Configuration](#configuration) • [Design Decisions](#design-decisions) • [Feature Matrix](#subsystem--feature-matrix) • [Documentation](docs/)
+[Architecture Overview](#architecture-overview) • [Benchmarks](#benchmarks) • [Quick Start](#quick-start) • [Configuration](#configuration) • [Production Deployment](#production-deployment) • [Design Decisions](#design-decisions) • [Feature Matrix](#subsystem--feature-matrix) • [Documentation](docs/)
 
 ---
 
@@ -47,6 +47,7 @@ are called out explicitly rather than left implicit, both here and in the linked
 - [Benchmarks](#benchmarks)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
+- [Production Deployment](#production-deployment)
 - [Design Decisions](#design-decisions)
   - [1. Shared-Nothing Thread-Per-Core on Linux io_uring](#1-shared-nothing-thread-per-core-on-linux-io_uring)
   - [2. Fork-less RDB Snapshots](#2-fork-less-rdb-snapshots)
@@ -317,6 +318,162 @@ dir /var/lib/rudis
 
 cluster-enabled no
 ```
+
+---
+
+## Production Deployment
+
+Practical guidance for running Rudis somewhere other than a laptop, verified against current
+source rather than aspirational. Read the [Subsystem & Feature Matrix](#subsystem--feature-matrix)
+and [License](#license) before depending on this in a business-critical path — this is a young,
+single-maintainer project with real, documented gaps, called out below rather than smoothed over.
+
+### System Requirements & Kernel Tuning
+
+Rudis requires Linux (for `io_uring`) at runtime. On every startup it runs sanity checks
+([`src/syscheck.rs`](src/syscheck.rs)) and prints non-fatal `[!]` warnings to stdout — check
+them at boot rather than assuming defaults are fine:
+
+| Check | Recommended | Fix |
+| :--- | :--- | :--- |
+| `vm.overcommit_memory` | `1` | `sysctl -w vm.overcommit_memory=1` |
+| `net.core.somaxconn` (TCP backlog) | `>= 512`, ideally `>= 4096` under load | `sysctl -w net.core.somaxconn=4096` |
+| `ulimit -n` (open file descriptors) | `>= 10000` | systemd `LimitNOFILE=`, or `/etc/security/limits.conf` |
+| Transparent Huge Pages | `never` | `echo never > /sys/kernel/mm/transparent_hugepage/enabled` |
+
+These checks are advisory only — the process still starts if they fail; the warnings exist so a
+degraded deployment is visible in logs instead of silently running with a bad kernel config.
+
+### Running as a systemd Service
+
+```ini
+[Unit]
+Description=Rudis in-memory datastore
+After=network.target
+
+[Service]
+Type=simple
+User=rudis
+Group=rudis
+ExecStart=/usr/local/bin/rudis -c /etc/rudis/rudis.conf
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Create the `rudis` user/group and a data directory it owns (matching `dir` in `rudis.conf`)
+before enabling the unit. If the host or container has a restricted CPU set (cgroups, a VM with
+fewer cores than the physical host), pass `--no-pin` — `core_affinity` pinning assumes it can
+address the physical core IDs it sees, which will not line up 1:1 inside a constrained cgroup.
+
+### Docker
+
+A multi-stage [`Dockerfile`](Dockerfile) is included: a `rust:1.85-bookworm` build stage and a
+`debian:bookworm-slim` runtime stage that runs as a non-root `rudis` system user, with
+`/var/lib/rudis` declared as a volume.
+
+```bash
+docker build -t rudis:latest .
+docker run -d --name rudis \
+  -p 6379:6379 \
+  -v rudis-data:/var/lib/rudis \
+  rudis:latest
+```
+
+The image's `CMD` defaults to `--port 6379 --aof true --aof-dir /var/lib/rudis`. Note that
+`--aof` takes an explicit `true`/`false` token (it is `Option<bool>` in [`src/main.rs`](src/main.rs),
+not a bare flag) — passing bare `--aof` immediately followed by another `--flag` fails to parse
+and the container will not start; any `docker run ... rudis:latest <args>` override must follow
+the same rule. To use a config file instead of flags, bind-mount it and pass `-c`:
+
+```bash
+docker run -d --name rudis \
+  -p 6379:6379 -p 6380:6380 \
+  -v rudis-data:/var/lib/rudis \
+  -v $(pwd)/rudis.conf:/etc/rudis/rudis.conf:ro \
+  rudis:latest -c /etc/rudis/rudis.conf
+```
+
+### Logging & Observability
+
+- Rudis logs via `tracing`/`tracing-subscriber`, controlled by the standard `RUST_LOG`
+  environment variable (e.g. `RUST_LOG=info,rudis=debug`); it defaults to `info,rudis=info` if
+  unset. The startup banner and final shutdown line are printed directly with `println!` and are
+  not gated by `RUST_LOG`.
+- `INFO` (optionally `INFO <section>` — `server` (default), `clients`, `memory`, `persistence`,
+  `replication`, `storage`/`tiered`, `stats`, `commandstats`) returns Redis-protocol text over
+  the normal client connection: `redis-cli -p 6379 INFO`.
+- `INFO metrics` (alias `INFO prometheus`) returns Prometheus exposition-format text
+  ([`src/telemetry.rs`](src/telemetry.rs)) — but **there is no separate HTTP `/metrics`
+  endpoint**; it is a RESP bulk-string reply on the same port. To feed a real Prometheus
+  scraper, run a small sidecar that issues `redis-cli -p 6379 INFO metrics` on an interval and
+  republishes the text over HTTP.
+- There is no built-in log file rotation or structured JSON logging; redirect and rotate at the
+  process-manager level (systemd journal, your container runtime's log driver, or `logrotate`).
+
+### Persistence & Durability Posture
+
+Understand what "durable" means here today before relying on it:
+
+- **AOF** (`appendonly yes`): the fsync policy is currently hardcoded to flush roughly every
+  second ([`src/aof.rs`](src/aof.rs)) — there is no config directive yet to select Redis's
+  `appendfsync always` (fsync every write) or `appendfsync no` (OS-decided) policies. Expect to
+  lose at most ~1 second of writes on a hard crash.
+- **RDB autosave**: the classic `save <seconds> <changes>` directive is parsed and stored, but
+  **nothing schedules a `BGSAVE` from it today** — drive periodic snapshots externally (e.g. a
+  cron job issuing `redis-cli BGSAVE`) if you need them.
+- **A known data-integrity gap**: keys currently offloaded to NVMe tiering
+  (`RudisValue::Tiered`) serialize to **zero bytes** in an RDB image — see
+  [`docs/rdbsave.md`](docs/rdbsave.md) before combining NVMe tiering with RDB-based backup in
+  production.
+- `SAVE`/`BGSAVE` never `fork()`s, but each shard's serialization work is synchronous and blocks
+  that shard's reactor for its duration — a `BGSAVE` is not a zero-impact operation on the shard
+  being saved, proportional to that shard's dataset size.
+
+### Memory Sizing & Eviction
+
+- `maxmemory-policy` accepts `noeviction` (default — new writes get `-OOM` once `maxmemory` is
+  exceeded), `allkeys-lru`, `volatile-lru`, `volatile-ttl`, and `allkeys-random`.
+- Despite the name, the "LRU" policies are **not true LRU**: eviction samples up to 10 occupied
+  slots from a rolling cursor (`RudisTable::try_evict_one_key` in [`src/table.rs`](src/table.rs))
+  and evicts from that small sample — there is no per-key access-time tracking. `volatile-ttl`
+  picks the soonest-to-expire key *within the sample*, not globally across the keyspace. Size
+  `maxmemory` with headroom rather than relying on precise recency-based eviction under pressure.
+- `maxmemory` also drives the thresholds that trigger NVMe tiering offload — see
+  [NVMe Tiered Storage](#6-nvme-tiered-storage-smallbins--direct-io) below.
+
+### Graceful Shutdown
+
+- `SIGTERM`/`SIGINT` set a cooperative flag ([`src/shutdown.rs`](src/shutdown.rs)); each shard
+  stops accepting *new* connections within ~200ms of the signal and its worker thread exits once
+  its accept loop observes the flag.
+- This is **not a full drain**: shutdown does not wait for in-flight commands to finish, does not
+  flush AOF early, and does not trigger an automatic snapshot before the process exits. If you
+  need a guaranteed-fresh RDB snapshot before stopping, issue a blocking `SAVE` (or `BGSAVE` and
+  poll for completion) first.
+- `SIGKILL` (a `docker stop`/systemd stop past its grace period) skips all of the above. Give the
+  process a real shutdown grace period — `docker stop -t <seconds>`, systemd `TimeoutStopSec=` —
+  so it at least has the ~200ms it needs to stop accepting new connections cleanly.
+
+### Security Checklist
+
+- Set `requirepass` in the config file (there is no CLI flag for it — see
+  [Configuration](#configuration)) or configure ACL users; without it, `AUTH` is open to any
+  client that can reach the port.
+- Set `tls-port`/`tls-cert-file`/`tls-key-file` for traffic leaving a trusted network. Without an
+  explicit cert/key pair, Rudis generates a self-signed certificate **in memory** at startup — do
+  not rely on that beyond local testing, since clients have nothing to verify it against.
+- TLS connections run through userspace `rustls` only today — kernel TLS offload is attempted
+  best-effort but its result is currently discarded (see
+  [Kernel-Bypass Networking & TLS: Status](#7-kernel-bypass-networking--tls-status)) — and TLS
+  connections never receive pipeline-squashing acceleration.
+- Run as a dedicated non-root user; the included [`Dockerfile`](Dockerfile) already does this via
+  a `rudis` system user.
+- Bind to a private interface (`bind <ip>`) rather than `0.0.0.0` unless the port is otherwise
+  firewalled — command access control is governed by the Redis ACL model, not a network ACL.
 
 ---
 

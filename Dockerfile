@@ -49,4 +49,4 @@ USER rudis
 EXPOSE 6379 6380
 
 ENTRYPOINT ["/usr/local/bin/rudis"]
-CMD ["--port", "6379", "--aof", "--aof-dir", "/var/lib/rudis"]
+CMD ["--port", "6379", "--aof", "true", "--aof-dir", "/var/lib/rudis"]
