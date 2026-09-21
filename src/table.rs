@@ -2426,7 +2426,7 @@ impl RudisTable {
 
     #[inline(always)]
     pub fn parse_i64_bytes(bytes: &[u8]) -> Option<i64> {
-        if bytes.is_empty() {
+        if bytes.is_empty() || bytes.len() > 20 {
             return None;
         }
         let (neg, s) = match bytes[0] {
@@ -2434,7 +2434,7 @@ impl RudisTable {
             b'+' => (false, &bytes[1..]),
             _ => (false, bytes),
         };
-        if s.is_empty() || s.len() > 20 {
+        if s.is_empty() {
             return None;
         }
         let mut val: u64 = 0;
@@ -2495,7 +2495,7 @@ impl RudisTable {
         let val = if let Some(int_val) = Self::parse_i64_bytes(&value) {
             RudisValue::Int(int_val)
         } else {
-            RudisValue::String(Bytes::copy_from_slice(&value))
+            RudisValue::String(value)
         };
         let val_bytes = val.approx_bytes();
         let (existing, candidate_idx) = self.table.find_or_prepare_insert(&key, h);
@@ -2528,7 +2528,7 @@ impl RudisTable {
         }
         let entry_mem = key.len() + val_bytes + 64;
         let entry = RudisEntry {
-            key: Bytes::copy_from_slice(&key),
+            key,
             val,
             expire_at,
         };
