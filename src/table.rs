@@ -1289,7 +1289,57 @@ impl RawSegment {
             self.ctrl[self.capacity + idx] = byte;
         }
     }
+}
 
+#[inline(always)]
+pub fn fast_slice_eq(a: &[u8], b: &[u8]) -> bool {
+    let len = a.len();
+    if len != b.len() {
+        return false;
+    }
+    let p1 = a.as_ptr();
+    let p2 = b.as_ptr();
+    if len <= 8 {
+        if len >= 4 {
+            unsafe {
+                let u1 = (p1 as *const u32).read_unaligned();
+                let u2 = (p2 as *const u32).read_unaligned();
+                let u1_end = (p1.add(len - 4) as *const u32).read_unaligned();
+                let u2_end = (p2.add(len - 4) as *const u32).read_unaligned();
+                return u1 == u2 && u1_end == u2_end;
+            }
+        }
+        if len == 0 {
+            return true;
+        }
+        return a == b;
+    }
+    if len <= 16 {
+        unsafe {
+            let u1 = (p1 as *const u64).read_unaligned();
+            let u2 = (p2 as *const u64).read_unaligned();
+            let u1_end = (p1.add(len - 8) as *const u64).read_unaligned();
+            let u2_end = (p2.add(len - 8) as *const u64).read_unaligned();
+            return u1 == u2 && u1_end == u2_end;
+        }
+    }
+    if len <= 32 {
+        unsafe {
+            let u1 = (p1 as *const u64).read_unaligned();
+            let u2 = (p2 as *const u64).read_unaligned();
+            let u1_end = (p1.add(len - 8) as *const u64).read_unaligned();
+            let u2_end = (p2.add(len - 8) as *const u64).read_unaligned();
+            let u3 = (p1.add(8) as *const u64).read_unaligned();
+            let u4 = (p2.add(8) as *const u64).read_unaligned();
+            let u3_end = (p1.add(len - 16) as *const u64).read_unaligned();
+            let u4_end = (p2.add(len - 16) as *const u64).read_unaligned();
+            return u1 == u2 && u1_end == u2_end && u3 == u4 && u3_end == u4_end;
+        }
+    }
+    a == b
+}
+
+impl RawSegment {
     #[inline(always)]
     pub fn find_entry(&self, key: &[u8], h: u64) -> Option<(usize, &RudisEntry)> {
         if self.items == 0 {
@@ -1312,7 +1362,7 @@ impl RawSegment {
                         .as_ref()
                         .unwrap_unchecked()
                 };
-                if entry.key.len() == key.len() && entry.key.as_ref() == key {
+                if fast_slice_eq(entry.key.as_ref(), key) {
                     return Some((slot_idx, entry));
                 }
                 bits &= bits - 1;
@@ -1333,7 +1383,7 @@ impl RawSegment {
                                 .as_ref()
                                 .unwrap_unchecked()
                         };
-                        if entry.key.len() == key.len() && entry.key.as_ref() == key {
+                        if fast_slice_eq(entry.key.as_ref(), key) {
                             return Some((slot_idx, entry));
                         }
                     }
@@ -1373,7 +1423,7 @@ impl RawSegment {
                         .as_ref()
                         .unwrap_unchecked()
                 };
-                if entry.key.len() == key.len() && entry.key.as_ref() == key {
+                if fast_slice_eq(entry.key.as_ref(), key) {
                     let entry_mut = unsafe {
                         self.slots
                             .get_unchecked_mut(slot_idx)
@@ -1400,7 +1450,7 @@ impl RawSegment {
                                 .as_ref()
                                 .unwrap_unchecked()
                         };
-                        if entry.key.len() == key.len() && entry.key.as_ref() == key {
+                        if fast_slice_eq(entry.key.as_ref(), key) {
                             let entry_mut = unsafe {
                                 self.slots
                                     .get_unchecked_mut(slot_idx)
@@ -1442,7 +1492,7 @@ impl RawSegment {
                         .as_ref()
                         .unwrap_unchecked()
                 };
-                if entry.key.len() == key.len() && entry.key.as_ref() == key {
+                if fast_slice_eq(entry.key.as_ref(), key) {
                     return (Some(slot_idx), slot_idx);
                 }
                 bits &= bits - 1;
@@ -1476,7 +1526,7 @@ impl RawSegment {
                                     .as_ref()
                                     .unwrap_unchecked()
                             };
-                            if entry.key.len() == key.len() && entry.key.as_ref() == key {
+                            if fast_slice_eq(entry.key.as_ref(), key) {
                                 return (Some(slot_idx), slot_idx);
                             }
                         }
@@ -11539,6 +11589,57 @@ mod tests {
         // Update with insert_prepared path
         table.set(Bytes::from("prep_k1"), Bytes::from("val2"), None);
         assert_eq!(table.get(b"prep_k1").unwrap(), Some(Bytes::from("val2")));
+    }
+
+    #[test]
+    fn test_fast_slice_eq() {
+        // Empty
+        assert!(fast_slice_eq(b"", b""));
+        assert!(!fast_slice_eq(b"", b"a"));
+        assert!(!fast_slice_eq(b"a", b""));
+
+        // Lengths 1 to 3
+        assert!(fast_slice_eq(b"a", b"a"));
+        assert!(!fast_slice_eq(b"a", b"b"));
+        assert!(fast_slice_eq(b"ab", b"ab"));
+        assert!(!fast_slice_eq(b"ab", b"ac"));
+        assert!(fast_slice_eq(b"xyz", b"xyz"));
+        assert!(!fast_slice_eq(b"xyz", b"xyw"));
+
+        // Lengths 4 to 8
+        assert!(fast_slice_eq(b"1234", b"1234"));
+        assert!(!fast_slice_eq(b"1234", b"1235"));
+        assert!(fast_slice_eq(b"12345", b"12345"));
+        assert!(!fast_slice_eq(b"12345", b"12346"));
+        assert!(fast_slice_eq(b"12345678", b"12345678"));
+        assert!(!fast_slice_eq(b"12345678", b"12345679"));
+
+        // Lengths 9 to 16
+        assert!(fast_slice_eq(b"123456789", b"123456789"));
+        assert!(!fast_slice_eq(b"123456789", b"123456780"));
+        assert!(fast_slice_eq(b"memtier-12345", b"memtier-12345"));
+        assert!(!fast_slice_eq(b"memtier-12345", b"memtier-12346"));
+        assert!(fast_slice_eq(b"1234567890abcdef", b"1234567890abcdef"));
+        assert!(!fast_slice_eq(b"1234567890abcdef", b"1234567890abcdeg"));
+
+        // Lengths 17 to 32
+        assert!(fast_slice_eq(b"1234567890abcdefg", b"1234567890abcdefg"));
+        assert!(!fast_slice_eq(b"1234567890abcdefg", b"1234567890abcdefh"));
+        assert!(fast_slice_eq(
+            b"12345678901234567890123456789012",
+            b"12345678901234567890123456789012"
+        ));
+        assert!(!fast_slice_eq(
+            b"12345678901234567890123456789012",
+            b"12345678901234567890123456789013"
+        ));
+
+        // Lengths > 32
+        let l1 = vec![b'x'; 64];
+        let mut l2 = l1.clone();
+        assert!(fast_slice_eq(&l1, &l2));
+        l2[63] = b'y';
+        assert!(!fast_slice_eq(&l1, &l2));
     }
 
     #[test]
