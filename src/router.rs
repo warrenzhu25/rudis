@@ -1096,18 +1096,7 @@ impl Router {
         }
 
         // Wait for all remote shards to complete their writes
-        if !descriptor.done.load(Ordering::Acquire) {
-            for _ in 0..64 {
-                std::hint::spin_loop();
-                if descriptor.done.load(Ordering::Acquire) {
-                    break;
-                }
-            }
-            while !descriptor.done.load(Ordering::Acquire) {
-                let _ = notify_rx.recv_async().await;
-            }
-        }
-        while notify_rx.try_recv().is_ok() {}
+        descriptor.wait_completed(64, &notify_rx).await;
 
         let recycled = descriptor.take_recycled_keys();
         self.mget_batch_pool.borrow_mut().push(recycled);
@@ -1138,9 +1127,9 @@ impl Router {
         }
 
         let total_keys = keys.len();
-        out.reserve(total_keys * 140);
 
         if self.num_shards <= 1 {
+            out.reserve(total_keys * 32 + 16);
             crate::connection::write_resp_array_header(out, total_keys);
             for key in keys {
                 if let Some(v) = self.get_local_direct(&key).await {
@@ -1176,6 +1165,7 @@ impl Router {
 
         // Fast path: all keys are local - 0 channel operations
         if !has_remote {
+            out.reserve(total_keys * 32 + 16);
             crate::connection::write_resp_array_header(out, total_keys);
             {
                 let mut db = self.local_db.borrow_mut();
@@ -1236,19 +1226,8 @@ impl Router {
             total_keys,
         } = inflight;
 
-        // Wait for all remote shards to complete their writes and finish notify_tx.try_send
-        if !descriptor.done.load(Ordering::Acquire) {
-            for _ in 0..256 {
-                std::hint::spin_loop();
-                if descriptor.done.load(Ordering::Acquire) {
-                    break;
-                }
-            }
-            while !descriptor.done.load(Ordering::Acquire) {
-                let _ = notify_rx.recv_async().await;
-            }
-        }
-        while notify_rx.try_recv().is_ok() {}
+        // Wait for all remote shards to complete their writes
+        descriptor.wait_completed(256, &notify_rx).await;
 
         let recycled = descriptor.take_recycled_keys();
         self.mget_batch_pool.borrow_mut().push(recycled);
@@ -1402,18 +1381,7 @@ impl Router {
             notify_rx,
         } = inflight;
 
-        if !descriptor.done.load(Ordering::Acquire) {
-            for _ in 0..64 {
-                std::hint::spin_loop();
-                if descriptor.done.load(Ordering::Acquire) {
-                    break;
-                }
-            }
-            while !descriptor.done.load(Ordering::Acquire) {
-                let _ = notify_rx.recv_async().await;
-            }
-        }
-        while notify_rx.try_recv().is_ok() {}
+        descriptor.wait_completed(64, &notify_rx).await;
 
         let recycled = descriptor.take_recycled_pairs();
         self.mset_batch_pool.borrow_mut().push(recycled);

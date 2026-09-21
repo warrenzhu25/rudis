@@ -22,11 +22,15 @@ impl<T> std::ops::DerefMut for CachePadded<T> {
 }
 
 /// Shared-memory Scatter-Gather Descriptor for multi-shard MGET.
+pub const DESC_RUNNING: u8 = 0;
+pub const DESC_COMPLETED: u8 = 1;
+pub const DESC_SLEEPING: u8 = 2;
+
 /// Remote shards write their looked up values directly into their respective slots.
 pub struct ScatterMgetDescriptor {
     pub results: Box<[CachePadded<UnsafeCell<Option<Bytes>>>]>,
     pub pending: AtomicUsize,
-    pub done: AtomicBool,
+    pub state: std::sync::atomic::AtomicU8,
     pub notify: CachePadded<UnsafeCell<flume::Sender<()>>>,
     pub recycled_keys: Box<[CachePadded<UnsafeCell<Vec<(usize, Bytes)>>>]>,
 }
@@ -52,7 +56,11 @@ impl ScatterMgetDescriptor {
         Self {
             results: vec.into_boxed_slice(),
             pending: AtomicUsize::new(pending_shards),
-            done: AtomicBool::new(pending_shards == 0),
+            state: std::sync::atomic::AtomicU8::new(if pending_shards == 0 {
+                DESC_COMPLETED
+            } else {
+                DESC_RUNNING
+            }),
             notify: CachePadded(UnsafeCell::new(notify)),
             recycled_keys: recycled.into_boxed_slice(),
         }
@@ -60,7 +68,14 @@ impl ScatterMgetDescriptor {
 
     #[inline(always)]
     pub fn reset(&self, total_keys: usize, pending_shards: usize, notify: flume::Sender<()>) {
-        self.done.store(pending_shards == 0, Ordering::Relaxed);
+        self.state.store(
+            if pending_shards == 0 {
+                DESC_COMPLETED
+            } else {
+                DESC_RUNNING
+            },
+            Ordering::Relaxed,
+        );
         unsafe {
             *self.notify.get() = notify;
         }
@@ -89,9 +104,34 @@ impl ScatterMgetDescriptor {
     #[inline(always)]
     pub fn finish_shard(&self) {
         if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let tx = unsafe { &*self.notify.get() };
-            let _ = tx.try_send(());
-            self.done.store(true, Ordering::Release);
+            let tx = unsafe { (*self.notify.get()).clone() };
+            if self.state.swap(DESC_COMPLETED, Ordering::AcqRel) == DESC_SLEEPING {
+                let _ = tx.try_send(());
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub async fn wait_completed(&self, spin_iters: usize, notify_rx: &flume::Receiver<()>) {
+        if self.state.load(Ordering::Acquire) != DESC_COMPLETED {
+            for _ in 0..spin_iters {
+                std::hint::spin_loop();
+                if self.state.load(Ordering::Acquire) == DESC_COMPLETED {
+                    return;
+                }
+            }
+            if self
+                .state
+                .compare_exchange(
+                    DESC_RUNNING,
+                    DESC_SLEEPING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                let _ = notify_rx.recv_async().await;
+            }
         }
     }
 
@@ -123,7 +163,7 @@ impl ScatterMgetDescriptor {
 /// Shared-memory Scatter-Gather Descriptor for multi-shard MSET.
 pub struct ScatterMsetDescriptor {
     pub pending: AtomicUsize,
-    pub done: AtomicBool,
+    pub state: std::sync::atomic::AtomicU8,
     pub notify: CachePadded<UnsafeCell<flume::Sender<()>>>,
     pub recycled_pairs: Box<[CachePadded<UnsafeCell<Vec<(Bytes, Bytes)>>>]>,
 }
@@ -139,7 +179,11 @@ impl ScatterMsetDescriptor {
         }
         Self {
             pending: AtomicUsize::new(pending_shards),
-            done: AtomicBool::new(pending_shards == 0),
+            state: std::sync::atomic::AtomicU8::new(if pending_shards == 0 {
+                DESC_COMPLETED
+            } else {
+                DESC_RUNNING
+            }),
             notify: CachePadded(UnsafeCell::new(notify)),
             recycled_pairs: recycled.into_boxed_slice(),
         }
@@ -147,7 +191,14 @@ impl ScatterMsetDescriptor {
 
     #[inline(always)]
     pub fn reset(&self, pending_shards: usize, notify: flume::Sender<()>) {
-        self.done.store(pending_shards == 0, Ordering::Relaxed);
+        self.state.store(
+            if pending_shards == 0 {
+                DESC_COMPLETED
+            } else {
+                DESC_RUNNING
+            },
+            Ordering::Relaxed,
+        );
         unsafe {
             *self.notify.get() = notify;
         }
@@ -164,9 +215,34 @@ impl ScatterMsetDescriptor {
     #[inline(always)]
     pub fn finish_shard(&self) {
         if self.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
-            let tx = unsafe { &*self.notify.get() };
-            let _ = tx.try_send(());
-            self.done.store(true, Ordering::Release);
+            let tx = unsafe { (*self.notify.get()).clone() };
+            if self.state.swap(DESC_COMPLETED, Ordering::AcqRel) == DESC_SLEEPING {
+                let _ = tx.try_send(());
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub async fn wait_completed(&self, spin_iters: usize, notify_rx: &flume::Receiver<()>) {
+        if self.state.load(Ordering::Acquire) != DESC_COMPLETED {
+            for _ in 0..spin_iters {
+                std::hint::spin_loop();
+                if self.state.load(Ordering::Acquire) == DESC_COMPLETED {
+                    return;
+                }
+            }
+            if self
+                .state
+                .compare_exchange(
+                    DESC_RUNNING,
+                    DESC_SLEEPING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                let _ = notify_rx.recv_async().await;
+            }
         }
     }
 
@@ -633,8 +709,19 @@ mod tests {
             }));
         }
 
-        rx.recv_timeout(Duration::from_secs(2))
-            .expect("mget notification timeout");
+        if desc
+            .state
+            .compare_exchange(
+                DESC_RUNNING,
+                DESC_SLEEPING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("mget notification timeout");
+        }
         for h in handles {
             h.join().unwrap();
         }
@@ -677,8 +764,19 @@ mod tests {
             }));
         }
 
-        rx.recv_timeout(Duration::from_secs(2))
-            .expect("mset notification timeout");
+        if desc
+            .state
+            .compare_exchange(
+                DESC_RUNNING,
+                DESC_SLEEPING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("mset notification timeout");
+        }
         for h in handles {
             h.join().unwrap();
         }

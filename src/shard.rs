@@ -11,6 +11,7 @@ pub enum CompactResp {
     Big(Vec<u8>),
     Bulk(Bytes),
     Array1Bulk(Bytes),
+    RawBytes(Bytes),
 }
 
 pub const DIGIT_PAIRS: &[u8; 200] = b"\
@@ -233,6 +234,7 @@ impl CompactResp {
             CompactResp::Big(vec) => vec.len(),
             CompactResp::Bulk(bytes) => bytes.len() + 16,
             CompactResp::Array1Bulk(bytes) => bytes.len() + 20,
+            CompactResp::RawBytes(bytes) => bytes.len(),
         }
     }
 
@@ -246,6 +248,7 @@ impl CompactResp {
                 out.extend_from_slice(b"*1\r\n");
                 crate::connection::write_resp_bulk(out, bytes);
             }
+            CompactResp::RawBytes(bytes) => out.extend_from_slice(bytes),
         }
     }
 
@@ -254,7 +257,9 @@ impl CompactResp {
         match self {
             CompactResp::Small { len, data } => &data[..*len as usize],
             CompactResp::Big(vec) => vec.as_slice(),
-            CompactResp::Bulk(bytes) | CompactResp::Array1Bulk(bytes) => bytes.as_ref(),
+            CompactResp::Bulk(bytes)
+            | CompactResp::Array1Bulk(bytes)
+            | CompactResp::RawBytes(bytes) => bytes.as_ref(),
         }
     }
 
@@ -274,6 +279,7 @@ impl CompactResp {
                 crate::connection::write_resp_bulk(&mut v, &bytes);
                 v
             }
+            CompactResp::RawBytes(bytes) => bytes.to_vec(),
         }
     }
 }

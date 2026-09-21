@@ -743,6 +743,65 @@ pub fn write_resp_bulk(out: &mut Vec<u8>, val: &[u8]) {
 }
 
 #[inline(always)]
+pub fn write_resp_bulk_bytesmut(out: &mut BytesMut, val: &[u8]) {
+    let v_len = val.len();
+    out.reserve(v_len + 16);
+    out.extend_from_slice(b"$");
+    match v_len {
+        0 => out.extend_from_slice(b"0\r\n"),
+        1..=9 => {
+            out.extend_from_slice(&[b'0' + v_len as u8, b'\r', b'\n']);
+        }
+        10..=99 => {
+            let p = v_len * 2;
+            out.extend_from_slice(&[
+                crate::shard::DIGIT_PAIRS[p],
+                crate::shard::DIGIT_PAIRS[p + 1],
+                b'\r',
+                b'\n',
+            ]);
+        }
+        100..=999 => {
+            let h = (v_len / 100) as u8;
+            let p = (v_len % 100) * 2;
+            out.extend_from_slice(&[
+                b'0' + h,
+                crate::shard::DIGIT_PAIRS[p],
+                crate::shard::DIGIT_PAIRS[p + 1],
+                b'\r',
+                b'\n',
+            ]);
+        }
+        1000..=9999 => {
+            let p1 = (v_len / 100) * 2;
+            let p2 = (v_len % 100) * 2;
+            out.extend_from_slice(&[
+                crate::shard::DIGIT_PAIRS[p1],
+                crate::shard::DIGIT_PAIRS[p1 + 1],
+                crate::shard::DIGIT_PAIRS[p2],
+                crate::shard::DIGIT_PAIRS[p2 + 1],
+                b'\r',
+                b'\n',
+            ]);
+        }
+        _ => {
+            let mut buf = [0u8; 20];
+            let mut i = buf.len();
+            let mut uval = v_len;
+            while uval > 0 {
+                i -= 1;
+                buf[i] = b'0' + (uval % 10) as u8;
+                uval /= 10;
+            }
+            out.extend_from_slice(&buf[i..]);
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+    out.extend_from_slice(val);
+    out.extend_from_slice(b"\r\n");
+}
+
+#[inline(always)]
 pub fn write_resp_array_header(out: &mut Vec<u8>, len: usize) {
     out.push(b'*');
     match len {
@@ -766,6 +825,51 @@ pub fn write_resp_array_header(out: &mut Vec<u8>, len: usize) {
             out.extend_from_slice(b"\r\n");
         }
         _ => {
+            let mut buf = [0u8; 20];
+            let mut i = buf.len();
+            let mut uval = len;
+            while uval > 0 {
+                i -= 1;
+                buf[i] = b'0' + (uval % 10) as u8;
+                uval /= 10;
+            }
+            out.extend_from_slice(&buf[i..]);
+            out.extend_from_slice(b"\r\n");
+        }
+    }
+}
+
+#[inline(always)]
+pub fn write_resp_array_header_bytesmut(out: &mut BytesMut, len: usize) {
+    match len {
+        0 => out.extend_from_slice(b"*0\r\n"),
+        1..=9 => {
+            out.extend_from_slice(&[b'*', b'0' + len as u8, b'\r', b'\n']);
+        }
+        10..=99 => {
+            let p = len * 2;
+            out.extend_from_slice(&[
+                b'*',
+                crate::shard::DIGIT_PAIRS[p],
+                crate::shard::DIGIT_PAIRS[p + 1],
+                b'\r',
+                b'\n',
+            ]);
+        }
+        100..=999 => {
+            let h = (len / 100) as u8;
+            let p = (len % 100) * 2;
+            out.extend_from_slice(&[
+                b'*',
+                b'0' + h,
+                crate::shard::DIGIT_PAIRS[p],
+                crate::shard::DIGIT_PAIRS[p + 1],
+                b'\r',
+                b'\n',
+            ]);
+        }
+        _ => {
+            out.extend_from_slice(b"*");
             let mut buf = [0u8; 20];
             let mut i = buf.len();
             let mut uval = len;
@@ -14024,12 +14128,27 @@ async fn execute_commands_squashed(
 
     // 4. Gather the cross-shard MGET/MSET replies that were dispatched in step 1.
     //    They ran concurrently with each other and with the shard batch hops above.
+    let batch_len = responses.len();
+    if inflight_mgets.len() == batch_len {
+        for (_idx, inflight) in inflight_mgets.drain(..) {
+            router.finish_mget_resp(inflight, out).await;
+        }
+        return should_close;
+    }
     if !inflight_mgets.is_empty() {
         for (idx, inflight) in inflight_mgets.drain(..) {
-            let mut mget_buf = Vec::new();
-            router.finish_mget_resp(inflight, &mut mget_buf).await;
-            responses[idx] = CompactResp::from_vec(mget_buf);
+            local_buf.clear();
+            router.finish_mget_resp(inflight, &mut local_buf).await;
+            responses[idx] = CompactResp::from_vec(std::mem::take(&mut local_buf));
         }
+    }
+    if inflight_msets.len() == batch_len {
+        out.reserve(batch_len * 5);
+        for (_idx, inflight) in inflight_msets.drain(..) {
+            router.finish_mset(inflight).await;
+            out.extend_from_slice(b"+OK\r\n");
+        }
+        return should_close;
     }
     if !inflight_msets.is_empty() {
         for (idx, inflight) in inflight_msets.drain(..) {

@@ -1154,6 +1154,14 @@ pub fn hash_key(key: &[u8]) -> u64 {
 }
 
 #[inline(always)]
+fn mix_hash(mut h: u64) -> u64 {
+    h ^= h >> 32;
+    h = h.wrapping_mul(0xd6e8feb86659fd93);
+    h ^= h >> 32;
+    h
+}
+
+#[inline(always)]
 pub fn fingerprint(hash: u64) -> u8 {
     (hash >> 57) as u8 & 0x7F
 }
@@ -1234,10 +1242,13 @@ unsafe fn probe_group_match_del_empty(ptr: *const u8, tag: u8) -> (u16, u16, u16
 }
 
 const SEG_SHIFT: usize = 10;
-const SEG_CAP: usize = 1 << SEG_SHIFT; // 1024 slots per segment (~48KB, L1/L2 cache resident)
-const SEG_MASK: usize = SEG_CAP - 1;
+const SEG_CAP: usize = 1 << SEG_SHIFT; // 1024 main SIMD slots per segment (~48KB, L1/L2 cache resident)
+const STASH_CAP: usize = 4; // 4 DashTable-style overflow stash slots per segment
+const GLOBAL_IDX_SHIFT: usize = 11;
+const GLOBAL_IDX_MASK: usize = (1 << GLOBAL_IDX_SHIFT) - 1;
 
-/// Fixed-size SwissTable segment managed by `RudisFlatTable`'s extendible hashing directory.
+/// Fixed-size SwissTable segment with a 4-slot DashTable-style overflow stash,
+/// managed by `RudisFlatTable`'s extendible hashing directory.
 pub struct RawSegment {
     pub ctrl: Vec<u8>,
     pub slots: Vec<Option<RudisEntry>>,
@@ -1246,14 +1257,17 @@ pub struct RawSegment {
     pub items: usize,
     pub growth_left: usize,
     pub local_depth: u8,
+    pub stash_ctrl: [u8; STASH_CAP],
+    pub stash_count: u8,
 }
 
 impl RawSegment {
     pub fn new(capacity: usize, local_depth: u8) -> Self {
         let cap = capacity.next_power_of_two().clamp(GROUP_SIZE, SEG_CAP);
         let ctrl = vec![EMPTY; cap + GROUP_SIZE];
-        let mut slots = Vec::with_capacity(cap);
-        slots.resize_with(cap, || None);
+        let mut slots = Vec::with_capacity(cap + STASH_CAP);
+        slots.resize_with(cap + STASH_CAP, || None);
+        let stash_bonus = if cap == SEG_CAP { STASH_CAP } else { 0 };
 
         Self {
             ctrl,
@@ -1261,8 +1275,10 @@ impl RawSegment {
             capacity: cap,
             mask: cap - 1,
             items: 0,
-            growth_left: (cap * 7) / 8,
+            growth_left: (cap * 7) / 8 + stash_bonus,
             local_depth,
+            stash_ctrl: [EMPTY; STASH_CAP],
+            stash_count: 0,
         }
     }
 
@@ -1275,12 +1291,12 @@ impl RawSegment {
     }
 
     #[inline(always)]
-    pub fn find_entry(&self, key: &[u8], hash: u64) -> Option<(usize, &RudisEntry)> {
+    pub fn find_entry(&self, key: &[u8], h: u64) -> Option<(usize, &RudisEntry)> {
         if self.items == 0 {
             return None;
         }
-        let tag = fingerprint(hash);
-        let mut idx = (hash as usize) & self.mask;
+        let tag = fingerprint(h);
+        let mut idx = (h as usize) & self.mask;
         let mut step = 0;
 
         loop {
@@ -1307,6 +1323,22 @@ impl RawSegment {
             }
 
             step += GROUP_SIZE;
+            if step == 2 * GROUP_SIZE && self.stash_count > 0 {
+                for s in 0..STASH_CAP {
+                    if self.stash_ctrl[s] == tag {
+                        let slot_idx = self.capacity + s;
+                        let entry = unsafe {
+                            self.slots
+                                .get_unchecked(slot_idx)
+                                .as_ref()
+                                .unwrap_unchecked()
+                        };
+                        if entry.key.len() == key.len() && entry.key.as_ref() == key {
+                            return Some((slot_idx, entry));
+                        }
+                    }
+                }
+            }
             if step >= self.capacity {
                 return None;
             }
@@ -1315,52 +1347,17 @@ impl RawSegment {
     }
 
     #[inline(always)]
-    pub fn contains(&self, key: &[u8], hash: u64) -> bool {
-        if self.items == 0 {
-            return false;
-        }
-        let tag = fingerprint(hash);
-        let mut idx = (hash as usize) & self.mask;
-        let mut step = 0;
-
-        loop {
-            let (match_mask, empty_mask) =
-                unsafe { probe_group_match_or_empty(self.ctrl.as_ptr().add(idx), tag) };
-            let mut bits = match_mask;
-            while bits != 0 {
-                let offset = bits.trailing_zeros() as usize;
-                let slot_idx = (idx + offset) & self.mask;
-                let entry = unsafe {
-                    self.slots
-                        .get_unchecked(slot_idx)
-                        .as_ref()
-                        .unwrap_unchecked()
-                };
-                if entry.key.len() == key.len() && entry.key.as_ref() == key {
-                    return true;
-                }
-                bits &= bits - 1;
-            }
-
-            if empty_mask != 0 {
-                return false;
-            }
-
-            step += GROUP_SIZE;
-            if step >= self.capacity {
-                return false;
-            }
-            idx = (idx + step) & self.mask;
-        }
+    pub fn contains(&self, key: &[u8], h: u64) -> bool {
+        self.find_entry(key, h).is_some()
     }
 
     #[inline(always)]
-    pub fn find_entry_mut(&mut self, key: &[u8], hash: u64) -> Option<(usize, &mut RudisEntry)> {
+    pub fn find_entry_mut(&mut self, key: &[u8], h: u64) -> Option<(usize, &mut RudisEntry)> {
         if self.items == 0 {
             return None;
         }
-        let tag = fingerprint(hash);
-        let mut idx = (hash as usize) & self.mask;
+        let tag = fingerprint(h);
+        let mut idx = (h as usize) & self.mask;
         let mut step = 0;
 
         loop {
@@ -1393,6 +1390,28 @@ impl RawSegment {
             }
 
             step += GROUP_SIZE;
+            if step == 2 * GROUP_SIZE && self.stash_count > 0 {
+                for s in 0..STASH_CAP {
+                    if self.stash_ctrl[s] == tag {
+                        let slot_idx = self.capacity + s;
+                        let entry = unsafe {
+                            self.slots
+                                .get_unchecked(slot_idx)
+                                .as_ref()
+                                .unwrap_unchecked()
+                        };
+                        if entry.key.len() == key.len() && entry.key.as_ref() == key {
+                            let entry_mut = unsafe {
+                                self.slots
+                                    .get_unchecked_mut(slot_idx)
+                                    .as_mut()
+                                    .unwrap_unchecked()
+                            };
+                            return Some((slot_idx, entry_mut));
+                        }
+                    }
+                }
+            }
             if step >= self.capacity {
                 return None;
             }
@@ -1401,12 +1420,12 @@ impl RawSegment {
     }
 
     #[inline(always)]
-    pub fn find_or_prepare_insert_raw(&self, key: &[u8], hash: u64) -> (Option<usize>, usize) {
+    pub fn find_or_prepare_insert_raw(&self, key: &[u8], h: u64) -> (Option<usize>, usize) {
         if self.items == 0 {
-            return (None, (hash as usize) & self.mask);
+            return (None, (h as usize) & self.mask);
         }
-        let tag = fingerprint(hash);
-        let mut idx = (hash as usize) & self.mask;
+        let tag = fingerprint(h);
+        let mut idx = (h as usize) & self.mask;
         let mut step = 0;
         let mut first_free: Option<usize> = None;
 
@@ -1446,6 +1465,32 @@ impl RawSegment {
             }
 
             step += GROUP_SIZE;
+            if step == 2 * GROUP_SIZE {
+                if self.stash_count > 0 {
+                    for s in 0..STASH_CAP {
+                        if self.stash_ctrl[s] == tag {
+                            let slot_idx = self.capacity + s;
+                            let entry = unsafe {
+                                self.slots
+                                    .get_unchecked(slot_idx)
+                                    .as_ref()
+                                    .unwrap_unchecked()
+                            };
+                            if entry.key.len() == key.len() && entry.key.as_ref() == key {
+                                return (Some(slot_idx), slot_idx);
+                            }
+                        }
+                    }
+                }
+                if first_free.is_none() && (self.stash_count as usize) < STASH_CAP {
+                    for s in 0..STASH_CAP {
+                        if self.stash_ctrl[s] == EMPTY {
+                            first_free = Some(self.capacity + s);
+                            break;
+                        }
+                    }
+                }
+            }
             if step >= self.capacity {
                 return (None, first_free.unwrap_or(idx));
             }
@@ -1454,36 +1499,77 @@ impl RawSegment {
     }
 
     #[inline(always)]
-    pub fn insert_at(&mut self, entry: RudisEntry, hash: u64, insert_idx: usize) {
-        let was_empty = self.ctrl[insert_idx] == EMPTY;
-        let tag = fingerprint(hash);
-        self.set_ctrl(insert_idx, tag);
-        self.slots[insert_idx] = Some(entry);
-        self.items += 1;
-        if was_empty {
+    pub fn insert_at(&mut self, entry: RudisEntry, h: u64, insert_idx: usize) {
+        let tag = fingerprint(h);
+        if insert_idx < self.capacity {
+            let was_empty = self.ctrl[insert_idx] == EMPTY;
+            self.set_ctrl(insert_idx, tag);
+            self.slots[insert_idx] = Some(entry);
+            self.items += 1;
+            if was_empty {
+                self.growth_left = self.growth_left.saturating_sub(1);
+            }
+        } else {
+            let s = insert_idx - self.capacity;
+            self.stash_ctrl[s] = tag;
+            self.stash_count += 1;
+            self.slots[insert_idx] = Some(entry);
+            self.items += 1;
             self.growth_left = self.growth_left.saturating_sub(1);
         }
     }
 
     #[inline(always)]
+    fn insert_migrated(&mut self, entry: RudisEntry, h: u64) {
+        let (_, idx) = self.find_or_prepare_insert_raw(&entry.key, h);
+        self.insert_at(entry, h, idx);
+    }
+
+    #[inline(always)]
     pub fn remove(&mut self, slot_idx: usize) -> Option<RudisEntry> {
         let entry = self.slots.get_mut(slot_idx)?.take()?;
-        self.set_ctrl(slot_idx, DELETED);
+        if slot_idx < self.capacity {
+            self.set_ctrl(slot_idx, DELETED);
+        } else {
+            self.stash_ctrl[slot_idx - self.capacity] = EMPTY;
+            self.stash_count = self.stash_count.saturating_sub(1);
+            self.growth_left += 1;
+        }
         self.items -= 1;
         if self.items == 0 {
             self.ctrl.fill(EMPTY);
-            self.growth_left = (self.capacity * 7) / 8;
+            self.stash_ctrl = [EMPTY; STASH_CAP];
+            self.stash_count = 0;
+            let stash_bonus = if self.capacity == SEG_CAP {
+                STASH_CAP
+            } else {
+                0
+            };
+            self.growth_left = (self.capacity * 7) / 8 + stash_bonus;
         }
         Some(entry)
     }
 
     #[inline(always)]
     pub fn remove_present(&mut self, slot_idx: usize) -> RudisEntry {
-        self.set_ctrl(slot_idx, DELETED);
+        if slot_idx < self.capacity {
+            self.set_ctrl(slot_idx, DELETED);
+        } else {
+            self.stash_ctrl[slot_idx - self.capacity] = EMPTY;
+            self.stash_count = self.stash_count.saturating_sub(1);
+            self.growth_left += 1;
+        }
         self.items -= 1;
         if self.items == 0 {
             self.ctrl.fill(EMPTY);
-            self.growth_left = (self.capacity * 7) / 8;
+            self.stash_ctrl = [EMPTY; STASH_CAP];
+            self.stash_count = 0;
+            let stash_bonus = if self.capacity == SEG_CAP {
+                STASH_CAP
+            } else {
+                0
+            };
+            self.growth_left = (self.capacity * 7) / 8 + stash_bonus;
         }
         unsafe {
             self.slots
@@ -1496,9 +1582,8 @@ impl RawSegment {
     pub fn rebuild(&mut self, new_cap: usize) {
         let mut next = RawSegment::new(new_cap, self.local_depth);
         for entry in self.slots.drain(..).flatten() {
-            let h = hash_key(&entry.key);
-            let (_, insert_idx) = next.find_or_prepare_insert_raw(&entry.key, h);
-            next.insert_at(entry, h, insert_idx);
+            let h = mix_hash(hash_key(&entry.key));
+            next.insert_migrated(entry, h);
         }
         *self = next;
     }
@@ -1532,12 +1617,12 @@ impl RudisFlatTable {
     }
 
     #[inline(always)]
-    fn dir_index(&self, hash: u64) -> usize {
-        ((hash >> SEG_SHIFT) as usize) & self.dir_mask
+    fn dir_index(&self, mixed_hash: u64) -> usize {
+        ((mixed_hash >> SEG_SHIFT) as usize) & self.dir_mask
     }
 
     /// Splits or grows `segments[seg_id]` when `growth_left == 0`.
-    fn split_or_grow_segment(&mut self, mut dir_idx: usize, mut seg_id: usize, key_hash: u64) {
+    fn split_or_grow_segment(&mut self, mut dir_idx: usize, mut seg_id: usize, mixed_hash: u64) {
         while self.segments[seg_id].growth_left == 0 {
             let seg_items = self.segments[seg_id].items;
             let seg_cap = self.segments[seg_id].capacity;
@@ -1570,7 +1655,7 @@ impl RudisFlatTable {
                 }
                 self.global_depth += 1;
                 self.dir_mask = self.directory.len() - 1;
-                dir_idx = self.dir_index(key_hash);
+                dir_idx = self.dir_index(mixed_hash);
             }
 
             let mut seg_zero = RawSegment::new(SEG_CAP, d + 1);
@@ -1578,13 +1663,11 @@ impl RudisFlatTable {
             let bit_shift = SEG_SHIFT + (d as usize);
 
             for entry in self.segments[seg_id].slots.drain(..).flatten() {
-                let h = hash_key(&entry.key);
+                let h = mix_hash(hash_key(&entry.key));
                 if ((h >> bit_shift) & 1) == 0 {
-                    let (_, idx) = seg_zero.find_or_prepare_insert_raw(&entry.key, h);
-                    seg_zero.insert_at(entry, h, idx);
+                    seg_zero.insert_migrated(entry, h);
                 } else {
-                    let (_, idx) = seg_one.find_or_prepare_insert_raw(&entry.key, h);
-                    seg_one.insert_at(entry, h, idx);
+                    seg_one.insert_migrated(entry, h);
                 }
             }
 
@@ -1601,7 +1684,7 @@ impl RudisFlatTable {
                 i += step;
             }
 
-            dir_idx = self.dir_index(key_hash);
+            dir_idx = self.dir_index(mixed_hash);
             seg_id = self.directory[dir_idx] as usize;
         }
     }
@@ -1611,11 +1694,12 @@ impl RudisFlatTable {
         if self.items == 0 {
             return None;
         }
-        let dir_idx = self.dir_index(hash);
+        let h = mix_hash(hash);
+        let dir_idx = self.dir_index(h);
         let seg_id = unsafe { *self.directory.get_unchecked(dir_idx) as usize };
         let seg = unsafe { self.segments.get_unchecked(seg_id) };
-        seg.find_entry(key, hash)
-            .map(|(local_idx, entry)| ((seg_id << SEG_SHIFT) | local_idx, entry))
+        seg.find_entry(key, h)
+            .map(|(local_idx, entry)| ((seg_id << GLOBAL_IDX_SHIFT) | local_idx, entry))
     }
 
     #[inline(always)]
@@ -1623,10 +1707,11 @@ impl RudisFlatTable {
         if self.items == 0 {
             return false;
         }
-        let dir_idx = self.dir_index(hash);
+        let h = mix_hash(hash);
+        let dir_idx = self.dir_index(h);
         let seg_id = unsafe { *self.directory.get_unchecked(dir_idx) as usize };
         let seg = unsafe { self.segments.get_unchecked(seg_id) };
-        seg.contains(key, hash)
+        seg.contains(key, h)
     }
 
     #[inline(always)]
@@ -1634,11 +1719,12 @@ impl RudisFlatTable {
         if self.items == 0 {
             return None;
         }
-        let dir_idx = self.dir_index(hash);
+        let h = mix_hash(hash);
+        let dir_idx = self.dir_index(h);
         let seg_id = unsafe { *self.directory.get_unchecked(dir_idx) as usize };
         let seg = unsafe { self.segments.get_unchecked_mut(seg_id) };
-        seg.find_entry_mut(key, hash)
-            .map(|(local_idx, entry)| ((seg_id << SEG_SHIFT) | local_idx, entry))
+        seg.find_entry_mut(key, h)
+            .map(|(local_idx, entry)| ((seg_id << GLOBAL_IDX_SHIFT) | local_idx, entry))
     }
 
     #[inline(always)]
@@ -1648,21 +1734,22 @@ impl RudisFlatTable {
 
     #[inline(always)]
     pub fn find_or_prepare_insert(&mut self, key: &[u8], hash: u64) -> (Option<usize>, usize) {
-        let mut dir_idx = self.dir_index(hash);
+        let h = mix_hash(hash);
+        let mut dir_idx = self.dir_index(h);
         let mut seg_id = unsafe { *self.directory.get_unchecked(dir_idx) as usize };
 
         if self.segments[seg_id].growth_left == 0 {
-            if let Some((local_idx, _)) = self.segments[seg_id].find_entry(key, hash) {
-                let global_idx = (seg_id << SEG_SHIFT) | local_idx;
+            if let Some((local_idx, _)) = self.segments[seg_id].find_entry(key, h) {
+                let global_idx = (seg_id << GLOBAL_IDX_SHIFT) | local_idx;
                 return (Some(global_idx), global_idx);
             }
-            self.split_or_grow_segment(dir_idx, seg_id, hash);
-            dir_idx = self.dir_index(hash);
+            self.split_or_grow_segment(dir_idx, seg_id, h);
+            dir_idx = self.dir_index(h);
             seg_id = unsafe { *self.directory.get_unchecked(dir_idx) as usize };
         }
 
-        let (existing, local_idx) = self.segments[seg_id].find_or_prepare_insert_raw(key, hash);
-        let base = seg_id << SEG_SHIFT;
+        let (existing, local_idx) = self.segments[seg_id].find_or_prepare_insert_raw(key, h);
+        let base = seg_id << GLOBAL_IDX_SHIFT;
         (existing.map(|i| base | i), base | local_idx)
     }
 
@@ -1685,8 +1772,8 @@ impl RudisFlatTable {
     pub fn insert(&mut self, entry: RudisEntry) -> Option<RudisEntry> {
         let h = hash_key(&entry.key);
         let (existing, global_idx) = self.find_or_prepare_insert(&entry.key, h);
-        let seg_id = global_idx >> SEG_SHIFT;
-        let local_idx = global_idx & SEG_MASK;
+        let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
+        let local_idx = global_idx & GLOBAL_IDX_MASK;
 
         if existing.is_some() {
             self.segments[seg_id].slots[local_idx].replace(entry)
@@ -1695,7 +1782,7 @@ impl RudisFlatTable {
                 let slot = crate::router::key_slot(&entry.key) as usize;
                 self.slot_counts[slot] += 1;
             }
-            self.segments[seg_id].insert_at(entry, h, local_idx);
+            self.segments[seg_id].insert_at(entry, mix_hash(h), local_idx);
             self.items += 1;
             None
         }
@@ -1707,12 +1794,12 @@ impl RudisFlatTable {
             let slot = crate::router::key_slot(&entry.key) as usize;
             self.slot_counts[slot] += 1;
         }
-        let seg_id = global_idx >> SEG_SHIFT;
-        let local_idx = global_idx & SEG_MASK;
+        let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
+        let local_idx = global_idx & GLOBAL_IDX_MASK;
         unsafe {
             self.segments
                 .get_unchecked_mut(seg_id)
-                .insert_at(entry, hash, local_idx);
+                .insert_at(entry, mix_hash(hash), local_idx);
         }
         self.items += 1;
     }
@@ -1728,8 +1815,8 @@ impl RudisFlatTable {
 
     #[inline(always)]
     pub fn remove(&mut self, global_idx: usize) -> Option<RudisEntry> {
-        let seg_id = global_idx >> SEG_SHIFT;
-        let local_idx = global_idx & SEG_MASK;
+        let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
+        let local_idx = global_idx & GLOBAL_IDX_MASK;
         let entry = self.segments.get_mut(seg_id)?.remove(local_idx)?;
         self.items -= 1;
         if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1741,8 +1828,8 @@ impl RudisFlatTable {
 
     #[inline(always)]
     pub fn remove_present(&mut self, global_idx: usize) -> RudisEntry {
-        let seg_id = global_idx >> SEG_SHIFT;
-        let local_idx = global_idx & SEG_MASK;
+        let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
+        let local_idx = global_idx & GLOBAL_IDX_MASK;
         let entry = unsafe {
             self.segments
                 .get_unchecked_mut(seg_id)
@@ -1758,15 +1845,15 @@ impl RudisFlatTable {
 
     #[inline(always)]
     pub fn get_slot(&self, global_idx: usize) -> Option<&RudisEntry> {
-        let seg_id = global_idx >> SEG_SHIFT;
-        let local_idx = global_idx & SEG_MASK;
+        let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
+        let local_idx = global_idx & GLOBAL_IDX_MASK;
         self.segments.get(seg_id)?.slots.get(local_idx)?.as_ref()
     }
 
     #[inline(always)]
     pub fn get_slot_mut(&mut self, global_idx: usize) -> Option<&mut RudisEntry> {
-        let seg_id = global_idx >> SEG_SHIFT;
-        let local_idx = global_idx & SEG_MASK;
+        let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
+        let local_idx = global_idx & GLOBAL_IDX_MASK;
         self.segments
             .get_mut(seg_id)?
             .slots
@@ -1789,7 +1876,7 @@ impl RudisFlatTable {
     #[inline]
     pub fn enumerate_slots(&self) -> impl Iterator<Item = (usize, Option<&RudisEntry>)> {
         self.segments.iter().enumerate().flat_map(|(seg_id, seg)| {
-            let base = seg_id << SEG_SHIFT;
+            let base = seg_id << GLOBAL_IDX_SHIFT;
             seg.slots
                 .iter()
                 .enumerate()
@@ -1849,9 +1936,8 @@ impl RudisFlatTable {
             let mut single = RawSegment::new(target_cap, 0);
             for seg in self.segments.iter_mut() {
                 for entry in seg.slots.drain(..).flatten() {
-                    let h = hash_key(&entry.key);
-                    let (_, idx) = single.find_or_prepare_insert_raw(&entry.key, h);
-                    single.insert_at(entry, h, idx);
+                    let h = mix_hash(hash_key(&entry.key));
+                    single.insert_migrated(entry, h);
                 }
             }
             self.segments.clear();
@@ -5151,6 +5237,7 @@ impl RudisTable {
                         return Ok(crate::shard::CompactResp::Array1Bulk(v.clone()));
                     }
                     out.clear();
+                    out.reserve(16 + count * 28);
                     crate::connection::write_resp_array_header(out, count);
                     for i in start_u..=stop_u {
                         if let Some(v) = deque.get(i) {
@@ -7388,6 +7475,7 @@ impl RudisTable {
                                 }
                             }
                             out.clear();
+                            out.reserve(16 + limit * 28);
                             crate::connection::write_resp_array_header(out, limit);
                             match zset {
                                 RudisZSet::Small(v) => {
