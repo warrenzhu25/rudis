@@ -11498,3 +11498,59 @@ fn test_e2e_unlink_readonly_wait_object_and_proto_max() {
     assert!(cmd_list_resp.contains("xinfo"));
     assert!(cmd_list_resp.contains("unlink"));
 }
+
+#[test]
+fn test_client_setinfo_latency_pubsub_function_e2e() {
+    let port = 19123;
+    start_test_server(port, 4);
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // 1. CLIENT SETINFO lib-name & lib-ver
+    assert_eq!(
+        send_and_read(&mut stream, b"CLIENT SETINFO lib-name test-driver\r\n"),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"CLIENT SETINFO lib-ver 1.2.3\r\n"),
+        "+OK\r\n"
+    );
+
+    let client_info = send_and_read(&mut stream, b"CLIENT INFO\r\n");
+    assert!(client_info.contains("lib-name=test-driver"));
+    assert!(client_info.contains("lib-ver=1.2.3"));
+
+    let client_list = send_and_read(&mut stream, b"CLIENT LIST\r\n");
+    assert!(client_list.contains("lib-name=test-driver"));
+    assert!(client_list.contains("lib-ver=1.2.3"));
+
+    // 2. LATENCY subcommands
+    assert_eq!(send_and_read(&mut stream, b"LATENCY LATEST\r\n"), "*0\r\n");
+    let doctor = send_and_read(&mut stream, b"LATENCY DOCTOR\r\n");
+    assert!(doctor.contains("Dave"));
+
+    assert_eq!(
+        send_and_read(&mut stream, b"LATENCY HISTORY cmd\r\n"),
+        "*0\r\n"
+    );
+    assert_eq!(send_and_read(&mut stream, b"LATENCY RESET\r\n"), ":0\r\n");
+    let graph = send_and_read(&mut stream, b"LATENCY GRAPH cmd\r\n");
+    assert!(graph.contains("No samples available"));
+
+    let latency_help = send_and_read(&mut stream, b"LATENCY HELP\r\n");
+    assert!(latency_help.contains("LATEST"));
+
+    // 3. PUBSUB HELP
+    let pubsub_help = send_and_read(&mut stream, b"PUBSUB HELP\r\n");
+    assert!(pubsub_help.contains("CHANNELS"));
+    assert!(pubsub_help.contains("NUMPAT"));
+
+    // 4. FUNCTION STATS & KILL
+    let func_stats = send_and_read(&mut stream, b"FUNCTION STATS\r\n");
+    assert!(func_stats.contains("running_script"));
+    assert!(func_stats.contains("libraries_count"));
+    assert_eq!(send_and_read(&mut stream, b"FUNCTION KILL\r\n"), "+OK\r\n");
+}

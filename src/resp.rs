@@ -153,6 +153,20 @@ pub enum ClientSubcommand {
     Pause(u64),
     Unpause,
     NoTouch(bool),
+    SetInfo {
+        attr: String,
+        val: String,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum LatencySubcommand {
+    Latest,
+    History(String),
+    Doctor,
+    Reset(Vec<String>),
+    Graph(String),
+    Help,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -190,6 +204,10 @@ pub enum XinfoSubcommand {
 pub enum Command {
     Object(ObjectSubcommand),
     Xinfo(XinfoSubcommand),
+    Latency(LatencySubcommand),
+    PubsubHelp,
+    FunctionStats,
+    FunctionKill,
     CommandCount,
     CommandList,
     Auth {
@@ -2970,6 +2988,19 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     let name = String::from_utf8_lossy(&args[2]).to_string();
                     Ok(Some(Command::Client(ClientSubcommand::SetName(name))))
                 }
+                "SETINFO" => {
+                    if args.len() < 4 {
+                        return Err(
+                            "wrong number of arguments for 'client setinfo' command".to_string()
+                        );
+                    }
+                    let attr = String::from_utf8_lossy(&args[2]).to_string();
+                    let val = String::from_utf8_lossy(&args[3]).to_string();
+                    Ok(Some(Command::Client(ClientSubcommand::SetInfo {
+                        attr,
+                        val,
+                    })))
+                }
                 "GETNAME" => Ok(Some(Command::Client(ClientSubcommand::GetName))),
                 "ID" => Ok(Some(Command::Client(ClientSubcommand::Id))),
                 "KILL" => Ok(Some(Command::Client(ClientSubcommand::Kill(
@@ -4826,6 +4857,41 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
         "BGSAVE" => Ok(Some(Command::Bgsave)),
         "BGREWRITEAOF" => Ok(Some(Command::Bgrewriteaof)),
         "LASTSAVE" => Ok(Some(Command::Lastsave)),
+        "LATENCY" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'latency' command".to_string());
+            }
+            let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
+            match sub.as_str() {
+                "LATEST" => Ok(Some(Command::Latency(LatencySubcommand::Latest))),
+                "HISTORY" => {
+                    let ev = if args.len() > 2 {
+                        String::from_utf8_lossy(&args[2]).to_string()
+                    } else {
+                        String::new()
+                    };
+                    Ok(Some(Command::Latency(LatencySubcommand::History(ev))))
+                }
+                "DOCTOR" => Ok(Some(Command::Latency(LatencySubcommand::Doctor))),
+                "RESET" => {
+                    let events = args[2..]
+                        .iter()
+                        .map(|b| String::from_utf8_lossy(b).to_string())
+                        .collect();
+                    Ok(Some(Command::Latency(LatencySubcommand::Reset(events))))
+                }
+                "GRAPH" => {
+                    let ev = if args.len() > 2 {
+                        String::from_utf8_lossy(&args[2]).to_string()
+                    } else {
+                        String::new()
+                    };
+                    Ok(Some(Command::Latency(LatencySubcommand::Graph(ev))))
+                }
+                "HELP" => Ok(Some(Command::Latency(LatencySubcommand::Help))),
+                _ => Ok(Some(Command::Unknown(format!("LATENCY {}", sub)))),
+            }
+        }
         "COMMAND" => {
             if args.len() == 1 {
                 Ok(Some(Command::CommandDocs))
@@ -5363,6 +5429,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     };
                     Ok(Some(Command::PubsubShardnumsub(channels)))
                 }
+                "HELP" => Ok(Some(Command::PubsubHelp)),
                 _ => Ok(Some(Command::Unknown(format!("PUBSUB {}", sub)))),
             }
         }
@@ -7084,6 +7151,8 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
                 "LIST" => Ok(Some(Command::FunctionList)),
                 "FLUSH" => Ok(Some(Command::FunctionFlush)),
+                "STATS" => Ok(Some(Command::FunctionStats)),
+                "KILL" => Ok(Some(Command::FunctionKill)),
                 "DELETE" => {
                     if args.len() != 3 {
                         return Err(
@@ -9456,8 +9525,9 @@ mod tests {
         );
 
         // XINFO CONSUMERS
-        let mut buf =
-            BytesMut::from("*4\r\n$5\r\nXINFO\r\n$9\r\nCONSUMERS\r\n$8\r\nmystream\r\n$7\r\nmygroup\r\n");
+        let mut buf = BytesMut::from(
+            "*4\r\n$5\r\nXINFO\r\n$9\r\nCONSUMERS\r\n$8\r\nmystream\r\n$7\r\nmygroup\r\n",
+        );
         let cmd = parse_command(&mut buf).unwrap().unwrap();
         assert_eq!(
             cmd,
@@ -9480,5 +9550,63 @@ mod tests {
         let mut buf = BytesMut::from("*2\r\n$7\r\nCOMMAND\r\n$4\r\nLIST\r\n");
         let cmd = parse_command(&mut buf).unwrap().unwrap();
         assert_eq!(cmd, Command::CommandList);
+
+        // CLIENT SETINFO
+        let mut buf = BytesMut::from(
+            "*4\r\n$6\r\nCLIENT\r\n$7\r\nSETINFO\r\n$8\r\nlib-name\r\n$8\r\nredis-py\r\n",
+        );
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::Client(ClientSubcommand::SetInfo {
+                attr: "lib-name".to_string(),
+                val: "redis-py".to_string(),
+            })
+        );
+
+        // LATENCY subcommands
+        let mut buf = BytesMut::from("*2\r\n$7\r\nLATENCY\r\n$6\r\nLATEST\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(cmd, Command::Latency(LatencySubcommand::Latest));
+
+        let mut buf = BytesMut::from("*2\r\n$7\r\nLATENCY\r\n$6\r\nDOCTOR\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(cmd, Command::Latency(LatencySubcommand::Doctor));
+
+        let mut buf = BytesMut::from("*3\r\n$7\r\nLATENCY\r\n$7\r\nHISTORY\r\n$7\r\ncommand\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::Latency(LatencySubcommand::History("command".to_string()))
+        );
+
+        let mut buf = BytesMut::from("*2\r\n$7\r\nLATENCY\r\n$5\r\nRESET\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(cmd, Command::Latency(LatencySubcommand::Reset(vec![])));
+
+        let mut buf = BytesMut::from("*3\r\n$7\r\nLATENCY\r\n$5\r\nGRAPH\r\n$7\r\ncommand\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::Latency(LatencySubcommand::Graph("command".to_string()))
+        );
+
+        let mut buf = BytesMut::from("*2\r\n$7\r\nLATENCY\r\n$4\r\nHELP\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(cmd, Command::Latency(LatencySubcommand::Help));
+
+        // PUBSUB HELP
+        let mut buf = BytesMut::from("*2\r\n$6\r\nPUBSUB\r\n$4\r\nHELP\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(cmd, Command::PubsubHelp);
+
+        // FUNCTION STATS & KILL
+        let mut buf = BytesMut::from("*2\r\n$8\r\nFUNCTION\r\n$5\r\nSTATS\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(cmd, Command::FunctionStats);
+
+        let mut buf = BytesMut::from("*2\r\n$8\r\nFUNCTION\r\n$4\r\nKILL\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(cmd, Command::FunctionKill);
     }
 }

@@ -10,8 +10,8 @@ use std::time::Instant;
 use std::os::unix::io::AsRawFd;
 
 use crate::resp::{
-    ClientSubcommand, ClusterSubcommand, Command, MemorySubcommand, MsetexCondition, MsetexExpiry,
-    SetSlotSubcommand, parse_command,
+    ClientSubcommand, ClusterSubcommand, Command, LatencySubcommand, MemorySubcommand,
+    MsetexCondition, MsetexExpiry, SetSlotSubcommand, parse_command,
 };
 use crate::router::{Router, key_slot, target_shard};
 use crate::shard::{CompactResp, ShardDb, ShardMessage};
@@ -28,6 +28,8 @@ pub struct ClientInfo {
     pub id: u64,
     pub addr: SocketAddr,
     pub name: Option<String>,
+    pub lib_name: Option<String>,
+    pub lib_ver: Option<String>,
     pub connected_at: Instant,
     pub last_active: Instant,
     pub last_cmd: &'static str,
@@ -982,6 +984,8 @@ pub async fn handle_tls_connection(
             id: client_id,
             addr: client_addr,
             name: None,
+            lib_name: None,
+            lib_ver: None,
             connected_at: now,
             last_active: now,
             last_cmd: "NONE",
@@ -1107,6 +1111,8 @@ pub async fn handle_connection(
             id: client_id,
             addr: client_addr,
             name: None,
+            lib_name: None,
+            lib_ver: None,
             connected_at: now,
             last_active: now,
             last_cmd: "NONE",
@@ -3536,6 +3542,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
             ClientSubcommand::Pause(_) => "client|pause",
             ClientSubcommand::Unpause => "client|unpause",
             ClientSubcommand::NoTouch(_) => "client|no-touch",
+            ClientSubcommand::SetInfo { .. } => "client|setinfo",
         },
         Command::Asking => "ASKING",
         Command::Migrate { .. } => "MIGRATE",
@@ -3656,6 +3663,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::PubsubNumsub(_) => "PUBSUB NUMSUB",
         Command::PubsubShardnumsub(_) => "PUBSUB SHARDNUMSUB",
         Command::PubsubNumpat => "PUBSUB NUMPAT",
+        Command::PubsubHelp => "PUBSUB HELP",
         Command::Keys(_) => "KEYS",
         Command::Scan { .. } => "SCAN",
         Command::Randomkey => "RANDOMKEY",
@@ -3711,7 +3719,9 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::FunctionLoad { .. }
         | Command::FunctionList
         | Command::FunctionDelete(_)
-        | Command::FunctionFlush => "FUNCTION",
+        | Command::FunctionFlush
+        | Command::FunctionStats
+        | Command::FunctionKill => "FUNCTION",
         Command::Fcall { .. } => "FCALL",
         Command::JsonSet { .. }
         | Command::JsonGet { .. }
@@ -3791,6 +3801,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::MemcachedVersion => "MEMCACHED_VERSION",
         Command::MemcachedQuit => "MEMCACHED_QUIT",
         Command::Memory(_) => "MEMORY",
+        Command::Latency(_) => "LATENCY",
         Command::Debug(_) => "DEBUG",
         Command::Readonly => "READONLY",
         Command::Readwrite => "READWRITE",
@@ -5782,7 +5793,7 @@ async fn execute_command(
                             .is_blocked(c.id);
                         let flags = if is_blocked { "b" } else { "N" };
                         let info = format!(
-                            "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=20448 argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name= lib-ver= io-thread=0 tot-net-in=0 tot-net-out=0 tot-cmds=0 read-events=0 avg-pipeline-len-sum=0 avg-pipeline-len-cnt=0\n",
+                            "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=20448 argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name={} lib-ver={} io-thread=0 tot-net-in=0 tot-net-out=0 tot-cmds=0 read-events=0 avg-pipeline-len-sum=0 avg-pipeline-len-cnt=0\n",
                             c.id,
                             c.addr,
                             router.port,
@@ -5791,7 +5802,9 @@ async fn execute_command(
                             idle,
                             flags,
                             c.omem,
-                            c.last_cmd.to_lowercase()
+                            c.last_cmd.to_lowercase(),
+                            c.lib_name.as_deref().unwrap_or(""),
+                            c.lib_ver.as_deref().unwrap_or(""),
                         );
                         out.extend_from_slice(format!("${}\r\n", info.len()).as_bytes());
                         out.extend_from_slice(info.as_bytes());
@@ -5803,6 +5816,16 @@ async fn execute_command(
                 ClientSubcommand::SetName(name) => {
                     if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                         c.name = Some(name);
+                    }
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                ClientSubcommand::SetInfo { attr, val } => {
+                    if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                        if attr.eq_ignore_ascii_case("lib-name") {
+                            c.lib_name = Some(val);
+                        } else if attr.eq_ignore_ascii_case("lib-ver") {
+                            c.lib_ver = Some(val);
+                        }
                     }
                     out.extend_from_slice(b"+OK\r\n");
                 }
@@ -8137,6 +8160,30 @@ async fn execute_command(
             out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
             false
         }
+        Command::PubsubHelp => {
+            let help_lines = [
+                "PUBSUB <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                "CHANNELS [<pattern>]",
+                "    Return the currently active channels matching a <pattern> (default: '*').",
+                "NUMPAT",
+                "    Return number of subscriptions to patterns (that are performed using",
+                "    the PSUBSCRIBE command).",
+                "NUMSUB [<channel> ...]",
+                "    Return the number of subscribers for the specified channels, excluding",
+                "    pattern subscriptions(default: no channels).",
+                "SHARDCHANNELS [<pattern>]",
+                "    Return the currently active shard level channels matching a <pattern> (default: '*').",
+                "SHARDNUMSUB [<shardchannel> ...]",
+                "    Return the number of subscribers for the specified shard level channels.",
+                "HELP",
+                "    Print this help.",
+            ];
+            out.extend_from_slice(format!("*{}\r\n", help_lines.len()).as_bytes());
+            for line in help_lines {
+                out.extend_from_slice(format!("${}\r\n{}\r\n", line.len(), line).as_bytes());
+            }
+            false
+        }
         Command::Keys(pattern) => {
             let keys = router.keys(&pattern).await;
             out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
@@ -8488,6 +8535,39 @@ async fn execute_command(
         }
         Command::FunctionFlush => {
             crate::scripting::flush_functions();
+            out.extend_from_slice(b"+OK\r\n");
+            false
+        }
+        Command::FunctionStats => {
+            let libs = crate::scripting::list_functions();
+            let lib_count = libs.len();
+            let func_count: usize = libs.iter().map(|l| l.functions.len()).sum();
+            if CURRENT_CLIENT_RESP3.get() {
+                out.extend_from_slice(b"%2\r\n");
+            } else {
+                out.extend_from_slice(b"*4\r\n");
+            }
+            write_resp_bulk(out, b"running_script");
+            write_resp_null(out);
+            write_resp_bulk(out, b"engines");
+            if CURRENT_CLIENT_RESP3.get() {
+                out.extend_from_slice(b"%1\r\n");
+            } else {
+                out.extend_from_slice(b"*2\r\n");
+            }
+            write_resp_bulk(out, b"LUA");
+            if CURRENT_CLIENT_RESP3.get() {
+                out.extend_from_slice(b"%2\r\n");
+            } else {
+                out.extend_from_slice(b"*4\r\n");
+            }
+            write_resp_bulk(out, b"libraries_count");
+            write_resp_integer(out, lib_count as i64);
+            write_resp_bulk(out, b"functions_count");
+            write_resp_integer(out, func_count as i64);
+            false
+        }
+        Command::FunctionKill => {
             out.extend_from_slice(b"+OK\r\n");
             false
         }
@@ -9086,6 +9166,65 @@ async fn execute_command(
                     out.extend_from_slice(
                         b"+Hi Sam, I can't find any memory issues in your instance.\r\n",
                     );
+                }
+            }
+            false
+        }
+        Command::Latency(sub) => {
+            match sub {
+                LatencySubcommand::Latest => {
+                    out.extend_from_slice(b"*0\r\n");
+                }
+                LatencySubcommand::History(ev) => {
+                    if ev.is_empty() {
+                        out.extend_from_slice(
+                            b"-ERR wrong number of arguments for 'latency history' command\r\n",
+                        );
+                    } else {
+                        out.extend_from_slice(b"*0\r\n");
+                    }
+                }
+                LatencySubcommand::Doctor => {
+                    out.extend_from_slice(
+                        b"+Dave, no latency spikes observed in your instance.\r\n",
+                    );
+                }
+                LatencySubcommand::Reset(_) => {
+                    out.extend_from_slice(b":0\r\n");
+                }
+                LatencySubcommand::Graph(ev) => {
+                    if ev.is_empty() {
+                        out.extend_from_slice(
+                            b"-ERR wrong number of arguments for 'latency graph' command\r\n",
+                        );
+                    } else {
+                        let err = format!("-ERR No samples available for event '{}'\r\n", ev);
+                        out.extend_from_slice(err.as_bytes());
+                    }
+                }
+                LatencySubcommand::Help => {
+                    let help_lines = [
+                        "LATENCY <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                        "DOCTOR",
+                        "    Return a human readable latency analysis report.",
+                        "GRAPH <event>",
+                        "    Return an ASCII latency graph for the <event> class.",
+                        "HISTORY <event>",
+                        "    Return time-latency samples for the <event> class.",
+                        "LATEST",
+                        "    Return the latest latency samples for all events.",
+                        "RESET [<event> ...]",
+                        "    Reset latency data of one or more <event> classes.",
+                        "    (default: reset all data for all event classes)",
+                        "HELP",
+                        "    Print this help.",
+                    ];
+                    out.extend_from_slice(format!("*{}\r\n", help_lines.len()).as_bytes());
+                    for line in help_lines {
+                        out.extend_from_slice(
+                            format!("${}\r\n{}\r\n", line.len(), line).as_bytes(),
+                        );
+                    }
                 }
             }
             false
@@ -13663,6 +13802,122 @@ pub fn execute_local_command(
             write_resp_integer(out, set_tombstones as i64);
             false
         }
+        Command::Latency(sub) => {
+            match sub {
+                LatencySubcommand::Latest => {
+                    out.extend_from_slice(b"*0\r\n");
+                }
+                LatencySubcommand::History(ev) => {
+                    if ev.is_empty() {
+                        out.extend_from_slice(
+                            b"-ERR wrong number of arguments for 'latency history' command\r\n",
+                        );
+                    } else {
+                        out.extend_from_slice(b"*0\r\n");
+                    }
+                }
+                LatencySubcommand::Doctor => {
+                    out.extend_from_slice(
+                        b"+Dave, no latency spikes observed in your instance.\r\n",
+                    );
+                }
+                LatencySubcommand::Reset(_) => {
+                    out.extend_from_slice(b":0\r\n");
+                }
+                LatencySubcommand::Graph(ev) => {
+                    if ev.is_empty() {
+                        out.extend_from_slice(
+                            b"-ERR wrong number of arguments for 'latency graph' command\r\n",
+                        );
+                    } else {
+                        let err = format!("-ERR No samples available for event '{}'\r\n", ev);
+                        out.extend_from_slice(err.as_bytes());
+                    }
+                }
+                LatencySubcommand::Help => {
+                    let help_lines = [
+                        "LATENCY <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                        "DOCTOR",
+                        "    Return a human readable latency analysis report.",
+                        "GRAPH <event>",
+                        "    Return an ASCII latency graph for the <event> class.",
+                        "HISTORY <event>",
+                        "    Return time-latency samples for the <event> class.",
+                        "LATEST",
+                        "    Return the latest latency samples for all events.",
+                        "RESET [<event> ...]",
+                        "    Reset latency data of one or more <event> classes.",
+                        "    (default: reset all data for all event classes)",
+                        "HELP",
+                        "    Print this help.",
+                    ];
+                    out.extend_from_slice(format!("*{}\r\n", help_lines.len()).as_bytes());
+                    for line in help_lines {
+                        out.extend_from_slice(
+                            format!("${}\r\n{}\r\n", line.len(), line).as_bytes(),
+                        );
+                    }
+                }
+            }
+            false
+        }
+        Command::PubsubHelp => {
+            let help_lines = [
+                "PUBSUB <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                "CHANNELS [<pattern>]",
+                "    Return the currently active channels matching a <pattern> (default: '*').",
+                "NUMPAT",
+                "    Return number of subscriptions to patterns (that are performed using",
+                "    the PSUBSCRIBE command).",
+                "NUMSUB [<channel> ...]",
+                "    Return the number of subscribers for the specified channels, excluding",
+                "    pattern subscriptions(default: no channels).",
+                "SHARDCHANNELS [<pattern>]",
+                "    Return the currently active shard level channels matching a <pattern> (default: '*').",
+                "SHARDNUMSUB [<shardchannel> ...]",
+                "    Return the number of subscribers for the specified shard level channels.",
+                "HELP",
+                "    Print this help.",
+            ];
+            out.extend_from_slice(format!("*{}\r\n", help_lines.len()).as_bytes());
+            for line in help_lines {
+                out.extend_from_slice(format!("${}\r\n{}\r\n", line.len(), line).as_bytes());
+            }
+            false
+        }
+        Command::FunctionStats => {
+            let libs = crate::scripting::list_functions();
+            let lib_count = libs.len();
+            let func_count: usize = libs.iter().map(|l| l.functions.len()).sum();
+            if CURRENT_CLIENT_RESP3.get() {
+                out.extend_from_slice(b"%2\r\n");
+            } else {
+                out.extend_from_slice(b"*4\r\n");
+            }
+            write_resp_bulk(out, b"running_script");
+            write_resp_null(out);
+            write_resp_bulk(out, b"engines");
+            if CURRENT_CLIENT_RESP3.get() {
+                out.extend_from_slice(b"%1\r\n");
+            } else {
+                out.extend_from_slice(b"*2\r\n");
+            }
+            write_resp_bulk(out, b"LUA");
+            if CURRENT_CLIENT_RESP3.get() {
+                out.extend_from_slice(b"%2\r\n");
+            } else {
+                out.extend_from_slice(b"*4\r\n");
+            }
+            write_resp_bulk(out, b"libraries_count");
+            write_resp_integer(out, lib_count as i64);
+            write_resp_bulk(out, b"functions_count");
+            write_resp_integer(out, func_count as i64);
+            false
+        }
+        Command::FunctionKill => {
+            out.extend_from_slice(b"+OK\r\n");
+            false
+        }
         Command::Quit => {
             out.extend_from_slice(b"+OK\r\n");
             true
@@ -13830,6 +14085,10 @@ async fn execute_commands_squashed(
                                 | Command::Readwrite
                                 | Command::CommandCount
                                 | Command::CommandList
+                                | Command::Latency(_)
+                                | Command::PubsubHelp
+                                | Command::FunctionStats
+                                | Command::FunctionKill
                         )
                     {
                         can_squash = false;
@@ -14392,6 +14651,10 @@ async fn execute_commands_squashed(
                 | Command::Quit
                 | Command::Time
                 | Command::Echo(_)
+                | Command::Latency(_)
+                | Command::PubsubHelp
+                | Command::FunctionStats
+                | Command::FunctionKill
         ) {
             drop(local_db);
             local_buf.clear();
@@ -15311,6 +15574,61 @@ mod tests {
 
         execute_local_command(&Command::CommandList, &mut db, &mut out, None);
         assert!(std::str::from_utf8(&out).unwrap().contains("get"));
+        out.clear();
+
+        // LATENCY LATEST / DOCTOR / HELP / RESET
+        execute_local_command(
+            &Command::Latency(LatencySubcommand::Latest),
+            &mut db,
+            &mut out,
+            None,
+        );
+        assert_eq!(&out[..], b"*0\r\n");
+        out.clear();
+
+        execute_local_command(
+            &Command::Latency(LatencySubcommand::Doctor),
+            &mut db,
+            &mut out,
+            None,
+        );
+        assert!(std::str::from_utf8(&out).unwrap().contains("Dave"));
+        out.clear();
+
+        execute_local_command(
+            &Command::Latency(LatencySubcommand::Reset(vec![])),
+            &mut db,
+            &mut out,
+            None,
+        );
+        assert_eq!(&out[..], b":0\r\n");
+        out.clear();
+
+        execute_local_command(
+            &Command::Latency(LatencySubcommand::Help),
+            &mut db,
+            &mut out,
+            None,
+        );
+        assert!(std::str::from_utf8(&out).unwrap().contains("LATEST"));
+        out.clear();
+
+        // PUBSUB HELP
+        execute_local_command(&Command::PubsubHelp, &mut db, &mut out, None);
+        assert!(std::str::from_utf8(&out).unwrap().contains("CHANNELS"));
+        out.clear();
+
+        // FUNCTION STATS & KILL
+        execute_local_command(&Command::FunctionStats, &mut db, &mut out, None);
+        assert!(
+            std::str::from_utf8(&out)
+                .unwrap()
+                .contains("running_script")
+        );
+        out.clear();
+
+        execute_local_command(&Command::FunctionKill, &mut db, &mut out, None);
+        assert_eq!(&out[..], b"+OK\r\n");
         out.clear();
     }
 }
