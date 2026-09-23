@@ -65,3 +65,10 @@ jobs:
             exit 1
           }
 
+      - name: Build Optimized Release Binary
+        run: cargo build --release
+
+      - name: Verify Zero Hardware Regression Invariants
+        run: python3 scripts/check_perf_regression.py
+
+

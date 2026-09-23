@@ -31,19 +31,53 @@ import re
 import signal
 import socket
 import statistics
+import shutil
 import subprocess
 import sys
 import time
 
-RUDIS_BIN = "/usr/local/google/home/warrenzhu/github/rudis/target/release/rudis"
-MEMTIER_BIN = "/usr/local/google/home/warrenzhu/memtier_benchmark/memtier_benchmark"
+REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+RUDIS_BIN = os.environ.get("RUDIS_BIN", os.path.join(REPO_DIR, "target/release/rudis"))
 
-# Matches the throughput harness: server on quiet physical cores 16-31,
-# client on disjoint physical cores 0-15, all SMT siblings (32-63) idle.
-SERVER_CPUS = "16-31"
-CLIENT_CPUS = "0-15"
-SHARDS = 16
-PORT = 6379
+
+def find_memtier():
+    if "MEMTIER_BIN" in os.environ and os.path.exists(os.environ["MEMTIER_BIN"]):
+        return os.environ["MEMTIER_BIN"]
+    default_path = "/usr/local/google/home/warrenzhu/memtier_benchmark/memtier_benchmark"
+    if os.path.exists(default_path):
+        return default_path
+    which = shutil.which("memtier_benchmark")
+    if which:
+        return which
+    for p in ["/usr/local/bin/memtier_benchmark", "/usr/bin/memtier_benchmark"]:
+        if os.path.exists(p):
+            return p
+    return default_path
+
+
+MEMTIER_BIN = find_memtier()
+
+# CPU pinning: Detect core count dynamically
+total_cpus = os.cpu_count() or 32
+if total_cpus >= 32:
+    default_server = "16-31"
+    default_client = "0-15"
+    default_shards = 16
+elif total_cpus >= 4:
+    half = total_cpus // 2
+    default_server = f"0-{half - 1}"
+    default_client = f"{half}-{total_cpus - 1}"
+    default_shards = half
+else:
+    default_server = "0"
+    default_client = "0"
+    default_shards = 1
+
+SERVER_CPUS = os.environ.get("SERVER_CPUS", default_server)
+CLIENT_CPUS = os.environ.get("CLIENT_CPUS", default_client)
+SHARDS = int(os.environ.get("SHARDS", str(default_shards)))
+CLIENT_THREADS = min(16, max(1, SHARDS))
+PORT = int(os.environ.get("BENCH_PORT", "6379"))
 
 PERF_SECS = int(os.environ.get("BENCH_PERF_SECS", "5"))
 ITERATIONS = int(os.environ.get("BENCH_PERF_ITERS", "3"))
@@ -114,7 +148,7 @@ def populate(pop_type):
     cmd = [
         "taskset", "-c", CLIENT_CPUS, MEMTIER_BIN,
         "-s", "127.0.0.1", "-p", str(PORT),
-        "-t", "16", "-c", "4", "-n", "500",
+        "-t", str(CLIENT_THREADS), "-c", "4", "-n", "500",
         "--key-maximum", str(KEY_MAX), "--pipeline", "16",
         "--hide-histogram",
     ] + POPULATE_ARGS[pop_type]
@@ -125,7 +159,7 @@ def run_client(extra_args):
     cmd = [
         "taskset", "-c", CLIENT_CPUS, MEMTIER_BIN,
         "-s", "127.0.0.1", "-p", str(PORT),
-        "-t", "16", "-c", "4",
+        "-t", str(CLIENT_THREADS), "-c", "4",
         "--test-time", str(PERF_SECS),
         "--pipeline", "16",
         "--key-maximum", str(KEY_MAX),
@@ -158,6 +192,28 @@ def parse_perf(stderr_text):
     return counters
 
 
+def read_proc_counters(pid):
+    """Read page faults and context switches from /proc when PMU/perf is unavailable."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            fields = f.read().split(")")[-1].split()
+            page_faults = int(fields[7]) + int(fields[9])
+        voluntary = 0
+        nonvoluntary = 0
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("voluntary_ctxt_switches:"):
+                    voluntary = int(line.split(":")[1].strip())
+                elif line.startswith("nonvoluntary_ctxt_switches:"):
+                    nonvoluntary = int(line.split(":")[1].strip())
+        return {
+            "page-faults": page_faults,
+            "context-switches": voluntary + nonvoluntary,
+        }
+    except Exception:
+        return None
+
+
 def measure(name, spec):
     """Attach perf to a running Rudis, drive one workload, return per-op counters."""
     proc = subprocess.Popen(
@@ -178,16 +234,38 @@ def measure(name, spec):
 
         samples = []
         for _ in range(ITERATIONS):
-            perf = subprocess.Popen(
-                ["perf", "stat", "-e", ",".join(EVENTS), "-p", str(proc.pid)],
-                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
-            )
-            time.sleep(0.3)  # let perf attach before load starts
-            ops_sec = run_client(spec["args"])
-            perf.send_signal(signal.SIGINT)
-            _, err = perf.communicate(timeout=20)
+            proc_before = read_proc_counters(proc.pid)
+            perf = None
+            try:
+                perf = subprocess.Popen(
+                    ["perf", "stat", "-e", ",".join(EVENTS), "-p", str(proc.pid)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                )
+                time.sleep(0.3)  # let perf attach before load starts
+            except Exception:
+                pass
 
-            counters = parse_perf(err)
+            ops_sec = run_client(spec["args"])
+            counters = {}
+            if perf:
+                try:
+                    perf.send_signal(signal.SIGINT)
+                    _, err = perf.communicate(timeout=20)
+                    counters = parse_perf(err)
+                except Exception:
+                    pass
+
+            proc_after = read_proc_counters(proc.pid)
+            if proc_before and proc_after:
+                counters.setdefault(
+                    "page-faults",
+                    max(0, proc_after["page-faults"] - proc_before["page-faults"]),
+                )
+                counters.setdefault(
+                    "context-switches",
+                    max(0, proc_after["context-switches"] - proc_before["context-switches"]),
+                )
+
             total_ops = ops_sec * PERF_SECS
             if not counters or total_ops <= 0:
                 continue
@@ -205,8 +283,45 @@ def measure(name, spec):
         time.sleep(0.5)
 
 
+def check_regressions(results, baseline_path):
+    if not os.path.exists(baseline_path):
+        print(f"No baseline found at {baseline_path}, skipping regression check.")
+        return 0
+    with open(baseline_path) as f:
+        baseline = json.load(f)
+    regressions = []
+    for wl in baseline.keys():
+        if wl not in results:
+            continue
+        cur_data = results[wl]
+        if wl == "GET":
+            cur_pf = cur_data.get("page-faults", {}).get("per_op_median", 0.0)
+            cur_cs = cur_data.get("context-switches", {}).get("per_op_median", 0.0)
+            if cur_pf > 0.01:
+                regressions.append(f"GET page-faults regression: {cur_pf:.4f} /op (expected ~0.0)")
+            if cur_cs > 0.01:
+                regressions.append(f"GET context-switches regression: {cur_cs:.4f} /op (expected ~0.0)")
+        elif wl == "SET":
+            cur_cs = cur_data.get("context-switches", {}).get("per_op_median", 0.0)
+            if cur_cs > 0.01:
+                regressions.append(f"SET context-switches regression: {cur_cs:.4f} /op (expected ~0.0)")
+
+    if regressions:
+        print("\n" + "=" * 80)
+        print("  PERFORMANCE REGRESSION GATE FAILED:")
+        for r in regressions:
+            print(f"  [!] {r}")
+        print("=" * 80)
+        return 1
+    else:
+        print("\n[+] Performance regression gate passed: zero hardware counter regressions detected.")
+        return 0
+
+
 def main():
-    selected = sys.argv[1:] or list(WORKLOADS.keys())
+    check_mode = "--check" in sys.argv
+    args = [a for a in sys.argv[1:] if a != "--check"]
+    selected = args or list(WORKLOADS.keys())
     unknown = [w for w in selected if w not in WORKLOADS]
     if unknown:
         raise SystemExit(f"Unknown workload(s): {unknown}. Known: {list(WORKLOADS)}")
@@ -217,6 +332,12 @@ def main():
           f"{PERF_SECS}s x {ITERATIONS} runs (+1 warmup)")
     print("  User-space counters only (perf_event_paranoid=2).")
     print("=" * 100)
+
+    out = os.environ.get(
+        "PERF_OUT_FILE",
+        os.path.join(REPO_DIR, "benchmark_perf_counters.json"),
+    )
+    baseline_path = out
 
     results = {}
     for name in selected:
@@ -241,10 +362,15 @@ def main():
         print(f"    {'(throughput)':<18} {statistics.median(ops):>14,.0f} ops/s")
         results[name] = agg
 
-    out = "/usr/local/google/home/warrenzhu/github/rudis/benchmark_perf_counters.json"
     with open(out, "w") as f:
         json.dump(results, f, indent=2)
     print(f"\nWritten to {out}")
+
+    if check_mode:
+        ret = check_regressions(results, baseline_path)
+        if ret != 0:
+            sys.exit(ret)
+
     print("\nCompare across commits with: git stash && <rebuild> && rerun && diff the json.")
     print("instructions/op and page-faults/op are the most trustworthy signals.")
 

@@ -1,24 +1,24 @@
 {
   "SET": {
     "page-faults": {
-      "per_op_median": 0.0005616920093767087,
-      "cv_pct": 13.069286978937816
+      "per_op_median": 0.0005270380554917566,
+      "cv_pct": 0.0
     },
     "context-switches": {
       "per_op_median": 0.0,
       "cv_pct": 0.0
     },
-    "_ops_sec_median": 2072875.69
+    "_ops_sec_median": 2616509.35
   },
   "GET": {
     "page-faults": {
-      "per_op_median": 0.0,
+      "per_op_median": 3.2141463890751135e-06,
       "cv_pct": 0.0
     },
     "context-switches": {
       "per_op_median": 0.0,
       "cv_pct": 0.0
     },
-    "_ops_sec_median": 2918215.97
+    "_ops_sec_median": 3111245.97
   }
 }
