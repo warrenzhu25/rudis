@@ -9617,6 +9617,21 @@ impl RudisTable {
         }
     }
 
+    pub fn stream_last_id(&mut self, key: &[u8]) -> Option<StreamId> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return None;
+            }
+            if let Some(entry) = self.table.get_slot(idx)
+                && let RudisValue::Stream(s) = &entry.val
+            {
+                return Some(s.last_id);
+            }
+        }
+        None
+    }
+
     pub fn xread(
         &mut self,
         keys: &[Bytes],

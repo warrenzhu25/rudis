@@ -4116,6 +4116,236 @@ async fn fetch_remote_zset(
     Ok(map)
 }
 
+fn extract_stream_blocks(raw: &[u8]) -> Vec<&[u8]> {
+    let mut blocks = Vec::new();
+    if raw.is_empty()
+        || raw.starts_with(b"$-1")
+        || raw.starts_with(b"*0\r\n")
+        || raw.starts_with(b"-")
+    {
+        return blocks;
+    }
+    if raw[0] != b'*' {
+        return blocks;
+    }
+    let Some(first_nl) = raw.iter().position(|&b| b == b'\n') else {
+        return blocks;
+    };
+    let mut pos = first_nl + 1;
+    while pos < raw.len() {
+        if raw[pos] != b'*' {
+            break;
+        }
+        let block_start = pos;
+        let Some(nl1) = raw[pos..].iter().position(|&b| b == b'\n') else {
+            break;
+        };
+        pos += nl1 + 1;
+        if pos >= raw.len() || raw[pos] != b'$' {
+            break;
+        }
+        let Some(nl2) = raw[pos..].iter().position(|&b| b == b'\n') else {
+            break;
+        };
+        let klen: usize = std::str::from_utf8(&raw[pos + 1..pos + nl2 - 1])
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0);
+        pos += nl2 + 1 + klen + 2;
+        if pos >= raw.len() || raw[pos] != b'*' {
+            break;
+        }
+        let Some(nl3) = raw[pos..].iter().position(|&b| b == b'\n') else {
+            break;
+        };
+        let num_entries: usize = std::str::from_utf8(&raw[pos + 1..pos + nl3 - 1])
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0);
+        pos += nl3 + 1;
+        let mut ok = true;
+        for _ in 0..num_entries {
+            if pos >= raw.len() || raw[pos] != b'*' {
+                ok = false;
+                break;
+            }
+            let Some(enl1) = raw[pos..].iter().position(|&b| b == b'\n') else {
+                ok = false;
+                break;
+            };
+            pos += enl1 + 1;
+            if pos >= raw.len() || raw[pos] != b'$' {
+                ok = false;
+                break;
+            }
+            let Some(enl2) = raw[pos..].iter().position(|&b| b == b'\n') else {
+                ok = false;
+                break;
+            };
+            let idlen: usize = std::str::from_utf8(&raw[pos + 1..pos + enl2 - 1])
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0);
+            pos += enl2 + 1 + idlen + 2;
+            if pos >= raw.len() || raw[pos] != b'*' {
+                ok = false;
+                break;
+            }
+            let Some(enl3) = raw[pos..].iter().position(|&b| b == b'\n') else {
+                ok = false;
+                break;
+            };
+            let num_fields_kv: usize = std::str::from_utf8(&raw[pos + 1..pos + enl3 - 1])
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0);
+            pos += enl3 + 1;
+            for _ in 0..num_fields_kv {
+                if pos >= raw.len() || raw[pos] != b'$' {
+                    ok = false;
+                    break;
+                }
+                let Some(fnl) = raw[pos..].iter().position(|&b| b == b'\n') else {
+                    ok = false;
+                    break;
+                };
+                let flen: usize = std::str::from_utf8(&raw[pos + 1..pos + fnl - 1])
+                    .unwrap_or("0")
+                    .parse()
+                    .unwrap_or(0);
+                pos += fnl + 1 + flen + 2;
+            }
+            if !ok {
+                break;
+            }
+        }
+        if !ok {
+            break;
+        }
+        let block_end = pos;
+        blocks.push(&raw[block_start..block_end]);
+    }
+    blocks
+}
+
+async fn query_cross_shard_streams(
+    router: &Router,
+    cmd: &Command,
+) -> Result<Vec<Vec<u8>>, Vec<u8>> {
+    let (keys, ids) = match cmd {
+        Command::Xread { keys, ids, .. } => (keys, ids),
+        Command::Xreadgroup { keys, ids, .. } => (keys, ids),
+        _ => return Ok(Vec::new()),
+    };
+    let mut shard_keys: hashbrown::HashMap<usize, (Vec<Bytes>, Vec<String>)> =
+        hashbrown::HashMap::new();
+    for (k, id) in keys.iter().zip(ids.iter()) {
+        let s = router.target_shard(k);
+        let entry = shard_keys.entry(s).or_default();
+        entry.0.push(k.clone());
+        entry.1.push(id.clone());
+    }
+
+    let mut shard_ids: Vec<usize> = shard_keys.keys().copied().collect();
+    shard_ids.sort_unstable();
+
+    let mut all_stream_blocks = Vec::new();
+    for s in shard_ids {
+        let (sub_keys, sub_ids) = shard_keys.remove(&s).unwrap();
+        let sub_cmd = match cmd {
+            Command::Xread { count, .. } => Command::Xread {
+                count: *count,
+                block_ms: None,
+                keys: sub_keys,
+                ids: sub_ids,
+            },
+            Command::Xreadgroup {
+                group,
+                consumer,
+                count,
+                noack,
+                ..
+            } => Command::Xreadgroup {
+                group: group.clone(),
+                consumer: consumer.clone(),
+                count: *count,
+                block_ms: None,
+                noack: *noack,
+                keys: sub_keys,
+                ids: sub_ids,
+            },
+            _ => continue,
+        };
+
+        let raw = if s == router.shard_id {
+            let mut tmp = Vec::new();
+            execute_local_command(
+                &sub_cmd,
+                &mut router.local_db.borrow_mut(),
+                &mut tmp,
+                router.aof.as_deref(),
+            );
+            tmp
+        } else {
+            router.execute_remote(s, sub_cmd).await
+        };
+
+        if raw.starts_with(b"-") {
+            return Err(raw);
+        }
+        let blocks = extract_stream_blocks(&raw);
+        for b in blocks {
+            all_stream_blocks.push(b.to_vec());
+        }
+    }
+    Ok(all_stream_blocks)
+}
+
+fn extract_xinfo_last_id(raw: &[u8]) -> Option<String> {
+    const NEEDLE: &[u8] = b"last-generated-id\r\n$";
+    let pos = raw.windows(NEEDLE.len()).position(|w| w == NEEDLE)?;
+    let rem = &raw[pos + NEEDLE.len()..];
+    let nl = rem.iter().position(|&b| b == b'\n')?;
+    let len_str = std::str::from_utf8(&rem[..nl.saturating_sub(1)]).ok()?;
+    let val_len: usize = len_str.parse().ok()?;
+    let val_start = nl + 1;
+    if val_start + val_len <= rem.len() {
+        let id_str = std::str::from_utf8(&rem[val_start..val_start + val_len]).ok()?;
+        Some(id_str.to_string())
+    } else {
+        None
+    }
+}
+
+async fn resolve_stream_last_ids(router: &Router, keys: &[Bytes], ids: &[String]) -> Vec<String> {
+    let mut resolved = Vec::with_capacity(ids.len());
+    for (k, id) in keys.iter().zip(ids.iter()) {
+        if id != "$" {
+            resolved.push(id.clone());
+            continue;
+        }
+        let target = router.target_shard(k);
+        let last_id = if target == router.shard_id {
+            router
+                .local_db
+                .borrow_mut()
+                .table
+                .stream_last_id(k)
+                .map(|sid| sid.to_string())
+        } else {
+            let res = router
+                .execute_remote(
+                    target,
+                    Command::Xinfo(crate::resp::XinfoSubcommand::Stream(k.clone())),
+                )
+                .await;
+            extract_xinfo_last_id(&res)
+        };
+        resolved.push(last_id.unwrap_or_else(|| "0-0".to_string()));
+    }
+    resolved
+}
+
 async fn execute_command(
     cmd: Command,
     router: &Router,
@@ -6221,79 +6451,169 @@ async fn execute_command(
         }
 
         Command::Xread {
-            ref keys, block_ms, ..
+            ref keys,
+            ref ids,
+            block_ms,
+            ..
         }
         | Command::Xreadgroup {
-            ref keys, block_ms, ..
+            ref keys,
+            ref ids,
+            block_ms,
+            ..
         } => {
             if keys.is_empty() {
                 out.extend_from_slice(b"$-1\r\n");
                 return false;
             }
             let first_target = router.target_shard(&keys[0]);
-            for k in &keys[1..] {
-                if router.target_shard(k) != first_target {
-                    out.extend_from_slice(
-                        b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+            let all_same = keys[1..]
+                .iter()
+                .all(|k| router.target_shard(k) == first_target);
+            if all_same {
+                let start_len = out.len();
+                if first_target == router.shard_id {
+                    execute_local_command(
+                        &cmd,
+                        &mut router.local_db.borrow_mut(),
+                        out,
+                        router.aof.as_deref(),
                     );
-                    return false;
-                }
-            }
-
-            let start_len = out.len();
-            if first_target == router.shard_id {
-                execute_local_command(
-                    &cmd,
-                    &mut router.local_db.borrow_mut(),
-                    out,
-                    router.aof.as_deref(),
-                );
-            } else {
-                let res = router.execute_remote(first_target, cmd.clone()).await;
-                out.extend_from_slice(&res);
-            }
-
-            let produced_empty = &out[start_len..] == b"$-1\r\n" || &out[start_len..] == b"*0\r\n";
-            if let Some(wait_ms) = block_ms
-                && produced_empty
-            {
-                out.truncate(start_len);
-                let (tx, rx) = flume::bounded(1);
-                {
-                    let hub_arc = crate::block::get_block_hub_for_port(router.port);
-                    let mut hub = hub_arc.lock().unwrap();
-                    for k in keys {
-                        hub.register_stream_waiter(k.clone(), tx.clone());
-                    }
-                }
-                let raw_fd = client_registry.borrow().get(&client_id).map(|c| c.raw_fd);
-                let (wait_res, client_disconnected) =
-                    wait_for_stream_result(&rx, wait_ms, raw_fd).await;
-                if client_disconnected {
-                    return true;
-                }
-                if wait_res {
-                    let mut unblocked_cmd = cmd.clone();
-                    match &mut unblocked_cmd {
-                        Command::Xread { block_ms: b, .. }
-                        | Command::Xreadgroup { block_ms: b, .. } => {
-                            *b = None;
-                        }
-                        _ => {}
-                    }
-                    if first_target == router.shard_id {
-                        execute_local_command(
-                            &unblocked_cmd,
-                            &mut router.local_db.borrow_mut(),
-                            out,
-                            router.aof.as_deref(),
-                        );
-                    } else {
-                        let res = router.execute_remote(first_target, unblocked_cmd).await;
-                        out.extend_from_slice(&res);
-                    }
                 } else {
-                    out.extend_from_slice(b"$-1\r\n");
+                    let res = router.execute_remote(first_target, cmd.clone()).await;
+                    out.extend_from_slice(&res);
+                }
+
+                let produced_empty =
+                    &out[start_len..] == b"$-1\r\n" || &out[start_len..] == b"*0\r\n";
+                if let Some(wait_ms) = block_ms
+                    && produced_empty
+                {
+                    out.truncate(start_len);
+                    let resolved_ids = resolve_stream_last_ids(router, keys, ids).await;
+                    let (tx, rx) = flume::bounded(1);
+                    {
+                        let hub_arc = crate::block::get_block_hub_for_port(router.port);
+                        let mut hub = hub_arc.lock().unwrap();
+                        for k in keys {
+                            hub.register_stream_waiter(k.clone(), tx.clone());
+                        }
+                    }
+                    let raw_fd = client_registry.borrow().get(&client_id).map(|c| c.raw_fd);
+                    let (wait_res, client_disconnected) =
+                        wait_for_stream_result(&rx, wait_ms, raw_fd).await;
+                    if client_disconnected {
+                        return true;
+                    }
+                    if wait_res {
+                        let mut unblocked_cmd = cmd.clone();
+                        match &mut unblocked_cmd {
+                            Command::Xread {
+                                block_ms: b,
+                                ids: cmd_ids,
+                                ..
+                            }
+                            | Command::Xreadgroup {
+                                block_ms: b,
+                                ids: cmd_ids,
+                                ..
+                            } => {
+                                *b = None;
+                                *cmd_ids = resolved_ids;
+                            }
+                            _ => {}
+                        }
+                        if first_target == router.shard_id {
+                            execute_local_command(
+                                &unblocked_cmd,
+                                &mut router.local_db.borrow_mut(),
+                                out,
+                                router.aof.as_deref(),
+                            );
+                        } else {
+                            let res = router.execute_remote(first_target, unblocked_cmd).await;
+                            out.extend_from_slice(&res);
+                        }
+                    } else {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+                return false;
+            }
+
+            if router.cluster_enabled
+                && keys[1..]
+                    .iter()
+                    .any(|k| crate::router::key_slot(k) != crate::router::key_slot(&keys[0]))
+            {
+                out.extend_from_slice(
+                    b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                );
+                return false;
+            }
+
+            // Cross-shard multi-stream execution
+            match query_cross_shard_streams(router, &cmd).await {
+                Ok(stream_blocks) => {
+                    if !stream_blocks.is_empty() {
+                        write_resp_array_header(out, stream_blocks.len());
+                        for b in stream_blocks {
+                            out.extend_from_slice(&b);
+                        }
+                    } else if let Some(wait_ms) = block_ms {
+                        let resolved_ids = resolve_stream_last_ids(router, keys, ids).await;
+                        let (tx, rx) = flume::bounded(1);
+                        {
+                            let hub_arc = crate::block::get_block_hub_for_port(router.port);
+                            let mut hub = hub_arc.lock().unwrap();
+                            for k in keys {
+                                hub.register_stream_waiter(k.clone(), tx.clone());
+                            }
+                        }
+                        let raw_fd = client_registry.borrow().get(&client_id).map(|c| c.raw_fd);
+                        let (wait_res, client_disconnected) =
+                            wait_for_stream_result(&rx, wait_ms, raw_fd).await;
+                        if client_disconnected {
+                            return true;
+                        }
+                        if wait_res {
+                            let mut unblocked_cmd = cmd.clone();
+                            match &mut unblocked_cmd {
+                                Command::Xread {
+                                    block_ms: b,
+                                    ids: cmd_ids,
+                                    ..
+                                }
+                                | Command::Xreadgroup {
+                                    block_ms: b,
+                                    ids: cmd_ids,
+                                    ..
+                                } => {
+                                    *b = None;
+                                    *cmd_ids = resolved_ids;
+                                }
+                                _ => {}
+                            }
+                            match query_cross_shard_streams(router, &unblocked_cmd).await {
+                                Ok(unblocked_blocks) if !unblocked_blocks.is_empty() => {
+                                    write_resp_array_header(out, unblocked_blocks.len());
+                                    for b in unblocked_blocks {
+                                        out.extend_from_slice(&b);
+                                    }
+                                }
+                                _ => {
+                                    out.extend_from_slice(b"$-1\r\n");
+                                }
+                            }
+                        } else {
+                            out.extend_from_slice(b"$-1\r\n");
+                        }
+                    } else {
+                        out.extend_from_slice(b"$-1\r\n");
+                    }
+                }
+                Err(err) => {
+                    out.extend_from_slice(&err);
                 }
             }
             false

@@ -11871,3 +11871,191 @@ fn test_cross_shard_set_and_zset_algebra_e2e() {
         ":1\r\n"
     );
 }
+
+#[test]
+fn test_cross_shard_xread_and_xreadgroup_e2e() {
+    let port = 19128;
+    start_test_server(port, 4);
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // 1. Pick two stream keys that map to distinct shards
+    let mut s1 = String::new();
+    let mut s2 = String::new();
+    for i in 0..100 {
+        let k = format!("xs_key_{}", i);
+        let shard = target_shard(k.as_bytes(), 4);
+        if shard == 0 && s1.is_empty() {
+            s1 = k;
+        } else if shard == 1 && s2.is_empty() {
+            s2 = k;
+        }
+        if !s1.is_empty() && !s2.is_empty() {
+            break;
+        }
+    }
+    assert_ne!(s1, s2);
+    assert_ne!(
+        target_shard(s1.as_bytes(), 4),
+        target_shard(s2.as_bytes(), 4)
+    );
+
+    // 2. Populate both streams on distinct shards
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            format!("XADD {} 100-1 f1 v1\r\n", s1).as_bytes()
+        ),
+        "$5\r\n100-1\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            format!("XADD {} 100-2 f2 v2\r\n", s1).as_bytes()
+        ),
+        "$5\r\n100-2\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            format!("XADD {} 200-1 f3 v3\r\n", s2).as_bytes()
+        ),
+        "$5\r\n200-1\r\n"
+    );
+
+    // 3. Cross-shard non-blocking XREAD
+    let xread_all = send_and_read(
+        &mut stream,
+        format!("XREAD STREAMS {} {} 0 0\r\n", s1, s2).as_bytes(),
+    );
+    assert!(xread_all.starts_with("*2\r\n"));
+    assert!(xread_all.contains(&s1));
+    assert!(xread_all.contains("100-1"));
+    assert!(xread_all.contains("100-2"));
+    assert!(xread_all.contains(&s2));
+    assert!(xread_all.contains("200-1"));
+
+    // 4. Cross-shard XREAD with COUNT 1
+    let xread_c1 = send_and_read(
+        &mut stream,
+        format!("XREAD COUNT 1 STREAMS {} {} 0 0\r\n", s1, s2).as_bytes(),
+    );
+    assert!(xread_c1.starts_with("*2\r\n"));
+    assert!(xread_c1.contains(&s1));
+    assert!(xread_c1.contains("100-1"));
+    assert!(!xread_c1.contains("100-2"));
+    assert!(xread_c1.contains(&s2));
+    assert!(xread_c1.contains("200-1"));
+
+    // 5. Cross-shard blocking XREAD timeout (idle streams)
+    let t0 = std::time::Instant::now();
+    let xread_timeout = send_and_read(
+        &mut stream,
+        format!("XREAD BLOCK 100 STREAMS {} {} $ $\r\n", s1, s2).as_bytes(),
+    );
+    assert_eq!(xread_timeout, "$-1\r\n");
+    assert!(t0.elapsed() >= Duration::from_millis(90));
+
+    // 6. Cross-shard blocking XREAD wake-up via concurrent XADD
+    let s2_clone = s2.clone();
+    let producer_handle = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(60));
+        let mut producer = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        let resp = send_and_read(
+            &mut producer,
+            format!("XADD {} 300-1 alert high\r\n", s2_clone).as_bytes(),
+        );
+        assert_eq!(resp, "$5\r\n300-1\r\n");
+    });
+
+    let xread_wakeup = send_and_read(
+        &mut stream,
+        format!("XREAD BLOCK 2000 STREAMS {} {} $ $\r\n", s1, s2).as_bytes(),
+    );
+    producer_handle.join().unwrap();
+    assert!(xread_wakeup.contains(&s2));
+    assert!(xread_wakeup.contains("300-1"));
+    assert!(xread_wakeup.contains("alert"));
+
+    // 7. Cross-shard XREADGROUP
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            format!("XGROUP CREATE {} grp 0\r\n", s1).as_bytes()
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            format!("XGROUP CREATE {} grp 0\r\n", s2).as_bytes()
+        ),
+        "+OK\r\n"
+    );
+
+    let xrg_res = send_and_read(
+        &mut stream,
+        format!("XREADGROUP GROUP grp c1 STREAMS {} {} > >\r\n", s1, s2).as_bytes(),
+    );
+    assert!(xrg_res.starts_with("*2\r\n"));
+    assert!(xrg_res.contains(&s1));
+    assert!(xrg_res.contains("100-1"));
+    assert!(xrg_res.contains(&s2));
+    assert!(xrg_res.contains("200-1"));
+
+    // Check PEL state on both streams
+    let p1 = send_and_read(&mut stream, format!("XPENDING {} grp\r\n", s1).as_bytes());
+    assert!(p1.contains(":2\r\n"));
+    let p2 = send_and_read(&mut stream, format!("XPENDING {} grp\r\n", s2).as_bytes());
+    assert!(p2.contains(":2\r\n"));
+}
+
+#[test]
+fn test_cross_shard_xread_cluster_crossslot_e2e() {
+    let port = 19129;
+    start_test_server_cluster(port, 4);
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // Pick two keys with different cluster slots
+    let mut s1 = String::new();
+    let mut s2 = String::new();
+    for i in 0..100 {
+        let k = format!("cluster_s_{}", i);
+        let slot = rudis::router::key_slot(k.as_bytes());
+        if s1.is_empty() {
+            s1 = k;
+        } else if rudis::router::key_slot(s1.as_bytes()) != slot {
+            s2 = k;
+            break;
+        }
+    }
+    assert_ne!(
+        rudis::router::key_slot(s1.as_bytes()),
+        rudis::router::key_slot(s2.as_bytes())
+    );
+
+    let res = send_and_read(
+        &mut stream,
+        format!("XREAD STREAMS {} {} 0 0\r\n", s1, s2).as_bytes(),
+    );
+    assert_eq!(
+        res,
+        "-CROSSSLOT Keys in request don't hash to the same slot\r\n"
+    );
+
+    let res_group = send_and_read(
+        &mut stream,
+        format!("XREADGROUP GROUP grp c1 STREAMS {} {} > >\r\n", s1, s2).as_bytes(),
+    );
+    assert_eq!(
+        res_group,
+        "-CROSSSLOT Keys in request don't hash to the same slot\r\n"
+    );
+}
