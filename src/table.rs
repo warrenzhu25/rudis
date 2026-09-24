@@ -2636,6 +2636,9 @@ impl RudisTable {
         if self.table.items == 0 {
             return false;
         }
+        if !self.hash_field_expires.is_empty() {
+            self.hash_field_expires.remove(key);
+        }
         if self.num_expires == 0 {
             if let Some((idx, entry)) = self.table.find_entry(key, hash) {
                 let val_bytes = match &entry.val {
@@ -2975,6 +2978,7 @@ impl RudisTable {
 
     pub fn flushdb(&mut self) {
         self.table.clear();
+        self.hash_field_expires.clear();
         self.num_expires = 0;
         let base_mem = self.table.capacity * std::mem::size_of::<Option<RudisEntry>>()
             + self.table.ctrl_bytes()
@@ -3667,6 +3671,17 @@ impl RudisTable {
             crate::connection::HASH_MAX_ENTRIES.load(std::sync::atomic::Ordering::Relaxed);
         let max_value =
             crate::connection::HASH_MAX_VALUE.load(std::sync::atomic::Ordering::Relaxed);
+        if !self.hash_field_expires.is_empty() {
+            self.purge_expired_hash_fields(key);
+            if let Some(fmap) = self.hash_field_expires.get_mut(key) {
+                for (f, _) in fields {
+                    fmap.remove(f);
+                }
+                if fmap.is_empty() {
+                    self.hash_field_expires.remove(key);
+                }
+            }
+        }
         if let Some((idx, entry)) = self.table.find_entry_mut(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at
@@ -4509,6 +4524,9 @@ impl RudisTable {
     }
 
     pub fn hdel(&mut self, key: &[u8], fields: &[Bytes]) -> Result<usize, &'static str> {
+        if !self.hash_field_expires.is_empty() {
+            self.purge_expired_hash_fields(key);
+        }
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
@@ -4544,6 +4562,19 @@ impl RudisTable {
             } else {
                 (0, false)
             };
+
+            if !self.hash_field_expires.is_empty() {
+                if is_empty {
+                    self.hash_field_expires.remove(key);
+                } else if let Some(fmap) = self.hash_field_expires.get_mut(key) {
+                    for f in fields {
+                        fmap.remove(f);
+                    }
+                    if fmap.is_empty() {
+                        self.hash_field_expires.remove(key);
+                    }
+                }
+            }
 
             if is_empty && let Some(entry) = self.table.remove(idx) {
                 self.recycle_value(entry.val);
@@ -10028,6 +10059,32 @@ impl RudisTable {
                 }
             }
         }
+        if !self.hash_field_expires.is_empty() {
+            for (key, fmap) in &self.hash_field_expires {
+                let active: Vec<(&Bytes, u64)> = fmap
+                    .iter()
+                    .filter_map(|(f, &exp)| {
+                        if exp > now {
+                            let rem_ms = exp.duration_since(now).as_millis() as u64;
+                            Some((f, unix_now + rem_ms))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !active.is_empty() {
+                    buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(key);
+                    buf.push(14u8);
+                    buf.extend_from_slice(&(active.len() as u32).to_le_bytes());
+                    for (field, exp_unix_ms) in active {
+                        buf.extend_from_slice(&(field.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(field);
+                        buf.extend_from_slice(&exp_unix_ms.to_le_bytes());
+                    }
+                }
+            }
+        }
     }
 
     pub fn restore_rdb_chunk(&mut self, mut data: &[u8]) -> Result<(), &'static str> {
@@ -10072,6 +10129,42 @@ impl RudisTable {
             }
             let key = Bytes::copy_from_slice(&data[..k_len]);
             data = &data[k_len..];
+            if !data.is_empty() && data[0] == 14 {
+                data = &data[1..];
+                if data.len() < 4 {
+                    return Err("Truncated RDB hash field expires count");
+                }
+                let f_count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+                data = &data[4..];
+                let mut expired_on_disk = Vec::new();
+                for _ in 0..f_count {
+                    if data.len() < 4 {
+                        return Err("Truncated RDB hash field len");
+                    }
+                    let f_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+                    data = &data[4..];
+                    if data.len() < f_len + 8 {
+                        return Err("Truncated RDB hash field expire payload");
+                    }
+                    let field = Bytes::copy_from_slice(&data[..f_len]);
+                    let exp_unix_ms =
+                        u64::from_le_bytes(data[f_len..f_len + 8].try_into().unwrap());
+                    data = &data[f_len + 8..];
+                    if exp_unix_ms > unix_now {
+                        let rem_ms = exp_unix_ms - unix_now;
+                        self.hash_field_expires
+                            .entry(key.clone())
+                            .or_default()
+                            .insert(field, Instant::now() + Duration::from_millis(rem_ms));
+                    } else {
+                        expired_on_disk.push(field);
+                    }
+                }
+                if !expired_on_disk.is_empty() {
+                    let _ = self.hdel(&key, &expired_on_disk);
+                }
+                continue;
+            }
             let (val, consumed) = Self::deserialize_val_payload(data)?;
             data = &data[consumed..];
 
@@ -11029,6 +11122,47 @@ pub fn load_rdb_bytes(
             cursor += payload_len;
             let _ = db.crdt_store.merge_sync_payload(payload);
             count += 1;
+            continue;
+        } else if type_byte == 14 {
+            cursor += 1;
+            if cursor + 4 > content_len {
+                break;
+            }
+            let f_count = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+            cursor += 4;
+            let is_owned = crate::router::target_shard(&key, num_shards) == shard_id;
+            let mut expired_on_disk = Vec::new();
+            for _ in 0..f_count {
+                if cursor + 4 > content_len {
+                    break;
+                }
+                let f_len =
+                    u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                cursor += 4;
+                if cursor + f_len + 8 > content_len {
+                    break;
+                }
+                let field = Bytes::copy_from_slice(&data[cursor..cursor + f_len]);
+                let exp_unix_ms = u64::from_le_bytes(
+                    data[cursor + f_len..cursor + f_len + 8].try_into().unwrap(),
+                );
+                cursor += f_len + 8;
+                if is_owned {
+                    if exp_unix_ms > unix_now {
+                        let rem_ms = exp_unix_ms - unix_now;
+                        db.table
+                            .hash_field_expires
+                            .entry(key.clone())
+                            .or_default()
+                            .insert(field, Instant::now() + Duration::from_millis(rem_ms));
+                    } else {
+                        expired_on_disk.push(field);
+                    }
+                }
+            }
+            if is_owned && !expired_on_disk.is_empty() {
+                let _ = db.table.hdel(&key, &expired_on_disk);
+            }
             continue;
         }
 

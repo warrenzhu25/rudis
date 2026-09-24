@@ -1061,6 +1061,130 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             Some(buf)
         }
+        Command::Hexpire {
+            key,
+            expire_ms,
+            is_at,
+            condition,
+            fields,
+        } => {
+            let cmd_name = if *is_at { "HPEXPIREAT" } else { "HPEXPIRE" };
+            let exp_s = expire_ms.to_string();
+            let numfields_s = fields.len().to_string();
+            let mut args: Vec<&[u8]> = vec![cmd_name.as_bytes(), key.as_ref(), exp_s.as_bytes()];
+            match condition {
+                crate::resp::HexpireCondition::None => {}
+                crate::resp::HexpireCondition::Nx => args.push(b"NX"),
+                crate::resp::HexpireCondition::Xx => args.push(b"XX"),
+                crate::resp::HexpireCondition::Gt => args.push(b"GT"),
+                crate::resp::HexpireCondition::Lt => args.push(b"LT"),
+            }
+            args.push(b"FIELDS");
+            args.push(numfields_s.as_bytes());
+            for f in fields {
+                args.push(f.as_ref());
+            }
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend_from_slice(a);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
+        Command::Hpersist { key, fields } => {
+            let numfields_s = fields.len().to_string();
+            let mut args: Vec<&[u8]> =
+                vec![b"HPERSIST", key.as_ref(), b"FIELDS", numfields_s.as_bytes()];
+            for f in fields {
+                args.push(f.as_ref());
+            }
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend_from_slice(a);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
+        Command::Xclaim {
+            key,
+            group,
+            consumer,
+            min_idle_time,
+            ids,
+            idle,
+            time,
+            retrycount,
+            force,
+            justid,
+        } => {
+            let mut args: Vec<Vec<u8>> = vec![
+                b"XCLAIM".to_vec(),
+                key.to_vec(),
+                group.to_vec(),
+                consumer.to_vec(),
+                min_idle_time.to_string().into_bytes(),
+            ];
+            for id in ids {
+                args.push(id.to_vec());
+            }
+            if let Some(i) = idle {
+                args.push(b"IDLE".to_vec());
+                args.push(i.to_string().into_bytes());
+            }
+            if let Some(t) = time {
+                args.push(b"TIME".to_vec());
+                args.push(t.to_string().into_bytes());
+            }
+            if let Some(r) = retrycount {
+                args.push(b"RETRYCOUNT".to_vec());
+                args.push(r.to_string().into_bytes());
+            }
+            if *force {
+                args.push(b"FORCE".to_vec());
+            }
+            if *justid {
+                args.push(b"JUSTID".to_vec());
+            }
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend_from_slice(&a);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
+        Command::Xautoclaim {
+            key,
+            group,
+            consumer,
+            min_idle_time,
+            start,
+            count,
+            justid,
+        } => {
+            let mut args: Vec<Vec<u8>> = vec![
+                b"XAUTOCLAIM".to_vec(),
+                key.to_vec(),
+                group.to_vec(),
+                consumer.to_vec(),
+                min_idle_time.to_string().into_bytes(),
+                start.to_vec(),
+            ];
+            args.push(b"COUNT".to_vec());
+            args.push(count.to_string().into_bytes());
+            if *justid {
+                args.push(b"JUSTID".to_vec());
+            }
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend_from_slice(&a);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
         _ => None,
     }
 }
@@ -1094,6 +1218,18 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
     use std::io::Write;
     let mut count = 0;
     let now = std::time::Instant::now();
+    let unix_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    if !db.table.hash_field_expires.is_empty() {
+        let keys_with_field_exp: Vec<bytes::Bytes> =
+            db.table.hash_field_expires.keys().cloned().collect();
+        for k in keys_with_field_exp {
+            db.table.purge_expired_hash_fields(&k);
+        }
+    }
 
     static TMP_REWRITE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let tmp_id = TMP_REWRITE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1311,6 +1447,30 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
             writer.write_all(rem_ms_str.as_bytes())?;
             writer.write_all(b"\r\n")?;
         }
+
+        if !db.table.hash_field_expires.is_empty()
+            && let Some(fmap) = db.table.hash_field_expires.get(k)
+        {
+            for (field, &exp) in fmap {
+                if exp > now {
+                    let rem_ms = exp.duration_since(now).as_millis() as u64;
+                    let exp_unix_ms_str = (unix_now + rem_ms).to_string();
+                    writer.write_all(b"*6\r\n$10\r\nHPEXPIREAT\r\n$")?;
+                    writer.write_all(k.len().to_string().as_bytes())?;
+                    writer.write_all(b"\r\n")?;
+                    writer.write_all(k)?;
+                    writer.write_all(b"\r\n$")?;
+                    writer.write_all(exp_unix_ms_str.len().to_string().as_bytes())?;
+                    writer.write_all(b"\r\n")?;
+                    writer.write_all(exp_unix_ms_str.as_bytes())?;
+                    writer.write_all(b"\r\n$6\r\nFIELDS\r\n$1\r\n1\r\n$")?;
+                    writer.write_all(field.len().to_string().as_bytes())?;
+                    writer.write_all(b"\r\n")?;
+                    writer.write_all(field.as_ref())?;
+                    writer.write_all(b"\r\n")?;
+                }
+            }
+        }
     }
 
     // 2. Snapshot JSON documents
@@ -1487,6 +1647,71 @@ mod tests {
         std::fs::write(&test_file, b"data").unwrap();
 
         assert!(sync_parent_dir(&test_file).is_ok());
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_rdb_and_aof_hash_field_expiration_persistence() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("rudis-hexpire-persist-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let mut db = ShardDb::new(6379);
+        db.hset(
+            Bytes::from("session_h"),
+            vec![
+                (Bytes::from("token"), Bytes::from("abc123")),
+                (Bytes::from("perm"), Bytes::from("admin")),
+            ],
+        )
+        .unwrap();
+        let res = db
+            .table
+            .hexpire(
+                b"session_h",
+                60_000,
+                false,
+                crate::resp::HexpireCondition::None,
+                &[Bytes::from("token")],
+            )
+            .unwrap();
+        assert_eq!(res, vec![1]);
+
+        // 1. Verify RDB chunk round-trip preserves field TTL
+        let mut rdb_chunk = Vec::new();
+        db.save_rdb_chunk(&mut rdb_chunk);
+
+        let mut restored_rdb_db = ShardDb::new(6379);
+        restored_rdb_db.restore_rdb_chunk(&rdb_chunk).unwrap();
+        let ttls = restored_rdb_db
+            .table
+            .httl(
+                b"session_h",
+                false,
+                false,
+                &[Bytes::from("token"), Bytes::from("perm")],
+            )
+            .unwrap();
+        assert!(ttls[0] > 0 && ttls[0] <= 60);
+        assert_eq!(ttls[1], -1);
+
+        // 2. Verify AOF rewrite & replay preserves field TTL
+        rewrite_shard_aof(&mut db, &temp_dir, 0).unwrap();
+        let aof_file = temp_dir.join("appendonly-0.aof");
+        let mut restored_aof_db = ShardDb::new(6379);
+        replay_aof(&aof_file, &mut restored_aof_db).unwrap();
+        let aof_ttls = restored_aof_db
+            .table
+            .httl(
+                b"session_h",
+                false,
+                false,
+                &[Bytes::from("token"), Bytes::from("perm")],
+            )
+            .unwrap();
+        assert!(aof_ttls[0] > 0 && aof_ttls[0] <= 60);
+        assert_eq!(aof_ttls[1], -1);
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

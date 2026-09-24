@@ -2072,6 +2072,39 @@ impl ShardDb {
             buf.extend_from_slice(&(crdt_payload.len() as u32).to_le_bytes());
             buf.extend_from_slice(&crdt_payload);
         }
+
+        // 8. Hash field expirations (Redis 7.4 / Valkey 8 HEXPIRE)
+        if !self.table.hash_field_expires.is_empty() {
+            let now = std::time::Instant::now();
+            let unix_now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            for (key, fmap) in &self.table.hash_field_expires {
+                let active: Vec<(&Bytes, u64)> = fmap
+                    .iter()
+                    .filter_map(|(f, &exp)| {
+                        if exp > now {
+                            let rem_ms = exp.duration_since(now).as_millis() as u64;
+                            Some((f, unix_now + rem_ms))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if !active.is_empty() {
+                    buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(key);
+                    buf.push(14u8);
+                    buf.extend_from_slice(&(active.len() as u32).to_le_bytes());
+                    for (field, exp_unix_ms) in active {
+                        buf.extend_from_slice(&(field.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(field);
+                        buf.extend_from_slice(&exp_unix_ms.to_le_bytes());
+                    }
+                }
+            }
+        }
     }
 
     pub fn restore_rdb_chunk(&mut self, mut data: &[u8]) -> Result<(), &'static str> {
@@ -2334,6 +2367,46 @@ impl ShardDb {
                 let payload = &data[..payload_len];
                 data = &data[payload_len..];
                 let _ = self.crdt_store.merge_sync_payload(payload);
+                continue;
+            } else if type_byte == 14 {
+                data = &data[1..];
+                if data.len() < 4 {
+                    return Err("Truncated hash field expires count");
+                }
+                let f_count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+                data = &data[4..];
+                let mut expired_on_disk = Vec::new();
+                for _ in 0..f_count {
+                    if data.len() < 4 {
+                        return Err("Truncated hash field len");
+                    }
+                    let f_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+                    data = &data[4..];
+                    if data.len() < f_len + 8 {
+                        return Err("Truncated hash field expire payload");
+                    }
+                    let field = bytes::Bytes::copy_from_slice(&data[..f_len]);
+                    let exp_unix_ms =
+                        u64::from_le_bytes(data[f_len..f_len + 8].try_into().unwrap());
+                    data = &data[f_len + 8..];
+                    if exp_unix_ms > unix_now {
+                        let rem_ms = exp_unix_ms - unix_now;
+                        self.table
+                            .hash_field_expires
+                            .entry(key.clone())
+                            .or_default()
+                            .insert(
+                                field,
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_millis(rem_ms),
+                            );
+                    } else {
+                        expired_on_disk.push(field);
+                    }
+                }
+                if !expired_on_disk.is_empty() {
+                    let _ = self.table.hdel(&key, &expired_on_disk);
+                }
                 continue;
             }
 
