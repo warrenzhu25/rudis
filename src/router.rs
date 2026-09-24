@@ -594,12 +594,21 @@ impl Router {
             }
         }
 
-        // Phase 2: Spill Hot keys to NVMe disk until under shard_max_mem
-        let hot_keys = self.local_db.borrow_mut().table.get_hot_keys_for_spill(256);
-        for k in hot_keys {
-            let _ = self.spill_local_internal(&k, false).await;
-            if self.local_db.borrow().table.used_memory <= shard_max_mem {
+        // Phase 2: Spill Hot keys to NVMe disk in 64-key slices until under target_mem
+        let target_mem = shard_max_mem.saturating_sub((shard_max_mem / 20).max(128 * 1024));
+        loop {
+            if self.local_db.borrow().table.used_memory <= target_mem {
                 break;
+            }
+            let hot_keys = self.local_db.borrow_mut().table.get_hot_keys_for_spill(64);
+            if hot_keys.is_empty() {
+                break;
+            }
+            for k in hot_keys {
+                let _ = self.spill_local_internal(&k, false).await;
+                if self.local_db.borrow().table.used_memory <= target_mem {
+                    break;
+                }
             }
         }
 

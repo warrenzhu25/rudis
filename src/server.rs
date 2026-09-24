@@ -595,14 +595,7 @@ pub fn run_shard_worker(
                         is_resp3,
                     } => {
                         let has_tier_manager = cross_shard_db.borrow().tier_manager.is_some();
-                        let needs_async = has_tier_manager && items.iter().any(|(_, _, cmd)| {
-                            if let Command::Get(key) = cmd {
-                                cross_shard_db.borrow_mut().get(key).is_none()
-                                    && cross_shard_db.borrow_mut().table.is_tiered(key).is_some()
-                            } else {
-                                false
-                            }
-                        });
+                        let needs_async = false;
 
                         if needs_async {
                             let r = cross_shard_router.clone();
@@ -948,6 +941,8 @@ pub fn run_shard_worker(
                             let aof_ref = cross_shard_aof.as_deref();
                             let mut temp_buf = Vec::new();
                             let mut has_writes = false;
+                            let mut cold_gets: smallvec::SmallVec<[(usize, bytes::Bytes); 8]> =
+                                smallvec::SmallVec::new();
                             for (idx, key_hash, cmd) in items.drain(..) {
                                 temp_buf.clear();
                                 if let Command::Get(ref key) = cmd {
@@ -957,7 +952,16 @@ pub fn run_shard_worker(
                                             continue;
                                         }
                                         Ok(None) => {
-                                            responder.write_slot(idx, crate::shard::CompactResp::NULL);
+                                            if has_tier_manager
+                                                && db.table.is_tiered(key).is_some()
+                                            {
+                                                cold_gets.push((idx, key.clone()));
+                                            } else {
+                                                responder.write_slot(
+                                                    idx,
+                                                    crate::shard::CompactResp::NULL,
+                                                );
+                                            }
                                             continue;
                                         }
                                         Err(err) => {
@@ -983,7 +987,12 @@ pub fn run_shard_worker(
                                     if crate::connection::HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
                                         crate::connection::notify_key_invalidation(cross_shard_router.port, key.as_ref(), 0);
                                     }
-                                    db.table.set_with_hash(key, key_hash, value, expire_in);
+                                    if let Some((ptr, is_cooled)) =
+                                        db.table.set_with_hash(key, key_hash, value, expire_in)
+                                        && let Some(tm) = &db.tier_manager
+                                    {
+                                        tm.on_key_overwritten(ptr, is_cooled);
+                                    }
                                     responder.write_slot(idx, crate::shard::CompactResp::OK);
                                     continue;
                                 } else if aof_ref.is_none()
@@ -1262,7 +1271,25 @@ pub fn run_shard_worker(
                             if has_writes {
                                 cross_shard_router.check_auto_tier_after_write();
                             }
-                            responder.finish(items);
+                            if cold_gets.is_empty() {
+                                responder.finish(items);
+                            } else {
+                                let r = cross_shard_router.clone();
+                                monoio::spawn(async move {
+                                    for (idx, key) in cold_gets {
+                                        if let Some(v) = r.stream_cold_read_local(&key).await {
+                                            responder.write_slot(
+                                                idx,
+                                                crate::shard::CompactResp::Bulk(v),
+                                            );
+                                        } else {
+                                            responder
+                                                .write_slot(idx, crate::shard::CompactResp::NULL);
+                                        }
+                                    }
+                                    responder.finish(items);
+                                });
+                            }
                         }
                     }
                     ShardMessage::Mget { mut keys, responder } => {

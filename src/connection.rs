@@ -14132,6 +14132,8 @@ async fn execute_commands_squashed(
     // the handles until the gather phase below.
     let mut inflight_mgets: Vec<(usize, crate::router::MgetInFlight)> = Vec::new();
     let mut inflight_msets: Vec<(usize, crate::router::MsetInFlight)> = Vec::new();
+    let mut local_cold_gets: smallvec::SmallVec<[(usize, bytes::Bytes); 8]> =
+        smallvec::SmallVec::new();
 
     for batch in remote_batches.iter_mut() {
         batch.clear();
@@ -14156,13 +14158,7 @@ async fn execute_commands_squashed(
                             let is_tiered = local_db.tier_manager.is_some()
                                 && local_db.table.is_tiered(key).is_some();
                             if is_tiered {
-                                drop(local_db);
-                                if let Some(v) = router.stream_cold_read_local(key).await {
-                                    responses[idx] = CompactResp::Bulk(v);
-                                } else {
-                                    responses[idx] = crate::shard::CompactResp::NULL;
-                                }
-                                local_db = router.local_db.borrow_mut();
+                                local_cold_gets.push((idx, key.clone()));
                             } else {
                                 responses[idx] = crate::shard::CompactResp::NULL;
                             }
@@ -14191,9 +14187,13 @@ async fn execute_commands_squashed(
                     if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
                         notify_key_invalidation(router.port, key.as_ref(), client_id);
                     }
-                    local_db
+                    if let Some((ptr, is_cooled)) = local_db
                         .table
-                        .set_with_hash(key, key_hash, value, expire_in);
+                        .set_with_hash(key, key_hash, value, expire_in)
+                        && let Some(tm) = &local_db.tier_manager
+                    {
+                        tm.on_key_overwritten(ptr, is_cooled);
+                    }
                     responses[idx] = crate::shard::CompactResp::OK;
                     continue;
                 } else if router.aof.is_none()
@@ -14705,6 +14705,14 @@ async fn execute_commands_squashed(
             if router.senders[target_shard].send(msg).is_ok() {
                 pending_mask |= 1u64 << target_shard;
             }
+        }
+    }
+
+    for (cold_idx, cold_key) in local_cold_gets {
+        if let Some(v) = router.stream_cold_read_local(&cold_key).await {
+            responses[cold_idx] = CompactResp::Bulk(v);
+        } else {
+            responses[cold_idx] = crate::shard::CompactResp::NULL;
         }
     }
 

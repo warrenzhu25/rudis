@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crate::table::{TieredPointer, crc64};
+use crate::table::TieredPointer;
 
 /// Magic header for tiered disk records: "TIER"
 pub const TIER_MAGIC: &[u8; 4] = b"TIER";
@@ -401,6 +401,7 @@ pub struct ShardTierManager {
     pub port: u16,
     pub file: Rc<monoio::fs::File>,
     pub current_offset: Cell<u64>,
+    pub preallocated_len: Cell<u64>,
     pub path: PathBuf,
     pub stats: Arc<TieringStats>,
     pub op_manager: Rc<OpManager>,
@@ -446,6 +447,7 @@ impl ShardTierManager {
             port,
             file: Rc::new(file),
             current_offset: Cell::new(current_offset),
+            preallocated_len: Cell::new(raw_len),
             path,
             stats,
             op_manager: Rc::new(OpManager::new()),
@@ -575,13 +577,31 @@ impl ShardTierManager {
         Ok((is_reflink, file_size))
     }
 
+    #[inline]
+    pub fn ensure_preallocated(&self, needed_end: u64) {
+        if needed_end > self.preallocated_len.get() {
+            use std::os::unix::io::AsRawFd;
+            let chunk = 64 * 1024 * 1024u64; // 64 MB chunks
+            let new_len = needed_end.div_ceil(chunk) * chunk;
+            let fd = self.file.as_raw_fd();
+            unsafe {
+                if libc::fallocate(fd, 0, 0, new_len as libc::off_t) != 0 {
+                    let _ = libc::ftruncate(fd, new_len as libc::off_t);
+                }
+            }
+            self.preallocated_len.set(new_len);
+        }
+    }
+
     pub fn allocate_page(&self) -> u64 {
         if let Some(page_idx) = self.free_pages.borrow_mut().pop() {
             page_idx
         } else {
-            let next_page_idx = self.current_offset.get() / PAGE_SIZE as u64;
-            self.current_offset
-                .set(self.current_offset.get() + PAGE_SIZE as u64);
+            let cur = self.current_offset.get();
+            let next_page_idx = cur / PAGE_SIZE as u64;
+            let new_end = cur + PAGE_SIZE as u64;
+            self.current_offset.set(new_end);
+            self.ensure_preallocated(new_end);
             next_page_idx
         }
     }
@@ -597,7 +617,9 @@ impl ShardTierManager {
             offset
         } else {
             let offset = self.current_offset.get();
-            self.current_offset.set(offset + req_len);
+            let new_end = offset + req_len;
+            self.current_offset.set(new_end);
+            self.ensure_preallocated(new_end);
             offset
         }
     }
@@ -665,7 +687,7 @@ impl ShardTierManager {
 
             let aligned_len = record_len.div_ceil(PAGE_SIZE) * PAGE_SIZE;
             let mut write_buf = record;
-            if write_buf.len() < aligned_len {
+            if self.is_direct_io && write_buf.len() < aligned_len {
                 write_buf.resize(aligned_len, 0);
             }
             let offset = self.allocate_extent(aligned_len);
@@ -739,6 +761,33 @@ impl ShardTierManager {
         }
     }
 
+    #[inline]
+    pub fn on_key_overwritten(&self, ptr: TieredPointer, is_cooled: bool) {
+        if is_cooled {
+            self.stats.cooled_keys.fetch_sub(1, Ordering::Relaxed);
+        } else {
+            self.stats.tiered_keys.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.stats.total_deletes.fetch_add(1, Ordering::Relaxed);
+        if (ptr.length as usize) < SMALL_VALUE_LIMIT {
+            let page_index = ptr.offset / PAGE_SIZE as u64;
+            self.small_bins
+                .borrow_mut()
+                .decrement_page_key(page_index, &self.stats);
+        } else {
+            let aligned_len = (ptr.length as usize).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+            if aligned_len == PAGE_SIZE {
+                self.free_pages
+                    .borrow_mut()
+                    .push(ptr.offset / PAGE_SIZE as u64);
+            } else {
+                self.free_extents
+                    .borrow_mut()
+                    .push((ptr.offset, aligned_len as u64));
+            }
+        }
+    }
+
     pub fn read_ptr_sync(&self, ptr: TieredPointer) -> io::Result<(Bytes, Vec<u8>)> {
         let len = ptr.length as usize;
         let offset_in_page = (ptr.offset % PAGE_SIZE as u64) as usize;
@@ -768,7 +817,7 @@ pub fn read_tiered_record_sync(path: &Path, ptr: TieredPointer) -> io::Result<(B
 pub fn encode_tiered_record(key: &[u8], val_payload: &[u8], val_type: u8) -> Vec<u8> {
     let key_len = key.len() as u32;
     let val_len = val_payload.len() as u32;
-    let total_len = 4 + 1 + 4 + 4 + 8 + key.len() + val_payload.len();
+    let total_len = 21 + key.len() + val_payload.len();
     let mut buf = Vec::with_capacity(total_len);
 
     // 1. Magic (4 bytes)
@@ -779,17 +828,14 @@ pub fn encode_tiered_record(key: &[u8], val_payload: &[u8], val_type: u8) -> Vec
     buf.extend_from_slice(&key_len.to_le_bytes());
     // 4. Value length (4 bytes)
     buf.extend_from_slice(&val_len.to_le_bytes());
-
-    // 5. CRC64 (8 bytes) over key + val_payload
-    let mut crc_data = Vec::with_capacity(key.len() + val_payload.len());
-    crc_data.extend_from_slice(key);
-    crc_data.extend_from_slice(val_payload);
-    let crc = crc64(&crc_data);
-    buf.extend_from_slice(&crc.to_le_bytes());
-
-    // 6. Key and Payload
+    // 5. Checksum placeholder (8 bytes)
+    buf.extend_from_slice(&[0u8; 8]);
+    // 6. Key and Payload (zero extra Vec allocation)
     buf.extend_from_slice(key);
     buf.extend_from_slice(val_payload);
+
+    let crc = xxhash_rust::xxh3::xxh3_64(&buf[21..]);
+    buf[13..21].copy_from_slice(&crc.to_le_bytes());
     buf
 }
 
@@ -825,7 +871,7 @@ pub fn decode_tiered_record(data: &[u8], expected_val_type: u8) -> io::Result<(B
     }
 
     let body = &data[21..21 + key_len + val_len];
-    let actual_crc = crc64(body);
+    let actual_crc = xxhash_rust::xxh3::xxh3_64(body);
     if actual_crc != expected_crc {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

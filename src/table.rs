@@ -2543,8 +2543,14 @@ impl RudisTable {
     }
 
     #[inline(always)]
-    pub fn set_with_hash(&mut self, key: Bytes, h: u64, value: Bytes, expire_in: Option<Duration>) {
-        self.set_extended_with_hash(key, h, value, expire_in, false);
+    pub fn set_with_hash(
+        &mut self,
+        key: Bytes,
+        h: u64,
+        value: Bytes,
+        expire_in: Option<Duration>,
+    ) -> Option<(TieredPointer, bool)> {
+        self.set_extended_with_hash(key, h, value, expire_in, false)
     }
 
     pub fn set_extended(
@@ -2555,7 +2561,7 @@ impl RudisTable {
         keepttl: bool,
     ) {
         let h = hash_key(&key);
-        self.set_extended_with_hash(key, h, value, expire_in, keepttl);
+        let _ = self.set_extended_with_hash(key, h, value, expire_in, keepttl);
     }
 
     #[inline(always)]
@@ -2566,7 +2572,7 @@ impl RudisTable {
         value: Bytes,
         expire_in: Option<Duration>,
         keepttl: bool,
-    ) {
+    ) -> Option<(TieredPointer, bool)> {
         let val = if let Some(int_val) = Self::parse_i64_bytes(&value) {
             RudisValue::Int(int_val)
         } else {
@@ -2578,6 +2584,11 @@ impl RudisTable {
             && let Some(entry) = self.table.get_slot_mut(idx)
         {
             let old_bytes = entry.val.approx_bytes();
+            let old_tiered = match &entry.val {
+                RudisValue::Tiered(ptr) => Some((*ptr, false)),
+                RudisValue::Cooled { ptr, .. } => Some((*ptr, true)),
+                _ => None,
+            };
             entry.val = val;
             if !keepttl {
                 let had_exp = entry.expire_at.is_some();
@@ -2590,7 +2601,7 @@ impl RudisTable {
                 entry.expire_at = expire_in.map(|d| Instant::now() + d);
             }
             self.used_memory = self.used_memory.saturating_sub(old_bytes) + val_bytes;
-            return;
+            return old_tiered;
         }
 
         let expire_at = if keepttl {
@@ -2609,6 +2620,7 @@ impl RudisTable {
         };
         self.table.insert_prepared(entry, h, candidate_idx);
         self.used_memory += entry_mem;
+        None
     }
 
     #[inline(always)]
