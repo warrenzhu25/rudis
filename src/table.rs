@@ -6832,7 +6832,8 @@ impl RudisTable {
             return Ok(0);
         }
         let mut missing = false;
-        let mut sets: Vec<RudisSet> = Vec::with_capacity(keys.len());
+        let mut slot_indices: smallvec::SmallVec<[usize; 8]> =
+            smallvec::SmallVec::with_capacity(keys.len());
         for k in keys {
             let h = hash_key(k);
             if let Some(idx) = self.table.find(k, h) {
@@ -6841,14 +6842,12 @@ impl RudisTable {
                     continue;
                 }
                 if let Some(entry) = self.table.get_slot(idx) {
-                    match &entry.val {
-                        RudisValue::Set(s) => sets.push((**s).clone()),
-                        _ => {
-                            return Err(
-                                "WRONGTYPE Operation against a key holding the wrong kind of value",
-                            );
-                        }
+                    if !matches!(entry.val, RudisValue::Set(_)) {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
                     }
+                    slot_indices.push(idx);
                 } else {
                     missing = true;
                 }
@@ -6856,14 +6855,32 @@ impl RudisTable {
                 missing = true;
             }
         }
-        if missing || sets.is_empty() {
+        if missing || slot_indices.is_empty() {
             return Ok(0);
         }
-        sets.sort_by_key(|s| s.len());
-        let first = &sets[0];
+        let mut sets: smallvec::SmallVec<[&RudisSet; 8]> =
+            smallvec::SmallVec::with_capacity(slot_indices.len());
+        for &idx in &slot_indices {
+            if let Some(entry) = self.table.get_slot(idx)
+                && let RudisValue::Set(s) = &entry.val
+            {
+                sets.push(s.as_ref());
+            }
+        }
+        sets.sort_unstable_by_key(|s| s.len());
+        if sets[0].is_empty() {
+            return Ok(0);
+        }
+        let first = sets[0];
+        let rest = &sets[1..];
+        if rest.is_empty() {
+            let len = first.len();
+            return Ok(if limit > 0 { len.min(limit) } else { len });
+        }
         let mut count = 0;
         for m in first.iter() {
-            if sets[1..].iter().all(|s| s.contains(m.as_ref())) {
+            let mh = hash64(m.as_ref());
+            if rest.iter().all(|s| s.contains_with_hash(m.as_ref(), mh)) {
                 count += 1;
                 if limit > 0 && count >= limit {
                     return Ok(limit);
@@ -6877,7 +6894,8 @@ impl RudisTable {
         if keys.is_empty() {
             return Ok(0);
         }
-        let mut sets: Vec<RudisSet> = Vec::with_capacity(keys.len());
+        let mut slot_indices: smallvec::SmallVec<[usize; 8]> =
+            smallvec::SmallVec::with_capacity(keys.len());
         for k in keys {
             let h = hash_key(k);
             if let Some(idx) = self.table.find(k, h) {
@@ -6885,21 +6903,32 @@ impl RudisTable {
                     continue;
                 }
                 if let Some(entry) = self.table.get_slot(idx) {
-                    match &entry.val {
-                        RudisValue::Set(s) => sets.push((**s).clone()),
-                        _ => {
-                            return Err(
-                                "WRONGTYPE Operation against a key holding the wrong kind of value",
-                            );
-                        }
+                    if !matches!(entry.val, RudisValue::Set(_)) {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
                     }
+                    slot_indices.push(idx);
                 }
             }
         }
-        let mut union_set = hashbrown::HashSet::new();
+        let mut sets: smallvec::SmallVec<[&RudisSet; 8]> =
+            smallvec::SmallVec::with_capacity(slot_indices.len());
+        for &idx in &slot_indices {
+            if let Some(entry) = self.table.get_slot(idx)
+                && let RudisValue::Set(s) = &entry.val
+            {
+                sets.push(s.as_ref());
+            }
+        }
+        if sets.len() == 1 {
+            let len = sets[0].len();
+            return Ok(if limit > 0 { len.min(limit) } else { len });
+        }
+        let mut union_set: hashbrown::HashSet<&[u8]> = hashbrown::HashSet::new();
         for s in sets {
             for m in s.iter() {
-                union_set.insert(m.clone());
+                union_set.insert(m.as_ref());
                 if limit > 0 && union_set.len() >= limit {
                     return Ok(limit);
                 }
@@ -6912,47 +6941,58 @@ impl RudisTable {
         if keys.is_empty() {
             return Ok(0);
         }
-        let mut first_missing = false;
-        let mut first_set: Option<RudisSet> = None;
-        let mut other_sets: Vec<RudisSet> = Vec::new();
+        let mut first_slot: Option<usize> = None;
+        let mut other_slots: smallvec::SmallVec<[usize; 8]> = smallvec::SmallVec::new();
         for (i, k) in keys.iter().enumerate() {
             let h = hash_key(k);
             if let Some(idx) = self.table.find(k, h) {
                 if self.check_expired_slot(idx) {
-                    if i == 0 {
-                        first_missing = true;
-                    }
                     continue;
                 }
                 if let Some(entry) = self.table.get_slot(idx) {
-                    match &entry.val {
-                        RudisValue::Set(s) => {
-                            if i == 0 {
-                                first_set = Some((**s).clone());
-                            } else {
-                                other_sets.push((**s).clone());
-                            }
-                        }
-                        _ => {
-                            return Err(
-                                "WRONGTYPE Operation against a key holding the wrong kind of value",
-                            );
-                        }
+                    if !matches!(entry.val, RudisValue::Set(_)) {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
                     }
-                } else if i == 0 {
-                    first_missing = true;
+                    if i == 0 {
+                        first_slot = Some(idx);
+                    } else {
+                        other_slots.push(idx);
+                    }
                 }
-            } else if i == 0 {
-                first_missing = true;
             }
         }
-        if first_missing || first_set.is_none() {
+        let Some(f_idx) = first_slot else {
             return Ok(0);
+        };
+        let Some(RudisEntry {
+            val: RudisValue::Set(first),
+            ..
+        }) = self.table.get_slot(f_idx)
+        else {
+            return Ok(0);
+        };
+        let mut other_sets: smallvec::SmallVec<[&RudisSet; 8]> =
+            smallvec::SmallVec::with_capacity(other_slots.len());
+        for &idx in &other_slots {
+            if let Some(entry) = self.table.get_slot(idx)
+                && let RudisValue::Set(s) = &entry.val
+            {
+                other_sets.push(s.as_ref());
+            }
         }
-        let first = first_set.unwrap();
+        if other_sets.is_empty() {
+            let len = first.len();
+            return Ok(if limit > 0 { len.min(limit) } else { len });
+        }
         let mut count = 0;
         for m in first.iter() {
-            if !other_sets.iter().any(|s| s.contains(m.as_ref())) {
+            let mh = hash64(m.as_ref());
+            if !other_sets
+                .iter()
+                .any(|s| s.contains_with_hash(m.as_ref(), mh))
+            {
                 count += 1;
                 if limit > 0 && count >= limit {
                     return Ok(limit);
@@ -7438,25 +7478,8 @@ impl RudisTable {
             return Ok(0);
         }
         let mut missing = false;
-        enum SetOrZSet {
-            Set(RudisSet),
-            ZSet(RudisZSet),
-        }
-        impl SetOrZSet {
-            fn len(&self) -> usize {
-                match self {
-                    SetOrZSet::Set(s) => s.len(),
-                    SetOrZSet::ZSet(zs) => zs.len(),
-                }
-            }
-            fn contains(&self, m: &[u8]) -> bool {
-                match self {
-                    SetOrZSet::Set(s) => s.contains(m),
-                    SetOrZSet::ZSet(zs) => zs.get_score(m).is_some(),
-                }
-            }
-        }
-        let mut collections: Vec<SetOrZSet> = Vec::with_capacity(keys.len());
+        let mut slot_indices: smallvec::SmallVec<[usize; 8]> =
+            smallvec::SmallVec::with_capacity(keys.len());
         for k in keys {
             let h = hash_key(k);
             if let Some(idx) = self.table.find(k, h) {
@@ -7465,15 +7488,12 @@ impl RudisTable {
                     continue;
                 }
                 if let Some(entry) = self.table.get_slot(idx) {
-                    match &entry.val {
-                        RudisValue::ZSet(zs) => collections.push(SetOrZSet::ZSet((**zs).clone())),
-                        RudisValue::Set(s) => collections.push(SetOrZSet::Set((**s).clone())),
-                        _ => {
-                            return Err(
-                                "WRONGTYPE Operation against a key holding the wrong kind of value",
-                            );
-                        }
+                    if !matches!(entry.val, RudisValue::ZSet(_) | RudisValue::Set(_)) {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
                     }
+                    slot_indices.push(idx);
                 } else {
                     missing = true;
                 }
@@ -7481,17 +7501,56 @@ impl RudisTable {
                 missing = true;
             }
         }
-        if missing || collections.is_empty() {
+        if missing || slot_indices.is_empty() {
             return Ok(0);
         }
-        collections.sort_by_key(|c| c.len());
+        #[derive(Clone, Copy)]
+        enum SetOrZSetRef<'a> {
+            Set(&'a RudisSet),
+            ZSet(&'a RudisZSet),
+        }
+        impl<'a> SetOrZSetRef<'a> {
+            #[inline]
+            fn len(self) -> usize {
+                match self {
+                    SetOrZSetRef::Set(s) => s.len(),
+                    SetOrZSetRef::ZSet(zs) => zs.len(),
+                }
+            }
+            #[inline]
+            fn contains_with_hash(self, m: &[u8], mh: u64) -> bool {
+                match self {
+                    SetOrZSetRef::Set(s) => s.contains_with_hash(m, mh),
+                    SetOrZSetRef::ZSet(zs) => zs.get_score(m).is_some(),
+                }
+            }
+        }
+        let mut collections: smallvec::SmallVec<[SetOrZSetRef<'_>; 8]> =
+            smallvec::SmallVec::with_capacity(slot_indices.len());
+        for &idx in &slot_indices {
+            if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::ZSet(zs) => collections.push(SetOrZSetRef::ZSet(zs.as_ref())),
+                    RudisValue::Set(s) => collections.push(SetOrZSetRef::Set(s.as_ref())),
+                    _ => {}
+                }
+            }
+        }
+        collections.sort_unstable_by_key(|c| c.len());
+        if collections[0].len() == 0 {
+            return Ok(0);
+        }
+        let rest = &collections[1..];
+        if rest.is_empty() {
+            let len = collections[0].len();
+            return Ok(if limit > 0 { len.min(limit) } else { len });
+        }
         let mut count = 0;
-        let check_other =
-            |m: &[u8], cols: &[SetOrZSet]| -> bool { cols.iter().all(|c| c.contains(m)) };
-        match &collections[0] {
-            SetOrZSet::Set(s) => {
+        match collections[0] {
+            SetOrZSetRef::Set(s) => {
                 for m in s.iter() {
-                    if check_other(m.as_ref(), &collections[1..]) {
+                    let mh = hash64(m.as_ref());
+                    if rest.iter().all(|c| c.contains_with_hash(m.as_ref(), mh)) {
                         count += 1;
                         if limit > 0 && count >= limit {
                             return Ok(limit);
@@ -7499,13 +7558,14 @@ impl RudisTable {
                     }
                 }
             }
-            SetOrZSet::ZSet(zs) => {
+            SetOrZSetRef::ZSet(zs) => {
                 let mut early_exit = false;
                 zs.for_each(|m, _| {
                     if early_exit {
                         return;
                     }
-                    if check_other(m.as_ref(), &collections[1..]) {
+                    let mh = hash64(m.as_ref());
+                    if rest.iter().all(|c| c.contains_with_hash(m.as_ref(), mh)) {
                         count += 1;
                         if limit > 0 && count >= limit {
                             early_exit = true;
@@ -8335,10 +8395,8 @@ impl RudisTable {
     ) -> Result<usize, &'static str> {
         let items = self.zrange(src, opts)?;
         let h_dst = hash_key(dst);
+        self.del_with_hash(dst, h_dst);
         if items.is_empty() {
-            if let Some(idx) = self.table.find(dst, h_dst) {
-                self.table.remove(idx);
-            }
             return Ok(0);
         }
         let mut zset = RudisZSet::new();

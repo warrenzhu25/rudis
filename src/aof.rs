@@ -1185,6 +1185,53 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             Some(buf)
         }
+        Command::Zrangestore { dst, src, opts } => {
+            let (start_s, stop_s) = if opts.by_score {
+                let min_s = if opts.min_inc {
+                    opts.min_score.to_string()
+                } else {
+                    format!("({}", opts.min_score)
+                };
+                let max_s = if opts.max_inc {
+                    opts.max_score.to_string()
+                } else {
+                    format!("({}", opts.max_score)
+                };
+                (min_s.into_bytes(), max_s.into_bytes())
+            } else {
+                (
+                    opts.start.to_string().into_bytes(),
+                    opts.stop.to_string().into_bytes(),
+                )
+            };
+            let mut args: Vec<Vec<u8>> = vec![
+                b"ZRANGESTORE".to_vec(),
+                dst.to_vec(),
+                src.to_vec(),
+                start_s,
+                stop_s,
+            ];
+            if opts.by_score {
+                args.push(b"BYSCORE".to_vec());
+            } else if opts.by_lex {
+                args.push(b"BYLEX".to_vec());
+            }
+            if opts.rev {
+                args.push(b"REV".to_vec());
+            }
+            if let Some(count) = opts.count {
+                args.push(b"LIMIT".to_vec());
+                args.push(opts.offset.to_string().into_bytes());
+                args.push(count.to_string().into_bytes());
+            }
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend_from_slice(&a);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
         _ => None,
     }
 }

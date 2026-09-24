@@ -2725,7 +2725,6 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
         | Command::Zcount { key, .. }
         | Command::Zincrby { key, .. }
         | Command::Zrange { key, .. }
-        | Command::Zrangestore { dst: key, .. }
         | Command::Zpopmin { key, .. }
         | Command::Zpopmax { key, .. }
         | Command::Setnx { key, .. }
@@ -2834,6 +2833,11 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
         Command::Smove {
             source,
             destination,
+            ..
+        }
+        | Command::Zrangestore {
+            dst: destination,
+            src: source,
             ..
         }
         | Command::Lmove {
@@ -5951,7 +5955,6 @@ async fn execute_command(
         | Command::Zcount { .. }
         | Command::Zincrby { .. }
         | Command::Zrange { .. }
-        | Command::Zrangestore { .. }
         | Command::Zpopmin { .. }
         | Command::Zpopmax { .. }
         | Command::Type(_)
@@ -7383,16 +7386,268 @@ async fn execute_command(
             write_resp_bulk(out, msg);
             false
         }
+        Command::Zrangestore {
+            ref dst,
+            ref src,
+            ref opts,
+        } => {
+            let src_target = router.target_shard(src);
+            let dst_target = router.target_shard(dst);
+            if src_target == dst_target {
+                if src_target == router.shard_id {
+                    execute_local_command(
+                        &cmd,
+                        &mut router.local_db.borrow_mut(),
+                        out,
+                        router.aof.as_deref(),
+                    );
+                } else {
+                    let res = router.execute_remote(src_target, cmd).await;
+                    out.extend_from_slice(&res);
+                }
+                return false;
+            }
+            if router.cluster_enabled
+                && crate::router::key_slot(src) != crate::router::key_slot(dst)
+            {
+                out.extend_from_slice(
+                    b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                );
+                return false;
+            }
+            let mut zrange_opts = opts.clone();
+            zrange_opts.with_scores = true;
+            let zrange_cmd = Command::Zrange {
+                key: src.clone(),
+                opts: zrange_opts,
+            };
+            let raw = if src_target == router.shard_id {
+                let mut tmp = Vec::new();
+                execute_local_command(
+                    &zrange_cmd,
+                    &mut router.local_db.borrow_mut(),
+                    &mut tmp,
+                    None,
+                );
+                tmp
+            } else {
+                router.execute_remote(src_target, zrange_cmd).await
+            };
+            if raw.starts_with(b"-") {
+                out.extend_from_slice(&raw);
+                return false;
+            }
+            let mut items = Vec::new();
+            let mut pos = 0usize;
+            if pos < raw.len()
+                && raw[pos] == b'*'
+                && let Some(nl) = raw[pos..].iter().position(|&b| b == b'\n')
+            {
+                pos += nl + 1;
+                while pos < raw.len() {
+                    if raw[pos] != b'$' {
+                        break;
+                    }
+                    let Some(len_nl) = raw[pos..].iter().position(|&b| b == b'\n') else {
+                        break;
+                    };
+                    let len_str =
+                        std::str::from_utf8(&raw[pos + 1..pos + len_nl - 1]).unwrap_or("0");
+                    let bulk_len: usize = len_str.parse().unwrap_or(0);
+                    pos += len_nl + 1;
+                    if pos + bulk_len + 2 > raw.len() {
+                        break;
+                    }
+                    let val = bytes::Bytes::copy_from_slice(&raw[pos..pos + bulk_len]);
+                    pos += bulk_len + 2;
+                    items.push(val);
+                }
+            }
+            let del_cmd = Command::Del(smallvec::smallvec![dst.clone()]);
+            if dst_target == router.shard_id {
+                let mut tmp = Vec::new();
+                execute_local_command(&del_cmd, &mut router.local_db.borrow_mut(), &mut tmp, None);
+            } else {
+                let _ = router.execute_remote(dst_target, del_cmd).await;
+            }
+            let count = items.len() / 2;
+            if count > 0 {
+                let mut elements = Vec::with_capacity(count);
+                for pair in items.as_chunks::<2>().0 {
+                    let score: f64 = std::str::from_utf8(&pair[1])
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0.0);
+                    elements.push((score, pair[0].clone()));
+                }
+                let zadd_cmd = Command::Zadd {
+                    key: dst.clone(),
+                    elements: elements.into(),
+                    flags: crate::table::ZAddFlags::default(),
+                };
+                if dst_target == router.shard_id {
+                    let mut tmp = Vec::new();
+                    execute_local_command(
+                        &zadd_cmd,
+                        &mut router.local_db.borrow_mut(),
+                        &mut tmp,
+                        router.aof.as_deref(),
+                    );
+                } else {
+                    let _ = router.execute_remote(dst_target, zadd_cmd).await;
+                }
+            }
+            write_resp_integer(out, count as i64);
+            false
+        }
+        Command::Sintercard { ref keys, limit } | Command::Zintercard { ref keys, limit } => {
+            if keys.is_empty() {
+                write_resp_integer(out, 0);
+                return false;
+            }
+            let first_target = router.target_shard(&keys[0]);
+            let all_same_shard = keys[1..]
+                .iter()
+                .all(|k| router.target_shard(k) == first_target);
+            if all_same_shard {
+                if first_target == router.shard_id {
+                    execute_local_command(
+                        &cmd,
+                        &mut router.local_db.borrow_mut(),
+                        out,
+                        router.aof.as_deref(),
+                    );
+                } else {
+                    let res = router.execute_remote(first_target, cmd).await;
+                    out.extend_from_slice(&res);
+                }
+                return false;
+            }
+            if router.cluster_enabled
+                && keys[1..]
+                    .iter()
+                    .any(|k| crate::router::key_slot(k) != crate::router::key_slot(&keys[0]))
+            {
+                out.extend_from_slice(
+                    b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                );
+                return false;
+            }
+            let is_zinter = matches!(cmd, Command::Zintercard { .. });
+            let mut member_sets: Vec<hashbrown::HashSet<bytes::Bytes>> =
+                Vec::with_capacity(keys.len());
+            let mut any_empty = false;
+            for k in keys {
+                let target = router.target_shard(k);
+                let fetch_cmd = if is_zinter {
+                    let type_cmd = Command::Type(k.clone());
+                    let t_raw = if target == router.shard_id {
+                        let mut tmp = Vec::new();
+                        execute_local_command(
+                            &type_cmd,
+                            &mut router.local_db.borrow_mut(),
+                            &mut tmp,
+                            None,
+                        );
+                        tmp
+                    } else {
+                        router.execute_remote(target, type_cmd).await
+                    };
+                    if t_raw.as_slice() == b"+set\r\n" {
+                        Command::Smembers(k.clone())
+                    } else if t_raw.as_slice() == b"+zset\r\n" || t_raw.as_slice() == b"+none\r\n" {
+                        Command::Zrange {
+                            key: k.clone(),
+                            opts: crate::table::ZRangeOpts {
+                                start: 0,
+                                stop: -1,
+                                ..crate::table::ZRangeOpts::default()
+                            },
+                        }
+                    } else {
+                        out.extend_from_slice(
+                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                        );
+                        return false;
+                    }
+                } else {
+                    Command::Smembers(k.clone())
+                };
+                let raw = if target == router.shard_id {
+                    let mut tmp = Vec::new();
+                    execute_local_command(
+                        &fetch_cmd,
+                        &mut router.local_db.borrow_mut(),
+                        &mut tmp,
+                        None,
+                    );
+                    tmp
+                } else {
+                    router.execute_remote(target, fetch_cmd).await
+                };
+                if raw.starts_with(b"-") {
+                    out.extend_from_slice(&raw);
+                    return false;
+                }
+                let mut set = hashbrown::HashSet::new();
+                let mut pos = 0usize;
+                if pos < raw.len()
+                    && raw[pos] == b'*'
+                    && let Some(nl) = raw[pos..].iter().position(|&b| b == b'\n')
+                {
+                    pos += nl + 1;
+                    while pos < raw.len() {
+                        if raw[pos] != b'$' {
+                            break;
+                        }
+                        let Some(len_nl) = raw[pos..].iter().position(|&b| b == b'\n') else {
+                            break;
+                        };
+                        let len_str =
+                            std::str::from_utf8(&raw[pos + 1..pos + len_nl - 1]).unwrap_or("0");
+                        let bulk_len: usize = len_str.parse().unwrap_or(0);
+                        pos += len_nl + 1;
+                        if pos + bulk_len + 2 > raw.len() {
+                            break;
+                        }
+                        let val = bytes::Bytes::copy_from_slice(&raw[pos..pos + bulk_len]);
+                        pos += bulk_len + 2;
+                        set.insert(val);
+                    }
+                }
+                if set.is_empty() {
+                    any_empty = true;
+                }
+                member_sets.push(set);
+            }
+            if any_empty || member_sets.is_empty() {
+                write_resp_integer(out, 0);
+                return false;
+            }
+            member_sets.sort_unstable_by_key(|s| s.len());
+            let first = &member_sets[0];
+            let rest = &member_sets[1..];
+            let mut count = 0usize;
+            for m in first.iter() {
+                if rest.iter().all(|s| s.contains(m)) {
+                    count += 1;
+                    if limit > 0 && count >= limit {
+                        count = limit;
+                        break;
+                    }
+                }
+            }
+            write_resp_integer(out, count as i64);
+            false
+        }
         Command::Sinter(ref keys)
         | Command::Sunion(ref keys)
         | Command::Sdiff(ref keys)
-        | Command::Sintercard { ref keys, .. }
         | Command::Sunioncard { ref keys, .. }
         | Command::Sdiffcard { ref keys, .. }
         | Command::Zdiff { ref keys, .. }
         | Command::Zinter { ref keys, .. }
-        | Command::Zunion { ref keys, .. }
-        | Command::Zintercard { ref keys, .. } => {
+        | Command::Zunion { ref keys, .. } => {
             if keys.is_empty() {
                 out.extend_from_slice(b"*0\r\n");
                 return false;

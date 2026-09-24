@@ -11647,3 +11647,104 @@ fn test_hash_field_expiration_and_stream_claim_e2e() {
     assert!(autoclaim_res.contains("100-0"));
     assert!(autoclaim_res.contains("200-0"));
 }
+
+#[test]
+fn test_sintercard_zintercard_zrangestore_cross_shard_e2e() {
+    let port = 19126;
+    start_test_server(port, 4);
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // 1. Co-located single-shard SINTERCARD & ZINTERCARD (zero-allocation fast path)
+    assert_eq!(
+        send_and_read(&mut stream, b"SADD {grp}:s1 a b c d\r\n"),
+        ":4\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"SADD {grp}:s2 b c d e\r\n"),
+        ":4\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"SINTERCARD 2 {grp}:s1 {grp}:s2\r\n"),
+        ":3\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"SINTERCARD 2 {grp}:s1 {grp}:s2 LIMIT 2\r\n"),
+        ":2\r\n"
+    );
+
+    // 2. Cross-shard SINTERCARD & ZINTERCARD across distinct shards
+    assert_eq!(
+        send_and_read(&mut stream, b"SADD shard_set_alpha u1 u2 u3 u4\r\n"),
+        ":4\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"SADD shard_set_beta u2 u3 u4 u5\r\n"),
+        ":4\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            b"SINTERCARD 2 shard_set_alpha shard_set_beta\r\n"
+        ),
+        ":3\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            b"SINTERCARD 2 shard_set_alpha shard_set_beta LIMIT 1\r\n"
+        ),
+        ":1\r\n"
+    );
+
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            b"ZADD shard_zset_1 10 m1 20 m2 30 m3 40 m4\r\n"
+        ),
+        ":4\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"ZADD shard_zset_2 5 m2 15 m3 25 m4 35 m5\r\n"),
+        ":4\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"ZINTERCARD 2 shard_zset_1 shard_zset_2\r\n"),
+        ":3\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            b"ZINTERCARD 2 shard_zset_1 shard_zset_2 LIMIT 2\r\n"
+        ),
+        ":2\r\n"
+    );
+
+    // 3. Cross-shard & overwrite ZRANGESTORE
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            b"ZRANGESTORE shard_zset_dst shard_zset_1 15 35 BYSCORE\r\n"
+        ),
+        ":2\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"ZCARD shard_zset_dst\r\n"),
+        ":2\r\n"
+    );
+    // Overwrite existing dst with smaller range
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            b"ZRANGESTORE shard_zset_dst shard_zset_1 0 0\r\n"
+        ),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"ZCARD shard_zset_dst\r\n"),
+        ":1\r\n"
+    );
+}
