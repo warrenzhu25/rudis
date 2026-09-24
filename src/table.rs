@@ -2098,6 +2098,7 @@ pub struct RudisTable {
     pub used_memory: usize,
     pub arena: crate::allocator::SmallCollectionArena,
     pub num_expires: usize,
+    pub hash_field_expires: hashbrown::HashMap<Bytes, hashbrown::HashMap<Bytes, Instant>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2122,6 +2123,7 @@ impl RudisTable {
             used_memory: base_mem,
             arena: crate::allocator::SmallCollectionArena::new(),
             num_expires: 0,
+            hash_field_expires: hashbrown::HashMap::new(),
         }
     }
 
@@ -3870,7 +3872,457 @@ impl RudisTable {
         Ok(1)
     }
 
+    pub fn purge_expired_hash_fields(&mut self, key: &[u8]) {
+        let now = Instant::now();
+        let mut expired = Vec::new();
+        let mut empty_map = false;
+        if let Some(fmap) = self.hash_field_expires.get_mut(key) {
+            fmap.retain(|f, exp| {
+                if now >= *exp {
+                    expired.push(f.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            empty_map = fmap.is_empty();
+        }
+        if empty_map {
+            self.hash_field_expires.remove(key);
+        }
+        if !expired.is_empty() {
+            let _ = self.hdel(key, &expired);
+        }
+    }
+
+    pub fn hexpire(
+        &mut self,
+        key: &[u8],
+        expire_ms: i64,
+        is_at: bool,
+        condition: crate::resp::HexpireCondition,
+        fields: &[Bytes],
+    ) -> Result<Vec<i64>, &'static str> {
+        if !self.hash_field_expires.is_empty() {
+            self.purge_expired_hash_fields(key);
+        }
+        let h = hash_key(key);
+        let Some(idx) = self.table.find(key, h) else {
+            return Ok(vec![-2; fields.len()]);
+        };
+        if self.check_expired_slot(idx) {
+            return Ok(vec![-2; fields.len()]);
+        }
+        let Some(entry) = self.table.get_slot(idx) else {
+            return Ok(vec![-2; fields.len()]);
+        };
+        match &entry.val {
+            RudisValue::SmallHash(_) | RudisValue::Hash(_) => {}
+            _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        }
+
+        let now = Instant::now();
+        let now_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let delta_ms = if is_at {
+            expire_ms - now_unix_ms
+        } else {
+            expire_ms
+        };
+
+        let mut results = Vec::with_capacity(fields.len());
+        let mut to_delete = Vec::new();
+
+        for f in fields {
+            let exists = if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::SmallHash(pairs) => pairs.iter().any(|(k, _)| k == f),
+                    RudisValue::Hash(map) => map.contains_key(f),
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if !exists {
+                results.push(-2);
+                continue;
+            }
+
+            let cur_exp = self
+                .hash_field_expires
+                .get(key)
+                .and_then(|m| m.get(f).copied());
+
+            if delta_ms <= 0 {
+                let cond_ok = match condition {
+                    crate::resp::HexpireCondition::None => true,
+                    crate::resp::HexpireCondition::Nx => cur_exp.is_none(),
+                    crate::resp::HexpireCondition::Xx => cur_exp.is_some(),
+                    crate::resp::HexpireCondition::Gt => false,
+                    crate::resp::HexpireCondition::Lt => true,
+                };
+                if cond_ok {
+                    if let Some(m) = self.hash_field_expires.get_mut(key) {
+                        m.remove(f);
+                    }
+                    to_delete.push(f.clone());
+                    results.push(2);
+                } else {
+                    results.push(0);
+                }
+            } else {
+                let new_exp = now + Duration::from_millis(delta_ms as u64);
+                let cond_ok = match condition {
+                    crate::resp::HexpireCondition::None => true,
+                    crate::resp::HexpireCondition::Nx => cur_exp.is_none(),
+                    crate::resp::HexpireCondition::Xx => cur_exp.is_some(),
+                    crate::resp::HexpireCondition::Gt => match cur_exp {
+                        Some(old) => new_exp > old,
+                        None => false,
+                    },
+                    crate::resp::HexpireCondition::Lt => match cur_exp {
+                        Some(old) => new_exp < old,
+                        None => true,
+                    },
+                };
+                if cond_ok {
+                    self.hash_field_expires
+                        .entry(Bytes::copy_from_slice(key))
+                        .or_default()
+                        .insert(f.clone(), new_exp);
+                    results.push(1);
+                } else {
+                    results.push(0);
+                }
+            }
+        }
+
+        if !to_delete.is_empty() {
+            let _ = self.hdel(key, &to_delete);
+        }
+        Ok(results)
+    }
+
+    pub fn httl(
+        &mut self,
+        key: &[u8],
+        is_ms: bool,
+        is_expiretime: bool,
+        fields: &[Bytes],
+    ) -> Result<Vec<i64>, &'static str> {
+        if !self.hash_field_expires.is_empty() {
+            self.purge_expired_hash_fields(key);
+        }
+        let h = hash_key(key);
+        let Some(idx) = self.table.find(key, h) else {
+            return Ok(vec![-2; fields.len()]);
+        };
+        if self.check_expired_slot(idx) {
+            return Ok(vec![-2; fields.len()]);
+        }
+        let Some(entry) = self.table.get_slot(idx) else {
+            return Ok(vec![-2; fields.len()]);
+        };
+        match &entry.val {
+            RudisValue::SmallHash(_) | RudisValue::Hash(_) => {}
+            _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        }
+
+        let now = Instant::now();
+        let now_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let mut results = Vec::with_capacity(fields.len());
+
+        for f in fields {
+            let exists = match &entry.val {
+                RudisValue::SmallHash(pairs) => pairs.iter().any(|(k, _)| k == f),
+                RudisValue::Hash(map) => map.contains_key(f),
+                _ => false,
+            };
+            if !exists {
+                results.push(-2);
+                continue;
+            }
+            if let Some(exp) = self
+                .hash_field_expires
+                .get(key)
+                .and_then(|m| m.get(f).copied())
+            {
+                let rem_ms = exp.saturating_duration_since(now).as_millis() as i64;
+                if is_expiretime {
+                    let abs_ms = now_unix_ms + rem_ms;
+                    results.push(if is_ms { abs_ms } else { (abs_ms + 500) / 1000 });
+                } else {
+                    results.push(if is_ms { rem_ms } else { (rem_ms + 500) / 1000 });
+                }
+            } else {
+                results.push(-1);
+            }
+        }
+        Ok(results)
+    }
+
+    pub fn hpersist(&mut self, key: &[u8], fields: &[Bytes]) -> Result<Vec<i64>, &'static str> {
+        if !self.hash_field_expires.is_empty() {
+            self.purge_expired_hash_fields(key);
+        }
+        let h = hash_key(key);
+        let Some(idx) = self.table.find(key, h) else {
+            return Ok(vec![-2; fields.len()]);
+        };
+        if self.check_expired_slot(idx) {
+            return Ok(vec![-2; fields.len()]);
+        }
+        let Some(entry) = self.table.get_slot(idx) else {
+            return Ok(vec![-2; fields.len()]);
+        };
+        match &entry.val {
+            RudisValue::SmallHash(_) | RudisValue::Hash(_) => {}
+            _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        }
+
+        let mut results = Vec::with_capacity(fields.len());
+        for f in fields {
+            let exists = match &entry.val {
+                RudisValue::SmallHash(pairs) => pairs.iter().any(|(k, _)| k == f),
+                RudisValue::Hash(map) => map.contains_key(f),
+                _ => false,
+            };
+            if !exists {
+                results.push(-2);
+            } else if self
+                .hash_field_expires
+                .get_mut(key)
+                .and_then(|m| m.remove(f))
+                .is_some()
+            {
+                results.push(1);
+            } else {
+                results.push(-1);
+            }
+        }
+        Ok(results)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn xclaim(
+        &mut self,
+        key: &[u8],
+        group: &[u8],
+        consumer: Bytes,
+        min_idle_time: u64,
+        ids: &[Bytes],
+        idle: Option<u64>,
+        time: Option<u64>,
+        retrycount: Option<usize>,
+        force: bool,
+        justid: bool,
+    ) -> Result<Vec<(StreamId, Vec<(Bytes, Bytes)>)>, String> {
+        let h = hash_key(key);
+        let Some(idx) = self.table.find(key, h) else {
+            return Err("NOGROUP No such key or consumer group".to_string());
+        };
+        if self.check_expired_slot(idx) {
+            return Err("NOGROUP No such key or consumer group".to_string());
+        }
+        let Some(entry) = self.table.get_slot_mut(idx) else {
+            return Err("NOGROUP No such key or consumer group".to_string());
+        };
+        let RudisValue::Stream(stream) = &mut entry.val else {
+            return Err(
+                "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+            );
+        };
+        let Some(grp) = stream.groups.get_mut(group) else {
+            return Err("NOGROUP No such key or consumer group".to_string());
+        };
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let target_delivery_time = if let Some(t) = time {
+            t
+        } else if let Some(id_ms) = idle {
+            now_ms.saturating_sub(id_ms)
+        } else {
+            now_ms
+        };
+
+        grp.consumers
+            .entry(consumer.clone())
+            .and_modify(|c| c.seen_time_ms = now_ms)
+            .or_insert_with(|| StreamConsumer {
+                name: consumer.clone(),
+                seen_time_ms: now_ms,
+                pel: std::collections::BTreeMap::new(),
+            });
+
+        let mut claimed = Vec::new();
+        for raw_id in ids {
+            let s = std::str::from_utf8(raw_id)
+                .map_err(|_| "Invalid stream ID specified as stream command argument")?;
+            let sid = StreamId::parse_exact(s).map_err(|e| e.to_string())?;
+
+            if let Some(pel_entry) = grp.pel.get(&sid).cloned() {
+                let elapsed = now_ms.saturating_sub(pel_entry.delivery_time_ms);
+                if elapsed < min_idle_time && !force {
+                    continue;
+                }
+                let Some(fields) = stream.entries.get(&sid).cloned() else {
+                    grp.pel.remove(&sid);
+                    if let Some(old_c) = grp.consumers.get_mut(&pel_entry.consumer) {
+                        old_c.pel.remove(&sid);
+                    }
+                    continue;
+                };
+                if let Some(old_c) = grp.consumers.get_mut(&pel_entry.consumer) {
+                    old_c.pel.remove(&sid);
+                }
+                let new_count = retrycount.unwrap_or_else(|| {
+                    if justid {
+                        pel_entry.delivery_count
+                    } else {
+                        pel_entry.delivery_count + 1
+                    }
+                });
+                if let Some(pe) = grp.pel.get_mut(&sid) {
+                    pe.consumer = consumer.clone();
+                    pe.delivery_time_ms = target_delivery_time;
+                    pe.delivery_count = new_count;
+                }
+                if let Some(new_c) = grp.consumers.get_mut(&consumer) {
+                    new_c.pel.insert(sid, target_delivery_time);
+                }
+                claimed.push((sid, fields));
+            } else if force && let Some(fields) = stream.entries.get(&sid).cloned() {
+                let new_count = retrycount.unwrap_or(if justid { 0 } else { 1 });
+                grp.pel.insert(
+                    sid,
+                    StreamPelEntry {
+                        consumer: consumer.clone(),
+                        delivery_time_ms: target_delivery_time,
+                        delivery_count: new_count,
+                    },
+                );
+                if let Some(new_c) = grp.consumers.get_mut(&consumer) {
+                    new_c.pel.insert(sid, target_delivery_time);
+                }
+                claimed.push((sid, fields));
+            }
+        }
+
+        Ok(claimed)
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn xautoclaim(
+        &mut self,
+        key: &[u8],
+        group: &[u8],
+        consumer: Bytes,
+        min_idle_time: u64,
+        start: &[u8],
+        count: usize,
+        justid: bool,
+    ) -> Result<(String, Vec<(StreamId, Vec<(Bytes, Bytes)>)>, Vec<StreamId>), String> {
+        let start_s = std::str::from_utf8(start)
+            .map_err(|_| "Invalid stream ID specified as stream command argument")?;
+        let start_id = if start_s == "-" || start_s == "0" || start_s == "0-0" {
+            StreamId::new(0, 0)
+        } else {
+            StreamId::parse_exact(start_s).map_err(|e| e.to_string())?
+        };
+
+        let h = hash_key(key);
+        let Some(idx) = self.table.find(key, h) else {
+            return Err("NOGROUP No such key or consumer group".to_string());
+        };
+        if self.check_expired_slot(idx) {
+            return Err("NOGROUP No such key or consumer group".to_string());
+        }
+        let Some(entry) = self.table.get_slot_mut(idx) else {
+            return Err("NOGROUP No such key or consumer group".to_string());
+        };
+        let RudisValue::Stream(stream) = &mut entry.val else {
+            return Err(
+                "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+            );
+        };
+        let Some(grp) = stream.groups.get_mut(group) else {
+            return Err("NOGROUP No such key or consumer group".to_string());
+        };
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        grp.consumers
+            .entry(consumer.clone())
+            .and_modify(|c| c.seen_time_ms = now_ms)
+            .or_insert_with(|| StreamConsumer {
+                name: consumer.clone(),
+                seen_time_ms: now_ms,
+                pel: std::collections::BTreeMap::new(),
+            });
+
+        let candidates: Vec<(StreamId, StreamPelEntry)> = grp
+            .pel
+            .range(start_id..)
+            .take(count.saturating_add(1))
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+
+        let next_cursor = if candidates.len() > count {
+            candidates[count].0.to_string()
+        } else {
+            "0-0".to_string()
+        };
+
+        let mut claimed = Vec::new();
+        let mut deleted_ids = Vec::new();
+
+        for (sid, pel_entry) in candidates.into_iter().take(count) {
+            let Some(fields) = stream.entries.get(&sid).cloned() else {
+                grp.pel.remove(&sid);
+                if let Some(old_c) = grp.consumers.get_mut(&pel_entry.consumer) {
+                    old_c.pel.remove(&sid);
+                }
+                deleted_ids.push(sid);
+                continue;
+            };
+
+            let elapsed = now_ms.saturating_sub(pel_entry.delivery_time_ms);
+            if elapsed >= min_idle_time {
+                if let Some(old_c) = grp.consumers.get_mut(&pel_entry.consumer) {
+                    old_c.pel.remove(&sid);
+                }
+                if let Some(pe) = grp.pel.get_mut(&sid) {
+                    pe.consumer = consumer.clone();
+                    pe.delivery_time_ms = now_ms;
+                    if !justid {
+                        pe.delivery_count += 1;
+                    }
+                }
+                if let Some(new_c) = grp.consumers.get_mut(&consumer) {
+                    new_c.pel.insert(sid, now_ms);
+                }
+                claimed.push((sid, fields));
+            }
+        }
+
+        Ok((next_cursor, claimed, deleted_ids))
+    }
+
     pub fn hget(&mut self, key: &[u8], field: &[u8]) -> Result<Option<Bytes>, &'static str> {
+        if !self.hash_field_expires.is_empty() {
+            self.purge_expired_hash_fields(key);
+        }
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h)
             && let Some(entry) = self.table.get_slot(idx)
@@ -3918,6 +4370,9 @@ impl RudisTable {
         h: u64,
         field: &[u8],
     ) -> Result<crate::shard::CompactResp, &'static str> {
+        if !self.hash_field_expires.is_empty() {
+            self.purge_expired_hash_fields(key);
+        }
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at
@@ -4100,6 +4555,9 @@ impl RudisTable {
     }
 
     pub fn hexists(&mut self, key: &[u8], field: &[u8]) -> Result<bool, &'static str> {
+        if !self.hash_field_expires.is_empty() {
+            self.purge_expired_hash_fields(key);
+        }
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
@@ -4120,6 +4578,9 @@ impl RudisTable {
     }
 
     pub fn hlen(&mut self, key: &[u8]) -> Result<usize, &'static str> {
+        if !self.hash_field_expires.is_empty() {
+            self.purge_expired_hash_fields(key);
+        }
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
@@ -4140,6 +4601,9 @@ impl RudisTable {
     }
 
     pub fn hgetall(&mut self, key: &[u8]) -> Result<Vec<(Bytes, Bytes)>, &'static str> {
+        if !self.hash_field_expires.is_empty() {
+            self.purge_expired_hash_fields(key);
+        }
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
@@ -4162,6 +4626,9 @@ impl RudisTable {
     }
 
     pub fn hkeys(&mut self, key: &[u8]) -> Result<Vec<Bytes>, &'static str> {
+        if !self.hash_field_expires.is_empty() {
+            self.purge_expired_hash_fields(key);
+        }
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
@@ -4184,6 +4651,9 @@ impl RudisTable {
     }
 
     pub fn hvals(&mut self, key: &[u8]) -> Result<Vec<Bytes>, &'static str> {
+        if !self.hash_field_expires.is_empty() {
+            self.purge_expired_hash_fields(key);
+        }
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {

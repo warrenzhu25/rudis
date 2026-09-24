@@ -200,6 +200,15 @@ pub enum XinfoSubcommand {
     Help,
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum HexpireCondition {
+    None,
+    Nx,
+    Xx,
+    Gt,
+    Lt,
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum Command {
     Object(ObjectSubcommand),
@@ -210,6 +219,44 @@ pub enum Command {
     FunctionKill,
     CommandCount,
     CommandList,
+    Hexpire {
+        key: Bytes,
+        expire_ms: i64,
+        is_at: bool,
+        condition: HexpireCondition,
+        fields: Vec<Bytes>,
+    },
+    Httl {
+        key: Bytes,
+        is_ms: bool,
+        is_expiretime: bool,
+        fields: Vec<Bytes>,
+    },
+    Hpersist {
+        key: Bytes,
+        fields: Vec<Bytes>,
+    },
+    Xclaim {
+        key: Bytes,
+        group: Bytes,
+        consumer: Bytes,
+        min_idle_time: u64,
+        ids: Vec<Bytes>,
+        idle: Option<u64>,
+        time: Option<u64>,
+        retrycount: Option<usize>,
+        force: bool,
+        justid: bool,
+    },
+    Xautoclaim {
+        key: Bytes,
+        group: Bytes,
+        consumer: Bytes,
+        min_idle_time: u64,
+        start: Bytes,
+        count: usize,
+        justid: bool,
+    },
     Auth {
         username: Option<String>,
         password: String,
@@ -6200,6 +6247,260 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }))
             }
         }
+        "HEXPIRE" | "HPEXPIRE" | "HEXPIREAT" | "HPEXPIREAT" => {
+            if args.len() < 6 {
+                return Err(format!(
+                    "wrong number of arguments for '{}' command",
+                    cmd_name.to_lowercase()
+                ));
+            }
+            let key = args[1].clone();
+            let raw_time: i64 = std::str::from_utf8(&args[2])
+                .map_err(|_| "value is not an integer or out of range")?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range")?;
+            let expire_ms = match cmd_name {
+                "HEXPIRE" | "HEXPIREAT" => raw_time.saturating_mul(1000),
+                _ => raw_time,
+            };
+            let is_at = matches!(cmd_name, "HEXPIREAT" | "HPEXPIREAT");
+
+            let mut idx = 3;
+            let mut condition = HexpireCondition::None;
+            if idx < args.len() {
+                let tok = String::from_utf8_lossy(&args[idx]).to_uppercase();
+                match tok.as_str() {
+                    "NX" => {
+                        condition = HexpireCondition::Nx;
+                        idx += 1;
+                    }
+                    "XX" => {
+                        condition = HexpireCondition::Xx;
+                        idx += 1;
+                    }
+                    "GT" => {
+                        condition = HexpireCondition::Gt;
+                        idx += 1;
+                    }
+                    "LT" => {
+                        condition = HexpireCondition::Lt;
+                        idx += 1;
+                    }
+                    _ => {}
+                }
+            }
+            if idx + 2 > args.len() || !args[idx].eq_ignore_ascii_case(b"FIELDS") {
+                return Err("syntax error".to_string());
+            }
+            let numfields: usize = std::str::from_utf8(&args[idx + 1])
+                .map_err(|_| "value is not an integer or out of range")?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range")?;
+            if numfields == 0 || args.len() != idx + 2 + numfields {
+                return Err(
+                    "Parameter `numfields` does not match the number of arguments".to_string(),
+                );
+            }
+            let fields = args[idx + 2..].to_vec();
+            Ok(Some(Command::Hexpire {
+                key,
+                expire_ms,
+                is_at,
+                condition,
+                fields,
+            }))
+        }
+        "HTTL" | "HPTTL" | "HEXPIRETIME" | "HPEXPIRETIME" => {
+            if args.len() < 5 || !args[2].eq_ignore_ascii_case(b"FIELDS") {
+                return Err(format!(
+                    "wrong number of arguments for '{}' command",
+                    cmd_name.to_lowercase()
+                ));
+            }
+            let key = args[1].clone();
+            let numfields: usize = std::str::from_utf8(&args[3])
+                .map_err(|_| "value is not an integer or out of range")?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range")?;
+            if numfields == 0 || args.len() != 4 + numfields {
+                return Err(
+                    "Parameter `numfields` does not match the number of arguments".to_string(),
+                );
+            }
+            let is_ms = matches!(cmd_name, "HPTTL" | "HPEXPIRETIME");
+            let is_expiretime = matches!(cmd_name, "HEXPIRETIME" | "HPEXPIRETIME");
+            let fields = args[4..].to_vec();
+            Ok(Some(Command::Httl {
+                key,
+                is_ms,
+                is_expiretime,
+                fields,
+            }))
+        }
+        "HPERSIST" => {
+            if args.len() < 5 || !args[2].eq_ignore_ascii_case(b"FIELDS") {
+                return Err("wrong number of arguments for 'hpersist' command".to_string());
+            }
+            let key = args[1].clone();
+            let numfields: usize = std::str::from_utf8(&args[3])
+                .map_err(|_| "value is not an integer or out of range")?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range")?;
+            if numfields == 0 || args.len() != 4 + numfields {
+                return Err(
+                    "Parameter `numfields` does not match the number of arguments".to_string(),
+                );
+            }
+            let fields = args[4..].to_vec();
+            Ok(Some(Command::Hpersist { key, fields }))
+        }
+        "XCLAIM" => {
+            if args.len() < 6 {
+                return Err("wrong number of arguments for 'xclaim' command".to_string());
+            }
+            let key = args[1].clone();
+            let group = args[2].clone();
+            let consumer = args[3].clone();
+            let min_idle_time: u64 = std::str::from_utf8(&args[4])
+                .map_err(|_| "value is not an integer or out of range")?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range")?;
+
+            let mut ids = Vec::new();
+            let mut idle = None;
+            let mut time = None;
+            let mut retrycount = None;
+            let mut force = false;
+            let mut justid = false;
+            let mut i = 5;
+            let mut in_opts = false;
+
+            while i < args.len() {
+                let tok = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match tok.as_str() {
+                    "IDLE" => {
+                        in_opts = true;
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        idle = Some(
+                            std::str::from_utf8(&args[i + 1])
+                                .map_err(|_| "value is not an integer or out of range")?
+                                .parse()
+                                .map_err(|_| "value is not an integer or out of range")?,
+                        );
+                        i += 2;
+                    }
+                    "TIME" => {
+                        in_opts = true;
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        time = Some(
+                            std::str::from_utf8(&args[i + 1])
+                                .map_err(|_| "value is not an integer or out of range")?
+                                .parse()
+                                .map_err(|_| "value is not an integer or out of range")?,
+                        );
+                        i += 2;
+                    }
+                    "RETRYCOUNT" => {
+                        in_opts = true;
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        retrycount = Some(
+                            std::str::from_utf8(&args[i + 1])
+                                .map_err(|_| "value is not an integer or out of range")?
+                                .parse()
+                                .map_err(|_| "value is not an integer or out of range")?,
+                        );
+                        i += 2;
+                    }
+                    "FORCE" => {
+                        in_opts = true;
+                        force = true;
+                        i += 1;
+                    }
+                    "JUSTID" => {
+                        in_opts = true;
+                        justid = true;
+                        i += 1;
+                    }
+                    "LASTID" => {
+                        in_opts = true;
+                        i += 2;
+                    }
+                    _ => {
+                        if in_opts {
+                            return Err("syntax error".to_string());
+                        }
+                        ids.push(args[i].clone());
+                        i += 1;
+                    }
+                }
+            }
+            if ids.is_empty() {
+                return Err("wrong number of arguments for 'xclaim' command".to_string());
+            }
+            Ok(Some(Command::Xclaim {
+                key,
+                group,
+                consumer,
+                min_idle_time,
+                ids,
+                idle,
+                time,
+                retrycount,
+                force,
+                justid,
+            }))
+        }
+        "XAUTOCLAIM" => {
+            if args.len() < 6 {
+                return Err("wrong number of arguments for 'xautoclaim' command".to_string());
+            }
+            let key = args[1].clone();
+            let group = args[2].clone();
+            let consumer = args[3].clone();
+            let min_idle_time: u64 = std::str::from_utf8(&args[4])
+                .map_err(|_| "value is not an integer or out of range")?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range")?;
+            let start = args[5].clone();
+            let mut count: usize = 100;
+            let mut justid = false;
+            let mut i = 6;
+            while i < args.len() {
+                let tok = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match tok.as_str() {
+                    "COUNT" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        count = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        i += 2;
+                    }
+                    "JUSTID" => {
+                        justid = true;
+                        i += 1;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            Ok(Some(Command::Xautoclaim {
+                key,
+                group,
+                consumer,
+                min_idle_time,
+                start,
+                count,
+                justid,
+            }))
+        }
         "XINFO" => {
             if args.len() < 2 {
                 return Err("wrong number of arguments for 'xinfo' command".to_string());
@@ -9608,5 +9909,85 @@ mod tests {
         let mut buf = BytesMut::from("*2\r\n$8\r\nFUNCTION\r\n$4\r\nKILL\r\n");
         let cmd = parse_command(&mut buf).unwrap().unwrap();
         assert_eq!(cmd, Command::FunctionKill);
+
+        // HEXPIRE / HTTL / HPERSIST
+        let mut buf = BytesMut::from(
+            "*8\r\n$7\r\nHEXPIRE\r\n$6\r\nmyhash\r\n$2\r\n10\r\n$2\r\nNX\r\n$6\r\nFIELDS\r\n$1\r\n2\r\n$2\r\nf1\r\n$2\r\nf2\r\n",
+        );
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::Hexpire {
+                key: Bytes::from_static(b"myhash"),
+                expire_ms: 10000,
+                is_at: false,
+                condition: HexpireCondition::Nx,
+                fields: vec![Bytes::from_static(b"f1"), Bytes::from_static(b"f2")],
+            }
+        );
+
+        let mut buf = BytesMut::from(
+            "*5\r\n$4\r\nHTTL\r\n$6\r\nmyhash\r\n$6\r\nFIELDS\r\n$1\r\n1\r\n$2\r\nf1\r\n",
+        );
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::Httl {
+                key: Bytes::from_static(b"myhash"),
+                is_ms: false,
+                is_expiretime: false,
+                fields: vec![Bytes::from_static(b"f1")],
+            }
+        );
+
+        let mut buf = BytesMut::from(
+            "*5\r\n$8\r\nHPERSIST\r\n$6\r\nmyhash\r\n$6\r\nFIELDS\r\n$1\r\n1\r\n$2\r\nf1\r\n",
+        );
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::Hpersist {
+                key: Bytes::from_static(b"myhash"),
+                fields: vec![Bytes::from_static(b"f1")],
+            }
+        );
+
+        // XCLAIM & XAUTOCLAIM
+        let mut buf = BytesMut::from(
+            "*7\r\n$6\r\nXCLAIM\r\n$2\r\ns1\r\n$2\r\ng1\r\n$2\r\nc2\r\n$1\r\n0\r\n$5\r\n100-0\r\n$6\r\nJUSTID\r\n",
+        );
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::Xclaim {
+                key: Bytes::from_static(b"s1"),
+                group: Bytes::from_static(b"g1"),
+                consumer: Bytes::from_static(b"c2"),
+                min_idle_time: 0,
+                ids: vec![Bytes::from_static(b"100-0")],
+                idle: None,
+                time: None,
+                retrycount: None,
+                force: false,
+                justid: true,
+            }
+        );
+
+        let mut buf = BytesMut::from(
+            "*8\r\n$10\r\nXAUTOCLAIM\r\n$2\r\ns1\r\n$2\r\ng1\r\n$2\r\nc2\r\n$1\r\n0\r\n$3\r\n0-0\r\n$5\r\nCOUNT\r\n$2\r\n10\r\n",
+        );
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::Xautoclaim {
+                key: Bytes::from_static(b"s1"),
+                group: Bytes::from_static(b"g1"),
+                consumer: Bytes::from_static(b"c2"),
+                min_idle_time: 0,
+                start: Bytes::from_static(b"0-0"),
+                count: 10,
+                justid: false,
+            }
+        );
     }
 }

@@ -11554,3 +11554,96 @@ fn test_client_setinfo_latency_pubsub_function_e2e() {
     assert!(func_stats.contains("libraries_count"));
     assert_eq!(send_and_read(&mut stream, b"FUNCTION KILL\r\n"), "+OK\r\n");
 }
+
+#[test]
+fn test_hash_field_expiration_and_stream_claim_e2e() {
+    let port = 19125;
+    start_test_server(port, 4);
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // 1. Hash field expiration (HEXPIRE, HTTL, HPERSIST)
+    assert_eq!(
+        send_and_read(&mut stream, b"HSET user:900 session tok_123 role admin\r\n"),
+        ":2\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            b"HTTL user:900 FIELDS 3 session role ghost\r\n"
+        ),
+        "*3\r\n:-1\r\n:-1\r\n:-2\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            b"HEXPIRE user:900 30 NX FIELDS 2 session ghost\r\n"
+        ),
+        "*2\r\n:1\r\n:-2\r\n"
+    );
+    // NX fails when field already has TTL
+    assert_eq!(
+        send_and_read(&mut stream, b"HEXPIRE user:900 60 NX FIELDS 1 session\r\n"),
+        "*1\r\n:0\r\n"
+    );
+    // HPERSIST removes expiration
+    assert_eq!(
+        send_and_read(&mut stream, b"HPERSIST user:900 FIELDS 2 session role\r\n"),
+        "*2\r\n:1\r\n:-1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"HTTL user:900 FIELDS 1 session\r\n"),
+        "*1\r\n:-1\r\n"
+    );
+    // Immediate expiration with TTL = 0 deletes the field
+    assert_eq!(
+        send_and_read(&mut stream, b"HEXPIRE user:900 0 FIELDS 1 session\r\n"),
+        "*1\r\n:2\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"HGET user:900 session\r\n"),
+        "$-1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"HGET user:900 role\r\n"),
+        "$5\r\nadmin\r\n"
+    );
+
+    // 2. Stream consumer recovery (XCLAIM & XAUTOCLAIM)
+    assert_eq!(
+        send_and_read(&mut stream, b"XADD events:1 100-0 job alpha\r\n"),
+        "$5\r\n100-0\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"XADD events:1 200-0 job beta\r\n"),
+        "$5\r\n200-0\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"XGROUP CREATE events:1 workers 0\r\n"),
+        "+OK\r\n"
+    );
+    let read_res = send_and_read(
+        &mut stream,
+        b"XREADGROUP GROUP workers w1 COUNT 2 STREAMS events:1 >\r\n",
+    );
+    assert!(read_res.contains("100-0") && read_res.contains("200-0"));
+
+    // XCLAIM 100-0 from w1 to w2 with JUSTID
+    let claim_res = send_and_read(
+        &mut stream,
+        b"XCLAIM events:1 workers w2 0 100-0 JUSTID\r\n",
+    );
+    assert_eq!(claim_res, "*1\r\n$5\r\n100-0\r\n");
+
+    // XAUTOCLAIM remaining entries to w3 with JUSTID
+    let autoclaim_res = send_and_read(
+        &mut stream,
+        b"XAUTOCLAIM events:1 workers w3 0 0-0 COUNT 10 JUSTID\r\n",
+    );
+    assert!(autoclaim_res.contains("0-0"));
+    assert!(autoclaim_res.contains("100-0"));
+    assert!(autoclaim_res.contains("200-0"));
+}

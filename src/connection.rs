@@ -2679,7 +2679,12 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Object(crate::resp::ObjectSubcommand::Refcount(key))
         | Command::Xinfo(crate::resp::XinfoSubcommand::Stream(key))
         | Command::Xinfo(crate::resp::XinfoSubcommand::Groups(key))
-        | Command::Xinfo(crate::resp::XinfoSubcommand::Consumers { key, .. }) => Some(key),
+        | Command::Xinfo(crate::resp::XinfoSubcommand::Consumers { key, .. })
+        | Command::Hexpire { key, .. }
+        | Command::Httl { key, .. }
+        | Command::Hpersist { key, .. }
+        | Command::Xclaim { key, .. }
+        | Command::Xautoclaim { key, .. } => Some(key),
         _ => None,
     }
 }
@@ -2957,7 +2962,12 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
         | Command::Object(crate::resp::ObjectSubcommand::Refcount(k))
         | Command::Xinfo(crate::resp::XinfoSubcommand::Stream(k))
         | Command::Xinfo(crate::resp::XinfoSubcommand::Groups(k))
-        | Command::Xinfo(crate::resp::XinfoSubcommand::Consumers { key: k, .. }) => f(k.as_ref()),
+        | Command::Xinfo(crate::resp::XinfoSubcommand::Consumers { key: k, .. })
+        | Command::Hexpire { key: k, .. }
+        | Command::Httl { key: k, .. }
+        | Command::Hpersist { key: k, .. }
+        | Command::Xclaim { key: k, .. }
+        | Command::Xautoclaim { key: k, .. } => f(k.as_ref()),
         Command::Eval { keys, .. } | Command::Evalsha { keys, .. } => {
             for k in keys {
                 f(k.as_ref());
@@ -3809,6 +3819,11 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::WaitAof { .. } => "WAITAOF",
         Command::Object(_) => "OBJECT",
         Command::Xinfo(_) => "XINFO",
+        Command::Hexpire { .. } => "HEXPIRE",
+        Command::Httl { .. } => "HTTL",
+        Command::Hpersist { .. } => "HPERSIST",
+        Command::Xclaim { .. } => "XCLAIM",
+        Command::Xautoclaim { .. } => "XAUTOCLAIM",
         Command::CommandCount | Command::CommandList => "COMMAND",
         Command::Unknown(_) => "UNKNOWN",
     }
@@ -7668,6 +7683,25 @@ async fn execute_command(
             }
             false
         }
+        Command::Hexpire { ref key, .. }
+        | Command::Httl { ref key, .. }
+        | Command::Hpersist { ref key, .. }
+        | Command::Xclaim { ref key, .. }
+        | Command::Xautoclaim { ref key, .. } => {
+            let target = router.target_shard(key);
+            if target == router.shard_id {
+                execute_local_command(
+                    &cmd,
+                    &mut router.local_db.borrow_mut(),
+                    out,
+                    router.aof.as_deref(),
+                );
+            } else {
+                let res = router.execute_remote(target, cmd).await;
+                out.extend_from_slice(&res);
+            }
+            false
+        }
         Command::Save => {
             match router.save_rdb().await {
                 Ok(_) => out.extend_from_slice(b"+OK\r\n"),
@@ -9439,9 +9473,12 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Object(crate::resp::ObjectSubcommand::Refcount(key))
         | Command::Xinfo(crate::resp::XinfoSubcommand::Stream(key))
         | Command::Xinfo(crate::resp::XinfoSubcommand::Groups(key))
-        | Command::Xinfo(crate::resp::XinfoSubcommand::Consumers { key, .. }) => {
-            Some(target_shard(key, num_shards))
-        }
+        | Command::Xinfo(crate::resp::XinfoSubcommand::Consumers { key, .. })
+        | Command::Hexpire { key, .. }
+        | Command::Httl { key, .. }
+        | Command::Hpersist { key, .. }
+        | Command::Xclaim { key, .. }
+        | Command::Xautoclaim { key, .. } => Some(target_shard(key, num_shards)),
         Command::Smove {
             source,
             destination,
@@ -13914,6 +13951,149 @@ pub fn execute_local_command(
             write_resp_integer(out, func_count as i64);
             false
         }
+        Command::Hexpire {
+            key,
+            expire_ms,
+            is_at,
+            condition,
+            fields,
+        } => {
+            match db
+                .table
+                .hexpire(key, *expire_ms, *is_at, *condition, fields)
+            {
+                Ok(res) => {
+                    record_change!(cmd);
+                    write_resp_array_header(out, res.len());
+                    for code in res {
+                        write_resp_integer(out, code);
+                    }
+                }
+                Err(e) => write_resp_err(out, e),
+            }
+            false
+        }
+        Command::Httl {
+            key,
+            is_ms,
+            is_expiretime,
+            fields,
+        } => {
+            match db.table.httl(key, *is_ms, *is_expiretime, fields) {
+                Ok(res) => {
+                    write_resp_array_header(out, res.len());
+                    for code in res {
+                        write_resp_integer(out, code);
+                    }
+                }
+                Err(e) => write_resp_err(out, e),
+            }
+            false
+        }
+        Command::Hpersist { key, fields } => {
+            match db.table.hpersist(key, fields) {
+                Ok(res) => {
+                    record_change!(cmd);
+                    write_resp_array_header(out, res.len());
+                    for code in res {
+                        write_resp_integer(out, code);
+                    }
+                }
+                Err(e) => write_resp_err(out, e),
+            }
+            false
+        }
+        Command::Xclaim {
+            key,
+            group,
+            consumer,
+            min_idle_time,
+            ids,
+            idle,
+            time,
+            retrycount,
+            force,
+            justid,
+        } => {
+            match db.table.xclaim(
+                key,
+                group,
+                consumer.clone(),
+                *min_idle_time,
+                ids,
+                *idle,
+                *time,
+                *retrycount,
+                *force,
+                *justid,
+            ) {
+                Ok(claimed) => {
+                    write_resp_array_header(out, claimed.len());
+                    for (sid, fields) in claimed {
+                        let sid_str = sid.to_string();
+                        if *justid {
+                            write_resp_bulk(out, sid_str.as_bytes());
+                        } else {
+                            write_resp_array_header(out, 2);
+                            write_resp_bulk(out, sid_str.as_bytes());
+                            write_resp_array_header(out, fields.len() * 2);
+                            for (f, v) in fields {
+                                write_resp_bulk(out, &f);
+                                write_resp_bulk(out, &v);
+                            }
+                        }
+                    }
+                }
+                Err(e) => write_resp_err(out, e),
+            }
+            false
+        }
+        Command::Xautoclaim {
+            key,
+            group,
+            consumer,
+            min_idle_time,
+            start,
+            count,
+            justid,
+        } => {
+            match db.table.xautoclaim(
+                key,
+                group,
+                consumer.clone(),
+                *min_idle_time,
+                start,
+                *count,
+                *justid,
+            ) {
+                Ok((next_cursor, claimed, deleted_ids)) => {
+                    write_resp_array_header(out, 3);
+                    write_resp_bulk(out, next_cursor.as_bytes());
+                    write_resp_array_header(out, claimed.len());
+                    for (sid, fields) in claimed {
+                        let sid_str = sid.to_string();
+                        if *justid {
+                            write_resp_bulk(out, sid_str.as_bytes());
+                        } else {
+                            write_resp_array_header(out, 2);
+                            write_resp_bulk(out, sid_str.as_bytes());
+                            write_resp_array_header(out, fields.len() * 2);
+                            for (f, v) in fields {
+                                write_resp_bulk(out, &f);
+                                write_resp_bulk(out, &v);
+                            }
+                        }
+                    }
+                    write_resp_array_header(out, deleted_ids.len());
+                    for del_sid in deleted_ids {
+                        let s = del_sid.to_string();
+                        write_resp_bulk(out, s.as_bytes());
+                    }
+                }
+                Err(e) => write_resp_err(out, e),
+            }
+            false
+        }
         Command::FunctionKill => {
             out.extend_from_slice(b"+OK\r\n");
             false
@@ -15637,6 +15817,118 @@ mod tests {
 
         execute_local_command(&Command::FunctionKill, &mut db, &mut out, None);
         assert_eq!(&out[..], b"+OK\r\n");
+        out.clear();
+
+        // HEXPIRE / HTTL / HPERSIST
+        let _ = db.hset(
+            bytes::Bytes::from("hexp_hash"),
+            vec![
+                (bytes::Bytes::from("f1"), bytes::Bytes::from("v1")),
+                (bytes::Bytes::from("f2"), bytes::Bytes::from("v2")),
+            ],
+        );
+        execute_local_command(
+            &Command::Hexpire {
+                key: bytes::Bytes::from("hexp_hash"),
+                expire_ms: 10000,
+                is_at: false,
+                condition: crate::resp::HexpireCondition::Nx,
+                fields: vec![bytes::Bytes::from("f1"), bytes::Bytes::from("missing")],
+            },
+            &mut db,
+            &mut out,
+            None,
+        );
+        assert_eq!(&out[..], b"*2\r\n:1\r\n:-2\r\n");
+        out.clear();
+
+        execute_local_command(
+            &Command::Httl {
+                key: bytes::Bytes::from("hexp_hash"),
+                is_ms: false,
+                is_expiretime: false,
+                fields: vec![bytes::Bytes::from("f1"), bytes::Bytes::from("f2")],
+            },
+            &mut db,
+            &mut out,
+            None,
+        );
+        assert!(std::str::from_utf8(&out).unwrap().contains(":-1\r\n"));
+        out.clear();
+
+        execute_local_command(
+            &Command::Hpersist {
+                key: bytes::Bytes::from("hexp_hash"),
+                fields: vec![bytes::Bytes::from("f1"), bytes::Bytes::from("f2")],
+            },
+            &mut db,
+            &mut out,
+            None,
+        );
+        assert_eq!(&out[..], b"*2\r\n:1\r\n:-1\r\n");
+        out.clear();
+
+        // XCLAIM & XAUTOCLAIM
+        let sid = db
+            .xadd(
+                bytes::Bytes::from("xclaim_s"),
+                crate::table::StreamAddId::Explicit(crate::table::StreamId::new(1000, 0)),
+                vec![(bytes::Bytes::from("k"), bytes::Bytes::from("v"))],
+                false,
+                None,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let _ = db.xgroup_create(
+            bytes::Bytes::from("xclaim_s"),
+            bytes::Bytes::from("grp"),
+            "0",
+            false,
+        );
+        let _ = db.xreadgroup(
+            b"xclaim_s",
+            b"grp",
+            bytes::Bytes::from("c1"),
+            ">",
+            Some(1),
+            false,
+        );
+        execute_local_command(
+            &Command::Xclaim {
+                key: bytes::Bytes::from("xclaim_s"),
+                group: bytes::Bytes::from("grp"),
+                consumer: bytes::Bytes::from("c2"),
+                min_idle_time: 0,
+                ids: vec![bytes::Bytes::from(sid.to_string())],
+                idle: None,
+                time: None,
+                retrycount: None,
+                force: false,
+                justid: true,
+            },
+            &mut db,
+            &mut out,
+            None,
+        );
+        assert!(std::str::from_utf8(&out).unwrap().contains("1000-0"));
+        out.clear();
+
+        execute_local_command(
+            &Command::Xautoclaim {
+                key: bytes::Bytes::from("xclaim_s"),
+                group: bytes::Bytes::from("grp"),
+                consumer: bytes::Bytes::from("c3"),
+                min_idle_time: 0,
+                start: bytes::Bytes::from("0-0"),
+                count: 10,
+                justid: true,
+            },
+            &mut db,
+            &mut out,
+            None,
+        );
+        assert!(std::str::from_utf8(&out).unwrap().contains("1000-0"));
         out.clear();
     }
 }
