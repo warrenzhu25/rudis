@@ -4440,6 +4440,9 @@ impl RudisTable {
         field: &[u8],
         out: &mut Vec<u8>,
     ) -> Result<(), &'static str> {
+        if !self.hash_field_expires.is_empty() {
+            self.purge_expired_hash_fields(key);
+        }
         let h = hash_key(key);
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
@@ -4499,6 +4502,9 @@ impl RudisTable {
         key: &[u8],
         fields: &[Bytes],
     ) -> Result<Vec<Option<Bytes>>, &'static str> {
+        if !self.hash_field_expires.is_empty() {
+            self.purge_expired_hash_fields(key);
+        }
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
@@ -4707,6 +4713,9 @@ impl RudisTable {
     }
 
     pub fn hstrlen(&mut self, key: &[u8], field: &[u8]) -> Result<usize, &'static str> {
+        if !self.hash_field_expires.is_empty() {
+            self.purge_expired_hash_fields(key);
+        }
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
@@ -4743,6 +4752,9 @@ impl RudisTable {
         key: &[u8],
         fields: &[Bytes],
     ) -> Result<(Vec<Option<Bytes>>, Vec<Bytes>), &'static str> {
+        if !self.hash_field_expires.is_empty() {
+            self.purge_expired_hash_fields(key);
+        }
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
@@ -8762,17 +8774,66 @@ impl RudisTable {
         Ok((next_cursor, res))
     }
 
-    /// Active sampling cycle: samples up to 20 slots starting from cursor and evicts expired keys.
-    pub fn active_expire_cycle(&mut self) -> usize {
-        if self.num_expires == 0 || self.table.is_empty() {
+    /// Bounded background sampling of hash field expirations (`HEXPIRE`).
+    /// Samples up to `max_keys` entries from `hash_field_expires` starting at `sample_cursor`
+    /// and reclaims expired fields (and parent hashes when empty).
+    pub fn evict_expired_hash_fields_sample(&mut self, max_keys: usize) -> usize {
+        if self.hash_field_expires.is_empty() || max_keys == 0 {
             return 0;
+        }
+        let now = Instant::now();
+        let total = self.hash_field_expires.len();
+        let start = self.sample_cursor % total;
+        let sample_keys: smallvec::SmallVec<[Bytes; 8]> = self
+            .hash_field_expires
+            .keys()
+            .skip(start)
+            .chain(self.hash_field_expires.keys().take(start))
+            .take(max_keys)
+            .cloned()
+            .collect();
+
+        let mut evicted_fields = 0usize;
+        for key in sample_keys {
+            let mut expired: smallvec::SmallVec<[Bytes; 8]> = smallvec::SmallVec::new();
+            let mut empty_map = false;
+            if let Some(fmap) = self.hash_field_expires.get_mut(&key) {
+                fmap.retain(|f, exp| {
+                    if now >= *exp {
+                        expired.push(f.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+                empty_map = fmap.is_empty();
+            }
+            if empty_map {
+                self.hash_field_expires.remove(&key);
+            }
+            if !expired.is_empty() {
+                evicted_fields += expired.len();
+                let _ = self.hdel(&key, &expired);
+            }
+        }
+        evicted_fields
+    }
+
+    /// Active sampling cycle: samples up to 20 slots starting from cursor and evicts expired keys
+    /// and expired hash fields (`HEXPIRE`).
+    pub fn active_expire_cycle(&mut self) -> usize {
+        let mut expired_count = 0;
+        if !self.hash_field_expires.is_empty() {
+            expired_count += self.evict_expired_hash_fields_sample(8);
+        }
+        if self.num_expires == 0 || self.table.is_empty() {
+            return expired_count;
         }
         let bound = self.table.cursor_bound();
         if bound == 0 {
-            return 0;
+            return expired_count;
         }
 
-        let mut expired_count = 0;
         let mut checked = 0;
         while checked < 20 {
             let cur = self.sample_cursor % bound;

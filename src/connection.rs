@@ -3987,6 +3987,135 @@ async fn handle_bzpop(
     false
 }
 
+async fn fetch_remote_set(
+    router: &Router,
+    key: &Bytes,
+) -> Result<hashbrown::HashSet<Bytes>, Vec<u8>> {
+    let target = router.target_shard(key);
+    let cmd = Command::Smembers(key.clone());
+    let raw = if target == router.shard_id {
+        let mut tmp = Vec::new();
+        execute_local_command(&cmd, &mut router.local_db.borrow_mut(), &mut tmp, None);
+        tmp
+    } else {
+        router.execute_remote(target, cmd).await
+    };
+    if raw.starts_with(b"-") {
+        return Err(raw);
+    }
+    let mut set = hashbrown::HashSet::new();
+    let mut pos = 0usize;
+    if pos < raw.len()
+        && raw[pos] == b'*'
+        && let Some(nl) = raw[pos..].iter().position(|&b| b == b'\n')
+    {
+        pos += nl + 1;
+        while pos < raw.len() {
+            if raw[pos] != b'$' {
+                break;
+            }
+            let Some(len_nl) = raw[pos..].iter().position(|&b| b == b'\n') else {
+                break;
+            };
+            let len_str = std::str::from_utf8(&raw[pos + 1..pos + len_nl - 1]).unwrap_or("0");
+            let bulk_len: usize = len_str.parse().unwrap_or(0);
+            pos += len_nl + 1;
+            if pos + bulk_len + 2 > raw.len() {
+                break;
+            }
+            let val = Bytes::copy_from_slice(&raw[pos..pos + bulk_len]);
+            pos += bulk_len + 2;
+            set.insert(val);
+        }
+    }
+    Ok(set)
+}
+
+async fn fetch_remote_zset(
+    router: &Router,
+    key: &Bytes,
+) -> Result<hashbrown::HashMap<Bytes, f64>, Vec<u8>> {
+    let target = router.target_shard(key);
+    let type_cmd = Command::Type(key.clone());
+    let t_raw = if target == router.shard_id {
+        let mut tmp = Vec::new();
+        execute_local_command(&type_cmd, &mut router.local_db.borrow_mut(), &mut tmp, None);
+        tmp
+    } else {
+        router.execute_remote(target, type_cmd).await
+    };
+    if t_raw.as_slice() == b"+none\r\n" {
+        return Ok(hashbrown::HashMap::new());
+    }
+    if t_raw.as_slice() == b"+set\r\n" {
+        let set = fetch_remote_set(router, key).await?;
+        return Ok(set.into_iter().map(|m| (m, 1.0)).collect());
+    }
+    if t_raw.as_slice() != b"+zset\r\n" {
+        return Err(
+            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n".to_vec(),
+        );
+    }
+    let zrange_cmd = Command::Zrange {
+        key: key.clone(),
+        opts: crate::table::ZRangeOpts {
+            start: 0,
+            stop: -1,
+            with_scores: true,
+            ..crate::table::ZRangeOpts::default()
+        },
+    };
+    let raw = if target == router.shard_id {
+        let mut tmp = Vec::new();
+        execute_local_command(
+            &zrange_cmd,
+            &mut router.local_db.borrow_mut(),
+            &mut tmp,
+            None,
+        );
+        tmp
+    } else {
+        router.execute_remote(target, zrange_cmd).await
+    };
+    if raw.starts_with(b"-") {
+        return Err(raw);
+    }
+    let mut items = Vec::new();
+    let mut pos = 0usize;
+    if pos < raw.len()
+        && raw[pos] == b'*'
+        && let Some(nl) = raw[pos..].iter().position(|&b| b == b'\n')
+    {
+        pos += nl + 1;
+        while pos < raw.len() {
+            if raw[pos] != b'$' {
+                break;
+            }
+            let Some(len_nl) = raw[pos..].iter().position(|&b| b == b'\n') else {
+                break;
+            };
+            let len_str = std::str::from_utf8(&raw[pos + 1..pos + len_nl - 1]).unwrap_or("0");
+            let bulk_len: usize = len_str.parse().unwrap_or(0);
+            pos += len_nl + 1;
+            if pos + bulk_len + 2 > raw.len() {
+                break;
+            }
+            let val = Bytes::copy_from_slice(&raw[pos..pos + bulk_len]);
+            pos += bulk_len + 2;
+            items.push(val);
+        }
+    }
+    let mut map = hashbrown::HashMap::with_capacity(items.len() / 2);
+    for pair in items.as_chunks::<2>().0 {
+        let score: f64 = std::str::from_utf8(&pair[1])
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        map.insert(pair[0].clone(), score);
+    }
+    Ok(map)
+}
+
 async fn execute_command(
     cmd: Command,
     router: &Router,
@@ -7533,144 +7662,199 @@ async fn execute_command(
                 );
                 return false;
             }
-            let is_zinter = matches!(cmd, Command::Zintercard { .. });
-            let mut member_sets: Vec<hashbrown::HashSet<bytes::Bytes>> =
-                Vec::with_capacity(keys.len());
-            let mut any_empty = false;
-            for k in keys {
-                let target = router.target_shard(k);
-                let fetch_cmd = if is_zinter {
-                    let type_cmd = Command::Type(k.clone());
-                    let t_raw = if target == router.shard_id {
-                        let mut tmp = Vec::new();
-                        execute_local_command(
-                            &type_cmd,
-                            &mut router.local_db.borrow_mut(),
-                            &mut tmp,
-                            None,
-                        );
-                        tmp
-                    } else {
-                        router.execute_remote(target, type_cmd).await
-                    };
-                    if t_raw.as_slice() == b"+set\r\n" {
-                        Command::Smembers(k.clone())
-                    } else if t_raw.as_slice() == b"+zset\r\n" || t_raw.as_slice() == b"+none\r\n" {
-                        Command::Zrange {
-                            key: k.clone(),
-                            opts: crate::table::ZRangeOpts {
-                                start: 0,
-                                stop: -1,
-                                ..crate::table::ZRangeOpts::default()
-                            },
+            if matches!(cmd, Command::Zintercard { .. }) {
+                let mut member_sets: Vec<hashbrown::HashSet<Bytes>> =
+                    Vec::with_capacity(keys.len());
+                for k in keys {
+                    match fetch_remote_zset(router, k).await {
+                        Ok(map) => member_sets.push(map.into_keys().collect()),
+                        Err(e) => {
+                            out.extend_from_slice(&e);
+                            return false;
                         }
-                    } else {
-                        out.extend_from_slice(
-                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                        );
-                        return false;
                     }
-                } else {
-                    Command::Smembers(k.clone())
-                };
-                let raw = if target == router.shard_id {
-                    let mut tmp = Vec::new();
-                    execute_local_command(
-                        &fetch_cmd,
-                        &mut router.local_db.borrow_mut(),
-                        &mut tmp,
-                        None,
-                    );
-                    tmp
-                } else {
-                    router.execute_remote(target, fetch_cmd).await
-                };
-                if raw.starts_with(b"-") {
-                    out.extend_from_slice(&raw);
+                }
+                if member_sets.iter().any(|s| s.is_empty()) {
+                    write_resp_integer(out, 0);
                     return false;
                 }
-                let mut set = hashbrown::HashSet::new();
-                let mut pos = 0usize;
-                if pos < raw.len()
-                    && raw[pos] == b'*'
-                    && let Some(nl) = raw[pos..].iter().position(|&b| b == b'\n')
-                {
-                    pos += nl + 1;
-                    while pos < raw.len() {
-                        if raw[pos] != b'$' {
+                member_sets.sort_unstable_by_key(|s| s.len());
+                let first = &member_sets[0];
+                let rest = &member_sets[1..];
+                let mut count = 0usize;
+                for m in first {
+                    if rest.iter().all(|s| s.contains(m)) {
+                        count += 1;
+                        if limit > 0 && count >= limit {
+                            count = limit;
                             break;
                         }
-                        let Some(len_nl) = raw[pos..].iter().position(|&b| b == b'\n') else {
-                            break;
-                        };
-                        let len_str =
-                            std::str::from_utf8(&raw[pos + 1..pos + len_nl - 1]).unwrap_or("0");
-                        let bulk_len: usize = len_str.parse().unwrap_or(0);
-                        pos += len_nl + 1;
-                        if pos + bulk_len + 2 > raw.len() {
+                    }
+                }
+                write_resp_integer(out, count as i64);
+            } else {
+                let mut member_sets: Vec<hashbrown::HashSet<Bytes>> =
+                    Vec::with_capacity(keys.len());
+                for k in keys {
+                    match fetch_remote_set(router, k).await {
+                        Ok(s) => member_sets.push(s),
+                        Err(e) => {
+                            out.extend_from_slice(&e);
+                            return false;
+                        }
+                    }
+                }
+                if member_sets.iter().any(|s| s.is_empty()) {
+                    write_resp_integer(out, 0);
+                    return false;
+                }
+                member_sets.sort_unstable_by_key(|s| s.len());
+                let first = &member_sets[0];
+                let rest = &member_sets[1..];
+                let mut count = 0usize;
+                for m in first {
+                    if rest.iter().all(|s| s.contains(m)) {
+                        count += 1;
+                        if limit > 0 && count >= limit {
+                            count = limit;
                             break;
                         }
-                        let val = bytes::Bytes::copy_from_slice(&raw[pos..pos + bulk_len]);
-                        pos += bulk_len + 2;
-                        set.insert(val);
                     }
                 }
-                if set.is_empty() {
-                    any_empty = true;
-                }
-                member_sets.push(set);
+                write_resp_integer(out, count as i64);
             }
-            if any_empty || member_sets.is_empty() {
-                write_resp_integer(out, 0);
-                return false;
-            }
-            member_sets.sort_unstable_by_key(|s| s.len());
-            let first = &member_sets[0];
-            let rest = &member_sets[1..];
-            let mut count = 0usize;
-            for m in first.iter() {
-                if rest.iter().all(|s| s.contains(m)) {
-                    count += 1;
-                    if limit > 0 && count >= limit {
-                        count = limit;
-                        break;
-                    }
-                }
-            }
-            write_resp_integer(out, count as i64);
             false
         }
         Command::Sinter(ref keys)
         | Command::Sunion(ref keys)
         | Command::Sdiff(ref keys)
         | Command::Sunioncard { ref keys, .. }
-        | Command::Sdiffcard { ref keys, .. }
-        | Command::Zdiff { ref keys, .. }
-        | Command::Zinter { ref keys, .. }
-        | Command::Zunion { ref keys, .. } => {
+        | Command::Sdiffcard { ref keys, .. } => {
             if keys.is_empty() {
-                out.extend_from_slice(b"*0\r\n");
+                if matches!(cmd, Command::Sunioncard { .. } | Command::Sdiffcard { .. }) {
+                    write_resp_integer(out, 0);
+                } else {
+                    out.extend_from_slice(b"*0\r\n");
+                }
                 return false;
             }
             let first_target = router.target_shard(&keys[0]);
-            for k in &keys[1..] {
-                if router.target_shard(k) != first_target {
-                    out.extend_from_slice(
-                        b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+            let all_same = keys[1..]
+                .iter()
+                .all(|k| router.target_shard(k) == first_target);
+            if all_same {
+                if first_target == router.shard_id {
+                    execute_local_command(
+                        &cmd,
+                        &mut router.local_db.borrow_mut(),
+                        out,
+                        router.aof.as_deref(),
                     );
-                    return false;
+                } else {
+                    let res = router.execute_remote(first_target, cmd).await;
+                    out.extend_from_slice(&res);
+                }
+                return false;
+            }
+            if router.cluster_enabled
+                && keys[1..]
+                    .iter()
+                    .any(|k| crate::router::key_slot(k) != crate::router::key_slot(&keys[0]))
+            {
+                out.extend_from_slice(
+                    b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                );
+                return false;
+            }
+            let mut sets = Vec::with_capacity(keys.len());
+            for k in keys {
+                match fetch_remote_set(router, k).await {
+                    Ok(s) => sets.push(s),
+                    Err(e) => {
+                        out.extend_from_slice(&e);
+                        return false;
+                    }
                 }
             }
-            if first_target == router.shard_id {
-                execute_local_command(
-                    &cmd,
-                    &mut router.local_db.borrow_mut(),
-                    out,
-                    router.aof.as_deref(),
-                );
-            } else {
-                let res = router.execute_remote(first_target, cmd).await;
-                out.extend_from_slice(&res);
+            match cmd {
+                Command::Sinter(_) => {
+                    if sets.iter().any(|s| s.is_empty()) {
+                        out.extend_from_slice(b"*0\r\n");
+                        return false;
+                    }
+                    sets.sort_unstable_by_key(|s| s.len());
+                    let first = &sets[0];
+                    let rest = &sets[1..];
+                    let mut res = Vec::new();
+                    for m in first {
+                        if rest.iter().all(|s| s.contains(m)) {
+                            res.push(m.clone());
+                        }
+                    }
+                    write_resp_array_header(out, res.len());
+                    for m in res {
+                        write_resp_bulk(out, &m);
+                    }
+                }
+                Command::Sunion(_) => {
+                    let mut union_set = hashbrown::HashSet::new();
+                    for s in sets {
+                        for m in s {
+                            union_set.insert(m);
+                        }
+                    }
+                    write_resp_array_header(out, union_set.len());
+                    for m in union_set {
+                        write_resp_bulk(out, &m);
+                    }
+                }
+                Command::Sdiff(_) => {
+                    let first = sets.remove(0);
+                    let mut diff = Vec::new();
+                    for m in first {
+                        if !sets.iter().any(|s| s.contains(&m)) {
+                            diff.push(m);
+                        }
+                    }
+                    write_resp_array_header(out, diff.len());
+                    for m in diff {
+                        write_resp_bulk(out, &m);
+                    }
+                }
+                Command::Sunioncard { limit, .. } => {
+                    let mut union_set = hashbrown::HashSet::new();
+                    for s in sets {
+                        for m in s {
+                            union_set.insert(m);
+                            if limit > 0 && union_set.len() >= limit {
+                                break;
+                            }
+                        }
+                        if limit > 0 && union_set.len() >= limit {
+                            break;
+                        }
+                    }
+                    let count = if limit > 0 {
+                        union_set.len().min(limit)
+                    } else {
+                        union_set.len()
+                    };
+                    write_resp_integer(out, count as i64);
+                }
+                Command::Sdiffcard { limit, .. } => {
+                    let first = sets.remove(0);
+                    let mut count = 0;
+                    for m in first {
+                        if !sets.iter().any(|s| s.contains(&m)) {
+                            count += 1;
+                            if limit > 0 && count >= limit {
+                                break;
+                            }
+                        }
+                    }
+                    write_resp_integer(out, count as i64);
+                }
+                _ => {}
             }
             false
         }
@@ -7685,41 +7869,402 @@ async fn execute_command(
         | Command::Sdiffstore {
             ref destination,
             ref keys,
-        }
-        | Command::Zunionstore {
-            ref destination,
-            ref keys,
-            ..
-        }
-        | Command::Zinterstore {
-            ref destination,
-            ref keys,
-            ..
-        }
-        | Command::Zdiffstore {
-            ref destination,
-            ref keys,
         } => {
             let dest_target = router.target_shard(destination);
-            for k in keys {
-                if router.target_shard(k) != dest_target {
-                    out.extend_from_slice(
-                        b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+            let all_same = keys.iter().all(|k| router.target_shard(k) == dest_target);
+            if all_same {
+                if dest_target == router.shard_id {
+                    execute_local_command(
+                        &cmd,
+                        &mut router.local_db.borrow_mut(),
+                        out,
+                        router.aof.as_deref(),
                     );
-                    return false;
+                } else {
+                    let res = router.execute_remote(dest_target, cmd).await;
+                    out.extend_from_slice(&res);
+                }
+                return false;
+            }
+            if router.cluster_enabled
+                && keys
+                    .iter()
+                    .any(|k| crate::router::key_slot(k) != crate::router::key_slot(destination))
+            {
+                out.extend_from_slice(
+                    b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                );
+                return false;
+            }
+            let mut sets = Vec::with_capacity(keys.len());
+            for k in keys {
+                match fetch_remote_set(router, k).await {
+                    Ok(s) => sets.push(s),
+                    Err(e) => {
+                        out.extend_from_slice(&e);
+                        return false;
+                    }
                 }
             }
-            if dest_target == router.shard_id {
-                execute_local_command(
-                    &cmd,
-                    &mut router.local_db.borrow_mut(),
-                    out,
-                    router.aof.as_deref(),
-                );
+            let members: Vec<Bytes> = if sets.is_empty() {
+                Vec::new()
             } else {
-                let res = router.execute_remote(dest_target, cmd).await;
-                out.extend_from_slice(&res);
+                match cmd {
+                    Command::Sinterstore { .. } => {
+                        if sets.iter().any(|s| s.is_empty()) {
+                            Vec::new()
+                        } else {
+                            sets.sort_unstable_by_key(|s| s.len());
+                            let first = &sets[0];
+                            let rest = &sets[1..];
+                            first
+                                .iter()
+                                .filter(|m| rest.iter().all(|s| s.contains(*m)))
+                                .cloned()
+                                .collect()
+                        }
+                    }
+                    Command::Sunionstore { .. } => {
+                        let mut union_set = hashbrown::HashSet::new();
+                        for s in sets {
+                            for m in s {
+                                union_set.insert(m);
+                            }
+                        }
+                        union_set.into_iter().collect()
+                    }
+                    Command::Sdiffstore { .. } => {
+                        let first = sets.remove(0);
+                        first
+                            .into_iter()
+                            .filter(|m| !sets.iter().any(|s| s.contains(m)))
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                }
+            };
+            let del_cmd = Command::Del(smallvec::smallvec![destination.clone()]);
+            if dest_target == router.shard_id {
+                let mut tmp = Vec::new();
+                execute_local_command(&del_cmd, &mut router.local_db.borrow_mut(), &mut tmp, None);
+            } else {
+                let _ = router.execute_remote(dest_target, del_cmd).await;
             }
+            let count = members.len();
+            if count > 0 {
+                let sadd_cmd = Command::Sadd {
+                    key: destination.clone(),
+                    members: members.into(),
+                };
+                if dest_target == router.shard_id {
+                    let mut tmp = Vec::new();
+                    execute_local_command(
+                        &sadd_cmd,
+                        &mut router.local_db.borrow_mut(),
+                        &mut tmp,
+                        router.aof.as_deref(),
+                    );
+                } else {
+                    let _ = router.execute_remote(dest_target, sadd_cmd).await;
+                }
+            }
+            write_resp_integer(out, count as i64);
+            false
+        }
+        Command::Zdiff {
+            ref keys,
+            with_scores,
+        }
+        | Command::Zinter {
+            ref keys,
+            with_scores,
+            ..
+        }
+        | Command::Zunion {
+            ref keys,
+            with_scores,
+            ..
+        } => {
+            if keys.is_empty() {
+                out.extend_from_slice(b"*0\r\n");
+                return false;
+            }
+            let first_target = router.target_shard(&keys[0]);
+            let all_same = keys[1..]
+                .iter()
+                .all(|k| router.target_shard(k) == first_target);
+            if all_same {
+                if first_target == router.shard_id {
+                    execute_local_command(
+                        &cmd,
+                        &mut router.local_db.borrow_mut(),
+                        out,
+                        router.aof.as_deref(),
+                    );
+                } else {
+                    let res = router.execute_remote(first_target, cmd).await;
+                    out.extend_from_slice(&res);
+                }
+                return false;
+            }
+            if router.cluster_enabled
+                && keys[1..]
+                    .iter()
+                    .any(|k| crate::router::key_slot(k) != crate::router::key_slot(&keys[0]))
+            {
+                out.extend_from_slice(
+                    b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                );
+                return false;
+            }
+            let mut maps = Vec::with_capacity(keys.len());
+            for k in keys {
+                match fetch_remote_zset(router, k).await {
+                    Ok(m) => maps.push(m),
+                    Err(e) => {
+                        out.extend_from_slice(&e);
+                        return false;
+                    }
+                }
+            }
+            let mut results: Vec<(Bytes, f64)> = match &cmd {
+                Command::Zdiff { .. } => {
+                    let first = maps.remove(0);
+                    first
+                        .into_iter()
+                        .filter(|(m, _)| !maps.iter().any(|other| other.contains_key(m)))
+                        .collect()
+                }
+                Command::Zinter {
+                    weights, aggregate, ..
+                } => {
+                    if maps.iter().any(|m| m.is_empty()) {
+                        Vec::new()
+                    } else {
+                        let mut acc: hashbrown::HashMap<Bytes, f64> = hashbrown::HashMap::new();
+                        for (i, m) in maps.into_iter().enumerate() {
+                            let w = weights.get(i).copied().unwrap_or(1.0);
+                            if i == 0 {
+                                for (k, s) in m {
+                                    let val = s * w;
+                                    acc.insert(k, if val.is_nan() { 0.0 } else { val });
+                                }
+                            } else {
+                                acc.retain(|k, cur| {
+                                    if let Some(other_score) = m.get(k) {
+                                        let val = *other_score * w;
+                                        *cur = match aggregate {
+                                            crate::table::Aggregate::Sum
+                                            | crate::table::Aggregate::Count => {
+                                                let r = *cur + val;
+                                                if r.is_nan() { 0.0 } else { r }
+                                            }
+                                            crate::table::Aggregate::Min => cur.min(val),
+                                            crate::table::Aggregate::Max => cur.max(val),
+                                        };
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                });
+                            }
+                        }
+                        acc.into_iter().collect()
+                    }
+                }
+                Command::Zunion {
+                    weights, aggregate, ..
+                } => {
+                    let mut acc: hashbrown::HashMap<Bytes, f64> = hashbrown::HashMap::new();
+                    for (i, m) in maps.into_iter().enumerate() {
+                        let w = weights.get(i).copied().unwrap_or(1.0);
+                        for (k, s) in m {
+                            let val = s * w;
+                            acc.entry(k)
+                                .and_modify(|cur| {
+                                    *cur = match aggregate {
+                                        crate::table::Aggregate::Sum
+                                        | crate::table::Aggregate::Count => {
+                                            let r = *cur + val;
+                                            if r.is_nan() { 0.0 } else { r }
+                                        }
+                                        crate::table::Aggregate::Min => cur.min(val),
+                                        crate::table::Aggregate::Max => cur.max(val),
+                                    };
+                                })
+                                .or_insert(if val.is_nan() { 0.0 } else { val });
+                        }
+                    }
+                    acc.into_iter().collect()
+                }
+                _ => Vec::new(),
+            };
+            results.sort_by(|(m1, s1), (m2, s2)| {
+                s1.partial_cmp(s2)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| m1.cmp(m2))
+            });
+            if with_scores {
+                write_resp_array_header(out, results.len() * 2);
+                for (m, s) in results {
+                    write_resp_bulk(out, &m);
+                    write_resp_score(out, s);
+                }
+            } else {
+                write_resp_array_header(out, results.len());
+                for (m, _) in results {
+                    write_resp_bulk(out, &m);
+                }
+            }
+            false
+        }
+        Command::Zunionstore { .. } | Command::Zinterstore { .. } | Command::Zdiffstore { .. } => {
+            let (destination, keys) = match &cmd {
+                Command::Zunionstore {
+                    destination, keys, ..
+                }
+                | Command::Zinterstore {
+                    destination, keys, ..
+                }
+                | Command::Zdiffstore { destination, keys } => (destination, keys),
+                _ => unreachable!(),
+            };
+            let dest_target = router.target_shard(destination);
+            let all_same = keys.iter().all(|k| router.target_shard(k) == dest_target);
+            if all_same {
+                if dest_target == router.shard_id {
+                    execute_local_command(
+                        &cmd,
+                        &mut router.local_db.borrow_mut(),
+                        out,
+                        router.aof.as_deref(),
+                    );
+                } else {
+                    let res = router.execute_remote(dest_target, cmd).await;
+                    out.extend_from_slice(&res);
+                }
+                return false;
+            }
+            if router.cluster_enabled
+                && keys
+                    .iter()
+                    .any(|k| crate::router::key_slot(k) != crate::router::key_slot(destination))
+            {
+                out.extend_from_slice(
+                    b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                );
+                return false;
+            }
+            let mut maps = Vec::with_capacity(keys.len());
+            for k in keys {
+                match fetch_remote_zset(router, k).await {
+                    Ok(m) => maps.push(m),
+                    Err(e) => {
+                        out.extend_from_slice(&e);
+                        return false;
+                    }
+                }
+            }
+            let elements: Vec<(f64, Bytes)> = match &cmd {
+                Command::Zdiffstore { .. } => {
+                    let first = maps.remove(0);
+                    first
+                        .into_iter()
+                        .filter(|(m, _)| !maps.iter().any(|other| other.contains_key(m)))
+                        .map(|(m, s)| (s, m))
+                        .collect()
+                }
+                Command::Zinterstore {
+                    weights, aggregate, ..
+                } => {
+                    if maps.iter().any(|m| m.is_empty()) {
+                        Vec::new()
+                    } else {
+                        let mut acc: hashbrown::HashMap<Bytes, f64> = hashbrown::HashMap::new();
+                        for (i, m) in maps.into_iter().enumerate() {
+                            let w = weights.get(i).copied().unwrap_or(1.0);
+                            if i == 0 {
+                                for (k, s) in m {
+                                    let val = s * w;
+                                    acc.insert(k, if val.is_nan() { 0.0 } else { val });
+                                }
+                            } else {
+                                acc.retain(|k, cur| {
+                                    if let Some(other_score) = m.get(k) {
+                                        let val = *other_score * w;
+                                        *cur = match aggregate {
+                                            crate::table::Aggregate::Sum
+                                            | crate::table::Aggregate::Count => {
+                                                let r = *cur + val;
+                                                if r.is_nan() { 0.0 } else { r }
+                                            }
+                                            crate::table::Aggregate::Min => cur.min(val),
+                                            crate::table::Aggregate::Max => cur.max(val),
+                                        };
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                });
+                            }
+                        }
+                        acc.into_iter().map(|(m, s)| (s, m)).collect()
+                    }
+                }
+                Command::Zunionstore {
+                    weights, aggregate, ..
+                } => {
+                    let mut acc: hashbrown::HashMap<Bytes, f64> = hashbrown::HashMap::new();
+                    for (i, m) in maps.into_iter().enumerate() {
+                        let w = weights.get(i).copied().unwrap_or(1.0);
+                        for (k, s) in m {
+                            let val = s * w;
+                            acc.entry(k)
+                                .and_modify(|cur| {
+                                    *cur = match aggregate {
+                                        crate::table::Aggregate::Sum
+                                        | crate::table::Aggregate::Count => {
+                                            let r = *cur + val;
+                                            if r.is_nan() { 0.0 } else { r }
+                                        }
+                                        crate::table::Aggregate::Min => cur.min(val),
+                                        crate::table::Aggregate::Max => cur.max(val),
+                                    };
+                                })
+                                .or_insert(if val.is_nan() { 0.0 } else { val });
+                        }
+                    }
+                    acc.into_iter().map(|(m, s)| (s, m)).collect()
+                }
+                _ => Vec::new(),
+            };
+            let del_cmd = Command::Del(smallvec::smallvec![destination.clone()]);
+            if dest_target == router.shard_id {
+                let mut tmp = Vec::new();
+                execute_local_command(&del_cmd, &mut router.local_db.borrow_mut(), &mut tmp, None);
+            } else {
+                let _ = router.execute_remote(dest_target, del_cmd).await;
+            }
+            let count = elements.len();
+            if count > 0 {
+                let zadd_cmd = Command::Zadd {
+                    key: destination.clone(),
+                    elements: elements.into(),
+                    flags: crate::table::ZAddFlags::default(),
+                };
+                if dest_target == router.shard_id {
+                    let mut tmp = Vec::new();
+                    execute_local_command(
+                        &zadd_cmd,
+                        &mut router.local_db.borrow_mut(),
+                        &mut tmp,
+                        router.aof.as_deref(),
+                    );
+                } else {
+                    let _ = router.execute_remote(dest_target, zadd_cmd).await;
+                }
+            }
+            write_resp_integer(out, count as i64);
             false
         }
         Command::Dbsize => {

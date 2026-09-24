@@ -11748,3 +11748,126 @@ fn test_sintercard_zintercard_zrangestore_cross_shard_e2e() {
         ":1\r\n"
     );
 }
+
+#[test]
+fn test_cross_shard_set_and_zset_algebra_e2e() {
+    let port = 19127;
+    start_test_server(port, 4);
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // 1. Cross-shard SINTER, SUNION, SDIFF
+    assert_eq!(
+        send_and_read(&mut stream, b"SADD alg_s1 foo bar baz\r\n"),
+        ":3\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"SADD alg_s2 bar baz qux\r\n"),
+        ":3\r\n"
+    );
+
+    let sinter_res = send_and_read(&mut stream, b"SINTER alg_s1 alg_s2\r\n");
+    assert!(
+        sinter_res.contains("bar") && sinter_res.contains("baz") && !sinter_res.contains("foo")
+    );
+
+    let sunion_res = send_and_read(&mut stream, b"SUNION alg_s1 alg_s2\r\n");
+    assert!(
+        sunion_res.contains("foo")
+            && sunion_res.contains("bar")
+            && sunion_res.contains("baz")
+            && sunion_res.contains("qux")
+    );
+
+    let sdiff_res = send_and_read(&mut stream, b"SDIFF alg_s1 alg_s2\r\n");
+    assert!(sdiff_res.contains("foo") && !sdiff_res.contains("bar"));
+
+    // 2. Cross-shard SINTERSTORE, SUNIONSTORE, SDIFFSTORE
+    assert_eq!(
+        send_and_read(&mut stream, b"SINTERSTORE alg_dest_inter alg_s1 alg_s2\r\n"),
+        ":2\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"SCARD alg_dest_inter\r\n"),
+        ":2\r\n"
+    );
+
+    assert_eq!(
+        send_and_read(&mut stream, b"SUNIONSTORE alg_dest_union alg_s1 alg_s2\r\n"),
+        ":4\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"SCARD alg_dest_union\r\n"),
+        ":4\r\n"
+    );
+
+    assert_eq!(
+        send_and_read(&mut stream, b"SDIFFSTORE alg_dest_diff alg_s1 alg_s2\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"SCARD alg_dest_diff\r\n"),
+        ":1\r\n"
+    );
+
+    // 3. Cross-shard ZINTER, ZUNION, ZDIFF
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            b"ZADD alg_z1 10 item_a 20 item_b 30 item_c\r\n"
+        ),
+        ":3\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"ZADD alg_z2 5 item_b 15 item_c 25 item_d\r\n"),
+        ":3\r\n"
+    );
+
+    let zinter_res = send_and_read(&mut stream, b"ZINTER 2 alg_z1 alg_z2 WITHSCORES\r\n");
+    assert!(zinter_res.contains("item_b") && zinter_res.contains("25")); // 20 + 5
+    assert!(zinter_res.contains("item_c") && zinter_res.contains("45")); // 30 + 15
+
+    let zdiff_res = send_and_read(&mut stream, b"ZDIFF 2 alg_z1 alg_z2 WITHSCORES\r\n");
+    assert!(zdiff_res.contains("item_a") && zdiff_res.contains("10"));
+    assert!(!zdiff_res.contains("item_b"));
+
+    // 4. Cross-shard ZINTERSTORE, ZUNIONSTORE, ZDIFFSTORE
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            b"ZINTERSTORE alg_zdest_inter 2 alg_z1 alg_z2 WEIGHTS 2 1\r\n"
+        ),
+        ":2\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"ZSCORE alg_zdest_inter item_b\r\n"),
+        "$2\r\n45\r\n" // 20*2 + 5*1
+    );
+
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            b"ZUNIONSTORE alg_zdest_union 2 alg_z1 alg_z2 AGGREGATE MAX\r\n"
+        ),
+        ":4\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"ZCARD alg_zdest_union\r\n"),
+        ":4\r\n"
+    );
+
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            b"ZDIFFSTORE alg_zdest_diff 2 alg_z1 alg_z2\r\n"
+        ),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"ZCARD alg_zdest_diff\r\n"),
+        ":1\r\n"
+    );
+}
