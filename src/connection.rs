@@ -2683,6 +2683,8 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Hexpire { key, .. }
         | Command::Httl { key, .. }
         | Command::Hpersist { key, .. }
+        | Command::Hgetex { key, .. }
+        | Command::Hsetex { key, .. }
         | Command::Xclaim { key, .. }
         | Command::Xautoclaim { key, .. } => Some(key),
         _ => None,
@@ -2970,6 +2972,8 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
         | Command::Hexpire { key: k, .. }
         | Command::Httl { key: k, .. }
         | Command::Hpersist { key: k, .. }
+        | Command::Hgetex { key: k, .. }
+        | Command::Hsetex { key: k, .. }
         | Command::Xclaim { key: k, .. }
         | Command::Xautoclaim { key: k, .. } => f(k.as_ref()),
         Command::Eval { keys, .. } | Command::Evalsha { keys, .. } => {
@@ -3826,6 +3830,8 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Hexpire { .. } => "HEXPIRE",
         Command::Httl { .. } => "HTTL",
         Command::Hpersist { .. } => "HPERSIST",
+        Command::Hgetex { .. } => "HGETEX",
+        Command::Hsetex { .. } => "HSETEX",
         Command::Xclaim { .. } => "XCLAIM",
         Command::Xautoclaim { .. } => "XAUTOCLAIM",
         Command::CommandCount | Command::CommandList => "COMMAND",
@@ -8806,6 +8812,8 @@ async fn execute_command(
         Command::Hexpire { ref key, .. }
         | Command::Httl { ref key, .. }
         | Command::Hpersist { ref key, .. }
+        | Command::Hgetex { ref key, .. }
+        | Command::Hsetex { ref key, .. }
         | Command::Xclaim { ref key, .. }
         | Command::Xautoclaim { ref key, .. } => {
             let target = router.target_shard(key);
@@ -10597,6 +10605,8 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Hexpire { key, .. }
         | Command::Httl { key, .. }
         | Command::Hpersist { key, .. }
+        | Command::Hgetex { key, .. }
+        | Command::Hsetex { key, .. }
         | Command::Xclaim { key, .. }
         | Command::Xautoclaim { key, .. } => Some(target_shard(key, num_shards)),
         Command::Smove {
@@ -15117,6 +15127,50 @@ pub fn execute_local_command(
                     write_resp_array_header(out, res.len());
                     for code in res {
                         write_resp_integer(out, code);
+                    }
+                }
+                Err(e) => write_resp_err(out, e),
+            }
+            false
+        }
+        Command::Hgetex {
+            key,
+            expire,
+            fields,
+        } => {
+            match db.table.hgetex(key, *expire, fields) {
+                Ok((vals, modified)) => {
+                    if modified {
+                        record_change!(cmd);
+                    }
+                    write_resp_array_header(out, vals.len());
+                    for v in vals {
+                        match v {
+                            Some(val) => write_resp_bulk(out, &val),
+                            None => out.extend_from_slice(b"$-1\r\n"),
+                        }
+                    }
+                }
+                Err(e) => write_resp_err(out, e),
+            }
+            false
+        }
+        Command::Hsetex {
+            key,
+            condition,
+            expire,
+            pairs,
+        } => {
+            match db
+                .table
+                .hsetex(key.clone(), *condition, *expire, pairs.clone())
+            {
+                Ok(applied) => {
+                    if applied {
+                        record_change!(cmd);
+                        write_resp_integer(out, 1);
+                    } else {
+                        write_resp_integer(out, 0);
                     }
                 }
                 Err(e) => write_resp_err(out, e),

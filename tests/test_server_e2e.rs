@@ -12059,3 +12059,77 @@ fn test_cross_shard_xread_cluster_crossslot_e2e() {
         "-CROSSSLOT Keys in request don't hash to the same slot\r\n"
     );
 }
+
+#[test]
+fn test_hpexpire_hgetex_hsetex_e2e() {
+    let port = 19130;
+    start_test_server(port, 4);
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // 1. HSETEX with FNX and PX
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            b"HSETEX h_prof FNX PX 60000 FIELDS 2 name alice role admin\r\n"
+        ),
+        ":1\r\n"
+    );
+    // FNX fails if any field exists
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            b"HSETEX h_prof FNX PX 60000 FIELDS 2 name bob extra val\r\n"
+        ),
+        ":0\r\n"
+    );
+    // FXX succeeds when all fields exist, and KEEPTTL preserves TTL
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            b"HSETEX h_prof FXX KEEPTTL FIELDS 1 name alice_updated\r\n"
+        ),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"HGET h_prof name\r\n"),
+        "$13\r\nalice_updated\r\n"
+    );
+
+    // 2. Verify HPTTL > 0 for both fields
+    let hpttl_res = send_and_read(&mut stream, b"HPTTL h_prof FIELDS 2 name role\r\n");
+    assert!(hpttl_res.starts_with("*2\r\n:"));
+    assert!(!hpttl_res.contains(":-1\r\n") && !hpttl_res.contains(":-2\r\n"));
+
+    // 3. HGETEX with PERSIST
+    let hgetex_res = send_and_read(
+        &mut stream,
+        b"HGETEX h_prof PERSIST FIELDS 2 name missing\r\n",
+    );
+    assert_eq!(hgetex_res, "*2\r\n$13\r\nalice_updated\r\n$-1\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, b"HPTTL h_prof FIELDS 1 name\r\n"),
+        "*1\r\n:-1\r\n"
+    );
+
+    // 4. HGETEX with EX sets new TTL
+    assert_eq!(
+        send_and_read(&mut stream, b"HGETEX h_prof EX 30 FIELDS 1 name\r\n"),
+        "*1\r\n$13\r\nalice_updated\r\n"
+    );
+    let httl_after = send_and_read(&mut stream, b"HTTL h_prof FIELDS 1 name\r\n");
+    assert!(!httl_after.contains(":-1\r\n") && !httl_after.contains(":-2\r\n"));
+
+    // 5. HGETEX with PX 0 returns current value and immediately expires/deletes the field
+    assert_eq!(
+        send_and_read(&mut stream, b"HGETEX h_prof PX 0 FIELDS 1 role\r\n"),
+        "*1\r\n$5\r\nadmin\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"HGET h_prof role\r\n"),
+        "$-1\r\n"
+    );
+}

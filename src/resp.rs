@@ -209,6 +209,22 @@ pub enum HexpireCondition {
     Lt,
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum HFieldExpireOpt {
+    None,
+    Persist,
+    KeepTtl,
+    ExMs(i64),
+    ExAtMs(i64),
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum HsetexCondition {
+    None,
+    Fnx,
+    Fxx,
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum Command {
     Object(ObjectSubcommand),
@@ -235,6 +251,17 @@ pub enum Command {
     Hpersist {
         key: Bytes,
         fields: Vec<Bytes>,
+    },
+    Hgetex {
+        key: Bytes,
+        expire: HFieldExpireOpt,
+        fields: Vec<Bytes>,
+    },
+    Hsetex {
+        key: Bytes,
+        condition: HsetexCondition,
+        expire: HFieldExpireOpt,
+        pairs: Vec<(Bytes, Bytes)>,
     },
     Xclaim {
         key: Bytes,
@@ -6353,6 +6380,152 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             let fields = args[4..].to_vec();
             Ok(Some(Command::Hpersist { key, fields }))
+        }
+        "HGETEX" => {
+            if args.len() < 5 {
+                return Err("wrong number of arguments for 'hgetex' command".to_string());
+            }
+            let key = args[1].clone();
+            let mut idx = 2;
+            let mut expire = HFieldExpireOpt::None;
+            let mut has_exp_opt = false;
+            while idx < args.len() {
+                if args[idx].eq_ignore_ascii_case(b"FIELDS") {
+                    break;
+                }
+                if has_exp_opt {
+                    return Err("syntax error".to_string());
+                }
+                let opt = String::from_utf8_lossy(&args[idx]).to_uppercase();
+                match opt.as_str() {
+                    "PERSIST" => {
+                        expire = HFieldExpireOpt::Persist;
+                        has_exp_opt = true;
+                        idx += 1;
+                    }
+                    "EX" | "PX" | "EXAT" | "PXAT" => {
+                        if idx + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let val: i64 = std::str::from_utf8(&args[idx + 1])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        expire = match opt.as_str() {
+                            "EX" => HFieldExpireOpt::ExMs(val.saturating_mul(1000)),
+                            "PX" => HFieldExpireOpt::ExMs(val),
+                            "EXAT" => HFieldExpireOpt::ExAtMs(val.saturating_mul(1000)),
+                            "PXAT" => HFieldExpireOpt::ExAtMs(val),
+                            _ => unreachable!(),
+                        };
+                        has_exp_opt = true;
+                        idx += 2;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            if idx + 2 > args.len() || !args[idx].eq_ignore_ascii_case(b"FIELDS") {
+                return Err("syntax error".to_string());
+            }
+            let numfields: usize = std::str::from_utf8(&args[idx + 1])
+                .map_err(|_| "value is not an integer or out of range")?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range")?;
+            if numfields == 0 || args.len() != idx + 2 + numfields {
+                return Err(
+                    "Parameter `numfields` does not match the number of arguments".to_string(),
+                );
+            }
+            let fields = args[idx + 2..].to_vec();
+            Ok(Some(Command::Hgetex {
+                key,
+                expire,
+                fields,
+            }))
+        }
+        "HSETEX" => {
+            if args.len() < 6 {
+                return Err("wrong number of arguments for 'hsetex' command".to_string());
+            }
+            let key = args[1].clone();
+            let mut idx = 2;
+            let mut condition = HsetexCondition::None;
+            let mut has_cond = false;
+            let mut expire = HFieldExpireOpt::None;
+            let mut has_exp_opt = false;
+            while idx < args.len() {
+                if args[idx].eq_ignore_ascii_case(b"FIELDS") {
+                    break;
+                }
+                let opt = String::from_utf8_lossy(&args[idx]).to_uppercase();
+                match opt.as_str() {
+                    "FNX" => {
+                        if has_cond {
+                            return Err("syntax error".to_string());
+                        }
+                        condition = HsetexCondition::Fnx;
+                        has_cond = true;
+                        idx += 1;
+                    }
+                    "FXX" => {
+                        if has_cond {
+                            return Err("syntax error".to_string());
+                        }
+                        condition = HsetexCondition::Fxx;
+                        has_cond = true;
+                        idx += 1;
+                    }
+                    "KEEPTTL" => {
+                        if has_exp_opt {
+                            return Err("syntax error".to_string());
+                        }
+                        expire = HFieldExpireOpt::KeepTtl;
+                        has_exp_opt = true;
+                        idx += 1;
+                    }
+                    "EX" | "PX" | "EXAT" | "PXAT" => {
+                        if has_exp_opt || idx + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let val: i64 = std::str::from_utf8(&args[idx + 1])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        expire = match opt.as_str() {
+                            "EX" => HFieldExpireOpt::ExMs(val.saturating_mul(1000)),
+                            "PX" => HFieldExpireOpt::ExMs(val),
+                            "EXAT" => HFieldExpireOpt::ExAtMs(val.saturating_mul(1000)),
+                            "PXAT" => HFieldExpireOpt::ExAtMs(val),
+                            _ => unreachable!(),
+                        };
+                        has_exp_opt = true;
+                        idx += 2;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            if idx + 2 > args.len() || !args[idx].eq_ignore_ascii_case(b"FIELDS") {
+                return Err("syntax error".to_string());
+            }
+            let numfields: usize = std::str::from_utf8(&args[idx + 1])
+                .map_err(|_| "value is not an integer or out of range")?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range")?;
+            if numfields == 0 || args.len() != idx + 2 + numfields * 2 {
+                return Err(
+                    "Parameter `numfields` does not match the number of arguments".to_string(),
+                );
+            }
+            let mut pairs = Vec::with_capacity(numfields);
+            for [f, v] in args[idx + 2..].as_chunks::<2>().0 {
+                pairs.push((f.clone(), v.clone()));
+            }
+            Ok(Some(Command::Hsetex {
+                key,
+                condition,
+                expire,
+                pairs,
+            }))
         }
         "XCLAIM" => {
             if args.len() < 6 {

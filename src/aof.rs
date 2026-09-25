@@ -1107,6 +1107,91 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             Some(buf)
         }
+        Command::Hgetex {
+            key,
+            expire,
+            fields,
+        } => {
+            if matches!(
+                expire,
+                crate::resp::HFieldExpireOpt::None | crate::resp::HFieldExpireOpt::KeepTtl
+            ) {
+                return None;
+            }
+            let numfields_s = fields.len().to_string();
+            let val_s;
+            let mut args: Vec<&[u8]> = vec![b"HGETEX", key.as_ref()];
+            match expire {
+                crate::resp::HFieldExpireOpt::Persist => {
+                    args.push(b"PERSIST");
+                }
+                crate::resp::HFieldExpireOpt::ExMs(ms) => {
+                    val_s = ms.to_string();
+                    args.push(b"PX");
+                    args.push(val_s.as_bytes());
+                }
+                crate::resp::HFieldExpireOpt::ExAtMs(ms) => {
+                    val_s = ms.to_string();
+                    args.push(b"PXAT");
+                    args.push(val_s.as_bytes());
+                }
+                _ => {}
+            }
+            args.push(b"FIELDS");
+            args.push(numfields_s.as_bytes());
+            for f in fields {
+                args.push(f.as_ref());
+            }
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend_from_slice(a);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
+        Command::Hsetex {
+            key,
+            condition,
+            expire,
+            pairs,
+        } => {
+            let numfields_s = pairs.len().to_string();
+            let val_s;
+            let mut args: Vec<&[u8]> = vec![b"HSETEX", key.as_ref()];
+            match condition {
+                crate::resp::HsetexCondition::None => {}
+                crate::resp::HsetexCondition::Fnx => args.push(b"FNX"),
+                crate::resp::HsetexCondition::Fxx => args.push(b"FXX"),
+            }
+            match expire {
+                crate::resp::HFieldExpireOpt::None | crate::resp::HFieldExpireOpt::Persist => {}
+                crate::resp::HFieldExpireOpt::KeepTtl => args.push(b"KEEPTTL"),
+                crate::resp::HFieldExpireOpt::ExMs(ms) => {
+                    val_s = ms.to_string();
+                    args.push(b"PX");
+                    args.push(val_s.as_bytes());
+                }
+                crate::resp::HFieldExpireOpt::ExAtMs(ms) => {
+                    val_s = ms.to_string();
+                    args.push(b"PXAT");
+                    args.push(val_s.as_bytes());
+                }
+            }
+            args.push(b"FIELDS");
+            args.push(numfields_s.as_bytes());
+            for (f, v) in pairs {
+                args.push(f.as_ref());
+                args.push(v.as_ref());
+            }
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend_from_slice(a);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
         Command::Xclaim {
             key,
             group,

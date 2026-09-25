@@ -4123,6 +4123,206 @@ impl RudisTable {
         Ok(results)
     }
 
+    pub fn hgetex(
+        &mut self,
+        key: &[u8],
+        expire: crate::resp::HFieldExpireOpt,
+        fields: &[Bytes],
+    ) -> Result<(Vec<Option<Bytes>>, bool), &'static str> {
+        if !self.hash_field_expires.is_empty() {
+            self.purge_expired_hash_fields(key);
+        }
+        let h = hash_key(key);
+        let Some(idx) = self.table.find(key, h) else {
+            return Ok((vec![None; fields.len()], false));
+        };
+        if self.check_expired_slot(idx) {
+            return Ok((vec![None; fields.len()], false));
+        }
+        let Some(entry) = self.table.get_slot(idx) else {
+            return Ok((vec![None; fields.len()], false));
+        };
+        let mut vals = Vec::with_capacity(fields.len());
+        let mut existing_fields = Vec::new();
+        match &entry.val {
+            RudisValue::SmallHash(pairs) => {
+                for f in fields {
+                    if let Some((_, v)) = pairs.iter().find(|(k, _)| k == f) {
+                        vals.push(Some(v.clone()));
+                        existing_fields.push(f.clone());
+                    } else {
+                        vals.push(None);
+                    }
+                }
+            }
+            RudisValue::Hash(map) => {
+                for f in fields {
+                    if let Some(v) = map.get(f) {
+                        vals.push(Some(v.clone()));
+                        existing_fields.push(f.clone());
+                    } else {
+                        vals.push(None);
+                    }
+                }
+            }
+            _ => return Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        }
+
+        if existing_fields.is_empty() {
+            return Ok((vals, false));
+        }
+
+        let mut modified = false;
+        match expire {
+            crate::resp::HFieldExpireOpt::None | crate::resp::HFieldExpireOpt::KeepTtl => {}
+            crate::resp::HFieldExpireOpt::Persist => {
+                if let Some(fmap) = self.hash_field_expires.get_mut(key) {
+                    for f in &existing_fields {
+                        if fmap.remove(f).is_some() {
+                            modified = true;
+                        }
+                    }
+                    if fmap.is_empty() {
+                        self.hash_field_expires.remove(key);
+                    }
+                }
+            }
+            crate::resp::HFieldExpireOpt::ExMs(ms) | crate::resp::HFieldExpireOpt::ExAtMs(ms) => {
+                let is_at = matches!(expire, crate::resp::HFieldExpireOpt::ExAtMs(_));
+                let now_unix_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                let delta_ms = if is_at { ms - now_unix_ms } else { ms };
+                modified = true;
+                if delta_ms <= 0 {
+                    let _ = self.hdel(key, &existing_fields);
+                } else {
+                    let new_exp = Instant::now() + Duration::from_millis(delta_ms as u64);
+                    let fmap = self
+                        .hash_field_expires
+                        .entry(Bytes::copy_from_slice(key))
+                        .or_default();
+                    for f in existing_fields {
+                        fmap.insert(f, new_exp);
+                    }
+                }
+            }
+        }
+
+        Ok((vals, modified))
+    }
+
+    pub fn hsetex(
+        &mut self,
+        key: Bytes,
+        condition: crate::resp::HsetexCondition,
+        expire: crate::resp::HFieldExpireOpt,
+        pairs: Vec<(Bytes, Bytes)>,
+    ) -> Result<bool, &'static str> {
+        if !self.hash_field_expires.is_empty() {
+            self.purge_expired_hash_fields(&key);
+        }
+        let h = hash_key(&key);
+        if let Some(idx) = self.table.find(&key, h) {
+            if !self.check_expired_slot(idx)
+                && let Some(entry) = self.table.get_slot(idx)
+            {
+                match &entry.val {
+                    RudisValue::SmallHash(existing) => match condition {
+                        crate::resp::HsetexCondition::None => {}
+                        crate::resp::HsetexCondition::Fnx => {
+                            if pairs
+                                .iter()
+                                .any(|(f, _)| existing.iter().any(|(k, _)| k == f))
+                            {
+                                return Ok(false);
+                            }
+                        }
+                        crate::resp::HsetexCondition::Fxx => {
+                            if pairs
+                                .iter()
+                                .any(|(f, _)| !existing.iter().any(|(k, _)| k == f))
+                            {
+                                return Ok(false);
+                            }
+                        }
+                    },
+                    RudisValue::Hash(map) => match condition {
+                        crate::resp::HsetexCondition::None => {}
+                        crate::resp::HsetexCondition::Fnx => {
+                            if pairs.iter().any(|(f, _)| map.contains_key(f)) {
+                                return Ok(false);
+                            }
+                        }
+                        crate::resp::HsetexCondition::Fxx => {
+                            if pairs.iter().any(|(f, _)| !map.contains_key(f)) {
+                                return Ok(false);
+                            }
+                        }
+                    },
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
+                }
+            } else if condition == crate::resp::HsetexCondition::Fxx {
+                return Ok(false);
+            }
+        } else if condition == crate::resp::HsetexCondition::Fxx {
+            return Ok(false);
+        }
+
+        let saved_expires: Vec<(Bytes, Instant)> =
+            if expire == crate::resp::HFieldExpireOpt::KeepTtl {
+                if let Some(fmap) = self.hash_field_expires.get(key.as_ref()) {
+                    pairs
+                        .iter()
+                        .filter_map(|(f, _)| fmap.get(f).map(|&exp| (f.clone(), exp)))
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
+        let fields: Vec<Bytes> = pairs.iter().map(|(f, _)| f.clone()).collect();
+        self.hset(key.clone(), pairs)?;
+
+        match expire {
+            crate::resp::HFieldExpireOpt::None | crate::resp::HFieldExpireOpt::Persist => {}
+            crate::resp::HFieldExpireOpt::KeepTtl => {
+                if !saved_expires.is_empty() {
+                    let fmap = self.hash_field_expires.entry(key).or_default();
+                    for (f, exp) in saved_expires {
+                        fmap.insert(f, exp);
+                    }
+                }
+            }
+            crate::resp::HFieldExpireOpt::ExMs(ms) | crate::resp::HFieldExpireOpt::ExAtMs(ms) => {
+                let is_at = matches!(expire, crate::resp::HFieldExpireOpt::ExAtMs(_));
+                let now_unix_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                let delta_ms = if is_at { ms - now_unix_ms } else { ms };
+                if delta_ms <= 0 {
+                    let _ = self.hdel(&key, &fields);
+                } else {
+                    let new_exp = Instant::now() + Duration::from_millis(delta_ms as u64);
+                    let fmap = self.hash_field_expires.entry(key).or_default();
+                    for f in fields {
+                        fmap.insert(f, new_exp);
+                    }
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn xclaim(
         &mut self,
