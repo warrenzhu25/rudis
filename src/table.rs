@@ -1053,6 +1053,7 @@ pub struct StreamPelEntry {
 pub struct StreamConsumer {
     pub name: Bytes,
     pub seen_time_ms: u64,
+    pub active_time_ms: Option<u64>,
     pub pel: std::collections::BTreeMap<StreamId, u64>,
 }
 
@@ -1060,6 +1061,7 @@ pub struct StreamConsumer {
 pub struct StreamGroup {
     pub name: Bytes,
     pub last_delivered_id: StreamId,
+    pub entries_read: u64,
     pub consumers: HashMap<Bytes, StreamConsumer>,
     pub pel: std::collections::BTreeMap<StreamId, StreamPelEntry>,
 }
@@ -1068,6 +1070,8 @@ pub struct StreamGroup {
 pub struct RudisStream {
     pub entries: std::collections::BTreeMap<StreamId, Vec<(Bytes, Bytes)>>,
     pub last_id: StreamId,
+    pub entries_added: u64,
+    pub max_deleted_entry_id: StreamId,
     pub groups: HashMap<Bytes, StreamGroup>,
 }
 
@@ -1082,6 +1086,8 @@ impl RudisStream {
         Self {
             entries: std::collections::BTreeMap::new(),
             last_id: StreamId::default(),
+            entries_added: 0,
+            max_deleted_entry_id: StreamId::default(),
             groups: HashMap::new(),
         }
     }
@@ -4374,6 +4380,7 @@ impl RudisTable {
             .or_insert_with(|| StreamConsumer {
                 name: consumer.clone(),
                 seen_time_ms: now_ms,
+                active_time_ms: None,
                 pel: std::collections::BTreeMap::new(),
             });
 
@@ -4431,6 +4438,12 @@ impl RudisTable {
             }
         }
 
+        if !claimed.is_empty()
+            && let Some(new_c) = grp.consumers.get_mut(&consumer)
+        {
+            new_c.active_time_ms = Some(now_ms);
+        }
+
         Ok(claimed)
     }
 
@@ -4483,6 +4496,7 @@ impl RudisTable {
             .or_insert_with(|| StreamConsumer {
                 name: consumer.clone(),
                 seen_time_ms: now_ms,
+                active_time_ms: None,
                 pel: std::collections::BTreeMap::new(),
             });
 
@@ -4529,6 +4543,12 @@ impl RudisTable {
                 }
                 claimed.push((sid, fields));
             }
+        }
+
+        if !claimed.is_empty()
+            && let Some(new_c) = grp.consumers.get_mut(&consumer)
+        {
+            new_c.active_time_ms = Some(now_ms);
         }
 
         Ok((next_cursor, claimed, deleted_ids))
@@ -9636,6 +9656,8 @@ impl RudisTable {
             while stream.entries.len() > max {
                 if let Some(first_key) = stream.entries.keys().next().copied() {
                     stream.entries.remove(&first_key);
+                    stream.max_deleted_entry_id =
+                        std::cmp::max(stream.max_deleted_entry_id, first_key);
                     trimmed += 1;
                 } else {
                     break;
@@ -9646,6 +9668,8 @@ impl RudisTable {
             while let Some(first_key) = stream.entries.keys().next().copied() {
                 if first_key < min_id {
                     stream.entries.remove(&first_key);
+                    stream.max_deleted_entry_id =
+                        std::cmp::max(stream.max_deleted_entry_id, first_key);
                     trimmed += 1;
                 } else {
                     break;
@@ -9673,6 +9697,7 @@ impl RudisTable {
                 let mut stream = RudisStream::new();
                 let final_id = Self::compute_stream_id(&mut stream, add_id)?;
                 stream.last_id = final_id;
+                stream.entries_added += 1;
                 stream.entries.insert(final_id, fields);
                 Self::apply_stream_trim(&mut stream, maxlen, minid);
 
@@ -9690,6 +9715,7 @@ impl RudisTable {
                     RudisValue::Stream(stream) => {
                         let final_id = Self::compute_stream_id(stream, add_id)?;
                         stream.last_id = final_id;
+                        stream.entries_added += 1;
                         stream.entries.insert(final_id, fields);
                         Self::apply_stream_trim(stream, maxlen, minid);
                         return Ok(Some(final_id));
@@ -9710,6 +9736,7 @@ impl RudisTable {
         let mut stream = RudisStream::new();
         let final_id = Self::compute_stream_id(&mut stream, add_id)?;
         stream.last_id = final_id;
+        stream.entries_added += 1;
         stream.entries.insert(final_id, fields);
         Self::apply_stream_trim(&mut stream, maxlen, minid);
 
@@ -9913,6 +9940,8 @@ impl RudisTable {
                         let mut count = 0;
                         for id in ids {
                             if stream.entries.remove(id).is_some() {
+                                stream.max_deleted_entry_id =
+                                    std::cmp::max(stream.max_deleted_entry_id, *id);
                                 count += 1;
                             }
                         }
@@ -10267,10 +10296,13 @@ impl RudisTable {
                     }
                     entries.insert(StreamId::new(ms, seq), fields);
                 }
+                let entries_added = entries.len() as u64;
                 RudisValue::Stream(Box::new(RudisStream {
                     entries,
                     last_id: StreamId::new(last_ms, last_seq),
                     groups: HashMap::new(),
+                    entries_added,
+                    max_deleted_entry_id: StreamId::default(),
                 }))
             }
             _ => return Err("DUMP payload version or checksum are wrong"),
@@ -10549,9 +10581,11 @@ impl RudisTable {
                 } else {
                     StreamId::parse(id_str)?
                 };
+                let entries_read = stream.entries.range(..=last_delivered_id).count() as u64;
                 let grp = StreamGroup {
                     name: group.clone(),
                     last_delivered_id,
+                    entries_read,
                     consumers: HashMap::new(),
                     pel: std::collections::BTreeMap::new(),
                 };
@@ -10611,6 +10645,7 @@ impl RudisTable {
                                 StreamConsumer {
                                     name: consumer,
                                     seen_time_ms: now,
+                                    active_time_ms: None,
                                     pel: std::collections::BTreeMap::new(),
                                 },
                             );
@@ -10704,6 +10739,7 @@ impl RudisTable {
                         .or_insert_with(|| StreamConsumer {
                             name: consumer.clone(),
                             seen_time_ms: now,
+                            active_time_ms: None,
                             pel: std::collections::BTreeMap::new(),
                         });
                 cons.seen_time_ms = now;
@@ -10719,6 +10755,13 @@ impl RudisTable {
                             break;
                         }
                         results.push((id, fields.clone()));
+                    }
+
+                    if !results.is_empty() {
+                        grp.entries_read += results.len() as u64;
+                        if let Some(cons) = grp.consumers.get_mut(&consumer) {
+                            cons.active_time_ms = Some(now);
+                        }
                     }
 
                     for (id, _) in &results {
@@ -10750,6 +10793,11 @@ impl RudisTable {
                         if let Some(fields) = stream.entries.get(&id) {
                             results.push((id, fields.clone()));
                         }
+                    }
+                    if !results.is_empty()
+                        && let Some(cons) = grp.consumers.get_mut(&consumer)
+                    {
+                        cons.active_time_ms = Some(now);
                     }
                     for (id, _) in &results {
                         if let Some(pel_entry) = grp.pel.get_mut(id) {
@@ -10929,8 +10977,8 @@ impl RudisTable {
                     radix_tree_keys: 1,
                     radix_tree_nodes: 2,
                     last_generated_id: s.last_id,
-                    max_deleted_entry_id: StreamId::default(),
-                    entries_added: s.entries.len() as u64,
+                    max_deleted_entry_id: s.max_deleted_entry_id,
+                    entries_added: s.entries_added,
                     recorded_first_entry_id: first_entry.as_ref().map(|(id, _)| *id),
                     groups: s.groups.len(),
                     first_entry,
@@ -10957,11 +11005,20 @@ impl RudisTable {
             RudisValue::Stream(s) => {
                 let mut res = Vec::with_capacity(s.groups.len());
                 for (name, grp) in &s.groups {
+                    let lag = s
+                        .entries
+                        .range((
+                            std::ops::Bound::Excluded(grp.last_delivered_id),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .count() as u64;
                     res.push(StreamGroupInfo {
                         name: name.clone(),
                         consumers: grp.consumers.len(),
                         pending: grp.pel.len(),
                         last_delivered_id: grp.last_delivered_id,
+                        entries_read: grp.entries_read,
+                        lag,
                     });
                 }
                 Ok(res)
@@ -10999,10 +11056,15 @@ impl RudisTable {
                 let mut res = Vec::with_capacity(grp.consumers.len());
                 for (name, cons) in &grp.consumers {
                     let idle = now.saturating_sub(cons.seen_time_ms);
+                    let inactive_ms = cons
+                        .active_time_ms
+                        .map(|a| now.saturating_sub(a) as i64)
+                        .unwrap_or(-1);
                     res.push(StreamConsumerInfo {
                         name: name.clone(),
                         pending: cons.pel.len(),
                         idle_ms: idle,
+                        inactive_ms,
                     });
                 }
                 Ok(res)
@@ -11032,6 +11094,8 @@ pub struct StreamGroupInfo {
     pub consumers: usize,
     pub pending: usize,
     pub last_delivered_id: StreamId,
+    pub entries_read: u64,
+    pub lag: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -11039,6 +11103,7 @@ pub struct StreamConsumerInfo {
     pub name: Bytes,
     pub pending: usize,
     pub idle_ms: u64,
+    pub inactive_ms: i64,
 }
 
 pub fn crc64_update(mut crc: u64, data: &[u8]) -> u64 {

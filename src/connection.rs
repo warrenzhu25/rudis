@@ -221,6 +221,39 @@ pub fn notify_zset_or_defer(db: &mut ShardDb, key: &Bytes) {
     }
 }
 
+#[inline]
+pub fn notify_stream_or_defer(db: &mut ShardDb, key: &Bytes) {
+    touch_watched_key(db.port, key.as_ref());
+    if !crate::block::has_blocked_waiters(db.port) {
+        return;
+    }
+    let hub_arc = crate::block::get_block_hub_for_port(db.port);
+    let mut hub = hub_arc.lock().unwrap();
+    if hub.is_paused() {
+        hub.add_pending_notify(key.clone());
+    } else {
+        hub.notify_stream(key);
+    }
+}
+
+#[inline]
+pub fn tx_has_cross_slot(tx_queue: &[Command]) -> bool {
+    let mut expected_slot: Option<u16> = None;
+    for cmd in tx_queue {
+        for k in cmd_keys(cmd) {
+            let slot = crate::router::key_slot(k);
+            if let Some(s) = expected_slot {
+                if s != slot {
+                    return true;
+                }
+            } else {
+                expected_slot = Some(slot);
+            }
+        }
+    }
+    false
+}
+
 pub static DIRTY_CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[inline]
@@ -1006,6 +1039,7 @@ pub async fn handle_tls_connection(
             ACTIVE_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             self.registry.borrow_mut().remove(&self.client_id);
             unregister_client_tracking(self.port, self.client_id);
+            unwatch_keys(self.port, self.client_id);
             if crate::block::has_blocked_waiters(self.port) {
                 let hub_arc = crate::block::get_block_hub_for_port(self.port);
                 let mut hub = hub_arc.lock().unwrap();
@@ -1030,6 +1064,9 @@ pub async fn handle_tls_connection(
         .unwrap()
         .is_auth_required_for_default();
     let mut auth_user = "default".to_string();
+    let mut in_multi = false;
+    let mut tx_queue: Vec<Command> = Vec::new();
+    let mut tx_has_error = false;
 
     loop {
         let n = match session
@@ -1047,7 +1084,7 @@ pub async fn handle_tls_connection(
         while !buf.is_empty() {
             match parse_command(&mut buf) {
                 Ok(Some(cmd)) => {
-                    if execute_command(
+                    if execute_tx_step(
                         cmd,
                         &router,
                         client_id,
@@ -1056,15 +1093,22 @@ pub async fn handle_tls_connection(
                         &mut asking,
                         &mut authenticated,
                         &mut auth_user,
+                        &mut in_multi,
+                        &mut tx_queue,
+                        &mut tx_has_error,
                     )
                     .await
                     {
                         should_quit = true;
+                        break;
                     }
                 }
                 Ok(None) => break,
                 Err(err) => {
                     write_resp_err(&mut out_buf, &err);
+                    if in_multi {
+                        tx_has_error = true;
+                    }
                 }
             }
         }
@@ -1082,6 +1126,227 @@ pub async fn handle_tls_connection(
 
         if should_quit {
             break;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_tx_step(
+    cmd: Command,
+    router: &Rc<Router>,
+    client_id: u64,
+    client_registry: &Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
+    out_buf: &mut Vec<u8>,
+    asking: &mut bool,
+    authenticated: &mut bool,
+    auth_user: &mut String,
+    in_multi: &mut bool,
+    tx_queue: &mut Vec<Command>,
+    tx_has_error: &mut bool,
+) -> bool {
+    if !IN_TX.get()
+        && let Some(c) = client_registry.borrow_mut().get_mut(&client_id)
+    {
+        c.last_active = Instant::now();
+        c.last_cmd = get_cmd_name(&cmd);
+    }
+    if *in_multi {
+        match cmd {
+            Command::Multi => {
+                out_buf.extend_from_slice(b"-ERR MULTI calls can not be nested\r\n");
+                false
+            }
+            Command::Watch(_) => {
+                out_buf.extend_from_slice(b"-ERR WATCH inside MULTI is not allowed\r\n");
+                false
+            }
+            Command::Unwatch => {
+                out_buf.extend_from_slice(b"+OK\r\n");
+                false
+            }
+            Command::Discard => {
+                *in_multi = false;
+                tx_queue.clear();
+                *tx_has_error = false;
+                unwatch_keys(router.port, client_id);
+                crate::block::get_block_hub_for_port(router.port)
+                    .lock()
+                    .unwrap()
+                    .clear_pending_notifies();
+                out_buf.extend_from_slice(b"+OK\r\n");
+                false
+            }
+            Command::Reset => {
+                *in_multi = false;
+                tx_queue.clear();
+                *tx_has_error = false;
+                unwatch_keys(router.port, client_id);
+                crate::block::get_block_hub_for_port(router.port)
+                    .lock()
+                    .unwrap()
+                    .clear_pending_notifies();
+                out_buf.extend_from_slice(b"+RESET\r\n");
+                false
+            }
+            Command::Exec => {
+                *in_multi = false;
+                if *tx_has_error {
+                    tx_queue.clear();
+                    *tx_has_error = false;
+                    unwatch_keys(router.port, client_id);
+                    crate::block::get_block_hub_for_port(router.port)
+                        .lock()
+                        .unwrap()
+                        .clear_pending_notifies();
+                    out_buf.extend_from_slice(
+                        b"-EXECABORT Transaction discarded because of previous errors.\r\n",
+                    );
+                    false
+                } else if router.cluster_enabled && tx_has_cross_slot(tx_queue) {
+                    tx_queue.clear();
+                    *tx_has_error = false;
+                    unwatch_keys(router.port, client_id);
+                    crate::block::get_block_hub_for_port(router.port)
+                        .lock()
+                        .unwrap()
+                        .clear_pending_notifies();
+                    out_buf.extend_from_slice(
+                        b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                    );
+                    false
+                } else if is_watch_tainted(router.port, client_id) {
+                    tx_queue.clear();
+                    *tx_has_error = false;
+                    unwatch_keys(router.port, client_id);
+                    crate::block::get_block_hub_for_port(router.port)
+                        .lock()
+                        .unwrap()
+                        .clear_pending_notifies();
+                    write_resp_null_array(out_buf);
+                    false
+                } else {
+                    unwatch_keys(router.port, client_id);
+                    let mut shards = hashbrown::HashSet::new();
+                    for cmd in tx_queue.iter() {
+                        for k in cmd_keys(cmd) {
+                            shards.insert(router.target_shard(k));
+                        }
+                    }
+                    let mut sorted_shards: Vec<usize> = shards.into_iter().collect();
+                    sorted_shards.sort_unstable();
+
+                    let use_vll = sorted_shards.len() > 1;
+                    let tx_id = if use_vll {
+                        static NEXT_TX: std::sync::atomic::AtomicU64 =
+                            std::sync::atomic::AtomicU64::new(1);
+                        let id = NEXT_TX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        router.acquire_tx_locks(&sorted_shards, id).await;
+                        id
+                    } else {
+                        0
+                    };
+
+                    let hub_arc = crate::block::get_block_hub_for_port(router.port);
+                    hub_arc.lock().unwrap().pause();
+
+                    let count = tx_queue.len();
+                    out_buf.extend_from_slice(format!("*{}\r\n", count).as_bytes());
+                    let queued = std::mem::take(tx_queue);
+                    let mut should_quit = false;
+                    IN_TX.set(true);
+                    for q_cmd in queued {
+                        let quit = execute_command(
+                            q_cmd,
+                            router,
+                            client_id,
+                            client_registry,
+                            out_buf,
+                            asking,
+                            authenticated,
+                            auth_user,
+                        )
+                        .await;
+                        if quit {
+                            should_quit = true;
+                            break;
+                        }
+                    }
+                    IN_TX.set(false);
+                    if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                        c.last_active = Instant::now();
+                        c.last_cmd = "EXEC";
+                    }
+
+                    if use_vll {
+                        router.release_tx_locks(&sorted_shards, tx_id).await;
+                    }
+
+                    let pending = hub_arc.lock().unwrap().resume();
+                    for k in pending {
+                        hub_arc.lock().unwrap().notify_stream(&k);
+                        let shard_id = router.target_shard(&k);
+                        if shard_id == router.shard_id {
+                            let mut hub = hub_arc.lock().unwrap();
+                            hub.notify_list(&mut router.local_db.borrow_mut().table, &k);
+                            hub.notify_zset(&mut router.local_db.borrow_mut().table, &k);
+                        } else {
+                            let _ = router.senders[shard_id]
+                                .send(ShardMessage::NotifyList { keys: vec![k] });
+                        }
+                    }
+                    should_quit
+                }
+            }
+            Command::Quit => {
+                out_buf.extend_from_slice(b"+OK\r\n");
+                true
+            }
+            _ => {
+                tx_queue.push(cmd);
+                out_buf.extend_from_slice(b"+QUEUED\r\n");
+                false
+            }
+        }
+    } else {
+        match cmd {
+            Command::Multi => {
+                *in_multi = true;
+                tx_queue.clear();
+                *tx_has_error = false;
+                out_buf.extend_from_slice(b"+OK\r\n");
+                false
+            }
+            Command::Discard => {
+                out_buf.extend_from_slice(b"-ERR DISCARD without MULTI\r\n");
+                false
+            }
+            Command::Exec => {
+                out_buf.extend_from_slice(b"-ERR EXEC without MULTI\r\n");
+                false
+            }
+            Command::Watch(keys) => {
+                watch_keys(router.port, client_id, &keys);
+                out_buf.extend_from_slice(b"+OK\r\n");
+                false
+            }
+            Command::Unwatch => {
+                unwatch_keys(router.port, client_id);
+                out_buf.extend_from_slice(b"+OK\r\n");
+                false
+            }
+            _ => {
+                execute_command(
+                    cmd,
+                    router,
+                    client_id,
+                    client_registry,
+                    out_buf,
+                    asking,
+                    authenticated,
+                    auth_user,
+                )
+                .await
+            }
         }
     }
 }
@@ -1395,210 +1660,23 @@ pub async fn handle_connection(
 
                     if has_tx {
                         for cmd in commands.drain(..) {
-                            if !IN_TX.get()
-                                && let Some(c) = client_registry.borrow_mut().get_mut(&client_id)
+                            if execute_tx_step(
+                                cmd,
+                                &router,
+                                client_id,
+                                &client_registry,
+                                &mut out_buf,
+                                &mut asking,
+                                &mut authenticated,
+                                &mut auth_user,
+                                &mut in_multi,
+                                &mut tx_queue,
+                                &mut tx_has_error,
+                            )
+                            .await
                             {
-                                c.last_active = Instant::now();
-                                c.last_cmd = get_cmd_name(&cmd);
-                            }
-                            if in_multi {
-                                match cmd {
-                                    Command::Multi => {
-                                        out_buf.extend_from_slice(
-                                            b"-ERR MULTI calls can not be nested\r\n",
-                                        );
-                                    }
-                                    Command::Watch(_) => {
-                                        out_buf.extend_from_slice(
-                                            b"-ERR WATCH inside MULTI is not allowed\r\n",
-                                        );
-                                    }
-                                    Command::Unwatch => {
-                                        out_buf.extend_from_slice(b"+OK\r\n");
-                                    }
-                                    Command::Discard => {
-                                        in_multi = false;
-                                        tx_queue.clear();
-                                        tx_has_error = false;
-                                        unwatch_keys(router.port, client_id);
-                                        crate::block::get_block_hub_for_port(router.port)
-                                            .lock()
-                                            .unwrap()
-                                            .clear_pending_notifies();
-                                        out_buf.extend_from_slice(b"+OK\r\n");
-                                    }
-                                    Command::Reset => {
-                                        in_multi = false;
-                                        tx_queue.clear();
-                                        tx_has_error = false;
-                                        unwatch_keys(router.port, client_id);
-                                        crate::block::get_block_hub_for_port(router.port)
-                                            .lock()
-                                            .unwrap()
-                                            .clear_pending_notifies();
-                                        out_buf.extend_from_slice(b"+RESET\r\n");
-                                    }
-                                    Command::Exec => {
-                                        in_multi = false;
-                                        if tx_has_error {
-                                            tx_queue.clear();
-                                            tx_has_error = false;
-                                            unwatch_keys(router.port, client_id);
-                                            crate::block::get_block_hub_for_port(router.port)
-                                                .lock()
-                                                .unwrap()
-                                                .clear_pending_notifies();
-                                            out_buf.extend_from_slice(
-                                                b"-EXECABORT Transaction discarded because of previous errors.\r\n",
-                                            );
-                                        } else if is_watch_tainted(router.port, client_id) {
-                                            tx_queue.clear();
-                                            tx_has_error = false;
-                                            unwatch_keys(router.port, client_id);
-                                            crate::block::get_block_hub_for_port(router.port)
-                                                .lock()
-                                                .unwrap()
-                                                .clear_pending_notifies();
-                                            write_resp_null_array(&mut out_buf);
-                                        } else {
-                                            unwatch_keys(router.port, client_id);
-                                            let mut shards = hashbrown::HashSet::new();
-                                            for cmd in &tx_queue {
-                                                for k in cmd_keys(cmd) {
-                                                    shards.insert(router.target_shard(k));
-                                                }
-                                            }
-                                            let mut sorted_shards: Vec<usize> =
-                                                shards.into_iter().collect();
-                                            sorted_shards.sort_unstable();
-
-                                            let use_vll = sorted_shards.len() > 1;
-                                            let tx_id = if use_vll {
-                                                static NEXT_TX: std::sync::atomic::AtomicU64 =
-                                                    std::sync::atomic::AtomicU64::new(1);
-                                                let id = NEXT_TX.fetch_add(
-                                                    1,
-                                                    std::sync::atomic::Ordering::Relaxed,
-                                                );
-                                                router.acquire_tx_locks(&sorted_shards, id).await;
-                                                id
-                                            } else {
-                                                0
-                                            };
-
-                                            let hub_arc =
-                                                crate::block::get_block_hub_for_port(router.port);
-                                            hub_arc.lock().unwrap().pause();
-
-                                            let count = tx_queue.len();
-                                            out_buf.extend_from_slice(
-                                                format!("*{}\r\n", count).as_bytes(),
-                                            );
-                                            let queued = std::mem::take(&mut tx_queue);
-                                            IN_TX.set(true);
-                                            for q_cmd in queued {
-                                                let quit = execute_command(
-                                                    q_cmd,
-                                                    &router,
-                                                    client_id,
-                                                    &client_registry,
-                                                    &mut out_buf,
-                                                    &mut asking,
-                                                    &mut authenticated,
-                                                    &mut auth_user,
-                                                )
-                                                .await;
-                                                if quit {
-                                                    should_quit = true;
-                                                    break;
-                                                }
-                                            }
-                                            IN_TX.set(false);
-                                            if let Some(c) =
-                                                client_registry.borrow_mut().get_mut(&client_id)
-                                            {
-                                                c.last_active = Instant::now();
-                                                c.last_cmd = "EXEC";
-                                            }
-
-                                            if use_vll {
-                                                router
-                                                    .release_tx_locks(&sorted_shards, tx_id)
-                                                    .await;
-                                            }
-
-                                            let pending = hub_arc.lock().unwrap().resume();
-                                            for k in pending {
-                                                let shard_id = router.target_shard(&k);
-                                                if shard_id == router.shard_id {
-                                                    let mut hub = hub_arc.lock().unwrap();
-                                                    hub.notify_list(
-                                                        &mut router.local_db.borrow_mut().table,
-                                                        &k,
-                                                    );
-                                                    hub.notify_zset(
-                                                        &mut router.local_db.borrow_mut().table,
-                                                        &k,
-                                                    );
-                                                } else {
-                                                    let _ = router.senders[shard_id].send(
-                                                        ShardMessage::NotifyList { keys: vec![k] },
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Command::Quit => {
-                                        out_buf.extend_from_slice(b"+OK\r\n");
-                                        should_quit = true;
-                                        break;
-                                    }
-                                    _ => {
-                                        tx_queue.push(cmd);
-                                        out_buf.extend_from_slice(b"+QUEUED\r\n");
-                                    }
-                                }
-                            } else {
-                                match cmd {
-                                    Command::Multi => {
-                                        in_multi = true;
-                                        tx_queue.clear();
-                                        tx_has_error = false;
-                                        out_buf.extend_from_slice(b"+OK\r\n");
-                                    }
-                                    Command::Discard => {
-                                        out_buf
-                                            .extend_from_slice(b"-ERR DISCARD without MULTI\r\n");
-                                    }
-                                    Command::Exec => {
-                                        out_buf.extend_from_slice(b"-ERR EXEC without MULTI\r\n");
-                                    }
-                                    Command::Watch(keys) => {
-                                        watch_keys(router.port, client_id, &keys);
-                                        out_buf.extend_from_slice(b"+OK\r\n");
-                                    }
-                                    Command::Unwatch => {
-                                        unwatch_keys(router.port, client_id);
-                                        out_buf.extend_from_slice(b"+OK\r\n");
-                                    }
-                                    _ => {
-                                        let quit = execute_command(
-                                            cmd,
-                                            &router,
-                                            client_id,
-                                            &client_registry,
-                                            &mut out_buf,
-                                            &mut asking,
-                                            &mut authenticated,
-                                            &mut auth_user,
-                                        )
-                                        .await;
-                                        if quit {
-                                            should_quit = true;
-                                            break;
-                                        }
-                                    }
-                                }
+                                should_quit = true;
+                                break;
                             }
                         }
                     } else if has_special
@@ -2966,9 +3044,26 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
         | Command::Object(crate::resp::ObjectSubcommand::Freq(k))
         | Command::Object(crate::resp::ObjectSubcommand::Idletime(k))
         | Command::Object(crate::resp::ObjectSubcommand::Refcount(k))
+        | Command::Memory(crate::resp::MemorySubcommand::Usage { key: k })
         | Command::Xinfo(crate::resp::XinfoSubcommand::Stream(k))
         | Command::Xinfo(crate::resp::XinfoSubcommand::Groups(k))
         | Command::Xinfo(crate::resp::XinfoSubcommand::Consumers { key: k, .. })
+        | Command::Getex { key: k, .. }
+        | Command::Delex { key: k, .. }
+        | Command::Sticky(k)
+        | Command::MemcachedSet { key: k, .. }
+        | Command::MemcachedAdd { key: k, .. }
+        | Command::MemcachedReplace { key: k, .. }
+        | Command::MemcachedDelete { key: k, .. }
+        | Command::MemcachedIncr { key: k, .. }
+        | Command::MemcachedDecr { key: k, .. }
+        | Command::CrdtSet { key: k, .. }
+        | Command::CrdtGet(k)
+        | Command::CrdtDel(k)
+        | Command::CrdtIncrby { key: k, .. }
+        | Command::CrdtSadd { key: k, .. }
+        | Command::CrdtSmembers(k)
+        | Command::CrdtSrem { key: k, .. }
         | Command::Hexpire { key: k, .. }
         | Command::Httl { key: k, .. }
         | Command::Hpersist { key: k, .. }
@@ -2976,7 +3071,27 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
         | Command::Hsetex { key: k, .. }
         | Command::Xclaim { key: k, .. }
         | Command::Xautoclaim { key: k, .. } => f(k.as_ref()),
-        Command::Eval { keys, .. } | Command::Evalsha { keys, .. } => {
+        Command::Eval { keys, .. }
+        | Command::Evalsha { keys, .. }
+        | Command::Fcall { keys, .. }
+        | Command::Lmpop { keys, .. }
+        | Command::Blmpop { keys, .. }
+        | Command::JsonMget { keys, .. }
+        | Command::Stick(keys)
+        | Command::Unstick(keys)
+        | Command::MemcachedGet { keys } => {
+            for k in keys {
+                f(k.as_ref());
+            }
+        }
+        Command::Vsim { k1, k2, .. } => {
+            f(k1.as_ref());
+            f(k2.as_ref());
+        }
+        Command::Migrate { key, keys, .. } => {
+            if let Some(k) = key {
+                f(k.as_ref());
+            }
             for k in keys {
                 f(k.as_ref());
             }
@@ -6494,6 +6609,7 @@ async fn execute_command(
                     &out[start_len..] == b"$-1\r\n" || &out[start_len..] == b"*0\r\n";
                 if let Some(wait_ms) = block_ms
                     && produced_empty
+                    && !IN_TX.get()
                 {
                     out.truncate(start_len);
                     let resolved_ids = resolve_stream_last_ids(router, keys, ids).await;
@@ -6566,7 +6682,9 @@ async fn execute_command(
                         for b in stream_blocks {
                             out.extend_from_slice(&b);
                         }
-                    } else if let Some(wait_ms) = block_ms {
+                    } else if let Some(wait_ms) = block_ms
+                        && !IN_TX.get()
+                    {
                         let resolved_ids = resolve_stream_last_ids(router, keys, ids).await;
                         let (tx, rx) = flume::bounded(1);
                         {
@@ -10485,7 +10603,6 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Zcount { key, .. }
         | Command::Zincrby { key, .. }
         | Command::Zrange { key, .. }
-        | Command::Zrangestore { dst: key, .. }
         | Command::Zpopmin { key, .. }
         | Command::Zpopmax { key, .. }
         | Command::Type(key)
@@ -10609,7 +10726,12 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Hsetex { key, .. }
         | Command::Xclaim { key, .. }
         | Command::Xautoclaim { key, .. } => Some(target_shard(key, num_shards)),
-        Command::Smove {
+        Command::Zrangestore {
+            dst: destination,
+            src: source,
+            ..
+        }
+        | Command::Smove {
             source,
             destination,
             ..
@@ -12377,7 +12499,7 @@ pub fn execute_local_command(
             match sub {
                 crate::resp::XinfoSubcommand::Stream(key) => match db.xinfo_stream(key) {
                     Ok(info) => {
-                        write_resp_array_header(out, 14);
+                        write_resp_array_header(out, 20);
                         write_resp_bulk(out, b"length");
                         write_resp_integer(out, info.length as i64);
                         write_resp_bulk(out, b"radix-tree-keys");
@@ -12392,8 +12514,38 @@ pub fn execute_local_command(
                         write_resp_bulk(out, max_del_str.as_bytes());
                         write_resp_bulk(out, b"entries-added");
                         write_resp_integer(out, info.entries_added as i64);
+                        write_resp_bulk(out, b"recorded-first-entry-id");
+                        let rec_first_str =
+                            info.recorded_first_entry_id.unwrap_or_default().to_string();
+                        write_resp_bulk(out, rec_first_str.as_bytes());
                         write_resp_bulk(out, b"groups");
                         write_resp_integer(out, info.groups as i64);
+                        write_resp_bulk(out, b"first-entry");
+                        if let Some((id, fields)) = &info.first_entry {
+                            write_resp_array_header(out, 2);
+                            let id_s = id.to_string();
+                            write_resp_bulk(out, id_s.as_bytes());
+                            write_resp_array_header(out, fields.len() * 2);
+                            for (f, v) in fields {
+                                write_resp_bulk(out, f);
+                                write_resp_bulk(out, v);
+                            }
+                        } else {
+                            write_resp_null_array(out);
+                        }
+                        write_resp_bulk(out, b"last-entry");
+                        if let Some((id, fields)) = &info.last_entry {
+                            write_resp_array_header(out, 2);
+                            let id_s = id.to_string();
+                            write_resp_bulk(out, id_s.as_bytes());
+                            write_resp_array_header(out, fields.len() * 2);
+                            for (f, v) in fields {
+                                write_resp_bulk(out, f);
+                                write_resp_bulk(out, v);
+                            }
+                        } else {
+                            write_resp_null_array(out);
+                        }
                     }
                     Err(err) => write_resp_err(out, err),
                 },
@@ -12401,7 +12553,7 @@ pub fn execute_local_command(
                     Ok(groups) => {
                         write_resp_array_header(out, groups.len());
                         for g in groups {
-                            write_resp_array_header(out, 8);
+                            write_resp_array_header(out, 12);
                             write_resp_bulk(out, b"name");
                             write_resp_bulk(out, &g.name);
                             write_resp_bulk(out, b"consumers");
@@ -12411,6 +12563,10 @@ pub fn execute_local_command(
                             write_resp_bulk(out, b"last-delivered-id");
                             let id_str = g.last_delivered_id.to_string();
                             write_resp_bulk(out, id_str.as_bytes());
+                            write_resp_bulk(out, b"entries-read");
+                            write_resp_integer(out, g.entries_read as i64);
+                            write_resp_bulk(out, b"lag");
+                            write_resp_integer(out, g.lag as i64);
                         }
                     }
                     Err(err) => write_resp_err(out, err),
@@ -12420,11 +12576,15 @@ pub fn execute_local_command(
                         Ok(consumers) => {
                             write_resp_array_header(out, consumers.len());
                             for c in consumers {
-                                write_resp_array_header(out, 4);
+                                write_resp_array_header(out, 8);
                                 write_resp_bulk(out, b"name");
                                 write_resp_bulk(out, &c.name);
                                 write_resp_bulk(out, b"pending");
                                 write_resp_integer(out, c.pending as i64);
+                                write_resp_bulk(out, b"idle");
+                                write_resp_integer(out, c.idle_ms as i64);
+                                write_resp_bulk(out, b"inactive");
+                                write_resp_integer(out, c.inactive_ms);
                             }
                         }
                         Err(err) => write_resp_err(out, err),
@@ -12938,10 +13098,7 @@ pub fn execute_local_command(
                     };
                     record_change!(&explicit_cmd);
                     let s = generated_id.to_string();
-                    crate::block::get_block_hub_for_port(db.port)
-                        .lock()
-                        .unwrap()
-                        .notify_stream(key);
+                    notify_stream_or_defer(db, key);
                     out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
                 }
                 Ok(None) => {

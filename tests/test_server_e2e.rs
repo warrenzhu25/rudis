@@ -12062,7 +12062,7 @@ fn test_cross_shard_xread_cluster_crossslot_e2e() {
 
 #[test]
 fn test_hpexpire_hgetex_hsetex_e2e() {
-    let port = 19130;
+    let port = 19133;
     start_test_server(port, 4);
 
     let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
@@ -12130,6 +12130,254 @@ fn test_hpexpire_hgetex_hsetex_e2e() {
     );
     assert_eq!(
         send_and_read(&mut stream, b"HGET h_prof role\r\n"),
+        "$-1\r\n"
+    );
+}
+
+#[test]
+fn test_distributed_multi_exec_and_stream_observability_e2e() {
+    let port = 19134;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // Find 4 keys on 4 distinct shards
+    let mut shard_keys = vec![String::new(); num_shards];
+    for i in 0..1000 {
+        let candidate = format!("dtx_k_{}", i);
+        let s = rudis::router::target_shard(candidate.as_bytes(), num_shards);
+        if shard_keys[s].is_empty() {
+            shard_keys[s] = candidate;
+        }
+        if shard_keys.iter().all(|k| !k.is_empty()) {
+            break;
+        }
+    }
+    let k0 = &shard_keys[0];
+    let k1 = &shard_keys[1];
+    let k2 = &shard_keys[2];
+    let k3 = &shard_keys[3];
+
+    // 1. Multi-shard MULTI/EXEC with cross-shard ZRANGESTORE, SINTERSTORE, HSETEX, and non-blocking XREAD BLOCK
+    assert_eq!(send_and_read(&mut stream, b"MULTI\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            format!("ZADD {} 10 a 20 b 30 c\r\n", k0).as_bytes()
+        ),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            format!("ZRANGESTORE {} {} 1 2\r\n", k1, k0).as_bytes()
+        ),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, format!("ZRANGE {} 0 -1\r\n", k1).as_bytes()),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            format!("HSETEX {} FNX PX 60000 FIELDS 1 f1 v1\r\n", k2).as_bytes()
+        ),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            format!("XREAD BLOCK 5000 STREAMS {} 0-0\r\n", k3).as_bytes()
+        ),
+        "+QUEUED\r\n"
+    );
+    let exec_res = send_and_read(&mut stream, b"EXEC\r\n");
+    assert_eq!(
+        exec_res,
+        "*5\r\n:3\r\n:2\r\n*2\r\n$1\r\nb\r\n$1\r\nc\r\n:1\r\n$-1\r\n"
+    );
+
+    // 2. XADD inside MULTI/EXEC wakes blocked XREAD waiter on commit
+    let k3_clone = k3.clone();
+    let waiter_handle = std::thread::spawn(move || {
+        let mut w_stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        w_stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        send_and_read(
+            &mut w_stream,
+            format!("XREAD BLOCK 3000 STREAMS {} $\r\n", k3_clone).as_bytes(),
+        )
+    });
+    std::thread::sleep(Duration::from_millis(80));
+    assert_eq!(send_and_read(&mut stream, b"MULTI\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            format!("XADD {} 1-1 msg tx_stream\r\n", k3).as_bytes()
+        ),
+        "+QUEUED\r\n"
+    );
+    let tx_stream_exec = send_and_read(&mut stream, b"EXEC\r\n");
+    assert_eq!(tx_stream_exec, "*1\r\n$3\r\n1-1\r\n");
+    let waiter_res = waiter_handle.join().unwrap();
+    assert!(waiter_res.contains("1-1") && waiter_res.contains("tx_stream"));
+
+    // 3. Redis 7.0+ / 7.4 Stream Observability (XINFO STREAM, XINFO GROUPS, XINFO CONSUMERS)
+    assert_eq!(
+        send_and_read(&mut stream, b"XADD obs_s 10-1 f a\r\n"),
+        "$4\r\n10-1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"XADD obs_s 10-2 f b\r\n"),
+        "$4\r\n10-2\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"XADD obs_s 10-3 f c\r\n"),
+        "$4\r\n10-3\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"XGROUP CREATE obs_s grp1 0\r\n"),
+        "+OK\r\n"
+    );
+
+    let ginfo_initial = send_and_read(&mut stream, b"XINFO GROUPS obs_s\r\n");
+    assert!(
+        ginfo_initial.contains("entries-read\r\n:0\r\n") && ginfo_initial.contains("lag\r\n:3\r\n"),
+        "unexpected initial XINFO GROUPS: {}",
+        ginfo_initial
+    );
+
+    assert_eq!(
+        send_and_read(&mut stream, b"XGROUP CREATECONSUMER obs_s grp1 c_idle\r\n"),
+        ":1\r\n"
+    );
+    let cinfo_idle = send_and_read(&mut stream, b"XINFO CONSUMERS obs_s grp1\r\n");
+    assert!(
+        cinfo_idle.contains("c_idle") && cinfo_idle.contains("inactive\r\n:-1\r\n"),
+        "unexpected idle XINFO CONSUMERS: {}",
+        cinfo_idle
+    );
+
+    let read_res = send_and_read(
+        &mut stream,
+        b"XREADGROUP GROUP grp1 c_active COUNT 2 STREAMS obs_s >\r\n",
+    );
+    assert!(read_res.contains("10-1") && read_res.contains("10-2"));
+
+    let ginfo_after = send_and_read(&mut stream, b"XINFO GROUPS obs_s\r\n");
+    assert!(
+        ginfo_after.contains("entries-read\r\n:2\r\n") && ginfo_after.contains("lag\r\n:1\r\n"),
+        "unexpected post-read XINFO GROUPS: {}",
+        ginfo_after
+    );
+
+    let cinfo_active = send_and_read(&mut stream, b"XINFO CONSUMERS obs_s grp1\r\n");
+    assert!(
+        cinfo_active.contains("c_active") && cinfo_active.contains("pending\r\n:2\r\n"),
+        "unexpected active XINFO CONSUMERS: {}",
+        cinfo_active
+    );
+
+    assert_eq!(send_and_read(&mut stream, b"XDEL obs_s 10-2\r\n"), ":1\r\n");
+    let sinfo = send_and_read(&mut stream, b"XINFO STREAM obs_s\r\n");
+    assert!(
+        sinfo.contains("length\r\n:2\r\n")
+            && sinfo.contains("entries-added\r\n:3\r\n")
+            && sinfo.contains("max-deleted-entry-id\r\n$4\r\n10-2\r\n")
+            && sinfo.contains("recorded-first-entry-id\r\n$4\r\n10-1\r\n")
+            && sinfo.contains("first-entry")
+            && sinfo.contains("last-entry"),
+        "unexpected XINFO STREAM: {}",
+        sinfo
+    );
+}
+
+#[test]
+fn test_cluster_multi_exec_crossslot_e2e() {
+    let port = 19135;
+    let num_shards = 4;
+    start_test_server_cluster(port, num_shards);
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // Find a hash tag owned by shard 0 (slot < 4096)
+    let mut tag = String::new();
+    for i in 0..1000 {
+        let candidate = format!("tx_{}", i);
+        let probe = format!("k{{{}}}", candidate);
+        if rudis::router::key_slot(probe.as_bytes()) < 4096 {
+            tag = candidate;
+            break;
+        }
+    }
+
+    // 1. Same hash slot succeeds in cluster MULTI/EXEC
+    assert_eq!(send_and_read(&mut stream, b"MULTI\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            format!("SET k1{{{}}} val1\r\n", tag).as_bytes()
+        ),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            format!("SET k2{{{}}} val2\r\n", tag).as_bytes()
+        ),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut stream,
+            format!("MGET k1{{{}}} k2{{{}}}\r\n", tag, tag).as_bytes()
+        ),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"EXEC\r\n"),
+        "*3\r\n+OK\r\n+OK\r\n*2\r\n$4\r\nval1\r\n$4\r\nval2\r\n"
+    );
+
+    // 2. Different hash slots across queued commands in MULTI/EXEC returns -CROSSSLOT
+    let mut s1 = String::new();
+    let mut s2 = String::new();
+    for i in 0..1000 {
+        let k = format!("ctx_key_{}", i);
+        let slot = rudis::router::key_slot(k.as_bytes());
+        if slot < 4096 {
+            if s1.is_empty() {
+                s1 = k;
+            } else if rudis::router::key_slot(s1.as_bytes()) != slot {
+                s2 = k;
+                break;
+            }
+        }
+    }
+    assert_eq!(send_and_read(&mut stream, b"MULTI\r\n"), "+OK\r\n");
+    assert_eq!(
+        send_and_read(&mut stream, format!("SET {} v1\r\n", s1).as_bytes()),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, format!("SET {} v2\r\n", s2).as_bytes()),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, b"EXEC\r\n"),
+        "-CROSSSLOT Keys in request don't hash to the same slot\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut stream, format!("GET {}\r\n", s1).as_bytes()),
         "$-1\r\n"
     );
 }
