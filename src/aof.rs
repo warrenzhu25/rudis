@@ -1924,7 +1924,7 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
                 let cmd = Command::Vadd {
                     key: bytes::Bytes::from(name.clone()),
                     element: elem.clone(),
-                    vector: node.vector.clone(),
+                    vector: index.node_vector_cow(node).into_owned(),
                     metric: Some(index.metric),
                     quantize: node.quantized.is_some(),
                     pq: node.pq.is_some(),

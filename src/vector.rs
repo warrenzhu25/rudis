@@ -903,6 +903,7 @@ pub struct HnswNode {
     pub binary: Option<Vec<u64>>,
     pub pq: Option<PQVector>,
     pub is_tiered: bool,
+    pub tier_offset: Option<u64>,
     /// Neighbors at each layer [0..layer]
     pub neighbors: Vec<Vec<usize>>,
 }
@@ -1034,6 +1035,10 @@ pub struct HnswIndex {
     pub uid: u64,
     /// True when created via Redis 8 `VADD` syntax (`FP32` / `VALUES` / `REDUCE`).
     pub is_redis_vset: bool,
+    /// Path to disk-backed NVMe vector tier file when `TIERED` mode is used.
+    pub tier_path: Option<std::path::PathBuf>,
+    /// Total bytes of full-precision FP32 vectors spilled to `tier_path`.
+    pub tiered_bytes: u64,
     rng_state: u64,
 }
 
@@ -1064,6 +1069,8 @@ impl HnswIndex {
             input_dim: 0,
             uid: NEXT_VSET_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             is_redis_vset: false,
+            tier_path: None,
+            tiered_bytes: 0,
             rng_state: 0x853c49e6748fea9b,
         }
     }
@@ -1087,6 +1094,65 @@ impl HnswIndex {
         idx
     }
 
+    /// Returns the full-precision `f32` vector for `node`, reading from the NVMe `.vtier` file
+    /// if the node's in-RAM vector was spilled (`node.is_tiered && node.vector.is_empty()`).
+    pub fn node_vector_cow<'a>(&self, node: &'a HnswNode) -> std::borrow::Cow<'a, [f32]> {
+        if !node.vector.is_empty() {
+            return std::borrow::Cow::Borrowed(&node.vector);
+        }
+        if node.is_tiered
+            && let Some(offset) = node.tier_offset
+            && let Some(path) = &self.tier_path
+            && let Ok(file) = std::fs::File::open(path)
+        {
+            use std::os::unix::fs::FileExt;
+            let mut raw = vec![0u8; self.dim * 4];
+            if file.read_exact_at(&mut raw, offset).is_ok() {
+                let mut vec = Vec::with_capacity(self.dim);
+                for &chunk in raw.as_chunks::<4>().0 {
+                    vec.push(f32::from_le_bytes(chunk));
+                }
+                return std::borrow::Cow::Owned(vec);
+            }
+        }
+        if let Some(q) = &node.quantized {
+            return std::borrow::Cow::Owned(q.dequantize());
+        }
+        std::borrow::Cow::Owned(vec![0.0; self.dim])
+    }
+
+    /// Spills a node's full-precision `f32` vector to the per-index `.vtier` file and drops its
+    /// in-RAM `Vec<f32>` buffer so only the quantized representation remains in memory.
+    fn spill_node_to_tier(&mut self, node_id: usize, full_vector: &[f32]) {
+        use std::io::Write;
+        let path = self.tier_path.get_or_insert_with(|| {
+            std::env::temp_dir().join(format!(
+                "rudis-vtier-{}-{}.bin",
+                std::process::id(),
+                self.uid
+            ))
+        });
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            && let Ok(meta) = file.metadata()
+        {
+            let offset = meta.len();
+            let mut raw = Vec::with_capacity(full_vector.len() * 4);
+            for &v in full_vector {
+                raw.extend_from_slice(&v.to_le_bytes());
+            }
+            if file.write_all(&raw).is_ok() {
+                self.tiered_bytes += raw.len() as u64;
+                if let Some(Some(node)) = self.nodes.get_mut(node_id) {
+                    node.tier_offset = Some(offset);
+                    node.vector = Vec::new();
+                }
+            }
+        }
+    }
+
     pub fn enable_pq(&mut self, m: usize) {
         self.pq_quantizer = Some(ProductQuantizer::new(self.dim, m));
         self.pq_trained = false;
@@ -1104,15 +1170,21 @@ impl HnswIndex {
             .nodes
             .iter()
             .flatten()
-            .map(|n| n.vector.clone())
+            .map(|n| self.node_vector_cow(n).into_owned())
             .collect();
         if samples.is_empty() {
             return;
         }
         let trained = ProductQuantizer::train(self.dim, m, &samples, max_iters);
-        for node in self.nodes.iter_mut().flatten() {
-            if node.pq.is_some() {
-                node.pq = Some(trained.encode(&node.vector));
+        for node_id in 0..self.nodes.len() {
+            if let Some(node) = self.nodes[node_id].as_ref()
+                && node.pq.is_some()
+            {
+                let v = self.node_vector_cow(node).into_owned();
+                let encoded = trained.encode(&v);
+                if let Some(node_mut) = self.nodes[node_id].as_mut() {
+                    node_mut.pq = Some(encoded);
+                }
             }
         }
         self.pq_quantizer = Some(trained);
@@ -1169,7 +1241,7 @@ impl HnswIndex {
                 .quantized
                 .as_ref()
                 .map(|q| q.dequantize())
-                .unwrap_or_else(|| node.vector.clone()),
+                .unwrap_or_else(|| self.node_vector_cow(node).into_owned()),
             VQuant::Bin => {
                 if let Some(bits) = &node.binary {
                     (0..self.dim)
@@ -1182,10 +1254,10 @@ impl HnswIndex {
                         })
                         .collect()
                 } else {
-                    node.vector.clone()
+                    self.node_vector_cow(node).into_owned()
                 }
             }
-            VQuant::NoQuant => node.vector.clone(),
+            VQuant::NoQuant => self.node_vector_cow(node).into_owned(),
         })
     }
 
@@ -1193,6 +1265,7 @@ impl HnswIndex {
     pub fn links(&self, key: &Bytes) -> Option<Vec<Vec<(Bytes, f32)>>> {
         let id = *self.key_to_id.get(key)?;
         let node = self.nodes.get(id)?.as_ref()?;
+        let node_v = self.node_vector_cow(node);
         Some(
             node.neighbors
                 .iter()
@@ -1201,7 +1274,8 @@ impl HnswIndex {
                         .iter()
                         .filter_map(|&n| self.nodes.get(n).and_then(|o| o.as_ref()))
                         .map(|n| {
-                            let d = compute_distance(&node.vector, &n.vector, self.metric);
+                            let n_v = self.node_vector_cow(n);
+                            let d = compute_distance(&node_v, &n_v, self.metric);
                             let score = (1.0 - d / 2.0).clamp(0.0, 1.0);
                             (n.key.clone(), score)
                         })
@@ -1264,6 +1338,12 @@ impl HnswIndex {
         })
     }
 
+    pub fn get_vector_cow(&self, key: &Bytes) -> Option<std::borrow::Cow<'_, [f32]>> {
+        let id = *self.key_to_id.get(key)?;
+        let node = self.nodes.get(id)?.as_ref()?;
+        Some(self.node_vector_cow(node))
+    }
+
     #[inline]
     pub fn dist_to_node(&self, query: &[f32], node: &HnswNode) -> f32 {
         if let Some(pq) = &node.pq
@@ -1278,7 +1358,8 @@ impl HnswIndex {
         if let Some(quant) = &node.quantized {
             quant.compute_distance(query, self.metric)
         } else {
-            compute_distance(query, &node.vector, self.metric)
+            let v = self.node_vector_cow(node);
+            compute_distance(query, &v, self.metric)
         }
     }
 
@@ -1304,7 +1385,8 @@ impl HnswIndex {
                     .get(sel_id)
                     .and_then(|o| o.as_ref())
                     .is_none_or(|sel_node| {
-                        let dist_to_sel = self.dist_to_node(&sel_node.vector, cand_node);
+                        let sv = self.node_vector_cow(sel_node);
+                        let dist_to_sel = self.dist_to_node(&sv, cand_node);
                         cand.distance <= dist_to_sel
                     })
             });
@@ -1387,13 +1469,19 @@ impl HnswIndex {
                     .nodes
                     .iter()
                     .flatten()
-                    .map(|n| n.vector.clone())
+                    .map(|n| self.node_vector_cow(n).into_owned())
                     .collect();
                 samples.push(vector.clone());
                 let trained = ProductQuantizer::train(self.dim, m, &samples, 10);
-                for node in self.nodes.iter_mut().flatten() {
-                    if node.pq.is_some() {
-                        node.pq = Some(trained.encode(&node.vector));
+                for nid in 0..self.nodes.len() {
+                    if let Some(n) = self.nodes[nid].as_ref()
+                        && n.pq.is_some()
+                    {
+                        let v = self.node_vector_cow(n).into_owned();
+                        let encoded = trained.encode(&v);
+                        if let Some(n_mut) = self.nodes[nid].as_mut() {
+                            n_mut.pq = Some(encoded);
+                        }
                     }
                 }
                 self.pq_quantizer = Some(trained);
@@ -1412,6 +1500,7 @@ impl HnswIndex {
             binary,
             pq,
             is_tiered: tiered,
+            tier_offset: None,
             neighbors: vec![Vec::new(); target_level + 1],
         };
 
@@ -1424,6 +1513,9 @@ impl HnswIndex {
                 self.nodes.push(Some(node));
             }
             self.key_to_id.insert(key, new_id);
+            if tiered {
+                self.spill_node_to_tier(new_id, &vector);
+            }
             return Ok(());
         }
 
@@ -1496,12 +1588,16 @@ impl HnswIndex {
             self.entry_point = Some(new_id);
         }
 
+        if tiered {
+            self.spill_node_to_tier(new_id, &vector);
+        }
+
         Ok(())
     }
 
     fn prune_neighbors(&mut self, node_id: usize, layer: usize, max_neighbors: usize) {
         if let Some(node) = &self.nodes[node_id] {
-            let node_vec = node.vector.clone();
+            let node_vec = self.node_vector_cow(node).into_owned();
             let mut candidates: Vec<Candidate> = node.neighbors[layer]
                 .iter()
                 .filter_map(|&id| {
@@ -1754,7 +1850,8 @@ impl HnswIndex {
                 .into_iter()
                 .filter_map(|c| {
                     self.nodes[c.id].as_ref().map(|n| {
-                        let exact_d = compute_distance(query, &n.vector, self.metric);
+                        let full_v = self.node_vector_cow(n);
+                        let exact_d = compute_distance(query, &full_v, self.metric);
                         (n.key.clone(), exact_d)
                     })
                 })
@@ -1883,7 +1980,7 @@ impl HnswIndex {
                         {
                             continue;
                         }
-                        let u_vec = u_node.vector.clone();
+                        let u_vec = self.node_vector_cow(u_node).into_owned();
                         let mut extra: Vec<(usize, f32)> = nbrs
                             .iter()
                             .copied()
@@ -1931,13 +2028,14 @@ impl HnswIndex {
     pub fn raw_embedding(&self, key: &Bytes) -> Option<(&'static str, Vec<u8>, f32, Option<f32>)> {
         let id = *self.key_to_id.get(key)?;
         let node = self.nodes.get(id)?.as_ref()?;
-        let norm = dot_product(&node.vector, &node.vector).sqrt().max(1e-12);
+        let full_v = self.node_vector_cow(node);
+        let norm = dot_product(&full_v, &full_v).sqrt().max(1e-12);
         match self.quant {
             VQuant::Q8 => {
                 let q = node
                     .quantized
                     .clone()
-                    .unwrap_or_else(|| QuantizedVector::quantize(&node.vector));
+                    .unwrap_or_else(|| QuantizedVector::quantize(&full_v));
                 let range = (q.scale * 255.0).abs();
                 Some(("q8", q.data, norm, Some(range)))
             }
@@ -1945,7 +2043,7 @@ impl HnswIndex {
                 let words = node
                     .binary
                     .clone()
-                    .unwrap_or_else(|| quantize_binary(&node.vector));
+                    .unwrap_or_else(|| quantize_binary(&full_v));
                 let byte_len = self.dim.div_ceil(8);
                 let mut raw = Vec::with_capacity(byte_len);
                 for word in words {
@@ -1958,8 +2056,8 @@ impl HnswIndex {
                 Some(("bin", raw, norm, None))
             }
             VQuant::NoQuant => {
-                let mut raw = Vec::with_capacity(node.vector.len() * 4);
-                for &v in &node.vector {
+                let mut raw = Vec::with_capacity(full_v.len() * 4);
+                for &v in full_v.iter() {
                     raw.extend_from_slice(&(v / norm).to_le_bytes());
                 }
                 Some(("fp32", raw, norm, None))
@@ -3157,5 +3255,51 @@ mod tests {
         assert!(idx.pq_trained);
         let hits = idx.search(&samples[10], 1);
         assert_eq!(hits[0].0, Bytes::from("p10"));
+    }
+
+    #[test]
+    fn test_nvme_tiered_vector_spills_ram_and_reranks_from_disk() {
+        let mut idx = HnswIndex::new("tiered_idx".to_string(), 4, VectorMetric::L2);
+        idx.add_quantized_ext(
+            Bytes::from("v1"),
+            vec![1.0, 0.25, -0.5, 0.75],
+            true,
+            false,
+            true,
+        )
+        .unwrap();
+        idx.add_quantized_ext(
+            Bytes::from("v2"),
+            vec![0.0, 1.0, 0.5, -0.25],
+            true,
+            false,
+            true,
+        )
+        .unwrap();
+
+        // In-RAM full-precision vectors are cleared (`Vec::new()`), while `.vtier` file holds 32 bytes
+        for node in idx.nodes.iter().flatten() {
+            assert!(node.is_tiered);
+            assert!(
+                node.vector.is_empty(),
+                "in-RAM Vec<f32> should be dropped when tiered"
+            );
+            assert!(node.tier_offset.is_some());
+            assert!(node.quantized.is_some());
+        }
+        assert_eq!(idx.tiered_bytes, 32);
+
+        // Reranked search reads back exact FP32 vectors via positional pread from disk
+        let hits = idx.search_tiered(&[1.0, 0.25, -0.5, 0.75], 2, true);
+        assert_eq!(hits[0].0, Bytes::from("v1"));
+        assert!(
+            hits[0].1 < 1e-6,
+            "exact FP32 distance from disk should be 0.0, got {}",
+            hits[0].1
+        );
+
+        if let Some(p) = &idx.tier_path {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }

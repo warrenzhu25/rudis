@@ -2167,8 +2167,9 @@ impl ShardDb {
                     buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
                     buf.extend_from_slice(key);
                     buf.push((index.metric as u8) | 0x80);
-                    buf.extend_from_slice(&(node.vector.len() as u32).to_le_bytes());
-                    for &coord in &node.vector {
+                    let full_v = index.node_vector_cow(node);
+                    buf.extend_from_slice(&(full_v.len() as u32).to_le_bytes());
+                    for &coord in full_v.iter() {
                         buf.extend_from_slice(&coord.to_bits().to_le_bytes());
                     }
                     let mut vset_flags = 0u8;
@@ -2882,10 +2883,10 @@ impl ShardDb {
         metric_override: Option<crate::vector::VectorMetric>,
     ) -> Result<f32, &'static str> {
         if let Some(idx) = self.vector_indexes.get(index_name) {
-            let v1 = idx.get_vector(k1).ok_or("vector 1 not found")?;
-            let v2 = idx.get_vector(k2).ok_or("vector 2 not found")?;
+            let v1 = idx.get_vector_cow(k1).ok_or("vector 1 not found")?;
+            let v2 = idx.get_vector_cow(k2).ok_or("vector 2 not found")?;
             let metric = metric_override.unwrap_or(idx.metric);
-            Ok(crate::vector::compute_distance(v1, v2, metric))
+            Ok(crate::vector::compute_distance(&v1, &v2, metric))
         } else {
             Err("index not found")
         }
@@ -2914,9 +2915,9 @@ impl ShardDb {
         };
         let query_vec: Vec<f32> = match target {
             crate::resp::VsimTarget::Element(elem) => idx
-                .get_vector(elem)
+                .get_vector_cow(elem)
                 .ok_or_else(|| "Element not found".to_string())?
-                .to_vec(),
+                .into_owned(),
             crate::resp::VsimTarget::Vector(v) => {
                 if v.len() != idx.client_dim() {
                     return Err("vector dimension mismatch".to_string());

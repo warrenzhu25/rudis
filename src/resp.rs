@@ -7679,11 +7679,16 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 let mut ef = None;
                 let mut setattr = None;
                 let mut m = None;
+                let mut tiered = false;
                 while i < args.len() {
                     let opt = String::from_utf8_lossy(&args[i]).to_ascii_uppercase();
                     match opt.as_str() {
                         "CAS" => {
                             cas = true;
+                            i += 1;
+                        }
+                        "TIERED" => {
+                            tiered = true;
                             i += 1;
                         }
                         "NOQUANT" => {
@@ -7750,7 +7755,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     metric: None,
                     quantize,
                     pq: false,
-                    tiered: false,
+                    tiered,
                     reduce,
                     quant,
                     ef,
@@ -7762,6 +7767,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             } else {
                 let element = args[2].clone();
                 let mut vector = Vec::with_capacity(args.len() - 3);
+                let mut metric = None;
                 let mut quantize = false;
                 let mut pq = false;
                 let mut tiered = false;
@@ -7773,6 +7779,8 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         pq = true;
                     } else if s == "TIERED" {
                         tiered = true;
+                    } else if let Ok(m) = s.parse::<crate::vector::VectorMetric>() {
+                        metric = Some(m);
                     } else {
                         let val: f32 = s.parse().map_err(|_| "not a valid float")?;
                         vector.push(val);
@@ -7782,7 +7790,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     key,
                     element,
                     vector,
-                    metric: None,
+                    metric,
                     quantize,
                     pq,
                     tiered,

@@ -344,15 +344,19 @@ pub enum AggregateStage { Group(GroupByStage), Apply(ApplyStage), Sort(SortBySta
 
 | Command | Parsed Syntax |
 | :--- | :--- |
-| `FT.CREATE` | `<index> [ON HASH\|JSON] [PREFIX n p1 ...] SCHEMA (<id> [AS <alias>] TEXT [WEIGHT w] [SORTABLE] [NOSTEM] \| NUMERIC [SORTABLE] \| TAG [SEPARATOR c] [CASESENSITIVE] \| VECTOR <algo> [DIM n] [DISTANCE_METRIC m] ...)+` |
-| `FT.SEARCH` | `<index> <query> [NOCONTENT] [LIMIT off n] [SORTBY field [ASC\|DESC]] [RETURN n f1 ...] [PARAMS n k v ...]` |
+| `FT.CREATE` | `<index> [ON HASH\|JSON] [PREFIX n p1 ...] SCHEMA (<id> [AS <alias>] TEXT [WEIGHT w] [SORTABLE] [NOSTEM] \| NUMERIC [SORTABLE] \| TAG [SEPARATOR c] [CASESENSITIVE] \| VECTOR <FLAT\|HNSW> <n_args> [TYPE FLOAT32\|FLOAT16\|BFLOAT16] [DIM n] [DISTANCE_METRIC L2\|IP\|COSINE] [M m] [EF_CONSTRUCTION efc] [EF_RUNTIME efr])+` |
+| `FT.SEARCH` | `<index> <query> [NOCONTENT] [WITHSCORES] [LIMIT off n] [SORTBY field [ASC\|DESC]] [RETURN n f1 ...] [PARAMS n k v ...]` |
+| `FT.HYBRID` | `<index> <lexical_query> VECTOR <vec_field> $<param> [K k] [EF_RUNTIME ef] [SCORER RRF\|LINEAR] [RRF_K rk] [ALPHA a] [BETA b] [LIMIT off n] [WITHSCORES] [RETURN n f1 ...] [PARAMS n k v ...]` |
 | `FT.AGGREGATE` | `<index> <query> [LOAD n @f1 ...] [GROUPBY n @f1 ... [REDUCE COUNT\|SUM\|AVG\|MIN\|MAX n args [AS alias]]...] [APPLY ...] [SORTBY ...] [LIMIT ...] [FILTER ...]` |
+| `FT.ALTER` | `<index> SCHEMA ADD (<id> [AS <alias>] <type>...)+` — dynamically adds fields and retroactively re-indexes existing documents |
+| `FT._LIST` | Lists all active RediSearch index names |
+| `FT.PROFILE` | `<index> SEARCH [LIMITED] QUERY <query> [options...]` — returns `[search_results, profile_details]` with timing and AST plan |
 | `FT.INFO` | `<index>` — reads the process-wide mirror registry (§2.2) |
 | `FT.DROPINDEX` | `<index> [DD]` |
 | `FT.EXPLAIN` | `<index> <query>` — returns the `Debug`-formatted `QueryAst` |
 | `FT.ADD` | `<index> <doc_id> <score> [FIELDS f1 v1 ...]` |
 
-`VECTOR` field parsing tolerates and skips `TYPE`/`FLOAT32`/`M`/`EF_CONSTRUCTION`/bare-numeric tokens for compatibility with the fuller upstream `FT.CREATE ... VECTOR HNSW n ...` argument grammar, without acting on those specific sub-arguments beyond `DIM`/`DISTANCE_METRIC`. There is no `DIALECT` argument support anywhere in the parser.
+`VECTOR` fields are backed by `InvertedIndex.vector_indices: HashMap<String, VectorFieldIndex>`, which wraps either `FlatIndex` (`VECTOR FLAT`) or `HnswIndex` (`VECTOR HNSW`) from `src/vector.rs`. Multi-vector JSON chunk arrays (`$.chunks[*].emb`) index each chunk under `<doc_key>#chunk:<i>` and deduplicate to the parent document (`max_i score(chunk_i)`) during KNN and `VECTOR_RANGE` evaluation.
 
 ---
 

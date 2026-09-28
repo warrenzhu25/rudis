@@ -87,7 +87,10 @@ CATEGORIES = {
         "JSON.TOGGLE", "JSON.CLEAR", "JSON.MGET"
     ],
     "RediSearch & Hybrid Fusion": [
-        "FT.CREATE", "FT.SEARCH", "FT.INFO", "FT.DROPINDEX", "FT.EXPLAIN", "FT.ADD"
+        "FT.CREATE", "FT.SEARCH", "FT.AGGREGATE", "FT.HYBRID", "FT.INFO",
+        "FT.DROPINDEX", "FT.EXPLAIN", "FT.ADD", "FT.ALTER", "FT._LIST",
+        "FT.PROFILE", "FT.SYNUPDATE", "FT.SYNDUMP", "FT.SUGADD", "FT.SUGGET",
+        "FT.SUGDEL", "FT.SUGLEN"
     ],
     "RedisBloom Probabilistic": [
         "BF.RESERVE", "BF.ADD", "BF.MADD", "BF.EXISTS", "BF.MEXISTS", "BF.INFO",
@@ -96,7 +99,17 @@ CATEGORIES = {
         "TOPK.RESERVE", "TOPK.ADD", "TOPK.QUERY", "TOPK.LIST", "TOPK.INFO"
     ],
     "Vector Search (HNSW)": [
-        "VADD", "VQUERY", "VSIM", "VDEL", "VINFO"
+        "VADD", "VQUERY", "VSIM", "VDEL", "VREM", "VINFO", "VCARD", "VDIM",
+        "VEMB", "VLINKS", "VRANDMEMBER", "VSETATTR", "VGETATTR", "VISMEMBER"
+    ],
+    "AI-Native & Agent Runtime": [
+        "SEMANTIC.SET", "SEMANTIC.GET", "SEMANTIC.DEL", "SEMANTIC.FLUSH",
+        "SEMANTIC.INFO", "AGENT.MEM.ADD", "AGENT.MEM.CONTEXT",
+        "AGENT.MEM.COMPACT", "AGENT.MEM.INFO", "AGENT.MEM.CLEAR",
+        "LLM.QUOTA.RESERVE", "LLM.QUOTA.SETTLE", "LLM.QUOTA.INFO",
+        "AGENT.CHECKPOINT.PUT", "AGENT.CHECKPOINT.GET",
+        "AGENT.CHECKPOINT.HISTORY", "AGENT.TOOL.CLAIM", "AGENT.TOOL.COMPLETE",
+        "MCP.TOOLS", "MCP.CALL", "MCP.RPC"
     ],
     "NVMe Tiered Storage": [
         "TIER"

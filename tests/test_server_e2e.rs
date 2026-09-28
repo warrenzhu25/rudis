@@ -13515,3 +13515,68 @@ fn test_mcp_protocol_tools_call_and_rpc_e2e() {
         mem_ctx_resp
     );
 }
+
+#[test]
+fn test_nvme_tiered_vector_and_rerank_e2e() {
+    let port = 19157;
+    start_test_server(port, 2);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // Insert vectors with TIERED (spills FP32 to NVMe .vtier file, keeps SQ8 in RAM)
+    assert_eq!(
+        send_and_read(
+            &mut client,
+            &format_resp_cmd(&[
+                "VADD",
+                "vtier_idx",
+                "doc_a",
+                "1.0",
+                "0.25",
+                "-0.5",
+                "0.75",
+                "L2",
+                "TIERED",
+            ]),
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut client,
+            &format_resp_cmd(&[
+                "VADD",
+                "vtier_idx",
+                "doc_b",
+                "0.0",
+                "1.0",
+                "0.5",
+                "-0.25",
+                "L2",
+                "TIERED",
+            ]),
+        ),
+        "+OK\r\n"
+    );
+
+    // VQUERY with RERANK reads exact FP32 vectors back from the .vtier file
+    let vq = format_resp_cmd(&[
+        "VQUERY",
+        "vtier_idx",
+        "2",
+        "1.0",
+        "0.25",
+        "-0.5",
+        "0.75",
+        "RERANK",
+    ]);
+    let vq_resp = send_and_read(&mut client, &vq);
+    assert!(
+        vq_resp.contains("doc_a") && vq_resp.contains("0.000000"),
+        "VQUERY RERANK on tiered vectors should return exact 0.000000 distance from disk: {}",
+        vq_resp
+    );
+}

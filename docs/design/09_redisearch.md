@@ -14,7 +14,7 @@ Full-text and secondary-index search over Redis-shaped data (hashes and JSON doc
 
 ### 1.2 The Rudis Solution
 
-`src/search.rs` implements a native, in-process search engine supporting multi-field indexes over `TEXT` (Okapi BM25-ranked), `TAG` (exact-match set membership), `NUMERIC` (balanced-tree range queries), and `VECTOR` (brute-force cosine-similarity KNN) fields, addressable through the familiar `FT.CREATE`/`FT.SEARCH`/`FT.AGGREGATE` command family. Query results from lexical (BM25) and vector (KNN) retrieval can be combined via **Reciprocal Rank Fusion (RRF)**, giving hybrid keyword-plus-vector search without requiring a separate fusion step on the client.
+`src/search.rs` implements a native, in-process search engine supporting multi-field indexes over `TEXT` (Okapi BM25-ranked), `TAG` (exact-match set membership), `NUMERIC` (balanced-tree range queries), and `VECTOR` (`FLAT` brute-force or `HNSW` graph KNN and `@vec:[VECTOR_RANGE]` radius queries, including multi-vector JSON chunk arrays via `$.chunks[*].emb`), addressable through the `FT.CREATE`/`FT.SEARCH`/`FT.AGGREGATE`/`FT.HYBRID`/`FT.ALTER`/`FT._LIST`/`FT.PROFILE` command family. Query results from lexical (BM25) and vector (KNN) retrieval can be combined via **Reciprocal Rank Fusion (RRF)** or weighted linear score normalization (`FT.HYBRID ... SCORER RRF|LINEAR`), giving hybrid keyword-plus-vector search without requiring a separate fusion step on the client.
 
 ### 1.3 Indexing Model — Per-Shard Partitioned, Not a Bolt-On Global Store
 
@@ -33,9 +33,9 @@ Combining a BM25-ranked lexical result list and a cosine-similarity-ranked vecto
 
 Rudis's search engine intentionally omits several features found in mature inverted-index systems (Lucene-class engines, or RediSearch itself), in favor of a smaller, easier-to-verify implementation:
 
-- **Whole-document BM25, not per-field BM25F.** `DocMeta` stores a single combined token count (`doc_len`) across every indexed text field of a document, and `InvertedIndex::avg_doc_len()` averages over the whole corpus, not per field. Genuine BM25F (per-field lengths and per-field weighted contributions) is a materially larger implementation and was not judged worth the complexity for the corpus sizes this engine targets — see the internal doc for the specific consequence this has for `FT.CREATE`'s `WEIGHT` option.
-- **No positional/phrase indexing in query evaluation.** Term positions are not persisted or consulted during scoring, so exact-phrase queries are not distinguished from a bag-of-words AND of the same terms — again, a complexity/precision trade-off, not an accidental gap.
-- **Brute-force vector search, not an ANN index.** KNN queries scan every document holding a vector in the queried field and compute exact cosine similarity, rather than using an approximate nearest-neighbor index. `src/vector.rs`'s HNSW implementation (Component 08) is a separate subsystem serving standalone vector-index commands; `search.rs` reuses only its low-level SIMD-accelerated distance kernel (`cosine_distance`), not its HNSW graph. Brute-force KNN gives exact results and a simple, easily-audited implementation at the cost of `O(indexed documents)` work per KNN query — appropriate while corpora are small to moderate, and a natural place to introduce ANN acceleration later without changing the query-language surface.
+- **Per-field BM25 weighting with whole-document length normalization.** `DocMeta` stores a single combined token count (`doc_len`) across every indexed text field of a document while scaling per-field term frequencies by each `TEXT` field's `WEIGHT`.
+- **Positional phrase matching for quoted queries.** Exact-phrase queries (`"rust systems"`) verify adjacent token positions using `DocMeta.field_positions`.
+- **Unified `VectorFieldIndex` (`FlatIndex` or `HnswIndex`).** `FT.CREATE ... SCHEMA ... VECTOR FLAT|HNSW` delegates per-field vector storage and KNN/range search to `src/vector.rs`'s `FlatIndex` (exact scan) or `HnswIndex` (Malkov & Yashunin heuristic graph with in-graph pre-filtering and `EF_RUNTIME` overrides), supporting `FLOAT32`/`FLOAT16`/`BFLOAT16` and `L2`/`IP`/`COSINE` metrics as well as multi-vector JSON chunk paths (`$.chunks[*].emb`).
 - **A lightweight heuristic stemmer and stop-word list, not a full Porter/Snowball implementation.** Tokenization applies a handful of suffix-stripping rules — good enough to materially improve recall on common English morphology, not a substitute for a linguistically complete stemmer.
 
 ---
@@ -44,7 +44,7 @@ Rudis's search engine intentionally omits several features found in mature inver
 
 ### 2.1 The Mental Model
 
-A multi-field full-text and secondary index over hash or JSON documents. `TEXT` fields are BM25-ranked; `NUMERIC` fields are served by a balanced range tree for `O(log N + K)` range queries; `TAG` fields are exact-match set filters; `VECTOR` fields support brute-force KNN. `FT.AGGREGATE` executes a multi-stage pipeline (`GROUPBY`/`REDUCE`, `APPLY`, `SORTBY`, `LIMIT`, `FILTER`) with a small arithmetic-expression evaluator for computed fields.
+A multi-field full-text and secondary index over hash or JSON documents. `TEXT` fields are BM25-ranked; `NUMERIC` fields are served by a balanced range tree for `O(log N + K)` range queries; `TAG` fields are exact-match set filters; `VECTOR` fields support both `FLAT` exact KNN and `HNSW` graph ANN (`*=>[KNN k @vec $blob]` and `@vec:[VECTOR_RANGE r $blob]`). `FT.HYBRID` fuses lexical and vector rankings via RRF or min-max normalized linear combination, while `FT.AGGREGATE` executes a multi-stage pipeline (`GROUPBY`/`REDUCE`, `APPLY`, `SORTBY`, `LIMIT`, `FILTER`) with a small arithmetic-expression evaluator for computed fields.
 
 ### 2.2 Design Rationale (The "Why")
 
