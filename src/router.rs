@@ -2406,7 +2406,10 @@ impl Router {
             return Err(format!("Index already exists: {}", name));
         }
 
-        // Initialize on local shard
+        // Register in global search registry first so per-shard backfill also populates the mirror
+        let _ = crate::search::create_search_index(schema.clone());
+
+        // Initialize and backfill on local shard
         self.local_db.borrow_mut().init_search_index(schema.clone());
 
         // Broadcast to all other shards
@@ -2422,9 +2425,6 @@ impl Router {
                 }
             }
         }
-
-        // Also register in global search registry
-        let _ = crate::search::create_search_index(schema);
 
         Ok(())
     }

@@ -9841,16 +9841,8 @@ async fn execute_command(
                 fields,
                 schema_fields,
             };
-            let on_type_str = schema.on_type.to_uppercase();
             match router.create_search_index(schema).await {
                 Ok(()) => {
-                    if on_type_str == "JSON" {
-                        let local_db = router.local_db.borrow();
-                        for (k, doc) in local_db.json_store.iter() {
-                            let k_str = String::from_utf8_lossy(k);
-                            crate::search::index_json_document_hook(&k_str, doc);
-                        }
-                    }
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 Err(e) => out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes()),
@@ -9926,19 +9918,116 @@ async fn execute_command(
             if let Some(idx_arc) = crate::search::get_search_index(&index) {
                 let idx = idx_arc.read().unwrap();
                 if let Some(schema) = &idx.schema {
-                    out.extend_from_slice(b"*12\r\n");
+                    let total_vec_bytes: usize =
+                        idx.vector_indices.values().map(|v| v.memory_usage()).sum();
+                    let vec_mb = format!("{:.6}", total_vec_bytes as f64 / (1024.0 * 1024.0));
+
+                    out.extend_from_slice(b"*20\r\n");
                     write_resp_bulk(out, b"index_name");
                     write_resp_bulk(out, schema.name.as_bytes());
                     write_resp_bulk(out, b"index_options");
                     out.extend_from_slice(b"*0\r\n");
+                    write_resp_bulk(out, b"index_definition");
+                    out.extend_from_slice(b"*4\r\n");
+                    write_resp_bulk(out, b"key_type");
+                    write_resp_bulk(out, schema.on_type.as_bytes());
+                    write_resp_bulk(out, b"prefixes");
+                    out.extend_from_slice(format!("*{}\r\n", schema.prefixes.len()).as_bytes());
+                    for p in &schema.prefixes {
+                        write_resp_bulk(out, p.as_bytes());
+                    }
+                    write_resp_bulk(out, b"attributes");
+                    out.extend_from_slice(
+                        format!("*{}\r\n", schema.schema_fields.len()).as_bytes(),
+                    );
+                    for sf in &schema.schema_fields {
+                        match &sf.field_type {
+                            crate::search::FieldType::Vector {
+                                dim,
+                                distance_metric,
+                                algorithm,
+                                attrs,
+                            } => {
+                                let v_idx = idx
+                                    .vector_indices
+                                    .get(&sf.alias)
+                                    .or_else(|| idx.vector_indices.get(&sf.identifier));
+                                let actual_dim = v_idx.map(|v| v.dim()).unwrap_or(*dim);
+                                let num_vecs = v_idx.map(|v| v.len()).unwrap_or(0);
+                                out.extend_from_slice(b"*22\r\n");
+                                write_resp_bulk(out, b"identifier");
+                                write_resp_bulk(out, sf.identifier.as_bytes());
+                                write_resp_bulk(out, b"attribute");
+                                write_resp_bulk(out, sf.alias.as_bytes());
+                                write_resp_bulk(out, b"type");
+                                write_resp_bulk(out, b"VECTOR");
+                                write_resp_bulk(out, b"algorithm");
+                                write_resp_bulk(out, algorithm.to_ascii_uppercase().as_bytes());
+                                write_resp_bulk(out, b"data_type");
+                                write_resp_bulk(out, attrs.data_type.as_str().as_bytes());
+                                write_resp_bulk(out, b"dim");
+                                write_resp_integer(out, actual_dim as i64);
+                                write_resp_bulk(out, b"distance_metric");
+                                write_resp_bulk(
+                                    out,
+                                    distance_metric.to_ascii_uppercase().as_bytes(),
+                                );
+                                write_resp_bulk(out, b"M");
+                                write_resp_integer(out, attrs.m as i64);
+                                write_resp_bulk(out, b"ef_construction");
+                                write_resp_integer(out, attrs.ef_construction as i64);
+                                write_resp_bulk(out, b"ef_runtime");
+                                write_resp_integer(out, attrs.ef_runtime as i64);
+                                write_resp_bulk(out, b"num_vectors");
+                                write_resp_integer(out, num_vecs as i64);
+                            }
+                            crate::search::FieldType::Text { weight, .. } => {
+                                out.extend_from_slice(b"*8\r\n");
+                                write_resp_bulk(out, b"identifier");
+                                write_resp_bulk(out, sf.identifier.as_bytes());
+                                write_resp_bulk(out, b"attribute");
+                                write_resp_bulk(out, sf.alias.as_bytes());
+                                write_resp_bulk(out, b"type");
+                                write_resp_bulk(out, b"TEXT");
+                                write_resp_bulk(out, b"WEIGHT");
+                                let w = format!("{}", weight);
+                                write_resp_bulk(out, w.as_bytes());
+                            }
+                            crate::search::FieldType::Numeric { .. } => {
+                                out.extend_from_slice(b"*6\r\n");
+                                write_resp_bulk(out, b"identifier");
+                                write_resp_bulk(out, sf.identifier.as_bytes());
+                                write_resp_bulk(out, b"attribute");
+                                write_resp_bulk(out, sf.alias.as_bytes());
+                                write_resp_bulk(out, b"type");
+                                write_resp_bulk(out, b"NUMERIC");
+                            }
+                            crate::search::FieldType::Tag { separator, .. } => {
+                                out.extend_from_slice(b"*8\r\n");
+                                write_resp_bulk(out, b"identifier");
+                                write_resp_bulk(out, sf.identifier.as_bytes());
+                                write_resp_bulk(out, b"attribute");
+                                write_resp_bulk(out, sf.alias.as_bytes());
+                                write_resp_bulk(out, b"type");
+                                write_resp_bulk(out, b"TAG");
+                                write_resp_bulk(out, b"SEPARATOR");
+                                let sep = separator.to_string();
+                                write_resp_bulk(out, sep.as_bytes());
+                            }
+                        }
+                    }
                     write_resp_bulk(out, b"num_docs");
                     write_resp_integer(out, idx.total_docs as i64);
                     write_resp_bulk(out, b"num_terms");
                     write_resp_integer(out, idx.inverted.len() as i64);
                     write_resp_bulk(out, b"total_inverted_index_blocks");
                     write_resp_integer(out, idx.total_terms as i64);
+                    write_resp_bulk(out, b"vector_index_sz_mb");
+                    write_resp_bulk(out, vec_mb.as_bytes());
                     write_resp_bulk(out, b"indexing");
                     write_resp_bulk(out, b"0");
+                    write_resp_bulk(out, b"hash_indexing_failures");
+                    write_resp_integer(out, idx.indexing_failures as i64);
                 } else {
                     out.extend_from_slice(b"$-1\r\n");
                 }

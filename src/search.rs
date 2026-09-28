@@ -1661,6 +1661,8 @@ pub struct SearchOptions {
     pub sortby: Option<(String, bool)>, // (field, ascending)
     pub return_fields: Option<Vec<String>>,
     pub params: HashMap<String, Vec<u8>>,
+    pub dialect: Option<u32>,
+    pub timeout_ms: Option<u64>,
 }
 
 impl Default for SearchOptions {
@@ -1674,6 +1676,8 @@ impl Default for SearchOptions {
             sortby: None,
             return_fields: None,
             params: HashMap::new(),
+            dialect: None,
+            timeout_ms: None,
         }
     }
 }

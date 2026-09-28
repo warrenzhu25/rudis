@@ -622,10 +622,63 @@ impl ShardDb {
     }
 
     pub fn init_search_index(&mut self, schema: crate::search::IndexSchema) {
-        self.search_indices.insert(
-            schema.name.clone(),
-            crate::search::InvertedIndex::new(schema),
-        );
+        let index_name = schema.name.clone();
+        let on_type = schema.on_type.to_uppercase();
+        let prefixes = schema.prefixes.clone();
+        let mut idx = crate::search::InvertedIndex::new(schema.clone());
+        let global_idx = crate::search::get_search_index(&index_name);
+
+        if on_type == "HASH" {
+            let now = std::time::Instant::now();
+            let matching_keys: Vec<Bytes> = self
+                .table
+                .entries()
+                .filter(|e| e.expire_at.is_none_or(|exp| exp > now))
+                .filter_map(|e| {
+                    let k_str = String::from_utf8_lossy(&e.key);
+                    let matched = if prefixes.is_empty() {
+                        true
+                    } else {
+                        prefixes.iter().any(|p| k_str.starts_with(p))
+                    };
+                    if matched { Some(e.key.clone()) } else { None }
+                })
+                .collect();
+            for key in matching_keys {
+                if let Ok(raw) = self.table.hgetall(&key)
+                    && !raw.is_empty()
+                {
+                    let key_str = String::from_utf8_lossy(&key);
+                    idx.add_hash_document(&key_str, &raw);
+                    if let Some(ref g) = global_idx
+                        && let Ok(mut g_idx) = g.write()
+                    {
+                        g_idx.add_hash_document(&key_str, &raw);
+                    }
+                }
+            }
+        } else if on_type == "JSON" {
+            for (k, doc) in self.json_store.iter() {
+                let k_str = String::from_utf8_lossy(k);
+                let matched = if prefixes.is_empty() {
+                    true
+                } else {
+                    prefixes.iter().any(|p| k_str.starts_with(p))
+                };
+                if matched {
+                    let (extracted_fields, extracted_vectors) =
+                        crate::search::extract_json_fields(&schema, doc);
+                    idx.add_document(&k_str, extracted_fields.clone(), extracted_vectors.clone());
+                    if let Some(ref g) = global_idx
+                        && let Ok(mut g_idx) = g.write()
+                    {
+                        g_idx.add_document(&k_str, extracted_fields, extracted_vectors);
+                    }
+                }
+            }
+        }
+
+        self.search_indices.insert(index_name, idx);
     }
 
     pub fn drop_search_index(&mut self, name: &str) -> bool {

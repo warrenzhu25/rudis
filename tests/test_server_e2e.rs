@@ -12907,3 +12907,85 @@ fn test_redis8_vector_sets_and_cross_shard_routing_e2e() {
         "+none\r\n"
     );
 }
+
+#[test]
+fn test_ft_create_backfill_ft_info_vector_stats_and_vector_range_e2e() {
+    let port = 19151;
+    start_test_server(port, 4);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    let format_resp_cmd = |args: &[&str]| -> Vec<u8> {
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for arg in args {
+            out.extend_from_slice(format!("${}\r\n{}\r\n", arg.len(), arg).as_bytes());
+        }
+        out
+    };
+
+    // 1. Insert HASH documents BEFORE FT.CREATE to verify backfill across shards
+    for (id, cat, vec_str) in [
+        ("bfitem:1", "gpu", "1.0, 0.0, 0.0"),
+        ("bfitem:2", "cpu", "0.8, 0.2, 0.0"),
+        ("bfitem:3", "gpu", "-1.0, 0.0, 0.0"),
+    ] {
+        let cmd = format_resp_cmd(&["HSET", id, "cat", cat, "vec", vec_str]);
+        assert_eq!(send_and_read(&mut client, &cmd), ":2\r\n");
+    }
+
+    // 2. Create search index with HNSW vector field after data already exists
+    let create = format_resp_cmd(&[
+        "FT.CREATE",
+        "idx:bfitems",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "bfitem:",
+        "SCHEMA",
+        "cat",
+        "TAG",
+        "vec",
+        "VECTOR",
+        "HNSW",
+        "6",
+        "TYPE",
+        "FLOAT32",
+        "DIM",
+        "3",
+        "DISTANCE_METRIC",
+        "L2",
+    ]);
+    assert_eq!(send_and_read(&mut client, &create), "+OK\r\n");
+
+    // 3. FT.INFO should report backfilled num_docs=3, num_vectors=3, algorithm=HNSW, vector_index_sz_mb, and hash_indexing_failures
+    let info = send_and_read(&mut client, b"FT.INFO idx:bfitems\r\n");
+    assert!(info.contains("num_docs\r\n:3\r\n"), "FT.INFO: {}", info);
+    assert!(info.contains("num_vectors\r\n:3\r\n"), "FT.INFO: {}", info);
+    assert!(info.contains("HNSW"), "FT.INFO: {}", info);
+    assert!(info.contains("vector_index_sz_mb"), "FT.INFO: {}", info);
+    assert!(info.contains("hash_indexing_failures"), "FT.INFO: {}", info);
+
+    // 4. FT.SEARCH with @vec:[VECTOR_RANGE ...], DIALECT 2, and TIMEOUT 5000
+    let search = format_resp_cmd(&[
+        "FT.SEARCH",
+        "idx:bfitems",
+        "@vec:[VECTOR_RANGE 0.5 $q]=>{$YIELD_DISTANCE_AS: dist}",
+        "PARAMS",
+        "2",
+        "q",
+        "1.0, 0.0, 0.0",
+        "DIALECT",
+        "2",
+        "TIMEOUT",
+        "5000",
+    ]);
+    let s_resp = send_and_read(&mut client, &search);
+    assert!(
+        s_resp.starts_with("*5\r\n:2\r\n$8\r\nbfitem:1\r\n") && s_resp.contains("bfitem:2"),
+        "VECTOR_RANGE search: {}",
+        s_resp
+    );
+}

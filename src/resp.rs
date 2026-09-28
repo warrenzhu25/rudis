@@ -9223,6 +9223,21 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             i += 2;
                         }
                     }
+                } else if opt == "DIALECT" && i + 1 < args.len() {
+                    let d: u32 = String::from_utf8_lossy(&args[i + 1])
+                        .parse()
+                        .map_err(|_| "DIALECT requires a non-negative integer".to_string())?;
+                    if !(1..=4).contains(&d) {
+                        return Err(format!("Unsupported dialect version {}", d));
+                    }
+                    options.dialect = Some(d);
+                    i += 2;
+                } else if opt == "TIMEOUT" && i + 1 < args.len() {
+                    let ms: u64 = String::from_utf8_lossy(&args[i + 1])
+                        .parse()
+                        .map_err(|_| "TIMEOUT requires a non-negative integer".to_string())?;
+                    options.timeout_ms = Some(ms);
+                    i += 2;
                 } else {
                     i += 1;
                 }
@@ -9392,6 +9407,8 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     options
                         .stages
                         .push(crate::search::AggregateStage::Filter(expr));
+                } else if (opt == "DIALECT" || opt == "TIMEOUT") && i + 1 < args.len() {
+                    i += 2;
                 } else {
                     i += 1;
                 }
