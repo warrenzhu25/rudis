@@ -3921,6 +3921,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::LlmQuotaReserve { .. }
         | Command::LlmQuotaSettle { .. }
         | Command::LlmQuotaInfo(_) => "LLM",
+        Command::McpTools | Command::McpCall { .. } | Command::McpRpc(_) => "MCP",
         Command::CrdtSet { .. }
         | Command::CrdtGet(_)
         | Command::CrdtDel(_)
@@ -5306,6 +5307,145 @@ async fn execute_command(
         }
         Command::CommandDocs => {
             out.extend_from_slice(b"*0\r\n");
+            false
+        }
+        Command::McpTools => {
+            let tools = crate::mcp::builtin_mcp_tools();
+            write_resp_array_header(out, tools.len());
+            for t in tools {
+                write_resp_array_header(out, 6);
+                write_resp_bulk(out, b"name");
+                write_resp_bulk(out, t.name.as_bytes());
+                write_resp_bulk(out, b"description");
+                write_resp_bulk(out, t.description.as_bytes());
+                write_resp_bulk(out, b"inputSchema");
+                let schema_s = serde_json::to_string(&t.input_schema).unwrap_or_default();
+                write_resp_bulk(out, schema_s.as_bytes());
+            }
+            false
+        }
+        Command::McpCall { tool, args_json } => {
+            let args: serde_json::Value = match serde_json::from_slice(&args_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    write_resp_err(out, format!("invalid JSON arguments: {}", e));
+                    return false;
+                }
+            };
+            let planned = match crate::mcp::plan_tool_command(&tool, &args) {
+                Ok(cmd) => cmd,
+                Err(e) => {
+                    let err_obj =
+                        crate::mcp::format_mcp_call_result(serde_json::Value::String(e), true);
+                    let s = serde_json::to_string(&err_obj).unwrap_or_default();
+                    write_resp_bulk(out, s.as_bytes());
+                    return false;
+                }
+            };
+            let mut sub_out = Vec::new();
+            Box::pin(execute_command(
+                planned,
+                router,
+                client_id,
+                client_registry,
+                &mut sub_out,
+                asking,
+                authenticated,
+                auth_user,
+            ))
+            .await;
+            let (val, is_err) = crate::mcp::resp_bytes_to_json(&sub_out);
+            let call_res = crate::mcp::format_mcp_call_result(val, is_err);
+            let s = serde_json::to_string(&call_res).unwrap_or_default();
+            write_resp_bulk(out, s.as_bytes());
+            false
+        }
+        Command::McpRpc(req_bytes) => {
+            let req: serde_json::Value = match serde_json::from_slice(&req_bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    let err_rpc = serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": serde_json::Value::Null,
+                        "error": { "code": -32700, "message": format!("Parse error: {}", e) }
+                    });
+                    let s = serde_json::to_string(&err_rpc).unwrap_or_default();
+                    write_resp_bulk(out, s.as_bytes());
+                    return false;
+                }
+            };
+            let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+            let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+            let rpc_resp = match method {
+                "initialize" => serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": { "tools": { "listChanged": false } },
+                        "serverInfo": { "name": "rudis-mcp", "version": "0.1.0" }
+                    }
+                }),
+                "ping" => serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {}
+                }),
+                "tools/list" => serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": crate::mcp::tools_list_json()
+                }),
+                "tools/call" => {
+                    let params = req
+                        .get("params")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let tool_args = params
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    match crate::mcp::plan_tool_command(tool_name, &tool_args) {
+                        Ok(planned) => {
+                            let mut sub_out = Vec::new();
+                            Box::pin(execute_command(
+                                planned,
+                                router,
+                                client_id,
+                                client_registry,
+                                &mut sub_out,
+                                asking,
+                                authenticated,
+                                auth_user,
+                            ))
+                            .await;
+                            let (val, is_err) = crate::mcp::resp_bytes_to_json(&sub_out);
+                            let call_res = crate::mcp::format_mcp_call_result(val, is_err);
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": call_res
+                            })
+                        }
+                        Err(e) => serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": crate::mcp::format_mcp_call_result(
+                                serde_json::Value::String(e),
+                                true
+                            )
+                        }),
+                    }
+                }
+                _ => serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32601, "message": format!("Method not found: {}", method) }
+                }),
+            };
+            let s = serde_json::to_string(&rpc_resp).unwrap_or_default();
+            write_resp_bulk(out, s.as_bytes());
             false
         }
         Command::Info(section) => {

@@ -165,14 +165,14 @@ fn start_test_server_with_tls(port: u16, tls_port: u16, num_shards: usize) -> (V
 
 fn send_and_read(stream: &mut TcpStream, cmd: &[u8]) -> String {
     stream.write_all(cmd).unwrap();
-    let mut buf = [0u8; 1024];
+    let mut buf = [0u8; 16384];
     let n = stream.read(&mut buf).unwrap();
     String::from_utf8_lossy(&buf[..n]).to_string()
 }
 
 fn send_and_read_bytes(stream: &mut TcpStream, cmd: &[u8]) -> Vec<u8> {
     stream.write_all(cmd).unwrap();
-    let mut buf = [0u8; 1024];
+    let mut buf = [0u8; 16384];
     let n = stream.read(&mut buf).unwrap();
     buf[..n].to_vec()
 }
@@ -13435,5 +13435,83 @@ fn test_agent_checkpoint_dag_and_tool_idempotency_e2e() {
             && claim3_resp.contains(r#"{"tx_id":"tx_999"}"#),
         "third claim should return COMPLETED with cached output: {}",
         claim3_resp
+    );
+}
+
+#[test]
+fn test_mcp_protocol_tools_call_and_rpc_e2e() {
+    let port = 19156;
+    start_test_server(port, 2);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // 1. MCP.TOOLS returns built-in MCP tool definitions
+    let tools_cmd = format_resp_cmd(&["MCP.TOOLS"]);
+    let tools_resp = send_and_read(&mut client, &tools_cmd);
+    assert!(
+        tools_resp.contains("rudis_kv_set")
+            && tools_resp.contains("rudis_semantic_get")
+            && tools_resp.contains("rudis_agent_memory_context"),
+        "MCP.TOOLS should list built-in tools: {}",
+        tools_resp
+    );
+
+    // 2. MCP.CALL rudis_kv_set and rudis_kv_get
+    let call_set = format_resp_cmd(&[
+        "MCP.CALL",
+        "rudis_kv_set",
+        r#"{"key":"mcp:k1","value":"mcp_hello"}"#,
+    ]);
+    let set_resp = send_and_read(&mut client, &call_set);
+    assert!(
+        set_resp.contains(r#""isError":false"#) && set_resp.contains("OK"),
+        "MCP.CALL rudis_kv_set: {}",
+        set_resp
+    );
+
+    let call_get = format_resp_cmd(&["MCP.CALL", "rudis_kv_get", r#"{"key":"mcp:k1"}"#]);
+    let get_resp = send_and_read(&mut client, &call_get);
+    assert!(
+        get_resp.contains(r#""isError":false"#) && get_resp.contains("mcp_hello"),
+        "MCP.CALL rudis_kv_get: {}",
+        get_resp
+    );
+
+    // 3. MCP.RPC initialize & tools/call (rudis_agent_memory_add + rudis_agent_memory_context)
+    let init_rpc = format_resp_cmd(&[
+        "MCP.RPC",
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+    ]);
+    let init_resp = send_and_read(&mut client, &init_rpc);
+    assert!(
+        init_resp.contains("rudis-mcp") && init_resp.contains("2024-11-05"),
+        "MCP.RPC initialize: {}",
+        init_resp
+    );
+
+    let mem_add_rpc = format_resp_cmd(&[
+        "MCP.RPC",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"rudis_agent_memory_add","arguments":{"session":"mcp_sess","role":"user","content":"remember secret code 7788","vector":[1.0,0.0,0.0]}}}"#,
+    ]);
+    let mem_add_resp = send_and_read(&mut client, &mem_add_rpc);
+    assert!(
+        mem_add_resp.contains(r#""isError":false"#),
+        "MCP.RPC tools/call rudis_agent_memory_add: {}",
+        mem_add_resp
+    );
+
+    let mem_ctx_rpc = format_resp_cmd(&[
+        "MCP.RPC",
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"rudis_agent_memory_context","arguments":{"session":"mcp_sess","max_tokens":500,"query_vector":[1.0,0.0,0.0],"recall_k":2}}}"#,
+    ]);
+    let mem_ctx_resp = send_and_read(&mut client, &mem_ctx_rpc);
+    assert!(
+        mem_ctx_resp.contains("remember secret code 7788")
+            && mem_ctx_resp.contains(r#""isError":false"#),
+        "MCP.RPC tools/call rudis_agent_memory_context: {}",
+        mem_ctx_resp
     );
 }

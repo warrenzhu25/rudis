@@ -1159,6 +1159,13 @@ pub enum Command {
         output: Bytes,
         ttl_ms: Option<u64>,
     },
+    // MODEL CONTEXT PROTOCOL (MCP) COMMANDS
+    McpTools,
+    McpCall {
+        tool: String,
+        args_json: Bytes,
+    },
+    McpRpc(Bytes),
     // CRDT MULTI-REGION COMMANDS
     CrdtSet {
         key: Bytes,
@@ -10712,6 +10719,25 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 output,
                 ttl_ms,
             }))
+        }
+        "MCP.TOOLS" => Ok(Some(Command::McpTools)),
+        "MCP.CALL" => {
+            if args.len() < 2 || args.len() > 3 {
+                return Err("wrong number of arguments for 'mcp.call' command".to_string());
+            }
+            let tool = String::from_utf8_lossy(&args[1]).to_string();
+            let args_json = if args.len() == 3 {
+                args[2].clone()
+            } else {
+                Bytes::from_static(b"{}")
+            };
+            Ok(Some(Command::McpCall { tool, args_json }))
+        }
+        "MCP.RPC" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'mcp.rpc' command".to_string());
+            }
+            Ok(Some(Command::McpRpc(args[1].clone())))
         }
         "XDP.INFO" => Ok(Some(Command::XdpInfo)),
         "XDP.RULE" => {
