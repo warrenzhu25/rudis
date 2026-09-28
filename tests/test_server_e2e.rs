@@ -12381,3 +12381,180 @@ fn test_cluster_multi_exec_crossslot_e2e() {
         "$-1\r\n"
     );
 }
+
+#[test]
+fn test_ft_search_hnsw_hybrid_rrf_multishard_e2e() {
+    let port = 19140;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    let format_resp_cmd = |args: &[&str]| -> Vec<u8> {
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for arg in args {
+            out.extend_from_slice(format!("${}\r\n{}\r\n", arg.len(), arg).as_bytes());
+        }
+        out
+    };
+
+    // 1. Create FT index with HNSW vector field + TEXT + TAG across 4 shards
+    let create_cmd = format_resp_cmd(&[
+        "FT.CREATE",
+        "idx:ai_docs",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "aidoc:",
+        "SCHEMA",
+        "content",
+        "TEXT",
+        "category",
+        "TAG",
+        "embedding",
+        "VECTOR",
+        "HNSW",
+        "6",
+        "TYPE",
+        "FLOAT32",
+        "DIM",
+        "3",
+        "DISTANCE_METRIC",
+        "COSINE",
+    ]);
+    assert_eq!(send_and_read(&mut client, &create_cmd), "+OK\r\n");
+
+    // 2. Insert 4 documents across shards:
+    // aidoc:1 -> strong BM25 ("rust" x2) AND strong vector similarity to [1, 0, 0] -> wins RRF!
+    // aidoc:2 -> no "rust" keyword, exact vector [1, 0, 0] -> #1 in pure KNN, lower in RRF
+    // aidoc:3 -> has "rust" keyword, orthogonal vector [0, 1, 0]
+    // aidoc:4 -> category "archive", vector [0.9, 0.4, 0.0]
+    let docs = [
+        (
+            "aidoc:1",
+            "rust vector database in rust for rag",
+            "tech",
+            "0.96, 0.28, 0.0",
+        ),
+        (
+            "aidoc:2",
+            "semantic memory store for agents",
+            "tech",
+            "1.0, 0.0, 0.0",
+        ),
+        (
+            "aidoc:3",
+            "rust compiler internals guide",
+            "tech",
+            "0.0, 1.0, 0.0",
+        ),
+        (
+            "aidoc:4",
+            "legacy archive document",
+            "archive",
+            "0.9, 0.4, 0.0",
+        ),
+    ];
+
+    for (key, content, category, emb) in docs {
+        let hset_cmd = format_resp_cmd(&[
+            "HSET",
+            key,
+            "content",
+            content,
+            "category",
+            category,
+            "embedding",
+            emb,
+        ]);
+        assert_eq!(send_and_read(&mut client, &hset_cmd), ":3\r\n");
+    }
+
+    let q_bytes: Vec<u8> = vec![1.0f32, 0.0f32, 0.0f32]
+        .into_iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+
+    // 3. Pure HNSW KNN search across shards: *=>[KNN 2 @embedding $vec]
+    let mut knn_cmd = Vec::new();
+    let knn_args: &[&[u8]] = &[
+        b"FT.SEARCH",
+        b"idx:ai_docs",
+        b"*=>[KNN 2 @embedding $vec]",
+        b"PARAMS",
+        b"2",
+        b"vec",
+        &q_bytes,
+        b"NOCONTENT",
+    ];
+    knn_cmd.extend_from_slice(format!("*{}\r\n", knn_args.len()).as_bytes());
+    for arg in knn_args {
+        knn_cmd.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+        knn_cmd.extend_from_slice(arg);
+        knn_cmd.extend_from_slice(b"\r\n");
+    }
+    let knn_resp = send_and_read(&mut client, &knn_cmd);
+    assert!(
+        knn_resp.starts_with("*3\r\n:2\r\n$7\r\naidoc:2\r\n$7\r\naidoc:1\r\n"),
+        "Unexpected pure KNN response: {}",
+        knn_resp
+    );
+
+    // 4. Pre-filtered HNSW KNN search: @category:{archive}=>[KNN 1 @embedding $vec]
+    let mut filt_cmd = Vec::new();
+    let filt_args: &[&[u8]] = &[
+        b"FT.SEARCH",
+        b"idx:ai_docs",
+        b"@category:{archive}=>[KNN 1 @embedding $vec]",
+        b"PARAMS",
+        b"2",
+        b"vec",
+        &q_bytes,
+        b"NOCONTENT",
+    ];
+    filt_cmd.extend_from_slice(format!("*{}\r\n", filt_args.len()).as_bytes());
+    for arg in filt_args {
+        filt_cmd.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+        filt_cmd.extend_from_slice(arg);
+        filt_cmd.extend_from_slice(b"\r\n");
+    }
+    let filt_resp = send_and_read(&mut client, &filt_cmd);
+    assert_eq!(filt_resp, "*2\r\n:1\r\n$7\r\naidoc:4\r\n");
+
+    // 5. Hybrid BM25 + HNSW Reciprocal Rank Fusion (RRF):
+    // Query: rust=>[KNN 2 @embedding $vec] RRF 60 WITHSCORES NOCONTENT
+    // BM25("rust") matches aidoc:1 and aidoc:3.
+    // KNN(2) matches aidoc:2 and aidoc:1.
+    // aidoc:1 appears in BOTH rankings (BM25 + KNN), so RRF ranks aidoc:1 #1!
+    let mut rrf_cmd = Vec::new();
+    let rrf_args: &[&[u8]] = &[
+        b"FT.SEARCH",
+        b"idx:ai_docs",
+        b"rust=>[KNN 2 @embedding $vec]",
+        b"PARAMS",
+        b"2",
+        b"vec",
+        &q_bytes,
+        b"RRF",
+        b"60",
+        b"WITHSCORES",
+        b"NOCONTENT",
+    ];
+    rrf_cmd.extend_from_slice(format!("*{}\r\n", rrf_args.len()).as_bytes());
+    for arg in rrf_args {
+        rrf_cmd.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+        rrf_cmd.extend_from_slice(arg);
+        rrf_cmd.extend_from_slice(b"\r\n");
+    }
+    let rrf_resp = send_and_read(&mut client, &rrf_cmd);
+    assert!(
+        rrf_resp.starts_with("*7\r\n:3\r\n$7\r\naidoc:1\r\n"),
+        "Expected aidoc:1 to rank #1 in RRF hybrid search, got: {}",
+        rrf_resp
+    );
+
+    // Cleanup
+    let drop_cmd = format_resp_cmd(&["FT.DROPINDEX", "idx:ai_docs"]);
+    assert_eq!(send_and_read(&mut client, &drop_cmd), "+OK\r\n");
+}

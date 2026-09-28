@@ -204,7 +204,8 @@ pub fn decode_typed_blob(bytes: &[u8], data_type: VectorDataType) -> Option<Vec<
 fn parse_vector_text(bytes: &[u8]) -> Option<Vec<f32>> {
     if bytes.is_empty()
         || !bytes.iter().all(|b| {
-            b.is_ascii_digit() || matches!(b, b'.' | b',' | b'-' | b'+' | b'e' | b'E' | b'[' | b']')
+            b.is_ascii_digit()
+                || matches!(b, b'.' | b',' | b'-' | b'+' | b'e' | b'E' | b'[' | b']')
                 || b.is_ascii_whitespace()
         })
     {
@@ -896,7 +897,10 @@ impl InvertedIndex {
 
         for (field_name, vec) in &vector_fields {
             if !self.vector_indices.contains_key(field_name)
-                && let Some(sf) = schema.schema_fields.iter().find(|sf| &sf.alias == field_name)
+                && let Some(sf) = schema
+                    .schema_fields
+                    .iter()
+                    .find(|sf| &sf.alias == field_name)
                 && let Some(vi) = build_vector_index(&schema.name, &sf.field_type, vec.len())
             {
                 self.vector_indices.insert(field_name.clone(), vi);
@@ -1289,6 +1293,19 @@ impl QueryAst {
             _ => None,
         }
     }
+
+    /// If this query is a hybrid `(text_or_filter)=>[KNN ...]` AST where the base query is
+    /// not `MatchAll`, returns `(base_ast, knn_ast)` for Reciprocal Rank Fusion (RRF).
+    pub fn as_hybrid_rrf(&self) -> Option<(QueryAst, QueryAst)> {
+        if let QueryAst::And(subs) = self
+            && subs.len() == 2
+            && !matches!(subs[0], QueryAst::MatchAll)
+            && matches!(subs[1], QueryAst::KnnVector { .. })
+        {
+            return Some((subs[0].clone(), subs[1].clone()));
+        }
+        None
+    }
 }
 
 /// Resolves a literal or `$param` value as `usize`.
@@ -1539,6 +1556,8 @@ pub struct SearchOptions {
     pub offset: usize,
     pub limit: usize,
     pub nocontent: bool,
+    pub withscores: bool,
+    pub rrf_k: Option<f64>,
     pub sortby: Option<(String, bool)>, // (field, ascending)
     pub return_fields: Option<Vec<String>>,
     pub params: HashMap<String, Vec<u8>>,
@@ -1550,6 +1569,8 @@ impl Default for SearchOptions {
             offset: 0,
             limit: 10,
             nocontent: false,
+            withscores: false,
+            rrf_k: None,
             sortby: None,
             return_fields: None,
             params: HashMap::new(),
@@ -1789,8 +1810,12 @@ fn knn_search(
         let mut dists: Vec<(DocId, f32)> = ids
             .filter_map(|id| {
                 let v = index.id_to_meta.get(&id)?.vector_fields.get(alias)?;
-                (v.len() == effective_vec.len())
-                    .then(|| (id, crate::vector::compute_distance(&effective_vec, v, metric)))
+                (v.len() == effective_vec.len()).then(|| {
+                    (
+                        id,
+                        crate::vector::compute_distance(&effective_vec, v, metric),
+                    )
+                })
             })
             .collect();
         dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -1907,10 +1932,7 @@ fn knn_distances(
             && let Some(v) = doc.vector_fields.get(alias)
             && v.len() == query.len()
         {
-            out.insert(
-                *doc_id,
-                crate::vector::compute_distance(&query, v, metric),
-            );
+            out.insert(*doc_id, crate::vector::compute_distance(&query, v, metric));
         }
     }
     Some(out)
@@ -1927,6 +1949,27 @@ pub fn execute_search(
     ast: &QueryAst,
     opts: &SearchOptions,
 ) -> (usize, Vec<SearchHit>) {
+    if let Some(rrf_k) = opts.rrf_k
+        && let Some((bm25_ast, knn_ast)) = ast.as_hybrid_rrf()
+    {
+        let unpaged_opts = SearchOptions {
+            offset: 0,
+            limit: usize::MAX,
+            rrf_k: None,
+            ..opts.clone()
+        };
+        let (_bm25_total, bm25_hits) = execute_search(index, &bm25_ast, &unpaged_opts);
+        let (_knn_total, vector_hits) = execute_search(index, &knn_ast, &unpaged_opts);
+        let fused = reciprocal_rank_fusion(&bm25_hits, &vector_hits, rrf_k);
+        let total = fused.len();
+        let paged = fused
+            .into_iter()
+            .skip(opts.offset)
+            .take(opts.limit)
+            .collect();
+        return (total, paged);
+    }
+
     let candidate_scores = evaluate_ast(index, ast, opts);
     let total_matches = candidate_scores.len();
 
@@ -2787,7 +2830,10 @@ mod tests {
 
     #[test]
     fn test_typed_vector_decoding() {
-        let f64_blob: Vec<u8> = [1.5f64, -2.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+        let f64_blob: Vec<u8> = [1.5f64, -2.0]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
         assert_eq!(
             decode_vector(&f64_blob, VectorDataType::Float64, 2),
             Some(vec![1.5, -2.0])
@@ -2827,7 +2873,12 @@ mod tests {
 
     #[test]
     fn test_flat_index_binary_hash_ingest_and_dim_validation() {
-        let mut idx = InvertedIndex::new(vector_schema("flat_idx", "FLAT", 3, VectorDataType::Float32));
+        let mut idx = InvertedIndex::new(vector_schema(
+            "flat_idx",
+            "FLAT",
+            3,
+            VectorDataType::Float32,
+        ));
         assert!(matches!(
             idx.vector_indices.get("v"),
             Some(crate::vector::VectorFieldIndex::Flat(_))
@@ -2845,15 +2896,25 @@ mod tests {
             ],
         );
         assert_eq!(idx.vector_indices["v"].len(), 1);
-        let got = idx.vector_indices["v"].get_vector(&Bytes::from_static(b"a")).unwrap();
+        let got = idx.vector_indices["v"]
+            .get_vector(&Bytes::from_static(b"a"))
+            .unwrap();
         assert_eq!(got[1].to_bits(), 0x3f80_00ff);
 
         // Dimension mismatch -> document rejected and counted as failure.
-        idx.add_hash_document("b", &[(Bytes::from_static(b"v"), Bytes::from_static(b"1,2"))]);
+        idx.add_hash_document(
+            "b",
+            &[(Bytes::from_static(b"v"), Bytes::from_static(b"1,2"))],
+        );
         assert_eq!(idx.indexing_failures, 1);
         assert!(idx.doc_id_of(b"b").is_none());
 
-        let hnsw = InvertedIndex::new(vector_schema("hnsw_idx", "HNSW", 3, VectorDataType::Float32));
+        let hnsw = InvertedIndex::new(vector_schema(
+            "hnsw_idx",
+            "HNSW",
+            3,
+            VectorDataType::Float32,
+        ));
         assert!(matches!(
             hnsw.vector_indices.get("v"),
             Some(crate::vector::VectorFieldIndex::Hnsw(_))
@@ -2862,11 +2923,15 @@ mod tests {
 
     #[test]
     fn test_knn_clause_params_alias_and_distance_sort() {
-        let mut idx = InvertedIndex::new(vector_schema("knn_idx", "HNSW", 2, VectorDataType::Float32));
+        let mut idx =
+            InvertedIndex::new(vector_schema("knn_idx", "HNSW", 2, VectorDataType::Float32));
         for (k, v) in [("a", "0,0"), ("b", "3,4"), ("c", "1,0"), ("d", "10,10")] {
             idx.add_hash_document(
                 k,
-                &[(Bytes::from_static(b"v"), Bytes::copy_from_slice(v.as_bytes()))],
+                &[(
+                    Bytes::from_static(b"v"),
+                    Bytes::copy_from_slice(v.as_bytes()),
+                )],
             );
         }
         let ast = parse_query("*=>[KNN $K @v $blob EF_RUNTIME $EF AS dist]");
@@ -2909,7 +2974,9 @@ mod tests {
 
         // Default distance field name and legacy YIELD_DISTANCE_AS attribute block.
         assert_eq!(
-            parse_query("*=>[KNN 2 @v $blob]").knn_score_field().as_deref(),
+            parse_query("*=>[KNN 2 @v $blob]")
+                .knn_score_field()
+                .as_deref(),
             Some("__v_score")
         );
         assert_eq!(
@@ -2923,7 +2990,8 @@ mod tests {
     #[test]
     fn test_hybrid_knn_prefilter_returns_k_results() {
         for algo in ["HNSW", "FLAT"] {
-            let mut idx = InvertedIndex::new(vector_schema("hyb", algo, 2, VectorDataType::Float32));
+            let mut idx =
+                InvertedIndex::new(vector_schema("hyb", algo, 2, VectorDataType::Float32));
             // 300 "common" docs clustered near the origin, 40 "rare" docs far away.
             for i in 0..300 {
                 let v = format!("{},{}", i as f32 * 0.01, (i % 13) as f32 * 0.01);
@@ -3375,5 +3443,89 @@ mod tests {
         assert_eq!(get_row_field(row1, "min_price"), Some("40"));
         assert_eq!(get_row_field(row1, "max_price"), Some("50"));
         assert_eq!(get_row_field(row1, "taxed"), Some("99"));
+    }
+
+    #[test]
+    fn test_ft_search_rrf_hybrid_fusion() {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "title".to_string(),
+            FieldType::Text {
+                weight: 1.0,
+                sortable: false,
+                nostem: false,
+            },
+        );
+        fields.insert(
+            "embedding".to_string(),
+            FieldType::Vector {
+                dim: 3,
+                distance_metric: "COSINE".to_string(),
+                algorithm: "HNSW".to_string(),
+                attrs: VectorFieldAttrs::default(),
+            },
+        );
+        let schema_fields = vec![
+            SchemaField {
+                identifier: "title".to_string(),
+                alias: "title".to_string(),
+                field_type: fields["title"].clone(),
+            },
+            SchemaField {
+                identifier: "embedding".to_string(),
+                alias: "embedding".to_string(),
+                field_type: fields["embedding"].clone(),
+            },
+        ];
+        let schema = IndexSchema {
+            name: "idx:rag_rrf".to_string(),
+            on_type: "HASH".to_string(),
+            prefixes: vec!["chunk:".to_string()],
+            fields,
+            schema_fields,
+        };
+        let mut idx = InvertedIndex::new(schema);
+
+        // chunk:1: appears in BOTH BM25 ("rust") and KNN top-2 -> wins RRF!
+        let mut c1 = HashMap::new();
+        c1.insert(
+            "title".to_string(),
+            "rust engine for rust ai rag".to_string(),
+        );
+        c1.insert("embedding".to_string(), "0.96, 0.28, 0.0".to_string());
+        idx.add_document("chunk:1", c1, None);
+
+        // chunk:2: #1 in KNN (exact [1,0,0]), but does NOT contain "rust"
+        let mut c2 = HashMap::new();
+        c2.insert("title".to_string(), "semantic vector store".to_string());
+        c2.insert("embedding".to_string(), "1.0, 0.0, 0.0".to_string());
+        idx.add_document("chunk:2", c2, None);
+
+        // chunk:3: contains "rust", but orthogonal vector [0,1,0] (not in KNN top-2)
+        let mut c3 = HashMap::new();
+        c3.insert("title".to_string(), "rust compiler internals".to_string());
+        c3.insert("embedding".to_string(), "0.0, 1.0, 0.0".to_string());
+        idx.add_document("chunk:3", c3, None);
+
+        let mut params = HashMap::new();
+        let q_bytes: Vec<u8> = vec![1.0f32, 0.0f32, 0.0f32]
+            .into_iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        params.insert("vec".to_string(), q_bytes);
+
+        let ast_rrf = parse_query("rust=>[KNN 2 @embedding $vec]");
+        let opts_rrf = SearchOptions {
+            limit: 10,
+            params,
+            rrf_k: Some(60.0),
+            withscores: true,
+            ..Default::default()
+        };
+        let (total_rrf, hits_rrf) = execute_search(&idx, &ast_rrf, &opts_rrf);
+        assert_eq!(total_rrf, 3);
+        assert_eq!(hits_rrf[0].doc_id, "chunk:1");
+        let expected_top_rrf = (1.0 / 61.0) + (1.0 / 62.0);
+        assert!((hits_rrf[0].score - expected_top_rrf).abs() < 1e-6);
     }
 }

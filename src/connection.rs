@@ -9891,20 +9891,27 @@ async fn execute_command(
                 let (total, hits) = router.ft_search(&index, &ast, &options).await;
 
                 if options.nocontent {
+                    let per_hit = if options.withscores { 2 } else { 1 };
                     out.extend_from_slice(
-                        format!("*{}\r\n:{}\r\n", 1 + hits.len(), total).as_bytes(),
+                        format!("*{}\r\n:{}\r\n", 1 + hits.len() * per_hit, total).as_bytes(),
                     );
                     for hit in hits {
                         write_resp_bulk(out, hit.doc_id.as_bytes());
+                        if options.withscores {
+                            let s = format!("{:.6}", hit.score);
+                            write_resp_bulk(out, s.as_bytes());
+                        }
                     }
                 } else {
-                    let mut num_elems = 1;
-                    for _ in &hits {
-                        num_elems += 2;
-                    }
+                    let per_hit = if options.withscores { 3 } else { 2 };
+                    let num_elems = 1 + hits.len() * per_hit;
                     out.extend_from_slice(format!("*{}\r\n:{}\r\n", num_elems, total).as_bytes());
                     for hit in hits {
                         write_resp_bulk(out, hit.doc_id.as_bytes());
+                        if options.withscores {
+                            let s = format!("{:.6}", hit.score);
+                            write_resp_bulk(out, s.as_bytes());
+                        }
                         out.extend_from_slice(format!("*{}\r\n", hit.fields.len() * 2).as_bytes());
                         for (k, v) in hit.fields {
                             write_resp_bulk(out, k.as_bytes());

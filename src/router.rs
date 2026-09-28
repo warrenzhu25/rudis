@@ -2462,6 +2462,34 @@ impl Router {
         ast: &crate::search::QueryAst,
         opts: &crate::search::SearchOptions,
     ) -> (usize, Vec<crate::search::SearchHit>) {
+        if let Some(rrf_k) = opts.rrf_k
+            && let Some((bm25_ast, knn_ast)) = ast.as_hybrid_rrf()
+        {
+            let knn_limit = knn_ast.knn_k(opts).unwrap_or(10);
+            let sub_opts = crate::search::SearchOptions {
+                offset: 0,
+                limit: opts
+                    .offset
+                    .saturating_add(opts.limit)
+                    .max(knn_limit)
+                    .max(100),
+                rrf_k: None,
+                ..opts.clone()
+            };
+            let (_bm25_total, bm25_hits) =
+                Box::pin(self.ft_search(index, &bm25_ast, &sub_opts)).await;
+            let (_knn_total, vector_hits) =
+                Box::pin(self.ft_search(index, &knn_ast, &sub_opts)).await;
+            let fused = crate::search::reciprocal_rank_fusion(&bm25_hits, &vector_hits, rrf_k);
+            let total = fused.len();
+            let paged = fused
+                .into_iter()
+                .skip(opts.offset)
+                .take(opts.limit)
+                .collect();
+            return (total, paged);
+        }
+
         let scatter_opts = crate::search::SearchOptions {
             offset: 0,
             limit: opts.offset.saturating_add(opts.limit),

@@ -8503,7 +8503,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     }
                     "VECTOR" => {
                         if i >= args.len() {
-                            return Err("Bad arguments for vector field: missing algorithm".to_string());
+                            return Err(
+                                "Bad arguments for vector field: missing algorithm".to_string()
+                            );
                         }
                         let algorithm = String::from_utf8_lossy(&args[i]).to_uppercase();
                         if algorithm != "HNSW" && algorithm != "FLAT" {
@@ -8538,13 +8540,15 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         let mut data_type: Option<crate::search::VectorDataType> = None;
                         let mut attrs = crate::search::VectorFieldAttrs::default();
                         let bad = |attr: &str| {
-                            format!("Bad arguments for vector similarity {} argument {}", algorithm, attr)
+                            format!(
+                                "Bad arguments for vector similarity {} argument {}",
+                                algorithm, attr
+                            )
                         };
                         while i + 1 < args.len() && (nargs.is_none() || i < end) {
                             let attr = String::from_utf8_lossy(&args[i]).to_uppercase();
                             let val = String::from_utf8_lossy(&args[i + 1]).to_string();
-                            let parse_usize =
-                                |v: &str| v.parse::<usize>().map_err(|_| bad(&attr));
+                            let parse_usize = |v: &str| v.parse::<usize>().map_err(|_| bad(&attr));
                             match attr.as_str() {
                                 "TYPE" => {
                                     data_type = Some(
@@ -8655,6 +8659,27 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 if opt == "NOCONTENT" {
                     options.nocontent = true;
                     i += 1;
+                } else if opt == "WITHSCORES" {
+                    options.withscores = true;
+                    i += 1;
+                } else if opt == "RRF" {
+                    let mut k_val = 60.0;
+                    if i + 1 < args.len()
+                        && let Ok(parsed_k) = String::from_utf8_lossy(&args[i + 1]).parse::<f64>()
+                        && parsed_k > 0.0
+                    {
+                        k_val = parsed_k;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    options.rrf_k = Some(k_val);
+                } else if opt == "SCORER" && i + 1 < args.len() {
+                    let scorer = String::from_utf8_lossy(&args[i + 1]).to_uppercase();
+                    if scorer == "RRF" {
+                        options.rrf_k = Some(60.0);
+                    }
+                    i += 2;
                 } else if opt == "LIMIT" && i + 2 < args.len() {
                     options.offset = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(0);
                     options.limit = String::from_utf8_lossy(&args[i + 2]).parse().unwrap_or(10);
