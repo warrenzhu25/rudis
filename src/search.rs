@@ -1666,6 +1666,34 @@ fn evaluate_ast(
             if sub_asts.is_empty() {
                 return HashMap::new();
             }
+            // Hybrid query: evaluate the non-vector filter first and restrict the KNN search to
+            // it (pre-filtering), so selective filters still return K results.
+            if let Some(knn_pos) = sub_asts
+                .iter()
+                .position(|s| matches!(s, QueryAst::KnnVector { .. }))
+            {
+                let others: Vec<&QueryAst> = sub_asts
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, s)| *i != knn_pos && !matches!(s, QueryAst::MatchAll))
+                    .map(|(_, s)| s)
+                    .collect();
+                if others.is_empty() {
+                    return knn_search(index, &sub_asts[knn_pos], opts, None);
+                }
+                let mut filter = evaluate_ast(index, others[0], opts);
+                for sub in &others[1..] {
+                    if filter.is_empty() {
+                        break;
+                    }
+                    let sub_map = evaluate_ast(index, sub, opts);
+                    filter.retain(|id, _| sub_map.contains_key(id));
+                }
+                if filter.is_empty() {
+                    return HashMap::new();
+                }
+                return knn_search(index, &sub_asts[knn_pos], opts, Some(&filter));
+            }
             let mut current = evaluate_ast(index, &sub_asts[0], opts);
             for sub in &sub_asts[1..] {
                 if current.is_empty() {
@@ -1703,60 +1731,111 @@ fn evaluate_ast(
             }
             map
         }
-        QueryAst::KnnVector {
-            field,
-            query_vec,
-            param_name,
-            ef_runtime,
-            ..
-        } => {
-            let effective_vec = knn_query_vector(index, field, query_vec, param_name, opts);
-            let k = &ast.knn_k(opts).unwrap_or(10);
-            let ef = ef_runtime
-                .as_deref()
-                .and_then(|e| resolve_usize_param(e, opts));
+        QueryAst::KnnVector { .. } => knn_search(index, ast, opts, None),
+    }
+}
 
-            let mut map = HashMap::new();
-            if !effective_vec.is_empty() {
-                let vi_opt = index
-                    .resolve_vector_field(field)
-                    .and_then(|sf| index.vector_indices.get(&sf.alias));
-                if let Some(vi) = vi_opt {
-                    let results = vi.search(&effective_vec, *k, ef);
-                    for (doc_key, dist) in results {
-                        if let Some(doc_id) = index.key_to_id.get(&doc_key) {
-                            let sim = match vi.metric() {
-                                crate::vector::VectorMetric::Cosine => (1.0 - dist).max(0.0) as f64,
-                                _ => (1.0 / (1.0 + dist)) as f64,
-                            };
-                            map.insert(*doc_id, sim);
-                        }
-                    }
+/// Fraction of the index below which a filtered KNN query switches from filtered HNSW
+/// traversal to exact brute force over the filtered set (RediSearch "ADHOC_BF" heuristic).
+const KNN_ADHOC_BF_RATIO: f64 = 0.1;
+
+fn distance_to_similarity(metric: crate::vector::VectorMetric, dist: f32) -> f64 {
+    match metric {
+        crate::vector::VectorMetric::Cosine => (1.0 - dist).max(0.0) as f64,
+        _ => (1.0 / (1.0 + dist.max(0.0))) as f64,
+    }
+}
+
+/// Executes a KNN clause, optionally restricted to the documents of `filter`.
+fn knn_search(
+    index: &InvertedIndex,
+    knn: &QueryAst,
+    opts: &SearchOptions,
+    filter: Option<&HashMap<DocId, f64>>,
+) -> HashMap<DocId, f64> {
+    let QueryAst::KnnVector {
+        field,
+        query_vec,
+        param_name,
+        ef_runtime,
+        ..
+    } = knn
+    else {
+        return HashMap::new();
+    };
+    let effective_vec = knn_query_vector(index, field, query_vec, param_name, opts);
+    let k = knn.knn_k(opts).unwrap_or(10);
+    let ef = ef_runtime
+        .as_deref()
+        .and_then(|e| resolve_usize_param(e, opts));
+    let mut map = HashMap::new();
+    if effective_vec.is_empty() || k == 0 {
+        return map;
+    }
+    let sf = index.resolve_vector_field(field);
+    let alias = sf.map(|s| s.alias.as_str()).unwrap_or(field.as_str());
+    let vi_opt = index.vector_indices.get(alias);
+    let metric = vi_opt
+        .map(|vi| vi.metric())
+        .or_else(|| match sf.map(|s| &s.field_type) {
+            Some(FieldType::Vector {
+                distance_metric, ..
+            }) => Some(metric_from_str(distance_metric)),
+            _ => None,
+        })
+        .unwrap_or(crate::vector::VectorMetric::Cosine);
+
+    let brute_force = |ids: &mut dyn Iterator<Item = DocId>| -> Vec<(DocId, f32)> {
+        let mut dists: Vec<(DocId, f32)> = ids
+            .filter_map(|id| {
+                let v = index.id_to_meta.get(&id)?.vector_fields.get(alias)?;
+                (v.len() == effective_vec.len())
+                    .then(|| (id, crate::vector::compute_distance(&effective_vec, v, metric)))
+            })
+            .collect();
+        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        dists.truncate(k);
+        dists
+    };
+
+    let results: Vec<(DocId, f32)> = match (vi_opt, filter) {
+        (None, None) => brute_force(&mut index.id_to_meta.keys().copied()),
+        (None, Some(f)) => brute_force(&mut f.keys().copied()),
+        (Some(vi), None) => vi
+            .search(&effective_vec, k, ef)
+            .into_iter()
+            .filter_map(|(key, d)| index.key_to_id.get(&key).map(|id| (*id, d)))
+            .collect(),
+        (Some(vi), Some(f)) => {
+            let small = (f.len() as f64) <= (vi.len() as f64 * KNN_ADHOC_BF_RATIO).max(k as f64);
+            if small || matches!(vi, crate::vector::VectorFieldIndex::Flat(_)) {
+                brute_force(&mut f.keys().copied())
+            } else {
+                let pred = |key: &Bytes| {
+                    index
+                        .key_to_id
+                        .get(key)
+                        .is_some_and(|id| f.contains_key(id))
+                };
+                let found: Vec<(DocId, f32)> = vi
+                    .search_filtered(&effective_vec, k, ef, Some(&pred))
+                    .into_iter()
+                    .filter_map(|(key, d)| index.key_to_id.get(&key).map(|id| (*id, d)))
+                    .collect();
+                if found.len() < k.min(f.len()) {
+                    // The filtered traversal could not reach enough matching nodes (e.g. the
+                    // filtered set lives in a poorly connected region): fall back to exact BF.
+                    brute_force(&mut f.keys().copied())
                 } else {
-                    let mut vector_dists = Vec::new();
-                    for (&doc_id, doc) in &index.id_to_meta {
-                        let vec_opt = doc.vector_fields.get(field).or_else(|| {
-                            field
-                                .strip_prefix("$.")
-                                .and_then(|f| doc.vector_fields.get(f))
-                        });
-                        if let Some(doc_vec) = vec_opt
-                            && effective_vec.len() == doc_vec.len()
-                        {
-                            let sim = cosine_similarity(&effective_vec, doc_vec);
-                            vector_dists.push((doc_id, sim));
-                        }
-                    }
-                    vector_dists
-                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                    for (id, sim) in vector_dists.into_iter().take(*k) {
-                        map.insert(id, sim as f64);
-                    }
+                    found
                 }
             }
-            map
         }
+    };
+    for (id, d) in results {
+        map.insert(id, distance_to_similarity(metric, d));
     }
+    map
 }
 
 /// Resolves the query vector of a KNN clause: inline vector, or `$param` decoded with the
@@ -1975,10 +2054,6 @@ pub fn execute_search(
     }
 
     (total_matches, hits)
-}
-
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    (1.0 - crate::vector::cosine_distance(a, b)).max(0.0)
 }
 
 // Reciprocal Rank Fusion (RRF) for Hybrid Keyword + Vector Retrieval
@@ -2843,6 +2918,56 @@ mod tests {
                 .as_deref(),
             Some("d2")
         );
+    }
+
+    #[test]
+    fn test_hybrid_knn_prefilter_returns_k_results() {
+        for algo in ["HNSW", "FLAT"] {
+            let mut idx = InvertedIndex::new(vector_schema("hyb", algo, 2, VectorDataType::Float32));
+            // 300 "common" docs clustered near the origin, 40 "rare" docs far away.
+            for i in 0..300 {
+                let v = format!("{},{}", i as f32 * 0.01, (i % 13) as f32 * 0.01);
+                idx.add_hash_document(
+                    &format!("c{}", i),
+                    &[
+                        (Bytes::from_static(b"v"), Bytes::from(v)),
+                        (Bytes::from_static(b"tag"), Bytes::from_static(b"common")),
+                    ],
+                );
+            }
+            for i in 0..40 {
+                let v = format!("{},{}", 100.0 + i as f32, 100.0);
+                idx.add_hash_document(
+                    &format!("r{}", i),
+                    &[
+                        (Bytes::from_static(b"v"), Bytes::from(v)),
+                        (Bytes::from_static(b"tag"), Bytes::from_static(b"rare")),
+                    ],
+                );
+            }
+            let mut params = HashMap::new();
+            params.insert(
+                "blob".to_string(),
+                [0.0f32, 0.0].iter().flat_map(|f| f.to_le_bytes()).collect(),
+            );
+            let opts = SearchOptions {
+                params,
+                ..Default::default()
+            };
+            // Small filtered set -> ad-hoc brute force.
+            let ast = parse_query("(@tag:{rare})=>[KNN 5 @v $blob]");
+            let (total, hits) = execute_search(&idx, &ast, &opts);
+            assert_eq!(total, 5, "{algo}");
+            let ids: Vec<_> = hits.iter().map(|h| h.doc_id.clone()).collect();
+            assert_eq!(ids, vec!["r0", "r1", "r2", "r3", "r4"], "{algo}");
+
+            // Large filtered set -> filtered graph traversal; all results must satisfy the filter.
+            let ast = parse_query("(@tag:{common})=>[KNN 7 @v $blob]");
+            let (total, hits) = execute_search(&idx, &ast, &opts);
+            assert_eq!(total, 7, "{algo}");
+            assert!(hits.iter().all(|h| h.doc_id.starts_with('c')), "{algo}");
+            assert_eq!(hits[0].doc_id, "c0", "{algo}");
+        }
     }
 
     #[test]

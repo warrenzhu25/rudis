@@ -1158,6 +1158,84 @@ impl HnswIndex {
         results
     }
 
+    /// Layer-0 beam search where only nodes accepted by `filter` enter the result set; rejected
+    /// nodes are still traversed so the graph stays navigable under selective filters.
+    fn search_layer_filtered(
+        &self,
+        query: &[f32],
+        entry_point: usize,
+        ef: usize,
+        filter: &dyn Fn(&Bytes) -> bool,
+    ) -> Vec<Candidate> {
+        let mut visited = HashSet::new();
+        let mut candidates = BinaryHeap::new();
+        let mut w: BinaryHeap<FurthestCandidate> = BinaryHeap::new();
+
+        let entry = self.nodes[entry_point].as_ref().unwrap();
+        let initial_dist = self.dist_to_node(query, entry);
+        visited.insert(entry_point);
+        candidates.push(Candidate {
+            id: entry_point,
+            distance: initial_dist,
+        });
+        if filter(&entry.key) {
+            w.push(FurthestCandidate {
+                id: entry_point,
+                distance: initial_dist,
+            });
+        }
+
+        while let Some(curr) = candidates.pop() {
+            if w.len() >= ef
+                && let Some(furthest) = w.peek()
+                && curr.distance > furthest.distance
+            {
+                break;
+            }
+            if let Some(node) = &self.nodes[curr.id]
+                && !node.neighbors.is_empty()
+            {
+                for &nbr_id in &node.neighbors[0] {
+                    if visited.insert(nbr_id)
+                        && let Some(nbr_node) = &self.nodes[nbr_id]
+                    {
+                        let d = self.dist_to_node(query, nbr_node);
+                        let furthest_dist = w.peek().map(|f| f.distance).unwrap_or(f32::MAX);
+                        if w.len() < ef || d < furthest_dist {
+                            candidates.push(Candidate {
+                                id: nbr_id,
+                                distance: d,
+                            });
+                            if filter(&nbr_node.key) {
+                                w.push(FurthestCandidate {
+                                    id: nbr_id,
+                                    distance: d,
+                                });
+                                if w.len() > ef {
+                                    w.pop();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut results: Vec<Candidate> = w
+            .into_iter()
+            .map(|f| Candidate {
+                id: f.id,
+                distance: f.distance,
+            })
+            .collect();
+        results.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(Ordering::Equal)
+        });
+        results
+    }
+
     /// Searches for top-k nearest neighbors.
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(Bytes, f32)> {
         self.search_tiered(query, k, false)
@@ -1176,7 +1254,19 @@ impl HnswIndex {
         ef_runtime: Option<usize>,
         rerank: bool,
     ) -> Vec<(Bytes, f32)> {
-        if self.entry_point.is_none() || self.is_empty() {
+        self.search_filtered(query, k, ef_runtime, rerank, None)
+    }
+
+    /// Top-k search restricted to keys accepted by `filter` (in-graph pre-filtering).
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_runtime: Option<usize>,
+        rerank: bool,
+        filter: Option<&dyn Fn(&Bytes) -> bool>,
+    ) -> Vec<(Bytes, f32)> {
+        if self.entry_point.is_none() || self.is_empty() || k == 0 {
             return Vec::new();
         }
         let base_ef = ef_runtime.unwrap_or(self.ef_search).max(1);
@@ -1212,7 +1302,10 @@ impl HnswIndex {
         } else {
             base_ef.max(k)
         };
-        let candidates = self.search_layer(query, curr_obj, search_ef, 0);
+        let candidates = match filter {
+            Some(f) => self.search_layer_filtered(query, curr_obj, search_ef, f),
+            None => self.search_layer(query, curr_obj, search_ef, 0),
+        };
 
         if rerank {
             let mut exact_results: Vec<(Bytes, f32)> = candidates
@@ -1467,9 +1560,20 @@ impl VectorFieldIndex {
 
     /// Top-k search with optional `EF_RUNTIME` override.
     pub fn search(&self, query: &[f32], k: usize, ef_runtime: Option<usize>) -> Vec<(Bytes, f32)> {
+        self.search_filtered(query, k, ef_runtime, None)
+    }
+
+    /// Top-k search restricted to keys accepted by `filter`.
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_runtime: Option<usize>,
+        filter: Option<&dyn Fn(&Bytes) -> bool>,
+    ) -> Vec<(Bytes, f32)> {
         match self {
-            Self::Flat(f) => f.search_filtered(query, k, None),
-            Self::Hnsw(h) => h.search_ext(query, k, ef_runtime, false),
+            Self::Flat(f) => f.search_filtered(query, k, filter),
+            Self::Hnsw(h) => h.search_filtered(query, k, ef_runtime, false, filter),
         }
     }
 
