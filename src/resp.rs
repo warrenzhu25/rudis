@@ -8502,42 +8502,120 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         })
                     }
                     "VECTOR" => {
-                        let algorithm = if i < args.len() {
-                            String::from_utf8_lossy(&args[i]).to_string()
-                        } else {
-                            "HNSW".to_string()
-                        };
-                        i += 1;
-                        let mut dim = 128;
-                        let mut distance_metric = "COSINE".to_string();
-                        while i < args.len() {
-                            let sub_opt = String::from_utf8_lossy(&args[i]).to_uppercase();
-                            if sub_opt == "DIM" && i + 1 < args.len() {
-                                dim = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(128);
-                                i += 2;
-                            } else if sub_opt == "DISTANCE_METRIC" && i + 1 < args.len() {
-                                distance_metric =
-                                    String::from_utf8_lossy(&args[i + 1]).to_uppercase();
-                                i += 2;
-                            } else if sub_opt == "TYPE"
-                                || sub_opt == "FLOAT32"
-                                || sub_opt == "M"
-                                || sub_opt == "EF_CONSTRUCTION"
-                            {
-                                i += 2;
-                            } else if sub_opt == "HNSW"
-                                || sub_opt == "FLAT"
-                                || sub_opt.parse::<usize>().is_ok()
-                            {
-                                i += 1;
-                            } else {
-                                break;
-                            }
+                        if i >= args.len() {
+                            return Err("Bad arguments for vector field: missing algorithm".to_string());
                         }
+                        let algorithm = String::from_utf8_lossy(&args[i]).to_uppercase();
+                        if algorithm != "HNSW" && algorithm != "FLAT" {
+                            return Err(format!(
+                                "Bad arguments for vector similarity algorithm: {}",
+                                algorithm
+                            ));
+                        }
+                        i += 1;
+                        // `<nargs>` is mandatory in RediSearch; accept its absence for
+                        // backward compatibility and parse attribute pairs greedily instead.
+                        let nargs = if i < args.len() {
+                            String::from_utf8_lossy(&args[i]).parse::<usize>().ok()
+                        } else {
+                            None
+                        };
+                        let end = match nargs {
+                            Some(n) => {
+                                i += 1;
+                                if n % 2 != 0 || i + n > args.len() {
+                                    return Err(format!(
+                                        "Bad arguments for vector similarity {} index arguments",
+                                        algorithm
+                                    ));
+                                }
+                                i + n
+                            }
+                            None => args.len(),
+                        };
+                        let mut dim: Option<usize> = None;
+                        let mut distance_metric: Option<String> = None;
+                        let mut data_type: Option<crate::search::VectorDataType> = None;
+                        let mut attrs = crate::search::VectorFieldAttrs::default();
+                        let bad = |attr: &str| {
+                            format!("Bad arguments for vector similarity {} argument {}", algorithm, attr)
+                        };
+                        while i + 1 < args.len() && (nargs.is_none() || i < end) {
+                            let attr = String::from_utf8_lossy(&args[i]).to_uppercase();
+                            let val = String::from_utf8_lossy(&args[i + 1]).to_string();
+                            let parse_usize =
+                                |v: &str| v.parse::<usize>().map_err(|_| bad(&attr));
+                            match attr.as_str() {
+                                "TYPE" => {
+                                    data_type = Some(
+                                        crate::search::VectorDataType::parse(&val)
+                                            .ok_or_else(|| bad("TYPE"))?,
+                                    );
+                                }
+                                "DIM" => {
+                                    let d = parse_usize(&val)?;
+                                    if d == 0 {
+                                        return Err(bad("DIM"));
+                                    }
+                                    dim = Some(d);
+                                }
+                                "DISTANCE_METRIC" => {
+                                    let m = val.to_uppercase();
+                                    if !matches!(m.as_str(), "L2" | "IP" | "COSINE") {
+                                        return Err(bad("DISTANCE_METRIC"));
+                                    }
+                                    distance_metric = Some(m);
+                                }
+                                "INITIAL_CAP" => attrs.initial_cap = parse_usize(&val)?,
+                                "BLOCK_SIZE" if algorithm == "FLAT" => {
+                                    attrs.block_size = parse_usize(&val)?
+                                }
+                                "M" if algorithm == "HNSW" => attrs.m = parse_usize(&val)?,
+                                "EF_CONSTRUCTION" if algorithm == "HNSW" => {
+                                    attrs.ef_construction = parse_usize(&val)?
+                                }
+                                "EF_RUNTIME" if algorithm == "HNSW" => {
+                                    attrs.ef_runtime = parse_usize(&val)?
+                                }
+                                "EPSILON" if algorithm == "HNSW" => {
+                                    attrs.epsilon = val
+                                        .parse::<f64>()
+                                        .ok()
+                                        .filter(|e| *e > 0.0)
+                                        .ok_or_else(|| bad("EPSILON"))?
+                                }
+                                _ if nargs.is_none() => break,
+                                _ => return Err(bad(&attr)),
+                            }
+                            i += 2;
+                        }
+                        if nargs.is_some() {
+                            i = end;
+                        }
+                        let Some(dim) = dim else {
+                            return Err(format!(
+                                "Missing mandatory parameter: cannot create {} index without specifying DIM",
+                                algorithm
+                            ));
+                        };
+                        let Some(distance_metric) = distance_metric else {
+                            return Err(format!(
+                                "Missing mandatory parameter: cannot create {} index without specifying DISTANCE_METRIC",
+                                algorithm
+                            ));
+                        };
+                        let Some(data_type) = data_type else {
+                            return Err(format!(
+                                "Missing mandatory parameter: cannot create {} index without specifying TYPE",
+                                algorithm
+                            ));
+                        };
+                        attrs.data_type = data_type;
                         Some(crate::search::FieldType::Vector {
                             dim,
                             distance_metric,
                             algorithm,
+                            attrs,
                         })
                     }
                     _ => None,

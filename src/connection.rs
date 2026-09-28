@@ -10872,6 +10872,17 @@ pub fn target_shard_and_hash_of_cmd(cmd: &Command, num_shards: usize) -> Option<
     }
 }
 
+/// Re-indexes the full, binary-safe content of HASH `key` into local and global search indexes.
+fn reindex_hash_for_search(db: &mut ShardDb, key: &[u8]) {
+    let raw = db.reindex_hash_local(key);
+    let key_str = String::from_utf8_lossy(key);
+    if raw.is_empty() {
+        crate::search::delete_document_hook(&key_str);
+    } else {
+        crate::search::index_document_hook(&key_str, &raw);
+    }
+}
+
 pub fn execute_local_command(
     cmd: &Command,
     db: &mut ShardDb,
@@ -11309,20 +11320,7 @@ pub fn execute_local_command(
                 Ok(count) => {
                     record_change!(cmd);
                     if db.has_search_indices() || crate::search::has_active_search_indices() {
-                        let str_fields: std::collections::HashMap<String, String> = fields
-                            .iter()
-                            .map(|(k, v)| {
-                                (
-                                    String::from_utf8_lossy(k).to_string(),
-                                    String::from_utf8_lossy(v).to_string(),
-                                )
-                            })
-                            .collect();
-                        db.index_document_local(&String::from_utf8_lossy(key), str_fields.clone());
-                        crate::search::index_document_hook(
-                            &String::from_utf8_lossy(key),
-                            str_fields,
-                        );
+                        reindex_hash_for_search(db, key);
                     }
                     write_resp_integer(out, count as i64);
                 }
@@ -11351,20 +11349,7 @@ pub fn execute_local_command(
                 Ok(_) => {
                     record_change!(cmd);
                     if db.has_search_indices() || crate::search::has_active_search_indices() {
-                        let str_fields: std::collections::HashMap<String, String> = fields
-                            .iter()
-                            .map(|(k, v)| {
-                                (
-                                    String::from_utf8_lossy(k).to_string(),
-                                    String::from_utf8_lossy(v).to_string(),
-                                )
-                            })
-                            .collect();
-                        db.index_document_local(&String::from_utf8_lossy(key), str_fields.clone());
-                        crate::search::index_document_hook(
-                            &String::from_utf8_lossy(key),
-                            str_fields,
-                        );
+                        reindex_hash_for_search(db, key);
                     }
                     out.extend_from_slice(b"+OK\r\n");
                 }

@@ -22,7 +22,226 @@ pub enum FieldType {
         dim: usize,
         distance_metric: String,
         algorithm: String,
+        attrs: VectorFieldAttrs,
     },
+}
+
+/// Element type of a vector field (`TYPE` attribute of `FT.CREATE ... VECTOR`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VectorDataType {
+    #[default]
+    Float32,
+    Float64,
+    Float16,
+    BFloat16,
+    Int8,
+    Uint8,
+}
+
+impl VectorDataType {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_uppercase().as_str() {
+            "FLOAT32" => Some(Self::Float32),
+            "FLOAT64" => Some(Self::Float64),
+            "FLOAT16" => Some(Self::Float16),
+            "BFLOAT16" => Some(Self::BFloat16),
+            "INT8" => Some(Self::Int8),
+            "UINT8" => Some(Self::Uint8),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Float32 => "FLOAT32",
+            Self::Float64 => "FLOAT64",
+            Self::Float16 => "FLOAT16",
+            Self::BFloat16 => "BFLOAT16",
+            Self::Int8 => "INT8",
+            Self::Uint8 => "UINT8",
+        }
+    }
+
+    pub fn elem_size(&self) -> usize {
+        match self {
+            Self::Float64 => 8,
+            Self::Float32 => 4,
+            Self::Float16 | Self::BFloat16 => 2,
+            Self::Int8 | Self::Uint8 => 1,
+        }
+    }
+}
+
+/// Optional tuning attributes of a vector field.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VectorFieldAttrs {
+    pub data_type: VectorDataType,
+    pub m: usize,
+    pub ef_construction: usize,
+    pub ef_runtime: usize,
+    pub initial_cap: usize,
+    pub epsilon: f64,
+    pub block_size: usize,
+}
+
+impl Default for VectorFieldAttrs {
+    fn default() -> Self {
+        Self {
+            data_type: VectorDataType::Float32,
+            m: 16,
+            ef_construction: 200,
+            ef_runtime: 10,
+            initial_cap: 1024,
+            epsilon: 0.01,
+            block_size: 1024,
+        }
+    }
+}
+
+#[inline]
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = ((h >> 15) & 1) as u32;
+    let exp = ((h >> 10) & 0x1f) as u32;
+    let frac = (h & 0x3ff) as u32;
+    let bits = if exp == 0 {
+        if frac == 0 {
+            sign << 31
+        } else {
+            // Subnormal: normalize.
+            let mut e: i32 = -14;
+            let mut f = frac;
+            while f & 0x400 == 0 {
+                f <<= 1;
+                e -= 1;
+            }
+            f &= 0x3ff;
+            (sign << 31) | (((e + 127) as u32) << 23) | (f << 13)
+        }
+    } else if exp == 0x1f {
+        (sign << 31) | 0x7f80_0000 | (frac << 13)
+    } else {
+        (sign << 31) | ((exp + 112) << 23) | (frac << 13)
+    };
+    f32::from_bits(bits)
+}
+
+/// Converts an `f32` to IEEE-754 half precision bits (round-to-nearest-even).
+pub fn f32_to_f16(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mut frac = bits & 0x7f_ffff;
+    if exp == 0xff {
+        return sign | 0x7c00 | if frac != 0 { 0x200 } else { 0 };
+    }
+    let e = exp - 127 + 15;
+    if e >= 0x1f {
+        return sign | 0x7c00;
+    }
+    if e <= 0 {
+        if e < -10 {
+            return sign;
+        }
+        frac |= 0x80_0000;
+        let shift = (14 - e) as u32;
+        let half = frac >> shift;
+        let rem = frac & ((1 << shift) - 1);
+        let mid = 1 << (shift - 1);
+        let rounded = if rem > mid || (rem == mid && half & 1 == 1) {
+            half + 1
+        } else {
+            half
+        };
+        return sign | rounded as u16;
+    }
+    let half = ((e as u32) << 10) | (frac >> 13);
+    let rem = frac & 0x1fff;
+    let rounded = if rem > 0x1000 || (rem == 0x1000 && half & 1 == 1) {
+        half + 1
+    } else {
+        half
+    };
+    sign | rounded as u16
+}
+
+/// Decodes a binary little-endian vector blob of the given element type.
+pub fn decode_typed_blob(bytes: &[u8], data_type: VectorDataType) -> Option<Vec<f32>> {
+    let sz = data_type.elem_size();
+    if bytes.is_empty() || !bytes.len().is_multiple_of(sz) {
+        return None;
+    }
+    let out = match data_type {
+        VectorDataType::Float32 => bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect(),
+        VectorDataType::Float64 => bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| f64::from_le_bytes(*c) as f32)
+            .collect(),
+        VectorDataType::Float16 => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| f16_to_f32(u16::from_le_bytes(*c)))
+            .collect(),
+        VectorDataType::BFloat16 => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| f32::from_bits((u16::from_le_bytes(*c) as u32) << 16))
+            .collect(),
+        VectorDataType::Int8 => bytes.iter().map(|&b| b as i8 as f32).collect(),
+        VectorDataType::Uint8 => bytes.iter().map(|&b| b as f32).collect(),
+    };
+    Some(out)
+}
+
+fn parse_vector_text(bytes: &[u8]) -> Option<Vec<f32>> {
+    if bytes.is_empty()
+        || !bytes.iter().all(|b| {
+            b.is_ascii_digit() || matches!(b, b'.' | b',' | b'-' | b'+' | b'e' | b'E' | b'[' | b']')
+                || b.is_ascii_whitespace()
+        })
+    {
+        return None;
+    }
+    let s = std::str::from_utf8(bytes).ok()?;
+    let mut out = Vec::new();
+    for tok in s.split(|c: char| c == ',' || c.is_whitespace() || c == '[' || c == ']') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        out.push(tok.parse::<f32>().ok()?);
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Decodes a vector value according to the field's `TYPE` and `DIM`.
+///
+/// Binary little-endian blobs whose length equals `dim * sizeof(TYPE)` are decoded as binary.
+/// Otherwise a textual representation (`"1,2,3"` or `"[1, 2, 3]"`) is accepted. Returns `None`
+/// when the value cannot be decoded into exactly `dim` finite components (`dim == 0` accepts any).
+pub fn decode_vector(bytes: &[u8], data_type: VectorDataType, dim: usize) -> Option<Vec<f32>> {
+    let text = parse_vector_text(bytes);
+    let v = match text {
+        Some(t) if dim == 0 || t.len() == dim => t,
+        _ => {
+            if dim != 0 && bytes.len() != dim * data_type.elem_size() {
+                return None;
+            }
+            decode_typed_blob(bytes, data_type)?
+        }
+    };
+    if (dim != 0 && v.len() != dim) || v.iter().any(|x| !x.is_finite()) {
+        return None;
+    }
+    Some(v)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -160,12 +379,14 @@ pub struct InvertedIndex {
     pub key_to_id: HashMap<Bytes, DocId>,
     // doc_id -> metadata
     pub id_to_meta: HashMap<DocId, DocMeta>,
-    // vector field -> HnswIndex for logarithmic vector beam search
-    pub vector_indices: HashMap<String, crate::vector::HnswIndex>,
+    // vector field -> FLAT or HNSW vector index
+    pub vector_indices: HashMap<String, crate::vector::VectorFieldIndex>,
     pub next_doc_id: DocId,
     pub free_ids: Vec<DocId>,
     pub total_docs: usize,
     pub total_terms: usize,
+    /// Number of documents rejected because of invalid vector values (`hash_indexing_failures`).
+    pub indexing_failures: usize,
 }
 
 #[inline]
@@ -406,19 +627,52 @@ pub fn tokenize_text(text: &str, stem: bool) -> Vec<String> {
     tokens
 }
 
+/// Decodes a vector blob assuming `FLOAT32` when the field type is unknown.
 pub fn parse_vector_blob(bytes: &[u8]) -> Vec<f32> {
-    if bytes.len().is_multiple_of(4) && !bytes.is_empty() {
-        let (chunks, _) = bytes.as_chunks::<4>();
-        chunks
-            .iter()
-            .map(|chunk| f32::from_le_bytes(*chunk))
-            .collect()
-    } else {
-        String::from_utf8_lossy(bytes)
-            .split(|c: char| c == ',' || c.is_whitespace() || c == '[' || c == ']')
-            .filter_map(|s| s.trim().parse::<f32>().ok())
-            .collect()
+    decode_vector(bytes, VectorDataType::Float32, 0).unwrap_or_default()
+}
+
+/// Parses a `DISTANCE_METRIC` string into a [`crate::vector::VectorMetric`].
+pub fn metric_from_str(s: &str) -> crate::vector::VectorMetric {
+    s.parse().unwrap_or(crate::vector::VectorMetric::Cosine)
+}
+
+fn build_vector_index(
+    index_name: &str,
+    ftype: &FieldType,
+    dim_hint: usize,
+) -> Option<crate::vector::VectorFieldIndex> {
+    let FieldType::Vector {
+        dim,
+        distance_metric,
+        algorithm,
+        attrs,
+    } = ftype
+    else {
+        return None;
+    };
+    let dim = if *dim == 0 { dim_hint } else { *dim };
+    if dim == 0 {
+        return None;
     }
+    let metric = metric_from_str(distance_metric);
+    Some(if algorithm.eq_ignore_ascii_case("FLAT") {
+        crate::vector::VectorFieldIndex::Flat(crate::vector::FlatIndex::new(
+            index_name.to_string(),
+            dim,
+            metric,
+            attrs.initial_cap,
+        ))
+    } else {
+        crate::vector::VectorFieldIndex::Hnsw(crate::vector::HnswIndex::with_params(
+            index_name.to_string(),
+            dim,
+            metric,
+            attrs.m,
+            attrs.ef_construction,
+            attrs.ef_runtime,
+        ))
+    })
 }
 
 impl InvertedIndex {
@@ -434,18 +688,78 @@ impl InvertedIndex {
                 })
                 .collect();
         }
+        let mut vector_indices = HashMap::new();
+        for sf in &schema.schema_fields {
+            if let Some(vi) = build_vector_index(&schema.name, &sf.field_type, 0) {
+                vector_indices.insert(sf.alias.clone(), vi);
+            }
+        }
         Self {
             schema: Some(schema),
             inverted: HashMap::new(),
             numeric_trees: HashMap::new(),
             key_to_id: HashMap::new(),
             id_to_meta: HashMap::new(),
-            vector_indices: HashMap::new(),
+            vector_indices,
             next_doc_id: 1,
             free_ids: Vec::new(),
             total_docs: 0,
             total_terms: 0,
+            indexing_failures: 0,
         }
+    }
+
+    /// Resolves a vector field reference (alias, identifier or `$.`-prefixed path) to the
+    /// canonical alias used as the key of [`Self::vector_indices`].
+    pub fn resolve_vector_field(&self, name: &str) -> Option<&SchemaField> {
+        let schema = self.schema.as_ref()?;
+        let stripped = name.strip_prefix("$.").unwrap_or(name);
+        schema.schema_fields.iter().find(|sf| {
+            matches!(sf.field_type, FieldType::Vector { .. })
+                && (sf.alias == name
+                    || sf.identifier == name
+                    || sf.alias == stripped
+                    || sf.identifier.strip_prefix("$.").unwrap_or(&sf.identifier) == stripped)
+        })
+    }
+
+    /// Indexes a HASH document from its raw (binary-safe) field/value pairs.
+    ///
+    /// Vector fields are decoded from the raw bytes according to their `TYPE`, so binary
+    /// `FLOAT32`/`FLOAT16`/... blobs sent by clients are never corrupted by UTF-8 conversion.
+    pub fn add_hash_document(&mut self, key: &str, raw: &[(Bytes, Bytes)]) {
+        let Some(schema) = self.schema.as_ref() else {
+            return;
+        };
+        let mut str_fields = HashMap::with_capacity(raw.len());
+        let mut vectors = HashMap::new();
+        let mut failed = false;
+        for (f, v) in raw {
+            let fname = String::from_utf8_lossy(f).to_string();
+            let vec_field = schema.schema_fields.iter().find(|sf| {
+                matches!(sf.field_type, FieldType::Vector { .. })
+                    && (sf.identifier == fname || sf.alias == fname)
+            });
+            if let Some(sf) = vec_field
+                && let FieldType::Vector { dim, attrs, .. } = &sf.field_type
+            {
+                match decode_vector(v, attrs.data_type, *dim) {
+                    Some(vec) => {
+                        vectors.insert(sf.alias.clone(), vec);
+                    }
+                    None => failed = true,
+                }
+            }
+            str_fields.insert(fname, String::from_utf8_lossy(v).to_string());
+        }
+        if failed {
+            if self.key_to_id.contains_key(key.as_bytes()) {
+                self.remove_document(key);
+            }
+            self.indexing_failures += 1;
+            return;
+        }
+        self.add_document(key, str_fields, Some(vectors));
     }
 
     #[inline(always)]
@@ -483,6 +797,37 @@ impl InvertedIndex {
             Some(s) => s.clone(),
             None => return,
         };
+
+        // Resolve and validate vector fields first: a document with an undecodable vector or a
+        // dimension mismatch is rejected entirely (counted in `hash_indexing_failures`).
+        let provided = vectors.unwrap_or_default();
+        let mut vector_fields: HashMap<String, Vec<f32>> = HashMap::new();
+        for sf in &schema.schema_fields {
+            let FieldType::Vector { dim, attrs, .. } = &sf.field_type else {
+                continue;
+            };
+            let candidate = provided
+                .get(&sf.alias)
+                .or_else(|| provided.get(&sf.identifier))
+                .cloned()
+                .map(Some)
+                .or_else(|| {
+                    fields
+                        .get(&sf.alias)
+                        .or_else(|| fields.get(&sf.identifier))
+                        .map(|s| decode_vector(s.as_bytes(), attrs.data_type, *dim))
+                });
+            match candidate {
+                None => {}
+                Some(Some(v)) if *dim == 0 || v.len() == *dim => {
+                    vector_fields.insert(sf.alias.clone(), v);
+                }
+                Some(_) => {
+                    self.indexing_failures += 1;
+                    return;
+                }
+            }
+        }
 
         let mut doc_len = 0;
         let mut numeric_fields = HashMap::new();
@@ -549,36 +894,16 @@ impl InvertedIndex {
             indexed_terms.push(term);
         }
 
-        let mut vector_fields = vectors.unwrap_or_default();
-        for (field_name, field_val) in &fields {
-            if let Some(FieldType::Vector { .. }) = schema.fields.get(field_name)
-                && !vector_fields.contains_key(field_name)
-            {
-                let v = parse_vector_blob(field_val.as_bytes());
-                if !v.is_empty() {
-                    vector_fields.insert(field_name.clone(), v);
-                }
-            }
-        }
-
         for (field_name, vec) in &vector_fields {
-            let dim = vec.len();
-            let metric = match schema.fields.get(field_name) {
-                Some(FieldType::Vector {
-                    distance_metric, ..
-                }) => match distance_metric.to_uppercase().as_str() {
-                    "L2" => crate::vector::VectorMetric::L2,
-                    "IP" => crate::vector::VectorMetric::IP,
-                    _ => crate::vector::VectorMetric::Cosine,
-                },
-                _ => crate::vector::VectorMetric::Cosine,
-            };
-            let idx_name = schema.name.clone();
-            let hnsw = self
-                .vector_indices
-                .entry(field_name.clone())
-                .or_insert_with(|| crate::vector::HnswIndex::new(idx_name, dim, metric));
-            let _ = hnsw.add(key_bytes.clone(), vec.clone());
+            if !self.vector_indices.contains_key(field_name)
+                && let Some(sf) = schema.schema_fields.iter().find(|sf| &sf.alias == field_name)
+                && let Some(vi) = build_vector_index(&schema.name, &sf.field_type, vec.len())
+            {
+                self.vector_indices.insert(field_name.clone(), vi);
+            }
+            if let Some(vi) = self.vector_indices.get_mut(field_name) {
+                let _ = vi.add(key_bytes.clone(), vec.clone());
+            }
         }
 
         for (field_name, &num_val) in &numeric_fields {
@@ -709,7 +1034,7 @@ pub fn list_search_indices() -> Vec<String> {
     registry.keys().cloned().collect()
 }
 
-pub fn index_document_hook(key: &str, fields: HashMap<String, String>) {
+pub fn index_document_hook(key: &str, raw: &[(Bytes, Bytes)]) {
     let registry = SEARCH_INDICES.read().unwrap();
     for idx_lock in registry.values() {
         let mut idx = idx_lock.write().unwrap();
@@ -723,7 +1048,7 @@ pub fn index_document_hook(key: &str, fields: HashMap<String, String>) {
                 schema.prefixes.iter().any(|p| key.starts_with(p))
             };
             if matched {
-                idx.add_document(key, fields.clone(), None);
+                idx.add_hash_document(key, raw);
             }
         }
     }
@@ -1274,34 +1599,18 @@ fn evaluate_ast(
             query_vec,
             param_name,
         } => {
-            let effective_vec = if !query_vec.is_empty() {
-                query_vec.clone()
-            } else if !param_name.is_empty() {
-                let raw_bytes = opts
-                    .params
-                    .get(param_name)
-                    .or_else(|| opts.params.get(&format!("${}", param_name)));
-                if let Some(bytes) = raw_bytes {
-                    parse_vector_blob(bytes)
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            };
+            let effective_vec = knn_query_vector(index, field, query_vec, param_name, opts);
 
             let mut map = HashMap::new();
             if !effective_vec.is_empty() {
-                let hnsw_opt = index.vector_indices.get(field).or_else(|| {
-                    field
-                        .strip_prefix("$.")
-                        .and_then(|f| index.vector_indices.get(f))
-                });
-                if let Some(hnsw) = hnsw_opt {
-                    let results = hnsw.search(&effective_vec, *k);
+                let vi_opt = index
+                    .resolve_vector_field(field)
+                    .and_then(|sf| index.vector_indices.get(&sf.alias));
+                if let Some(vi) = vi_opt {
+                    let results = vi.search(&effective_vec, *k, None);
                     for (doc_key, dist) in results {
                         if let Some(doc_id) = index.key_to_id.get(&doc_key) {
-                            let sim = match hnsw.metric {
+                            let sim = match vi.metric() {
                                 crate::vector::VectorMetric::Cosine => (1.0 - dist).max(0.0) as f64,
                                 _ => (1.0 / (1.0 + dist)) as f64,
                             };
@@ -1332,6 +1641,36 @@ fn evaluate_ast(
             }
             map
         }
+    }
+}
+
+/// Resolves the query vector of a KNN clause: inline vector, or `$param` decoded with the
+/// target field's `TYPE` and `DIM`.
+fn knn_query_vector(
+    index: &InvertedIndex,
+    field: &str,
+    query_vec: &[f32],
+    param_name: &str,
+    opts: &SearchOptions,
+) -> Vec<f32> {
+    if !query_vec.is_empty() {
+        return query_vec.to_vec();
+    }
+    if param_name.is_empty() {
+        return Vec::new();
+    }
+    let Some(bytes) = opts
+        .params
+        .get(param_name)
+        .or_else(|| opts.params.get(&format!("${}", param_name)))
+    else {
+        return Vec::new();
+    };
+    match index.resolve_vector_field(field).map(|sf| &sf.field_type) {
+        Some(FieldType::Vector { dim, attrs, .. }) => {
+            decode_vector(bytes, attrs.data_type, *dim).unwrap_or_default()
+        }
+        _ => parse_vector_blob(bytes),
     }
 }
 
@@ -2087,6 +2426,7 @@ mod tests {
                 dim: 3,
                 distance_metric: "COSINE".to_string(),
                 algorithm: "FLAT".to_string(),
+                attrs: VectorFieldAttrs::default(),
             },
         );
         let schema = IndexSchema {
@@ -2126,6 +2466,111 @@ mod tests {
         let (total, hits) = execute_search(&idx, &ast, &opts);
         assert_eq!(total, 1);
         assert_eq!(hits[0].doc_id, "doc:1");
+    }
+
+    fn vector_schema(name: &str, algo: &str, dim: usize, data_type: VectorDataType) -> IndexSchema {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "tag".to_string(),
+            FieldType::Tag {
+                separator: ',',
+                casesensitive: false,
+            },
+        );
+        fields.insert(
+            "v".to_string(),
+            FieldType::Vector {
+                dim,
+                distance_metric: "L2".to_string(),
+                algorithm: algo.to_string(),
+                attrs: VectorFieldAttrs {
+                    data_type,
+                    ..Default::default()
+                },
+            },
+        );
+        IndexSchema {
+            name: name.to_string(),
+            on_type: "HASH".to_string(),
+            prefixes: vec![],
+            fields,
+            schema_fields: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_typed_vector_decoding() {
+        let f64_blob: Vec<u8> = [1.5f64, -2.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+        assert_eq!(
+            decode_vector(&f64_blob, VectorDataType::Float64, 2),
+            Some(vec![1.5, -2.0])
+        );
+        let f16_blob: Vec<u8> = [0.5f32, -3.0]
+            .iter()
+            .flat_map(|f| f32_to_f16(*f).to_le_bytes())
+            .collect();
+        assert_eq!(
+            decode_vector(&f16_blob, VectorDataType::Float16, 2),
+            Some(vec![0.5, -3.0])
+        );
+        let bf16_blob: Vec<u8> = [1.0f32, 2.0]
+            .iter()
+            .flat_map(|f| ((f.to_bits() >> 16) as u16).to_le_bytes())
+            .collect();
+        assert_eq!(
+            decode_vector(&bf16_blob, VectorDataType::BFloat16, 2),
+            Some(vec![1.0, 2.0])
+        );
+        assert_eq!(
+            decode_vector(&[0xff, 0x02], VectorDataType::Int8, 2),
+            Some(vec![-1.0, 2.0])
+        );
+        assert_eq!(
+            decode_vector(&[0xff, 0x02], VectorDataType::Uint8, 2),
+            Some(vec![255.0, 2.0])
+        );
+        assert_eq!(
+            decode_vector(b"1, 2, 3", VectorDataType::Float32, 3),
+            Some(vec![1.0, 2.0, 3.0])
+        );
+        // Wrong dimension is rejected.
+        assert_eq!(decode_vector(b"1,2", VectorDataType::Float32, 3), None);
+        assert_eq!(decode_vector(&f64_blob, VectorDataType::Float32, 2), None);
+    }
+
+    #[test]
+    fn test_flat_index_binary_hash_ingest_and_dim_validation() {
+        let mut idx = InvertedIndex::new(vector_schema("flat_idx", "FLAT", 3, VectorDataType::Float32));
+        assert!(matches!(
+            idx.vector_indices.get("v"),
+            Some(crate::vector::VectorFieldIndex::Flat(_))
+        ));
+        // A FLOAT32 blob containing bytes that are invalid UTF-8.
+        let v1: Vec<u8> = [1.0f32, f32::from_bits(0x3f80_00ff), 0.0]
+            .iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        idx.add_hash_document(
+            "a",
+            &[
+                (Bytes::from_static(b"v"), Bytes::from(v1)),
+                (Bytes::from_static(b"tag"), Bytes::from_static(b"x")),
+            ],
+        );
+        assert_eq!(idx.vector_indices["v"].len(), 1);
+        let got = idx.vector_indices["v"].get_vector(&Bytes::from_static(b"a")).unwrap();
+        assert_eq!(got[1].to_bits(), 0x3f80_00ff);
+
+        // Dimension mismatch -> document rejected and counted as failure.
+        idx.add_hash_document("b", &[(Bytes::from_static(b"v"), Bytes::from_static(b"1,2"))]);
+        assert_eq!(idx.indexing_failures, 1);
+        assert!(idx.doc_id_of(b"b").is_none());
+
+        let hnsw = InvertedIndex::new(vector_schema("hnsw_idx", "HNSW", 3, VectorDataType::Float32));
+        assert!(matches!(
+            hnsw.vector_indices.get("v"),
+            Some(crate::vector::VectorFieldIndex::Hnsw(_))
+        ));
     }
 
     #[test]

@@ -859,6 +859,25 @@ impl HnswIndex {
         }
     }
 
+    /// Creates an HNSW index with explicit graph parameters (`M`, `EF_CONSTRUCTION`, `EF_RUNTIME`).
+    pub fn with_params(
+        name: String,
+        dim: usize,
+        metric: VectorMetric,
+        m: usize,
+        ef_construction: usize,
+        ef_runtime: usize,
+    ) -> Self {
+        let mut idx = Self::new(name, dim, metric);
+        let m = m.max(2);
+        idx.m = m;
+        idx.m0 = m * 2;
+        idx.ml = 1.0 / (m as f64).ln();
+        idx.ef_construction = ef_construction.max(1);
+        idx.ef_search = ef_runtime.max(1);
+        idx
+    }
+
     pub fn enable_pq(&mut self, m: usize) {
         self.pq_quantizer = Some(ProductQuantizer::new(self.dim, m));
     }
@@ -1146,9 +1165,21 @@ impl HnswIndex {
 
     /// Searches for top-k nearest neighbors with optional exact reranking.
     pub fn search_tiered(&self, query: &[f32], k: usize, rerank: bool) -> Vec<(Bytes, f32)> {
+        self.search_ext(query, k, None, rerank)
+    }
+
+    /// Searches for top-k nearest neighbors with an optional per-query `EF_RUNTIME` override.
+    pub fn search_ext(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef_runtime: Option<usize>,
+        rerank: bool,
+    ) -> Vec<(Bytes, f32)> {
         if self.entry_point.is_none() || self.is_empty() {
             return Vec::new();
         }
+        let base_ef = ef_runtime.unwrap_or(self.ef_search).max(1);
 
         let mut curr_obj = self.entry_point.unwrap();
         let mut curr_dist = self.dist_to_node(query, self.nodes[curr_obj].as_ref().unwrap());
@@ -1177,9 +1208,9 @@ impl HnswIndex {
 
         // 2. Layer 0 search with ef_search
         let search_ef = if rerank {
-            self.ef_search.max(k * 3)
+            base_ef.max(k * 3)
         } else {
-            self.ef_search.max(k)
+            base_ef.max(k)
         };
         let candidates = self.search_layer(query, curr_obj, search_ef, 0);
 
@@ -1232,6 +1263,230 @@ impl HnswIndex {
             true
         } else {
             false
+        }
+    }
+}
+
+/// Exact brute-force (`FLAT`) vector index with contiguous storage.
+#[derive(Debug, Clone)]
+pub struct FlatIndex {
+    pub name: String,
+    pub dim: usize,
+    pub metric: VectorMetric,
+    keys: Vec<Bytes>,
+    data: Vec<f32>,
+    key_to_pos: HashMap<Bytes, usize>,
+}
+
+impl FlatIndex {
+    pub fn new(name: String, dim: usize, metric: VectorMetric, initial_cap: usize) -> Self {
+        let cap = initial_cap.min(1 << 20);
+        Self {
+            name,
+            dim,
+            metric,
+            keys: Vec::with_capacity(cap),
+            data: Vec::with_capacity(cap.saturating_mul(dim)),
+            key_to_pos: HashMap::with_capacity(cap),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    #[inline]
+    fn row(&self, pos: usize) -> &[f32] {
+        &self.data[pos * self.dim..(pos + 1) * self.dim]
+    }
+
+    pub fn get_vector(&self, key: &Bytes) -> Option<&[f32]> {
+        self.key_to_pos.get(key).map(|&p| self.row(p))
+    }
+
+    pub fn add(&mut self, key: Bytes, vector: Vec<f32>) -> Result<(), &'static str> {
+        if vector.len() != self.dim {
+            return Err("vector dimension mismatch");
+        }
+        if let Some(&pos) = self.key_to_pos.get(&key) {
+            self.data[pos * self.dim..(pos + 1) * self.dim].copy_from_slice(&vector);
+            return Ok(());
+        }
+        self.key_to_pos.insert(key.clone(), self.keys.len());
+        self.keys.push(key);
+        self.data.extend_from_slice(&vector);
+        Ok(())
+    }
+
+    pub fn remove(&mut self, key: &Bytes) -> bool {
+        let Some(pos) = self.key_to_pos.remove(key) else {
+            return false;
+        };
+        let last = self.keys.len() - 1;
+        if pos != last {
+            let (head, tail) = self.data.split_at_mut(last * self.dim);
+            head[pos * self.dim..(pos + 1) * self.dim].copy_from_slice(&tail[..self.dim]);
+            self.keys.swap(pos, last);
+            self.key_to_pos.insert(self.keys[pos].clone(), pos);
+        }
+        self.keys.pop();
+        self.data.truncate(last * self.dim);
+        true
+    }
+
+    /// Exact top-k search, optionally restricted by a key predicate.
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: Option<&dyn Fn(&Bytes) -> bool>,
+    ) -> Vec<(Bytes, f32)> {
+        if k == 0 || query.len() != self.dim {
+            return Vec::new();
+        }
+        let mut heap: BinaryHeap<FurthestCandidate> = BinaryHeap::with_capacity(k + 1);
+        for (pos, key) in self.keys.iter().enumerate() {
+            if let Some(f) = filter
+                && !f(key)
+            {
+                continue;
+            }
+            let d = compute_distance(query, self.row(pos), self.metric);
+            if heap.len() < k {
+                heap.push(FurthestCandidate { id: pos, distance: d });
+            } else if let Some(top) = heap.peek()
+                && d < top.distance
+            {
+                heap.pop();
+                heap.push(FurthestCandidate { id: pos, distance: d });
+            }
+        }
+        let mut out: Vec<(Bytes, f32)> = heap
+            .into_iter()
+            .map(|c| (self.keys[c.id].clone(), c.distance))
+            .collect();
+        out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        out
+    }
+
+    /// Exact range search returning all vectors within `radius`, sorted by distance.
+    pub fn range_filtered(
+        &self,
+        query: &[f32],
+        radius: f32,
+        filter: Option<&dyn Fn(&Bytes) -> bool>,
+    ) -> Vec<(Bytes, f32)> {
+        if query.len() != self.dim {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (pos, key) in self.keys.iter().enumerate() {
+            if let Some(f) = filter
+                && !f(key)
+            {
+                continue;
+            }
+            let d = compute_distance(query, self.row(pos), self.metric);
+            if d <= radius {
+                out.push((key.clone(), d));
+            }
+        }
+        out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        out
+    }
+
+    pub fn memory_usage(&self) -> usize {
+        self.data.len() * 4 + self.keys.iter().map(|k| k.len() + 32).sum::<usize>()
+    }
+}
+
+/// Vector index backing a `VECTOR` field of an FT index (`FLAT` or `HNSW`).
+#[derive(Debug, Clone)]
+pub enum VectorFieldIndex {
+    Flat(FlatIndex),
+    Hnsw(HnswIndex),
+}
+
+impl VectorFieldIndex {
+    pub fn metric(&self) -> VectorMetric {
+        match self {
+            Self::Flat(f) => f.metric,
+            Self::Hnsw(h) => h.metric,
+        }
+    }
+
+    pub fn dim(&self) -> usize {
+        match self {
+            Self::Flat(f) => f.dim,
+            Self::Hnsw(h) => h.dim,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Flat(f) => f.len(),
+            Self::Hnsw(h) => h.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn algorithm(&self) -> &'static str {
+        match self {
+            Self::Flat(_) => "FLAT",
+            Self::Hnsw(_) => "HNSW",
+        }
+    }
+
+    pub fn add(&mut self, key: Bytes, vector: Vec<f32>) -> Result<(), &'static str> {
+        match self {
+            Self::Flat(f) => f.add(key, vector),
+            Self::Hnsw(h) => h.add(key, vector),
+        }
+    }
+
+    pub fn remove(&mut self, key: &Bytes) -> bool {
+        match self {
+            Self::Flat(f) => f.remove(key),
+            Self::Hnsw(h) => h.remove(key),
+        }
+    }
+
+    pub fn get_vector(&self, key: &Bytes) -> Option<&[f32]> {
+        match self {
+            Self::Flat(f) => f.get_vector(key),
+            Self::Hnsw(h) => h.get_vector(key),
+        }
+    }
+
+    /// Top-k search with optional `EF_RUNTIME` override.
+    pub fn search(&self, query: &[f32], k: usize, ef_runtime: Option<usize>) -> Vec<(Bytes, f32)> {
+        match self {
+            Self::Flat(f) => f.search_filtered(query, k, None),
+            Self::Hnsw(h) => h.search_ext(query, k, ef_runtime, false),
+        }
+    }
+
+    pub fn memory_usage(&self) -> usize {
+        match self {
+            Self::Flat(f) => f.memory_usage(),
+            Self::Hnsw(h) => h
+                .nodes
+                .iter()
+                .flatten()
+                .map(|n| {
+                    n.vector.len() * 4
+                        + n.key.len()
+                        + n.neighbors.iter().map(|l| l.len() * 8 + 24).sum::<usize>()
+                        + 64
+                })
+                .sum(),
         }
     }
 }

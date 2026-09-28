@@ -630,11 +630,15 @@ impl ShardDb {
         self.search_indices.remove(name).is_some()
     }
 
-    pub fn index_document_local(
-        &mut self,
-        key: &str,
-        fields: std::collections::HashMap<String, String>,
-    ) {
+    /// Re-indexes the full content of HASH `key` into matching local search indexes and returns
+    /// the raw field/value pairs so the caller can feed the global registry too.
+    pub fn reindex_hash_local(&mut self, key: &[u8]) -> Vec<(Bytes, Bytes)> {
+        let raw = self.table.hgetall(key).unwrap_or_default();
+        let key_str = String::from_utf8_lossy(key);
+        if raw.is_empty() {
+            self.delete_document_local(&key_str);
+            return raw;
+        }
         for idx in self.search_indices.values_mut() {
             if let Some(schema) = &idx.schema {
                 if schema.on_type.to_uppercase() != "HASH" {
@@ -643,13 +647,14 @@ impl ShardDb {
                 let matched = if schema.prefixes.is_empty() {
                     true
                 } else {
-                    schema.prefixes.iter().any(|p| key.starts_with(p))
+                    schema.prefixes.iter().any(|p| key_str.starts_with(p))
                 };
                 if matched {
-                    idx.add_document(key, fields.clone(), None);
+                    idx.add_hash_document(&key_str, &raw);
                 }
             }
         }
+        raw
     }
 
     pub fn delete_document_local(&mut self, key: &str) {
