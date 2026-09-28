@@ -1464,6 +1464,61 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             buf.extend_from_slice(b"\r\n");
             Some(buf)
         }
+        Command::AgentCheckpointPut {
+            key,
+            step_id,
+            parent_id,
+            state,
+            meta,
+        } => {
+            let mut args: Vec<Vec<u8>> = vec![
+                b"AGENT.CHECKPOINT.PUT".to_vec(),
+                key.to_vec(),
+                step_id.to_vec(),
+            ];
+            if let Some(p) = parent_id {
+                args.push(b"PARENT".to_vec());
+                args.push(p.to_vec());
+            }
+            args.push(b"STATE".to_vec());
+            args.push(state.to_vec());
+            if let Some(m) = meta {
+                args.push(b"META".to_vec());
+                args.push(m.to_vec());
+            }
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend_from_slice(&a);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
+        Command::AgentToolComplete {
+            key,
+            call_id,
+            output,
+            ttl_ms,
+        } => {
+            let mut args: Vec<Vec<u8>> = vec![
+                b"AGENT.TOOL.COMPLETE".to_vec(),
+                key.to_vec(),
+                call_id.to_vec(),
+                b"OUTPUT".to_vec(),
+                output.to_vec(),
+            ];
+            if let Some(ttl) = ttl_ms {
+                args.push(b"TTL".to_vec());
+                args.push(ttl.to_string().into_bytes());
+            }
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend_from_slice(&a);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
         Command::Vadd {
             key,
             element,

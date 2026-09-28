@@ -588,6 +588,8 @@ pub struct ShardDb {
     pub semantic_caches: hashbrown::HashMap<Bytes, crate::vector::SemanticCache>,
     pub agent_memories: hashbrown::HashMap<Bytes, crate::agent::AgentMemorySession>,
     pub llm_quotas: hashbrown::HashMap<Bytes, crate::agent::LlmQuotaBucket>,
+    pub agent_checkpoints: hashbrown::HashMap<Bytes, crate::agent::AgentCheckpointThread>,
+    pub agent_tools: hashbrown::HashMap<Bytes, crate::agent::AgentToolRegistry>,
     pub crdt_store: crate::crdt::CrdtStore,
     pub json_store: crate::json::JsonStore,
     pub probabilistic_store: crate::probabilistic::ProbabilisticStore,
@@ -606,6 +608,8 @@ impl ShardDb {
             semantic_caches: hashbrown::HashMap::new(),
             agent_memories: hashbrown::HashMap::new(),
             llm_quotas: hashbrown::HashMap::new(),
+            agent_checkpoints: hashbrown::HashMap::new(),
+            agent_tools: hashbrown::HashMap::new(),
             crdt_store: crate::crdt::CrdtStore::new(port),
             json_store: crate::json::JsonStore::new(),
             probabilistic_store: crate::probabilistic::ProbabilisticStore::new(),
@@ -1780,6 +1784,8 @@ impl ShardDb {
         self.semantic_caches.clear();
         self.agent_memories.clear();
         self.llm_quotas.clear();
+        self.agent_checkpoints.clear();
+        self.agent_tools.clear();
     }
 
     #[inline]
@@ -3187,6 +3193,67 @@ impl ShardDb {
             return (0, 0, 0, 0, 60_000);
         };
         bucket.info()
+    }
+
+    // Agent Checkpoint DAG & Tool Lease operations
+    pub fn agent_checkpoint_put(
+        &mut self,
+        key: Bytes,
+        step_id: Bytes,
+        parent_id: Option<Bytes>,
+        state: Bytes,
+        metadata: Option<Bytes>,
+    ) -> u64 {
+        self.agent_checkpoints
+            .entry(key)
+            .or_default()
+            .put(step_id, parent_id, state, metadata)
+    }
+
+    pub fn agent_checkpoint_get(
+        &self,
+        key: &Bytes,
+        step_id: Option<&Bytes>,
+    ) -> Option<crate::agent::AgentCheckpointNode> {
+        self.agent_checkpoints.get(key)?.get(step_id).cloned()
+    }
+
+    pub fn agent_checkpoint_history(
+        &self,
+        key: &Bytes,
+        from_step: Option<&Bytes>,
+        limit: usize,
+    ) -> Vec<crate::agent::AgentCheckpointNode> {
+        let Some(thread) = self.agent_checkpoints.get(key) else {
+            return Vec::new();
+        };
+        thread.history(from_step, limit)
+    }
+
+    pub fn agent_tool_claim(
+        &mut self,
+        key: Bytes,
+        call_id: Bytes,
+        ttl_ms: u64,
+        input: Option<Bytes>,
+    ) -> crate::agent::ToolClaimResult {
+        self.agent_tools
+            .entry(key)
+            .or_default()
+            .claim(call_id, ttl_ms, input)
+    }
+
+    pub fn agent_tool_complete(
+        &mut self,
+        key: Bytes,
+        call_id: Bytes,
+        output: Bytes,
+        ttl_ms: Option<u64>,
+    ) -> bool {
+        self.agent_tools
+            .entry(key)
+            .or_default()
+            .complete(call_id, output, ttl_ms)
     }
 
     // Active-Active CRDT operations

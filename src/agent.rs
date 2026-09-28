@@ -385,6 +385,213 @@ impl LlmQuotaBucket {
     }
 }
 
+/// A single node in an [`AgentCheckpointThread`] execution DAG.
+#[derive(Debug, Clone)]
+pub struct AgentCheckpointNode {
+    pub step_id: Bytes,
+    pub parent_id: Option<Bytes>,
+    pub seq: u64,
+    pub timestamp_ms: u64,
+    pub state: Bytes,
+    pub metadata: Option<Bytes>,
+}
+
+/// DAG-aware durable agent state checkpoint store for a thread (`AGENT.CHECKPOINT.*`).
+#[derive(Debug, Clone)]
+pub struct AgentCheckpointThread {
+    pub nodes: hashbrown::HashMap<Bytes, AgentCheckpointNode>,
+    pub order: Vec<Bytes>,
+    pub head_step_id: Option<Bytes>,
+    pub next_seq: u64,
+}
+
+impl Default for AgentCheckpointThread {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AgentCheckpointThread {
+    pub fn new() -> Self {
+        Self {
+            nodes: hashbrown::HashMap::new(),
+            order: Vec::new(),
+            head_step_id: None,
+            next_seq: 1,
+        }
+    }
+
+    pub fn put(
+        &mut self,
+        step_id: Bytes,
+        parent_id: Option<Bytes>,
+        state: Bytes,
+        metadata: Option<Bytes>,
+    ) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let node = AgentCheckpointNode {
+            step_id: step_id.clone(),
+            parent_id,
+            seq,
+            timestamp_ms,
+            state,
+            metadata,
+        };
+        if !self.nodes.contains_key(&step_id) {
+            self.order.push(step_id.clone());
+        }
+        self.nodes.insert(step_id.clone(), node);
+        self.head_step_id = Some(step_id);
+        seq
+    }
+
+    pub fn get(&self, step_id: Option<&Bytes>) -> Option<&AgentCheckpointNode> {
+        let target = step_id.or(self.head_step_id.as_ref())?;
+        self.nodes.get(target)
+    }
+
+    /// Walks the parent-pointer DAG lineage starting from `from_step` (or `head_step_id` when `None`),
+    /// returning up to `limit` ancestor checkpoints in reverse-lineage order (leaf -> root).
+    pub fn history(&self, from_step: Option<&Bytes>, limit: usize) -> Vec<AgentCheckpointNode> {
+        let mut out = Vec::new();
+        if limit == 0 {
+            return out;
+        }
+        let mut cur = from_step.or(self.head_step_id.as_ref()).cloned();
+        let mut visited = hashbrown::HashSet::new();
+        while let Some(step) = cur {
+            if !visited.insert(step.clone()) {
+                break;
+            }
+            let Some(node) = self.nodes.get(&step) else {
+                break;
+            };
+            out.push(node.clone());
+            if out.len() >= limit {
+                break;
+            }
+            cur = node.parent_id.clone();
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolClaimState {
+    Claimed,
+    InProgress,
+    Completed,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolClaimResult {
+    pub state: ToolClaimState,
+    pub output: Option<Bytes>,
+    pub meta_int: u64,
+}
+
+#[derive(Debug, Clone)]
+struct ToolCallEntry {
+    input: Option<Bytes>,
+    output: Option<Bytes>,
+    attempt: u64,
+    lease_until: Option<std::time::Instant>,
+    expire_at: Option<std::time::Instant>,
+}
+
+/// Idempotent tool-call lease & result deduplication registry (`AGENT.TOOL.*`).
+#[derive(Debug, Clone, Default)]
+pub struct AgentToolRegistry {
+    calls: hashbrown::HashMap<Bytes, ToolCallEntry>,
+}
+
+impl AgentToolRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn claim(&mut self, call_id: Bytes, ttl_ms: u64, input: Option<Bytes>) -> ToolClaimResult {
+        let now = std::time::Instant::now();
+        let lease_dur = std::time::Duration::from_millis(ttl_ms.max(1));
+
+        if let Some(entry) = self.calls.get_mut(&call_id) {
+            if entry.expire_at.is_some_and(|exp| now >= exp) {
+                self.calls.remove(&call_id);
+            } else if let Some(ref out) = entry.output {
+                return ToolClaimResult {
+                    state: ToolClaimState::Completed,
+                    output: Some(out.clone()),
+                    meta_int: 0,
+                };
+            } else if let Some(lease_until) = entry.lease_until
+                && now < lease_until
+            {
+                let rem_ms = lease_until.duration_since(now).as_millis() as u64;
+                return ToolClaimResult {
+                    state: ToolClaimState::InProgress,
+                    output: None,
+                    meta_int: rem_ms.max(1),
+                };
+            } else {
+                entry.attempt += 1;
+                entry.lease_until = Some(now + lease_dur);
+                if input.is_some() {
+                    entry.input = input;
+                }
+                return ToolClaimResult {
+                    state: ToolClaimState::Claimed,
+                    output: None,
+                    meta_int: entry.attempt,
+                };
+            }
+        }
+
+        self.calls.insert(
+            call_id,
+            ToolCallEntry {
+                input,
+                output: None,
+                attempt: 1,
+                lease_until: Some(now + lease_dur),
+                expire_at: None,
+            },
+        );
+        ToolClaimResult {
+            state: ToolClaimState::Claimed,
+            output: None,
+            meta_int: 1,
+        }
+    }
+
+    pub fn complete(&mut self, call_id: Bytes, output: Bytes, ttl_ms: Option<u64>) -> bool {
+        let now = std::time::Instant::now();
+        let expire_at = ttl_ms.map(|ms| now + std::time::Duration::from_millis(ms.max(1)));
+        if let Some(entry) = self.calls.get_mut(&call_id) {
+            entry.output = Some(output);
+            entry.lease_until = None;
+            entry.expire_at = expire_at;
+            true
+        } else {
+            self.calls.insert(
+                call_id,
+                ToolCallEntry {
+                    input: None,
+                    output: Some(output),
+                    attempt: 1,
+                    lease_until: None,
+                    expire_at,
+                },
+            );
+            true
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,5 +715,88 @@ mod tests {
         // Third request with 50 tokens -> denied due to RPM=2 (1 settled + 1 reserved = 2 active requests)
         let r4 = bucket.reserve(2, 1000, 50, None);
         assert!(!r4.allowed);
+    }
+
+    #[test]
+    fn test_agent_checkpoint_dag_and_tool_idempotency() {
+        let mut thread = AgentCheckpointThread::new();
+        assert_eq!(
+            thread.put(
+                Bytes::from("step_1"),
+                None,
+                Bytes::from(r#"{"node":"plan"}"#),
+                Some(Bytes::from(r#"{"actor":"planner"}"#)),
+            ),
+            1
+        );
+        // Branch A: step_1 -> step_2a
+        assert_eq!(
+            thread.put(
+                Bytes::from("step_2a"),
+                Some(Bytes::from("step_1")),
+                Bytes::from(r#"{"node":"tool_a"}"#),
+                None,
+            ),
+            2
+        );
+        // Branch B (forked from step_1): step_1 -> step_2b -> step_3b
+        assert_eq!(
+            thread.put(
+                Bytes::from("step_2b"),
+                Some(Bytes::from("step_1")),
+                Bytes::from(r#"{"node":"tool_b"}"#),
+                None,
+            ),
+            3
+        );
+        assert_eq!(
+            thread.put(
+                Bytes::from("step_3b"),
+                Some(Bytes::from("step_2b")),
+                Bytes::from(r#"{"node":"final_b"}"#),
+                None,
+            ),
+            4
+        );
+
+        // Head is step_3b; lineage from head is [step_3b, step_2b, step_1]
+        let head = thread.get(None).unwrap();
+        assert_eq!(head.step_id, Bytes::from("step_3b"));
+        let hist_b = thread.history(None, 10);
+        let ids_b: Vec<&[u8]> = hist_b.iter().map(|n| n.step_id.as_ref()).collect();
+        assert_eq!(
+            ids_b,
+            vec![&b"step_3b"[..], &b"step_2b"[..], &b"step_1"[..]]
+        );
+
+        // Time-travel lineage from forked branch step_2a is [step_2a, step_1]
+        let hist_a = thread.history(Some(&Bytes::from("step_2a")), 10);
+        let ids_a: Vec<&[u8]> = hist_a.iter().map(|n| n.step_id.as_ref()).collect();
+        assert_eq!(ids_a, vec![&b"step_2a"[..], &b"step_1"[..]]);
+
+        // Tool idempotency lease lifecycle
+        let mut tools = AgentToolRegistry::new();
+        let c1 = tools.claim(
+            Bytes::from("call_99"),
+            30_000,
+            Some(Bytes::from(r#"{"sql":"SELECT 1"}"#)),
+        );
+        assert_eq!(c1.state, ToolClaimState::Claimed);
+        assert_eq!(c1.meta_int, 1);
+
+        // Concurrent duplicate claim while lease is active -> IN_PROGRESS
+        let c2 = tools.claim(Bytes::from("call_99"), 30_000, None);
+        assert_eq!(c2.state, ToolClaimState::InProgress);
+        assert!(c2.meta_int > 0);
+
+        // Complete the tool call -> subsequent claims return cached COMPLETED output
+        assert!(tools.complete(
+            Bytes::from("call_99"),
+            Bytes::from(r#"{"rows":[1]}"#),
+            Some(60_000),
+        ));
+        let c3 = tools.claim(Bytes::from("call_99"), 30_000, None);
+        assert_eq!(c3.state, ToolClaimState::Completed);
+        assert_eq!(c3.output, Some(Bytes::from(r#"{"rows":[1]}"#)));
     }
 }

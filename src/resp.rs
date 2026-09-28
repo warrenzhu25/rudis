@@ -1130,6 +1130,35 @@ pub enum Command {
         actual_tokens: u64,
     },
     LlmQuotaInfo(Bytes),
+    // AGENT CHECKPOINT & IDEMPOTENT TOOL EXECUTION COMMANDS
+    AgentCheckpointPut {
+        key: Bytes,
+        step_id: Bytes,
+        parent_id: Option<Bytes>,
+        state: Bytes,
+        meta: Option<Bytes>,
+    },
+    AgentCheckpointGet {
+        key: Bytes,
+        step_id: Option<Bytes>,
+    },
+    AgentCheckpointHistory {
+        key: Bytes,
+        from_step: Option<Bytes>,
+        limit: usize,
+    },
+    AgentToolClaim {
+        key: Bytes,
+        call_id: Bytes,
+        ttl_ms: u64,
+        input: Option<Bytes>,
+    },
+    AgentToolComplete {
+        key: Bytes,
+        call_id: Bytes,
+        output: Bytes,
+        ttl_ms: Option<u64>,
+    },
     // CRDT MULTI-REGION COMMANDS
     CrdtSet {
         key: Bytes,
@@ -10507,6 +10536,182 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'llm.quota.info' command".to_string());
             }
             Ok(Some(Command::LlmQuotaInfo(args[1].clone())))
+        }
+        "AGENT.CHECKPOINT.PUT" => {
+            if args.len() < 4 {
+                return Err(
+                    "wrong number of arguments for 'agent.checkpoint.put' command".to_string(),
+                );
+            }
+            let key = args[1].clone();
+            let step_id = args[2].clone();
+            let mut parent_id: Option<Bytes> = None;
+            let mut state: Option<Bytes> = None;
+            let mut meta: Option<Bytes> = None;
+            let mut i = 3;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "PARENT" if i + 1 < args.len() => {
+                        parent_id = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "STATE" if i + 1 < args.len() => {
+                        state = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "META" if i + 1 < args.len() => {
+                        meta = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    _ if state.is_none() && i == 3 => {
+                        state = Some(args[i].clone());
+                        i += 1;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            let Some(state) = state else {
+                return Err("missing STATE in 'agent.checkpoint.put' command".to_string());
+            };
+            Ok(Some(Command::AgentCheckpointPut {
+                key,
+                step_id,
+                parent_id,
+                state,
+                meta,
+            }))
+        }
+        "AGENT.CHECKPOINT.GET" => {
+            if args.len() < 2 {
+                return Err(
+                    "wrong number of arguments for 'agent.checkpoint.get' command".to_string(),
+                );
+            }
+            let key = args[1].clone();
+            let step_id = if args.len() == 2 {
+                None
+            } else if args.len() == 3 {
+                Some(args[2].clone())
+            } else if args.len() == 4
+                && String::from_utf8_lossy(&args[2]).eq_ignore_ascii_case("STEP")
+            {
+                Some(args[3].clone())
+            } else {
+                return Err("syntax error".to_string());
+            };
+            Ok(Some(Command::AgentCheckpointGet { key, step_id }))
+        }
+        "AGENT.CHECKPOINT.HISTORY" => {
+            if args.len() < 2 {
+                return Err(
+                    "wrong number of arguments for 'agent.checkpoint.history' command".to_string(),
+                );
+            }
+            let key = args[1].clone();
+            let mut from_step: Option<Bytes> = None;
+            let mut limit: usize = 50;
+            let mut i = 2;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "FROM" | "STEP" if i + 1 < args.len() => {
+                        from_step = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "LIMIT" if i + 1 < args.len() => {
+                        let v: usize = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        limit = v;
+                        i += 2;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            Ok(Some(Command::AgentCheckpointHistory {
+                key,
+                from_step,
+                limit,
+            }))
+        }
+        "AGENT.TOOL.CLAIM" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'agent.tool.claim' command".to_string());
+            }
+            let key = args[1].clone();
+            let call_id = args[2].clone();
+            let mut ttl_ms: u64 = 30_000;
+            let mut input: Option<Bytes> = None;
+            let mut i = 3;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "TTL" | "PX" if i + 1 < args.len() => {
+                        let v: u64 = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        ttl_ms = v;
+                        i += 2;
+                    }
+                    "INPUT" if i + 1 < args.len() => {
+                        input = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            Ok(Some(Command::AgentToolClaim {
+                key,
+                call_id,
+                ttl_ms,
+                input,
+            }))
+        }
+        "AGENT.TOOL.COMPLETE" => {
+            if args.len() < 4 {
+                return Err(
+                    "wrong number of arguments for 'agent.tool.complete' command".to_string(),
+                );
+            }
+            let key = args[1].clone();
+            let call_id = args[2].clone();
+            let mut output: Option<Bytes> = None;
+            let mut ttl_ms: Option<u64> = None;
+            let mut i = 3;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "OUTPUT" if i + 1 < args.len() => {
+                        output = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "TTL" | "PX" if i + 1 < args.len() => {
+                        let v: u64 = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        ttl_ms = Some(v);
+                        i += 2;
+                    }
+                    _ if output.is_none() && i == 3 => {
+                        output = Some(args[i].clone());
+                        i += 1;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            let Some(output) = output else {
+                return Err("missing OUTPUT in 'agent.tool.complete' command".to_string());
+            };
+            Ok(Some(Command::AgentToolComplete {
+                key,
+                call_id,
+                output,
+                ttl_ms,
+            }))
         }
         "XDP.INFO" => Ok(Some(Command::XdpInfo)),
         "XDP.RULE" => {

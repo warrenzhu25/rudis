@@ -2730,7 +2730,12 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::AgentMemClear(key)
         | Command::LlmQuotaReserve { key, .. }
         | Command::LlmQuotaSettle { key, .. }
-        | Command::LlmQuotaInfo(key) => Some(key),
+        | Command::LlmQuotaInfo(key)
+        | Command::AgentCheckpointPut { key, .. }
+        | Command::AgentCheckpointGet { key, .. }
+        | Command::AgentCheckpointHistory { key, .. }
+        | Command::AgentToolClaim { key, .. }
+        | Command::AgentToolComplete { key, .. } => Some(key),
 
         Command::Smove { source, .. }
         | Command::Lmove { source, .. }
@@ -3114,6 +3119,11 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
         | Command::LlmQuotaReserve { key: k, .. }
         | Command::LlmQuotaSettle { key: k, .. }
         | Command::LlmQuotaInfo(k)
+        | Command::AgentCheckpointPut { key: k, .. }
+        | Command::AgentCheckpointGet { key: k, .. }
+        | Command::AgentCheckpointHistory { key: k, .. }
+        | Command::AgentToolClaim { key: k, .. }
+        | Command::AgentToolComplete { key: k, .. }
         | Command::Hexpire { key: k, .. }
         | Command::Httl { key: k, .. }
         | Command::Hpersist { key: k, .. }
@@ -3902,7 +3912,12 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         | Command::AgentMemContext { .. }
         | Command::AgentMemCompact { .. }
         | Command::AgentMemInfo(_)
-        | Command::AgentMemClear(_) => "AGENT",
+        | Command::AgentMemClear(_)
+        | Command::AgentCheckpointPut { .. }
+        | Command::AgentCheckpointGet { .. }
+        | Command::AgentCheckpointHistory { .. }
+        | Command::AgentToolClaim { .. }
+        | Command::AgentToolComplete { .. } => "AGENT",
         Command::LlmQuotaReserve { .. }
         | Command::LlmQuotaSettle { .. }
         | Command::LlmQuotaInfo(_) => "LLM",
@@ -6620,6 +6635,11 @@ async fn execute_command(
         | Command::LlmQuotaReserve { .. }
         | Command::LlmQuotaSettle { .. }
         | Command::LlmQuotaInfo(_)
+        | Command::AgentCheckpointPut { .. }
+        | Command::AgentCheckpointGet { .. }
+        | Command::AgentCheckpointHistory { .. }
+        | Command::AgentToolClaim { .. }
+        | Command::AgentToolComplete { .. }
         | Command::Vadd { .. }
         | Command::Vquery { .. }
         | Command::Vsim { .. }
@@ -10916,6 +10936,11 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::LlmQuotaReserve { key, .. }
         | Command::LlmQuotaSettle { key, .. }
         | Command::LlmQuotaInfo(key)
+        | Command::AgentCheckpointPut { key, .. }
+        | Command::AgentCheckpointGet { key, .. }
+        | Command::AgentCheckpointHistory { key, .. }
+        | Command::AgentToolClaim { key, .. }
+        | Command::AgentToolComplete { key, .. }
         | Command::Vadd { key, .. }
         | Command::Vquery { key, .. }
         | Command::Vsim { key, .. }
@@ -15606,6 +15631,110 @@ pub fn execute_local_command(
             write_resp_integer(out, active_res as i64);
             write_resp_bulk(out, b"window_ms");
             write_resp_integer(out, window_ms as i64);
+            false
+        }
+        Command::AgentCheckpointPut {
+            key,
+            step_id,
+            parent_id,
+            state,
+            meta,
+        } => {
+            let seq = db.agent_checkpoint_put(
+                key.clone(),
+                step_id.clone(),
+                parent_id.clone(),
+                state.clone(),
+                meta.clone(),
+            );
+            record_change!(cmd);
+            write_resp_integer(out, seq as i64);
+            false
+        }
+        Command::AgentCheckpointGet { key, step_id } => {
+            match db.agent_checkpoint_get(key, step_id.as_ref()) {
+                Some(node) => {
+                    write_resp_array_header(out, 10);
+                    write_resp_bulk(out, b"step_id");
+                    write_resp_bulk(out, &node.step_id);
+                    write_resp_bulk(out, b"parent_id");
+                    match node.parent_id {
+                        Some(p) => write_resp_bulk(out, &p),
+                        None => write_resp_null(out),
+                    }
+                    write_resp_bulk(out, b"seq");
+                    write_resp_integer(out, node.seq as i64);
+                    write_resp_bulk(out, b"state");
+                    write_resp_bulk(out, &node.state);
+                    write_resp_bulk(out, b"meta");
+                    match node.metadata {
+                        Some(m) => write_resp_bulk(out, &m),
+                        None => write_resp_null(out),
+                    }
+                }
+                None => write_resp_null(out),
+            }
+            false
+        }
+        Command::AgentCheckpointHistory {
+            key,
+            from_step,
+            limit,
+        } => {
+            let history = db.agent_checkpoint_history(key, from_step.as_ref(), *limit);
+            write_resp_array_header(out, history.len());
+            for node in history {
+                write_resp_array_header(out, 10);
+                write_resp_bulk(out, b"step_id");
+                write_resp_bulk(out, &node.step_id);
+                write_resp_bulk(out, b"parent_id");
+                match node.parent_id {
+                    Some(p) => write_resp_bulk(out, &p),
+                    None => write_resp_null(out),
+                }
+                write_resp_bulk(out, b"seq");
+                write_resp_integer(out, node.seq as i64);
+                write_resp_bulk(out, b"state");
+                write_resp_bulk(out, &node.state);
+                write_resp_bulk(out, b"meta");
+                match node.metadata {
+                    Some(m) => write_resp_bulk(out, &m),
+                    None => write_resp_null(out),
+                }
+            }
+            false
+        }
+        Command::AgentToolClaim {
+            key,
+            call_id,
+            ttl_ms,
+            input,
+        } => {
+            let res = db.agent_tool_claim(key.clone(), call_id.clone(), *ttl_ms, input.clone());
+            write_resp_array_header(out, 3);
+            let status_str = match res.state {
+                crate::agent::ToolClaimState::Claimed => b"CLAIMED" as &[u8],
+                crate::agent::ToolClaimState::InProgress => b"IN_PROGRESS" as &[u8],
+                crate::agent::ToolClaimState::Completed => b"COMPLETED" as &[u8],
+            };
+            write_resp_bulk(out, status_str);
+            match res.output {
+                Some(o) => write_resp_bulk(out, &o),
+                None => write_resp_null(out),
+            }
+            write_resp_integer(out, res.meta_int as i64);
+            false
+        }
+        Command::AgentToolComplete {
+            key,
+            call_id,
+            output,
+            ttl_ms,
+        } => {
+            let created =
+                db.agent_tool_complete(key.clone(), call_id.clone(), output.clone(), *ttl_ms);
+            record_change!(cmd);
+            write_resp_integer(out, i64::from(created));
             false
         }
         Command::Vadd {

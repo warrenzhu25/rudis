@@ -13312,3 +13312,128 @@ fn test_ft_hybrid_alter_list_profile_and_multi_vector_json_e2e() {
         prof_resp
     );
 }
+
+#[test]
+fn test_agent_checkpoint_dag_and_tool_idempotency_e2e() {
+    let port = 19155;
+    start_test_server(port, 2);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // 1. AGENT.CHECKPOINT.PUT DAG nodes: root -> step_a -> step_b
+    let put_root = format_resp_cmd(&[
+        "AGENT.CHECKPOINT.PUT",
+        "thread:agent4",
+        "root",
+        "STATE",
+        r#"{"messages":["init"]}"#,
+        "META",
+        r#"{"node":"start"}"#,
+    ]);
+    assert_eq!(send_and_read(&mut client, &put_root), ":1\r\n");
+
+    let put_a = format_resp_cmd(&[
+        "AGENT.CHECKPOINT.PUT",
+        "thread:agent4",
+        "step_a",
+        "PARENT",
+        "root",
+        "STATE",
+        r#"{"messages":["init","plan"]}"#,
+    ]);
+    assert_eq!(send_and_read(&mut client, &put_a), ":2\r\n");
+
+    let put_b = format_resp_cmd(&[
+        "AGENT.CHECKPOINT.PUT",
+        "thread:agent4",
+        "step_b",
+        "PARENT",
+        "step_a",
+        "STATE",
+        r#"{"messages":["init","plan","done"]}"#,
+    ]);
+    assert_eq!(send_and_read(&mut client, &put_b), ":3\r\n");
+
+    // 2. AGENT.CHECKPOINT.GET latest (step_b) and specific (root)
+    let get_latest = format_resp_cmd(&["AGENT.CHECKPOINT.GET", "thread:agent4"]);
+    let latest_resp = send_and_read(&mut client, &get_latest);
+    assert!(
+        latest_resp.contains("step_b") && latest_resp.contains("step_a"),
+        "latest checkpoint: {}",
+        latest_resp
+    );
+
+    let get_root = format_resp_cmd(&["AGENT.CHECKPOINT.GET", "thread:agent4", "STEP", "root"]);
+    let root_resp = send_and_read(&mut client, &get_root);
+    assert!(
+        root_resp.contains("root") && root_resp.contains(r#"{"node":"start"}"#),
+        "root checkpoint: {}",
+        root_resp
+    );
+
+    // 3. AGENT.CHECKPOINT.HISTORY walks DAG lineage step_b -> step_a -> root
+    let hist_cmd = format_resp_cmd(&[
+        "AGENT.CHECKPOINT.HISTORY",
+        "thread:agent4",
+        "FROM",
+        "step_b",
+        "LIMIT",
+        "10",
+    ]);
+    let hist_resp = send_and_read(&mut client, &hist_cmd);
+    assert!(
+        hist_resp.starts_with("*3\r\n")
+            && hist_resp.contains("step_b")
+            && hist_resp.contains("step_a")
+            && hist_resp.contains("root"),
+        "history response: {}",
+        hist_resp
+    );
+
+    // 4. AGENT.TOOL.CLAIM & AGENT.TOOL.COMPLETE idempotency
+    let claim1 = format_resp_cmd(&[
+        "AGENT.TOOL.CLAIM",
+        "tools:agent4",
+        "call_42",
+        "TTL",
+        "30000",
+        "INPUT",
+        r#"{"amount":100}"#,
+    ]);
+    let claim1_resp = send_and_read(&mut client, &claim1);
+    assert!(
+        claim1_resp.starts_with("*3\r\n$7\r\nCLAIMED\r\n$-1\r\n"),
+        "first claim should be CLAIMED: {}",
+        claim1_resp
+    );
+
+    // Duplicate claim while in-flight -> IN_PROGRESS
+    let claim2_resp = send_and_read(&mut client, &claim1);
+    assert!(
+        claim2_resp.starts_with("*3\r\n$11\r\nIN_PROGRESS\r\n$-1\r\n"),
+        "second claim should be IN_PROGRESS: {}",
+        claim2_resp
+    );
+
+    // Complete tool call
+    let complete = format_resp_cmd(&[
+        "AGENT.TOOL.COMPLETE",
+        "tools:agent4",
+        "call_42",
+        "OUTPUT",
+        r#"{"tx_id":"tx_999"}"#,
+    ]);
+    assert_eq!(send_and_read(&mut client, &complete), ":1\r\n");
+
+    // Subsequent claim returns cached output with COMPLETED status
+    let claim3_resp = send_and_read(&mut client, &claim1);
+    assert!(
+        claim3_resp.starts_with("*3\r\n$9\r\nCOMPLETED\r\n")
+            && claim3_resp.contains(r#"{"tx_id":"tx_999"}"#),
+        "third claim should return COMPLETED with cached output: {}",
+        claim3_resp
+    );
+}
