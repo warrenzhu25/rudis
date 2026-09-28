@@ -1775,6 +1775,89 @@ impl HnswIndex {
         }
     }
 
+    /// Range search returning all vectors with `dist <= radius` (expanding up to
+    /// `radius * (1 + epsilon)` during layer-0 graph traversal), sorted by ascending distance.
+    pub fn range_filtered(
+        &self,
+        query: &[f32],
+        radius: f32,
+        epsilon: Option<f32>,
+        filter: Option<&dyn Fn(&Bytes) -> bool>,
+    ) -> Vec<(Bytes, f32)> {
+        if self.entry_point.is_none() || self.is_empty() || query.len() != self.dim || radius < 0.0
+        {
+            return Vec::new();
+        }
+        let eps = epsilon.unwrap_or(0.01).max(0.0);
+        let max_expand = (radius * (1.0 + eps)).max(radius);
+
+        let mut curr_obj = self.entry_point.unwrap();
+        let mut curr_dist = self.dist_to_node(query, self.nodes[curr_obj].as_ref().unwrap());
+        for lc in (1..=self.max_layer).rev() {
+            let mut changed = true;
+            while changed {
+                changed = false;
+                if let Some(curr_node) = &self.nodes[curr_obj]
+                    && lc < curr_node.neighbors.len()
+                {
+                    for &nbr in &curr_node.neighbors[lc] {
+                        if let Some(n) = &self.nodes[nbr] {
+                            let d = self.dist_to_node(query, n);
+                            if d < curr_dist {
+                                curr_dist = d;
+                                curr_obj = nbr;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Seed layer-0 expansion with a beam search of `ef_search` so we reach the query's
+        // neighborhood even when `entry_point` is outside `max_expand`, then expand all
+        // layer-0 neighbors within `max_expand`.
+        let seed = self.search_layer(query, curr_obj, self.ef_search.max(32), 0);
+        let mut visited = HashSet::new();
+        let mut queue = BinaryHeap::new();
+        let mut out = Vec::new();
+        for c in seed {
+            if visited.insert(c.id) {
+                queue.push(Candidate {
+                    id: c.id,
+                    distance: c.distance,
+                });
+            }
+        }
+
+        while let Some(curr) = queue.pop() {
+            let Some(Some(node)) = self.nodes.get(curr.id) else {
+                continue;
+            };
+            if curr.distance <= radius && filter.is_none_or(|f| f(&node.key)) {
+                out.push((node.key.clone(), curr.distance));
+            }
+            if !node.neighbors.is_empty() {
+                for &nbr_id in &node.neighbors[0] {
+                    if visited.insert(nbr_id)
+                        && let Some(Some(nbr_node)) = self.nodes.get(nbr_id)
+                    {
+                        let d = self.dist_to_node(query, nbr_node);
+                        if d <= max_expand {
+                            queue.push(Candidate {
+                                id: nbr_id,
+                                distance: d,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        out
+    }
+
     /// Removes a key from the index, repairing local neighbor links and recycling the slot id.
     pub fn remove(&mut self, key: &Bytes) -> bool {
         if let Some(id) = self.key_to_id.remove(key) {
@@ -2546,6 +2629,20 @@ impl VectorFieldIndex {
         match self {
             Self::Flat(f) => f.search_filtered(query, k, filter),
             Self::Hnsw(h) => h.search_filtered(query, k, ef_runtime, false, filter),
+        }
+    }
+
+    /// Range search returning all vectors within `radius`, optionally restricted by `filter`.
+    pub fn range_filtered(
+        &self,
+        query: &[f32],
+        radius: f32,
+        epsilon: Option<f32>,
+        filter: Option<&dyn Fn(&Bytes) -> bool>,
+    ) -> Vec<(Bytes, f32)> {
+        match self {
+            Self::Flat(f) => f.range_filtered(query, radius, filter),
+            Self::Hnsw(h) => h.range_filtered(query, radius, epsilon, filter),
         }
     }
 

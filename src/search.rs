@@ -1253,6 +1253,16 @@ pub enum QueryAst {
         /// `AS <alias>` / `$YIELD_DISTANCE_AS` name for the distance field.
         yield_as: Option<String>,
     },
+    VectorRange {
+        field: String,
+        radius: f32,
+        radius_param: Option<String>,
+        param_name: String,
+        /// `$EPSILON` literal or `$param`.
+        epsilon: Option<String>,
+        /// `$YIELD_DISTANCE_AS` / `AS` alias for the distance field.
+        yield_as: Option<String>,
+    },
     MatchAll,
 }
 
@@ -1270,20 +1280,24 @@ impl QueryAst {
         }
     }
 
-    /// Finds the KNN clause node of the query, if any.
+    /// Finds the KNN or `VECTOR_RANGE` clause node of the query, if any.
     pub fn knn_clause(&self) -> Option<&QueryAst> {
         match self {
-            QueryAst::KnnVector { .. } => Some(self),
+            QueryAst::KnnVector { .. } | QueryAst::VectorRange { .. } => Some(self),
             QueryAst::And(subs) | QueryAst::Or(subs) => subs.iter().find_map(|s| s.knn_clause()),
             QueryAst::FieldScope { inner, .. } => inner.knn_clause(),
             _ => None,
         }
     }
 
-    /// Name of the field carrying the KNN distance in results (`AS` alias or `__<field>_score`).
+    /// Name of the field carrying the vector distance in results (`AS` / `$YIELD_DISTANCE_AS`
+    /// alias or `__<field>_score`).
     pub fn knn_score_field(&self) -> Option<String> {
         match self.knn_clause()? {
             QueryAst::KnnVector {
+                field, yield_as, ..
+            }
+            | QueryAst::VectorRange {
                 field, yield_as, ..
             } => Some(
                 yield_as
@@ -1310,6 +1324,11 @@ impl QueryAst {
 
 /// Resolves a literal or `$param` value as `usize`.
 pub fn resolve_usize_param(raw: &str, opts: &SearchOptions) -> Option<usize> {
+    resolve_str_param(raw, opts)?.trim().parse().ok()
+}
+
+/// Resolves a literal or `$param` value as `f32`.
+pub fn resolve_f32_param(raw: &str, opts: &SearchOptions) -> Option<f32> {
     resolve_str_param(raw, opts)?.trim().parse().ok()
 }
 
@@ -1408,8 +1427,66 @@ fn parse_knn_clause(args_part: &str, trailer: &str) -> QueryAst {
     }
 }
 
+/// Parses `@field:[VECTOR_RANGE <radius|$param> $blob]` and an optional trailing
+/// `=>{$EPSILON: ...; $YIELD_DISTANCE_AS: alias}` attribute block.
+fn parse_vector_range_clause(field: &str, inside_brackets: &str, trailer: &str) -> QueryAst {
+    let tokens: Vec<&str> = inside_brackets.split_whitespace().collect();
+    // tokens[0] == "VECTOR_RANGE"
+    let (radius, radius_param) = match tokens.get(1) {
+        Some(t) if t.starts_with('$') => (0.0, Some(t.to_string())),
+        Some(t) => (t.parse().unwrap_or(0.0), None),
+        None => (0.0, None),
+    };
+    let param_name = tokens
+        .get(2)
+        .map(|s| s.trim_start_matches('$').to_string())
+        .unwrap_or_default();
+    let mut epsilon = None;
+    let mut yield_as = None;
+    let mut k = 3;
+    while k + 1 < tokens.len() {
+        match tokens[k]
+            .trim_start_matches('$')
+            .to_ascii_uppercase()
+            .as_str()
+        {
+            "EPSILON" => epsilon = Some(tokens[k + 1].to_string()),
+            "AS" | "YIELD_DISTANCE_AS" => yield_as = Some(tokens[k + 1].to_string()),
+            _ => {}
+        }
+        k += 2;
+    }
+    if let Some(body) = trailer
+        .trim()
+        .strip_prefix("=>")
+        .map(str::trim)
+        .and_then(|s| s.strip_prefix('{'))
+        .and_then(|s| s.split_once('}').map(|(b, _)| b))
+    {
+        for attr in body.split(';') {
+            if let Some((name, val)) = attr.split_once(':') {
+                let name = name.trim().trim_start_matches('$').to_ascii_uppercase();
+                let val = val.trim().to_string();
+                match name.as_str() {
+                    "EPSILON" => epsilon = Some(val),
+                    "YIELD_DISTANCE_AS" | "AS" => yield_as = Some(val),
+                    _ => {}
+                }
+            }
+        }
+    }
+    QueryAst::VectorRange {
+        field: field.to_string(),
+        radius,
+        radius_param,
+        param_name,
+        epsilon,
+        yield_as,
+    }
+}
+
 pub fn parse_query(q: &str) -> QueryAst {
-    let q = q.trim();
+    let q = strip_outer_parens(q);
     if q == "*" || q.is_empty() {
         return QueryAst::MatchAll;
     }
@@ -1441,33 +1518,56 @@ pub fn parse_query(q: &str) -> QueryAst {
         } else if w.starts_with('@') && w.contains(':') {
             let (field, rest) = w[1..].split_once(':').unwrap();
             if let Some(stripped) = rest.strip_prefix('[') {
-                // Numeric range: @price:[10 100]
+                // Numeric range `@price:[10 100]` or vector range `@vec:[VECTOR_RANGE r $blob]`
                 let mut range_str = stripped.to_string();
-                if !range_str.contains(']') {
+                while !range_str.contains(']') && i + 1 < words.len() {
+                    i += 1;
+                    range_str.push(' ');
+                    range_str.push_str(words[i]);
+                }
+                let (inside, after_bracket) = range_str
+                    .split_once(']')
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+                    .unwrap_or((range_str, String::new()));
+                let mut trailer = after_bracket;
+                if (trailer.starts_with("=>")
+                    || (trailer.is_empty()
+                        && i + 1 < words.len()
+                        && words[i + 1].starts_with("=>")))
+                    && !trailer.contains('}')
+                {
                     while i + 1 < words.len() {
                         i += 1;
-                        range_str.push(' ');
-                        range_str.push_str(words[i]);
-                        if words[i].ends_with(']') {
+                        if !trailer.is_empty() {
+                            trailer.push(' ');
+                        }
+                        trailer.push_str(words[i]);
+                        if words[i].contains('}') {
                             break;
                         }
                     }
                 }
-                let clean = range_str.trim_end_matches(']');
-                let parts: Vec<&str> = clean.split_whitespace().collect();
-                let min = parts
+                let parts: Vec<&str> = inside.split_whitespace().collect();
+                if parts
                     .first()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(f64::NEG_INFINITY);
-                let max = parts
-                    .get(1)
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(f64::INFINITY);
-                terms.push(QueryAst::NumericRange {
-                    field: field.to_string(),
-                    min,
-                    max,
-                });
+                    .is_some_and(|p| p.eq_ignore_ascii_case("VECTOR_RANGE"))
+                {
+                    terms.push(parse_vector_range_clause(field, &inside, &trailer));
+                } else {
+                    let min = parts
+                        .first()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(f64::NEG_INFINITY);
+                    let max = parts
+                        .get(1)
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(f64::INFINITY);
+                    terms.push(QueryAst::NumericRange {
+                        field: field.to_string(),
+                        min,
+                        max,
+                    });
+                }
             } else if let Some(stripped) = rest.strip_prefix('{') {
                 // Tag filter: @category:{electronics | books}
                 let mut tag_str = stripped.to_string();
@@ -1687,20 +1787,26 @@ fn evaluate_ast(
             if sub_asts.is_empty() {
                 return HashMap::new();
             }
-            // Hybrid query: evaluate the non-vector filter first and restrict the KNN search to
-            // it (pre-filtering), so selective filters still return K results.
-            if let Some(knn_pos) = sub_asts
-                .iter()
-                .position(|s| matches!(s, QueryAst::KnnVector { .. }))
-            {
+            // Hybrid query: evaluate the non-vector filter first and restrict the KNN /
+            // VECTOR_RANGE search to it (pre-filtering).
+            if let Some(vec_pos) = sub_asts.iter().position(|s| {
+                matches!(s, QueryAst::KnnVector { .. } | QueryAst::VectorRange { .. })
+            }) {
                 let others: Vec<&QueryAst> = sub_asts
                     .iter()
                     .enumerate()
-                    .filter(|(i, s)| *i != knn_pos && !matches!(s, QueryAst::MatchAll))
+                    .filter(|(i, s)| *i != vec_pos && !matches!(s, QueryAst::MatchAll))
                     .map(|(_, s)| s)
                     .collect();
+                let eval_vec = |f: Option<&HashMap<DocId, f64>>| match &sub_asts[vec_pos] {
+                    QueryAst::KnnVector { .. } => knn_search(index, &sub_asts[vec_pos], opts, f),
+                    QueryAst::VectorRange { .. } => {
+                        vector_range_search(index, &sub_asts[vec_pos], opts, f)
+                    }
+                    _ => HashMap::new(),
+                };
                 if others.is_empty() {
-                    return knn_search(index, &sub_asts[knn_pos], opts, None);
+                    return eval_vec(None);
                 }
                 let mut filter = evaluate_ast(index, others[0], opts);
                 for sub in &others[1..] {
@@ -1713,7 +1819,7 @@ fn evaluate_ast(
                 if filter.is_empty() {
                     return HashMap::new();
                 }
-                return knn_search(index, &sub_asts[knn_pos], opts, Some(&filter));
+                return eval_vec(Some(&filter));
             }
             let mut current = evaluate_ast(index, &sub_asts[0], opts);
             for sub in &sub_asts[1..] {
@@ -1753,6 +1859,7 @@ fn evaluate_ast(
             map
         }
         QueryAst::KnnVector { .. } => knn_search(index, ast, opts, None),
+        QueryAst::VectorRange { .. } => vector_range_search(index, ast, opts, None),
     }
 }
 
@@ -1765,6 +1872,86 @@ fn distance_to_similarity(metric: crate::vector::VectorMetric, dist: f32) -> f64
         crate::vector::VectorMetric::Cosine => (1.0 - dist).max(0.0) as f64,
         _ => (1.0 / (1.0 + dist.max(0.0))) as f64,
     }
+}
+
+/// Executes a `@field:[VECTOR_RANGE radius $blob]` clause, optionally restricted by `filter`.
+fn vector_range_search(
+    index: &InvertedIndex,
+    vr: &QueryAst,
+    opts: &SearchOptions,
+    filter: Option<&HashMap<DocId, f64>>,
+) -> HashMap<DocId, f64> {
+    let QueryAst::VectorRange {
+        field,
+        radius,
+        radius_param,
+        param_name,
+        epsilon,
+        ..
+    } = vr
+    else {
+        return HashMap::new();
+    };
+    let effective_radius = radius_param
+        .as_deref()
+        .and_then(|p| resolve_f32_param(p, opts))
+        .unwrap_or(*radius);
+    let eps = epsilon.as_deref().and_then(|e| resolve_f32_param(e, opts));
+    let effective_vec = knn_query_vector(index, field, &[], param_name, opts);
+    let mut map = HashMap::new();
+    if effective_vec.is_empty() || effective_radius < 0.0 {
+        return map;
+    }
+    let sf = index.resolve_vector_field(field);
+    let alias = sf.map(|s| s.alias.as_str()).unwrap_or(field.as_str());
+    let vi_opt = index.vector_indices.get(alias);
+    let metric = vi_opt
+        .map(|vi| vi.metric())
+        .or_else(|| match sf.map(|s| &s.field_type) {
+            Some(FieldType::Vector {
+                distance_metric, ..
+            }) => Some(metric_from_str(distance_metric)),
+            _ => None,
+        })
+        .unwrap_or(crate::vector::VectorMetric::Cosine);
+
+    let brute_force_range = |ids: &mut dyn Iterator<Item = DocId>| -> Vec<(DocId, f32)> {
+        ids.filter_map(|id| {
+            let v = index.id_to_meta.get(&id)?.vector_fields.get(alias)?;
+            if v.len() != effective_vec.len() {
+                return None;
+            }
+            let d = crate::vector::compute_distance(&effective_vec, v, metric);
+            (d <= effective_radius).then_some((id, d))
+        })
+        .collect()
+    };
+
+    let results: Vec<(DocId, f32)> = match (vi_opt, filter) {
+        (None, None) => brute_force_range(&mut index.id_to_meta.keys().copied()),
+        (None, Some(f)) => brute_force_range(&mut f.keys().copied()),
+        (Some(vi), None) => vi
+            .range_filtered(&effective_vec, effective_radius, eps, None)
+            .into_iter()
+            .filter_map(|(key, d)| index.key_to_id.get(&key).map(|id| (*id, d)))
+            .collect(),
+        (Some(vi), Some(f)) => {
+            let pred = |key: &Bytes| {
+                index
+                    .key_to_id
+                    .get(key)
+                    .is_some_and(|id| f.contains_key(id))
+            };
+            vi.range_filtered(&effective_vec, effective_radius, eps, Some(&pred))
+                .into_iter()
+                .filter_map(|(key, d)| index.key_to_id.get(&key).map(|id| (*id, d)))
+                .collect()
+        }
+    };
+    for (id, d) in results {
+        map.insert(id, distance_to_similarity(metric, d));
+    }
+    map
 }
 
 /// Executes a KNN clause, optionally restricted to the documents of `filter`.
@@ -1893,24 +2080,28 @@ fn knn_query_vector(
     }
 }
 
-/// Computes the exact KNN distance of each candidate document for the query's KNN clause.
+/// Computes the exact vector distance of each candidate document for the query's KNN or
+/// `VECTOR_RANGE` clause.
 fn knn_distances(
     index: &InvertedIndex,
     ast: &QueryAst,
     opts: &SearchOptions,
     candidates: &HashMap<DocId, f64>,
 ) -> Option<HashMap<DocId, f32>> {
-    let QueryAst::KnnVector {
-        field,
-        query_vec,
-        param_name,
-        ..
-    } = ast.knn_clause()?
-    else {
-        return None;
+    let (field, query_vec, param_name): (&str, &[f32], &str) = match ast.knn_clause()? {
+        QueryAst::KnnVector {
+            field,
+            query_vec,
+            param_name,
+            ..
+        } => (field, query_vec, param_name),
+        QueryAst::VectorRange {
+            field, param_name, ..
+        } => (field, &[], param_name),
+        _ => return None,
     };
     let sf = index.resolve_vector_field(field);
-    let alias = sf.map(|s| s.alias.as_str()).unwrap_or(field.as_str());
+    let alias = sf.map(|s| s.alias.as_str()).unwrap_or(field);
     let metric = index
         .vector_indices
         .get(alias)
@@ -3527,5 +3718,92 @@ mod tests {
         assert_eq!(hits_rrf[0].doc_id, "chunk:1");
         let expected_top_rrf = (1.0 / 61.0) + (1.0 / 62.0);
         assert!((hits_rrf[0].score - expected_top_rrf).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_vector_range_query_and_hybrid_filter() {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "cat".to_string(),
+            FieldType::Tag {
+                separator: ',',
+                casesensitive: false,
+            },
+        );
+        fields.insert(
+            "vec".to_string(),
+            FieldType::Vector {
+                dim: 3,
+                distance_metric: "L2".to_string(),
+                algorithm: "HNSW".to_string(),
+                attrs: VectorFieldAttrs::default(),
+            },
+        );
+        let schema_fields = vec![
+            SchemaField {
+                identifier: "cat".to_string(),
+                alias: "cat".to_string(),
+                field_type: fields["cat"].clone(),
+            },
+            SchemaField {
+                identifier: "vec".to_string(),
+                alias: "vec".to_string(),
+                field_type: fields["vec"].clone(),
+            },
+        ];
+        let mut idx = InvertedIndex::new(IndexSchema {
+            name: "idx:vr".to_string(),
+            on_type: "HASH".to_string(),
+            prefixes: vec!["item:".to_string()],
+            fields,
+            schema_fields,
+        });
+
+        for (id, cat, v) in [
+            ("item:1", "gpu", "1.0, 0.0, 0.0"),  // sq L2 to [1,0,0] = 0.0
+            ("item:2", "cpu", "0.8, 0.2, 0.0"),  // sq L2 = 0.08
+            ("item:3", "gpu", "0.6, 0.4, 0.0"),  // sq L2 = 0.32
+            ("item:4", "gpu", "-1.0, 0.0, 0.0"), // sq L2 = 4.0
+        ] {
+            let mut m = HashMap::new();
+            m.insert("cat".to_string(), cat.to_string());
+            m.insert("vec".to_string(), v.to_string());
+            idx.add_document(id, m, None);
+        }
+
+        let mut params = HashMap::new();
+        let q_bytes: Vec<u8> = [1.0f32, 0.0, 0.0]
+            .into_iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        params.insert("q".to_string(), q_bytes);
+        params.insert("r".to_string(), b"0.6".to_vec());
+
+        // 1. Standalone VECTOR_RANGE with $r parameter and $YIELD_DISTANCE_AS
+        let ast = parse_query(
+            "@vec:[VECTOR_RANGE $r $q]=>{$EPSILON: 0.05; $YIELD_DISTANCE_AS: range_dist}",
+        );
+        let opts = SearchOptions {
+            limit: 10,
+            params: params.clone(),
+            ..Default::default()
+        };
+        let (total, hits) = execute_search(&idx, &ast, &opts);
+        assert_eq!(total, 3);
+        assert_eq!(hits[0].doc_id, "item:1");
+        assert_eq!(hits[1].doc_id, "item:2");
+        assert_eq!(hits[2].doc_id, "item:3");
+        assert_eq!(
+            hits[0].fields.get("range_dist").map(String::as_str),
+            Some("0")
+        );
+
+        // 2. Hybrid tag + VECTOR_RANGE query
+        let ast_hybrid =
+            parse_query("@cat:{gpu} @vec:[VECTOR_RANGE 0.6 $q]=>{$YIELD_DISTANCE_AS: range_dist}");
+        let (total_h, hits_h) = execute_search(&idx, &ast_hybrid, &opts);
+        assert_eq!(total_h, 2);
+        assert_eq!(hits_h[0].doc_id, "item:1");
+        assert_eq!(hits_h[1].doc_id, "item:3");
     }
 }
