@@ -1385,6 +1385,105 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             buf.extend_from_slice(b"\r\n");
             Some(buf)
         }
+        Command::Vadd {
+            key,
+            element,
+            vector,
+            metric,
+            quantize,
+            pq,
+            tiered,
+            reduce,
+            quant,
+            ef,
+            setattr,
+            m,
+            cas,
+            is_redis_vset,
+        } => {
+            let mut args: Vec<Vec<u8>> = Vec::with_capacity(14);
+            args.push(b"VADD".to_vec());
+            args.push(key.to_vec());
+            if *is_redis_vset {
+                if let Some(r) = reduce {
+                    args.push(b"REDUCE".to_vec());
+                    args.push(r.to_string().into_bytes());
+                }
+                args.push(b"FP32".to_vec());
+                let mut blob = Vec::with_capacity(vector.len() * 4);
+                for &v in vector {
+                    blob.extend_from_slice(&v.to_le_bytes());
+                }
+                args.push(blob);
+                args.push(element.to_vec());
+                if *cas {
+                    args.push(b"CAS".to_vec());
+                }
+                if let Some(q) = quant {
+                    args.push(match q {
+                        crate::vector::VQuant::NoQuant => b"NOQUANT".to_vec(),
+                        crate::vector::VQuant::Q8 => b"Q8".to_vec(),
+                        crate::vector::VQuant::Bin => b"BIN".to_vec(),
+                    });
+                }
+                if let Some(e) = ef {
+                    args.push(b"EF".to_vec());
+                    args.push(e.to_string().into_bytes());
+                }
+                if let Some(attr) = setattr {
+                    args.push(b"SETATTR".to_vec());
+                    args.push(attr.as_bytes().to_vec());
+                }
+                if let Some(m_val) = m {
+                    args.push(b"M".to_vec());
+                    args.push(m_val.to_string().into_bytes());
+                }
+            } else {
+                args.push(element.to_vec());
+                for &v in vector {
+                    args.push(v.to_string().into_bytes());
+                }
+                if let Some(m_type) = metric {
+                    args.push(m_type.as_str().as_bytes().to_vec());
+                }
+                if *quantize {
+                    args.push(b"QUANTIZE".to_vec());
+                }
+                if *pq {
+                    args.push(b"PQ".to_vec());
+                }
+                if *tiered {
+                    args.push(b"TIERED".to_vec());
+                }
+            }
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend_from_slice(&a);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
+        Command::Vdel { key, element } => {
+            buf.extend_from_slice(b"*3\r\n$4\r\nVREM\r\n");
+            buf.extend_from_slice(format!("${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n", element.len()).as_bytes());
+            buf.extend_from_slice(element);
+            buf.extend_from_slice(b"\r\n");
+            Some(buf)
+        }
+        Command::Vsetattr { key, element, attr } => {
+            buf.extend_from_slice(b"*4\r\n$8\r\nVSETATTR\r\n");
+            buf.extend_from_slice(format!("${}\r\n", key.len()).as_bytes());
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n", element.len()).as_bytes());
+            buf.extend_from_slice(element);
+            buf.extend_from_slice(format!("\r\n${}\r\n", attr.len()).as_bytes());
+            buf.extend_from_slice(attr.as_bytes());
+            buf.extend_from_slice(b"\r\n");
+            Some(buf)
+        }
         _ => None,
     }
 }
@@ -1684,6 +1783,34 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
         count += 1;
     }
 
+    // 3. Snapshot Vector sets / HNSW indexes
+    for (name, index) in &db.vector_indexes {
+        for (elem, &node_id) in &index.key_to_id {
+            if let Some(Some(node)) = index.nodes.get(node_id) {
+                let cmd = Command::Vadd {
+                    key: bytes::Bytes::from(name.clone()),
+                    element: elem.clone(),
+                    vector: node.vector.clone(),
+                    metric: Some(index.metric),
+                    quantize: node.quantized.is_some(),
+                    pq: node.pq.is_some(),
+                    tiered: node.is_tiered,
+                    reduce: None,
+                    quant: Some(index.quant),
+                    ef: None,
+                    setattr: index.attributes.get(elem).cloned(),
+                    m: Some(index.m),
+                    cas: false,
+                    is_redis_vset: index.is_redis_vset,
+                };
+                if let Some(resp) = command_to_resp(&cmd) {
+                    writer.write_all(&resp)?;
+                    count += 1;
+                }
+            }
+        }
+    }
+
     writer.flush()?;
     let file = writer.into_inner().map_err(|e| e.into_error())?;
     file.sync_all()?;
@@ -1912,6 +2039,99 @@ mod tests {
             .unwrap();
         assert!(aof_ttls[0] > 0 && aof_ttls[0] <= 60);
         assert_eq!(aof_ttls[1], -1);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_rdb_and_aof_vector_set_persistence() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("rudis-vset-persist-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let mut db = ShardDb::new(6379);
+        db.vadd_ext(
+            "movies",
+            Bytes::from("m1"),
+            vec![1.0, 0.0, 0.0],
+            None,
+            false,
+            false,
+            false,
+            None,
+            Some(crate::vector::VQuant::Q8),
+            Some(64),
+            Some(r#"{"genre":"sci-fi","year":1999}"#.to_string()),
+            Some(24),
+            true,
+        )
+        .unwrap();
+        db.vadd_ext(
+            "movies",
+            Bytes::from("m2"),
+            vec![0.0, 1.0, 0.0],
+            None,
+            false,
+            false,
+            false,
+            None,
+            Some(crate::vector::VQuant::Q8),
+            None,
+            Some(r#"{"genre":"drama","year":2020}"#.to_string()),
+            Some(24),
+            true,
+        )
+        .unwrap();
+
+        // 1. Extended RDB round-trip
+        let mut rdb_chunk = Vec::new();
+        db.save_extended_rdb_chunk(&mut rdb_chunk);
+        let mut restored_rdb = ShardDb::new(6379);
+        restored_rdb.restore_rdb_chunk(&rdb_chunk).unwrap();
+        let idx = restored_rdb.vector_indexes.get("movies").unwrap();
+        assert!(idx.is_redis_vset);
+        assert_eq!(idx.quant, crate::vector::VQuant::Q8);
+        assert_eq!(idx.m, 24);
+        assert_eq!(idx.len(), 2);
+        assert_eq!(
+            restored_rdb.vgetattr("movies", &Bytes::from("m1")).unwrap(),
+            Some(r#"{"genre":"sci-fi","year":1999}"#.to_string())
+        );
+
+        // 2. AOF rewrite & replay round-trip
+        rewrite_shard_aof(&mut db, &temp_dir, 0).unwrap();
+        let aof_file = temp_dir.join("appendonly-0.aof");
+        let mut restored_aof = ShardDb::new(6379);
+        replay_aof(&aof_file, &mut restored_aof).unwrap();
+        let aof_idx = restored_aof.vector_indexes.get("movies").unwrap();
+        assert!(aof_idx.is_redis_vset);
+        assert_eq!(aof_idx.quant, crate::vector::VQuant::Q8);
+        assert_eq!(aof_idx.m, 24);
+        assert_eq!(aof_idx.len(), 2);
+        assert_eq!(
+            restored_aof.vgetattr("movies", &Bytes::from("m2")).unwrap(),
+            Some(r#"{"genre":"drama","year":2020}"#.to_string())
+        );
+
+        // 3. Incremental VSETATTR and VREM command_to_resp replay
+        let setattr_cmd = Command::Vsetattr {
+            key: Bytes::from("movies"),
+            element: Bytes::from("m1"),
+            attr: r#"{"genre":"action","year":2001}"#.to_string(),
+        };
+        let vrem_cmd = Command::Vdel {
+            key: Bytes::from("movies"),
+            element: Bytes::from("m2"),
+        };
+        let mut stream = command_to_resp(&setattr_cmd).unwrap();
+        stream.extend_from_slice(&command_to_resp(&vrem_cmd).unwrap());
+        std::fs::write(&aof_file, &stream).unwrap();
+        replay_aof(&aof_file, &mut restored_aof).unwrap();
+        assert_eq!(restored_aof.vector_indexes.get("movies").unwrap().len(), 1);
+        assert_eq!(
+            restored_aof.vgetattr("movies", &Bytes::from("m1")).unwrap(),
+            Some(r#"{"genre":"action","year":2001}"#.to_string())
+        );
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

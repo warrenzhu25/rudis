@@ -2081,10 +2081,37 @@ impl ShardDb {
                     buf.extend_from_slice(name.as_bytes());
                     buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
                     buf.extend_from_slice(key);
-                    buf.push(index.metric as u8);
+                    buf.push((index.metric as u8) | 0x80);
                     buf.extend_from_slice(&(node.vector.len() as u32).to_le_bytes());
                     for &coord in &node.vector {
                         buf.extend_from_slice(&coord.to_bits().to_le_bytes());
+                    }
+                    let mut vset_flags = 0u8;
+                    if index.is_redis_vset {
+                        vset_flags |= 0x01;
+                    }
+                    if node.quantized.is_some() {
+                        vset_flags |= 0x02;
+                    }
+                    if node.pq.is_some() {
+                        vset_flags |= 0x04;
+                    }
+                    if node.is_tiered {
+                        vset_flags |= 0x08;
+                    }
+                    buf.push(vset_flags);
+                    let quant_byte = match index.quant {
+                        crate::vector::VQuant::NoQuant => 0u8,
+                        crate::vector::VQuant::Q8 => 1u8,
+                        crate::vector::VQuant::Bin => 2u8,
+                    };
+                    buf.push(quant_byte);
+                    buf.extend_from_slice(&(index.m as u32).to_le_bytes());
+                    if let Some(attr) = index.attributes.get(key) {
+                        buf.extend_from_slice(&(attr.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(attr.as_bytes());
+                    } else {
+                        buf.extend_from_slice(&0u32.to_le_bytes());
                     }
                 }
             }
@@ -2307,7 +2334,8 @@ impl ShardDb {
                     return Err("Truncated vector metric and dim");
                 }
                 let metric_byte = data[0];
-                let metric = match metric_byte {
+                let has_vset_ext = (metric_byte & 0x80) != 0;
+                let metric = match metric_byte & 0x07 {
                     0 => crate::vector::VectorMetric::Cosine,
                     1 => crate::vector::VectorMetric::L2,
                     _ => crate::vector::VectorMetric::IP,
@@ -2323,15 +2351,58 @@ impl ShardDb {
                     vector.push(f32::from_bits(bits));
                 }
                 data = &data[vec_len * 4..];
-                let _ = self.vadd(
-                    &idx_name,
-                    doc_key,
-                    vector,
-                    Some(metric),
-                    false,
-                    false,
-                    false,
-                );
+                if has_vset_ext {
+                    if data.len() < 10 {
+                        return Err("Truncated vector set extended metadata");
+                    }
+                    let vset_flags = data[0];
+                    let is_redis_vset = (vset_flags & 0x01) != 0;
+                    let quantize = (vset_flags & 0x02) != 0;
+                    let pq = (vset_flags & 0x04) != 0;
+                    let tiered = (vset_flags & 0x08) != 0;
+                    let quant = match data[1] {
+                        0 => crate::vector::VQuant::NoQuant,
+                        1 => crate::vector::VQuant::Q8,
+                        _ => crate::vector::VQuant::Bin,
+                    };
+                    let m = u32::from_le_bytes(data[2..6].try_into().unwrap()) as usize;
+                    let attr_len = u32::from_le_bytes(data[6..10].try_into().unwrap()) as usize;
+                    data = &data[10..];
+                    if data.len() < attr_len {
+                        return Err("Truncated vector set attribute");
+                    }
+                    let setattr = if attr_len > 0 {
+                        Some(String::from_utf8_lossy(&data[..attr_len]).to_string())
+                    } else {
+                        None
+                    };
+                    data = &data[attr_len..];
+                    let _ = self.vadd_ext(
+                        &idx_name,
+                        doc_key,
+                        vector,
+                        Some(metric),
+                        quantize,
+                        pq,
+                        tiered,
+                        None,
+                        Some(quant),
+                        None,
+                        setattr,
+                        Some(m),
+                        is_redis_vset,
+                    );
+                } else {
+                    let _ = self.vadd(
+                        &idx_name,
+                        doc_key,
+                        vector,
+                        Some(metric),
+                        false,
+                        false,
+                        false,
+                    );
+                }
                 continue;
             } else if type_byte == 10 {
                 data = &data[1..];

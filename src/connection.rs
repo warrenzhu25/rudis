@@ -15263,6 +15263,7 @@ pub fn execute_local_command(
                 *is_redis_vset,
             ) {
                 Ok(added) => {
+                    record_change!(cmd);
                     notify_key_invalidation(db.port, key.as_ref(), 0);
                     notify_key_invalidation(db.port, element.as_ref(), 0);
                     if *is_redis_vset {
@@ -15410,6 +15411,7 @@ pub fn execute_local_command(
             let index = String::from_utf8_lossy(key);
             let removed = db.vdel(&index, element);
             if removed {
+                record_change!(cmd);
                 notify_key_invalidation(db.port, key.as_ref(), 0);
                 write_resp_integer(out, 1);
             } else {
@@ -15616,6 +15618,10 @@ pub fn execute_local_command(
             let index = String::from_utf8_lossy(key);
             match db.vsetattr(&index, element, attr.clone()) {
                 Ok(updated) => {
+                    if updated {
+                        record_change!(cmd);
+                        notify_key_invalidation(db.port, key.as_ref(), 0);
+                    }
                     write_resp_integer(out, i64::from(updated));
                 }
                 Err(err) => {
