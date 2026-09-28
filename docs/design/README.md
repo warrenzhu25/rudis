@@ -1,6 +1,6 @@
 # Rudis Subsystem Architecture & Design Specifications
 
-This directory contains the **High-Level Design Documents** for all 19 subsystems in Rudis.
+This directory contains the **High-Level Design Documents** for all 20 subsystems in Rudis.
 Each document focuses on **architectural purpose, design rationale ("why"), concurrency invariants, and performance characteristics**.
 
 For low-level implementation details, data structures, and line-by-line code references, see [`docs/internal/`](../internal/).
@@ -18,8 +18,8 @@ For low-level implementation details, data structures, and line-by-line code ref
 | 05 | **Storage Engine & Compact Encodings** | Custom SIMD open-addressed hash table inlining value, TTL, and small/full encodings in one slot | `src/table.rs` | [05_storage_engine.md](05_storage_engine.md) |
 | 06 | **Blocking Operations & The Reactive Event Hub** | Cross-shard blocking-command wakeup registry (`BLPOP`/`BZPOPMIN`/`XREAD BLOCK`) via one shared mutex | `src/block.rs` | [06_blocking_hub.md](06_blocking_hub.md) |
 | 07 | **NVMe SSD Tiered Storage Engine** | Transparent DRAM-to-NVMe cold-data offload via a Hot/Cooled/Tiered lifecycle with SmallBins packing | `src/tiering.rs` | [07_nvme_tiering.md](07_nvme_tiering.md) |
-| 08 | **Vector Search Engine: HNSW, SQ8 & PQ** | HNSW graph vector index with SIMD distance kernels and SQ8/Product-Quantization compression | `src/vector.rs` | [08_vector_engine.md](08_vector_engine.md) |
-| 09 | **RediSearch Full-Text Engine & Reciprocal Rank Fusion** | Native multi-field BM25/TAG/NUMERIC/vector search, per-shard partitioned, with RRF hybrid fusion | `src/search.rs` | [09_redisearch.md](09_redisearch.md) |
+| 08 | **Vector Search Engine: HNSW, Redis 8 Vector Sets & NVMe Tiering** | HNSW graph & Redis 8 Vector Sets with SIMD kernels, SQ8/BIN/PQ compression, and `.vtier` disk reranking | `src/vector.rs` | [08_vector_engine.md](08_vector_engine.md) |
+| 09 | **RediSearch Full-Text Engine & Hybrid Vector Fusion** | Multi-field BM25/TAG/NUMERIC/VECTOR search, `FT.HYBRID` (RRF/Linear), `FT.PROFILE`, and multi-vector JSON chunks | `src/search.rs` | [09_redisearch.md](09_redisearch.md) |
 | 10 | **Kernel Bypass & Zero-Copy Networking** | Simulated AF_XDP rings and unused `MSG_ZEROCOPY` primitives; not on the live network path | `src/xdp.rs, src/zerocopy.rs` | [10_kernel_bypass_xdp.md](10_kernel_bypass_xdp.md) |
 | 11 | **Redis Cluster Topology & Gossip Protocol** | 16,384-slot gossip cluster with quorum-based failover and genuine DUMP-and-replay slot migration | `src/cluster.rs` | [11_cluster_topology.md](11_cluster_topology.md) |
 | 12 | **CRDT Data Types & Manual Multi-Region Sync** | LWW-Register/OR-Set/PN-Counter CRDTs with an HLC, for manual, operator-driven multi-region sync | `src/crdt.rs` | [12_crdt_types.md](12_crdt_types.md) |
@@ -30,6 +30,7 @@ For low-level implementation details, data structures, and line-by-line code ref
 | 17 | **Geospatial Commands** | 52-bit geohash indexing over ZSet scores with geohash-interval-pruned Haversine distance queries | `src/geo.rs` | [17_geospatial.md](17_geospatial.md) |
 | 18 | **Probabilistic Data Structures** | Bloom, Cuckoo, Count-Min Sketch, and Top-K structures for bounded-memory approximate queries | `src/probabilistic.rs` | [18_probabilistic.md](18_probabilistic.md) |
 | 19 | **Pub/Sub Messaging Hub** | Per-shard Pub/Sub hubs with presence-bitmask-pruned cross-shard fan-out, plus sharded Pub/Sub | `src/pubsub.rs` | [19_pubsub.md](19_pubsub.md) |
+| 20 | **AI-Native Agent Runtime, Semantic Cache & MCP Server** | Working + HNSW episodic memory, RPM/TPM quota governor, DAG checkpoints, tool leases, MCP JSON-RPC 2.0, and semantic cache | `src/agent.rs, src/mcp.rs, src/semcache.rs` | [20_ai_native_runtime.md](20_ai_native_runtime.md) |
 
 ---
 

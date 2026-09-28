@@ -25,9 +25,10 @@ async runtime), in the tradition of engines such as ScyllaDB (Seastar) and Drago
 It speaks the **Redis wire protocol (RESP2, plus RESP3 reply encoding negotiated via
 `HELLO 3`)** and a **Memcached text-protocol gateway** on the same TCP port, so most existing
 Redis and Memcached client libraries can connect without modification. The `Command` enum in
-[`src/resp.rs`](src/resp.rs) currently defines close to 300 top-level command variants — strings,
+[`src/resp.rs`](src/resp.rs) currently defines over 330 top-level command variants — strings,
 hashes, lists, sets, sorted sets, streams, transactions, pub/sub, scripting, JSON, search,
-vector search, probabilistic structures, geospatial commands, cluster/replication/ACL
+vector search, AI-native agent memory/checkpoints/quotas, Model Context Protocol (MCP), semantic
+caching, probabilistic structures, geospatial commands, cluster/replication/ACL
 administration, and a Memcached command subset — plus nested subcommand enums (`ACL`,
 `CLUSTER`, `CLIENT`, `MEMORY`, and others) that expand the effective surface further. See
 [Subsystem & Feature Matrix](#subsystem--feature-matrix) below for what is implemented, and
@@ -52,11 +53,12 @@ are called out explicitly rather than left implicit, both here and in the linked
   - [1. Shared-Nothing Thread-Per-Core on Linux io_uring](#1-shared-nothing-thread-per-core-on-linux-io_uring)
   - [2. Fork-less RDB Snapshots](#2-fork-less-rdb-snapshots)
   - [3. Redis 7 Sharded Pub/Sub & Striped Presence Bitmask](#3-redis-7-sharded-pubsub--striped-presence-bitmask)
-  - [4. RediSearch: RangeTree Indexing & FT.AGGREGATE](#4-redisearch-rangetree-indexing--ftaggregate)
+  - [4. RediSearch: RangeTree Indexing, Hybrid Vector Search & FT.AGGREGATE](#4-redisearch-rangetree-indexing-hybrid-vector-search--ftaggregate)
   - [5. Replication: PSYNC and Dragonfly-Compatible DFLY FLOW](#5-replication-psync-and-dragonfly-compatible-dfly-flow)
   - [6. NVMe Tiered Storage (SmallBins & Direct I/O)](#6-nvme-tiered-storage-smallbins--direct-io)
   - [7. Kernel-Bypass Networking & TLS: Status](#7-kernel-bypass-networking--tls-status)
   - [8. Dual-Protocol Engine: Redis + Memcached](#8-dual-protocol-engine-redis--memcached)
+  - [9. AI-Native Agent Runtime, Semantic Cache & MCP Server](#9-ai-native-agent-runtime-semantic-cache--mcp-server)
 - [Subsystem & Feature Matrix](#subsystem--feature-matrix)
 - [Documentation & Contributor Guides](#documentation--contributor-guides)
 
@@ -521,11 +523,16 @@ mutex/cache-line-bouncing cost of a traditional shared-memory multi-threaded sto
   a documented, deliberate memory/precision trade-off, not a bug.
 - Details: [`docs/pub-sub.md`](docs/pub-sub.md).
 
-### 4. RediSearch: `RangeTree` Indexing & `FT.AGGREGATE`
+### 4. RediSearch: `RangeTree` Indexing, Hybrid Vector Search & `FT.AGGREGATE`
 
 - Documents are mapped to dense integer document IDs to shrink posting-list memory relative to
   storing string keys directly.
-- Numeric fields are indexed with a balanced `RangeTree` for `@field:[min max]` range queries.
+- Numeric fields are indexed with a balanced `RangeTree` for `@field:[min max]` range queries, and
+  `VECTOR` fields support both `FLAT` (exact) and `HNSW` (approximate) indexing over Hash and JSON
+  documents (including wildcard multi-vector chunk arrays such as `$.chunks[*].emb`).
+- Supports pre-filtered KNN (`@tag:{...}=>[KNN k @vec $blob]`), radius search (`@vec:[VECTOR_RANGE r $blob]`),
+  dedicated hybrid fusion (`FT.HYBRID` with `RRF` and `LINEAR` combinations), schema evolution (`FT.ALTER`),
+  and query execution profiling (`FT.PROFILE`).
 - `FT.AGGREGATE` supports a multi-stage pipeline (`GROUPBY`, `REDUCE`, `APPLY`, `SORTBY`).
 - Details and known limitations: [`docs/design/09_redisearch.md`](docs/design/09_redisearch.md).
 
@@ -582,6 +589,21 @@ including *why* this direction is still worth pursuing despite not being wired u
 - Protocol framing is auto-detected from the first bytes read on a new connection; both
   protocols share database 0.
 
+### 9. AI-Native Agent Runtime, Semantic Cache & MCP Server
+
+- **Hierarchical Agent Memory (`AGENT.MEM.*`)**: token-budgeted FIFO working memory window paired
+  with automatic HNSW episodic spill and hybrid recall (`AGENT.MEM.WINDOW`, `AGENT.MEM.SEARCH`,
+  `AGENT.MEM.COMPACT`).
+- **Dual RPM/TPM LLM Quota Governor (`LLM.QUOTA.*`)**: sliding-window Requests-Per-Minute and
+  Tokens-Per-Minute rate limiting with pre-flight token reservation (`LLM.QUOTA.RESERVE`) and
+  post-stream actual token settlement (`LLM.QUOTA.SETTLE`).
+- **DAG State Checkpointing & Idempotent Tool Leases (`AGENT.CHECKPOINT.*`, `AGENT.TOOL.*`)**:
+  parent-linked execution state lineage (`PUT`/`GET`/`HISTORY`) and TTL-guarded exactly-once tool
+  call execution leases (`CLAIM`/`COMPLETE`).
+- **Built-in Model Context Protocol Server (`MCP.*`) & Semantic Cache (`SEMCACHE.*`)**: native
+  JSON-RPC 2.0 MCP server (`MCP.TOOLS`, `MCP.CALL`, `MCP.RPC`) and cosine-similarity LLM prompt
+  cache. Details: [`docs/design/20_ai_native_runtime.md`](docs/design/20_ai_native_runtime.md).
+
 ---
 
 ## Subsystem & Feature Matrix
@@ -599,16 +621,17 @@ links go to the corresponding source-verified subsystem specification.
 | **Pub/Sub incl. Sharded Pub/Sub** | Implemented | 16-stripe presence bitmask; CRC16 slot routing for `SPUBLISH`. | [19](docs/design/19_pubsub.md), [pub-sub.md](docs/pub-sub.md) |
 | **Scripting & Functions** | Implemented | `EVAL`/`EVALSHA` and `FUNCTION`/`FCALL` via sandboxed `mlua` (Lua 5.4). | [13](docs/design/13_scripting_functions.md) |
 | **ACL & Security** | Implemented | Per-user permissions, category selectors, `AUTH`. | [15](docs/design/15_security_tls.md) |
-| **RDB persistence** | Implemented, with gaps | No `fork()`; blocking, per-shard-sequential file I/O; `save N M` is parsed but not scheduled; `RudisValue::Tiered` serializes to zero bytes today. | [rdbsave.md](docs/rdbsave.md) |
+| **RDB persistence** | Implemented, with gaps | No `fork()`; blocking, per-shard-sequential file I/O; persists KV, Vector Sets, and extended `RDBX` search/vector indexes; `RudisValue::Tiered` serializes to zero bytes today. | [rdbsave.md](docs/rdbsave.md) |
 | **AOF persistence** | Implemented | Async (`monoio`) periodic flush, distinct I/O strategy from RDB save. | [14](docs/design/14_persistence_replication.md) |
 | **Replication (`PSYNC`)** | Implemented | Single-connection, used for all Rudis-to-Rudis replication. | [replication.md](docs/replication.md) |
 | **Replication (`DFLY FLOW`)** | Implemented, narrow scope | Master-side only, for Dragonfly-protocol clients; Rudis replicas never use it. | [replication.md](docs/replication.md) |
 | **Redis Cluster & gossip** | Implemented | Plain-text gossip bus on `port + 10000` (not `io_uring`), quorum failover, real `CLUSTER SETSLOT`/`REBALANCE`/`RESHARD` key migration. | [11](docs/design/11_cluster_topology.md) |
 | **Dragonfly compatibility (state only)** | Partial | `DFLYCLUSTER`/`DFLYMIGRATE` remain bookkeeping-only, distinct from the more complete native cluster migration path above. | [11](docs/design/11_cluster_topology.md) |
 | **RedisJSON document store** | Implemented | JSONPath parsing, array slicing, in-place mutation. | [16](docs/design/16_json_store.md) |
-| **RediSearch (`FT.*`)** | Implemented | Inverted index, BM25 scoring, `RangeTree` numeric range, `FT.AGGREGATE`. | [09](docs/design/09_redisearch.md) |
+| **RediSearch (`FT.*`)** | Implemented | Inverted index, BM25, `RangeTree`, `FLAT` & `HNSW` vector fields, pre-filtered KNN, `VECTOR_RANGE`, `FT.HYBRID` (RRF/Linear), `FT.ALTER`, `FT.PROFILE`, multi-vector JSON chunks (`$.chunks[*].emb`). | [09](docs/design/09_redisearch.md) |
 | **RedisBloom-style probabilistic types** | Implemented | Bloom, Cuckoo, Count-Min Sketch, Top-K. | [18](docs/design/18_probabilistic.md) |
-| **HNSW vector search** | Implemented | Cosine/L2/IP metrics, SQ8 scalar quantization, product quantization. | [08](docs/design/08_vector_engine.md) |
+| **HNSW & Redis 8 Vector Sets (`V*`)** | Implemented | Redis 8 Vector Sets (`VADD`/`VSIM`/`VEMB`/`VLINKS`/`VSETATTR`), Cosine/L2/IP SIMD kernels, SQ8/BIN/PQ compression, `REDUCE` projection, NVMe `.vtier` disk reranking (`TIERED` + `RERANK`). | [08](docs/design/08_vector_engine.md) |
+| **AI-Native Agent Runtime & MCP** | Implemented | Working + HNSW episodic memory (`AGENT.MEM.*`), dual RPM/TPM quota governor (`LLM.QUOTA.*`), DAG checkpoints (`AGENT.CHECKPOINT.*`), tool leases (`AGENT.TOOL.*`), MCP JSON-RPC 2.0 (`MCP.*`), semantic cache (`SEMCACHE.*`). | [20](docs/design/20_ai_native_runtime.md) |
 | **NVMe tiered storage** | Implemented, with a known gap | Hot/Cooled/Cold lifecycle, `SmallBins`, Direct I/O; see tiered-value RDB gap above. | [07](docs/design/07_nvme_tiering.md), [tiered_storage.md](docs/design/tiered_storage.md) |
 | **`TIER.SNAPSHOT` reflink checkpoints** | Implemented | Real `ioctl(FICLONE)` cloning of the NVMe tier's backing file — unrelated to `SAVE`/`BGSAVE`. | [tiered_storage.md](docs/design/tiered_storage.md) |
 | **Multi-region CRDTs** | Implemented, manual sync only | LWW-Register, OR-Set, PN-Counter with HLC ordering; export/merge (`CRDT.DUMP`/`CRDT.MERGE`) is explicit and manual — there is no automatic peer discovery or background cross-region streaming. | [12](docs/design/12_crdt_types.md) |
@@ -628,7 +651,7 @@ For deep technical walkthroughs, internal architecture specifications, and bench
 * [**Pub/Sub Architecture**](docs/pub-sub.md): striped presence bitmask and Redis 7 sharded pub/sub.
 * [**RDB Snapshotting**](docs/rdbsave.md): what actually triggers a save, and how it interacts with the shard model.
 * [**Differences from Redis & Dragonfly**](docs/differences.md): architectural and behavioral comparison.
-* [**Subsystem Design Specifications**](docs/design/README.md): design rationale ("why") across all 19 subsystems.
+* [**Subsystem Design Specifications**](docs/design/README.md): design rationale ("why") across all 20 subsystems.
 * [**Subsystem Implementation References**](docs/internal/README.md): concrete data structures, algorithms, and source references.
 * [**Comprehensive Performance Guide**](docs/benchmarks/comprehensive_performance_guide.md) and [**Multicore Benchmark Report**](docs/benchmark_multicore_results.md): reproducible benchmark data and methodology.
 * [**Engineering Invariants for Contributors**](agent.md): mandatory architectural rules for anyone changing this codebase.
