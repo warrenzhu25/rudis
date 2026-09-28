@@ -2654,7 +2654,19 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Setrange { key, .. }
         | Command::Getrange { key, .. }
         | Command::Vadd { key, .. }
+        | Command::Vquery { key, .. }
+        | Command::Vsim { key, .. }
+        | Command::Vdist { key, .. }
         | Command::Vdel { key, .. }
+        | Command::Vinfo(key)
+        | Command::Vcard(key)
+        | Command::Vdim(key)
+        | Command::Vemb { key, .. }
+        | Command::Vlinks { key, .. }
+        | Command::Vrandmember { key, .. }
+        | Command::Vsetattr { key, .. }
+        | Command::Vgetattr { key, .. }
+        | Command::Vismember { key, .. }
         | Command::JsonSet { key, .. }
         | Command::JsonGet { key, .. }
         | Command::JsonDel { key, .. }
@@ -2869,7 +2881,19 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
         | Command::Setrange { key, .. }
         | Command::Getrange { key, .. }
         | Command::Vadd { key, .. }
+        | Command::Vquery { key, .. }
+        | Command::Vsim { key, .. }
+        | Command::Vdist { key, .. }
         | Command::Vdel { key, .. }
+        | Command::Vinfo(key)
+        | Command::Vcard(key)
+        | Command::Vdim(key)
+        | Command::Vemb { key, .. }
+        | Command::Vlinks { key, .. }
+        | Command::Vrandmember { key, .. }
+        | Command::Vsetattr { key, .. }
+        | Command::Vgetattr { key, .. }
+        | Command::Vismember { key, .. }
         | Command::JsonSet { key, .. }
         | Command::JsonGet { key, .. }
         | Command::JsonDel { key, .. }
@@ -3093,10 +3117,6 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
             for k in keys {
                 f(k.as_ref());
             }
-        }
-        Command::Vsim { k1, k2, .. } => {
-            f(k1.as_ref());
-            f(k2.as_ref());
         }
         Command::Migrate { key, keys, .. } => {
             if let Some(k) = key {
@@ -3846,9 +3866,17 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::ScriptLoad(_) | Command::ScriptExists(_) | Command::ScriptFlush => "SCRIPT",
         Command::Vadd { .. } => "VADD",
         Command::Vquery { .. } => "VQUERY",
-        Command::Vsim { .. } => "VSIM",
-        Command::Vdel { .. } => "VDEL",
+        Command::Vsim { .. } | Command::Vdist { .. } => "VSIM",
+        Command::Vdel { .. } => "VREM",
         Command::Vinfo(_) => "VINFO",
+        Command::Vcard(_) => "VCARD",
+        Command::Vdim(_) => "VDIM",
+        Command::Vemb { .. } => "VEMB",
+        Command::Vlinks { .. } => "VLINKS",
+        Command::Vrandmember { .. } => "VRANDMEMBER",
+        Command::Vsetattr { .. } => "VSETATTR",
+        Command::Vgetattr { .. } => "VGETATTR",
+        Command::Vismember { .. } => "VISMEMBER",
         Command::SemanticSet { .. }
         | Command::SemanticGet { .. }
         | Command::SemanticDel { .. }
@@ -6557,6 +6585,20 @@ async fn execute_command(
         | Command::SemanticDel { .. }
         | Command::SemanticFlush(_)
         | Command::SemanticInfo(_)
+        | Command::Vadd { .. }
+        | Command::Vquery { .. }
+        | Command::Vsim { .. }
+        | Command::Vdist { .. }
+        | Command::Vdel { .. }
+        | Command::Vinfo(_)
+        | Command::Vcard(_)
+        | Command::Vdim(_)
+        | Command::Vemb { .. }
+        | Command::Vlinks { .. }
+        | Command::Vrandmember { .. }
+        | Command::Vsetattr { .. }
+        | Command::Vgetattr { .. }
+        | Command::Vismember { .. }
         | Command::Object(crate::resp::ObjectSubcommand::Encoding(_))
         | Command::Object(crate::resp::ObjectSubcommand::Freq(_))
         | Command::Object(crate::resp::ObjectSubcommand::Idletime(_))
@@ -9617,92 +9659,6 @@ async fn execute_command(
             out.extend_from_slice(b"+OK\r\n");
             false
         }
-        Command::Vadd {
-            index,
-            key,
-            vector,
-            metric,
-            quantize,
-            pq,
-            tiered,
-        } => {
-            match router.local_db.borrow_mut().vadd(
-                &index,
-                key.clone(),
-                vector,
-                metric,
-                quantize,
-                pq,
-                tiered,
-            ) {
-                Ok(()) => {
-                    notify_key_invalidation(router.port, key.as_ref(), client_id);
-                    out.extend_from_slice(b"+OK\r\n");
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Vquery {
-            index,
-            k,
-            query,
-            rerank,
-        } => {
-            let results = router.local_db.borrow().vquery(&index, &query, k, rerank);
-            out.extend_from_slice(format!("*{}\r\n", results.len() * 2).as_bytes());
-            for (key, dist) in results {
-                write_resp_bulk(out, &key);
-                let s = format!("{:.6}", dist);
-                write_resp_bulk(out, s.as_bytes());
-            }
-            false
-        }
-        Command::Vsim {
-            index,
-            k1,
-            k2,
-            metric,
-        } => {
-            match router.local_db.borrow().vsim(&index, &k1, &k2, metric) {
-                Ok(dist) => {
-                    let s = format!("{:.6}", dist);
-                    write_resp_bulk(out, s.as_bytes());
-                }
-                Err(err) => {
-                    write_resp_err(out, err);
-                }
-            }
-            false
-        }
-        Command::Vdel { index, key } => {
-            let removed = router.local_db.borrow_mut().vdel(&index, &key);
-            if removed {
-                notify_key_invalidation(router.port, key.as_ref(), client_id);
-                write_resp_integer(out, 1);
-            } else {
-                write_resp_integer(out, 0);
-            }
-            false
-        }
-        Command::Vinfo(index) => {
-            if let Some((count, dim, metric, max_layer)) = router.local_db.borrow().vinfo(&index) {
-                out.extend_from_slice(b"*8\r\n");
-                write_resp_bulk(out, b"num_elements");
-                write_resp_integer(out, count as i64);
-                write_resp_bulk(out, b"dimension");
-                write_resp_integer(out, dim as i64);
-                write_resp_bulk(out, b"metric");
-                write_resp_bulk(out, metric.as_bytes());
-                write_resp_bulk(out, b"max_layer");
-                write_resp_integer(out, max_layer as i64);
-            } else {
-                out.extend_from_slice(b"$-1\r\n");
-            }
-            false
-        }
         Command::CrdtDump => {
             let mut payload = router.local_db.borrow().crdt_dump();
             for sid in 0..router.num_shards {
@@ -10744,6 +10700,20 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::SemanticDel { namespace: key, .. }
         | Command::SemanticFlush(key)
         | Command::SemanticInfo(key)
+        | Command::Vadd { key, .. }
+        | Command::Vquery { key, .. }
+        | Command::Vsim { key, .. }
+        | Command::Vdist { key, .. }
+        | Command::Vdel { key, .. }
+        | Command::Vinfo(key)
+        | Command::Vcard(key)
+        | Command::Vdim(key)
+        | Command::Vemb { key, .. }
+        | Command::Vlinks { key, .. }
+        | Command::Vrandmember { key, .. }
+        | Command::Vsetattr { key, .. }
+        | Command::Vgetattr { key, .. }
+        | Command::Vismember { key, .. }
         | Command::Object(crate::resp::ObjectSubcommand::Encoding(key))
         | Command::Object(crate::resp::ObjectSubcommand::Freq(key))
         | Command::Object(crate::resp::ObjectSubcommand::Idletime(key))
@@ -15258,6 +15228,431 @@ pub fn execute_local_command(
             write_resp_integer(out, tokens_saved as i64);
             write_resp_bulk(out, b"evicted_expired");
             write_resp_integer(out, evicted_expired as i64);
+            false
+        }
+        Command::Vadd {
+            key,
+            element,
+            vector,
+            metric,
+            quantize,
+            pq,
+            tiered,
+            reduce,
+            quant,
+            ef,
+            setattr,
+            m,
+            cas: _,
+            is_redis_vset,
+        } => {
+            let index = String::from_utf8_lossy(key);
+            match db.vadd_ext(
+                &index,
+                element.clone(),
+                vector.clone(),
+                *metric,
+                *quantize,
+                *pq,
+                *tiered,
+                *reduce,
+                *quant,
+                *ef,
+                setattr.clone(),
+                *m,
+                *is_redis_vset,
+            ) {
+                Ok(added) => {
+                    notify_key_invalidation(db.port, key.as_ref(), 0);
+                    notify_key_invalidation(db.port, element.as_ref(), 0);
+                    if *is_redis_vset {
+                        write_resp_integer(out, i64::from(added));
+                    } else {
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                }
+                Err(err) => {
+                    write_resp_err(out, &err);
+                }
+            }
+            false
+        }
+        Command::Vquery {
+            key,
+            k,
+            query,
+            rerank,
+        } => {
+            let index = String::from_utf8_lossy(key);
+            let results = db.vquery(&index, query, *k, *rerank);
+            out.extend_from_slice(format!("*{}\r\n", results.len() * 2).as_bytes());
+            for (elem, dist) in results {
+                write_resp_bulk(out, &elem);
+                let s = format!("{:.6}", dist);
+                write_resp_bulk(out, s.as_bytes());
+            }
+            false
+        }
+        Command::Vdist {
+            key,
+            k1,
+            k2,
+            metric,
+        } => {
+            let index = String::from_utf8_lossy(key);
+            match db.vsim(&index, k1, k2, *metric) {
+                Ok(dist) => {
+                    let s = format!("{:.6}", dist);
+                    write_resp_bulk(out, s.as_bytes());
+                }
+                Err(err) => {
+                    write_resp_err(out, err);
+                }
+            }
+            false
+        }
+        Command::Vsim {
+            key,
+            target,
+            with_scores,
+            with_attribs,
+            count,
+            epsilon,
+            ef,
+            filter,
+            filter_ef,
+            truth,
+            no_thread: _,
+        } => {
+            let index = String::from_utf8_lossy(key);
+            match db.vsim_ext(
+                &index,
+                target,
+                *with_attribs,
+                *count,
+                *epsilon,
+                *ef,
+                filter.as_deref(),
+                *filter_ef,
+                *truth,
+            ) {
+                Ok(hits) => {
+                    let is_resp3 = CURRENT_CLIENT_RESP3.get();
+                    if !*with_scores && !*with_attribs {
+                        write_resp_array_header(out, hits.len());
+                        for (elem, _, _) in hits {
+                            write_resp_bulk(out, &elem);
+                        }
+                    } else if *with_scores && !*with_attribs {
+                        if is_resp3 {
+                            out.extend_from_slice(format!("%{}\r\n", hits.len()).as_bytes());
+                            for (elem, score, _) in hits {
+                                write_resp_bulk(out, &elem);
+                                write_resp_score(out, score as f64);
+                            }
+                        } else {
+                            write_resp_array_header(out, hits.len() * 2);
+                            for (elem, score, _) in hits {
+                                write_resp_bulk(out, &elem);
+                                write_resp_score(out, score as f64);
+                            }
+                        }
+                    } else if !*with_scores && *with_attribs {
+                        if is_resp3 {
+                            out.extend_from_slice(format!("%{}\r\n", hits.len()).as_bytes());
+                        } else {
+                            write_resp_array_header(out, hits.len() * 2);
+                        }
+                        for (elem, _, attr) in hits {
+                            write_resp_bulk(out, &elem);
+                            match attr {
+                                Some(a) => write_resp_bulk(out, a.as_bytes()),
+                                None => write_resp_null(out),
+                            }
+                        }
+                    } else if is_resp3 {
+                        out.extend_from_slice(format!("%{}\r\n", hits.len()).as_bytes());
+                        for (elem, score, attr) in hits {
+                            write_resp_bulk(out, &elem);
+                            out.extend_from_slice(b"*2\r\n");
+                            write_resp_score(out, score as f64);
+                            match attr {
+                                Some(a) => write_resp_bulk(out, a.as_bytes()),
+                                None => write_resp_null(out),
+                            }
+                        }
+                    } else {
+                        write_resp_array_header(out, hits.len() * 3);
+                        for (elem, score, attr) in hits {
+                            write_resp_bulk(out, &elem);
+                            write_resp_score(out, score as f64);
+                            match attr {
+                                Some(a) => write_resp_bulk(out, a.as_bytes()),
+                                None => write_resp_null(out),
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    write_resp_err(out, &err);
+                }
+            }
+            false
+        }
+        Command::Vdel { key, element } => {
+            if db.table.exists(key.as_ref()) {
+                write_resp_err(
+                    out,
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                );
+                return false;
+            }
+            let index = String::from_utf8_lossy(key);
+            let removed = db.vdel(&index, element);
+            if removed {
+                notify_key_invalidation(db.port, key.as_ref(), 0);
+                write_resp_integer(out, 1);
+            } else {
+                write_resp_integer(out, 0);
+            }
+            false
+        }
+        Command::Vinfo(key) => {
+            if db.table.exists(key.as_ref()) {
+                write_resp_err(
+                    out,
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                );
+                return false;
+            }
+            let index = String::from_utf8_lossy(key);
+            if let Some(idx) = db.vector_indexes.get(index.as_ref()) {
+                if idx.is_redis_vset {
+                    if CURRENT_CLIENT_RESP3.get() {
+                        out.extend_from_slice(b"%9\r\n");
+                    } else {
+                        out.extend_from_slice(b"*18\r\n");
+                    }
+                    write_resp_bulk(out, b"quant-type");
+                    write_resp_bulk(out, idx.quant.as_str().as_bytes());
+                    write_resp_bulk(out, b"hnsw-m");
+                    write_resp_integer(out, idx.m as i64);
+                    write_resp_bulk(out, b"vector-dim");
+                    write_resp_integer(out, idx.dim as i64);
+                    write_resp_bulk(out, b"projection-input-dim");
+                    write_resp_integer(out, idx.input_dim as i64);
+                    write_resp_bulk(out, b"size");
+                    write_resp_integer(out, idx.len() as i64);
+                    write_resp_bulk(out, b"max-level");
+                    write_resp_integer(out, idx.max_layer as i64);
+                    write_resp_bulk(out, b"attributes-count");
+                    write_resp_integer(out, idx.attributes.len() as i64);
+                    write_resp_bulk(out, b"vset-uid");
+                    write_resp_integer(out, idx.uid as i64);
+                    write_resp_bulk(out, b"hnsw-max-node-uid");
+                    write_resp_integer(out, idx.max_node_uid() as i64);
+                } else {
+                    out.extend_from_slice(b"*8\r\n");
+                    write_resp_bulk(out, b"num_elements");
+                    write_resp_integer(out, idx.len() as i64);
+                    write_resp_bulk(out, b"dimension");
+                    write_resp_integer(out, idx.dim as i64);
+                    write_resp_bulk(out, b"metric");
+                    write_resp_bulk(out, idx.metric.as_str().as_bytes());
+                    write_resp_bulk(out, b"max_layer");
+                    write_resp_integer(out, idx.max_layer as i64);
+                }
+            } else {
+                write_resp_null(out);
+            }
+            false
+        }
+        Command::Vcard(key) => {
+            if db.table.exists(key.as_ref()) {
+                write_resp_err(
+                    out,
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                );
+                return false;
+            }
+            let index = String::from_utf8_lossy(key);
+            let card = db
+                .vector_indexes
+                .get(index.as_ref())
+                .map(|idx| idx.len())
+                .unwrap_or(0);
+            write_resp_integer(out, card as i64);
+            false
+        }
+        Command::Vdim(key) => {
+            if db.table.exists(key.as_ref()) {
+                write_resp_err(
+                    out,
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                );
+                return false;
+            }
+            let index = String::from_utf8_lossy(key);
+            if let Some(idx) = db.vector_indexes.get(index.as_ref()) {
+                write_resp_integer(out, idx.client_dim() as i64);
+            } else {
+                write_resp_err(out, "key does not exist");
+            }
+            false
+        }
+        Command::Vemb { key, element, raw } => {
+            if db.table.exists(key.as_ref()) {
+                write_resp_err(
+                    out,
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                );
+                return false;
+            }
+            let index = String::from_utf8_lossy(key);
+            let Some(idx) = db.vector_indexes.get(index.as_ref()) else {
+                write_resp_null(out);
+                return false;
+            };
+            if *raw {
+                if let Some((qtype, blob, norm, q8_range)) = idx.raw_embedding(element) {
+                    let count = if q8_range.is_some() { 4 } else { 3 };
+                    write_resp_array_header(out, count);
+                    write_resp_bulk(out, qtype.as_bytes());
+                    write_resp_bulk(out, &blob);
+                    write_resp_score(out, norm as f64);
+                    if let Some(r) = q8_range {
+                        write_resp_score(out, r as f64);
+                    }
+                } else {
+                    write_resp_null(out);
+                }
+            } else if let Some(vec) = idx.stored_vector(element) {
+                write_resp_array_header(out, vec.len());
+                for v in vec {
+                    write_resp_score(out, v as f64);
+                }
+            } else {
+                write_resp_null(out);
+            }
+            false
+        }
+        Command::Vlinks {
+            key,
+            element,
+            with_scores,
+        } => {
+            if db.table.exists(key.as_ref()) {
+                write_resp_err(
+                    out,
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                );
+                return false;
+            }
+            let index = String::from_utf8_lossy(key);
+            let Some(idx) = db.vector_indexes.get(index.as_ref()) else {
+                write_resp_null(out);
+                return false;
+            };
+            if let Some(layers) = idx.links(element) {
+                let is_resp3 = CURRENT_CLIENT_RESP3.get();
+                write_resp_array_header(out, layers.len());
+                for layer in layers {
+                    if *with_scores {
+                        if is_resp3 {
+                            out.extend_from_slice(format!("%{}\r\n", layer.len()).as_bytes());
+                        } else {
+                            write_resp_array_header(out, layer.len() * 2);
+                        }
+                        for (nbr, score) in layer {
+                            write_resp_bulk(out, &nbr);
+                            write_resp_score(out, score as f64);
+                        }
+                    } else {
+                        write_resp_array_header(out, layer.len());
+                        for (nbr, _) in layer {
+                            write_resp_bulk(out, &nbr);
+                        }
+                    }
+                }
+            } else {
+                write_resp_null(out);
+            }
+            false
+        }
+        Command::Vrandmember { key, count } => {
+            if db.table.exists(key.as_ref()) {
+                write_resp_err(
+                    out,
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                );
+                return false;
+            }
+            let index = String::from_utf8_lossy(key);
+            match count {
+                None => {
+                    if let Some(idx) = db.vector_indexes.get_mut(index.as_ref())
+                        && let Some(first) = idx.random_members(1).into_iter().next()
+                    {
+                        write_resp_bulk(out, &first);
+                    } else {
+                        write_resp_null(out);
+                    }
+                }
+                Some(c) => {
+                    if let Some(idx) = db.vector_indexes.get_mut(index.as_ref()) {
+                        let members = idx.random_members(*c);
+                        write_resp_array_header(out, members.len());
+                        for m in members {
+                            write_resp_bulk(out, &m);
+                        }
+                    } else {
+                        out.extend_from_slice(b"*0\r\n");
+                    }
+                }
+            }
+            false
+        }
+        Command::Vsetattr { key, element, attr } => {
+            let index = String::from_utf8_lossy(key);
+            match db.vsetattr(&index, element, attr.clone()) {
+                Ok(updated) => {
+                    write_resp_integer(out, i64::from(updated));
+                }
+                Err(err) => {
+                    write_resp_err(out, &err);
+                }
+            }
+            false
+        }
+        Command::Vgetattr { key, element } => {
+            let index = String::from_utf8_lossy(key);
+            match db.vgetattr(&index, element) {
+                Ok(Some(attr)) => {
+                    write_resp_bulk(out, attr.as_bytes());
+                }
+                Ok(None) => {
+                    write_resp_null(out);
+                }
+                Err(err) => {
+                    write_resp_err(out, &err);
+                }
+            }
+            false
+        }
+        Command::Vismember { key, element } => {
+            if db.table.exists(key.as_ref()) {
+                write_resp_err(
+                    out,
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                );
+                return false;
+            }
+            let index = String::from_utf8_lossy(key);
+            let is_mem = db
+                .vector_indexes
+                .get(index.as_ref())
+                .is_some_and(|idx| idx.key_to_id.contains_key(element));
+            write_resp_integer(out, i64::from(is_mem));
             false
         }
         Command::Latency(sub) => {

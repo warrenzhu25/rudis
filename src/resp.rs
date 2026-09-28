@@ -226,6 +226,12 @@ pub enum HsetexCondition {
 }
 
 #[derive(Debug, PartialEq, Clone)]
+pub enum VsimTarget {
+    Element(Bytes),
+    Vector(Vec<f32>),
+}
+
+#[derive(Debug, PartialEq, Clone)]
 pub enum Command {
     Object(ObjectSubcommand),
     Xinfo(XinfoSubcommand),
@@ -983,31 +989,82 @@ pub enum Command {
     },
     // VECTOR COMMANDS
     Vadd {
-        index: String,
         key: Bytes,
+        element: Bytes,
         vector: Vec<f32>,
         metric: Option<crate::vector::VectorMetric>,
         quantize: bool,
         pq: bool,
         tiered: bool,
+        reduce: Option<usize>,
+        quant: Option<crate::vector::VQuant>,
+        ef: Option<usize>,
+        setattr: Option<String>,
+        m: Option<usize>,
+        cas: bool,
+        is_redis_vset: bool,
     },
     Vquery {
-        index: String,
+        key: Bytes,
         k: usize,
         query: Vec<f32>,
         rerank: bool,
     },
+    /// Redis 8 `VSIM key (ELE elem | FP32 blob | VALUES n ...) [WITHSCORES] [WITHATTRIBS] ...`
     Vsim {
-        index: String,
+        key: Bytes,
+        target: VsimTarget,
+        with_scores: bool,
+        with_attribs: bool,
+        count: usize,
+        epsilon: Option<f32>,
+        ef: Option<usize>,
+        filter: Option<String>,
+        filter_ef: Option<usize>,
+        truth: bool,
+        no_thread: bool,
+    },
+    /// Legacy Rudis pairwise distance `VSIM index k1 k2 [COSINE|L2|IP]`.
+    Vdist {
+        key: Bytes,
         k1: Bytes,
         k2: Bytes,
         metric: Option<crate::vector::VectorMetric>,
     },
     Vdel {
-        index: String,
         key: Bytes,
+        element: Bytes,
     },
-    Vinfo(String),
+    Vinfo(Bytes),
+    Vcard(Bytes),
+    Vdim(Bytes),
+    Vemb {
+        key: Bytes,
+        element: Bytes,
+        raw: bool,
+    },
+    Vlinks {
+        key: Bytes,
+        element: Bytes,
+        with_scores: bool,
+    },
+    Vrandmember {
+        key: Bytes,
+        count: Option<i64>,
+    },
+    Vsetattr {
+        key: Bytes,
+        element: Bytes,
+        attr: String,
+    },
+    Vgetattr {
+        key: Bytes,
+        element: Bytes,
+    },
+    Vismember {
+        key: Bytes,
+        element: Bytes,
+    },
     // AI SEMANTIC CACHE COMMANDS
     SemanticSet {
         namespace: Bytes,
@@ -7459,40 +7516,206 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() < 4 {
                 return Err("wrong number of arguments for 'vadd' command".to_string());
             }
-            let index = String::from_utf8_lossy(&args[1]).to_string();
-            let key = args[2].clone();
-            let mut vector = Vec::with_capacity(args.len() - 3);
-            let mut quantize = false;
-            let mut pq = false;
-            let mut tiered = false;
-            for a in &args[3..] {
-                let s = String::from_utf8_lossy(a).to_uppercase();
-                if s == "QUANTIZE" || s == "SQ8" {
-                    quantize = true;
-                } else if s == "PQ" {
-                    pq = true;
-                } else if s == "TIERED" {
-                    tiered = true;
-                } else {
-                    let val: f32 = s.parse().map_err(|_| "not a valid float")?;
-                    vector.push(val);
+            let key = args[1].clone();
+            let second_upper = String::from_utf8_lossy(&args[2]).to_ascii_uppercase();
+            if second_upper == "REDUCE" || second_upper == "FP32" || second_upper == "VALUES" {
+                let mut i = 2;
+                let mut reduce = None;
+                if String::from_utf8_lossy(&args[i]).eq_ignore_ascii_case("REDUCE") {
+                    if i + 1 >= args.len() {
+                        return Err("syntax error".to_string());
+                    }
+                    let d: usize = std::str::from_utf8(&args[i + 1])
+                        .map_err(|_| "value is not an integer or out of range")?
+                        .parse()
+                        .map_err(|_| "value is not an integer or out of range")?;
+                    if d == 0 {
+                        return Err("Projection dimension must be > 0".to_string());
+                    }
+                    reduce = Some(d);
+                    i += 2;
                 }
+                if i >= args.len() {
+                    return Err("syntax error".to_string());
+                }
+                let fmt = String::from_utf8_lossy(&args[i]).to_ascii_uppercase();
+                let vector = if fmt == "FP32" {
+                    if i + 1 >= args.len() {
+                        return Err("syntax error".to_string());
+                    }
+                    let blob = &args[i + 1];
+                    if blob.is_empty() || !blob.len().is_multiple_of(4) {
+                        return Err("Invalid FP32 vector blob length".to_string());
+                    }
+                    let mut v = Vec::with_capacity(blob.len() / 4);
+                    for chunk in blob.as_chunks::<4>().0 {
+                        let f = f32::from_le_bytes(*chunk);
+                        if !f.is_finite() {
+                            return Err("Vector contains NaN or Inf".to_string());
+                        }
+                        v.push(f);
+                    }
+                    i += 2;
+                    v
+                } else if fmt == "VALUES" {
+                    if i + 1 >= args.len() {
+                        return Err("syntax error".to_string());
+                    }
+                    let num: usize = std::str::from_utf8(&args[i + 1])
+                        .map_err(|_| "value is not an integer or out of range")?
+                        .parse()
+                        .map_err(|_| "value is not an integer or out of range")?;
+                    if num == 0 || i + 2 + num > args.len() {
+                        return Err("syntax error".to_string());
+                    }
+                    let mut v = Vec::with_capacity(num);
+                    for a in &args[i + 2..i + 2 + num] {
+                        let f: f32 = std::str::from_utf8(a)
+                            .map_err(|_| "not a valid float")?
+                            .parse()
+                            .map_err(|_| "not a valid float")?;
+                        if !f.is_finite() {
+                            return Err("Vector contains NaN or Inf".to_string());
+                        }
+                        v.push(f);
+                    }
+                    i += 2 + num;
+                    v
+                } else {
+                    return Err("syntax error".to_string());
+                };
+                if i >= args.len() {
+                    return Err("wrong number of arguments for 'vadd' command".to_string());
+                }
+                let element = args[i].clone();
+                i += 1;
+                let mut cas = false;
+                let mut quant = None;
+                let mut ef = None;
+                let mut setattr = None;
+                let mut m = None;
+                while i < args.len() {
+                    let opt = String::from_utf8_lossy(&args[i]).to_ascii_uppercase();
+                    match opt.as_str() {
+                        "CAS" => {
+                            cas = true;
+                            i += 1;
+                        }
+                        "NOQUANT" => {
+                            quant = Some(crate::vector::VQuant::NoQuant);
+                            i += 1;
+                        }
+                        "Q8" => {
+                            quant = Some(crate::vector::VQuant::Q8);
+                            i += 1;
+                        }
+                        "BIN" => {
+                            quant = Some(crate::vector::VQuant::Bin);
+                            i += 1;
+                        }
+                        "EF" => {
+                            if i + 1 >= args.len() {
+                                return Err("syntax error".to_string());
+                            }
+                            let val: usize = std::str::from_utf8(&args[i + 1])
+                                .map_err(|_| "value is not an integer or out of range")?
+                                .parse()
+                                .map_err(|_| "value is not an integer or out of range")?;
+                            ef = Some(val.max(1));
+                            i += 2;
+                        }
+                        "SETATTR" => {
+                            if i + 1 >= args.len() {
+                                return Err("syntax error".to_string());
+                            }
+                            let s = std::str::from_utf8(&args[i + 1])
+                                .map_err(|_| "Invalid JSON attributes")?
+                                .to_string();
+                            if !s.trim().is_empty()
+                                && serde_json::from_str::<serde_json::Value>(&s).is_err()
+                            {
+                                return Err("Invalid JSON in SETATTR".to_string());
+                            }
+                            setattr = Some(s);
+                            i += 2;
+                        }
+                        "M" => {
+                            if i + 1 >= args.len() {
+                                return Err("syntax error".to_string());
+                            }
+                            let val: usize = std::str::from_utf8(&args[i + 1])
+                                .map_err(|_| "value is not an integer or out of range")?
+                                .parse()
+                                .map_err(|_| "value is not an integer or out of range")?;
+                            if val < 2 {
+                                return Err("M must be >= 2".to_string());
+                            }
+                            m = Some(val);
+                            i += 2;
+                        }
+                        _ => return Err("syntax error".to_string()),
+                    }
+                }
+                let quantize =
+                    quant.unwrap_or(crate::vector::VQuant::Q8) == crate::vector::VQuant::Q8;
+                Ok(Some(Command::Vadd {
+                    key,
+                    element,
+                    vector,
+                    metric: None,
+                    quantize,
+                    pq: false,
+                    tiered: false,
+                    reduce,
+                    quant,
+                    ef,
+                    setattr,
+                    m,
+                    cas,
+                    is_redis_vset: true,
+                }))
+            } else {
+                let element = args[2].clone();
+                let mut vector = Vec::with_capacity(args.len() - 3);
+                let mut quantize = false;
+                let mut pq = false;
+                let mut tiered = false;
+                for a in &args[3..] {
+                    let s = String::from_utf8_lossy(a).to_uppercase();
+                    if s == "QUANTIZE" || s == "SQ8" {
+                        quantize = true;
+                    } else if s == "PQ" {
+                        pq = true;
+                    } else if s == "TIERED" {
+                        tiered = true;
+                    } else {
+                        let val: f32 = s.parse().map_err(|_| "not a valid float")?;
+                        vector.push(val);
+                    }
+                }
+                Ok(Some(Command::Vadd {
+                    key,
+                    element,
+                    vector,
+                    metric: None,
+                    quantize,
+                    pq,
+                    tiered,
+                    reduce: None,
+                    quant: None,
+                    ef: None,
+                    setattr: None,
+                    m: None,
+                    cas: false,
+                    is_redis_vset: false,
+                }))
             }
-            Ok(Some(Command::Vadd {
-                index,
-                key,
-                vector,
-                metric: None,
-                quantize,
-                pq,
-                tiered,
-            }))
         }
         "VQUERY" => {
             if args.len() < 4 {
                 return Err("wrong number of arguments for 'vquery' command".to_string());
             }
-            let index = String::from_utf8_lossy(&args[1]).to_string();
+            let key = args[1].clone();
             let k: usize = std::str::from_utf8(&args[2])
                 .map_err(|_| "value is not an integer or out of range")?
                 .parse()
@@ -7509,7 +7732,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
             }
             Ok(Some(Command::Vquery {
-                index,
+                key,
                 k,
                 query,
                 rerank,
@@ -7596,36 +7819,288 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() < 4 {
                 return Err("wrong number of arguments for 'vsim' command".to_string());
             }
-            let index = String::from_utf8_lossy(&args[1]).to_string();
-            let k1 = args[2].clone();
-            let k2 = args[3].clone();
-            let metric = if args.len() > 4 {
-                let s = String::from_utf8_lossy(&args[4]);
-                s.parse::<crate::vector::VectorMetric>().ok()
+            let key = args[1].clone();
+            let mode = String::from_utf8_lossy(&args[2]).to_ascii_uppercase();
+            if mode == "ELE" || mode == "FP32" || mode == "VALUES" {
+                let mut i = 2;
+                let target = if mode == "ELE" {
+                    let elem = args[3].clone();
+                    i += 2;
+                    VsimTarget::Element(elem)
+                } else if mode == "FP32" {
+                    let blob = &args[3];
+                    if blob.is_empty() || !blob.len().is_multiple_of(4) {
+                        return Err("Invalid FP32 vector blob length".to_string());
+                    }
+                    let mut v = Vec::with_capacity(blob.len() / 4);
+                    for chunk in blob.as_chunks::<4>().0 {
+                        let f = f32::from_le_bytes(*chunk);
+                        if !f.is_finite() {
+                            return Err("Vector contains NaN or Inf".to_string());
+                        }
+                        v.push(f);
+                    }
+                    i += 2;
+                    VsimTarget::Vector(v)
+                } else {
+                    let num: usize = std::str::from_utf8(&args[3])
+                        .map_err(|_| "value is not an integer or out of range")?
+                        .parse()
+                        .map_err(|_| "value is not an integer or out of range")?;
+                    if num == 0 || i + 2 + num > args.len() {
+                        return Err("syntax error".to_string());
+                    }
+                    let mut v = Vec::with_capacity(num);
+                    for a in &args[i + 2..i + 2 + num] {
+                        let f: f32 = std::str::from_utf8(a)
+                            .map_err(|_| "not a valid float")?
+                            .parse()
+                            .map_err(|_| "not a valid float")?;
+                        if !f.is_finite() {
+                            return Err("Vector contains NaN or Inf".to_string());
+                        }
+                        v.push(f);
+                    }
+                    i += 2 + num;
+                    VsimTarget::Vector(v)
+                };
+                let mut with_scores = false;
+                let mut with_attribs = false;
+                let mut count = 10usize;
+                let mut epsilon = None;
+                let mut ef = None;
+                let mut filter = None;
+                let mut filter_ef = None;
+                let mut truth = false;
+                let mut no_thread = false;
+                while i < args.len() {
+                    let opt = String::from_utf8_lossy(&args[i]).to_ascii_uppercase();
+                    match opt.as_str() {
+                        "WITHSCORES" => {
+                            with_scores = true;
+                            i += 1;
+                        }
+                        "WITHATTRIBS" => {
+                            with_attribs = true;
+                            i += 1;
+                        }
+                        "COUNT" => {
+                            if i + 1 >= args.len() {
+                                return Err("syntax error".to_string());
+                            }
+                            let c: usize = std::str::from_utf8(&args[i + 1])
+                                .map_err(|_| "value is not an integer or out of range")?
+                                .parse()
+                                .map_err(|_| "value is not an integer or out of range")?;
+                            if c == 0 {
+                                return Err("COUNT must be > 0".to_string());
+                            }
+                            count = c;
+                            i += 2;
+                        }
+                        "EPSILON" => {
+                            if i + 1 >= args.len() {
+                                return Err("syntax error".to_string());
+                            }
+                            let ep: f32 = std::str::from_utf8(&args[i + 1])
+                                .map_err(|_| "not a valid float")?
+                                .parse()
+                                .map_err(|_| "not a valid float")?;
+                            if !(0.0..=1.0).contains(&ep) {
+                                return Err("EPSILON must be between 0 and 1".to_string());
+                            }
+                            epsilon = Some(ep);
+                            i += 2;
+                        }
+                        "EF" => {
+                            if i + 1 >= args.len() {
+                                return Err("syntax error".to_string());
+                            }
+                            let val: usize = std::str::from_utf8(&args[i + 1])
+                                .map_err(|_| "value is not an integer or out of range")?
+                                .parse()
+                                .map_err(|_| "value is not an integer or out of range")?;
+                            ef = Some(val.max(1));
+                            i += 2;
+                        }
+                        "FILTER" => {
+                            if i + 1 >= args.len() {
+                                return Err("syntax error".to_string());
+                            }
+                            let expr = std::str::from_utf8(&args[i + 1])
+                                .map_err(|_| "Invalid FILTER expression")?
+                                .to_string();
+                            crate::vector::validate_vset_filter(&expr)?;
+                            filter = Some(expr);
+                            i += 2;
+                        }
+                        "FILTER-EF" => {
+                            if i + 1 >= args.len() {
+                                return Err("syntax error".to_string());
+                            }
+                            let val: usize = std::str::from_utf8(&args[i + 1])
+                                .map_err(|_| "value is not an integer or out of range")?
+                                .parse()
+                                .map_err(|_| "value is not an integer or out of range")?;
+                            filter_ef = Some(val.max(1));
+                            i += 2;
+                        }
+                        "TRUTH" => {
+                            truth = true;
+                            i += 1;
+                        }
+                        "NOTHREAD" => {
+                            no_thread = true;
+                            i += 1;
+                        }
+                        _ => return Err("syntax error".to_string()),
+                    }
+                }
+                Ok(Some(Command::Vsim {
+                    key,
+                    target,
+                    with_scores,
+                    with_attribs,
+                    count,
+                    epsilon,
+                    ef,
+                    filter,
+                    filter_ef,
+                    truth,
+                    no_thread,
+                }))
             } else {
-                None
-            };
-            Ok(Some(Command::Vsim {
-                index,
-                k1,
-                k2,
-                metric,
-            }))
-        }
-        "VDEL" => {
-            if args.len() != 3 {
-                return Err("wrong number of arguments for 'vdel' command".to_string());
+                let k1 = args[2].clone();
+                let k2 = args[3].clone();
+                let metric = if args.len() > 4 {
+                    let s = String::from_utf8_lossy(&args[4]);
+                    s.parse::<crate::vector::VectorMetric>().ok()
+                } else {
+                    None
+                };
+                Ok(Some(Command::Vdist {
+                    key,
+                    k1,
+                    k2,
+                    metric,
+                }))
             }
-            let index = String::from_utf8_lossy(&args[1]).to_string();
-            let key = args[2].clone();
-            Ok(Some(Command::Vdel { index, key }))
+        }
+        "VDEL" | "VREM" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'vrem' command".to_string());
+            }
+            Ok(Some(Command::Vdel {
+                key: args[1].clone(),
+                element: args[2].clone(),
+            }))
         }
         "VINFO" => {
             if args.len() != 2 {
                 return Err("wrong number of arguments for 'vinfo' command".to_string());
             }
-            let index = String::from_utf8_lossy(&args[1]).to_string();
-            Ok(Some(Command::Vinfo(index)))
+            Ok(Some(Command::Vinfo(args[1].clone())))
+        }
+        "VCARD" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'vcard' command".to_string());
+            }
+            Ok(Some(Command::Vcard(args[1].clone())))
+        }
+        "VDIM" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'vdim' command".to_string());
+            }
+            Ok(Some(Command::Vdim(args[1].clone())))
+        }
+        "VEMB" => {
+            if args.len() != 3 && args.len() != 4 {
+                return Err("wrong number of arguments for 'vemb' command".to_string());
+            }
+            let raw = if args.len() == 4 {
+                if !String::from_utf8_lossy(&args[3]).eq_ignore_ascii_case("RAW") {
+                    return Err("syntax error".to_string());
+                }
+                true
+            } else {
+                false
+            };
+            Ok(Some(Command::Vemb {
+                key: args[1].clone(),
+                element: args[2].clone(),
+                raw,
+            }))
+        }
+        "VLINKS" => {
+            if args.len() != 3 && args.len() != 4 {
+                return Err("wrong number of arguments for 'vlinks' command".to_string());
+            }
+            let with_scores = if args.len() == 4 {
+                if !String::from_utf8_lossy(&args[3]).eq_ignore_ascii_case("WITHSCORES") {
+                    return Err("syntax error".to_string());
+                }
+                true
+            } else {
+                false
+            };
+            Ok(Some(Command::Vlinks {
+                key: args[1].clone(),
+                element: args[2].clone(),
+                with_scores,
+            }))
+        }
+        "VRANDMEMBER" => {
+            if args.len() != 2 && args.len() != 3 {
+                return Err("wrong number of arguments for 'vrandmember' command".to_string());
+            }
+            let count = if args.len() == 3 {
+                let c: i64 = std::str::from_utf8(&args[2])
+                    .map_err(|_| "value is not an integer or out of range")?
+                    .parse()
+                    .map_err(|_| "value is not an integer or out of range")?;
+                Some(c)
+            } else {
+                None
+            };
+            Ok(Some(Command::Vrandmember {
+                key: args[1].clone(),
+                count,
+            }))
+        }
+        "VSETATTR" => {
+            if args.len() != 4 {
+                return Err("wrong number of arguments for 'vsetattr' command".to_string());
+            }
+            let attr = std::str::from_utf8(&args[3])
+                .map_err(|_| "Invalid JSON attributes")?
+                .to_string();
+            if !attr.trim().is_empty() && serde_json::from_str::<serde_json::Value>(&attr).is_err()
+            {
+                return Err("Invalid JSON in VSETATTR".to_string());
+            }
+            Ok(Some(Command::Vsetattr {
+                key: args[1].clone(),
+                element: args[2].clone(),
+                attr,
+            }))
+        }
+        "VGETATTR" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'vgetattr' command".to_string());
+            }
+            Ok(Some(Command::Vgetattr {
+                key: args[1].clone(),
+                element: args[2].clone(),
+            }))
+        }
+        "VISMEMBER" => {
+            if args.len() != 3 {
+                return Err("wrong number of arguments for 'vismember' command".to_string());
+            }
+            Ok(Some(Command::Vismember {
+                key: args[1].clone(),
+                element: args[2].clone(),
+            }))
         }
         "FUNCTION" => {
             if args.len() < 2 {

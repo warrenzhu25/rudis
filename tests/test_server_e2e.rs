@@ -12721,3 +12721,189 @@ fn test_semantic_cache_llm_workload_e2e() {
     let flush_cmd = format_resp_cmd(&["SEMANTIC.FLUSH", "llm:gpt4o"]);
     assert_eq!(send_and_read(&mut client, &flush_cmd), "+OK\r\n");
 }
+
+#[test]
+fn test_redis8_vector_sets_and_cross_shard_routing_e2e() {
+    let port = 19150;
+    start_test_server(port, 4);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    let format_resp_cmd = |args: &[&str]| -> Vec<u8> {
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for arg in args {
+            out.extend_from_slice(format!("${}\r\n{}\r\n", arg.len(), arg).as_bytes());
+        }
+        out
+    };
+
+    // 1. Redis 8 VADD with VALUES, SETATTR, NOQUANT, M, EF
+    let vadd1 = format_resp_cmd(&[
+        "VADD",
+        "movies:vset",
+        "VALUES",
+        "3",
+        "1.0",
+        "0.0",
+        "0.0",
+        "m1",
+        "NOQUANT",
+        "M",
+        "16",
+        "EF",
+        "64",
+        "SETATTR",
+        r#"{"year":1999,"genre":"scifi"}"#,
+    ]);
+    assert_eq!(send_and_read(&mut client, &vadd1), ":1\r\n");
+
+    // Re-adding m1 updates and returns :0
+    assert_eq!(send_and_read(&mut client, &vadd1), ":0\r\n");
+
+    let vadd2 = format_resp_cmd(&[
+        "VADD",
+        "movies:vset",
+        "VALUES",
+        "3",
+        "0.9",
+        "0.1",
+        "0.0",
+        "m2",
+        "NOQUANT",
+        "SETATTR",
+        r#"{"year":2014,"genre":"scifi"}"#,
+    ]);
+    assert_eq!(send_and_read(&mut client, &vadd2), ":1\r\n");
+
+    let vadd3 = format_resp_cmd(&[
+        "VADD",
+        "movies:vset",
+        "VALUES",
+        "3",
+        "0.95",
+        "0.05",
+        "0.0",
+        "m3",
+        "NOQUANT",
+        "SETATTR",
+        r#"{"year":1972,"genre":"drama"}"#,
+    ]);
+    assert_eq!(send_and_read(&mut client, &vadd3), ":1\r\n");
+
+    // 2. Keyspace integration: TYPE, EXISTS, VCARD, VDIM, VISMEMBER, VINFO
+    assert_eq!(
+        send_and_read(&mut client, b"TYPE movies:vset\r\n"),
+        "+vectorset\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"EXISTS movies:vset\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"VCARD movies:vset\r\n"),
+        ":3\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"VDIM movies:vset\r\n"),
+        ":3\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"VISMEMBER movies:vset m2\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"VISMEMBER movies:vset missing\r\n"),
+        ":0\r\n"
+    );
+
+    let vinfo = send_and_read(&mut client, b"VINFO movies:vset\r\n");
+    assert!(vinfo.starts_with("*18\r\n"), "VINFO: {}", vinfo);
+    assert!(vinfo.contains("quant-type\r\n$3\r\nf32\r\n"));
+    assert!(vinfo.contains("vector-dim\r\n:3\r\n"));
+    assert!(vinfo.contains("size\r\n:3\r\n"));
+    assert!(vinfo.contains("attributes-count\r\n:3\r\n"));
+
+    // 3. VGETATTR / VSETATTR / VEMB / VLINKS / VRANDMEMBER
+    let attr = send_and_read(&mut client, b"VGETATTR movies:vset m1\r\n");
+    assert!(attr.contains(r#""year":1999"#));
+    let setattr_cmd = format_resp_cmd(&[
+        "VSETATTR",
+        "movies:vset",
+        "m1",
+        r#"{"year":2000,"genre":"scifi"}"#,
+    ]);
+    assert_eq!(send_and_read(&mut client, &setattr_cmd), ":1\r\n");
+    assert!(send_and_read(&mut client, b"VGETATTR movies:vset m1\r\n").contains("2000"));
+
+    let vemb = send_and_read(&mut client, b"VEMB movies:vset m1\r\n");
+    assert!(vemb.starts_with("*3\r\n"), "VEMB: {}", vemb);
+    let vemb_raw = send_and_read(&mut client, b"VEMB movies:vset m1 RAW\r\n");
+    assert!(
+        vemb_raw.starts_with("*3\r\n$4\r\nfp32\r\n"),
+        "VEMB RAW: {}",
+        vemb_raw
+    );
+
+    let vlinks = send_and_read(&mut client, b"VLINKS movies:vset m1 WITHSCORES\r\n");
+    assert!(vlinks.starts_with("*"), "VLINKS: {}", vlinks);
+
+    let vrand = send_and_read(&mut client, b"VRANDMEMBER movies:vset 2\r\n");
+    assert!(vrand.starts_with("*2\r\n"), "VRANDMEMBER: {}", vrand);
+
+    // 4. VSIM with ELE, VALUES, WITHSCORES, WITHATTRIBS, FILTER
+    let vsim_ele = format_resp_cmd(&["VSIM", "movies:vset", "ELE", "m1", "COUNT", "2"]);
+    let resp_ele = send_and_read(&mut client, &vsim_ele);
+    assert!(
+        resp_ele.starts_with("*2\r\n$2\r\nm1\r\n$2\r\nm3\r\n"),
+        "VSIM ELE: {}",
+        resp_ele
+    );
+
+    let vsim_filtered = format_resp_cmd(&[
+        "VSIM",
+        "movies:vset",
+        "VALUES",
+        "3",
+        "1.0",
+        "0.0",
+        "0.0",
+        "WITHSCORES",
+        "WITHATTRIBS",
+        "FILTER",
+        r#".genre == "scifi" and .year >= 2005"#,
+    ]);
+    let resp_filt = send_and_read(&mut client, &vsim_filtered);
+    assert!(
+        resp_filt.starts_with("*3\r\n$2\r\nm2\r\n") && !resp_filt.contains("m3"),
+        "VSIM FILTER: {}",
+        resp_filt
+    );
+
+    // 5. Cross-shard VQUERY & VREM cleanup
+    let vq = send_and_read(&mut client, b"VQUERY movies:vset 3 1.0 0.0 0.0\r\n");
+    assert!(vq.starts_with("*6\r\n"), "Cross-shard VQUERY: {}", vq);
+
+    assert_eq!(
+        send_and_read(&mut client, b"VREM movies:vset m1\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"VREM movies:vset m2\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"VREM movies:vset m3\r\n"),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"EXISTS movies:vset\r\n"),
+        ":0\r\n"
+    );
+    assert_eq!(
+        send_and_read(&mut client, b"TYPE movies:vset\r\n"),
+        "+none\r\n"
+    );
+}

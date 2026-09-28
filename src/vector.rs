@@ -764,10 +764,36 @@ pub struct HnswNode {
     pub key: Bytes,
     pub vector: Vec<f32>,
     pub quantized: Option<QuantizedVector>,
+    pub binary: Option<Vec<u64>>,
     pub pq: Option<PQVector>,
     pub is_tiered: bool,
     /// Neighbors at each layer [0..layer]
     pub neighbors: Vec<Vec<usize>>,
+}
+
+/// Packs the sign bits of `v` (`> 0.0` -> 1, else 0) into 64-bit words.
+pub fn quantize_binary(v: &[f32]) -> Vec<u64> {
+    let words = v.len().div_ceil(64);
+    let mut out = vec![0u64; words];
+    for (i, &x) in v.iter().enumerate() {
+        if x > 0.0 {
+            out[i / 64] |= 1u64 << (i % 64);
+        }
+    }
+    out
+}
+
+/// Normalized Hamming distance in `[0.0, 2.0]` (approximating Cosine distance) between two
+/// binary-quantized vectors of dimension `dim`.
+pub fn binary_hamming_cosine_distance(a: &[u64], b: &[u64], dim: usize) -> f32 {
+    if dim == 0 {
+        return 0.0;
+    }
+    let mut diff_bits = 0u32;
+    for (&wa, &wb) in a.iter().zip(b.iter()) {
+        diff_bits += (wa ^ wb).count_ones();
+    }
+    (2.0 * diff_bits as f32) / (dim as f32)
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -817,6 +843,31 @@ impl PartialOrd for FurthestCandidate {
     }
 }
 
+/// Quantization mode of a Redis 8 vector set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VQuant {
+    /// Full-precision `f32` storage (`NOQUANT`).
+    #[default]
+    NoQuant,
+    /// 8-bit scalar quantization (`Q8`, the Redis 8 default for new vector sets).
+    Q8,
+    /// 1-bit sign quantization (`BIN`).
+    Bin,
+}
+
+impl VQuant {
+    /// Name reported by `VINFO quant-type`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VQuant::NoQuant => "f32",
+            VQuant::Q8 => "int8",
+            VQuant::Bin => "bin",
+        }
+    }
+}
+
+static NEXT_VSET_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Hierarchical Navigable Small World (HNSW) Vector Index
 #[derive(Debug, Clone)]
 pub struct HnswIndex {
@@ -833,6 +884,18 @@ pub struct HnswIndex {
     pub nodes: Vec<Option<HnswNode>>,
     pub key_to_id: HashMap<Bytes, usize>,
     pub pq_quantizer: Option<ProductQuantizer>,
+    /// Redis 8 vector-set quantization mode (`NOQUANT` / `Q8` / `BIN`).
+    pub quant: VQuant,
+    /// Per-element JSON attributes (`VSETATTR` / `VADD ... SETATTR`), used by `VSIM ... FILTER`.
+    pub attributes: HashMap<Bytes, String>,
+    /// Row-major `dim x input_dim` random projection matrix created by `VADD ... REDUCE`.
+    pub projection: Option<Vec<f32>>,
+    /// Dimension of vectors supplied by clients before projection (0 when no projection).
+    pub input_dim: usize,
+    /// Unique id of this vector set (`VINFO vset-uid`).
+    pub uid: u64,
+    /// True when created via Redis 8 `VADD` syntax (`FP32` / `VALUES` / `REDUCE`).
+    pub is_redis_vset: bool,
     rng_state: u64,
 }
 
@@ -855,6 +918,12 @@ impl HnswIndex {
             nodes: Vec::new(),
             key_to_id: HashMap::new(),
             pq_quantizer: None,
+            quant: VQuant::NoQuant,
+            attributes: HashMap::new(),
+            projection: None,
+            input_dim: 0,
+            uid: NEXT_VSET_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            is_redis_vset: false,
             rng_state: 0x853c49e6748fea9b,
         }
     }
@@ -880,6 +949,122 @@ impl HnswIndex {
 
     pub fn enable_pq(&mut self, m: usize) {
         self.pq_quantizer = Some(ProductQuantizer::new(self.dim, m));
+    }
+
+    /// Installs a deterministic Gaussian random projection from `input_dim` to `self.dim`
+    /// (`VADD ... REDUCE`). Entries are scaled by `1/sqrt(dim)` to roughly preserve norms.
+    pub fn set_projection(&mut self, input_dim: usize) {
+        let out_dim = self.dim;
+        let mut state: u64 = 0x9e3779b97f4a7c15 ^ (input_dim as u64) ^ ((out_dim as u64) << 32);
+        let mut next_unit = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ((state >> 11) as f64 / (1u64 << 53) as f64).max(1e-12)
+        };
+        let scale = 1.0 / (out_dim as f64).sqrt();
+        let mut m = Vec::with_capacity(out_dim * input_dim);
+        for _ in 0..out_dim * input_dim {
+            let (u1, u2) = (next_unit(), next_unit());
+            let g = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+            m.push((g * scale) as f32);
+        }
+        self.projection = Some(m);
+        self.input_dim = input_dim;
+    }
+
+    /// Applies the `REDUCE` projection (if any) to a client-supplied vector.
+    pub fn project(&self, v: &[f32]) -> Vec<f32> {
+        match &self.projection {
+            Some(m) if self.input_dim == v.len() => (0..self.dim)
+                .map(|r| dot_product(&m[r * self.input_dim..(r + 1) * self.input_dim], v))
+                .collect(),
+            _ => v.to_vec(),
+        }
+    }
+
+    /// Dimension that clients must supply (`input_dim` for projected sets, otherwise `dim`).
+    pub fn client_dim(&self) -> usize {
+        if self.projection.is_some() {
+            self.input_dim
+        } else {
+            self.dim
+        }
+    }
+
+    /// Vector as stored for `key`, dequantized when the set uses `Q8` or `BIN`.
+    pub fn stored_vector(&self, key: &Bytes) -> Option<Vec<f32>> {
+        let id = *self.key_to_id.get(key)?;
+        let node = self.nodes.get(id)?.as_ref()?;
+        Some(match self.quant {
+            VQuant::Q8 => node
+                .quantized
+                .as_ref()
+                .map(|q| q.dequantize())
+                .unwrap_or_else(|| node.vector.clone()),
+            VQuant::Bin => {
+                if let Some(bits) = &node.binary {
+                    (0..self.dim)
+                        .map(|i| {
+                            if (bits[i / 64] >> (i % 64)) & 1 == 1 {
+                                1.0
+                            } else {
+                                -1.0
+                            }
+                        })
+                        .collect()
+                } else {
+                    node.vector.clone()
+                }
+            }
+            VQuant::NoQuant => node.vector.clone(),
+        })
+    }
+
+    /// Neighbor lists of `key` from layer 0 up to its highest layer (`VLINKS`).
+    pub fn links(&self, key: &Bytes) -> Option<Vec<Vec<(Bytes, f32)>>> {
+        let id = *self.key_to_id.get(key)?;
+        let node = self.nodes.get(id)?.as_ref()?;
+        Some(
+            node.neighbors
+                .iter()
+                .map(|layer| {
+                    layer
+                        .iter()
+                        .filter_map(|&n| self.nodes.get(n).and_then(|o| o.as_ref()))
+                        .map(|n| {
+                            let d = compute_distance(&node.vector, &n.vector, self.metric);
+                            let score = (1.0 - d / 2.0).clamp(0.0, 1.0);
+                            (n.key.clone(), score)
+                        })
+                        .collect()
+                })
+                .collect(),
+        )
+    }
+
+    /// Highest node id ever allocated (`VINFO hnsw-max-node-uid`).
+    pub fn max_node_uid(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Exact brute-force top-k (`VSIM ... TRUTH`), optionally restricted by `filter`.
+    pub fn search_exact(
+        &self,
+        query: &[f32],
+        k: usize,
+        filter: Option<&dyn Fn(&Bytes) -> bool>,
+    ) -> Vec<(Bytes, f32)> {
+        let mut all: Vec<(Bytes, f32)> = self
+            .nodes
+            .iter()
+            .flatten()
+            .filter(|n| filter.is_none_or(|f| f(&n.key)))
+            .map(|n| (n.key.clone(), self.dist_to_node(query, n)))
+            .collect();
+        all.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        all.truncate(k);
+        all
     }
 
     fn next_random_f64(&mut self) -> f64 {
@@ -917,6 +1102,10 @@ impl HnswIndex {
             && let Some(quantizer) = &self.pq_quantizer
         {
             return quantizer.compute_distance_with_vec(query, pq);
+        }
+        if let Some(bin) = &node.binary {
+            let q_bin = quantize_binary(query);
+            return binary_hamming_cosine_distance(&q_bin, bin, self.dim);
         }
         if let Some(quant) = &node.quantized {
             quant.compute_distance(query, self.metric)
@@ -962,8 +1151,14 @@ impl HnswIndex {
         let target_level = self.random_level();
         let new_id = self.nodes.len();
 
-        let quantized = if quantize_sq8 || (tiered && !quantize_pq) {
+        let use_q8 = quantize_sq8 || self.quant == VQuant::Q8 || (tiered && !quantize_pq);
+        let quantized = if use_q8 {
             Some(QuantizedVector::quantize(&vector))
+        } else {
+            None
+        };
+        let binary = if self.quant == VQuant::Bin {
+            Some(quantize_binary(&vector))
         } else {
             None
         };
@@ -983,6 +1178,7 @@ impl HnswIndex {
             key: key.clone(),
             vector: vector.clone(),
             quantized,
+            binary,
             pq,
             is_tiered: tiered,
             neighbors: vec![Vec::new(); target_level + 1],
@@ -1358,6 +1554,487 @@ impl HnswIndex {
             false
         }
     }
+
+    /// Returns the raw internal representation for `VEMB key element RAW`:
+    /// `(quant_type, raw_blob, norm, q8_range)`.
+    pub fn raw_embedding(&self, key: &Bytes) -> Option<(&'static str, Vec<u8>, f32, Option<f32>)> {
+        let id = *self.key_to_id.get(key)?;
+        let node = self.nodes.get(id)?.as_ref()?;
+        let norm = dot_product(&node.vector, &node.vector).sqrt().max(1e-12);
+        match self.quant {
+            VQuant::Q8 => {
+                let q = node
+                    .quantized
+                    .clone()
+                    .unwrap_or_else(|| QuantizedVector::quantize(&node.vector));
+                let range = (q.scale * 255.0).abs();
+                Some(("q8", q.data, norm, Some(range)))
+            }
+            VQuant::Bin => {
+                let words = node
+                    .binary
+                    .clone()
+                    .unwrap_or_else(|| quantize_binary(&node.vector));
+                let byte_len = self.dim.div_ceil(8);
+                let mut raw = Vec::with_capacity(byte_len);
+                for word in words {
+                    for b in word.to_le_bytes() {
+                        if raw.len() < byte_len {
+                            raw.push(b);
+                        }
+                    }
+                }
+                Some(("bin", raw, norm, None))
+            }
+            VQuant::NoQuant => {
+                let mut raw = Vec::with_capacity(node.vector.len() * 4);
+                for &v in &node.vector {
+                    raw.extend_from_slice(&(v / norm).to_le_bytes());
+                }
+                Some(("fp32", raw, norm, None))
+            }
+        }
+    }
+
+    /// Samples element keys for `VRANDMEMBER key [count]`.
+    pub fn random_members(&mut self, count: i64) -> Vec<Bytes> {
+        if self.key_to_id.is_empty() || count == 0 {
+            return Vec::new();
+        }
+        let mut keys: Vec<Bytes> = self.key_to_id.keys().cloned().collect();
+        // Sort first for deterministic base ordering before PRNG sampling.
+        keys.sort();
+        if count > 0 {
+            let n = (count as usize).min(keys.len());
+            // Partial Fisher-Yates shuffle.
+            for i in 0..n {
+                let rem = keys.len() - i;
+                let r = (self.next_random_f64() * (rem as f64)) as usize;
+                let j = i + r.min(rem - 1);
+                keys.swap(i, j);
+            }
+            keys.truncate(n);
+            keys
+        } else {
+            let n = count.unsigned_abs() as usize;
+            let mut out = Vec::with_capacity(n);
+            for _ in 0..n {
+                let r = (self.next_random_f64() * (keys.len() as f64)) as usize;
+                out.push(keys[r.min(keys.len() - 1)].clone());
+            }
+            out
+        }
+    }
+}
+
+/// Value produced during Redis 8 `VSIM ... FILTER` expression evaluation.
+#[derive(Debug, Clone, PartialEq)]
+enum FilterVal {
+    Null,
+    Bool(bool),
+    Num(f64),
+    Str(String),
+    List(Vec<FilterVal>),
+}
+
+impl FilterVal {
+    fn is_truthy(&self) -> bool {
+        match self {
+            FilterVal::Null => false,
+            FilterVal::Bool(b) => *b,
+            FilterVal::Num(n) => *n != 0.0 && !n.is_nan(),
+            FilterVal::Str(s) => !s.is_empty(),
+            FilterVal::List(l) => !l.is_empty(),
+        }
+    }
+
+    fn as_f64(&self) -> Option<f64> {
+        match self {
+            FilterVal::Num(n) => Some(*n),
+            FilterVal::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            _ => None,
+        }
+    }
+
+    fn from_json(v: &serde_json::Value) -> Self {
+        match v {
+            serde_json::Value::Null => FilterVal::Null,
+            serde_json::Value::Bool(b) => FilterVal::Bool(*b),
+            serde_json::Value::Number(n) => FilterVal::Num(n.as_f64().unwrap_or(0.0)),
+            serde_json::Value::String(s) => FilterVal::Str(s.clone()),
+            serde_json::Value::Array(arr) => {
+                FilterVal::List(arr.iter().map(Self::from_json).collect())
+            }
+            serde_json::Value::Object(_) => FilterVal::Null,
+        }
+    }
+
+    fn equals(&self, other: &Self) -> bool {
+        match (self, other) {
+            (FilterVal::Num(a), FilterVal::Num(b)) => (a - b).abs() < 1e-9,
+            (FilterVal::Bool(a), FilterVal::Bool(b)) => a == b,
+            (FilterVal::Num(a), FilterVal::Bool(b)) | (FilterVal::Bool(b), FilterVal::Num(a)) => {
+                (*a != 0.0) == *b
+            }
+            (FilterVal::Str(a), FilterVal::Str(b)) => a == b,
+            (FilterVal::Null, FilterVal::Null) => true,
+            (FilterVal::List(a), FilterVal::List(b)) => {
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.equals(y))
+            }
+            _ => false,
+        }
+    }
+
+    fn cmp_ord(&self, other: &Self) -> Option<Ordering> {
+        match (self, other) {
+            (FilterVal::Num(a), FilterVal::Num(b)) => a.partial_cmp(b),
+            (FilterVal::Str(a), FilterVal::Str(b)) => Some(a.cmp(b)),
+            _ => None,
+        }
+    }
+}
+
+struct FilterParser<'a> {
+    src: &'a [u8],
+    pos: usize,
+    root: Option<&'a serde_json::Value>,
+}
+
+impl<'a> FilterParser<'a> {
+    fn new(expr: &'a str, root: Option<&'a serde_json::Value>) -> Self {
+        Self {
+            src: expr.as_bytes(),
+            pos: 0,
+            root,
+        }
+    }
+
+    fn skip_ws(&mut self) {
+        while self.pos < self.src.len() && self.src[self.pos].is_ascii_whitespace() {
+            self.pos += 1;
+        }
+    }
+
+    fn peek(&mut self) -> Option<u8> {
+        self.skip_ws();
+        self.src.get(self.pos).copied()
+    }
+
+    fn eat_kw(&mut self, kw: &str) -> bool {
+        self.skip_ws();
+        let bytes = kw.as_bytes();
+        let end = self.pos + bytes.len();
+        if end <= self.src.len() && self.src[self.pos..end].eq_ignore_ascii_case(bytes) {
+            let next_ok = end == self.src.len()
+                || (!self.src[end].is_ascii_alphanumeric() && self.src[end] != b'_');
+            if next_ok {
+                self.pos = end;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn eat_op(&mut self, op: &[u8]) -> bool {
+        self.skip_ws();
+        if self.src[self.pos..].starts_with(op) {
+            self.pos += op.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn parse_or(&mut self) -> Result<FilterVal, String> {
+        let mut left = self.parse_and()?;
+        while self.eat_op(b"||") || self.eat_kw("or") {
+            let right = self.parse_and()?;
+            left = FilterVal::Bool(left.is_truthy() || right.is_truthy());
+        }
+        Ok(left)
+    }
+
+    fn parse_and(&mut self) -> Result<FilterVal, String> {
+        let mut left = self.parse_not()?;
+        while self.eat_op(b"&&") || self.eat_kw("and") {
+            let right = self.parse_not()?;
+            left = FilterVal::Bool(left.is_truthy() && right.is_truthy());
+        }
+        Ok(left)
+    }
+
+    fn parse_not(&mut self) -> Result<FilterVal, String> {
+        self.skip_ws();
+        if (self.src[self.pos..].starts_with(b"!") && !self.src[self.pos..].starts_with(b"!="))
+            || self.eat_kw("not")
+        {
+            if self.src.get(self.pos) == Some(&b'!') {
+                self.pos += 1;
+            }
+            let v = self.parse_not()?;
+            return Ok(FilterVal::Bool(!v.is_truthy()));
+        }
+        self.parse_cmp()
+    }
+
+    fn parse_cmp(&mut self) -> Result<FilterVal, String> {
+        let mut left = self.parse_add()?;
+        loop {
+            if self.eat_op(b"==") {
+                let r = self.parse_add()?;
+                left = FilterVal::Bool(left.equals(&r));
+            } else if self.eat_op(b"!=") {
+                let r = self.parse_add()?;
+                left = FilterVal::Bool(!left.equals(&r));
+            } else if self.eat_op(b"<=") {
+                let r = self.parse_add()?;
+                left = FilterVal::Bool(
+                    left.cmp_ord(&r)
+                        .is_some_and(|o| o == Ordering::Less || o == Ordering::Equal),
+                );
+            } else if self.eat_op(b">=") {
+                let r = self.parse_add()?;
+                left = FilterVal::Bool(
+                    left.cmp_ord(&r)
+                        .is_some_and(|o| o == Ordering::Greater || o == Ordering::Equal),
+                );
+            } else if self.eat_op(b"<") {
+                let r = self.parse_add()?;
+                left = FilterVal::Bool(left.cmp_ord(&r) == Some(Ordering::Less));
+            } else if self.eat_op(b">") {
+                let r = self.parse_add()?;
+                left = FilterVal::Bool(left.cmp_ord(&r) == Some(Ordering::Greater));
+            } else if self.eat_kw("in") {
+                let r = self.parse_add()?;
+                let matched = match (&left, &r) {
+                    (needle, FilterVal::List(items)) => items.iter().any(|it| it.equals(needle)),
+                    (FilterVal::Str(sub), FilterVal::Str(hay)) => hay.contains(sub.as_str()),
+                    _ => false,
+                };
+                left = FilterVal::Bool(matched);
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_add(&mut self) -> Result<FilterVal, String> {
+        let mut left = self.parse_mul()?;
+        loop {
+            if self.eat_op(b"+") {
+                let r = self.parse_mul()?;
+                left = match (left.as_f64(), r.as_f64()) {
+                    (Some(a), Some(b)) => FilterVal::Num(a + b),
+                    _ => FilterVal::Null,
+                };
+            } else if self.eat_op(b"-") {
+                let r = self.parse_mul()?;
+                left = match (left.as_f64(), r.as_f64()) {
+                    (Some(a), Some(b)) => FilterVal::Num(a - b),
+                    _ => FilterVal::Null,
+                };
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_mul(&mut self) -> Result<FilterVal, String> {
+        let mut left = self.parse_pow()?;
+        loop {
+            if self.eat_op(b"*") {
+                let r = self.parse_pow()?;
+                left = match (left.as_f64(), r.as_f64()) {
+                    (Some(a), Some(b)) => FilterVal::Num(a * b),
+                    _ => FilterVal::Null,
+                };
+            } else if self.eat_op(b"/") {
+                let r = self.parse_pow()?;
+                left = match (left.as_f64(), r.as_f64()) {
+                    (Some(a), Some(b)) if b != 0.0 => FilterVal::Num(a / b),
+                    _ => FilterVal::Null,
+                };
+            } else if self.eat_op(b"%") {
+                let r = self.parse_pow()?;
+                left = match (left.as_f64(), r.as_f64()) {
+                    (Some(a), Some(b)) if b != 0.0 => FilterVal::Num(a % b),
+                    _ => FilterVal::Null,
+                };
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    fn parse_pow(&mut self) -> Result<FilterVal, String> {
+        let left = self.parse_unary()?;
+        if self.eat_op(b"^") || self.eat_op(b"**") {
+            let r = self.parse_pow()?;
+            return Ok(match (left.as_f64(), r.as_f64()) {
+                (Some(a), Some(b)) => FilterVal::Num(a.powf(b)),
+                _ => FilterVal::Null,
+            });
+        }
+        Ok(left)
+    }
+
+    fn parse_unary(&mut self) -> Result<FilterVal, String> {
+        if self.eat_op(b"-") {
+            let v = self.parse_unary()?;
+            return Ok(v
+                .as_f64()
+                .map(|n| FilterVal::Num(-n))
+                .unwrap_or(FilterVal::Null));
+        }
+        if self.eat_op(b"+") {
+            let v = self.parse_unary()?;
+            return Ok(v.as_f64().map(FilterVal::Num).unwrap_or(FilterVal::Null));
+        }
+        self.parse_primary()
+    }
+
+    fn parse_primary(&mut self) -> Result<FilterVal, String> {
+        let Some(ch) = self.peek() else {
+            return Err("unexpected end of filter expression".to_string());
+        };
+        if ch == b'(' {
+            self.pos += 1;
+            let first = self.parse_or()?;
+            if self.eat_op(b",") {
+                let mut items = vec![first];
+                while self.peek() != Some(b')') {
+                    items.push(self.parse_or()?);
+                    if !self.eat_op(b",") {
+                        break;
+                    }
+                }
+                if !self.eat_op(b")") {
+                    return Err("unclosed tuple in filter expression".to_string());
+                }
+                return Ok(FilterVal::List(items));
+            }
+            if !self.eat_op(b")") {
+                return Err("unclosed '(' in filter expression".to_string());
+            }
+            return Ok(first);
+        }
+        if ch == b'[' {
+            self.pos += 1;
+            let mut items = Vec::new();
+            while self.peek() != Some(b']') {
+                items.push(self.parse_or()?);
+                if !self.eat_op(b",") {
+                    break;
+                }
+            }
+            if !self.eat_op(b"]") {
+                return Err("unclosed '[' in filter expression".to_string());
+            }
+            return Ok(FilterVal::List(items));
+        }
+        if ch == b'"' || ch == b'\'' {
+            let quote = ch;
+            self.pos += 1;
+            let mut s = String::new();
+            while self.pos < self.src.len() {
+                let b = self.src[self.pos];
+                self.pos += 1;
+                if b == quote {
+                    return Ok(FilterVal::Str(s));
+                }
+                if b == b'\\' && self.pos < self.src.len() {
+                    let esc = self.src[self.pos];
+                    self.pos += 1;
+                    s.push(esc as char);
+                } else {
+                    s.push(b as char);
+                }
+            }
+            return Err("unterminated string literal in filter expression".to_string());
+        }
+        if ch == b'.' {
+            let mut cur = self.root;
+            while self.peek() == Some(b'.') {
+                self.pos += 1;
+                let start = self.pos;
+                while self.pos < self.src.len()
+                    && (self.src[self.pos].is_ascii_alphanumeric()
+                        || self.src[self.pos] == b'_'
+                        || self.src[self.pos] == b'-')
+                {
+                    self.pos += 1;
+                }
+                if start == self.pos {
+                    return Err("empty field selector in filter expression".to_string());
+                }
+                let field = std::str::from_utf8(&self.src[start..self.pos])
+                    .map_err(|_| "invalid UTF-8 in field selector".to_string())?;
+                cur = cur.and_then(|v| v.get(field));
+            }
+            return Ok(cur.map(FilterVal::from_json).unwrap_or(FilterVal::Null));
+        }
+        if ch.is_ascii_digit() {
+            let start = self.pos;
+            while self.pos < self.src.len()
+                && (self.src[self.pos].is_ascii_digit()
+                    || self.src[self.pos] == b'.'
+                    || self.src[self.pos] == b'e'
+                    || self.src[self.pos] == b'E'
+                    || ((self.src[self.pos] == b'+' || self.src[self.pos] == b'-')
+                        && (self.src[self.pos - 1] == b'e' || self.src[self.pos - 1] == b'E')))
+            {
+                self.pos += 1;
+            }
+            let s = std::str::from_utf8(&self.src[start..self.pos])
+                .map_err(|_| "invalid number".to_string())?;
+            let n: f64 = s.parse().map_err(|_| "invalid number".to_string())?;
+            return Ok(FilterVal::Num(n));
+        }
+        if self.eat_kw("true") {
+            return Ok(FilterVal::Bool(true));
+        }
+        if self.eat_kw("false") {
+            return Ok(FilterVal::Bool(false));
+        }
+        if self.eat_kw("null") || self.eat_kw("nil") {
+            return Ok(FilterVal::Null);
+        }
+        Err(format!(
+            "unexpected token at byte {} in filter expression",
+            self.pos
+        ))
+    }
+}
+
+/// Validates that `expr` is syntactically valid for `VSIM ... FILTER`.
+pub fn validate_vset_filter(expr: &str) -> Result<(), String> {
+    let mut parser = FilterParser::new(expr, None);
+    let _ = parser.parse_or()?;
+    parser.skip_ws();
+    if parser.pos != parser.src.len() {
+        return Err("unexpected trailing tokens in filter expression".to_string());
+    }
+    Ok(())
+}
+
+/// Evaluates a Redis 8 `VSIM ... FILTER` expression against an element's optional JSON attributes.
+pub fn eval_vset_filter(expr: &str, json_str: Option<&str>) -> Result<bool, String> {
+    let Some(raw) = json_str.filter(|s| !s.trim().is_empty()) else {
+        return Ok(false);
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Ok(false);
+    };
+    let mut parser = FilterParser::new(expr, Some(&val));
+    let res = parser.parse_or()?;
+    parser.skip_ws();
+    if parser.pos != parser.src.len() {
+        return Err("unexpected trailing tokens in filter expression".to_string());
+    }
+    Ok(res.is_truthy())
 }
 
 /// Exact brute-force (`FLAT`) vector index with contiguous storage.
@@ -1981,5 +2658,39 @@ mod tests {
         assert!(cache.del(&Bytes::from("q1")));
         assert!(!cache.del(&Bytes::from("q1")));
         assert_eq!(cache.entries.len(), 0);
+    }
+
+    #[test]
+    fn test_redis8_vset_filter_evaluator_and_quantization() {
+        let json = r#"{"year": 1994, "rating": 9.3, "genre": "drama", "tags": ["crime", "classic"], "meta": {"oscar": true}}"#;
+        assert!(
+            eval_vset_filter(
+                r#".year >= 1990 and .rating > 9.0 and .genre == "drama""#,
+                Some(json)
+            )
+            .unwrap()
+        );
+        assert!(
+            eval_vset_filter(
+                r#".genre in ["drama", "sci-fi"] && "classic" in .tags && .meta.oscar"#,
+                Some(json)
+            )
+            .unwrap()
+        );
+        assert!(!eval_vset_filter(r#"not (.year == 1994)"#, Some(json)).unwrap());
+        assert!(eval_vset_filter(r#"(.year - 1990) * 2 == 8"#, Some(json)).unwrap());
+        assert!(!eval_vset_filter(r#".year > 1900"#, None).unwrap());
+
+        // Binary quantization + REDUCE projection
+        let mut idx = HnswIndex::new("vset_bin".to_string(), 4, VectorMetric::Cosine);
+        idx.quant = VQuant::Bin;
+        idx.set_projection(8);
+        assert_eq!(idx.client_dim(), 8);
+        let p1 = idx.project(&[1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0]);
+        let p2 = idx.project(&[-1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0]);
+        idx.add(Bytes::from("e1"), p1.clone()).unwrap();
+        idx.add(Bytes::from("e2"), p2).unwrap();
+        let hits = idx.search(&p1, 1);
+        assert_eq!(hits[0].0, Bytes::from("e1"));
     }
 }

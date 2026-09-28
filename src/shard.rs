@@ -776,7 +776,18 @@ impl ShardDb {
     #[inline(always)]
     pub fn del(&mut self, key: &[u8]) -> bool {
         if self.tier_manager.is_none() && self.sticky_keys.is_empty() {
-            return self.table.del(key);
+            if self.table.del(key) {
+                return true;
+            }
+            if !self.vector_indexes.is_empty()
+                && let Ok(s) = std::str::from_utf8(key)
+            {
+                return self
+                    .vector_indexes
+                    .remove(s)
+                    .is_some_and(|idx| !idx.is_empty());
+            }
+            return false;
         }
         if let Some(tm) = &self.tier_manager {
             tm.op_manager.cancel_pending_stash(key);
@@ -811,14 +822,34 @@ impl ShardDb {
                     .total_deletes
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+            return true;
         }
-        deleted
+        if !self.vector_indexes.is_empty()
+            && let Ok(s) = std::str::from_utf8(key)
+        {
+            return self
+                .vector_indexes
+                .remove(s)
+                .is_some_and(|idx| !idx.is_empty());
+        }
+        false
     }
 
     #[inline(always)]
     pub fn del_with_hash(&mut self, key: &[u8], hash: u64) -> bool {
         if self.tier_manager.is_none() && self.sticky_keys.is_empty() {
-            return self.table.del_with_hash(key, hash);
+            if self.table.del_with_hash(key, hash) {
+                return true;
+            }
+            if !self.vector_indexes.is_empty()
+                && let Ok(s) = std::str::from_utf8(key)
+            {
+                return self
+                    .vector_indexes
+                    .remove(s)
+                    .is_some_and(|idx| !idx.is_empty());
+            }
+            return false;
         }
         self.del(key)
     }
@@ -860,12 +891,34 @@ impl ShardDb {
 
     #[inline(always)]
     pub fn exists(&mut self, key: &[u8]) -> bool {
-        self.table.exists(key)
+        if self.table.exists(key) {
+            return true;
+        }
+        if !self.vector_indexes.is_empty()
+            && let Ok(s) = std::str::from_utf8(key)
+        {
+            return self
+                .vector_indexes
+                .get(s)
+                .is_some_and(|idx| !idx.is_empty());
+        }
+        false
     }
 
     #[inline(always)]
     pub fn exists_with_hash(&mut self, key: &[u8], hash: u64) -> bool {
-        self.table.exists_with_hash(key, hash)
+        if self.table.exists_with_hash(key, hash) {
+            return true;
+        }
+        if !self.vector_indexes.is_empty()
+            && let Ok(s) = std::str::from_utf8(key)
+        {
+            return self
+                .vector_indexes
+                .get(s)
+                .is_some_and(|idx| !idx.is_empty());
+        }
+        false
     }
 
     #[inline(always)]
@@ -1646,6 +1699,7 @@ impl ShardDb {
     #[inline]
     pub fn flushdb(&mut self) {
         self.table.flushdb();
+        self.vector_indexes.clear();
         self.semantic_caches.clear();
     }
 
@@ -1656,7 +1710,18 @@ impl ShardDb {
 
     #[inline]
     pub fn type_of(&mut self, key: &[u8]) -> &'static str {
-        self.table.type_of(key)
+        let t = self.table.type_of(key);
+        if t == "none"
+            && !self.vector_indexes.is_empty()
+            && let Ok(s) = std::str::from_utf8(key)
+            && self
+                .vector_indexes
+                .get(s)
+                .is_some_and(|idx| !idx.is_empty())
+        {
+            return "vectorset";
+        }
+        t
     }
 
     #[inline]
@@ -2546,6 +2611,98 @@ impl ShardDb {
         idx.add_quantized_ext(key, vector, quantize, pq, tiered)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn vadd_ext(
+        &mut self,
+        index_name: &str,
+        element: Bytes,
+        vector: Vec<f32>,
+        metric: Option<crate::vector::VectorMetric>,
+        quantize: bool,
+        pq: bool,
+        tiered: bool,
+        reduce: Option<usize>,
+        quant: Option<crate::vector::VQuant>,
+        ef: Option<usize>,
+        setattr: Option<String>,
+        m: Option<usize>,
+        is_redis_vset: bool,
+    ) -> Result<bool, String> {
+        if self.table.exists(index_name.as_bytes()) {
+            return Err(
+                "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+            );
+        }
+        if vector.is_empty() {
+            return Err("vector dimension must be greater than 0".to_string());
+        }
+        let target_dim = reduce.unwrap_or(vector.len());
+        let is_new_index = !self.vector_indexes.contains_key(index_name);
+        let idx = self
+            .vector_indexes
+            .entry(index_name.to_string())
+            .or_insert_with(|| {
+                let mut h = crate::vector::HnswIndex::new(
+                    index_name.to_string(),
+                    target_dim,
+                    metric.unwrap_or(crate::vector::VectorMetric::Cosine),
+                );
+                if is_redis_vset {
+                    h.is_redis_vset = true;
+                    h.quant = quant.unwrap_or(crate::vector::VQuant::Q8);
+                    if let Some(m_val) = m {
+                        let m_clamped = m_val.max(2);
+                        h.m = m_clamped;
+                        h.m0 = m_clamped * 2;
+                        h.ml = 1.0 / (m_clamped as f64).ln();
+                    }
+                    if let Some(ef_val) = ef {
+                        h.ef_construction = ef_val.max(1);
+                    }
+                    if reduce.is_some() {
+                        h.set_projection(vector.len());
+                    }
+                }
+                h
+            });
+        if !is_new_index && is_redis_vset {
+            if let Some(q) = quant
+                && q != idx.quant
+            {
+                return Err("Quantization type mismatch".to_string());
+            }
+            if let Some(r) = reduce
+                && (idx.projection.is_none() || r != idx.dim)
+            {
+                return Err("Projection dimension mismatch".to_string());
+            }
+            if vector.len() != idx.client_dim() {
+                return Err("vector dimension mismatch".to_string());
+            }
+            if let Some(ef_val) = ef {
+                idx.ef_construction = ef_val.max(1);
+            }
+        }
+        let existed = idx.key_to_id.contains_key(&element);
+        let projected = idx.project(&vector);
+        idx.add_quantized_ext(
+            element.clone(),
+            projected,
+            quantize || idx.quant == crate::vector::VQuant::Q8,
+            pq,
+            tiered,
+        )
+        .map_err(|e| e.to_string())?;
+        if let Some(attr) = setattr {
+            if attr.trim().is_empty() {
+                idx.attributes.remove(&element);
+            } else {
+                idx.attributes.insert(element, attr);
+            }
+        }
+        Ok(!existed)
+    }
+
     pub fn vquery(
         &self,
         index_name: &str,
@@ -2554,7 +2711,8 @@ impl ShardDb {
         rerank: bool,
     ) -> Vec<(Bytes, f32)> {
         if let Some(idx) = self.vector_indexes.get(index_name) {
-            idx.search_tiered(query, k, rerank)
+            let projected = idx.project(query);
+            idx.search_tiered(&projected, k, rerank)
         } else {
             Vec::new()
         }
@@ -2577,18 +2735,144 @@ impl ShardDb {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn vsim_ext(
+        &mut self,
+        index_name: &str,
+        target: &crate::resp::VsimTarget,
+        with_attribs: bool,
+        count: usize,
+        epsilon: Option<f32>,
+        ef: Option<usize>,
+        filter: Option<&str>,
+        filter_ef: Option<usize>,
+        truth: bool,
+    ) -> Result<Vec<(Bytes, f32, Option<String>)>, String> {
+        if self.table.exists(index_name.as_bytes()) {
+            return Err(
+                "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+            );
+        }
+        let Some(idx) = self.vector_indexes.get(index_name) else {
+            return Ok(Vec::new());
+        };
+        let query_vec: Vec<f32> = match target {
+            crate::resp::VsimTarget::Element(elem) => idx
+                .get_vector(elem)
+                .ok_or_else(|| "Element not found".to_string())?
+                .to_vec(),
+            crate::resp::VsimTarget::Vector(v) => {
+                if v.len() != idx.client_dim() {
+                    return Err("vector dimension mismatch".to_string());
+                }
+                idx.project(v)
+            }
+        };
+        let attrs_ref = &idx.attributes;
+        let filter_closure = |elem: &Bytes| -> bool {
+            let Some(expr) = filter else {
+                return true;
+            };
+            crate::vector::eval_vset_filter(expr, attrs_ref.get(elem).map(|s| s.as_str()))
+                .unwrap_or(false)
+        };
+        let filter_opt: Option<&dyn Fn(&Bytes) -> bool> = if filter.is_some() {
+            Some(&filter_closure)
+        } else {
+            None
+        };
+        let rerank = idx.quant == crate::vector::VQuant::NoQuant;
+        let raw_hits = if truth {
+            idx.search_exact(&query_vec, count, filter_opt)
+        } else if filter.is_some() {
+            let eff_ef = filter_ef.or(ef).or(Some((count * 10).max(64)));
+            let mut hits = idx.search_filtered(&query_vec, count, eff_ef, rerank, filter_opt);
+            if hits.len() < count {
+                hits = idx.search_exact(&query_vec, count, filter_opt);
+            }
+            hits
+        } else {
+            idx.search_ext(&query_vec, count, ef, rerank)
+        };
+        let mut out = Vec::with_capacity(raw_hits.len());
+        for (elem, dist) in raw_hits {
+            let score = (1.0 - dist / 2.0).clamp(0.0, 1.0);
+            if let Some(ep) = epsilon
+                && score < 1.0 - ep - 1e-6
+            {
+                continue;
+            }
+            let attr = if with_attribs {
+                idx.attributes.get(&elem).cloned()
+            } else {
+                None
+            };
+            out.push((elem, score, attr));
+        }
+        Ok(out)
+    }
+
     pub fn vdel(&mut self, index_name: &str, key: &Bytes) -> bool {
-        if let Some(idx) = self.vector_indexes.get_mut(index_name) {
-            idx.remove(key)
+        let mut empty = false;
+        let removed = if let Some(idx) = self.vector_indexes.get_mut(index_name) {
+            idx.attributes.remove(key);
+            let r = idx.remove(key);
+            empty = idx.is_empty();
+            r
         } else {
             false
+        };
+        if empty {
+            self.vector_indexes.remove(index_name);
         }
+        removed
     }
 
     pub fn vinfo(&self, index_name: &str) -> Option<(usize, usize, &'static str, usize)> {
         self.vector_indexes
             .get(index_name)
             .map(|idx| (idx.len(), idx.dim, idx.metric.as_str(), idx.max_layer))
+    }
+
+    pub fn vsetattr(
+        &mut self,
+        index_name: &str,
+        element: &Bytes,
+        attr: String,
+    ) -> Result<bool, String> {
+        if self.table.exists(index_name.as_bytes()) {
+            return Err(
+                "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+            );
+        }
+        let Some(idx) = self.vector_indexes.get_mut(index_name) else {
+            return Ok(false);
+        };
+        if !idx.key_to_id.contains_key(element) {
+            return Ok(false);
+        }
+        if attr.trim().is_empty() {
+            idx.attributes.remove(element);
+        } else {
+            idx.attributes.insert(element.clone(), attr);
+        }
+        Ok(true)
+    }
+
+    pub fn vgetattr(
+        &mut self,
+        index_name: &str,
+        element: &Bytes,
+    ) -> Result<Option<String>, String> {
+        if self.table.exists(index_name.as_bytes()) {
+            return Err(
+                "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+            );
+        }
+        let Some(idx) = self.vector_indexes.get(index_name) else {
+            return Ok(None);
+        };
+        Ok(idx.attributes.get(element).cloned())
     }
 
     // Semantic Cache operations
