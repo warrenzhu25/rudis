@@ -1242,25 +1242,152 @@ pub enum QueryAst {
         k: usize,
         query_vec: Vec<f32>,
         param_name: String,
+        /// `$K`-style parameter reference for K, resolved from `PARAMS` at execution.
+        k_param: Option<String>,
+        /// `EF_RUNTIME` literal or `$param`.
+        ef_runtime: Option<String>,
+        /// `AS <alias>` / `$YIELD_DISTANCE_AS` name for the distance field.
+        yield_as: Option<String>,
     },
     MatchAll,
 }
 
 impl QueryAst {
-    pub fn knn_k(&self) -> Option<usize> {
-        match self {
-            QueryAst::KnnVector { k, .. } => Some(*k),
-            QueryAst::And(subs) | QueryAst::Or(subs) => {
-                for sub in subs {
-                    if let Some(k) = sub.knn_k() {
-                        return Some(k);
-                    }
-                }
-                None
-            }
-            QueryAst::FieldScope { inner, .. } => inner.knn_k(),
+    /// Returns the effective K of the query's KNN clause, resolving `$K` from `PARAMS`.
+    pub fn knn_k(&self, opts: &SearchOptions) -> Option<usize> {
+        match self.knn_clause()? {
+            QueryAst::KnnVector { k, k_param, .. } => Some(
+                k_param
+                    .as_deref()
+                    .and_then(|p| resolve_usize_param(p, opts))
+                    .unwrap_or(*k),
+            ),
             _ => None,
         }
+    }
+
+    /// Finds the KNN clause node of the query, if any.
+    pub fn knn_clause(&self) -> Option<&QueryAst> {
+        match self {
+            QueryAst::KnnVector { .. } => Some(self),
+            QueryAst::And(subs) | QueryAst::Or(subs) => subs.iter().find_map(|s| s.knn_clause()),
+            QueryAst::FieldScope { inner, .. } => inner.knn_clause(),
+            _ => None,
+        }
+    }
+
+    /// Name of the field carrying the KNN distance in results (`AS` alias or `__<field>_score`).
+    pub fn knn_score_field(&self) -> Option<String> {
+        match self.knn_clause()? {
+            QueryAst::KnnVector {
+                field, yield_as, ..
+            } => Some(
+                yield_as
+                    .clone()
+                    .unwrap_or_else(|| format!("__{}_score", field)),
+            ),
+            _ => None,
+        }
+    }
+}
+
+/// Resolves a literal or `$param` value as `usize`.
+pub fn resolve_usize_param(raw: &str, opts: &SearchOptions) -> Option<usize> {
+    resolve_str_param(raw, opts)?.trim().parse().ok()
+}
+
+/// Resolves a literal or `$param` value as a string.
+pub fn resolve_str_param(raw: &str, opts: &SearchOptions) -> Option<String> {
+    match raw.strip_prefix('$') {
+        Some(name) => opts
+            .params
+            .get(name)
+            .or_else(|| opts.params.get(raw))
+            .map(|v| String::from_utf8_lossy(v).to_string()),
+        None => Some(raw.to_string()),
+    }
+}
+
+fn strip_outer_parens(s: &str) -> &str {
+    let t = s.trim();
+    if t.starts_with('(') && t.ends_with(')') {
+        let inner = &t[1..t.len() - 1];
+        let mut depth = 0i32;
+        for c in inner.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        return t;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth == 0 {
+            return inner.trim();
+        }
+    }
+    t
+}
+
+/// Parses the body of a `[KNN ...]` clause (without the brackets) plus an optional trailing
+/// `=>{$YIELD_DISTANCE_AS: alias}` attribute block.
+fn parse_knn_clause(args_part: &str, trailer: &str) -> QueryAst {
+    let tokens: Vec<&str> = args_part.split_whitespace().collect();
+    let (k, k_param) = match tokens.first() {
+        Some(t) if t.starts_with('$') => (10, Some(t.to_string())),
+        Some(t) => (t.parse().unwrap_or(10), None),
+        None => (10, None),
+    };
+    let field = tokens
+        .get(1)
+        .map(|s| s.trim_start_matches('@').to_string())
+        .unwrap_or_default();
+    let param_name = tokens
+        .get(2)
+        .map(|s| s.trim_start_matches('$').to_string())
+        .unwrap_or_default();
+    let mut ef_runtime = None;
+    let mut yield_as = None;
+    let mut i = 3;
+    while i + 1 < tokens.len() {
+        match tokens[i].to_ascii_uppercase().as_str() {
+            "EF_RUNTIME" => ef_runtime = Some(tokens[i + 1].to_string()),
+            "AS" | "YIELD_DISTANCE_AS" => yield_as = Some(tokens[i + 1].to_string()),
+            _ => {}
+        }
+        i += 2;
+    }
+    // Legacy attribute syntax: =>{$YIELD_DISTANCE_AS: dist; $EF_RUNTIME: 20}
+    if let Some(body) = trailer
+        .trim()
+        .strip_prefix("=>")
+        .map(str::trim)
+        .and_then(|s| s.strip_prefix('{'))
+        .and_then(|s| s.split_once('}').map(|(b, _)| b))
+    {
+        for attr in body.split(';') {
+            if let Some((name, val)) = attr.split_once(':') {
+                let name = name.trim().trim_start_matches('$').to_ascii_uppercase();
+                let val = val.trim().to_string();
+                match name.as_str() {
+                    "YIELD_DISTANCE_AS" => yield_as = Some(val),
+                    "EF_RUNTIME" => ef_runtime = Some(val),
+                    _ => {}
+                }
+            }
+        }
+    }
+    QueryAst::KnnVector {
+        field,
+        k,
+        query_vec: Vec::new(),
+        param_name,
+        k_param,
+        ef_runtime,
+        yield_as,
     }
 }
 
@@ -1270,34 +1397,17 @@ pub fn parse_query(q: &str) -> QueryAst {
         return QueryAst::MatchAll;
     }
 
-    // Check for KNN vector query syntax: "*=>[KNN 10 @vec $param]" or "(query)=>[KNN 10 @vec $param]"
+    // KNN vector query syntax: "*=>[KNN 10 @vec $param]" or "(query)=>[KNN $K @vec $p AS d]"
     if let Some((base_part, knn_part)) = q.split_once("=>[KNN") {
-        let base_ast = if base_part.trim() == "*" || base_part.trim().is_empty() {
+        let base = strip_outer_parens(base_part);
+        let base_ast = if base == "*" || base.is_empty() {
             QueryAst::MatchAll
         } else {
-            parse_query(base_part.trim())
+            parse_query(base)
         };
 
-        if let Some((args_part, _)) = knn_part.split_once(']') {
-            let tokens: Vec<&str> = args_part.split_whitespace().collect();
-            let k: usize = tokens
-                .first()
-                .and_then(|val| val.parse().ok())
-                .unwrap_or(10);
-            let field = tokens
-                .get(1)
-                .map(|s| s.trim_start_matches('@').to_string())
-                .unwrap_or_default();
-            let param_name = tokens
-                .get(2)
-                .map(|s| s.trim_start_matches('$').to_string())
-                .unwrap_or_default();
-            let knn_ast = QueryAst::KnnVector {
-                field,
-                k,
-                query_vec: Vec::new(),
-                param_name,
-            };
+        if let Some((args_part, trailer)) = knn_part.split_once(']') {
+            let knn_ast = parse_knn_clause(args_part, trailer);
             return QueryAst::And(vec![base_ast, knn_ast]);
         }
     }
@@ -1595,11 +1705,16 @@ fn evaluate_ast(
         }
         QueryAst::KnnVector {
             field,
-            k,
             query_vec,
             param_name,
+            ef_runtime,
+            ..
         } => {
             let effective_vec = knn_query_vector(index, field, query_vec, param_name, opts);
+            let k = &ast.knn_k(opts).unwrap_or(10);
+            let ef = ef_runtime
+                .as_deref()
+                .and_then(|e| resolve_usize_param(e, opts));
 
             let mut map = HashMap::new();
             if !effective_vec.is_empty() {
@@ -1607,7 +1722,7 @@ fn evaluate_ast(
                     .resolve_vector_field(field)
                     .and_then(|sf| index.vector_indices.get(&sf.alias));
                 if let Some(vi) = vi_opt {
-                    let results = vi.search(&effective_vec, *k, None);
+                    let results = vi.search(&effective_vec, *k, ef);
                     for (doc_key, dist) in results {
                         if let Some(doc_id) = index.key_to_id.get(&doc_key) {
                             let sim = match vi.metric() {
@@ -1674,6 +1789,60 @@ fn knn_query_vector(
     }
 }
 
+/// Computes the exact KNN distance of each candidate document for the query's KNN clause.
+fn knn_distances(
+    index: &InvertedIndex,
+    ast: &QueryAst,
+    opts: &SearchOptions,
+    candidates: &HashMap<DocId, f64>,
+) -> Option<HashMap<DocId, f32>> {
+    let QueryAst::KnnVector {
+        field,
+        query_vec,
+        param_name,
+        ..
+    } = ast.knn_clause()?
+    else {
+        return None;
+    };
+    let sf = index.resolve_vector_field(field);
+    let alias = sf.map(|s| s.alias.as_str()).unwrap_or(field.as_str());
+    let metric = index
+        .vector_indices
+        .get(alias)
+        .map(|vi| vi.metric())
+        .or_else(|| match sf.map(|s| &s.field_type) {
+            Some(FieldType::Vector {
+                distance_metric, ..
+            }) => Some(metric_from_str(distance_metric)),
+            _ => None,
+        })
+        .unwrap_or(crate::vector::VectorMetric::Cosine);
+    let query = knn_query_vector(index, field, query_vec, param_name, opts);
+    let mut out = HashMap::with_capacity(candidates.len());
+    if query.is_empty() {
+        return Some(out);
+    }
+    for doc_id in candidates.keys() {
+        if let Some(doc) = index.id_to_meta.get(doc_id)
+            && let Some(v) = doc.vector_fields.get(alias)
+            && v.len() == query.len()
+        {
+            out.insert(
+                *doc_id,
+                crate::vector::compute_distance(&query, v, metric),
+            );
+        }
+    }
+    Some(out)
+}
+
+/// Formats a KNN distance the way RediSearch does (shortest round-trip representation).
+pub fn format_distance(d: f32) -> String {
+    let d = if d == 0.0 { 0.0 } else { d };
+    format!("{}", d)
+}
+
 pub fn execute_search(
     index: &InvertedIndex,
     ast: &QueryAst,
@@ -1682,10 +1851,35 @@ pub fn execute_search(
     let candidate_scores = evaluate_ast(index, ast, opts);
     let total_matches = candidate_scores.len();
 
+    let knn_dists = knn_distances(index, ast, opts, &candidate_scores);
+    let knn_field = ast.knn_score_field();
+    let sort_by_knn = knn_dists.is_some()
+        && match &opts.sortby {
+            None => true,
+            Some((f, _)) => Some(f) == knn_field.as_ref(),
+        };
+    let knn_asc = match &opts.sortby {
+        Some((_, asc)) if sort_by_knn => *asc,
+        _ => true,
+    };
+    let dist_of = |id: &DocId| -> f32 {
+        knn_dists
+            .as_ref()
+            .and_then(|m| m.get(id).copied())
+            .unwrap_or(f32::INFINITY)
+    };
+
     // 2. Sort results
     let mut scored_docs: Vec<(DocId, f64)> = candidate_scores.into_iter().collect();
 
-    if let Some((sort_field, asc)) = &opts.sortby {
+    if sort_by_knn {
+        scored_docs.sort_by(|a, b| {
+            let ord = dist_of(&a.0)
+                .partial_cmp(&dist_of(&b.0))
+                .unwrap_or(std::cmp::Ordering::Equal);
+            if knn_asc { ord } else { ord.reverse() }
+        });
+    } else if let Some((sort_field, asc)) = &opts.sortby {
         scored_docs.sort_by(|a, b| {
             let doc_a = index.id_to_meta.get(&a.0);
             let doc_b = index.id_to_meta.get(&b.0);
@@ -1727,11 +1921,20 @@ pub fn execute_search(
 
     // 4. Construct SearchHit results
     let mut hits = Vec::new();
-    for (doc_id, score) in paged {
+    for (doc_id, mut score) in paged {
         let mut fields = HashMap::new();
         if let Some(doc) = index.id_to_meta.get(&doc_id) {
             let mut sort_val = None;
-            if let Some((sort_field, _)) = &opts.sortby {
+            let dist = knn_dists.as_ref().and_then(|m| m.get(&doc_id).copied());
+            if sort_by_knn {
+                // Encode distance so that the cross-shard merge (score desc / sort_val) keeps
+                // the nearest neighbours first.
+                let d = dist.unwrap_or(f32::INFINITY) as f64;
+                score = -d;
+                if opts.sortby.is_some() {
+                    sort_val = Some(d);
+                }
+            } else if let Some((sort_field, _)) = &opts.sortby {
                 sort_val = doc.numeric_fields.get(sort_field).copied().or_else(|| {
                     sort_field
                         .strip_prefix("$.")
@@ -1751,6 +1954,15 @@ pub fn execute_search(
                     }
                 } else {
                     fields = doc.fields.clone();
+                }
+                if let (Some(d), Some(kf)) = (dist, &knn_field) {
+                    let wanted = opts
+                        .return_fields
+                        .as_ref()
+                        .is_none_or(|r| r.iter().any(|f| f == kf));
+                    if wanted {
+                        fields.insert(kf.clone(), format_distance(d));
+                    }
                 }
             }
             hits.push(SearchHit {
@@ -2571,6 +2783,66 @@ mod tests {
             hnsw.vector_indices.get("v"),
             Some(crate::vector::VectorFieldIndex::Hnsw(_))
         ));
+    }
+
+    #[test]
+    fn test_knn_clause_params_alias_and_distance_sort() {
+        let mut idx = InvertedIndex::new(vector_schema("knn_idx", "HNSW", 2, VectorDataType::Float32));
+        for (k, v) in [("a", "0,0"), ("b", "3,4"), ("c", "1,0"), ("d", "10,10")] {
+            idx.add_hash_document(
+                k,
+                &[(Bytes::from_static(b"v"), Bytes::copy_from_slice(v.as_bytes()))],
+            );
+        }
+        let ast = parse_query("*=>[KNN $K @v $blob EF_RUNTIME $EF AS dist]");
+        match ast.knn_clause() {
+            Some(QueryAst::KnnVector {
+                k_param,
+                ef_runtime,
+                yield_as,
+                ..
+            }) => {
+                assert_eq!(k_param.as_deref(), Some("$K"));
+                assert_eq!(ef_runtime.as_deref(), Some("$EF"));
+                assert_eq!(yield_as.as_deref(), Some("dist"));
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+        let mut params = HashMap::new();
+        params.insert("K".to_string(), b"3".to_vec());
+        params.insert("EF".to_string(), b"50".to_vec());
+        params.insert(
+            "blob".to_string(),
+            [0.0f32, 0.0].iter().flat_map(|f| f.to_le_bytes()).collect(),
+        );
+        let mut opts = SearchOptions {
+            params,
+            ..Default::default()
+        };
+        assert_eq!(ast.knn_k(&opts), Some(3));
+        let (total, hits) = execute_search(&idx, &ast, &opts);
+        assert_eq!(total, 3);
+        let ids: Vec<_> = hits.iter().map(|h| h.doc_id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "c", "b"]);
+        assert_eq!(hits[0].fields.get("dist").map(String::as_str), Some("0"));
+        assert_eq!(hits[2].fields.get("dist").map(String::as_str), Some("5"));
+
+        opts.sortby = Some(("dist".to_string(), false));
+        let (_, hits) = execute_search(&idx, &ast, &opts);
+        let ids: Vec<_> = hits.iter().map(|h| h.doc_id.as_str()).collect();
+        assert_eq!(ids, vec!["b", "c", "a"]);
+
+        // Default distance field name and legacy YIELD_DISTANCE_AS attribute block.
+        assert_eq!(
+            parse_query("*=>[KNN 2 @v $blob]").knn_score_field().as_deref(),
+            Some("__v_score")
+        );
+        assert_eq!(
+            parse_query("*=>[KNN 2 @v $blob]=>{$YIELD_DISTANCE_AS: d2}")
+                .knn_score_field()
+                .as_deref(),
+            Some("d2")
+        );
     }
 
     #[test]

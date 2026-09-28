@@ -2531,13 +2531,13 @@ impl Router {
             });
         }
 
-        let effective_limit = if let Some(k) = ast.knn_k() {
+        let effective_limit = if let Some(k) = ast.knn_k(opts) {
             opts.limit.min(k)
         } else {
             opts.limit
         };
 
-        let reported_total = if let Some(k) = ast.knn_k() {
+        let reported_total = if let Some(k) = ast.knn_k(opts) {
             all_totals.min(k)
         } else {
             all_totals
