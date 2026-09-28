@@ -12989,3 +12989,135 @@ fn test_ft_create_backfill_ft_info_vector_stats_and_vector_range_e2e() {
         s_resp
     );
 }
+
+#[test]
+fn test_agent_memory_working_window_episodic_recall_and_compaction_e2e() {
+    let port = 19152;
+    start_test_server(port, 4);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    let format_resp_cmd = |args: &[&str]| -> Vec<u8> {
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for arg in args {
+            out.extend_from_slice(format!("${}\r\n{}\r\n", arg.len(), arg).as_bytes());
+        }
+        out
+    };
+
+    // 1. Add 4 turns to session "agent:sess1" with token counts and 3D embeddings
+    let add1 = format_resp_cmd(&[
+        "AGENT.MEM.ADD",
+        "agent:sess1",
+        "user",
+        "My prod cluster uses 8 shards on NVMe.",
+        "TOKENS",
+        "10",
+        "VEC",
+        "3",
+        "1.0",
+        "0.0",
+        "0.0",
+        "META",
+        r#"{"turn":1}"#,
+    ]);
+    assert_eq!(send_and_read(&mut client, &add1), ":1\r\n");
+
+    let add2 = format_resp_cmd(&[
+        "AGENT.MEM.ADD",
+        "agent:sess1",
+        "assistant",
+        "Noted: 8 shards with NVMe tiering.",
+        "TOKENS",
+        "10",
+        "VEC",
+        "3",
+        "0.9",
+        "0.1",
+        "0.0",
+    ]);
+    assert_eq!(send_and_read(&mut client, &add2), ":2\r\n");
+
+    let add3 = format_resp_cmd(&[
+        "AGENT.MEM.ADD",
+        "agent:sess1",
+        "user",
+        "How do I enable TLS on port 6380?",
+        "TOKENS",
+        "10",
+        "VEC",
+        "3",
+        "0.0",
+        "1.0",
+        "0.0",
+    ]);
+    assert_eq!(send_and_read(&mut client, &add3), ":3\r\n");
+
+    let add4 = format_resp_cmd(&[
+        "AGENT.MEM.ADD",
+        "agent:sess1",
+        "assistant",
+        "Use --tls-port 6380.",
+        "TOKENS",
+        "10",
+        "VEC",
+        "3",
+        "0.0",
+        "0.9",
+        "0.1",
+    ]);
+    assert_eq!(send_and_read(&mut client, &add4), ":4\r\n");
+
+    // 2. Request context with MAX_TOKENS 20 (fits turns 3 & 4) + QUERY [1,0,0] RECALL 2 (recalls turns 1 & 2)
+    let ctx_cmd = format_resp_cmd(&[
+        "AGENT.MEM.CONTEXT",
+        "agent:sess1",
+        "MAX_TOKENS",
+        "20",
+        "QUERY",
+        "3",
+        "1.0",
+        "0.0",
+        "0.0",
+        "RECALL",
+        "2",
+    ]);
+    let ctx_resp = send_and_read(&mut client, &ctx_cmd);
+    assert!(
+        ctx_resp.starts_with("*2\r\n*2\r\n")
+            && ctx_resp.contains("How do I enable TLS on port 6380?")
+            && ctx_resp.contains("My prod cluster uses 8 shards on NVMe."),
+        "AGENT.MEM.CONTEXT: {}",
+        ctx_resp
+    );
+
+    // 3. Compact older turns keeping only 1 recent turn
+    let compact_cmd = format_resp_cmd(&[
+        "AGENT.MEM.COMPACT",
+        "agent:sess1",
+        "KEEP_RECENT",
+        "1",
+        "SUMMARY",
+        "Summary: user runs 8 NVMe shards and asked about TLS.",
+        "TOKENS",
+        "8",
+    ]);
+    assert_eq!(send_and_read(&mut client, &compact_cmd), ":3\r\n");
+
+    // 4. Verify AGENT.MEM.INFO & AGENT.MEM.CLEAR
+    let info_resp = send_and_read(&mut client, b"AGENT.MEM.INFO agent:sess1\r\n");
+    assert!(
+        info_resp.contains("active_turns\r\n:2\r\n")
+            && info_resp.contains("total_turns\r\n:5\r\n")
+            && info_resp.contains("compactions\r\n:1\r\n"),
+        "AGENT.MEM.INFO: {}",
+        info_resp
+    );
+
+    assert_eq!(
+        send_and_read(&mut client, b"AGENT.MEM.CLEAR agent:sess1\r\n"),
+        ":1\r\n"
+    );
+}

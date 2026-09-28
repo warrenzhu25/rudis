@@ -586,6 +586,7 @@ pub struct ShardDb {
     pub tier_manager: Option<std::rc::Rc<crate::tiering::ShardTierManager>>,
     pub vector_indexes: std::collections::HashMap<String, crate::vector::HnswIndex>,
     pub semantic_caches: hashbrown::HashMap<Bytes, crate::vector::SemanticCache>,
+    pub agent_memories: hashbrown::HashMap<Bytes, crate::agent::AgentMemorySession>,
     pub crdt_store: crate::crdt::CrdtStore,
     pub json_store: crate::json::JsonStore,
     pub probabilistic_store: crate::probabilistic::ProbabilisticStore,
@@ -602,6 +603,7 @@ impl ShardDb {
             tier_manager: None,
             vector_indexes: std::collections::HashMap::new(),
             semantic_caches: hashbrown::HashMap::new(),
+            agent_memories: hashbrown::HashMap::new(),
             crdt_store: crate::crdt::CrdtStore::new(port),
             json_store: crate::json::JsonStore::new(),
             probabilistic_store: crate::probabilistic::ProbabilisticStore::new(),
@@ -1754,6 +1756,7 @@ impl ShardDb {
         self.table.flushdb();
         self.vector_indexes.clear();
         self.semantic_caches.clear();
+        self.agent_memories.clear();
     }
 
     #[inline]
@@ -3067,6 +3070,65 @@ impl ShardDb {
             cache.tokens_saved,
             cache.evicted_expired,
         )
+    }
+
+    // Agent Memory operations
+    pub fn agent_mem_add(
+        &mut self,
+        session: Bytes,
+        role: Bytes,
+        content: Bytes,
+        tokens: Option<u64>,
+        vector: Option<Vec<f32>>,
+        meta: Option<Bytes>,
+    ) -> Result<u64, String> {
+        let sid = String::from_utf8_lossy(&session).into_owned();
+        let mem = self
+            .agent_memories
+            .entry(session)
+            .or_insert_with(|| crate::agent::AgentMemorySession::new(sid));
+        mem.add(role, content, tokens, vector, meta)
+    }
+
+    pub fn agent_mem_context(
+        &self,
+        session: &Bytes,
+        max_tokens: u64,
+        query: Option<&[f32]>,
+        recall_k: usize,
+    ) -> Result<crate::agent::AgentContextResult, String> {
+        let Some(mem) = self.agent_memories.get(session) else {
+            return Ok(crate::agent::AgentContextResult {
+                recent_turns: Vec::new(),
+                recalled_episodes: Vec::new(),
+            });
+        };
+        mem.context(max_tokens, query, recall_k)
+    }
+
+    pub fn agent_mem_compact(
+        &mut self,
+        session: &Bytes,
+        keep_recent: usize,
+        summary: Bytes,
+        tokens: Option<u64>,
+        vector: Option<Vec<f32>>,
+    ) -> Result<usize, String> {
+        let Some(mem) = self.agent_memories.get_mut(session) else {
+            return Ok(0);
+        };
+        mem.compact(keep_recent, summary, tokens, vector)
+    }
+
+    pub fn agent_mem_info(&self, session: &Bytes) -> (usize, usize, u64, usize, usize, u64) {
+        let Some(mem) = self.agent_memories.get(session) else {
+            return (0, 0, 0, 0, 0, 0);
+        };
+        mem.info()
+    }
+
+    pub fn agent_mem_clear(&mut self, session: &Bytes) -> bool {
+        self.agent_memories.remove(session).is_some()
     }
 
     // Active-Active CRDT operations

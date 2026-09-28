@@ -2722,7 +2722,12 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::SemanticGet { namespace: key, .. }
         | Command::SemanticDel { namespace: key, .. }
         | Command::SemanticFlush(key)
-        | Command::SemanticInfo(key) => Some(key),
+        | Command::SemanticInfo(key)
+        | Command::AgentMemAdd { session: key, .. }
+        | Command::AgentMemContext { session: key, .. }
+        | Command::AgentMemCompact { session: key, .. }
+        | Command::AgentMemInfo(key)
+        | Command::AgentMemClear(key) => Some(key),
 
         Command::Smove { source, .. }
         | Command::Lmove { source, .. }
@@ -3098,6 +3103,11 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
         | Command::SemanticDel { namespace: k, .. }
         | Command::SemanticFlush(k)
         | Command::SemanticInfo(k)
+        | Command::AgentMemAdd { session: k, .. }
+        | Command::AgentMemContext { session: k, .. }
+        | Command::AgentMemCompact { session: k, .. }
+        | Command::AgentMemInfo(k)
+        | Command::AgentMemClear(k)
         | Command::Hexpire { key: k, .. }
         | Command::Httl { key: k, .. }
         | Command::Hpersist { key: k, .. }
@@ -3882,6 +3892,11 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         | Command::SemanticDel { .. }
         | Command::SemanticFlush(_)
         | Command::SemanticInfo(_) => "SEMANTIC",
+        Command::AgentMemAdd { .. }
+        | Command::AgentMemContext { .. }
+        | Command::AgentMemCompact { .. }
+        | Command::AgentMemInfo(_)
+        | Command::AgentMemClear(_) => "AGENT",
         Command::CrdtSet { .. }
         | Command::CrdtGet(_)
         | Command::CrdtDel(_)
@@ -6585,6 +6600,11 @@ async fn execute_command(
         | Command::SemanticDel { .. }
         | Command::SemanticFlush(_)
         | Command::SemanticInfo(_)
+        | Command::AgentMemAdd { .. }
+        | Command::AgentMemContext { .. }
+        | Command::AgentMemCompact { .. }
+        | Command::AgentMemInfo(_)
+        | Command::AgentMemClear(_)
         | Command::Vadd { .. }
         | Command::Vquery { .. }
         | Command::Vsim { .. }
@@ -10789,6 +10809,11 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::SemanticDel { namespace: key, .. }
         | Command::SemanticFlush(key)
         | Command::SemanticInfo(key)
+        | Command::AgentMemAdd { session: key, .. }
+        | Command::AgentMemContext { session: key, .. }
+        | Command::AgentMemCompact { session: key, .. }
+        | Command::AgentMemInfo(key)
+        | Command::AgentMemClear(key)
         | Command::Vadd { key, .. }
         | Command::Vquery { key, .. }
         | Command::Vsim { key, .. }
@@ -15317,6 +15342,121 @@ pub fn execute_local_command(
             write_resp_integer(out, tokens_saved as i64);
             write_resp_bulk(out, b"evicted_expired");
             write_resp_integer(out, evicted_expired as i64);
+            false
+        }
+        Command::AgentMemAdd {
+            session,
+            role,
+            content,
+            tokens,
+            vector,
+            meta,
+        } => {
+            match db.agent_mem_add(
+                session.clone(),
+                role.clone(),
+                content.clone(),
+                *tokens,
+                vector.clone(),
+                meta.clone(),
+            ) {
+                Ok(id) => {
+                    record_change!(cmd);
+                    write_resp_integer(out, id as i64);
+                }
+                Err(e) => write_resp_err(out, &e),
+            }
+            false
+        }
+        Command::AgentMemContext {
+            session,
+            max_tokens,
+            query,
+            recall_k,
+        } => {
+            match db.agent_mem_context(session, *max_tokens, query.as_deref(), *recall_k) {
+                Ok(ctx) => {
+                    write_resp_array_header(out, 2);
+                    write_resp_array_header(out, ctx.recent_turns.len());
+                    for turn in ctx.recent_turns {
+                        write_resp_array_header(out, 5);
+                        write_resp_integer(out, turn.id as i64);
+                        write_resp_bulk(out, &turn.role);
+                        write_resp_bulk(out, &turn.content);
+                        write_resp_integer(out, turn.tokens as i64);
+                        match turn.meta {
+                            Some(m) => write_resp_bulk(out, &m),
+                            None => write_resp_null(out),
+                        }
+                    }
+                    write_resp_array_header(out, ctx.recalled_episodes.len());
+                    for ep in ctx.recalled_episodes {
+                        write_resp_array_header(out, 5);
+                        write_resp_integer(out, ep.id as i64);
+                        write_resp_bulk(out, &ep.role);
+                        write_resp_bulk(out, &ep.content);
+                        let s = format!("{:.6}", ep.score);
+                        write_resp_bulk(out, s.as_bytes());
+                        match ep.meta {
+                            Some(m) => write_resp_bulk(out, &m),
+                            None => write_resp_null(out),
+                        }
+                    }
+                }
+                Err(e) => write_resp_err(out, &e),
+            }
+            false
+        }
+        Command::AgentMemCompact {
+            session,
+            keep_recent,
+            summary,
+            tokens,
+            vector,
+        } => {
+            match db.agent_mem_compact(
+                session,
+                *keep_recent,
+                summary.clone(),
+                *tokens,
+                vector.clone(),
+            ) {
+                Ok(compacted) => {
+                    if compacted > 0 {
+                        record_change!(cmd);
+                    }
+                    write_resp_integer(out, compacted as i64);
+                }
+                Err(e) => write_resp_err(out, &e),
+            }
+            false
+        }
+        Command::AgentMemInfo(session) => {
+            let (active_turns, total_turns, active_tokens, dim, vecs, compactions) =
+                db.agent_mem_info(session);
+            out.extend_from_slice(b"*14\r\n");
+            write_resp_bulk(out, b"session");
+            write_resp_bulk(out, session);
+            write_resp_bulk(out, b"active_turns");
+            write_resp_integer(out, active_turns as i64);
+            write_resp_bulk(out, b"total_turns");
+            write_resp_integer(out, total_turns as i64);
+            write_resp_bulk(out, b"active_tokens");
+            write_resp_integer(out, active_tokens as i64);
+            write_resp_bulk(out, b"vector_dim");
+            write_resp_integer(out, dim as i64);
+            write_resp_bulk(out, b"episodic_vectors");
+            write_resp_integer(out, vecs as i64);
+            write_resp_bulk(out, b"compactions");
+            write_resp_integer(out, compactions as i64);
+            false
+        }
+        Command::AgentMemClear(session) => {
+            let cleared = db.agent_mem_clear(session);
+            if cleared {
+                record_change!(cmd);
+            }
+            write_resp_integer(out, i64::from(cleared));
             false
         }
         Command::Vadd {

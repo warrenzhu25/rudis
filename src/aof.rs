@@ -1385,6 +1385,85 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             buf.extend_from_slice(b"\r\n");
             Some(buf)
         }
+        Command::AgentMemAdd {
+            session,
+            role,
+            content,
+            tokens,
+            vector,
+            meta,
+        } => {
+            let mut args: Vec<Vec<u8>> = vec![
+                b"AGENT.MEM.ADD".to_vec(),
+                session.to_vec(),
+                role.to_vec(),
+                content.to_vec(),
+            ];
+            if let Some(t) = tokens {
+                args.push(b"TOKENS".to_vec());
+                args.push(t.to_string().into_bytes());
+            }
+            if let Some(v) = vector {
+                args.push(b"VEC".to_vec());
+                args.push(v.len().to_string().into_bytes());
+                for &f in v {
+                    args.push(f.to_string().into_bytes());
+                }
+            }
+            if let Some(m) = meta {
+                args.push(b"META".to_vec());
+                args.push(m.to_vec());
+            }
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend_from_slice(&a);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
+        Command::AgentMemCompact {
+            session,
+            keep_recent,
+            summary,
+            tokens,
+            vector,
+        } => {
+            let mut args: Vec<Vec<u8>> = vec![
+                b"AGENT.MEM.COMPACT".to_vec(),
+                session.to_vec(),
+                b"KEEP_RECENT".to_vec(),
+                keep_recent.to_string().into_bytes(),
+                b"SUMMARY".to_vec(),
+                summary.to_vec(),
+            ];
+            if let Some(t) = tokens {
+                args.push(b"TOKENS".to_vec());
+                args.push(t.to_string().into_bytes());
+            }
+            if let Some(v) = vector {
+                args.push(b"VEC".to_vec());
+                args.push(v.len().to_string().into_bytes());
+                for &f in v {
+                    args.push(f.to_string().into_bytes());
+                }
+            }
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend_from_slice(&a);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
+        Command::AgentMemClear(session) => {
+            buf.extend_from_slice(
+                format!("*2\r\n$15\r\nAGENT.MEM.CLEAR\r\n${}\r\n", session.len()).as_bytes(),
+            );
+            buf.extend_from_slice(session);
+            buf.extend_from_slice(b"\r\n");
+            Some(buf)
+        }
         Command::Vadd {
             key,
             element,

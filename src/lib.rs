@@ -1,6 +1,7 @@
 #![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 pub mod acl;
+pub mod agent;
 pub mod allocator;
 pub mod aof;
 

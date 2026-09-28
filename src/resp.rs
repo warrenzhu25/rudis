@@ -1092,6 +1092,30 @@ pub enum Command {
     },
     SemanticFlush(Bytes),
     SemanticInfo(Bytes),
+    // AI AGENT MEMORY COMMANDS
+    AgentMemAdd {
+        session: Bytes,
+        role: Bytes,
+        content: Bytes,
+        tokens: Option<u64>,
+        vector: Option<Vec<f32>>,
+        meta: Option<Bytes>,
+    },
+    AgentMemContext {
+        session: Bytes,
+        max_tokens: u64,
+        query: Option<Vec<f32>>,
+        recall_k: usize,
+    },
+    AgentMemCompact {
+        session: Bytes,
+        keep_recent: usize,
+        summary: Bytes,
+        tokens: Option<u64>,
+        vector: Option<Vec<f32>>,
+    },
+    AgentMemInfo(Bytes),
+    AgentMemClear(Bytes),
     // CRDT MULTI-REGION COMMANDS
     CrdtSet {
         key: Bytes,
@@ -9690,6 +9714,233 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'semantic.info' command".to_string());
             }
             Ok(Some(Command::SemanticInfo(args[1].clone())))
+        }
+        "AGENT.MEM.ADD" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'agent.mem.add' command".to_string());
+            }
+            let session = args[1].clone();
+            let role = args[2].clone();
+            let content = args[3].clone();
+            let mut tokens = None;
+            let mut vector = None;
+            let mut meta = None;
+            let mut i = 4;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "TOKENS" if i + 1 < args.len() => {
+                        let n: u64 = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        tokens = Some(n);
+                        i += 2;
+                    }
+                    "VEC" | "VECTOR" if i + 1 < args.len() => {
+                        if let Some(dim) = std::str::from_utf8(&args[i + 1])
+                            .ok()
+                            .and_then(|s| s.parse::<usize>().ok())
+                            && dim > 0
+                            && i + 2 + dim <= args.len()
+                        {
+                            let mut v = Vec::with_capacity(dim);
+                            for k in 0..dim {
+                                let s = std::str::from_utf8(&args[i + 2 + k])
+                                    .map_err(|_| "not a valid float".to_string())?;
+                                let f: f32 =
+                                    s.parse().map_err(|_| "not a valid float".to_string())?;
+                                v.push(f);
+                            }
+                            vector = Some(v);
+                            i += 2 + dim;
+                        } else if let Some(decoded) = crate::search::decode_vector(
+                            &args[i + 1],
+                            crate::search::VectorDataType::Float32,
+                            0,
+                        ) {
+                            vector = Some(decoded);
+                            i += 2;
+                        } else {
+                            return Err("not a valid vector in 'agent.mem.add' command".to_string());
+                        }
+                    }
+                    "META" if i + 1 < args.len() => {
+                        meta = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            Ok(Some(Command::AgentMemAdd {
+                session,
+                role,
+                content,
+                tokens,
+                vector,
+                meta,
+            }))
+        }
+        "AGENT.MEM.CONTEXT" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'agent.mem.context' command".to_string());
+            }
+            let session = args[1].clone();
+            let mut max_tokens = 2048u64;
+            let mut query = None;
+            let mut recall_k = 0usize;
+            let mut i = 2;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "MAX_TOKENS" | "MAXTOKENS" if i + 1 < args.len() => {
+                        max_tokens = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        i += 2;
+                    }
+                    "QUERY" | "VEC" | "VECTOR" if i + 1 < args.len() => {
+                        if let Some(dim) = std::str::from_utf8(&args[i + 1])
+                            .ok()
+                            .and_then(|s| s.parse::<usize>().ok())
+                            && dim > 0
+                            && i + 2 + dim <= args.len()
+                        {
+                            let mut v = Vec::with_capacity(dim);
+                            for k in 0..dim {
+                                let s = std::str::from_utf8(&args[i + 2 + k])
+                                    .map_err(|_| "not a valid float".to_string())?;
+                                let f: f32 =
+                                    s.parse().map_err(|_| "not a valid float".to_string())?;
+                                v.push(f);
+                            }
+                            query = Some(v);
+                            i += 2 + dim;
+                        } else if let Some(decoded) = crate::search::decode_vector(
+                            &args[i + 1],
+                            crate::search::VectorDataType::Float32,
+                            0,
+                        ) {
+                            query = Some(decoded);
+                            i += 2;
+                        } else {
+                            return Err(
+                                "not a valid vector in 'agent.mem.context' command".to_string()
+                            );
+                        }
+                        if recall_k == 0 {
+                            recall_k = 3;
+                        }
+                    }
+                    "RECALL" | "RECALL_K" if i + 1 < args.len() => {
+                        recall_k = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        i += 2;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            Ok(Some(Command::AgentMemContext {
+                session,
+                max_tokens,
+                query,
+                recall_k,
+            }))
+        }
+        "AGENT.MEM.COMPACT" => {
+            if args.len() < 6 {
+                return Err("wrong number of arguments for 'agent.mem.compact' command".to_string());
+            }
+            let session = args[1].clone();
+            let mut keep_recent = None;
+            let mut summary = None;
+            let mut tokens = None;
+            let mut vector = None;
+            let mut i = 2;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "KEEP_RECENT" | "KEEP" if i + 1 < args.len() => {
+                        let k: usize = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        keep_recent = Some(k);
+                        i += 2;
+                    }
+                    "SUMMARY" if i + 1 < args.len() => {
+                        summary = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "TOKENS" if i + 1 < args.len() => {
+                        let n: u64 = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        tokens = Some(n);
+                        i += 2;
+                    }
+                    "VEC" | "VECTOR" if i + 1 < args.len() => {
+                        if let Some(dim) = std::str::from_utf8(&args[i + 1])
+                            .ok()
+                            .and_then(|s| s.parse::<usize>().ok())
+                            && dim > 0
+                            && i + 2 + dim <= args.len()
+                        {
+                            let mut v = Vec::with_capacity(dim);
+                            for k in 0..dim {
+                                let s = std::str::from_utf8(&args[i + 2 + k])
+                                    .map_err(|_| "not a valid float".to_string())?;
+                                let f: f32 =
+                                    s.parse().map_err(|_| "not a valid float".to_string())?;
+                                v.push(f);
+                            }
+                            vector = Some(v);
+                            i += 2 + dim;
+                        } else if let Some(decoded) = crate::search::decode_vector(
+                            &args[i + 1],
+                            crate::search::VectorDataType::Float32,
+                            0,
+                        ) {
+                            vector = Some(decoded);
+                            i += 2;
+                        } else {
+                            return Err(
+                                "not a valid vector in 'agent.mem.compact' command".to_string()
+                            );
+                        }
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            let Some(keep_recent) = keep_recent else {
+                return Err("missing KEEP_RECENT in 'agent.mem.compact' command".to_string());
+            };
+            let Some(summary) = summary else {
+                return Err("missing SUMMARY in 'agent.mem.compact' command".to_string());
+            };
+            Ok(Some(Command::AgentMemCompact {
+                session,
+                keep_recent,
+                summary,
+                tokens,
+                vector,
+            }))
+        }
+        "AGENT.MEM.INFO" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'agent.mem.info' command".to_string());
+            }
+            Ok(Some(Command::AgentMemInfo(args[1].clone())))
+        }
+        "AGENT.MEM.CLEAR" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'agent.mem.clear' command".to_string());
+            }
+            Ok(Some(Command::AgentMemClear(args[1].clone())))
         }
         "XDP.INFO" => Ok(Some(Command::XdpInfo)),
         "XDP.RULE" => {
