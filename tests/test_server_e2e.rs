@@ -12558,3 +12558,166 @@ fn test_ft_search_hnsw_hybrid_rrf_multishard_e2e() {
     let drop_cmd = format_resp_cmd(&["FT.DROPINDEX", "idx:ai_docs"]);
     assert_eq!(send_and_read(&mut client, &drop_cmd), "+OK\r\n");
 }
+
+#[test]
+fn test_semantic_cache_llm_workload_e2e() {
+    let port = 19145;
+    start_test_server(port, 2);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+
+    let format_resp_cmd = |args: &[&str]| -> Vec<u8> {
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for arg in args {
+            out.extend_from_slice(format!("${}\r\n{}\r\n", arg.len(), arg).as_bytes());
+        }
+        out
+    };
+
+    // 1. Insert semantic cache entries into namespace "llm:gpt4o"
+    let set1 = format_resp_cmd(&[
+        "SEMANTIC.SET",
+        "llm:gpt4o",
+        "entry:1",
+        "How does Rudis achieve sub-millisecond tail latency?",
+        "Rudis uses a thread-per-core shared-nothing architecture on io_uring.",
+        "VECTOR",
+        "4",
+        "1.0",
+        "0.0",
+        "0.0",
+        "0.0",
+        "SCOPE",
+        "tenant:alpha",
+        "QUANTIZE",
+        "TOKENS",
+        "64",
+    ]);
+    assert_eq!(send_and_read(&mut client, &set1), "+OK\r\n");
+
+    let set2 = format_resp_cmd(&[
+        "SEMANTIC.SET",
+        "llm:gpt4o",
+        "entry:2",
+        "Short-lived prompt",
+        "Ephemeral LLM completion",
+        "VECTOR",
+        "4",
+        "0.0",
+        "1.0",
+        "0.0",
+        "0.0",
+        "PX",
+        "30",
+        "SCOPE",
+        "tenant:alpha",
+        "TOKENS",
+        "20",
+    ]);
+    assert_eq!(send_and_read(&mut client, &set2), "+OK\r\n");
+
+    // Wait for entry:2 to expire
+    thread::sleep(Duration::from_millis(50));
+
+    // 2. Query near entry:1 with matching scope -> direct bulk string response hit
+    let get_hit = format_resp_cmd(&[
+        "SEMANTIC.GET",
+        "llm:gpt4o",
+        "VECTOR",
+        "4",
+        "0.99",
+        "0.05",
+        "0.0",
+        "0.0",
+        "THRESHOLD",
+        "0.95",
+        "SCOPE",
+        "tenant:alpha",
+    ]);
+    assert_eq!(
+        send_and_read(&mut client, &get_hit),
+        "$69\r\nRudis uses a thread-per-core shared-nothing architecture on io_uring.\r\n"
+    );
+
+    // 3. Query near entry:1 with WITHSCORE WITHPROMPT WITHID -> 4-element array hit
+    let get_rich = format_resp_cmd(&[
+        "SEMANTIC.GET",
+        "llm:gpt4o",
+        "VECTOR",
+        "4",
+        "0.99",
+        "0.05",
+        "0.0",
+        "0.0",
+        "THRESHOLD",
+        "0.95",
+        "SCOPE",
+        "tenant:alpha",
+        "WITHSCORE",
+        "WITHPROMPT",
+        "WITHID",
+    ]);
+    let rich_resp = send_and_read(&mut client, &get_rich);
+    assert!(
+        rich_resp.starts_with(
+            "*4\r\n$69\r\nRudis uses a thread-per-core shared-nothing architecture on io_uring.\r\n"
+        ) && rich_resp.contains("How does Rudis achieve sub-millisecond tail latency?")
+            && rich_resp.contains("entry:1"),
+        "Unexpected rich SEMANTIC.GET response: {}",
+        rich_resp
+    );
+
+    // 4. Query with wrong scope -> miss ($-1)
+    let get_wrong_scope = format_resp_cmd(&[
+        "SEMANTIC.GET",
+        "llm:gpt4o",
+        "VECTOR",
+        "4",
+        "0.99",
+        "0.05",
+        "0.0",
+        "0.0",
+        "THRESHOLD",
+        "0.95",
+        "SCOPE",
+        "tenant:beta",
+    ]);
+    assert_eq!(send_and_read(&mut client, &get_wrong_scope), "$-1\r\n");
+
+    // 5. Query expired entry:2 -> miss ($-1)
+    let get_expired = format_resp_cmd(&[
+        "SEMANTIC.GET",
+        "llm:gpt4o",
+        "VECTOR",
+        "4",
+        "0.0",
+        "1.0",
+        "0.0",
+        "0.0",
+        "THRESHOLD",
+        "0.90",
+        "SCOPE",
+        "tenant:alpha",
+    ]);
+    assert_eq!(send_and_read(&mut client, &get_expired), "$-1\r\n");
+
+    // 6. Inspect SEMANTIC.INFO telemetry (2 hits, 2 misses, 128 tokens_saved, 1 evicted_expired)
+    let info_cmd = format_resp_cmd(&["SEMANTIC.INFO", "llm:gpt4o"]);
+    let info_resp = send_and_read(&mut client, &info_cmd);
+    assert!(
+        info_resp.contains("entries\r\n:1\r\n")
+            && info_resp.contains("hits\r\n:2\r\n")
+            && info_resp.contains("misses\r\n:2\r\n")
+            && info_resp.contains("tokens_saved\r\n:128\r\n")
+            && info_resp.contains("evicted_expired\r\n:1\r\n"),
+        "Unexpected SEMANTIC.INFO response: {}",
+        info_resp
+    );
+
+    // 7. Delete entry:1 and flush namespace
+    let del_cmd = format_resp_cmd(&["SEMANTIC.DEL", "llm:gpt4o", "entry:1", "nonexistent"]);
+    assert_eq!(send_and_read(&mut client, &del_cmd), ":1\r\n");
+
+    let flush_cmd = format_resp_cmd(&["SEMANTIC.FLUSH", "llm:gpt4o"]);
+    assert_eq!(send_and_read(&mut client, &flush_cmd), "+OK\r\n");
+}

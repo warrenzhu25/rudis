@@ -2705,7 +2705,12 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::CrdtIncrby { key, .. }
         | Command::CrdtSadd { key, .. }
         | Command::CrdtSmembers(key)
-        | Command::CrdtSrem { key, .. } => Some(key),
+        | Command::CrdtSrem { key, .. }
+        | Command::SemanticSet { namespace: key, .. }
+        | Command::SemanticGet { namespace: key, .. }
+        | Command::SemanticDel { namespace: key, .. }
+        | Command::SemanticFlush(key)
+        | Command::SemanticInfo(key) => Some(key),
 
         Command::Smove { source, .. }
         | Command::Lmove { source, .. }
@@ -3064,6 +3069,11 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
         | Command::CrdtSadd { key: k, .. }
         | Command::CrdtSmembers(k)
         | Command::CrdtSrem { key: k, .. }
+        | Command::SemanticSet { namespace: k, .. }
+        | Command::SemanticGet { namespace: k, .. }
+        | Command::SemanticDel { namespace: k, .. }
+        | Command::SemanticFlush(k)
+        | Command::SemanticInfo(k)
         | Command::Hexpire { key: k, .. }
         | Command::Httl { key: k, .. }
         | Command::Hpersist { key: k, .. }
@@ -3839,6 +3849,11 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Vsim { .. } => "VSIM",
         Command::Vdel { .. } => "VDEL",
         Command::Vinfo(_) => "VINFO",
+        Command::SemanticSet { .. }
+        | Command::SemanticGet { .. }
+        | Command::SemanticDel { .. }
+        | Command::SemanticFlush(_)
+        | Command::SemanticInfo(_) => "SEMANTIC",
         Command::CrdtSet { .. }
         | Command::CrdtGet(_)
         | Command::CrdtDel(_)
@@ -6537,6 +6552,11 @@ async fn execute_command(
         | Command::CrdtSadd { .. }
         | Command::CrdtSmembers(_)
         | Command::CrdtSrem { .. }
+        | Command::SemanticSet { .. }
+        | Command::SemanticGet { .. }
+        | Command::SemanticDel { .. }
+        | Command::SemanticFlush(_)
+        | Command::SemanticInfo(_)
         | Command::Object(crate::resp::ObjectSubcommand::Encoding(_))
         | Command::Object(crate::resp::ObjectSubcommand::Freq(_))
         | Command::Object(crate::resp::ObjectSubcommand::Idletime(_))
@@ -10719,6 +10739,11 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::CrdtSadd { key, .. }
         | Command::CrdtSmembers(key)
         | Command::CrdtSrem { key, .. }
+        | Command::SemanticSet { namespace: key, .. }
+        | Command::SemanticGet { namespace: key, .. }
+        | Command::SemanticDel { namespace: key, .. }
+        | Command::SemanticFlush(key)
+        | Command::SemanticInfo(key)
         | Command::Object(crate::resp::ObjectSubcommand::Encoding(key))
         | Command::Object(crate::resp::ObjectSubcommand::Freq(key))
         | Command::Object(crate::resp::ObjectSubcommand::Idletime(key))
@@ -15116,6 +15141,123 @@ pub fn execute_local_command(
             write_resp_integer(out, regs as i64);
             write_resp_bulk(out, b"set_tombstones_pruned");
             write_resp_integer(out, set_tombstones as i64);
+            false
+        }
+        Command::SemanticSet {
+            namespace,
+            id,
+            prompt,
+            response,
+            vector,
+            ttl,
+            scope,
+            quantize,
+            tokens,
+        } => {
+            match db.semantic_set(
+                namespace.clone(),
+                id.clone(),
+                prompt.clone(),
+                response.clone(),
+                vector.clone(),
+                *ttl,
+                scope.clone(),
+                *quantize,
+                *tokens,
+            ) {
+                Ok(()) => {
+                    record_change!(cmd);
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                Err(e) => {
+                    write_resp_err(out, &e);
+                }
+            }
+            false
+        }
+        Command::SemanticGet {
+            namespace,
+            query,
+            threshold,
+            scope,
+            with_score,
+            with_prompt,
+            with_id,
+        } => {
+            match db.semantic_get(namespace, query, *threshold, scope.as_deref()) {
+                Ok(Some(hit)) => {
+                    if !*with_score && !*with_prompt && !*with_id {
+                        write_resp_bulk(out, &hit.response);
+                    } else {
+                        let count = 1
+                            + usize::from(*with_score)
+                            + usize::from(*with_prompt)
+                            + usize::from(*with_id);
+                        write_resp_array_header(out, count);
+                        write_resp_bulk(out, &hit.response);
+                        if *with_score {
+                            let s = format!("{:.6}", hit.score);
+                            write_resp_bulk(out, s.as_bytes());
+                        }
+                        if *with_prompt {
+                            write_resp_bulk(out, &hit.prompt);
+                        }
+                        if *with_id {
+                            write_resp_bulk(out, &hit.id);
+                        }
+                    }
+                }
+                Ok(None) => {
+                    out.extend_from_slice(b"$-1\r\n");
+                }
+                Err(e) => {
+                    write_resp_err(out, &e);
+                }
+            }
+            false
+        }
+        Command::SemanticDel { namespace, ids } => {
+            let removed = db.semantic_del(namespace, ids);
+            if removed > 0 {
+                record_change!(cmd);
+            }
+            write_resp_integer(out, removed as i64);
+            false
+        }
+        Command::SemanticFlush(namespace) => {
+            db.semantic_flush(namespace);
+            record_change!(cmd);
+            out.extend_from_slice(b"+OK\r\n");
+            false
+        }
+        Command::SemanticInfo(namespace) => {
+            let (entries, dim, hits, misses, tokens_saved, evicted_expired) =
+                db.semantic_info(namespace);
+            let total_lookups = hits + misses;
+            let hit_rate = if total_lookups > 0 {
+                format!("{:.4}", (hits as f64) / (total_lookups as f64))
+            } else {
+                "0.0000".to_string()
+            };
+            out.extend_from_slice(b"*18\r\n");
+            write_resp_bulk(out, b"namespace");
+            write_resp_bulk(out, namespace);
+            write_resp_bulk(out, b"entries");
+            write_resp_integer(out, entries as i64);
+            write_resp_bulk(out, b"dimension");
+            write_resp_integer(out, dim as i64);
+            write_resp_bulk(out, b"metric");
+            write_resp_bulk(out, b"COSINE");
+            write_resp_bulk(out, b"hits");
+            write_resp_integer(out, hits as i64);
+            write_resp_bulk(out, b"misses");
+            write_resp_integer(out, misses as i64);
+            write_resp_bulk(out, b"hit_rate");
+            write_resp_bulk(out, hit_rate.as_bytes());
+            write_resp_bulk(out, b"tokens_saved");
+            write_resp_integer(out, tokens_saved as i64);
+            write_resp_bulk(out, b"evicted_expired");
+            write_resp_integer(out, evicted_expired as i64);
             false
         }
         Command::Latency(sub) => {

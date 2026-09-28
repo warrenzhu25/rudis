@@ -1317,6 +1317,74 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             Some(buf)
         }
+        Command::SemanticSet {
+            namespace,
+            id,
+            prompt,
+            response,
+            vector,
+            ttl,
+            scope,
+            quantize,
+            tokens,
+        } => {
+            let mut args: Vec<Vec<u8>> = vec![
+                b"SEMANTIC.SET".to_vec(),
+                namespace.to_vec(),
+                id.to_vec(),
+                prompt.to_vec(),
+                response.to_vec(),
+                b"VECTOR".to_vec(),
+                vector.len().to_string().into_bytes(),
+            ];
+            for v in vector {
+                args.push(v.to_string().into_bytes());
+            }
+            if let Some(d) = ttl {
+                args.push(b"PX".to_vec());
+                args.push(d.as_millis().max(1).to_string().into_bytes());
+            }
+            if let Some(s) = scope {
+                args.push(b"SCOPE".to_vec());
+                args.push(s.to_vec());
+            }
+            if *quantize {
+                args.push(b"QUANTIZE".to_vec());
+            }
+            if let Some(t) = tokens {
+                args.push(b"TOKENS".to_vec());
+                args.push(t.to_string().into_bytes());
+            }
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend_from_slice(&a);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
+        Command::SemanticDel { namespace, ids } => {
+            buf.extend_from_slice(
+                format!("*{}\r\n$12\r\nSEMANTIC.DEL\r\n", 2 + ids.len()).as_bytes(),
+            );
+            buf.extend_from_slice(format!("${}\r\n", namespace.len()).as_bytes());
+            buf.extend_from_slice(namespace);
+            buf.extend_from_slice(b"\r\n");
+            for id in ids {
+                buf.extend_from_slice(format!("${}\r\n", id.len()).as_bytes());
+                buf.extend_from_slice(id);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
+        Command::SemanticFlush(namespace) => {
+            buf.extend_from_slice(
+                format!("*2\r\n$14\r\nSEMANTIC.FLUSH\r\n${}\r\n", namespace.len()).as_bytes(),
+            );
+            buf.extend_from_slice(namespace);
+            buf.extend_from_slice(b"\r\n");
+            Some(buf)
+        }
         _ => None,
     }
 }

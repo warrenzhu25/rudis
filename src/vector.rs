@@ -1450,12 +1450,18 @@ impl FlatIndex {
             }
             let d = compute_distance(query, self.row(pos), self.metric);
             if heap.len() < k {
-                heap.push(FurthestCandidate { id: pos, distance: d });
+                heap.push(FurthestCandidate {
+                    id: pos,
+                    distance: d,
+                });
             } else if let Some(top) = heap.peek()
                 && d < top.distance
             {
                 heap.pop();
-                heap.push(FurthestCandidate { id: pos, distance: d });
+                heap.push(FurthestCandidate {
+                    id: pos,
+                    distance: d,
+                });
             }
         }
         let mut out: Vec<(Bytes, f32)> = heap
@@ -1592,6 +1598,181 @@ impl VectorFieldIndex {
                 })
                 .sum(),
         }
+    }
+}
+
+/// A single cached LLM prompt/response entry inside a [`SemanticCache`] namespace.
+#[derive(Debug, Clone)]
+pub struct SemanticEntry {
+    pub id: Bytes,
+    pub prompt: Bytes,
+    pub response: Bytes,
+    pub scope: Option<Bytes>,
+    pub expire_at: Option<std::time::Instant>,
+    pub tokens: u64,
+}
+
+/// Result returned on a [`SemanticCache::get`] similarity hit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SemanticHit {
+    pub id: Bytes,
+    pub prompt: Bytes,
+    pub response: Bytes,
+    pub score: f32,
+}
+
+/// First-class AI/LLM Semantic Cache namespace backed by an in-shard [`HnswIndex`].
+#[derive(Debug, Clone)]
+pub struct SemanticCache {
+    pub namespace: String,
+    pub index: HnswIndex,
+    pub entries: HashMap<Bytes, SemanticEntry>,
+    pub hits: u64,
+    pub misses: u64,
+    pub tokens_saved: u64,
+    pub evicted_expired: u64,
+}
+
+impl SemanticCache {
+    pub fn new(namespace: String, dim: usize) -> Self {
+        Self {
+            index: HnswIndex::new(namespace.clone(), dim.max(1), VectorMetric::Cosine),
+            namespace,
+            entries: HashMap::new(),
+            hits: 0,
+            misses: 0,
+            tokens_saved: 0,
+            evicted_expired: 0,
+        }
+    }
+
+    /// Passively purges any expired entries from both the metadata map and the HNSW graph.
+    pub fn purge_expired(&mut self) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let expired_ids: Vec<Bytes> = self
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| {
+                if let Some(exp) = entry.expire_at
+                    && now >= exp
+                {
+                    return Some(id.clone());
+                }
+                None
+            })
+            .collect();
+        for id in expired_ids {
+            self.entries.remove(&id);
+            self.index.remove(&id);
+            self.evicted_expired += 1;
+        }
+    }
+
+    /// Inserts or updates a semantic cache entry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set(
+        &mut self,
+        id: Bytes,
+        prompt: Bytes,
+        response: Bytes,
+        vector: Vec<f32>,
+        ttl: Option<std::time::Duration>,
+        scope: Option<Bytes>,
+        quantize: bool,
+        tokens: Option<u64>,
+    ) -> Result<(), String> {
+        if vector.is_empty() {
+            return Err("ERR vector dimension must be greater than 0".to_string());
+        }
+        self.purge_expired();
+        if self.entries.is_empty() && self.index.dim != vector.len() {
+            self.index = HnswIndex::new(self.namespace.clone(), vector.len(), VectorMetric::Cosine);
+        }
+        if vector.len() != self.index.dim {
+            return Err("ERR vector dimension mismatch".to_string());
+        }
+        let expire_at = ttl.map(|d| std::time::Instant::now() + d);
+        let est_tokens = tokens.unwrap_or_else(|| (response.len().div_ceil(4)).max(1) as u64);
+        self.index
+            .add_quantized(id.clone(), vector, quantize, false)
+            .map_err(|e| format!("ERR {}", e))?;
+        self.entries.insert(
+            id.clone(),
+            SemanticEntry {
+                id,
+                prompt,
+                response,
+                scope,
+                expire_at,
+                tokens: est_tokens,
+            },
+        );
+        Ok(())
+    }
+
+    /// Queries the semantic cache for the closest non-expired entry matching `scope` whose
+    /// cosine similarity is `>= threshold`.
+    pub fn get(
+        &mut self,
+        query: &[f32],
+        threshold: f32,
+        scope: Option<&[u8]>,
+    ) -> Result<Option<SemanticHit>, String> {
+        self.purge_expired();
+        if self.entries.is_empty() {
+            self.misses += 1;
+            return Ok(None);
+        }
+        if query.len() != self.index.dim {
+            return Err("ERR vector dimension mismatch".to_string());
+        }
+        let entries_ref = &self.entries;
+        let filter_fn = |key: &Bytes| -> bool {
+            let Some(entry) = entries_ref.get(key) else {
+                return false;
+            };
+            if let Some(req_scope) = scope {
+                entry.scope.as_deref() == Some(req_scope)
+            } else {
+                true
+            }
+        };
+        let candidates = self
+            .index
+            .search_filtered(query, 4, None, true, Some(&filter_fn));
+        if let Some((best_id, dist)) = candidates.into_iter().next() {
+            let sim = (1.0 - dist).clamp(0.0, 1.0);
+            if sim >= threshold
+                && let Some(entry) = self.entries.get(&best_id)
+            {
+                self.hits += 1;
+                self.tokens_saved += entry.tokens;
+                return Ok(Some(SemanticHit {
+                    id: entry.id.clone(),
+                    prompt: entry.prompt.clone(),
+                    response: entry.response.clone(),
+                    score: sim,
+                }));
+            }
+        }
+        self.misses += 1;
+        Ok(None)
+    }
+
+    /// Deletes a single entry by ID.
+    pub fn del(&mut self, id: &Bytes) -> bool {
+        let removed_entry = self.entries.remove(id).is_some();
+        let removed_vec = self.index.remove(id);
+        removed_entry || removed_vec
+    }
+
+    /// Clears all entries and resets the index while preserving namespace configuration.
+    pub fn flush(&mut self) {
+        self.entries.clear();
+        self.index = HnswIndex::new(self.namespace.clone(), self.index.dim, VectorMetric::Cosine);
     }
 }
 
@@ -1734,5 +1915,71 @@ mod tests {
         assert!((d_cos - cos_simd).abs() < 1e-4);
         assert!((d_l2 - l2_simd.sqrt()).abs() < 1e-4);
         assert!((d_ip - (-dot_simd)).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_semantic_cache_set_get_ttl_scope_and_telemetry() {
+        let mut cache = SemanticCache::new("llm:gpt4".to_string(), 4);
+        cache
+            .set(
+                Bytes::from("q1"),
+                Bytes::from("What is Rudis?"),
+                Bytes::from("Rudis is an AI-native in-memory data store."),
+                vec![1.0, 0.0, 0.0, 0.0],
+                None,
+                Some(Bytes::from("tenant:acme")),
+                true,
+                Some(42),
+            )
+            .unwrap();
+        cache
+            .set(
+                Bytes::from("q2"),
+                Bytes::from("Expiring prompt"),
+                Bytes::from("Temporary answer"),
+                vec![0.0, 1.0, 0.0, 0.0],
+                Some(std::time::Duration::from_millis(1)),
+                Some(Bytes::from("tenant:acme")),
+                false,
+                Some(10),
+            )
+            .unwrap();
+
+        // Wait for q2 to expire
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Query near q1 with matching scope -> hit
+        let hit = cache
+            .get(&[0.99, 0.05, 0.0, 0.0], 0.95, Some(b"tenant:acme"))
+            .unwrap()
+            .expect("expected semantic hit");
+        assert_eq!(hit.id, Bytes::from("q1"));
+        assert_eq!(
+            hit.response,
+            Bytes::from("Rudis is an AI-native in-memory data store.")
+        );
+        assert!(hit.score >= 0.95);
+        assert_eq!(cache.hits, 1);
+        assert_eq!(cache.tokens_saved, 42);
+        assert_eq!(cache.evicted_expired, 1);
+
+        // Query near q1 with wrong scope -> miss
+        let miss_scope = cache
+            .get(&[0.99, 0.05, 0.0, 0.0], 0.95, Some(b"tenant:other"))
+            .unwrap();
+        assert!(miss_scope.is_none());
+        assert_eq!(cache.misses, 1);
+
+        // Query with expired q2's vector -> miss
+        let miss_expired = cache
+            .get(&[0.0, 1.0, 0.0, 0.0], 0.90, Some(b"tenant:acme"))
+            .unwrap();
+        assert!(miss_expired.is_none());
+        assert_eq!(cache.misses, 2);
+
+        // Delete q1
+        assert!(cache.del(&Bytes::from("q1")));
+        assert!(!cache.del(&Bytes::from("q1")));
+        assert_eq!(cache.entries.len(), 0);
     }
 }

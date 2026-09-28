@@ -1008,6 +1008,33 @@ pub enum Command {
         key: Bytes,
     },
     Vinfo(String),
+    // AI SEMANTIC CACHE COMMANDS
+    SemanticSet {
+        namespace: Bytes,
+        id: Bytes,
+        prompt: Bytes,
+        response: Bytes,
+        vector: Vec<f32>,
+        ttl: Option<Duration>,
+        scope: Option<Bytes>,
+        quantize: bool,
+        tokens: Option<u64>,
+    },
+    SemanticGet {
+        namespace: Bytes,
+        query: Vec<f32>,
+        threshold: f32,
+        scope: Option<Bytes>,
+        with_score: bool,
+        with_prompt: bool,
+        with_id: bool,
+    },
+    SemanticDel {
+        namespace: Bytes,
+        ids: Vec<Bytes>,
+    },
+    SemanticFlush(Bytes),
+    SemanticInfo(Bytes),
     // CRDT MULTI-REGION COMMANDS
     CrdtSet {
         key: Bytes,
@@ -8954,6 +8981,224 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 fields,
             }))
         }
+        "SEMANTIC.SET" => {
+            if args.len() < 7 {
+                return Err("wrong number of arguments for 'semantic.set' command".to_string());
+            }
+            let namespace = args[1].clone();
+            let id = args[2].clone();
+            let prompt = args[3].clone();
+            let response = args[4].clone();
+            let mut vector = Vec::new();
+            let mut ttl = None;
+            let mut scope = None;
+            let mut quantize = false;
+            let mut tokens = None;
+            let mut i = 5;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "VECTOR" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        if let Some(dim) = std::str::from_utf8(&args[i + 1])
+                            .ok()
+                            .and_then(|s| s.parse::<usize>().ok())
+                        {
+                            if dim == 0 || i + 2 + dim > args.len() {
+                                return Err("invalid VECTOR dimension in 'semantic.set' command"
+                                    .to_string());
+                            }
+                            vector.reserve(dim);
+                            for k in 0..dim {
+                                let v_str = std::str::from_utf8(&args[i + 2 + k])
+                                    .map_err(|_| "not a valid float".to_string())?;
+                                let v: f32 =
+                                    v_str.parse().map_err(|_| "not a valid float".to_string())?;
+                                vector.push(v);
+                            }
+                            i += 2 + dim;
+                        } else if let Some(decoded) = crate::search::decode_vector(
+                            &args[i + 1],
+                            crate::search::VectorDataType::Float32,
+                            0,
+                        ) {
+                            vector = decoded;
+                            i += 2;
+                        } else {
+                            return Err("not a valid float".to_string());
+                        }
+                    }
+                    "EX" if i + 1 < args.len() => {
+                        let secs: u64 = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        if secs == 0 {
+                            return Err("invalid expire time in 'semantic.set' command".to_string());
+                        }
+                        ttl = Some(Duration::from_secs(secs));
+                        i += 2;
+                    }
+                    "PX" if i + 1 < args.len() => {
+                        let ms: u64 = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        if ms == 0 {
+                            return Err("invalid expire time in 'semantic.set' command".to_string());
+                        }
+                        ttl = Some(Duration::from_millis(ms));
+                        i += 2;
+                    }
+                    "SCOPE" if i + 1 < args.len() => {
+                        scope = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "QUANTIZE" | "SQ8" => {
+                        quantize = true;
+                        i += 1;
+                    }
+                    "TOKENS" if i + 1 < args.len() => {
+                        let n: u64 = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        tokens = Some(n);
+                        i += 2;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            if vector.is_empty() {
+                return Err("missing or empty VECTOR in 'semantic.set' command".to_string());
+            }
+            Ok(Some(Command::SemanticSet {
+                namespace,
+                id,
+                prompt,
+                response,
+                vector,
+                ttl,
+                scope,
+                quantize,
+                tokens,
+            }))
+        }
+        "SEMANTIC.GET" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'semantic.get' command".to_string());
+            }
+            let namespace = args[1].clone();
+            let mut query = Vec::new();
+            let mut threshold = 0.90f32;
+            let mut scope = None;
+            let mut with_score = false;
+            let mut with_prompt = false;
+            let mut with_id = false;
+            let mut i = 2;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "VECTOR" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        if let Some(dim) = std::str::from_utf8(&args[i + 1])
+                            .ok()
+                            .and_then(|s| s.parse::<usize>().ok())
+                        {
+                            if dim == 0 || i + 2 + dim > args.len() {
+                                return Err("invalid VECTOR dimension in 'semantic.get' command"
+                                    .to_string());
+                            }
+                            query.reserve(dim);
+                            for k in 0..dim {
+                                let v_str = std::str::from_utf8(&args[i + 2 + k])
+                                    .map_err(|_| "not a valid float".to_string())?;
+                                let v: f32 =
+                                    v_str.parse().map_err(|_| "not a valid float".to_string())?;
+                                query.push(v);
+                            }
+                            i += 2 + dim;
+                        } else if let Some(decoded) = crate::search::decode_vector(
+                            &args[i + 1],
+                            crate::search::VectorDataType::Float32,
+                            0,
+                        ) {
+                            query = decoded;
+                            i += 2;
+                        } else {
+                            return Err("not a valid float".to_string());
+                        }
+                    }
+                    "THRESHOLD" if i + 1 < args.len() => {
+                        let t: f32 = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "not a valid float".to_string())?
+                            .parse()
+                            .map_err(|_| "not a valid float".to_string())?;
+                        if !(0.0..=1.0).contains(&t) {
+                            return Err(
+                                "THRESHOLD must be between 0.0 and 1.0 in 'semantic.get' command"
+                                    .to_string(),
+                            );
+                        }
+                        threshold = t;
+                        i += 2;
+                    }
+                    "SCOPE" if i + 1 < args.len() => {
+                        scope = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "WITHSCORE" | "WITHSCORES" => {
+                        with_score = true;
+                        i += 1;
+                    }
+                    "WITHPROMPT" => {
+                        with_prompt = true;
+                        i += 1;
+                    }
+                    "WITHID" => {
+                        with_id = true;
+                        i += 1;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            if query.is_empty() {
+                return Err("missing or empty VECTOR in 'semantic.get' command".to_string());
+            }
+            Ok(Some(Command::SemanticGet {
+                namespace,
+                query,
+                threshold,
+                scope,
+                with_score,
+                with_prompt,
+                with_id,
+            }))
+        }
+        "SEMANTIC.DEL" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'semantic.del' command".to_string());
+            }
+            let namespace = args[1].clone();
+            let ids = args[2..].to_vec();
+            Ok(Some(Command::SemanticDel { namespace, ids }))
+        }
+        "SEMANTIC.FLUSH" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'semantic.flush' command".to_string());
+            }
+            Ok(Some(Command::SemanticFlush(args[1].clone())))
+        }
+        "SEMANTIC.INFO" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'semantic.info' command".to_string());
+            }
+            Ok(Some(Command::SemanticInfo(args[1].clone())))
+        }
         "XDP.INFO" => Ok(Some(Command::XdpInfo)),
         "XDP.RULE" => {
             if args.len() < 2 {
@@ -10263,6 +10508,45 @@ mod tests {
                 start: Bytes::from_static(b"0-0"),
                 count: 10,
                 justid: false,
+            }
+        );
+    }
+
+    #[test]
+    fn test_resp_semantic_cache_commands() {
+        let mut buf = BytesMut::from(
+            "*15\r\n$12\r\nSEMANTIC.SET\r\n$7\r\nllm:ns1\r\n$2\r\nq1\r\n$6\r\nprompt\r\n$4\r\nresp\r\n$6\r\nVECTOR\r\n$1\r\n3\r\n$3\r\n1.0\r\n$3\r\n0.0\r\n$3\r\n0.0\r\n$2\r\nEX\r\n$2\r\n60\r\n$5\r\nSCOPE\r\n$2\r\nt1\r\n$8\r\nQUANTIZE\r\n",
+        );
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::SemanticSet {
+                namespace: Bytes::from_static(b"llm:ns1"),
+                id: Bytes::from_static(b"q1"),
+                prompt: Bytes::from_static(b"prompt"),
+                response: Bytes::from_static(b"resp"),
+                vector: vec![1.0, 0.0, 0.0],
+                ttl: Some(Duration::from_secs(60)),
+                scope: Some(Bytes::from_static(b"t1")),
+                quantize: true,
+                tokens: None,
+            }
+        );
+
+        let mut buf = BytesMut::from(
+            "*14\r\n$12\r\nSEMANTIC.GET\r\n$7\r\nllm:ns1\r\n$6\r\nVECTOR\r\n$1\r\n3\r\n$3\r\n1.0\r\n$3\r\n0.0\r\n$3\r\n0.0\r\n$9\r\nTHRESHOLD\r\n$4\r\n0.92\r\n$5\r\nSCOPE\r\n$2\r\nt1\r\n$9\r\nWITHSCORE\r\n$10\r\nWITHPROMPT\r\n$6\r\nWITHID\r\n",
+        );
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::SemanticGet {
+                namespace: Bytes::from_static(b"llm:ns1"),
+                query: vec![1.0, 0.0, 0.0],
+                threshold: 0.92,
+                scope: Some(Bytes::from_static(b"t1")),
+                with_score: true,
+                with_prompt: true,
+                with_id: true,
             }
         );
     }

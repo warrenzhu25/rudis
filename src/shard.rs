@@ -585,6 +585,7 @@ pub struct ShardDb {
     pub shard_id: usize,
     pub tier_manager: Option<std::rc::Rc<crate::tiering::ShardTierManager>>,
     pub vector_indexes: std::collections::HashMap<String, crate::vector::HnswIndex>,
+    pub semantic_caches: hashbrown::HashMap<Bytes, crate::vector::SemanticCache>,
     pub crdt_store: crate::crdt::CrdtStore,
     pub json_store: crate::json::JsonStore,
     pub probabilistic_store: crate::probabilistic::ProbabilisticStore,
@@ -600,6 +601,7 @@ impl ShardDb {
             shard_id: 0,
             tier_manager: None,
             vector_indexes: std::collections::HashMap::new(),
+            semantic_caches: hashbrown::HashMap::new(),
             crdt_store: crate::crdt::CrdtStore::new(port),
             json_store: crate::json::JsonStore::new(),
             probabilistic_store: crate::probabilistic::ProbabilisticStore::new(),
@@ -1644,6 +1646,7 @@ impl ShardDb {
     #[inline]
     pub fn flushdb(&mut self) {
         self.table.flushdb();
+        self.semantic_caches.clear();
     }
 
     #[inline]
@@ -2586,6 +2589,76 @@ impl ShardDb {
         self.vector_indexes
             .get(index_name)
             .map(|idx| (idx.len(), idx.dim, idx.metric.as_str(), idx.max_layer))
+    }
+
+    // Semantic Cache operations
+    #[allow(clippy::too_many_arguments)]
+    pub fn semantic_set(
+        &mut self,
+        namespace: Bytes,
+        id: Bytes,
+        prompt: Bytes,
+        response: Bytes,
+        vector: Vec<f32>,
+        ttl: Option<Duration>,
+        scope: Option<Bytes>,
+        quantize: bool,
+        tokens: Option<u64>,
+    ) -> Result<(), String> {
+        let dim = vector.len();
+        let ns_str = String::from_utf8_lossy(&namespace).into_owned();
+        let cache = self
+            .semantic_caches
+            .entry(namespace)
+            .or_insert_with(|| crate::vector::SemanticCache::new(ns_str, dim));
+        cache.set(id, prompt, response, vector, ttl, scope, quantize, tokens)
+    }
+
+    pub fn semantic_get(
+        &mut self,
+        namespace: &Bytes,
+        query: &[f32],
+        threshold: f32,
+        scope: Option<&[u8]>,
+    ) -> Result<Option<crate::vector::SemanticHit>, String> {
+        let Some(cache) = self.semantic_caches.get_mut(namespace) else {
+            return Ok(None);
+        };
+        cache.get(query, threshold, scope)
+    }
+
+    pub fn semantic_del(&mut self, namespace: &Bytes, ids: &[Bytes]) -> usize {
+        let Some(cache) = self.semantic_caches.get_mut(namespace) else {
+            return 0;
+        };
+        let mut removed = 0;
+        for id in ids {
+            if cache.del(id) {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
+    pub fn semantic_flush(&mut self, namespace: &Bytes) {
+        if let Some(cache) = self.semantic_caches.get_mut(namespace) {
+            cache.flush();
+        }
+    }
+
+    pub fn semantic_info(&mut self, namespace: &Bytes) -> (usize, usize, u64, u64, u64, u64) {
+        let Some(cache) = self.semantic_caches.get_mut(namespace) else {
+            return (0, 0, 0, 0, 0, 0);
+        };
+        cache.purge_expired();
+        (
+            cache.entries.len(),
+            cache.index.dim,
+            cache.hits,
+            cache.misses,
+            cache.tokens_saved,
+            cache.evicted_expired,
+        )
     }
 
     // Active-Active CRDT operations
