@@ -882,6 +882,7 @@ pub struct HnswIndex {
     pub entry_point: Option<usize>,
     pub max_layer: usize,
     pub nodes: Vec<Option<HnswNode>>,
+    pub free_ids: Vec<usize>,
     pub key_to_id: HashMap<Bytes, usize>,
     pub pq_quantizer: Option<ProductQuantizer>,
     /// Redis 8 vector-set quantization mode (`NOQUANT` / `Q8` / `BIN`).
@@ -916,6 +917,7 @@ impl HnswIndex {
             entry_point: None,
             max_layer: 0,
             nodes: Vec::new(),
+            free_ids: Vec::new(),
             key_to_id: HashMap::new(),
             pq_quantizer: None,
             quant: VQuant::NoQuant,
@@ -1114,6 +1116,47 @@ impl HnswIndex {
         }
     }
 
+    /// Malkov & Yashunin Algorithm 4 (`SELECT-NEIGHBORS-HEURISTIC`, `keepPrunedConnections = true`).
+    /// Prefers candidates that are closer to the base point than to any already-selected neighbor
+    /// so edges fan out across diverse directions around clusters, then backfills up to `m_max`
+    /// from pruned candidates to preserve graph degree.
+    fn select_neighbors_heuristic(&self, candidates: &[Candidate], m_max: usize) -> Vec<usize> {
+        if candidates.len() <= m_max {
+            return candidates.iter().map(|c| c.id).collect();
+        }
+        let mut selected: Vec<usize> = Vec::with_capacity(m_max);
+        let mut pruned: Vec<usize> = Vec::new();
+        for cand in candidates {
+            if selected.len() >= m_max {
+                break;
+            }
+            let Some(Some(cand_node)) = self.nodes.get(cand.id) else {
+                continue;
+            };
+            let is_diverse = selected.iter().all(|&sel_id| {
+                self.nodes
+                    .get(sel_id)
+                    .and_then(|o| o.as_ref())
+                    .is_none_or(|sel_node| {
+                        let dist_to_sel = self.dist_to_node(&sel_node.vector, cand_node);
+                        cand.distance <= dist_to_sel
+                    })
+            });
+            if is_diverse {
+                selected.push(cand.id);
+            } else {
+                pruned.push(cand.id);
+            }
+        }
+        for id in pruned {
+            if selected.len() >= m_max {
+                break;
+            }
+            selected.push(id);
+        }
+        selected
+    }
+
     /// Adds or updates a vector in the HNSW index.
     pub fn add(&mut self, key: Bytes, vector: Vec<f32>) -> Result<(), &'static str> {
         self.add_quantized(key, vector, false, false)
@@ -1149,7 +1192,7 @@ impl HnswIndex {
         }
 
         let target_level = self.random_level();
-        let new_id = self.nodes.len();
+        let new_id = self.free_ids.pop().unwrap_or(self.nodes.len());
 
         let use_q8 = quantize_sq8 || self.quant == VQuant::Q8 || (tiered && !quantize_pq);
         let quantized = if use_q8 {
@@ -1187,7 +1230,11 @@ impl HnswIndex {
         if self.entry_point.is_none() {
             self.entry_point = Some(new_id);
             self.max_layer = target_level;
-            self.nodes.push(Some(node));
+            if new_id < self.nodes.len() {
+                self.nodes[new_id] = Some(node);
+            } else {
+                self.nodes.push(Some(node));
+            }
             self.key_to_id.insert(key, new_id);
             return Ok(());
         }
@@ -1218,14 +1265,18 @@ impl HnswIndex {
         }
 
         // 2. Search and link at layers min(target_level, max_layer) down to 0
-        self.nodes.push(Some(node));
+        if new_id < self.nodes.len() {
+            self.nodes[new_id] = Some(node);
+        } else {
+            self.nodes.push(Some(node));
+        }
         self.key_to_id.insert(key, new_id);
 
         let search_level_max = target_level.min(self.max_layer);
         for lc in (0..=search_level_max).rev() {
             let candidates = self.search_layer(&vector, curr_obj, self.ef_construction, lc);
             let m_max = if lc == 0 { self.m0 } else { self.m };
-            let neighbors: Vec<usize> = candidates.into_iter().take(m_max).map(|c| c.id).collect();
+            let neighbors = self.select_neighbors_heuristic(&candidates, m_max);
 
             // Connect new node to neighbors
             if let Some(n) = &mut self.nodes[new_id] {
@@ -1237,9 +1288,11 @@ impl HnswIndex {
                 if let Some(nbr) = &mut self.nodes[nbr_id]
                     && lc < nbr.neighbors.len()
                 {
-                    nbr.neighbors[lc].push(new_id);
+                    if !nbr.neighbors[lc].contains(&new_id) {
+                        nbr.neighbors[lc].push(new_id);
+                    }
                     if nbr.neighbors[lc].len() > m_max {
-                        // Prune furthest neighbor
+                        // Prune furthest / redundant neighbor via diversity heuristic
                         self.prune_neighbors(nbr_id, lc, m_max);
                     }
                 }
@@ -1261,19 +1314,24 @@ impl HnswIndex {
     fn prune_neighbors(&mut self, node_id: usize, layer: usize, max_neighbors: usize) {
         if let Some(node) = &self.nodes[node_id] {
             let node_vec = node.vector.clone();
-            let mut candidates: Vec<(usize, f32)> = node.neighbors[layer]
+            let mut candidates: Vec<Candidate> = node.neighbors[layer]
                 .iter()
                 .filter_map(|&id| {
                     self.nodes
                         .get(id)
                         .and_then(|opt| opt.as_ref())
-                        .map(|n| (id, self.dist_to_node(&node_vec, n)))
+                        .map(|n| Candidate {
+                            id,
+                            distance: self.dist_to_node(&node_vec, n),
+                        })
                 })
                 .collect();
-            candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
-            candidates.truncate(max_neighbors);
-
-            let new_nbrs: Vec<usize> = candidates.into_iter().map(|(id, _)| id).collect();
+            candidates.sort_by(|a, b| {
+                a.distance
+                    .partial_cmp(&b.distance)
+                    .unwrap_or(Ordering::Equal)
+            });
+            let new_nbrs = self.select_neighbors_heuristic(&candidates, max_neighbors);
             if let Some(node_mut) = &mut self.nodes[node_id] {
                 node_mut.neighbors[layer] = new_nbrs;
             }
@@ -1529,25 +1587,67 @@ impl HnswIndex {
         }
     }
 
-    /// Removes a key from the index.
+    /// Removes a key from the index, repairing local neighbor links and recycling the slot id.
     pub fn remove(&mut self, key: &Bytes) -> bool {
         if let Some(id) = self.key_to_id.remove(key) {
             let nbrs_by_layer = self.nodes[id].as_ref().map(|n| n.neighbors.clone());
+            self.nodes[id] = None;
+            self.free_ids.push(id);
             if let Some(nbrs_by_layer) = nbrs_by_layer {
                 for (layer, nbrs) in nbrs_by_layer.into_iter().enumerate() {
-                    for nbr_id in nbrs {
+                    let m_max = if layer == 0 { self.m0 } else { self.m };
+                    for &nbr_id in &nbrs {
                         if let Some(nbr_node) = &mut self.nodes[nbr_id]
                             && layer < nbr_node.neighbors.len()
                         {
                             nbr_node.neighbors[layer].retain(|&x| x != id);
                         }
                     }
+                    // Reconnect former neighbors of the deleted node so graph connectivity holds
+                    for &u in &nbrs {
+                        let Some(Some(u_node)) = self.nodes.get(u) else {
+                            continue;
+                        };
+                        if layer >= u_node.neighbors.len() || u_node.neighbors[layer].len() >= m_max
+                        {
+                            continue;
+                        }
+                        let u_vec = u_node.vector.clone();
+                        let mut extra: Vec<(usize, f32)> = nbrs
+                            .iter()
+                            .copied()
+                            .filter(|&v| v != u && !u_node.neighbors[layer].contains(&v))
+                            .filter_map(|v| {
+                                self.nodes
+                                    .get(v)
+                                    .and_then(|o| o.as_ref())
+                                    .map(|vn| (v, self.dist_to_node(&u_vec, vn)))
+                            })
+                            .collect();
+                        extra.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+                        if let Some(Some(u_mut)) = self.nodes.get_mut(u) {
+                            for (v, _) in extra {
+                                if u_mut.neighbors[layer].len() >= m_max {
+                                    break;
+                                }
+                                u_mut.neighbors[layer].push(v);
+                            }
+                        }
+                    }
                 }
             }
-            self.nodes[id] = None;
-            if self.entry_point == Some(id) {
-                // Find next valid entry point
-                self.entry_point = self.nodes.iter().position(|n| n.is_some());
+            if self.entry_point == Some(id) || self.key_to_id.is_empty() {
+                let best = self
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, opt)| {
+                        opt.as_ref()
+                            .map(|n| (idx, n.neighbors.len().saturating_sub(1)))
+                    })
+                    .max_by_key(|&(_, top)| top);
+                self.entry_point = best.map(|(idx, _)| idx);
+                self.max_layer = best.map(|(_, top)| top).unwrap_or(0);
             }
             true
         } else {
@@ -2182,6 +2282,7 @@ impl FlatIndex {
 
 /// Vector index backing a `VECTOR` field of an FT index (`FLAT` or `HNSW`).
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum VectorFieldIndex {
     Flat(FlatIndex),
     Hnsw(HnswIndex),
@@ -2692,5 +2793,46 @@ mod tests {
         idx.add(Bytes::from("e2"), p2).unwrap();
         let hits = idx.search(&p1, 1);
         assert_eq!(hits[0].0, Bytes::from("e1"));
+    }
+
+    #[test]
+    fn test_hnsw_diversity_heuristic_and_delete_slot_reuse() {
+        let mut idx = HnswIndex::with_params("churn".to_string(), 4, VectorMetric::L2, 4, 32, 32);
+        for i in 0..30 {
+            let angle = (i as f32) * 0.2;
+            idx.add(
+                Bytes::from(format!("n{i}")),
+                vec![angle.cos(), angle.sin(), (i as f32) * 0.05, 1.0],
+            )
+            .unwrap();
+        }
+        assert_eq!(idx.nodes.len(), 30);
+
+        // Delete 15 elements (including the current entry point) and re-insert 15 new elements.
+        // Slot reuse (`free_ids`) must prevent `nodes.len()` from growing past 30.
+        for i in 0..15 {
+            assert!(idx.remove(&Bytes::from(format!("n{i}"))));
+        }
+        assert_eq!(idx.len(), 15);
+        assert_eq!(idx.free_ids.len(), 15);
+
+        for i in 30..45 {
+            let angle = (i as f32) * 0.2;
+            idx.add(
+                Bytes::from(format!("n{i}")),
+                vec![angle.cos(), angle.sin(), (i as f32) * 0.05, 1.0],
+            )
+            .unwrap();
+        }
+        assert_eq!(idx.len(), 30);
+        assert_eq!(idx.nodes.len(), 30);
+        assert!(idx.free_ids.is_empty());
+
+        // Verify recall on remaining + newly inserted nodes after churn
+        let target_i = 37usize;
+        let angle = (target_i as f32) * 0.2;
+        let q = [angle.cos(), angle.sin(), (target_i as f32) * 0.05, 1.0];
+        let hits = idx.search(&q, 3);
+        assert_eq!(hits[0].0, Bytes::from("n37"));
     }
 }
