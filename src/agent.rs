@@ -253,6 +253,138 @@ impl AgentMemorySession {
     }
 }
 
+/// Decision returned by `LLM.QUOTA.RESERVE`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmReserveResult {
+    pub allowed: bool,
+    pub reservation_id: Option<u64>,
+    pub remaining_tokens: u64,
+    pub retry_after_ms: u64,
+}
+
+/// Dual RPM (Requests Per Window) + TPM (Tokens Per Window) quota governor with
+/// pre-inference token reservation and post-stream actual token settlement.
+#[derive(Debug, Clone)]
+pub struct LlmQuotaBucket {
+    pub requests: std::collections::VecDeque<(std::time::Instant, u64)>,
+    pub reservations: HashMap<u64, (std::time::Instant, u64)>,
+    pub next_reservation_id: u64,
+    pub window_ms: u64,
+}
+
+impl Default for LlmQuotaBucket {
+    fn default() -> Self {
+        Self::new(60_000)
+    }
+}
+
+impl LlmQuotaBucket {
+    pub fn new(window_ms: u64) -> Self {
+        Self {
+            requests: std::collections::VecDeque::new(),
+            reservations: HashMap::new(),
+            next_reservation_id: 1,
+            window_ms: window_ms.max(1),
+        }
+    }
+
+    fn evict_expired(&mut self, now: std::time::Instant) {
+        let window = std::time::Duration::from_millis(self.window_ms);
+        while let Some(&(ts, _)) = self.requests.front() {
+            if now.duration_since(ts) >= window {
+                self.requests.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.reservations
+            .retain(|_, (ts, _)| now.duration_since(*ts) < window);
+    }
+
+    /// Atomically checks both `rpm` and `tpm` limits and reserves `est_tokens` if within quota.
+    pub fn reserve(
+        &mut self,
+        rpm: usize,
+        tpm: u64,
+        est_tokens: u64,
+        window_ms: Option<u64>,
+    ) -> LlmReserveResult {
+        if let Some(w) = window_ms {
+            self.window_ms = w.max(1);
+        }
+        let now = std::time::Instant::now();
+        self.evict_expired(now);
+
+        let active_reqs = self.requests.len() + self.reservations.len();
+        let used_tokens: u64 = self.requests.iter().map(|(_, t)| *t).sum();
+        let reserved_tokens: u64 = self.reservations.values().map(|(_, t)| *t).sum();
+        let committed = used_tokens.saturating_add(reserved_tokens);
+
+        if active_reqs < rpm && committed.saturating_add(est_tokens) <= tpm {
+            let res_id = self.next_reservation_id;
+            self.next_reservation_id += 1;
+            self.reservations.insert(res_id, (now, est_tokens));
+            let remaining = tpm.saturating_sub(committed.saturating_add(est_tokens));
+            LlmReserveResult {
+                allowed: true,
+                reservation_id: Some(res_id),
+                remaining_tokens: remaining,
+                retry_after_ms: 0,
+            }
+        } else {
+            let oldest_req = self.requests.front().map(|(ts, _)| *ts);
+            let oldest_res = self.reservations.values().map(|(ts, _)| *ts).min();
+            let oldest = match (oldest_req, oldest_res) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            let retry_after_ms = oldest
+                .map(|ts| {
+                    let elapsed = now.duration_since(ts).as_millis() as u64;
+                    self.window_ms.saturating_sub(elapsed).max(1)
+                })
+                .unwrap_or(self.window_ms);
+            LlmReserveResult {
+                allowed: false,
+                reservation_id: None,
+                remaining_tokens: tpm.saturating_sub(committed),
+                retry_after_ms,
+            }
+        }
+    }
+
+    /// Settles a reservation with the actual token count consumed by the LLM call.
+    /// Returns `(found, net_token_delta)` where negative delta indicates refunded tokens.
+    pub fn settle(&mut self, reservation_id: u64, actual_tokens: u64) -> (bool, i64) {
+        let now = std::time::Instant::now();
+        self.evict_expired(now);
+        if let Some((created_at, est_tokens)) = self.reservations.remove(&reservation_id) {
+            self.requests.push_back((created_at, actual_tokens));
+            let delta = (actual_tokens as i64).saturating_sub(est_tokens as i64);
+            (true, delta)
+        } else {
+            (false, 0)
+        }
+    }
+
+    pub fn info(&mut self) -> (usize, u64, u64, usize, u64) {
+        let now = std::time::Instant::now();
+        self.evict_expired(now);
+        let active_reqs = self.requests.len() + self.reservations.len();
+        let used_tokens: u64 = self.requests.iter().map(|(_, t)| *t).sum();
+        let reserved_tokens: u64 = self.reservations.values().map(|(_, t)| *t).sum();
+        (
+            active_reqs,
+            used_tokens,
+            reserved_tokens,
+            self.reservations.len(),
+            self.window_ms,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,5 +476,37 @@ mod tests {
         assert_eq!(ctx2.recent_turns[1].id, 4);
         assert_eq!(ctx2.recalled_episodes.len(), 1);
         assert_eq!(ctx2.recalled_episodes[0].id, 1);
+    }
+
+    #[test]
+    fn test_llm_quota_reserve_and_settle() {
+        let mut bucket = LlmQuotaBucket::new(60_000);
+
+        // RPM=2, TPM=1000: reserve 700 tokens -> allowed (remaining=300)
+        let r1 = bucket.reserve(2, 1000, 700, None);
+        assert!(r1.allowed);
+        assert_eq!(r1.reservation_id, Some(1));
+        assert_eq!(r1.remaining_tokens, 300);
+
+        // Second request tries to reserve 500 tokens -> exceeds TPM (700 + 500 > 1000), denied!
+        let r2 = bucket.reserve(2, 1000, 500, None);
+        assert!(!r2.allowed);
+        assert_eq!(r2.remaining_tokens, 300);
+        assert!(r2.retry_after_ms > 0);
+
+        // Settle reservation 1 with actual_tokens=400 (refunds 300 tokens -> delta = -300)
+        let (found, delta) = bucket.settle(1, 400);
+        assert!(found);
+        assert_eq!(delta, -300);
+
+        // Now 600 tokens are available (1000 - 400), so reserving 500 succeeds!
+        let r3 = bucket.reserve(2, 1000, 500, None);
+        assert!(r3.allowed);
+        assert_eq!(r3.reservation_id, Some(2));
+        assert_eq!(r3.remaining_tokens, 100);
+
+        // Third request with 50 tokens -> denied due to RPM=2 (1 settled + 1 reserved = 2 active requests)
+        let r4 = bucket.reserve(2, 1000, 50, None);
+        assert!(!r4.allowed);
     }
 }

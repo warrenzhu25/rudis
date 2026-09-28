@@ -587,6 +587,7 @@ pub struct ShardDb {
     pub vector_indexes: std::collections::HashMap<String, crate::vector::HnswIndex>,
     pub semantic_caches: hashbrown::HashMap<Bytes, crate::vector::SemanticCache>,
     pub agent_memories: hashbrown::HashMap<Bytes, crate::agent::AgentMemorySession>,
+    pub llm_quotas: hashbrown::HashMap<Bytes, crate::agent::LlmQuotaBucket>,
     pub crdt_store: crate::crdt::CrdtStore,
     pub json_store: crate::json::JsonStore,
     pub probabilistic_store: crate::probabilistic::ProbabilisticStore,
@@ -604,6 +605,7 @@ impl ShardDb {
             vector_indexes: std::collections::HashMap::new(),
             semantic_caches: hashbrown::HashMap::new(),
             agent_memories: hashbrown::HashMap::new(),
+            llm_quotas: hashbrown::HashMap::new(),
             crdt_store: crate::crdt::CrdtStore::new(port),
             json_store: crate::json::JsonStore::new(),
             probabilistic_store: crate::probabilistic::ProbabilisticStore::new(),
@@ -1757,6 +1759,7 @@ impl ShardDb {
         self.vector_indexes.clear();
         self.semantic_caches.clear();
         self.agent_memories.clear();
+        self.llm_quotas.clear();
     }
 
     #[inline]
@@ -3129,6 +3132,41 @@ impl ShardDb {
 
     pub fn agent_mem_clear(&mut self, session: &Bytes) -> bool {
         self.agent_memories.remove(session).is_some()
+    }
+
+    // LLM Quota Governor operations
+    pub fn llm_quota_reserve(
+        &mut self,
+        key: Bytes,
+        rpm: usize,
+        tpm: u64,
+        est_tokens: u64,
+        window_ms: Option<u64>,
+    ) -> crate::agent::LlmReserveResult {
+        let bucket = self
+            .llm_quotas
+            .entry(key)
+            .or_insert_with(|| crate::agent::LlmQuotaBucket::new(window_ms.unwrap_or(60_000)));
+        bucket.reserve(rpm, tpm, est_tokens, window_ms)
+    }
+
+    pub fn llm_quota_settle(
+        &mut self,
+        key: &Bytes,
+        reservation_id: u64,
+        actual_tokens: u64,
+    ) -> (bool, i64) {
+        let Some(bucket) = self.llm_quotas.get_mut(key) else {
+            return (false, 0);
+        };
+        bucket.settle(reservation_id, actual_tokens)
+    }
+
+    pub fn llm_quota_info(&mut self, key: &Bytes) -> (usize, u64, u64, usize, u64) {
+        let Some(bucket) = self.llm_quotas.get_mut(key) else {
+            return (0, 0, 0, 0, 60_000);
+        };
+        bucket.info()
     }
 
     // Active-Active CRDT operations

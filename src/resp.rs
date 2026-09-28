@@ -1116,6 +1116,20 @@ pub enum Command {
     },
     AgentMemInfo(Bytes),
     AgentMemClear(Bytes),
+    // LLM QUOTA GOVERNOR COMMANDS
+    LlmQuotaReserve {
+        key: Bytes,
+        rpm: usize,
+        tpm: u64,
+        est_tokens: u64,
+        window_ms: Option<u64>,
+    },
+    LlmQuotaSettle {
+        key: Bytes,
+        reservation_id: u64,
+        actual_tokens: u64,
+    },
+    LlmQuotaInfo(Bytes),
     // CRDT MULTI-REGION COMMANDS
     CrdtSet {
         key: Bytes,
@@ -9941,6 +9955,110 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'agent.mem.clear' command".to_string());
             }
             Ok(Some(Command::AgentMemClear(args[1].clone())))
+        }
+        "LLM.QUOTA.RESERVE" => {
+            if args.len() < 8 {
+                return Err("wrong number of arguments for 'llm.quota.reserve' command".to_string());
+            }
+            let key = args[1].clone();
+            let mut rpm = None;
+            let mut tpm = None;
+            let mut est_tokens = None;
+            let mut window_ms = None;
+            let mut i = 2;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "RPM" if i + 1 < args.len() => {
+                        let v: usize = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        rpm = Some(v);
+                        i += 2;
+                    }
+                    "TPM" if i + 1 < args.len() => {
+                        let v: u64 = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        tpm = Some(v);
+                        i += 2;
+                    }
+                    "EST_TOKENS" | "TOKENS" if i + 1 < args.len() => {
+                        let v: u64 = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        est_tokens = Some(v);
+                        i += 2;
+                    }
+                    "WINDOW" | "WINDOW_MS" if i + 1 < args.len() => {
+                        let v: u64 = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        window_ms = Some(v);
+                        i += 2;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            let Some(rpm) = rpm else {
+                return Err("missing RPM in 'llm.quota.reserve' command".to_string());
+            };
+            let Some(tpm) = tpm else {
+                return Err("missing TPM in 'llm.quota.reserve' command".to_string());
+            };
+            let Some(est_tokens) = est_tokens else {
+                return Err("missing EST_TOKENS in 'llm.quota.reserve' command".to_string());
+            };
+            Ok(Some(Command::LlmQuotaReserve {
+                key,
+                rpm,
+                tpm,
+                est_tokens,
+                window_ms,
+            }))
+        }
+        "LLM.QUOTA.SETTLE" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'llm.quota.settle' command".to_string());
+            }
+            let key = args[1].clone();
+            let reservation_id: u64 = std::str::from_utf8(&args[2])
+                .map_err(|_| "value is not an integer or out of range".to_string())?
+                .parse()
+                .map_err(|_| "value is not an integer or out of range".to_string())?;
+            let actual_tokens: u64 = if args.len() == 4 {
+                std::str::from_utf8(&args[3])
+                    .map_err(|_| "value is not an integer or out of range".to_string())?
+                    .parse()
+                    .map_err(|_| "value is not an integer or out of range".to_string())?
+            } else if args.len() == 5
+                && matches!(
+                    String::from_utf8_lossy(&args[3]).to_uppercase().as_str(),
+                    "ACTUAL_TOKENS" | "TOKENS"
+                )
+            {
+                std::str::from_utf8(&args[4])
+                    .map_err(|_| "value is not an integer or out of range".to_string())?
+                    .parse()
+                    .map_err(|_| "value is not an integer or out of range".to_string())?
+            } else {
+                return Err("syntax error".to_string());
+            };
+            Ok(Some(Command::LlmQuotaSettle {
+                key,
+                reservation_id,
+                actual_tokens,
+            }))
+        }
+        "LLM.QUOTA.INFO" => {
+            if args.len() != 2 {
+                return Err("wrong number of arguments for 'llm.quota.info' command".to_string());
+            }
+            Ok(Some(Command::LlmQuotaInfo(args[1].clone())))
         }
         "XDP.INFO" => Ok(Some(Command::XdpInfo)),
         "XDP.RULE" => {

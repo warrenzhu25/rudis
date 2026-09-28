@@ -13121,3 +13121,55 @@ fn test_agent_memory_working_window_episodic_recall_and_compaction_e2e() {
         ":1\r\n"
     );
 }
+
+#[test]
+fn test_llm_quota_governor_reserve_and_settle_e2e() {
+    let port = 19153;
+    start_test_server(port, 4);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // 1. Reserve 700 tokens under RPM=2, TPM=1000
+    let r1 = send_and_read(
+        &mut client,
+        b"LLM.QUOTA.RESERVE tenant:openai RPM 2 TPM 1000 EST_TOKENS 700 WINDOW 60000\r\n",
+    );
+    assert_eq!(r1, "*4\r\n:1\r\n:1\r\n:300\r\n:0\r\n");
+
+    // 2. Try reserving 500 tokens -> rejected because 700 + 500 > 1000
+    let r2 = send_and_read(
+        &mut client,
+        b"LLM.QUOTA.RESERVE tenant:openai RPM 2 TPM 1000 EST_TOKENS 500\r\n",
+    );
+    assert!(
+        r2.starts_with("*4\r\n:0\r\n$-1\r\n:300\r\n:"),
+        "Expected TPM rejection: {}",
+        r2
+    );
+
+    // 3. Settle reservation 1 with ACTUAL_TOKENS 400 (refunds 300 tokens -> net delta -300)
+    let settle = send_and_read(
+        &mut client,
+        b"LLM.QUOTA.SETTLE tenant:openai 1 ACTUAL_TOKENS 400\r\n",
+    );
+    assert_eq!(settle, "*2\r\n:1\r\n:-300\r\n");
+
+    // 4. Now reserving 500 tokens succeeds (400 + 500 = 900 <= 1000, remaining=100)
+    let r3 = send_and_read(
+        &mut client,
+        b"LLM.QUOTA.RESERVE tenant:openai RPM 2 TPM 1000 EST_TOKENS 500\r\n",
+    );
+    assert_eq!(r3, "*4\r\n:1\r\n:2\r\n:100\r\n:0\r\n");
+
+    // 5. Inspect LLM.QUOTA.INFO
+    let info = send_and_read(&mut client, b"LLM.QUOTA.INFO tenant:openai\r\n");
+    assert!(
+        info.contains("active_requests\r\n:2\r\n")
+            && info.contains("used_tokens\r\n:400\r\n")
+            && info.contains("reserved_tokens\r\n:500\r\n"),
+        "LLM.QUOTA.INFO: {}",
+        info
+    );
+}

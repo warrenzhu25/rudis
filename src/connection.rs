@@ -2727,7 +2727,10 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::AgentMemContext { session: key, .. }
         | Command::AgentMemCompact { session: key, .. }
         | Command::AgentMemInfo(key)
-        | Command::AgentMemClear(key) => Some(key),
+        | Command::AgentMemClear(key)
+        | Command::LlmQuotaReserve { key, .. }
+        | Command::LlmQuotaSettle { key, .. }
+        | Command::LlmQuotaInfo(key) => Some(key),
 
         Command::Smove { source, .. }
         | Command::Lmove { source, .. }
@@ -3108,6 +3111,9 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
         | Command::AgentMemCompact { session: k, .. }
         | Command::AgentMemInfo(k)
         | Command::AgentMemClear(k)
+        | Command::LlmQuotaReserve { key: k, .. }
+        | Command::LlmQuotaSettle { key: k, .. }
+        | Command::LlmQuotaInfo(k)
         | Command::Hexpire { key: k, .. }
         | Command::Httl { key: k, .. }
         | Command::Hpersist { key: k, .. }
@@ -3897,6 +3903,9 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         | Command::AgentMemCompact { .. }
         | Command::AgentMemInfo(_)
         | Command::AgentMemClear(_) => "AGENT",
+        Command::LlmQuotaReserve { .. }
+        | Command::LlmQuotaSettle { .. }
+        | Command::LlmQuotaInfo(_) => "LLM",
         Command::CrdtSet { .. }
         | Command::CrdtGet(_)
         | Command::CrdtDel(_)
@@ -6605,6 +6614,9 @@ async fn execute_command(
         | Command::AgentMemCompact { .. }
         | Command::AgentMemInfo(_)
         | Command::AgentMemClear(_)
+        | Command::LlmQuotaReserve { .. }
+        | Command::LlmQuotaSettle { .. }
+        | Command::LlmQuotaInfo(_)
         | Command::Vadd { .. }
         | Command::Vquery { .. }
         | Command::Vsim { .. }
@@ -10814,6 +10826,9 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::AgentMemCompact { session: key, .. }
         | Command::AgentMemInfo(key)
         | Command::AgentMemClear(key)
+        | Command::LlmQuotaReserve { key, .. }
+        | Command::LlmQuotaSettle { key, .. }
+        | Command::LlmQuotaInfo(key)
         | Command::Vadd { key, .. }
         | Command::Vquery { key, .. }
         | Command::Vsim { key, .. }
@@ -15457,6 +15472,53 @@ pub fn execute_local_command(
                 record_change!(cmd);
             }
             write_resp_integer(out, i64::from(cleared));
+            false
+        }
+        Command::LlmQuotaReserve {
+            key,
+            rpm,
+            tpm,
+            est_tokens,
+            window_ms,
+        } => {
+            let res = db.llm_quota_reserve(key.clone(), *rpm, *tpm, *est_tokens, *window_ms);
+            write_resp_array_header(out, 4);
+            write_resp_integer(out, i64::from(res.allowed));
+            match res.reservation_id {
+                Some(id) => write_resp_integer(out, id as i64),
+                None => write_resp_null(out),
+            }
+            write_resp_integer(out, res.remaining_tokens as i64);
+            write_resp_integer(out, res.retry_after_ms as i64);
+            false
+        }
+        Command::LlmQuotaSettle {
+            key,
+            reservation_id,
+            actual_tokens,
+        } => {
+            let (found, delta) = db.llm_quota_settle(key, *reservation_id, *actual_tokens);
+            write_resp_array_header(out, 2);
+            write_resp_integer(out, i64::from(found));
+            write_resp_integer(out, delta);
+            false
+        }
+        Command::LlmQuotaInfo(key) => {
+            let (active_reqs, used_tokens, reserved_tokens, active_res, window_ms) =
+                db.llm_quota_info(key);
+            out.extend_from_slice(b"*12\r\n");
+            write_resp_bulk(out, b"key");
+            write_resp_bulk(out, key);
+            write_resp_bulk(out, b"active_requests");
+            write_resp_integer(out, active_reqs as i64);
+            write_resp_bulk(out, b"used_tokens");
+            write_resp_integer(out, used_tokens as i64);
+            write_resp_bulk(out, b"reserved_tokens");
+            write_resp_integer(out, reserved_tokens as i64);
+            write_resp_bulk(out, b"active_reservations");
+            write_resp_integer(out, active_res as i64);
+            write_resp_bulk(out, b"window_ms");
+            write_resp_integer(out, window_ms as i64);
             false
         }
         Command::Vadd {
