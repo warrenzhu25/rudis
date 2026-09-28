@@ -629,6 +629,7 @@ impl ShardDb {
         let index_name = schema.name.clone();
         let on_type = schema.on_type.to_uppercase();
         let prefixes = schema.prefixes.clone();
+        let prev_idx = self.search_indices.remove(&index_name);
         let mut idx = crate::search::InvertedIndex::new(schema.clone());
         let global_idx = crate::search::get_search_index(&index_name);
 
@@ -677,6 +678,25 @@ impl ShardDb {
                         && let Ok(mut g_idx) = g.write()
                     {
                         g_idx.add_document(&k_str, extracted_fields, extracted_vectors);
+                    }
+                }
+            }
+        }
+
+        if let Some(prev) = prev_idx {
+            for meta in prev.id_to_meta.into_values() {
+                if !idx.key_to_id.contains_key(&meta.key) {
+                    let key_str = String::from_utf8_lossy(&meta.key).to_string();
+                    let vecs = if meta.vector_fields.is_empty() {
+                        None
+                    } else {
+                        Some(meta.vector_fields)
+                    };
+                    idx.add_document(&key_str, meta.fields.clone(), vecs.clone());
+                    if let Some(ref g) = global_idx
+                        && let Ok(mut g_idx) = g.write()
+                    {
+                        g_idx.add_document(&key_str, meta.fields, vecs);
                     }
                 }
             }

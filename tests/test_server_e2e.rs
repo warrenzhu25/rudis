@@ -13173,3 +13173,142 @@ fn test_llm_quota_governor_reserve_and_settle_e2e() {
         info
     );
 }
+
+fn format_resp_cmd(args: &[&str]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", args.len()).into_bytes();
+    for arg in args {
+        out.extend_from_slice(format!("${}\r\n{}\r\n", arg.len(), arg).as_bytes());
+    }
+    out
+}
+
+fn format_resp_bytes(args: &[&[u8]]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", args.len()).into_bytes();
+    for arg in args {
+        out.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+        out.extend_from_slice(arg);
+        out.extend_from_slice(b"\r\n");
+    }
+    out
+}
+
+#[test]
+fn test_ft_hybrid_alter_list_profile_and_multi_vector_json_e2e() {
+    let port = 19154;
+    start_test_server(port, 4);
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // 1. Pre-populate multi-chunk JSON documents
+    let j1 = r#"{"title":"rust hnsw guide","tag":"ai","chunks":[{"emb":[1.0,0.0,0.0]},{"emb":[0.0,1.0,0.0]}]}"#;
+    let j2 = r#"{"title":"rust parser guide","tag":"sys","chunks":[{"emb":[1.0,0.0,0.0]}]}"#;
+    for (k, body) in [("ragdoc:1", j1), ("ragdoc:2", j2)] {
+        let cmd = format_resp_cmd(&["JSON.SET", k, "$", body]);
+        assert_eq!(send_and_read(&mut client, &cmd), "+OK\r\n");
+    }
+
+    // 2. Create JSON index with multi-vector path $.chunks[*].emb
+    let create = format_resp_cmd(&[
+        "FT.CREATE",
+        "idx:rag_a3",
+        "ON",
+        "JSON",
+        "PREFIX",
+        "1",
+        "ragdoc:",
+        "SCHEMA",
+        "$.title",
+        "AS",
+        "title",
+        "TEXT",
+        "$.chunks[*].emb",
+        "AS",
+        "emb",
+        "VECTOR",
+        "HNSW",
+        "6",
+        "TYPE",
+        "FLOAT32",
+        "DIM",
+        "3",
+        "DISTANCE_METRIC",
+        "COSINE",
+    ]);
+    assert_eq!(send_and_read(&mut client, &create), "+OK\r\n");
+
+    // 3. FT._LIST includes idx:rag_a3
+    let list_resp = send_and_read(&mut client, b"FT._LIST\r\n");
+    assert!(
+        list_resp.contains("idx:rag_a3"),
+        "FT._LIST should list idx:rag_a3, got: {}",
+        list_resp
+    );
+
+    // 4. FT.ALTER adds $.tag AS tag TAG and backfills existing JSON documents
+    let alter = format_resp_cmd(&[
+        "FT.ALTER",
+        "idx:rag_a3",
+        "SCHEMA",
+        "ADD",
+        "$.tag",
+        "AS",
+        "tag",
+        "TAG",
+    ]);
+    assert_eq!(send_and_read(&mut client, &alter), "+OK\r\n");
+    let tag_search = format_resp_cmd(&["FT.SEARCH", "idx:rag_a3", "@tag:{ai}", "NOCONTENT"]);
+    assert_eq!(
+        send_and_read(&mut client, &tag_search),
+        "*2\r\n:1\r\n$8\r\nragdoc:1\r\n"
+    );
+
+    // 5. FT.HYBRID with SCORER LINEAR and multi-vector chunk hit ([0, 1, 0] matches ragdoc:1's 2nd chunk)
+    let q_bytes: Vec<u8> = [0.0f32, 1.0, 0.0]
+        .into_iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    let hybrid_cmd = format_resp_bytes(&[
+        b"FT.HYBRID".as_slice(),
+        b"idx:rag_a3".as_slice(),
+        b"rust".as_slice(),
+        b"[KNN 2 @emb $q]".as_slice(),
+        b"SCORER".as_slice(),
+        b"LINEAR".as_slice(),
+        b"ALPHA".as_slice(),
+        b"0.3".as_slice(),
+        b"BETA".as_slice(),
+        b"0.7".as_slice(),
+        b"PARAMS".as_slice(),
+        b"2".as_slice(),
+        b"q".as_slice(),
+        q_bytes.as_slice(),
+        b"NOCONTENT".as_slice(),
+        b"WITHSCORES".as_slice(),
+    ]);
+    let hybrid_resp = send_and_read(&mut client, &hybrid_cmd);
+    assert!(
+        hybrid_resp.starts_with("*5\r\n:2\r\n$8\r\nragdoc:1\r\n"),
+        "FT.HYBRID LINEAR should rank ragdoc:1 first: {}",
+        hybrid_resp
+    );
+
+    // 6. FT.PROFILE returns *2 [search_results, profile_details]
+    let prof_cmd = format_resp_cmd(&[
+        "FT.PROFILE",
+        "idx:rag_a3",
+        "SEARCH",
+        "QUERY",
+        "rust",
+        "NOCONTENT",
+    ]);
+    let prof_resp = send_and_read(&mut client, &prof_cmd);
+    assert!(
+        prof_resp.starts_with("*2\r\n*3\r\n:2\r\n")
+            && prof_resp.contains("Total profile time")
+            && prof_resp.contains("Query plan"),
+        "FT.PROFILE response: {}",
+        prof_resp
+    );
+}

@@ -275,6 +275,7 @@ pub struct DocMeta {
     pub numeric_fields: HashMap<String, f64>,
     pub tag_fields: HashMap<String, HashSet<String>>,
     pub vector_fields: HashMap<String, Vec<f32>>,
+    pub multi_vector_fields: HashMap<String, Vec<Vec<f32>>>,
     pub terms: Vec<String>,
 }
 
@@ -803,6 +804,7 @@ impl InvertedIndex {
         // dimension mismatch is rejected entirely (counted in `hash_indexing_failures`).
         let provided = vectors.unwrap_or_default();
         let mut vector_fields: HashMap<String, Vec<f32>> = HashMap::new();
+        let mut multi_vector_fields: HashMap<String, Vec<Vec<f32>>> = HashMap::new();
         for sf in &schema.schema_fields {
             let FieldType::Vector { dim, attrs, .. } = &sf.field_type else {
                 continue;
@@ -821,7 +823,21 @@ impl InvertedIndex {
             match candidate {
                 None => {}
                 Some(Some(v)) if *dim == 0 || v.len() == *dim => {
+                    let mut chunks = vec![v.clone()];
+                    let mut chunk_idx = 1usize;
+                    while let Some(extra) = provided
+                        .get(&format!("{}#{}", sf.alias, chunk_idx))
+                        .or_else(|| provided.get(&format!("{}#{}", sf.identifier, chunk_idx)))
+                    {
+                        if *dim != 0 && extra.len() != *dim {
+                            self.indexing_failures += 1;
+                            return;
+                        }
+                        chunks.push(extra.clone());
+                        chunk_idx += 1;
+                    }
                     vector_fields.insert(sf.alias.clone(), v);
+                    multi_vector_fields.insert(sf.alias.clone(), chunks);
                 }
                 Some(_) => {
                     self.indexing_failures += 1;
@@ -907,6 +923,12 @@ impl InvertedIndex {
             }
             if let Some(vi) = self.vector_indices.get_mut(field_name) {
                 let _ = vi.add(key_bytes.clone(), vec.clone());
+                if let Some(chunks) = multi_vector_fields.get(field_name) {
+                    for (chunk_idx, chunk_vec) in chunks.iter().enumerate().skip(1) {
+                        let chunk_key = Bytes::from(format!("{}\x00{}", doc_id_str, chunk_idx));
+                        let _ = vi.add(chunk_key, chunk_vec.clone());
+                    }
+                }
             }
         }
 
@@ -924,6 +946,7 @@ impl InvertedIndex {
             numeric_fields,
             tag_fields,
             vector_fields,
+            multi_vector_fields,
             terms: indexed_terms,
         };
 
@@ -965,10 +988,16 @@ impl InvertedIndex {
                 }
             }
 
-            // Remove from vector indices
+            // Remove from vector indices (including any extra chunk vectors)
             for field_name in meta.vector_fields.keys() {
                 if let Some(hnsw) = self.vector_indices.get_mut(field_name) {
                     hnsw.remove(&meta.key);
+                    if let Some(chunks) = meta.multi_vector_fields.get(field_name) {
+                        for chunk_idx in 1..chunks.len() {
+                            let chunk_key = Bytes::from(format!("{}\x00{}", key, chunk_idx));
+                            hnsw.remove(&chunk_key);
+                        }
+                    }
                 }
             }
         }
@@ -1023,6 +1052,14 @@ pub fn create_search_index(schema: IndexSchema) -> Result<(), String> {
     Ok(())
 }
 
+pub fn reset_search_index(schema: IndexSchema) {
+    let mut registry = SEARCH_INDICES.write().unwrap();
+    let name = schema.name.clone();
+    let idx = Arc::new(RwLock::new(InvertedIndex::new(schema)));
+    registry.insert(name, idx);
+    SEARCH_INDICES_COUNT.store(registry.len(), std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn drop_search_index(name: &str) -> Result<(), String> {
     let mut registry = SEARCH_INDICES.write().unwrap();
     if registry.remove(name).is_some() {
@@ -1035,7 +1072,9 @@ pub fn drop_search_index(name: &str) -> Result<(), String> {
 
 pub fn list_search_indices() -> Vec<String> {
     let registry = SEARCH_INDICES.read().unwrap();
-    registry.keys().cloned().collect()
+    let mut names: Vec<String> = registry.keys().cloned().collect();
+    names.sort();
+    names
 }
 
 pub fn index_document_hook(key: &str, raw: &[(Bytes, Bytes)]) {
@@ -1145,8 +1184,9 @@ pub fn extract_json_fields(
                 }
             }
             FieldType::Vector { .. } => {
-                if let Some(first) = matches.first() {
-                    let vec_opt: Option<Vec<f32>> = match first {
+                let mut all_vecs: Vec<Vec<f32>> = Vec::new();
+                for matched_val in &matches {
+                    let vec_opt: Option<Vec<f32>> = match matched_val {
                         serde_json::Value::Array(arr) => {
                             let v: Vec<f32> = arr
                                 .iter()
@@ -1160,20 +1200,27 @@ pub fn extract_json_fields(
                         }
                         _ => None,
                     };
-                    if let Some(vec) = vec_opt {
-                        extracted_vectors.insert(sf.alias.clone(), vec.clone());
-                        if sf.alias != sf.identifier {
-                            extracted_vectors.insert(sf.identifier.clone(), vec.clone());
-                        }
-                        let s = vec
-                            .iter()
-                            .map(|f| f.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        extracted_fields.insert(sf.alias.clone(), s.clone());
-                        if sf.alias != sf.identifier {
-                            extracted_fields.insert(sf.identifier.clone(), s);
-                        }
+                    if let Some(v) = vec_opt {
+                        all_vecs.push(v);
+                    }
+                }
+                if let Some(first_vec) = all_vecs.first() {
+                    extracted_vectors.insert(sf.alias.clone(), first_vec.clone());
+                    if sf.alias != sf.identifier {
+                        extracted_vectors.insert(sf.identifier.clone(), first_vec.clone());
+                    }
+                    for (chunk_idx, chunk_vec) in all_vecs.iter().enumerate().skip(1) {
+                        extracted_vectors
+                            .insert(format!("{}#{}", sf.alias, chunk_idx), chunk_vec.clone());
+                    }
+                    let s = first_vec
+                        .iter()
+                        .map(|f| f.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    extracted_fields.insert(sf.alias.clone(), s.clone());
+                    if sf.alias != sf.identifier {
+                        extracted_fields.insert(sf.identifier.clone(), s);
                     }
                 }
             }
@@ -1308,15 +1355,28 @@ impl QueryAst {
         }
     }
 
-    /// If this query is a hybrid `(text_or_filter)=>[KNN ...]` AST where the base query is
-    /// not `MatchAll`, returns `(base_ast, knn_ast)` for Reciprocal Rank Fusion (RRF).
+    /// If this query is a hybrid `(text_or_filter)=>[KNN ...]` or `text @vec:[VECTOR_RANGE ...]`
+    /// AST where the base query is not `MatchAll`, returns `(base_ast, vec_ast)` for RRF / linear fusion.
     pub fn as_hybrid_rrf(&self) -> Option<(QueryAst, QueryAst)> {
         if let QueryAst::And(subs) = self
-            && subs.len() == 2
-            && !matches!(subs[0], QueryAst::MatchAll)
-            && matches!(subs[1], QueryAst::KnnVector { .. })
+            && let Some(vec_pos) = subs.iter().position(|s| {
+                matches!(s, QueryAst::KnnVector { .. } | QueryAst::VectorRange { .. })
+            })
         {
-            return Some((subs[0].clone(), subs[1].clone()));
+            let others: Vec<QueryAst> = subs
+                .iter()
+                .enumerate()
+                .filter(|(i, s)| *i != vec_pos && !matches!(s, QueryAst::MatchAll))
+                .map(|(_, s)| s.clone())
+                .collect();
+            if !others.is_empty() {
+                let base = if others.len() == 1 {
+                    others.into_iter().next().unwrap()
+                } else {
+                    QueryAst::And(others)
+                };
+                return Some((base, subs[vec_pos].clone()));
+            }
         }
         None
     }
@@ -1658,6 +1718,7 @@ pub struct SearchOptions {
     pub nocontent: bool,
     pub withscores: bool,
     pub rrf_k: Option<f64>,
+    pub linear_weights: Option<(f64, f64)>,
     pub sortby: Option<(String, bool)>, // (field, ascending)
     pub return_fields: Option<Vec<String>>,
     pub params: HashMap<String, Vec<u8>>,
@@ -1673,6 +1734,7 @@ impl Default for SearchOptions {
             nocontent: false,
             withscores: false,
             rrf_k: None,
+            linear_weights: None,
             sortby: None,
             return_fields: None,
             params: HashMap::new(),
@@ -1878,6 +1940,58 @@ fn distance_to_similarity(metric: crate::vector::VectorMetric, dist: f32) -> f64
     }
 }
 
+/// Resolves a vector index key (`doc_key` or `doc_key\x00chunk_idx`) back to its parent `DocId`.
+#[inline]
+fn resolve_vec_key_doc_id(index: &InvertedIndex, vec_key: &Bytes) -> Option<DocId> {
+    if let Some(&id) = index.key_to_id.get(vec_key) {
+        return Some(id);
+    }
+    if let Some(pos) = vec_key.iter().position(|&b| b == 0) {
+        return index.key_to_id.get(&vec_key[..pos]).copied();
+    }
+    None
+}
+
+/// Computes the minimum vector distance across all indexed chunks of `doc` for `alias`.
+fn min_doc_vector_distance(
+    doc: &DocMeta,
+    alias: &str,
+    query: &[f32],
+    metric: crate::vector::VectorMetric,
+) -> Option<f32> {
+    if let Some(chunks) = doc.multi_vector_fields.get(alias) {
+        let mut best: Option<f32> = None;
+        for v in chunks {
+            if v.len() == query.len() {
+                let d = crate::vector::compute_distance(query, v, metric);
+                best = Some(best.map_or(d, |b| b.min(d)));
+            }
+        }
+        if best.is_some() {
+            return best;
+        }
+    }
+    let v = doc.vector_fields.get(alias)?;
+    (v.len() == query.len()).then(|| crate::vector::compute_distance(query, v, metric))
+}
+
+/// Deduplicates `(DocId, distance)` pairs by keeping the minimum distance per parent document.
+fn dedup_min_distance(raw: impl IntoIterator<Item = (DocId, f32)>) -> Vec<(DocId, f32)> {
+    let mut best: HashMap<DocId, f32> = HashMap::new();
+    for (id, d) in raw {
+        best.entry(id)
+            .and_modify(|cur| {
+                if d < *cur {
+                    *cur = d;
+                }
+            })
+            .or_insert(d);
+    }
+    let mut out: Vec<(DocId, f32)> = best.into_iter().collect();
+    out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    out
+}
+
 /// Executes a `@field:[VECTOR_RANGE radius $blob]` clause, optionally restricted by `filter`.
 fn vector_range_search(
     index: &InvertedIndex,
@@ -1921,11 +2035,8 @@ fn vector_range_search(
 
     let brute_force_range = |ids: &mut dyn Iterator<Item = DocId>| -> Vec<(DocId, f32)> {
         ids.filter_map(|id| {
-            let v = index.id_to_meta.get(&id)?.vector_fields.get(alias)?;
-            if v.len() != effective_vec.len() {
-                return None;
-            }
-            let d = crate::vector::compute_distance(&effective_vec, v, metric);
+            let doc = index.id_to_meta.get(&id)?;
+            let d = min_doc_vector_distance(doc, alias, &effective_vec, metric)?;
             (d <= effective_radius).then_some((id, d))
         })
         .collect()
@@ -1934,22 +2045,20 @@ fn vector_range_search(
     let results: Vec<(DocId, f32)> = match (vi_opt, filter) {
         (None, None) => brute_force_range(&mut index.id_to_meta.keys().copied()),
         (None, Some(f)) => brute_force_range(&mut f.keys().copied()),
-        (Some(vi), None) => vi
-            .range_filtered(&effective_vec, effective_radius, eps, None)
-            .into_iter()
-            .filter_map(|(key, d)| index.key_to_id.get(&key).map(|id| (*id, d)))
-            .collect(),
+        (Some(vi), None) => dedup_min_distance(
+            vi.range_filtered(&effective_vec, effective_radius, eps, None)
+                .into_iter()
+                .filter_map(|(key, d)| resolve_vec_key_doc_id(index, &key).map(|id| (id, d))),
+        ),
         (Some(vi), Some(f)) => {
             let pred = |key: &Bytes| {
-                index
-                    .key_to_id
-                    .get(key)
-                    .is_some_and(|id| f.contains_key(id))
+                resolve_vec_key_doc_id(index, key).is_some_and(|id| f.contains_key(&id))
             };
-            vi.range_filtered(&effective_vec, effective_radius, eps, Some(&pred))
-                .into_iter()
-                .filter_map(|(key, d)| index.key_to_id.get(&key).map(|id| (*id, d)))
-                .collect()
+            dedup_min_distance(
+                vi.range_filtered(&effective_vec, effective_radius, eps, Some(&pred))
+                    .into_iter()
+                    .filter_map(|(key, d)| resolve_vec_key_doc_id(index, &key).map(|id| (id, d))),
+            )
         }
     };
     for (id, d) in results {
@@ -1997,16 +2106,22 @@ fn knn_search(
         })
         .unwrap_or(crate::vector::VectorMetric::Cosine);
 
+    let has_multi_chunks = index.id_to_meta.values().any(|m| {
+        m.multi_vector_fields
+            .get(alias)
+            .is_some_and(|c| c.len() > 1)
+    });
+    let k_fetch = if has_multi_chunks {
+        k.saturating_mul(4).max(k)
+    } else {
+        k
+    };
+
     let brute_force = |ids: &mut dyn Iterator<Item = DocId>| -> Vec<(DocId, f32)> {
         let mut dists: Vec<(DocId, f32)> = ids
             .filter_map(|id| {
-                let v = index.id_to_meta.get(&id)?.vector_fields.get(alias)?;
-                (v.len() == effective_vec.len()).then(|| {
-                    (
-                        id,
-                        crate::vector::compute_distance(&effective_vec, v, metric),
-                    )
-                })
+                let doc = index.id_to_meta.get(&id)?;
+                min_doc_vector_distance(doc, alias, &effective_vec, metric).map(|d| (id, d))
             })
             .collect();
         dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -2017,27 +2132,31 @@ fn knn_search(
     let results: Vec<(DocId, f32)> = match (vi_opt, filter) {
         (None, None) => brute_force(&mut index.id_to_meta.keys().copied()),
         (None, Some(f)) => brute_force(&mut f.keys().copied()),
-        (Some(vi), None) => vi
-            .search(&effective_vec, k, ef)
-            .into_iter()
-            .filter_map(|(key, d)| index.key_to_id.get(&key).map(|id| (*id, d)))
-            .collect(),
+        (Some(vi), None) => {
+            let mut deduped = dedup_min_distance(
+                vi.search(&effective_vec, k_fetch, ef)
+                    .into_iter()
+                    .filter_map(|(key, d)| resolve_vec_key_doc_id(index, &key).map(|id| (id, d))),
+            );
+            deduped.truncate(k);
+            deduped
+        }
         (Some(vi), Some(f)) => {
             let small = (f.len() as f64) <= (vi.len() as f64 * KNN_ADHOC_BF_RATIO).max(k as f64);
             if small || matches!(vi, crate::vector::VectorFieldIndex::Flat(_)) {
                 brute_force(&mut f.keys().copied())
             } else {
                 let pred = |key: &Bytes| {
-                    index
-                        .key_to_id
-                        .get(key)
-                        .is_some_and(|id| f.contains_key(id))
+                    resolve_vec_key_doc_id(index, key).is_some_and(|id| f.contains_key(&id))
                 };
-                let found: Vec<(DocId, f32)> = vi
-                    .search_filtered(&effective_vec, k, ef, Some(&pred))
-                    .into_iter()
-                    .filter_map(|(key, d)| index.key_to_id.get(&key).map(|id| (*id, d)))
-                    .collect();
+                let mut found = dedup_min_distance(
+                    vi.search_filtered(&effective_vec, k_fetch, ef, Some(&pred))
+                        .into_iter()
+                        .filter_map(|(key, d)| {
+                            resolve_vec_key_doc_id(index, &key).map(|id| (id, d))
+                        }),
+                );
+                found.truncate(k);
                 if found.len() < k.min(f.len()) {
                     // The filtered traversal could not reach enough matching nodes (e.g. the
                     // filtered set lives in a poorly connected region): fall back to exact BF.
@@ -2124,10 +2243,9 @@ fn knn_distances(
     }
     for doc_id in candidates.keys() {
         if let Some(doc) = index.id_to_meta.get(doc_id)
-            && let Some(v) = doc.vector_fields.get(alias)
-            && v.len() == query.len()
+            && let Some(d) = min_doc_vector_distance(doc, alias, &query, metric)
         {
-            out.insert(*doc_id, crate::vector::compute_distance(&query, v, metric));
+            out.insert(*doc_id, d);
         }
     }
     Some(out)
@@ -2144,18 +2262,23 @@ pub fn execute_search(
     ast: &QueryAst,
     opts: &SearchOptions,
 ) -> (usize, Vec<SearchHit>) {
-    if let Some(rrf_k) = opts.rrf_k
+    if (opts.rrf_k.is_some() || opts.linear_weights.is_some())
         && let Some((bm25_ast, knn_ast)) = ast.as_hybrid_rrf()
     {
         let unpaged_opts = SearchOptions {
             offset: 0,
             limit: usize::MAX,
             rrf_k: None,
+            linear_weights: None,
             ..opts.clone()
         };
         let (_bm25_total, bm25_hits) = execute_search(index, &bm25_ast, &unpaged_opts);
         let (_knn_total, vector_hits) = execute_search(index, &knn_ast, &unpaged_opts);
-        let fused = reciprocal_rank_fusion(&bm25_hits, &vector_hits, rrf_k);
+        let fused = if let Some((alpha, beta)) = opts.linear_weights {
+            linear_score_fusion(&bm25_hits, &vector_hits, alpha, beta)
+        } else {
+            reciprocal_rank_fusion(&bm25_hits, &vector_hits, opts.rrf_k.unwrap_or(60.0))
+        };
         let total = fused.len();
         let paged = fused
             .into_iter()
@@ -2320,6 +2443,91 @@ pub fn reciprocal_rank_fusion(
     }
 
     let mut merged: Vec<SearchHit> = rrf_scores
+        .into_iter()
+        .map(|(doc_id, score)| SearchHit {
+            fields: doc_map.remove(&doc_id).unwrap_or_default(),
+            doc_id,
+            score,
+            sort_val: None,
+        })
+        .collect();
+
+    merged.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    merged
+}
+
+/// Convex linear combination of min-max normalized BM25 and vector similarity scores:
+/// `score = alpha * norm_bm25 + beta * norm_vec`.
+pub fn linear_score_fusion(
+    bm25_hits: &[SearchHit],
+    vector_hits: &[SearchHit],
+    alpha: f64,
+    beta: f64,
+) -> Vec<SearchHit> {
+    let mut linear_scores: HashMap<String, f64> = HashMap::new();
+    let mut doc_map: HashMap<String, HashMap<String, String>> = HashMap::new();
+
+    if !bm25_hits.is_empty() {
+        let min_b = bm25_hits
+            .iter()
+            .map(|h| h.score)
+            .fold(f64::INFINITY, f64::min);
+        let max_b = bm25_hits
+            .iter()
+            .map(|h| h.score)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let span_b = max_b - min_b;
+        for hit in bm25_hits {
+            let norm = if span_b > 1e-12 {
+                (hit.score - min_b) / span_b
+            } else {
+                1.0
+            };
+            *linear_scores.entry(hit.doc_id.clone()).or_default() += alpha * norm;
+            doc_map
+                .entry(hit.doc_id.clone())
+                .or_insert_with(|| hit.fields.clone());
+        }
+    }
+
+    if !vector_hits.is_empty() {
+        // `execute_search` encodes KNN score as `-distance` (<= 0.0); convert to similarity in (0, 1].
+        let sims: Vec<f64> = vector_hits
+            .iter()
+            .map(|h| {
+                if h.score <= 0.0 {
+                    1.0 / (1.0 + (-h.score))
+                } else {
+                    h.score
+                }
+            })
+            .collect();
+        let min_v = sims.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_v = sims.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let span_v = max_v - min_v;
+        for (hit, sim) in vector_hits.iter().zip(sims) {
+            let norm = if span_v > 1e-12 {
+                (sim - min_v) / span_v
+            } else {
+                sim
+            };
+            *linear_scores.entry(hit.doc_id.clone()).or_default() += beta * norm;
+            doc_map
+                .entry(hit.doc_id.clone())
+                .and_modify(|existing| {
+                    for (k, v) in &hit.fields {
+                        existing.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                })
+                .or_insert_with(|| hit.fields.clone());
+        }
+    }
+
+    let mut merged: Vec<SearchHit> = linear_scores
         .into_iter()
         .map(|(doc_id, score)| SearchHit {
             fields: doc_map.remove(&doc_id).unwrap_or_default(),
@@ -3809,5 +4017,101 @@ mod tests {
         assert_eq!(total_h, 2);
         assert_eq!(hits_h[0].doc_id, "item:1");
         assert_eq!(hits_h[1].doc_id, "item:3");
+    }
+
+    #[test]
+    fn test_multi_vector_json_chunks_and_linear_fusion() {
+        let mut fields = HashMap::new();
+        fields.insert(
+            "title".to_string(),
+            FieldType::Text {
+                weight: 1.0,
+                sortable: false,
+                nostem: false,
+            },
+        );
+        fields.insert(
+            "emb".to_string(),
+            FieldType::Vector {
+                dim: 3,
+                distance_metric: "COSINE".to_string(),
+                algorithm: "HNSW".to_string(),
+                attrs: VectorFieldAttrs::default(),
+            },
+        );
+        let schema = IndexSchema {
+            name: "idx:chunks".to_string(),
+            on_type: "JSON".to_string(),
+            prefixes: vec!["doc:".to_string()],
+            fields: fields.clone(),
+            schema_fields: vec![
+                SchemaField {
+                    identifier: "$.title".to_string(),
+                    alias: "title".to_string(),
+                    field_type: fields["title"].clone(),
+                },
+                SchemaField {
+                    identifier: "$.chunks[*].emb".to_string(),
+                    alias: "emb".to_string(),
+                    field_type: fields["emb"].clone(),
+                },
+            ],
+        };
+        let mut idx = InvertedIndex::new(schema.clone());
+
+        // doc:1 has 3 chunks; chunk #2 is an exact match for [0, 1, 0]
+        let doc1 = serde_json::json!({
+            "title": "rust rag architecture",
+            "chunks": [
+                { "text": "intro", "emb": [1.0, 0.0, 0.0] },
+                { "text": "middle", "emb": [0.0, 1.0, 0.0] },
+                { "text": "outro", "emb": [0.0, 0.0, 1.0] }
+            ]
+        });
+        let (f1, v1) = extract_json_fields(&schema, &doc1);
+        idx.add_document("doc:1", f1, v1);
+
+        // doc:2 has 1 chunk close to [1, 0, 0]
+        let doc2 = serde_json::json!({
+            "title": "rust compiler",
+            "chunks": [
+                { "text": "only", "emb": [1.0, 0.0, 0.0] }
+            ]
+        });
+        let (f2, v2) = extract_json_fields(&schema, &doc2);
+        idx.add_document("doc:2", f2, v2);
+
+        let mut params = HashMap::new();
+        let q_bytes: Vec<u8> = [0.0f32, 1.0, 0.0]
+            .into_iter()
+            .flat_map(|f| f.to_le_bytes())
+            .collect();
+        params.insert("q".to_string(), q_bytes);
+
+        // Querying for [0, 1, 0] matches doc:1 via its second chunk with distance 0, deduplicating doc:1's 3 chunks!
+        let ast = parse_query("*=>[KNN 2 @emb $q AS dist]");
+        let opts = SearchOptions {
+            limit: 10,
+            params: params.clone(),
+            ..Default::default()
+        };
+        let (total, hits) = execute_search(&idx, &ast, &opts);
+        assert_eq!(total, 2);
+        assert_eq!(hits[0].doc_id, "doc:1");
+        assert_eq!(hits[0].fields.get("dist").map(String::as_str), Some("0"));
+
+        // Linear score fusion on hybrid query
+        let ast_hybrid = parse_query("(rust)=>[KNN 2 @emb $q]");
+        let opts_linear = SearchOptions {
+            limit: 10,
+            params,
+            linear_weights: Some((0.3, 0.7)),
+            withscores: true,
+            ..Default::default()
+        };
+        let (total_lin, hits_lin) = execute_search(&idx, &ast_hybrid, &opts_linear);
+        assert_eq!(total_lin, 2);
+        assert_eq!(hits_lin[0].doc_id, "doc:1");
+        assert!(hits_lin[0].score > hits_lin[1].score);
     }
 }

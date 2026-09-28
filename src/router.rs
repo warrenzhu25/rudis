@@ -2456,13 +2456,69 @@ impl Router {
         }
     }
 
+    pub async fn alter_search_index(
+        &self,
+        index: &str,
+        new_fields: std::collections::HashMap<String, crate::search::FieldType>,
+        new_schema_fields: Vec<crate::search::SchemaField>,
+    ) -> Result<(), String> {
+        let mut schema = {
+            let db = self.local_db.borrow();
+            if let Some(idx) = db.search_indices.get(index)
+                && let Some(s) = &idx.schema
+            {
+                s.clone()
+            } else if let Some(idx_arc) = crate::search::get_search_index(index) {
+                let idx = idx_arc.read().unwrap();
+                idx.schema
+                    .clone()
+                    .ok_or_else(|| format!("Unknown Index name: {}", index))?
+            } else {
+                return Err(format!("Unknown Index name: {}", index));
+            }
+        };
+
+        for (k, v) in new_fields {
+            schema.fields.insert(k, v);
+        }
+        for sf in new_schema_fields {
+            if let Some(existing) = schema
+                .schema_fields
+                .iter_mut()
+                .find(|e| e.alias == sf.alias || e.identifier == sf.identifier)
+            {
+                *existing = sf;
+            } else {
+                schema.schema_fields.push(sf);
+            }
+        }
+
+        crate::search::reset_search_index(schema.clone());
+        self.local_db.borrow_mut().init_search_index(schema.clone());
+
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::InitSearchIndex {
+                    schema: Box::new(schema.clone()),
+                    responder: tx,
+                };
+                if sender.send(msg).is_ok() {
+                    let _ = rx.recv_async().await;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn ft_search(
         &self,
         index: &str,
         ast: &crate::search::QueryAst,
         opts: &crate::search::SearchOptions,
     ) -> (usize, Vec<crate::search::SearchHit>) {
-        if let Some(rrf_k) = opts.rrf_k
+        if (opts.rrf_k.is_some() || opts.linear_weights.is_some())
             && let Some((bm25_ast, knn_ast)) = ast.as_hybrid_rrf()
         {
             let knn_limit = knn_ast.knn_k(opts).unwrap_or(10);
@@ -2474,13 +2530,22 @@ impl Router {
                     .max(knn_limit)
                     .max(100),
                 rrf_k: None,
+                linear_weights: None,
                 ..opts.clone()
             };
             let (_bm25_total, bm25_hits) =
                 Box::pin(self.ft_search(index, &bm25_ast, &sub_opts)).await;
             let (_knn_total, vector_hits) =
                 Box::pin(self.ft_search(index, &knn_ast, &sub_opts)).await;
-            let fused = crate::search::reciprocal_rank_fusion(&bm25_hits, &vector_hits, rrf_k);
+            let fused = if let Some((alpha, beta)) = opts.linear_weights {
+                crate::search::linear_score_fusion(&bm25_hits, &vector_hits, alpha, beta)
+            } else {
+                crate::search::reciprocal_rank_fusion(
+                    &bm25_hits,
+                    &vector_hits,
+                    opts.rrf_k.unwrap_or(60.0),
+                )
+            };
             let total = fused.len();
             let paged = fused
                 .into_iter()

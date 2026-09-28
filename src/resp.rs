@@ -1406,6 +1406,17 @@ pub enum Command {
         score: f64,
         fields: Vec<(String, String)>,
     },
+    FtList,
+    FtAlter {
+        index: String,
+        fields: std::collections::HashMap<String, crate::search::FieldType>,
+        schema_fields: Vec<crate::search::SchemaField>,
+    },
+    FtProfile {
+        index: String,
+        query: String,
+        options: crate::search::SearchOptions,
+    },
     // AF_XDP & eBPF (XDP.*)
     XdpInfo,
     XdpRuleAdd {
@@ -9214,12 +9225,60 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         i += 1;
                     }
                     options.rrf_k = Some(k_val);
+                    options.linear_weights = None;
+                } else if opt == "LINEAR" {
+                    let mut alpha = 0.5;
+                    let mut beta = 0.5;
+                    if i + 2 < args.len()
+                        && let Ok(a) = String::from_utf8_lossy(&args[i + 1]).parse::<f64>()
+                        && let Ok(b) = String::from_utf8_lossy(&args[i + 2]).parse::<f64>()
+                    {
+                        alpha = a;
+                        beta = b;
+                        i += 3;
+                    } else {
+                        i += 1;
+                    }
+                    options.linear_weights = Some((alpha, beta));
+                    options.rrf_k = None;
                 } else if opt == "SCORER" && i + 1 < args.len() {
                     let scorer = String::from_utf8_lossy(&args[i + 1]).to_uppercase();
-                    if scorer == "RRF" {
-                        options.rrf_k = Some(60.0);
-                    }
                     i += 2;
+                    if scorer == "RRF" {
+                        let mut k_val = 60.0;
+                        if i + 1 < args.len()
+                            && String::from_utf8_lossy(&args[i]).eq_ignore_ascii_case("K")
+                            && let Ok(parsed_k) =
+                                String::from_utf8_lossy(&args[i + 1]).parse::<f64>()
+                            && parsed_k > 0.0
+                        {
+                            k_val = parsed_k;
+                            i += 2;
+                        }
+                        options.rrf_k = Some(k_val);
+                        options.linear_weights = None;
+                    } else if scorer == "LINEAR" {
+                        let mut alpha = 0.5;
+                        let mut beta = 0.5;
+                        while i + 1 < args.len() {
+                            let sub = String::from_utf8_lossy(&args[i]).to_uppercase();
+                            if sub == "ALPHA"
+                                && let Ok(a) = String::from_utf8_lossy(&args[i + 1]).parse::<f64>()
+                            {
+                                alpha = a;
+                                i += 2;
+                            } else if sub == "BETA"
+                                && let Ok(b) = String::from_utf8_lossy(&args[i + 1]).parse::<f64>()
+                            {
+                                beta = b;
+                                i += 2;
+                            } else {
+                                break;
+                            }
+                        }
+                        options.linear_weights = Some((alpha, beta));
+                        options.rrf_k = None;
+                    }
                 } else if opt == "LIMIT" && i + 2 < args.len() {
                     options.offset = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(0);
                     options.limit = String::from_utf8_lossy(&args[i + 2]).parse().unwrap_or(10);
@@ -9509,6 +9568,395 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 doc_id,
                 score,
                 fields,
+            }))
+        }
+        "FT._LIST" => Ok(Some(Command::FtList)),
+        "FT.ALTER" => {
+            if args.len() < 5 {
+                return Err("wrong number of arguments for 'ft.alter' command".to_string());
+            }
+            let index = String::from_utf8_lossy(&args[1]).to_string();
+            let mut i = 2;
+            while i < args.len() {
+                let tok = String::from_utf8_lossy(&args[i]).to_uppercase();
+                if tok == "SCHEMA" {
+                    i += 1;
+                    if i < args.len()
+                        && String::from_utf8_lossy(&args[i]).eq_ignore_ascii_case("ADD")
+                    {
+                        i += 1;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            if i >= args.len() {
+                return Err(
+                    "syntax error in 'ft.alter': expected SCHEMA ADD <field> <type>".to_string(),
+                );
+            }
+            let mut fields = std::collections::HashMap::new();
+            let mut schema_fields = Vec::new();
+            while i < args.len() {
+                let identifier = String::from_utf8_lossy(&args[i]).to_string();
+                i += 1;
+                if i >= args.len() {
+                    break;
+                }
+                let mut alias = identifier.clone();
+                if i < args.len() && String::from_utf8_lossy(&args[i]).to_uppercase() == "AS" {
+                    if i + 1 < args.len() {
+                        alias = String::from_utf8_lossy(&args[i + 1]).to_string();
+                        i += 2;
+                    }
+                } else if alias.starts_with("$.") {
+                    alias = alias
+                        .trim_start_matches("$.")
+                        .trim_end_matches(".*")
+                        .trim_end_matches("[*]")
+                        .to_string();
+                }
+                if i >= args.len() {
+                    break;
+                }
+                let ftype_str = String::from_utf8_lossy(&args[i]).to_uppercase();
+                i += 1;
+                let field_type = match ftype_str.as_str() {
+                    "TEXT" => {
+                        let mut weight = 1.0;
+                        let mut sortable = false;
+                        let mut nostem = false;
+                        while i < args.len() {
+                            let sub_opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                            if sub_opt == "WEIGHT" && i + 1 < args.len() {
+                                weight =
+                                    String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(1.0);
+                                i += 2;
+                            } else if sub_opt == "SORTABLE" {
+                                sortable = true;
+                                i += 1;
+                            } else if sub_opt == "NOSTEM" {
+                                nostem = true;
+                                i += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        Some(crate::search::FieldType::Text {
+                            weight,
+                            sortable,
+                            nostem,
+                        })
+                    }
+                    "NUMERIC" => {
+                        let mut sortable = false;
+                        if i < args.len()
+                            && String::from_utf8_lossy(&args[i]).to_uppercase() == "SORTABLE"
+                        {
+                            sortable = true;
+                            i += 1;
+                        }
+                        Some(crate::search::FieldType::Numeric { sortable })
+                    }
+                    "TAG" => {
+                        let mut separator = ',';
+                        let mut casesensitive = false;
+                        while i < args.len() {
+                            let sub_opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                            if sub_opt == "SEPARATOR" && i + 1 < args.len() {
+                                separator = String::from_utf8_lossy(&args[i + 1])
+                                    .chars()
+                                    .next()
+                                    .unwrap_or(',');
+                                i += 2;
+                            } else if sub_opt == "CASESENSITIVE" {
+                                casesensitive = true;
+                                i += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        Some(crate::search::FieldType::Tag {
+                            separator,
+                            casesensitive,
+                        })
+                    }
+                    "VECTOR" => {
+                        if i >= args.len() {
+                            return Err(
+                                "Bad arguments for vector field: missing algorithm".to_string()
+                            );
+                        }
+                        let algorithm = String::from_utf8_lossy(&args[i]).to_uppercase();
+                        i += 1;
+                        let nargs = if i < args.len() {
+                            String::from_utf8_lossy(&args[i]).parse::<usize>().ok()
+                        } else {
+                            None
+                        };
+                        let end = match nargs {
+                            Some(n) => {
+                                i += 1;
+                                (i + n).min(args.len())
+                            }
+                            None => args.len(),
+                        };
+                        let mut dim = 1usize;
+                        let mut distance_metric = "COSINE".to_string();
+                        let mut attrs = crate::search::VectorFieldAttrs::default();
+                        while i + 1 < args.len() && (nargs.is_none() || i < end) {
+                            let attr = String::from_utf8_lossy(&args[i]).to_uppercase();
+                            let val = String::from_utf8_lossy(&args[i + 1]).to_string();
+                            match attr.as_str() {
+                                "TYPE" => {
+                                    if let Some(dt) = crate::search::VectorDataType::parse(&val) {
+                                        attrs.data_type = dt;
+                                    }
+                                }
+                                "DIM" => dim = val.parse().unwrap_or(1),
+                                "DISTANCE_METRIC" => distance_metric = val.to_uppercase(),
+                                "INITIAL_CAP" => attrs.initial_cap = val.parse().unwrap_or(1024),
+                                "M" => attrs.m = val.parse().unwrap_or(16),
+                                "EF_CONSTRUCTION" => {
+                                    attrs.ef_construction = val.parse().unwrap_or(200)
+                                }
+                                "EF_RUNTIME" => attrs.ef_runtime = val.parse().unwrap_or(10),
+                                "EPSILON" => attrs.epsilon = val.parse().unwrap_or(0.01),
+                                _ if nargs.is_none() => break,
+                                _ => {}
+                            }
+                            i += 2;
+                        }
+                        if nargs.is_some() {
+                            i = end;
+                        }
+                        Some(crate::search::FieldType::Vector {
+                            dim,
+                            distance_metric,
+                            algorithm,
+                            attrs,
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(ftype) = field_type {
+                    fields.insert(alias.clone(), ftype.clone());
+                    if alias != identifier {
+                        fields.insert(identifier.clone(), ftype.clone());
+                    }
+                    schema_fields.push(crate::search::SchemaField {
+                        identifier,
+                        alias,
+                        field_type: ftype,
+                    });
+                }
+            }
+            if schema_fields.is_empty() {
+                return Err(
+                    "syntax error in 'ft.alter': no valid schema fields provided".to_string(),
+                );
+            }
+            Ok(Some(Command::FtAlter {
+                index,
+                fields,
+                schema_fields,
+            }))
+        }
+        "FT.PROFILE" => {
+            // FT.PROFILE <index> SEARCH [LIMITED] QUERY <query> [options ...]
+            if args.len() < 5 {
+                return Err("wrong number of arguments for 'ft.profile' command".to_string());
+            }
+            let index = String::from_utf8_lossy(&args[1]).to_string();
+            let mut i = 2;
+            let mut query_opt = None;
+            while i < args.len() {
+                let tok = String::from_utf8_lossy(&args[i]).to_uppercase();
+                if tok == "QUERY" && i + 1 < args.len() {
+                    query_opt = Some(String::from_utf8_lossy(&args[i + 1]).to_string());
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+            let query = query_opt
+                .ok_or_else(|| "syntax error in 'ft.profile': missing QUERY".to_string())?;
+            let mut options = crate::search::SearchOptions::default();
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                if opt == "NOCONTENT" {
+                    options.nocontent = true;
+                    i += 1;
+                } else if opt == "WITHSCORES" {
+                    options.withscores = true;
+                    i += 1;
+                } else if opt == "LIMIT" && i + 2 < args.len() {
+                    options.offset = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(0);
+                    options.limit = String::from_utf8_lossy(&args[i + 2]).parse().unwrap_or(10);
+                    i += 3;
+                } else if opt == "PARAMS" && i + 1 < args.len() {
+                    let count: usize = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(0);
+                    i += 2;
+                    for _ in 0..(count / 2) {
+                        if i + 1 < args.len() {
+                            let k = String::from_utf8_lossy(&args[i]).to_string();
+                            let v = args[i + 1].to_vec();
+                            options.params.insert(k, v);
+                            i += 2;
+                        }
+                    }
+                } else if (opt == "DIALECT" || opt == "TIMEOUT") && i + 1 < args.len() {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            Ok(Some(Command::FtProfile {
+                index,
+                query,
+                options,
+            }))
+        }
+        "FT.HYBRID" => {
+            // FT.HYBRID <index> <text_query> <vector_query> [SCORER RRF [K <k>] | LINEAR [ALPHA <a>] [BETA <b>]] [LIMIT ...] [PARAMS ...] [WITHSCORES] [NOCONTENT]
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'ft.hybrid' command".to_string());
+            }
+            let index = String::from_utf8_lossy(&args[1]).to_string();
+            let text_query = String::from_utf8_lossy(&args[2]).to_string();
+            let vec_query = String::from_utf8_lossy(&args[3]).to_string();
+            let trimmed_vec = vec_query.trim();
+            let query = if let Some(knn_tail) = trimmed_vec
+                .strip_prefix("*=>")
+                .or_else(|| trimmed_vec.strip_prefix("=>"))
+            {
+                format!("({})=>{}", text_query, knn_tail)
+            } else if trimmed_vec.starts_with("[KNN") {
+                format!("({})=>{}", text_query, trimmed_vec)
+            } else {
+                format!("{} {}", text_query, trimmed_vec)
+            };
+            let mut options = crate::search::SearchOptions {
+                rrf_k: Some(60.0),
+                ..Default::default()
+            };
+            let mut i = 4;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                if opt == "NOCONTENT" {
+                    options.nocontent = true;
+                    i += 1;
+                } else if opt == "WITHSCORES" {
+                    options.withscores = true;
+                    i += 1;
+                } else if opt == "RRF" {
+                    let mut k_val = 60.0;
+                    if i + 1 < args.len()
+                        && let Ok(parsed_k) = String::from_utf8_lossy(&args[i + 1]).parse::<f64>()
+                        && parsed_k > 0.0
+                    {
+                        k_val = parsed_k;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    options.rrf_k = Some(k_val);
+                    options.linear_weights = None;
+                } else if opt == "LINEAR" {
+                    let mut alpha = 0.5;
+                    let mut beta = 0.5;
+                    if i + 2 < args.len()
+                        && let Ok(a) = String::from_utf8_lossy(&args[i + 1]).parse::<f64>()
+                        && let Ok(b) = String::from_utf8_lossy(&args[i + 2]).parse::<f64>()
+                    {
+                        alpha = a;
+                        beta = b;
+                        i += 3;
+                    } else {
+                        i += 1;
+                    }
+                    options.linear_weights = Some((alpha, beta));
+                    options.rrf_k = None;
+                } else if opt == "SCORER" && i + 1 < args.len() {
+                    let scorer = String::from_utf8_lossy(&args[i + 1]).to_uppercase();
+                    i += 2;
+                    if scorer == "RRF" {
+                        let mut k_val = 60.0;
+                        if i + 1 < args.len()
+                            && String::from_utf8_lossy(&args[i]).eq_ignore_ascii_case("K")
+                            && let Ok(parsed_k) =
+                                String::from_utf8_lossy(&args[i + 1]).parse::<f64>()
+                            && parsed_k > 0.0
+                        {
+                            k_val = parsed_k;
+                            i += 2;
+                        } else if i < args.len()
+                            && let Ok(parsed_k) = String::from_utf8_lossy(&args[i]).parse::<f64>()
+                            && parsed_k > 0.0
+                        {
+                            k_val = parsed_k;
+                            i += 1;
+                        }
+                        options.rrf_k = Some(k_val);
+                        options.linear_weights = None;
+                    } else if scorer == "LINEAR" {
+                        let mut alpha = 0.5;
+                        let mut beta = 0.5;
+                        while i + 1 < args.len() {
+                            let sub = String::from_utf8_lossy(&args[i]).to_uppercase();
+                            if sub == "ALPHA"
+                                && let Ok(a) = String::from_utf8_lossy(&args[i + 1]).parse::<f64>()
+                            {
+                                alpha = a;
+                                i += 2;
+                            } else if sub == "BETA"
+                                && let Ok(b) = String::from_utf8_lossy(&args[i + 1]).parse::<f64>()
+                            {
+                                beta = b;
+                                i += 2;
+                            } else {
+                                break;
+                            }
+                        }
+                        options.linear_weights = Some((alpha, beta));
+                        options.rrf_k = None;
+                    }
+                } else if opt == "LIMIT" && i + 2 < args.len() {
+                    options.offset = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(0);
+                    options.limit = String::from_utf8_lossy(&args[i + 2]).parse().unwrap_or(10);
+                    i += 3;
+                } else if opt == "RETURN" && i + 1 < args.len() {
+                    let count: usize = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(0);
+                    i += 2;
+                    let mut r_fields = Vec::new();
+                    for _ in 0..count {
+                        if i < args.len() {
+                            r_fields.push(String::from_utf8_lossy(&args[i]).to_string());
+                            i += 1;
+                        }
+                    }
+                    options.return_fields = Some(r_fields);
+                } else if opt == "PARAMS" && i + 1 < args.len() {
+                    let count: usize = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(0);
+                    i += 2;
+                    for _ in 0..(count / 2) {
+                        if i + 1 < args.len() {
+                            let k = String::from_utf8_lossy(&args[i]).to_string();
+                            let v = args[i + 1].to_vec();
+                            options.params.insert(k, v);
+                            i += 2;
+                        }
+                    }
+                } else if (opt == "DIALECT" || opt == "TIMEOUT") && i + 1 < args.len() {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            Ok(Some(Command::FtSearch {
+                index,
+                query,
+                options,
             }))
         }
         "SEMANTIC.SET" => {

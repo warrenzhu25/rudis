@@ -3974,7 +3974,10 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         | Command::FtInfo(_)
         | Command::FtDropIndex { .. }
         | Command::FtExplain { .. }
-        | Command::FtAdd { .. } => "FT",
+        | Command::FtAdd { .. }
+        | Command::FtList
+        | Command::FtAlter { .. }
+        | Command::FtProfile { .. } => "FT",
         Command::XdpInfo
         | Command::XdpRuleAdd { .. }
         | Command::XdpRuleDel(_)
@@ -10092,6 +10095,90 @@ async fn execute_command(
                 let map: std::collections::HashMap<String, String> = fields.into_iter().collect();
                 idx.add_document(&doc_id, map, None);
                 out.extend_from_slice(b"+OK\r\n");
+            } else {
+                out.extend_from_slice(format!("-ERR Unknown Index name: {}\r\n", index).as_bytes());
+            }
+            false
+        }
+        Command::FtList => {
+            let names = crate::search::list_search_indices();
+            write_resp_array_header(out, names.len());
+            for name in names {
+                write_resp_bulk(out, name.as_bytes());
+            }
+            false
+        }
+        Command::FtAlter {
+            index,
+            fields,
+            schema_fields,
+        } => {
+            match router
+                .alter_search_index(&index, fields, schema_fields)
+                .await
+            {
+                Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                Err(e) => out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes()),
+            }
+            false
+        }
+        Command::FtProfile {
+            index,
+            query,
+            options,
+        } => {
+            if router.has_search_index(&index) {
+                let t0 = std::time::Instant::now();
+                let ast = crate::search::parse_query(&query);
+                let parse_us = t0.elapsed().as_micros();
+                let (total, hits) = router.ft_search(&index, &ast, &options).await;
+                let total_us = t0.elapsed().as_micros();
+                let total_sec = format!("{:.6}", total_us as f64 / 1_000_000.0);
+                let parse_sec = format!("{:.6}", parse_us as f64 / 1_000_000.0);
+                let repr = format!("{:?}", ast);
+
+                // Top-level *2 array: [search_results, profile_details]
+                out.extend_from_slice(b"*2\r\n");
+                if options.nocontent {
+                    let per_hit = if options.withscores { 2 } else { 1 };
+                    out.extend_from_slice(
+                        format!("*{}\r\n:{}\r\n", 1 + hits.len() * per_hit, total).as_bytes(),
+                    );
+                    for hit in hits {
+                        write_resp_bulk(out, hit.doc_id.as_bytes());
+                        if options.withscores {
+                            let s = format!("{:.6}", hit.score);
+                            write_resp_bulk(out, s.as_bytes());
+                        }
+                    }
+                } else {
+                    let per_hit = if options.withscores { 3 } else { 2 };
+                    let num_elems = 1 + hits.len() * per_hit;
+                    out.extend_from_slice(format!("*{}\r\n:{}\r\n", num_elems, total).as_bytes());
+                    for hit in hits {
+                        write_resp_bulk(out, hit.doc_id.as_bytes());
+                        if options.withscores {
+                            let s = format!("{:.6}", hit.score);
+                            write_resp_bulk(out, s.as_bytes());
+                        }
+                        out.extend_from_slice(format!("*{}\r\n", hit.fields.len() * 2).as_bytes());
+                        for (k, v) in hit.fields {
+                            write_resp_bulk(out, k.as_bytes());
+                            write_resp_bulk(out, v.as_bytes());
+                        }
+                    }
+                }
+
+                // Profile details array
+                out.extend_from_slice(b"*8\r\n");
+                write_resp_bulk(out, b"Total profile time");
+                write_resp_bulk(out, total_sec.as_bytes());
+                write_resp_bulk(out, b"Parsing time");
+                write_resp_bulk(out, parse_sec.as_bytes());
+                write_resp_bulk(out, b"Query plan");
+                write_resp_bulk(out, repr.as_bytes());
+                write_resp_bulk(out, b"Shards");
+                write_resp_integer(out, router.num_shards as i64);
             } else {
                 out.extend_from_slice(format!("-ERR Unknown Index name: {}\r\n", index).as_bytes());
             }
