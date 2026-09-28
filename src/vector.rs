@@ -756,6 +756,142 @@ impl ProductQuantizer {
         let table = self.compute_distance_table(query);
         self.compute_distance_adc(&table, pq)
     }
+
+    /// Reconstructs an approximate `dim`-dimensional vector from its PQ codes.
+    pub fn reconstruct(&self, pq: &PQVector) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.dim);
+        for (m, &code) in pq.codes.iter().enumerate() {
+            if let Some(cb) = self.codebooks.get(m) {
+                out.extend_from_slice(&cb[code as usize]);
+            }
+        }
+        out.truncate(self.dim);
+        out
+    }
+
+    /// Mean squared reconstruction error of `samples` under this quantizer's codebooks.
+    pub fn distortion(&self, samples: &[Vec<f32>]) -> f32 {
+        if samples.is_empty() {
+            return 0.0;
+        }
+        let mut total = 0.0f32;
+        for s in samples {
+            let code = self.encode(s);
+            let rec = self.reconstruct(&code);
+            for (a, b) in s.iter().zip(rec.iter()) {
+                let d = a - b;
+                total += d * d;
+            }
+        }
+        total / (samples.len() as f32)
+    }
+
+    /// Trains per-subspace codebooks on `samples` using furthest-first (deterministic k-means++)
+    /// initialization followed by up to `max_iters` Lloyd k-means iterations.
+    pub fn train(dim: usize, m: usize, samples: &[Vec<f32>], max_iters: usize) -> Self {
+        let mut pq = Self::new(dim, m);
+        if samples.is_empty() {
+            return pq;
+        }
+        let k_active = samples.len().clamp(1, 256);
+        let iters = max_iters.max(1);
+
+        for sub in 0..pq.m {
+            let start = sub * pq.d_sub;
+            let sub_vecs: Vec<&[f32]> = samples
+                .iter()
+                .filter_map(|v| {
+                    let end = (start + pq.d_sub).min(v.len());
+                    (end - start == pq.d_sub).then_some(&v[start..end])
+                })
+                .collect();
+            if sub_vecs.is_empty() {
+                continue;
+            }
+
+            // 1. Furthest-first k-means++ seeding for the first `k_active` centroids
+            pq.codebooks[sub][0].copy_from_slice(sub_vecs[0]);
+            let mut min_sq_dist: Vec<f32> = sub_vecs
+                .iter()
+                .map(|v| {
+                    v.iter()
+                        .zip(pq.codebooks[sub][0].iter())
+                        .map(|(a, b)| (a - b) * (a - b))
+                        .sum()
+                })
+                .collect();
+
+            let mut actual_k = 1usize;
+            for c in 1..k_active {
+                let (best_idx, &best_d) = min_sq_dist
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(Ordering::Equal))
+                    .unwrap();
+                if best_d <= 1e-12 {
+                    break;
+                }
+                pq.codebooks[sub][c].copy_from_slice(sub_vecs[best_idx]);
+                actual_k = c + 1;
+                for (i, v) in sub_vecs.iter().enumerate() {
+                    let d: f32 = v
+                        .iter()
+                        .zip(pq.codebooks[sub][c].iter())
+                        .map(|(a, b)| (a - b) * (a - b))
+                        .sum();
+                    if d < min_sq_dist[i] {
+                        min_sq_dist[i] = d;
+                    }
+                }
+            }
+
+            // 2. Lloyd's k-means refinement over `0..actual_k`
+            let mut assignments = vec![0usize; sub_vecs.len()];
+            for _ in 0..iters {
+                let mut changed = false;
+                for (i, v) in sub_vecs.iter().enumerate() {
+                    let mut best_c = 0usize;
+                    let mut best_d = f32::INFINITY;
+                    for (c, centroid) in pq.codebooks[sub][..actual_k].iter().enumerate() {
+                        let d: f32 = v
+                            .iter()
+                            .zip(centroid.iter())
+                            .map(|(a, b)| (a - b) * (a - b))
+                            .sum();
+                        if d < best_d {
+                            best_d = d;
+                            best_c = c;
+                        }
+                    }
+                    if assignments[i] != best_c {
+                        assignments[i] = best_c;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+                let mut sums = vec![vec![0.0f32; pq.d_sub]; actual_k];
+                let mut counts = vec![0usize; actual_k];
+                for (v, &c) in sub_vecs.iter().zip(assignments.iter()) {
+                    counts[c] += 1;
+                    for (acc, &x) in sums[c].iter_mut().zip(v.iter()) {
+                        *acc += x;
+                    }
+                }
+                for c in 0..actual_k {
+                    if counts[c] > 0 {
+                        let inv = 1.0 / (counts[c] as f32);
+                        for (dst, &s) in pq.codebooks[sub][c].iter_mut().zip(sums[c].iter()) {
+                            *dst = s * inv;
+                        }
+                    }
+                }
+            }
+        }
+
+        pq
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -885,6 +1021,7 @@ pub struct HnswIndex {
     pub free_ids: Vec<usize>,
     pub key_to_id: HashMap<Bytes, usize>,
     pub pq_quantizer: Option<ProductQuantizer>,
+    pub pq_trained: bool,
     /// Redis 8 vector-set quantization mode (`NOQUANT` / `Q8` / `BIN`).
     pub quant: VQuant,
     /// Per-element JSON attributes (`VSETATTR` / `VADD ... SETATTR`), used by `VSIM ... FILTER`.
@@ -920,6 +1057,7 @@ impl HnswIndex {
             free_ids: Vec::new(),
             key_to_id: HashMap::new(),
             pq_quantizer: None,
+            pq_trained: false,
             quant: VQuant::NoQuant,
             attributes: HashMap::new(),
             projection: None,
@@ -951,6 +1089,34 @@ impl HnswIndex {
 
     pub fn enable_pq(&mut self, m: usize) {
         self.pq_quantizer = Some(ProductQuantizer::new(self.dim, m));
+        self.pq_trained = false;
+    }
+
+    /// Trains the index's Product Quantizer codebooks using k-means++ and Lloyd's iterations
+    /// over all currently indexed vectors, then re-encodes all PQ-compressed nodes.
+    pub fn train_pq(&mut self, max_iters: usize) {
+        let m = self
+            .pq_quantizer
+            .as_ref()
+            .map(|q| q.m)
+            .unwrap_or_else(|| (self.dim / 8).clamp(1, 16));
+        let samples: Vec<Vec<f32>> = self
+            .nodes
+            .iter()
+            .flatten()
+            .map(|n| n.vector.clone())
+            .collect();
+        if samples.is_empty() {
+            return;
+        }
+        let trained = ProductQuantizer::train(self.dim, m, &samples, max_iters);
+        for node in self.nodes.iter_mut().flatten() {
+            if node.pq.is_some() {
+                node.pq = Some(trained.encode(&node.vector));
+            }
+        }
+        self.pq_quantizer = Some(trained);
+        self.pq_trained = true;
     }
 
     /// Installs a deterministic Gaussian random projection from `input_dim` to `self.dim`
@@ -1210,6 +1376,28 @@ impl HnswIndex {
             if self.pq_quantizer.is_none() {
                 let m = (self.dim / 8).clamp(1, 16);
                 self.pq_quantizer = Some(ProductQuantizer::new(self.dim, m));
+            }
+            if !self.pq_trained && self.len() >= 15 {
+                let m = self
+                    .pq_quantizer
+                    .as_ref()
+                    .map(|q| q.m)
+                    .unwrap_or_else(|| (self.dim / 8).clamp(1, 16));
+                let mut samples: Vec<Vec<f32>> = self
+                    .nodes
+                    .iter()
+                    .flatten()
+                    .map(|n| n.vector.clone())
+                    .collect();
+                samples.push(vector.clone());
+                let trained = ProductQuantizer::train(self.dim, m, &samples, 10);
+                for node in self.nodes.iter_mut().flatten() {
+                    if node.pq.is_some() {
+                        node.pq = Some(trained.encode(&node.vector));
+                    }
+                }
+                self.pq_quantizer = Some(trained);
+                self.pq_trained = true;
             }
             self.pq_quantizer.as_ref().map(|q| q.encode(&vector))
         } else {
@@ -2834,5 +3022,43 @@ mod tests {
         let q = [angle.cos(), angle.sin(), (target_i as f32) * 0.05, 1.0];
         let hits = idx.search(&q, 3);
         assert_eq!(hits[0].0, Bytes::from("n37"));
+    }
+
+    #[test]
+    fn test_pq_kmeans_codebook_training_reduces_distortion() {
+        // Generate vectors in a non-unit scale [10.0, 50.0] where an untrained [-1, 1] codebook
+        // suffers high clamping distortion, and verify k-means++ + Lloyd training drastically
+        // lowers reconstruction error and auto-trains on HnswIndex.
+        let mut samples = Vec::new();
+        for i in 0..24 {
+            let base = 10.0 + (i as f32) * 1.5;
+            samples.push(vec![
+                base,
+                base + 2.0,
+                base * 0.5,
+                base - 3.0,
+                -base,
+                base + 5.0,
+                base * 1.2,
+                base + 0.25,
+            ]);
+        }
+        let untrained = ProductQuantizer::new(8, 2);
+        let trained = ProductQuantizer::train(8, 2, &samples, 15);
+        let err_untrained = untrained.distortion(&samples);
+        let err_trained = trained.distortion(&samples);
+        assert!(
+            err_trained < err_untrained * 0.01,
+            "expected trained PQ distortion ({err_trained}) << untrained ({err_untrained})"
+        );
+
+        let mut idx = HnswIndex::new("pq_auto".to_string(), 8, VectorMetric::L2);
+        for (i, v) in samples.iter().enumerate() {
+            idx.add_quantized_ext(Bytes::from(format!("p{i}")), v.clone(), false, true, false)
+                .unwrap();
+        }
+        assert!(idx.pq_trained);
+        let hits = idx.search(&samples[10], 1);
+        assert_eq!(hits[0].0, Bytes::from("p10"));
     }
 }
