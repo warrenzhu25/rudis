@@ -13895,3 +13895,138 @@ fn test_ai_native_durability_and_replication_e2e() {
 
     let _ = std::fs::remove_dir_all(&data_dir);
 }
+
+#[test]
+fn test_bzmpop_bzpopmin_zmpop_sort_unwatch_zrangebylex_e2e() {
+    let port = 20100;
+    let num_shards = 4;
+    start_test_server(port, num_shards);
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{}", port))
+        .expect("Failed to connect to rudis server");
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // 1. SORT & SORT_RO
+    send_and_read(&mut client, b"RPUSH {sort1} 10 3 5 1 20 8\r\n");
+    let sort_asc = send_and_read(&mut client, b"SORT {sort1}\r\n");
+    assert!(
+        sort_asc.contains("$1\r\n1\r\n$1\r\n3\r\n$1\r\n5\r\n$1\r\n8\r\n$2\r\n10\r\n$2\r\n20\r\n"),
+        "SORT asc failed: {}",
+        sort_asc
+    );
+
+    let sort_desc = send_and_read(&mut client, b"SORT {sort1} DESC\r\n");
+    assert!(
+        sort_desc.contains("$2\r\n20\r\n$2\r\n10\r\n$1\r\n8\r\n$1\r\n5\r\n$1\r\n3\r\n$1\r\n1\r\n"),
+        "SORT desc failed: {}",
+        sort_desc
+    );
+
+    let sort_limit = send_and_read(&mut client, b"SORT {sort1} LIMIT 1 3\r\n");
+    assert!(
+        sort_limit.contains("$1\r\n3\r\n$1\r\n5\r\n$1\r\n8\r\n"),
+        "SORT limit failed: {}",
+        sort_limit
+    );
+
+    let sort_store = send_and_read(&mut client, b"SORT {sort1} STORE {sort1}:dst\r\n");
+    assert_eq!(sort_store, ":6\r\n");
+    let dst_len = send_and_read(&mut client, b"LLEN {sort1}:dst\r\n");
+    assert_eq!(dst_len, ":6\r\n");
+
+    send_and_read(
+        &mut client,
+        b"RPUSH {sortalpha} banana apple cherry date\r\n",
+    );
+    let sort_alpha = send_and_read(&mut client, b"SORT {sortalpha} ALPHA\r\n");
+    assert!(
+        sort_alpha.contains("apple")
+            && sort_alpha.contains("banana")
+            && sort_alpha.contains("cherry"),
+        "SORT ALPHA failed: {}",
+        sort_alpha
+    );
+
+    // 2. UNWATCH
+    send_and_read(&mut client, b"SET {watchkey} val1\r\n");
+    let watch_resp = send_and_read(&mut client, b"WATCH {watchkey}\r\n");
+    assert_eq!(watch_resp, "+OK\r\n");
+    let unwatch_resp = send_and_read(&mut client, b"UNWATCH\r\n");
+    assert_eq!(unwatch_resp, "+OK\r\n");
+    let mut other_client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    send_and_read(&mut other_client, b"SET {watchkey} val2\r\n");
+    send_and_read(&mut client, b"MULTI\r\n");
+    send_and_read(&mut client, b"SET {watchkey} val3\r\n");
+    let exec_resp = send_and_read(&mut client, b"EXEC\r\n");
+    assert_eq!(exec_resp, "*1\r\n+OK\r\n");
+    let final_val = send_and_read(&mut client, b"GET {watchkey}\r\n");
+    assert_eq!(final_val, "$4\r\nval3\r\n");
+
+    // 3. ZRANGEBYLEX & ZREVRANGEBYLEX
+    send_and_read(&mut client, b"ZADD {lexz} 0 a 0 b 0 c 0 d 0 e 0 f 0 g\r\n");
+    let zrangebylex_resp = send_and_read(&mut client, b"ZRANGEBYLEX {lexz} [b [e\r\n");
+    assert_eq!(
+        zrangebylex_resp,
+        "*4\r\n$1\r\nb\r\n$1\r\nc\r\n$1\r\nd\r\n$1\r\ne\r\n"
+    );
+
+    let zrangebylex_limit = send_and_read(&mut client, b"ZRANGEBYLEX {lexz} - + LIMIT 2 3\r\n");
+    assert_eq!(zrangebylex_limit, "*3\r\n$1\r\nc\r\n$1\r\nd\r\n$1\r\ne\r\n");
+
+    let zrevrangebylex_resp = send_and_read(&mut client, b"ZREVRANGEBYLEX {lexz} [e [b\r\n");
+    assert_eq!(
+        zrevrangebylex_resp,
+        "*4\r\n$1\r\ne\r\n$1\r\nd\r\n$1\r\nc\r\n$1\r\nb\r\n"
+    );
+
+    let zrevrangebylex_limit =
+        send_and_read(&mut client, b"ZREVRANGEBYLEX {lexz} + - LIMIT 1 2\r\n");
+    assert_eq!(zrevrangebylex_limit, "*2\r\n$1\r\nf\r\n$1\r\ne\r\n");
+
+    // 4. ZMPOP
+    send_and_read(&mut client, b"ZADD {zmpop_k} 10 m1 20 m2 30 m3 40 m4\r\n");
+    let zmpop_min = send_and_read(&mut client, b"ZMPOP 1 {zmpop_k} MIN COUNT 2\r\n");
+    assert!(
+        zmpop_min.contains("{zmpop_k}") && zmpop_min.contains("m1") && zmpop_min.contains("m2"),
+        "ZMPOP MIN failed: {}",
+        zmpop_min
+    );
+
+    let zmpop_max = send_and_read(&mut client, b"ZMPOP 1 {zmpop_k} MAX COUNT 1\r\n");
+    assert!(
+        zmpop_max.contains("{zmpop_k}") && zmpop_max.contains("m4"),
+        "ZMPOP MAX failed: {}",
+        zmpop_max
+    );
+
+    let zcard_after = send_and_read(&mut client, b"ZCARD {zmpop_k}\r\n");
+    assert_eq!(zcard_after, ":1\r\n");
+
+    // 5. BZPOPMIN
+    send_and_read(&mut client, b"ZADD {bzpop_k} 50 first 60 second\r\n");
+    let bzpop_resp = send_and_read(&mut client, b"BZPOPMIN {bzpop_k} 0.5\r\n");
+    assert!(
+        bzpop_resp.contains("{bzpop_k}") && bzpop_resp.contains("first"),
+        "BZPOPMIN failed: {}",
+        bzpop_resp
+    );
+
+    let bzpop_empty = send_and_read(&mut client, b"BZPOPMIN {empty_bzpop} 0.02\r\n");
+    assert_eq!(bzpop_empty, "*-1\r\n");
+
+    // 6. BZMPOP
+    send_and_read(&mut client, b"ZADD {bzmpop_k} 100 x 200 y 300 z\r\n");
+    let bzmpop_resp = send_and_read(&mut client, b"BZMPOP 0.5 1 {bzmpop_k} MIN COUNT 2\r\n");
+    assert!(
+        bzmpop_resp.contains("{bzmpop_k}")
+            && bzmpop_resp.contains("x")
+            && bzmpop_resp.contains("y"),
+        "BZMPOP failed: {}",
+        bzmpop_resp
+    );
+
+    let bzmpop_empty = send_and_read(&mut client, b"BZMPOP 0.02 1 {empty_bzmpop} MIN COUNT 1\r\n");
+    assert_eq!(bzmpop_empty, "*-1\r\n");
+}
