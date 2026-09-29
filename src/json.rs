@@ -72,8 +72,9 @@ pub fn parse_json_path(path_str: &str) -> Result<Vec<PathSegment>, String> {
             let inner = inner.trim();
             if inner == "*" {
                 segments.push(PathSegment::Wildcard);
-            } else if (inner.starts_with('"') && inner.ends_with('"'))
-                || (inner.starts_with('\'') && inner.ends_with('\''))
+            } else if inner.len() >= 2
+                && ((inner.starts_with('"') && inner.ends_with('"'))
+                    || (inner.starts_with('\'') && inner.ends_with('\'')))
             {
                 // Quoted field name: ["foo"]
                 let field_name = &inner[1..inner.len() - 1];
