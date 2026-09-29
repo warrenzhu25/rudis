@@ -2065,6 +2065,7 @@ impl RudisFlatTable {
 }
 
 static EXPIRED_KEYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static EXPIRED_KEYS_ACTIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static EVICTED_KEYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[inline]
@@ -2075,6 +2076,22 @@ pub fn inc_expired_keys() {
 #[inline]
 pub fn get_expired_keys() -> u64 {
     EXPIRED_KEYS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[inline]
+pub fn inc_expired_keys_active() {
+    EXPIRED_KEYS_ACTIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub fn get_expired_keys_active() -> u64 {
+    EXPIRED_KEYS_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[inline]
+pub fn reset_expired_keys() {
+    EXPIRED_KEYS.store(0, std::sync::atomic::Ordering::Relaxed);
+    EXPIRED_KEYS_ACTIVE.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[inline]
@@ -2801,17 +2818,49 @@ impl RudisTable {
             .map_err(|e| e.to_string())
     }
 
-    pub fn expire(&mut self, key: &[u8], duration: Duration) -> bool {
+    pub fn expire(
+        &mut self,
+        key: &[u8],
+        duration: Duration,
+        opts: crate::resp::ExpireOptions,
+    ) -> bool {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
                 return false;
             }
+            let target_instant = Instant::now() + duration;
             if let Some(entry) = self.table.get_slot_mut(idx) {
+                if opts.nx && entry.expire_at.is_some() {
+                    return false;
+                }
+                if opts.xx && entry.expire_at.is_none() {
+                    return false;
+                }
+                if opts.gt {
+                    if entry.expire_at.is_none() {
+                        return false;
+                    }
+                    if let Some(cur_exp) = entry.expire_at
+                        && target_instant <= cur_exp
+                    {
+                        return false;
+                    }
+                }
+                if opts.lt
+                    && let Some(cur_exp) = entry.expire_at
+                    && target_instant >= cur_exp
+                {
+                    return false;
+                }
+                if duration.is_zero() {
+                    self.expire_slot(idx);
+                    return true;
+                }
                 if entry.expire_at.is_none() {
                     self.num_expires += 1;
                 }
-                entry.expire_at = Some(Instant::now() + duration);
+                entry.expire_at = Some(target_instant);
                 return true;
             }
         }
@@ -2853,7 +2902,7 @@ impl RudisTable {
                             if in_millis {
                                 diff.as_millis() as i64
                             } else {
-                                diff.as_secs() as i64
+                                ((diff.as_millis() as i64) + 500) / 1000
                             }
                         }
                     }
@@ -9055,14 +9104,22 @@ impl RudisTable {
         }
 
         let mut checked = 0;
-        while checked < 20 {
+        let mut slots_scanned = 0;
+        let max_scan = bound.min(512);
+        while checked < 20 && slots_scanned < max_scan && self.num_expires > 0 {
             let cur = self.sample_cursor % bound;
             self.sample_cursor = (self.sample_cursor + 1) % bound;
             let idx = self.table.cursor_to_global_idx(cur);
-            if self.check_expired_slot(idx) {
-                expired_count += 1;
+            if let Some(entry) = self.table.get_slot(idx)
+                && entry.expire_at.is_some()
+            {
+                if self.check_expired_slot(idx) {
+                    expired_count += 1;
+                    inc_expired_keys_active();
+                }
+                checked += 1;
             }
-            checked += 1;
+            slots_scanned += 1;
         }
         expired_count
     }
@@ -11703,7 +11760,11 @@ mod tests {
         assert!(table.exists(b"k2"));
 
         // Add expiration back with expire()
-        assert!(table.expire(b"k2", Duration::from_millis(10)));
+        assert!(table.expire(
+            b"k2",
+            Duration::from_millis(10),
+            crate::resp::ExpireOptions::default()
+        ));
         assert_eq!(table.num_expires, 1);
         std::thread::sleep(Duration::from_millis(20));
         assert!(!table.exists(b"k2"));
@@ -12296,9 +12357,63 @@ mod tests {
         // EXPIRETIME
         assert_eq!(table.expiretime(b"non_exist", false), -2);
         assert_eq!(table.expiretime(b"alpha:1", false), -1);
-        table.expire(b"alpha:1", Duration::from_secs(50));
+        table.expire(
+            b"alpha:1",
+            Duration::from_secs(50),
+            crate::resp::ExpireOptions::default(),
+        );
         let exp = table.expiretime(b"alpha:1", false);
         assert!(exp > 0);
+
+        // Test ExpireOptions NX / XX / GT / LT
+        assert!(!table.expire(
+            b"alpha:1",
+            Duration::from_secs(100),
+            crate::resp::ExpireOptions {
+                nx: true,
+                ..Default::default()
+            }
+        ));
+        assert!(table.expire(
+            b"alpha:1",
+            Duration::from_secs(100),
+            crate::resp::ExpireOptions {
+                xx: true,
+                ..Default::default()
+            }
+        ));
+        assert!(!table.expire(
+            b"alpha:1",
+            Duration::from_secs(50),
+            crate::resp::ExpireOptions {
+                gt: true,
+                ..Default::default()
+            }
+        ));
+        assert!(table.expire(
+            b"alpha:1",
+            Duration::from_secs(200),
+            crate::resp::ExpireOptions {
+                gt: true,
+                ..Default::default()
+            }
+        ));
+        assert!(!table.expire(
+            b"alpha:1",
+            Duration::from_secs(300),
+            crate::resp::ExpireOptions {
+                lt: true,
+                ..Default::default()
+            }
+        ));
+        assert!(table.expire(
+            b"alpha:1",
+            Duration::from_secs(50),
+            crate::resp::ExpireOptions {
+                lt: true,
+                ..Default::default()
+            }
+        ));
     }
 
     #[test]

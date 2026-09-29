@@ -264,8 +264,8 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", d_str.len(), d_str).as_bytes());
             Some(buf)
         }
-        Command::Expire(key, dur) => {
-            let ms = dur.as_millis().max(1);
+        Command::Expire { key, duration, .. } => {
+            let ms = duration.as_millis().max(1);
             let ms_str = ms.to_string();
             buf.extend_from_slice(format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", key.len()).as_bytes());
             buf.extend_from_slice(key);

@@ -218,6 +218,41 @@ pub enum HFieldExpireOpt {
     ExAtMs(i64),
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
+pub struct ExpireOptions {
+    pub nx: bool,
+    pub xx: bool,
+    pub gt: bool,
+    pub lt: bool,
+}
+
+pub fn parse_expire_options(args: &[Bytes]) -> Result<ExpireOptions, String> {
+    let mut opts = ExpireOptions::default();
+    for arg in args {
+        let s = std::str::from_utf8(arg).map_err(|_| "ERR syntax error".to_string())?;
+        if s.eq_ignore_ascii_case("NX") {
+            opts.nx = true;
+        } else if s.eq_ignore_ascii_case("XX") {
+            opts.xx = true;
+        } else if s.eq_ignore_ascii_case("GT") {
+            opts.gt = true;
+        } else if s.eq_ignore_ascii_case("LT") {
+            opts.lt = true;
+        } else {
+            return Err(format!("ERR Unsupported option {}", s));
+        }
+    }
+    if (opts.nx && opts.xx) || (opts.nx && opts.gt) || (opts.nx && opts.lt) {
+        return Err(
+            "ERR NX and XX, GT or LT options at the same time are not compatible".to_string(),
+        );
+    }
+    if opts.gt && opts.lt {
+        return Err("ERR GT and LT options at the same time are not compatible".to_string());
+    }
+    Ok(opts)
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum HsetexCondition {
     None,
@@ -329,7 +364,11 @@ pub enum Command {
     Del(SmallVec<[Bytes; 1]>),
     Exists(SmallVec<[Bytes; 1]>),
     IncrBy(Bytes, i64),
-    Expire(Bytes, Duration),
+    Expire {
+        key: Bytes,
+        duration: Duration,
+        opts: ExpireOptions,
+    },
     Persist(Bytes),
     Ttl(Bytes, bool), // true for PTTL (milliseconds), false for TTL (seconds)
     Cluster(ClusterSubcommand),
@@ -2120,40 +2159,67 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         if i + 1 >= args.len() {
                             return Err("syntax error".to_string());
                         }
-                        let sec: u64 = std::str::from_utf8(&args[i + 1])
+                        let sec: i64 = std::str::from_utf8(&args[i + 1])
                             .ok()
                             .and_then(|s| s.parse().ok())
                             .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-                        expire_in = Some(Duration::from_secs(sec));
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64;
+                        if !((i64::MIN / 1000)..=(i64::MAX / 1000)).contains(&sec)
+                            || (sec > 0 && (sec as i128 * 1000) > (i64::MAX - now_ms) as i128)
+                        {
+                            return Err("invalid expire time in 'getex' command".to_string());
+                        }
+                        expire_in = Some(if sec <= 0 {
+                            Duration::ZERO
+                        } else {
+                            Duration::from_secs(sec as u64)
+                        });
                         i += 2;
                     }
                     "PX" => {
                         if i + 1 >= args.len() {
                             return Err("syntax error".to_string());
                         }
-                        let ms: u64 = std::str::from_utf8(&args[i + 1])
+                        let ms: i64 = std::str::from_utf8(&args[i + 1])
                             .ok()
                             .and_then(|s| s.parse().ok())
                             .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-                        expire_in = Some(Duration::from_millis(ms));
+                        let now_ms = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64;
+                        if ms > 0 && ms > i64::MAX - now_ms {
+                            return Err("invalid expire time in 'getex' command".to_string());
+                        }
+                        expire_in = Some(if ms <= 0 {
+                            Duration::ZERO
+                        } else {
+                            Duration::from_millis(ms as u64)
+                        });
                         i += 2;
                     }
                     "EXAT" => {
                         if i + 1 >= args.len() {
                             return Err("syntax error".to_string());
                         }
-                        let ts: u64 = std::str::from_utf8(&args[i + 1])
+                        let ts: i64 = std::str::from_utf8(&args[i + 1])
                             .ok()
                             .and_then(|s| s.parse().ok())
                             .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                        if !((i64::MIN / 1000)..=(i64::MAX / 1000)).contains(&ts) {
+                            return Err("invalid expire time in 'getex' command".to_string());
+                        }
                         let now_unix = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
+                            .map(|d| d.as_secs() as i64)
                             .unwrap_or(0);
                         let dur = if ts <= now_unix {
-                            Duration::from_millis(1)
+                            Duration::ZERO
                         } else {
-                            Duration::from_secs(ts - now_unix)
+                            Duration::from_secs((ts - now_unix) as u64)
                         };
                         expire_in = Some(dur);
                         i += 2;
@@ -2162,18 +2228,18 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         if i + 1 >= args.len() {
                             return Err("syntax error".to_string());
                         }
-                        let ts: u64 = std::str::from_utf8(&args[i + 1])
+                        let ts_ms: i64 = std::str::from_utf8(&args[i + 1])
                             .ok()
                             .and_then(|s| s.parse().ok())
                             .ok_or_else(|| "value is not an integer or out of range".to_string())?;
                         let now_unix_ms = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as u64)
+                            .map(|d| d.as_millis() as i64)
                             .unwrap_or(0);
-                        let dur = if ts <= now_unix_ms {
-                            Duration::from_millis(1)
+                        let dur = if ts_ms <= now_unix_ms {
+                            Duration::ZERO
                         } else {
-                            Duration::from_millis(ts - now_unix_ms)
+                            Duration::from_millis((ts_ms - now_unix_ms) as u64)
                         };
                         expire_in = Some(dur);
                         i += 2;
@@ -2270,7 +2336,14 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         let secs: i64 = secs_str
                             .parse()
                             .map_err(|_| "value is not an integer or out of range".to_string())?;
-                        if secs <= 0 || secs > (i64::MAX / 1000) {
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as i64;
+                        if secs <= 0
+                            || secs > (i64::MAX / 1000)
+                            || (secs as i128 * 1000) > (i64::MAX - now_ms) as i128
+                        {
                             return Err("invalid expire time in 'set' command".to_string());
                         }
                         expire_in = Some(Duration::from_secs(secs as u64));
@@ -2743,27 +2816,57 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() < 3 {
                 return Err("wrong number of arguments for 'expire' command".to_string());
             }
-            let secs: u64 = std::str::from_utf8(&args[2])
+            let secs: i64 = std::str::from_utf8(&args[2])
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-            Ok(Some(Command::Expire(
-                args[1].clone(),
-                Duration::from_secs(secs),
-            )))
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            if !((i64::MIN / 1000)..=(i64::MAX / 1000)).contains(&secs)
+                || (secs > 0 && (secs as i128 * 1000) > (i64::MAX - now_ms) as i128)
+            {
+                return Err("invalid expire time in 'expire' command".to_string());
+            }
+            let opts = parse_expire_options(&args[3..])?;
+            let dur = if secs <= 0 {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(secs as u64)
+            };
+            Ok(Some(Command::Expire {
+                key: args[1].clone(),
+                duration: dur,
+                opts,
+            }))
         }
         "PEXPIRE" => {
             if args.len() < 3 {
                 return Err("wrong number of arguments for 'pexpire' command".to_string());
             }
-            let ms: u64 = std::str::from_utf8(&args[2])
+            let ms: i64 = std::str::from_utf8(&args[2])
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-            Ok(Some(Command::Expire(
-                args[1].clone(),
-                Duration::from_millis(ms),
-            )))
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            if ms > 0 && ms > i64::MAX - now_ms {
+                return Err("invalid expire time in 'pexpire' command".to_string());
+            }
+            let opts = parse_expire_options(&args[3..])?;
+            let dur = if ms <= 0 {
+                Duration::ZERO
+            } else {
+                Duration::from_millis(ms as u64)
+            };
+            Ok(Some(Command::Expire {
+                key: args[1].clone(),
+                duration: dur,
+                opts,
+            }))
         }
         "PERSIST" => {
             if args.len() < 2 {
@@ -4943,42 +5046,55 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
         }
         "DEFRAG" | "ACTIVE-DEFRAG" => Ok(Some(Command::Memory(MemorySubcommand::Defrag))),
         "EXPIREAT" => {
-            if args.len() != 3 {
+            if args.len() < 3 {
                 return Err("wrong number of arguments for 'expireat' command".to_string());
             }
-            let ts: u64 = std::str::from_utf8(&args[2])
+            let ts: i64 = std::str::from_utf8(&args[2])
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            if !((i64::MIN / 1000)..=(i64::MAX / 1000)).contains(&ts) {
+                return Err("invalid expire time in 'expireat' command".to_string());
+            }
+            let opts = parse_expire_options(&args[3..])?;
             let now_unix = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
+                .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
             let dur = if ts <= now_unix {
-                Duration::from_millis(1)
+                Duration::ZERO
             } else {
-                Duration::from_secs(ts - now_unix)
+                Duration::from_secs((ts - now_unix) as u64)
             };
-            Ok(Some(Command::Expire(args[1].clone(), dur)))
+            Ok(Some(Command::Expire {
+                key: args[1].clone(),
+                duration: dur,
+                opts,
+            }))
         }
         "PEXPIREAT" => {
-            if args.len() != 3 {
+            if args.len() < 3 {
                 return Err("wrong number of arguments for 'pexpireat' command".to_string());
             }
-            let ts_ms: u64 = std::str::from_utf8(&args[2])
+            let ts_ms: i64 = std::str::from_utf8(&args[2])
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            let opts = parse_expire_options(&args[3..])?;
             let now_unix_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
+                .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
             let dur = if ts_ms <= now_unix_ms {
-                Duration::from_millis(1)
+                Duration::ZERO
             } else {
-                Duration::from_millis(ts_ms - now_unix_ms)
+                Duration::from_millis((ts_ms - now_unix_ms) as u64)
             };
-            Ok(Some(Command::Expire(args[1].clone(), dur)))
+            Ok(Some(Command::Expire {
+                key: args[1].clone(),
+                duration: dur,
+                opts,
+            }))
         }
         "TOUCH" => {
             if args.len() < 2 {
@@ -5022,14 +5138,24 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() != 4 {
                 return Err("wrong number of arguments for 'setex' command".to_string());
             }
-            let secs: u64 = std::str::from_utf8(&args[2])
+            let secs: i64 = std::str::from_utf8(&args[2])
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            if secs <= 0
+                || secs > (i64::MAX / 1000)
+                || (secs as i128 * 1000) > (i64::MAX - now_ms) as i128
+            {
+                return Err("invalid expire time in 'setex' command".to_string());
+            }
             Ok(Some(Command::Set {
                 key: args[1].clone(),
                 value: args[3].clone(),
-                expire_in: Some(Duration::from_secs(secs)),
+                expire_in: Some(Duration::from_secs(secs as u64)),
                 condition: SetCondition::None,
                 get: false,
                 keepttl: false,
@@ -5040,14 +5166,21 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() != 4 {
                 return Err("wrong number of arguments for 'psetex' command".to_string());
             }
-            let ms: u64 = std::str::from_utf8(&args[2])
+            let ms: i64 = std::str::from_utf8(&args[2])
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as i64;
+            if ms <= 0 || ms > i64::MAX - now_ms {
+                return Err("invalid expire time in 'psetex' command".to_string());
+            }
             Ok(Some(Command::Set {
                 key: args[1].clone(),
                 value: args[3].clone(),
-                expire_in: Some(Duration::from_millis(ms)),
+                expire_in: Some(Duration::from_millis(ms as u64)),
                 condition: SetCondition::None,
                 get: false,
                 keepttl: false,
@@ -10978,8 +11111,29 @@ mod tests {
         let cmd = parse_command(&mut buf).unwrap().unwrap();
         assert_eq!(
             cmd,
-            Command::Expire(Bytes::from_static(b"foo"), Duration::from_secs(60))
+            Command::Expire {
+                key: Bytes::from_static(b"foo"),
+                duration: Duration::from_secs(60),
+                opts: ExpireOptions::default(),
+            }
         );
+
+        let mut buf = BytesMut::from("EXPIRE foo 60 NX\r\n");
+        let cmd = parse_command(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::Expire {
+                key: Bytes::from_static(b"foo"),
+                duration: Duration::from_secs(60),
+                opts: ExpireOptions {
+                    nx: true,
+                    ..Default::default()
+                },
+            }
+        );
+
+        let mut buf = BytesMut::from("EXPIRE foo 60 LT GT\r\n");
+        assert!(parse_command(&mut buf).is_err());
 
         let mut buf = BytesMut::from("TTL foo\r\n");
         let cmd = parse_command(&mut buf).unwrap().unwrap();

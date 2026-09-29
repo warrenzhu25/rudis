@@ -1662,13 +1662,22 @@ impl Router {
         }
     }
 
-    pub async fn expire(&self, key: Bytes, duration: Duration) -> bool {
+    pub async fn expire(
+        &self,
+        key: Bytes,
+        duration: Duration,
+        opts: crate::resp::ExpireOptions,
+    ) -> bool {
         let target = self.target_shard(&key);
         if target == self.shard_id {
-            let res = self.local_db.borrow_mut().expire(&key, duration);
+            let res = self.local_db.borrow_mut().expire(&key, duration, opts);
             if res
                 && let Some(aof) = &self.aof
-                && let Some(bytes) = crate::aof::command_to_resp(&Command::Expire(key, duration))
+                && let Some(bytes) = crate::aof::command_to_resp(&Command::Expire {
+                    key,
+                    duration,
+                    opts,
+                })
             {
                 aof.borrow_mut().append(&bytes);
             }
@@ -1678,6 +1687,7 @@ impl Router {
             let msg = ShardMessage::Expire {
                 key,
                 duration,
+                opts,
                 responder: tx,
             };
             if self.senders[target].send(msg).is_ok() {

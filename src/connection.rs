@@ -2567,7 +2567,7 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Getex { key, .. }
         | Command::Set { key, .. }
         | Command::IncrBy(key, _)
-        | Command::Expire(key, _)
+        | Command::Expire { key, .. }
         | Command::Persist(key)
         | Command::Ttl(key, _)
         | Command::Hsetnx { key, .. }
@@ -2803,7 +2803,7 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
     match cmd {
         Command::Get(k)
         | Command::IncrBy(k, _)
-        | Command::Expire(k, _)
+        | Command::Expire { key: k, .. }
         | Command::Persist(k)
         | Command::Ttl(k, _)
         | Command::Hlen(k)
@@ -3714,7 +3714,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Del(_) => "DEL",
         Command::Exists(_) => "EXISTS",
         Command::IncrBy(_, _) => "INCRBY",
-        Command::Expire(_, _) => "EXPIRE",
+        Command::Expire { .. } => "EXPIRE",
         Command::Persist(_) => "PERSIST",
         Command::Ttl(_, _) => "TTL",
         Command::Cluster(_) => "CLUSTER",
@@ -4796,7 +4796,9 @@ async fn execute_command(
                     if persist {
                         let _ = router.persist(key).await;
                     } else if let Some(exp) = expire_in {
-                        let _ = router.expire(key, exp).await;
+                        let _ = router
+                            .expire(key, exp, crate::resp::ExpireOptions::default())
+                            .await;
                     }
                     write_resp_bulk(out, &v);
                 }
@@ -5263,10 +5265,18 @@ async fn execute_command(
             }
             false
         }
-        Command::Expire(key, duration) => {
-            let res = router.expire(key.clone(), duration).await;
+        Command::Expire {
+            key,
+            duration,
+            opts,
+        } => {
+            let res = router.expire(key.clone(), duration, opts).await;
             if res {
-                if let Some(bytes) = crate::aof::command_to_resp(&Command::Expire(key, duration)) {
+                if let Some(bytes) = crate::aof::command_to_resp(&Command::Expire {
+                    key: key.clone(),
+                    duration,
+                    opts,
+                }) {
                     crate::replication::propagate_bytes(router.port, &bytes);
                 }
                 out.extend_from_slice(b":1\r\n");
@@ -5511,8 +5521,9 @@ async fn execute_command(
             let slowlog_max_us = crate::slowlog::SLOWLOG_COMMANDS_TIME_US_MAX
                 .load(std::sync::atomic::Ordering::Relaxed);
             let stats_str = format!(
-                "# Stats\r\ntotal_connections_received:0\r\ntotal_commands_processed:0\r\ninstantaneous_ops_per_sec:0\r\ntotal_net_input_bytes:0\r\ntotal_net_output_bytes:0\r\ninstantaneous_input_kbps:0.00\r\ninstantaneous_output_kbps:0.00\r\nrejected_connections:0\r\nsync_full:0\r\nsync_partial_ok:0\r\nsync_partial_err:0\r\nexpired_keys:{}\r\nevicted_keys:{}\r\nkeyspace_hits:0\r\nkeyspace_misses:0\r\npubsub_channels:0\r\npubsub_patterns:0\r\nlatest_fork_usec:0\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\n",
+                "# Stats\r\ntotal_connections_received:0\r\ntotal_commands_processed:0\r\ninstantaneous_ops_per_sec:0\r\ntotal_net_input_bytes:0\r\ntotal_net_output_bytes:0\r\ninstantaneous_input_kbps:0.00\r\ninstantaneous_output_kbps:0.00\r\nrejected_connections:0\r\nsync_full:0\r\nsync_partial_ok:0\r\nsync_partial_err:0\r\nexpired_keys:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nkeyspace_hits:0\r\nkeyspace_misses:0\r\npubsub_channels:0\r\npubsub_patterns:0\r\nlatest_fork_usec:0\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\n",
                 crate::table::get_expired_keys(),
+                crate::table::get_expired_keys_active(),
                 crate::table::get_evicted_keys(),
                 slowlog_count,
                 slowlog_sum_us as f64 / 1000.0,
@@ -6107,6 +6118,7 @@ async fn execute_command(
             } else if p_str == "resetstat" {
                 router.reset_command_stats().await;
                 crate::slowlog::reset_slowlog_stats();
+                crate::table::reset_expired_keys();
                 out.extend_from_slice(b"+OK\r\n");
             } else if p_str == "maxclients" {
                 if let Ok(n) = val_str.parse::<usize>() {
@@ -10921,7 +10933,7 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Set { key, .. }
         | Command::Digest(key)
         | Command::IncrBy(key, _)
-        | Command::Expire(key, _)
+        | Command::Expire { key, .. }
         | Command::Persist(key)
         | Command::Ttl(key, _)
         | Command::Hsetnx { key, .. }
@@ -11317,7 +11329,7 @@ pub fn execute_local_command(
                     if *persist {
                         db.persist(key.as_ref());
                     } else if let Some(exp) = expire_in {
-                        db.expire(key.as_ref(), *exp);
+                        db.expire(key.as_ref(), *exp, crate::resp::ExpireOptions::default());
                     }
                     write_resp_bulk(out, &v);
                 }
@@ -11673,8 +11685,12 @@ pub fn execute_local_command(
             }
             false
         }
-        Command::Expire(key, duration) => {
-            let res = db.expire(key, *duration);
+        Command::Expire {
+            key,
+            duration,
+            opts,
+        } => {
+            let res = db.expire(key, *duration, *opts);
             if res {
                 record_change!(cmd);
                 out.extend_from_slice(b":1\r\n");
@@ -18458,7 +18474,11 @@ mod tests {
         // Invalidate from another client
         notify_key_invalidation(port, b"my_tracked_key", 101);
         let msg = rx.try_recv().expect("should receive invalidation");
-        assert!(std::str::from_utf8(&msg).unwrap().contains("my_tracked_key"));
+        assert!(
+            std::str::from_utf8(&msg)
+                .unwrap()
+                .contains("my_tracked_key")
+        );
 
         unregister_client_tracking(port, 100);
 

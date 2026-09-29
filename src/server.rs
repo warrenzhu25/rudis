@@ -517,16 +517,21 @@ pub fn run_shard_worker(
                     ShardMessage::Expire {
                         key,
                         duration,
+                        opts,
                         responder,
                     } => {
-                        let res = cross_shard_db.borrow_mut().expire(&key, duration);
+                        let res = cross_shard_db.borrow_mut().expire(&key, duration, opts);
                         if res
                             && let Some(aof) = &cross_shard_aof
-                                && let Some(bytes) = crate::aof::command_to_resp(
-                                    &crate::resp::Command::Expire(key, duration),
-                                ) {
-                                    aof.borrow_mut().append(&bytes);
-                                }
+                            && let Some(bytes) = crate::aof::command_to_resp(
+                                &crate::resp::Command::Expire {
+                                    key,
+                                    duration,
+                                    opts,
+                                },
+                            ) {
+                            aof.borrow_mut().append(&bytes);
+                        }
                         let _ = responder.send(res);
                     }
                     ShardMessage::Persist { key, responder } => {

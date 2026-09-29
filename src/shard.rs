@@ -348,6 +348,7 @@ pub enum ShardMessage {
     Expire {
         key: Bytes,
         duration: Duration,
+        opts: crate::resp::ExpireOptions,
         responder: flume::Sender<bool>,
     },
     Persist {
@@ -1055,8 +1056,13 @@ impl ShardDb {
     }
 
     #[inline]
-    pub fn expire(&mut self, key: &[u8], duration: Duration) -> bool {
-        self.table.expire(key, duration)
+    pub fn expire(
+        &mut self,
+        key: &[u8],
+        duration: Duration,
+        opts: crate::resp::ExpireOptions,
+    ) -> bool {
+        self.table.expire(key, duration, opts)
     }
 
     #[inline]
