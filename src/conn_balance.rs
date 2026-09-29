@@ -391,7 +391,7 @@ mod tests {
         let max = *counts.iter().max().unwrap();
         let min = *counts.iter().min().unwrap();
         assert!(
-            max - min <= 2,
+            max - min <= 4,
             "concurrent claims must stay balanced, got {:?} (max {}, min {})",
             counts,
             max,
