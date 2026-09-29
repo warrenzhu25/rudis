@@ -455,3 +455,149 @@ impl BlockHub {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use flume::unbounded;
+
+    #[test]
+    fn test_block_hub_lifecycle_and_pause() {
+        let mut hub = BlockHub::new(12345);
+        assert!(!hub.is_paused());
+
+        hub.pause();
+        assert!(hub.is_paused());
+        hub.add_pending_notify(Bytes::from_static(b"k1"));
+
+        let pending = hub.resume();
+        assert!(!hub.is_paused());
+        assert_eq!(pending, vec![Bytes::from_static(b"k1")]);
+
+        let (tx, _rx) = unbounded();
+        hub.register_list_waiter(100, Bytes::from_static(b"k1"), ListPopType::Left, 1, tx);
+        assert_eq!(hub.list_waiters.len(), 1);
+        assert!(has_blocked_waiters(12345));
+
+        hub.unregister_blocked_client(100);
+        assert_eq!(
+            hub.list_waiters
+                .get(&Bytes::from_static(b"k1"))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(!has_blocked_waiters(12345));
+    }
+
+    #[test]
+    fn test_block_hub_notify_list_and_move() {
+        let mut hub = BlockHub::new(12346);
+        let mut table = crate::table::RudisTable::new();
+        let key = Bytes::from_static(b"mylist");
+
+        let (tx, rx) = unbounded();
+        hub.register_list_waiter(201, key.clone(), ListPopType::Left, 1, tx);
+
+        // Initially empty, notify does not satisfy
+        hub.notify_list(&mut table, &key);
+        assert!(rx.try_recv().is_err());
+
+        // Push data to table and notify
+        table
+            .rpush(key.clone(), vec![Bytes::from_static(b"item1")])
+            .unwrap();
+        hub.notify_list(&mut table, &key);
+
+        let res = rx.try_recv().expect("should receive popped element");
+        match res {
+            BlockedListResult::Popped(k, items) => {
+                assert_eq!(k, key);
+                assert_eq!(items, vec![Bytes::from_static(b"item1")]);
+            }
+            _ => panic!("unexpected result: {:?}", res),
+        }
+
+        // Test move waiter
+        let src = Bytes::from_static(b"src_list");
+        let dst = Bytes::from_static(b"dst_list");
+        let (tx_m, rx_m) = unbounded();
+        hub.register_move_waiter(
+            202,
+            src.clone(),
+            ListPopType::Right,
+            ListPopType::Left,
+            dst.clone(),
+            tx_m,
+        );
+
+        table
+            .rpush(src.clone(), vec![Bytes::from_static(b"moved_val")])
+            .unwrap();
+        hub.notify_list(&mut table, &src);
+
+        let res_m = rx_m.try_recv().expect("should receive moved element");
+        match res_m {
+            BlockedListResult::Popped(s, items) => {
+                assert_eq!(s, src);
+                assert_eq!(items, vec![Bytes::from_static(b"moved_val")]);
+            }
+            _ => panic!("unexpected move result: {:?}", res_m),
+        }
+        assert_eq!(table.llen(dst.as_ref()), Ok(1));
+    }
+
+    #[test]
+    fn test_block_hub_zset_and_stream_notifications() {
+        let mut hub = BlockHub::new(12347);
+        let mut table = crate::table::RudisTable::new();
+        let zk = Bytes::from_static(b"zkey");
+
+        let (tx_z, rx_z) = unbounded();
+        hub.register_zset_waiter(301, zk.clone(), ZSetPopType::Min, 1, false, tx_z);
+
+        table
+            .zadd(
+                zk.clone(),
+                vec![(10.0, Bytes::from_static(b"m10"))],
+                crate::table::ZAddFlags::default(),
+            )
+            .unwrap();
+        hub.notify_zset(&mut table, &zk);
+
+        let res_z = rx_z.try_recv().expect("should receive zset pop");
+        match res_z {
+            BlockedZSetResult::Popped {
+                key,
+                items,
+                is_zmpop,
+            } => {
+                assert_eq!(key, zk);
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].0, Bytes::from_static(b"m10"));
+                assert!(!is_zmpop);
+            }
+            _ => panic!("unexpected zset pop result: {:?}", res_z),
+        }
+
+        // Test Stream waiter
+        let sk = Bytes::from_static(b"skey");
+        let (tx_s, rx_s) = unbounded();
+        hub.register_stream_waiter(sk.clone(), tx_s);
+        assert_eq!(hub.stream_waiters.len(), 1);
+
+        hub.notify_stream(&sk);
+        assert!(rx_s.try_recv().is_ok());
+        assert_eq!(hub.stream_waiters.len(), 0);
+
+        // Test unblock client
+        let (tx_u, rx_u) = unbounded();
+        hub.blocked_clients.insert(999, tx_u);
+        assert!(hub.unblock_client(999, ClientUnblockType::Timeout));
+        match rx_u.try_recv().unwrap() {
+            BlockedListResult::Unblocked(ClientUnblockType::Timeout) => {}
+            other => panic!("unexpected unblocked result: {:?}", other),
+        }
+    }
+}

@@ -616,6 +616,90 @@ mod tests {
     use crate::shard::ShardDb;
 
     #[test]
+    fn test_eval_script_basic_types_and_redis_call() {
+        let db = Rc::new(RefCell::new(ShardDb::new(6379)));
+
+        // Number return
+        let res = eval_script("return 10 + 20", &[], &[], &db, None).unwrap();
+        assert_eq!(res, b":30\r\n");
+
+        // String return
+        let res = eval_script("return 'rudis_script'", &[], &[], &db, None).unwrap();
+        assert_eq!(res, b"$12\r\nrudis_script\r\n");
+
+        // Boolean returns
+        let res_t = eval_script("return true", &[], &[], &db, None).unwrap();
+        assert_eq!(res_t, b":1\r\n");
+        let res_f = eval_script("return false", &[], &[], &db, None).unwrap();
+        assert_eq!(res_f, b"$-1\r\n");
+
+        // Array return
+        let res_arr = eval_script("return {'x', 'y'}", &[], &[], &db, None).unwrap();
+        assert_eq!(res_arr, b"*2\r\n$1\r\nx\r\n$1\r\ny\r\n");
+
+        // redis.call
+        let res_call = eval_script(
+            "redis.call('SET', KEYS[1], ARGV[1]); return redis.call('GET', KEYS[1]);",
+            &[Bytes::from("k_eval")],
+            &[Bytes::from("v_eval")],
+            &db,
+            None,
+        )
+        .unwrap();
+        assert_eq!(res_call, b"$6\r\nv_eval\r\n");
+
+        // Syntax error
+        let err_syn = eval_script("this is invalid lua !!!", &[], &[], &db, None);
+        assert!(err_syn.is_err());
+
+        // Runtime error
+        let err_rt = eval_script("error('custom lua panic')", &[], &[], &db, None);
+        assert!(err_rt.is_err());
+    }
+
+    #[test]
+    fn test_eval_sha_and_function_management() {
+        let db = Rc::new(RefCell::new(ShardDb::new(6379)));
+        let script = b"return redis.call('PING')";
+        let sha = load_script(script);
+
+        // Check script exists
+        assert_eq!(script_exists(&[Bytes::from(sha.clone())]), vec![true]);
+        assert_eq!(
+            script_exists(&[Bytes::from("0000000000000000000000000000000000000000")]),
+            vec![false]
+        );
+
+        // Retrieve script and eval
+        let cached = get_script(&sha).expect("script should be in cache");
+        let res = eval_script(&cached, &[], &[], &db, None).unwrap();
+        assert_eq!(res, b"+PONG\r\n");
+
+        flush_scripts();
+        assert_eq!(script_exists(&[Bytes::from(sha.clone())]), vec![false]);
+
+        let code = "#!lua name=mylib\nredis.register_function('greet', function(keys, args) return 'hello ' .. args[1] end)";
+        let lib_name = load_function(code, true).unwrap();
+        assert_eq!(lib_name, "mylib");
+
+        let funcs = list_functions();
+        assert!(funcs.iter().any(|f| f.name == "mylib"));
+
+        // Call registered function
+        let call_res = call_function("greet", &[], &[Bytes::from("world")], &db, None).unwrap();
+        assert_eq!(call_res, b"$11\r\nhello world\r\n");
+
+        // Duplicate load without replace fails
+        assert!(load_function(code, false).is_err());
+        // With replace succeeds
+        assert!(load_function(code, true).is_ok());
+
+        assert!(delete_function("mylib"));
+        assert!(!delete_function("mylib"));
+        assert!(!list_functions().iter().any(|f| f.name == "mylib"));
+    }
+
+    #[test]
     fn test_fcall_with_aof_writer() {
         let code = "#!lua name=testlib\nredis.register_function('test_set', function(keys, args) return redis.call('SET', keys[1], args[1]) end)";
         let lib_name = load_function(code, true).expect("function load should succeed");

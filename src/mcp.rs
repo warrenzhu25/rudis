@@ -569,15 +569,180 @@ mod tests {
                 .any(|t| t["name"] == "rudis_agent_memory_context")
         );
 
-        let cmd = plan_tool_command(
+        // rudis_kv_get
+        let cmd_get = plan_tool_command("rudis_kv_get", &json!({"key": "mykey"})).unwrap();
+        assert!(matches!(cmd_get, Command::Get(k) if k == "mykey"));
+
+        // rudis_kv_set
+        let cmd_set = plan_tool_command(
             "rudis_kv_set",
             &json!({"key": "k1", "value": "v1", "px": 1000}),
         )
         .unwrap();
-        assert!(matches!(cmd, Command::Set { .. }));
+        assert!(matches!(cmd_set, Command::Set { .. }));
+
+        // rudis_semantic_set
+        let cmd_sem_set = plan_tool_command(
+            "rudis_semantic_set",
+            &json!({
+                "namespace": "ns",
+                "id": "doc1",
+                "prompt": "what is rust?",
+                "response": "a language",
+                "vector": [0.1, 0.2, 0.3],
+                "px": 5000,
+                "scope": "tenantA"
+            }),
+        )
+        .unwrap();
+        assert!(matches!(cmd_sem_set, Command::SemanticSet { .. }));
+
+        // rudis_semantic_get
+        let cmd_sem_get = plan_tool_command(
+            "rudis_semantic_get",
+            &json!({
+                "namespace": "ns",
+                "vector": [0.1, 0.2, 0.3],
+                "threshold": 0.2,
+                "scope": "tenantA"
+            }),
+        )
+        .unwrap();
+        assert!(matches!(cmd_sem_get, Command::SemanticGet { .. }));
+
+        // rudis_vector_add
+        let cmd_vadd = plan_tool_command(
+            "rudis_vector_add",
+            &json!({
+                "key": "vkey",
+                "element": "elem1",
+                "vector": [1.0, 0.0],
+                "attr": "{\"category\":\"tech\"}"
+            }),
+        )
+        .unwrap();
+        assert!(matches!(cmd_vadd, Command::Vadd { .. }));
+
+        // rudis_vector_search
+        let cmd_vsearch = plan_tool_command(
+            "rudis_vector_search",
+            &json!({
+                "key": "vkey",
+                "vector": [1.0, 0.0],
+                "count": 10,
+                "filter": "@category == 'tech'"
+            }),
+        )
+        .unwrap();
+        assert!(matches!(cmd_vsearch, Command::Vsim { .. }));
+
+        // rudis_agent_memory_add
+        let cmd_mem_add = plan_tool_command(
+            "rudis_agent_memory_add",
+            &json!({
+                "session": "sess1",
+                "role": "user",
+                "content": "hello world",
+                "tokens": 2,
+                "vector": [0.5, 0.5]
+            }),
+        )
+        .unwrap();
+        assert!(matches!(cmd_mem_add, Command::AgentMemAdd { .. }));
+
+        // rudis_agent_memory_context
+        let cmd_mem_ctx = plan_tool_command(
+            "rudis_agent_memory_context",
+            &json!({
+                "session": "sess1",
+                "max_tokens": 1000,
+                "query_vector": [0.5, 0.5],
+                "recall_k": 5
+            }),
+        )
+        .unwrap();
+        assert!(matches!(cmd_mem_ctx, Command::AgentMemContext { .. }));
+
+        // rudis_agent_checkpoint_put & get
+        let cmd_chk_put = plan_tool_command(
+            "rudis_agent_checkpoint_put",
+            &json!({
+                "key": "chk_key",
+                "step_id": "step_1",
+                "parent_id": "step_0",
+                "state": "active",
+                "meta": "{}"
+            }),
+        )
+        .unwrap();
+        assert!(matches!(cmd_chk_put, Command::AgentCheckpointPut { .. }));
+
+        let cmd_chk_get = plan_tool_command(
+            "rudis_agent_checkpoint_get",
+            &json!({
+                "key": "chk_key",
+                "step_id": "step_1"
+            }),
+        )
+        .unwrap();
+        assert!(matches!(cmd_chk_get, Command::AgentCheckpointGet { .. }));
+
+        // rudis_ft_search
+        let cmd_ft = plan_tool_command(
+            "rudis_ft_search",
+            &json!({
+                "index": "idx",
+                "query": "rust speed",
+                "limit": 5
+            }),
+        )
+        .unwrap();
+        assert!(matches!(cmd_ft, Command::FtSearch { .. }));
+
+        // Error cases
+        assert!(plan_tool_command("nonexistent_tool", &json!({})).is_err());
+        assert!(plan_tool_command("rudis_kv_get", &json!({})).is_err());
+        assert!(plan_tool_command("rudis_semantic_set", &json!({"namespace": "ns", "id": "1", "prompt": "p", "response": "r", "vector": ["invalid"]})).is_err());
+    }
+
+    #[test]
+    fn test_resp_bytes_to_json_full_spectrum() {
+        let (val, is_err) = resp_bytes_to_json(b"+OK\r\n");
+        assert!(!is_err);
+        assert_eq!(val, json!("OK"));
+
+        let (val, is_err) = resp_bytes_to_json(b"-ERR unknown command\r\n");
+        assert!(is_err);
+        assert_eq!(val, json!("ERR unknown command"));
+
+        let (val, is_err) = resp_bytes_to_json(b":-123\r\n");
+        assert!(!is_err);
+        assert_eq!(val, json!(-123));
+
+        let (val, is_err) = resp_bytes_to_json(b",12.5\r\n");
+        assert!(!is_err);
+        assert_eq!(val, json!(12.5));
+
+        let (val, is_err) = resp_bytes_to_json(b"_\r\n");
+        assert!(!is_err);
+        assert_eq!(val, Value::Null);
+
+        let (val, is_err) = resp_bytes_to_json(b"$-1\r\n");
+        assert!(!is_err);
+        assert_eq!(val, Value::Null);
 
         let (val, is_err) = resp_bytes_to_json(b"*2\r\n$5\r\nhello\r\n:42\r\n");
         assert!(!is_err);
         assert_eq!(val, json!(["hello", 42]));
+
+        // RESP3 Map
+        let (val, is_err) = resp_bytes_to_json(b"%1\r\n+status\r\n+healthy\r\n");
+        assert!(!is_err);
+        assert_eq!(val, json!({"status": "healthy"}));
+
+        // Format mcp call result
+        let res = format_mcp_call_result(json!({"done": true}), false);
+        assert_eq!(res["isError"], false);
+        assert_eq!(res["content"][0]["type"], "text");
     }
 }

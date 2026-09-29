@@ -336,5 +336,11 @@ mod tests {
             server_config,
         };
         assert_eq!(worker_cfg.tls_port, 16379);
+
+        // Invalid key der returns error
+        assert!(create_server_config(&cert_der, &[0xDE, 0xAD, 0xBE, 0xEF]).is_err());
+
+        // enable_ktls on invalid fd returns error safely
+        assert!(enable_ktls(-1).is_err());
     }
 }
