@@ -2144,6 +2144,195 @@ impl Default for RudisTable {
     }
 }
 
+fn find_bit_in_slice(slice: &[u8], bit: u8) -> Option<usize> {
+    let mut i = 0;
+    if bit == 1 {
+        while i + 8 <= slice.len() {
+            let chunk = u64::from_be_bytes(slice[i..i + 8].try_into().unwrap());
+            if chunk != 0 {
+                return Some(i * 8 + chunk.leading_zeros() as usize);
+            }
+            i += 8;
+        }
+        while i < slice.len() {
+            let b = slice[i];
+            if b != 0 {
+                return Some(i * 8 + b.leading_zeros() as usize);
+            }
+            i += 1;
+        }
+    } else {
+        while i + 8 <= slice.len() {
+            let chunk = u64::from_be_bytes(slice[i..i + 8].try_into().unwrap());
+            if chunk != u64::MAX {
+                return Some(i * 8 + (!chunk).leading_zeros() as usize);
+            }
+            i += 8;
+        }
+        while i < slice.len() {
+            let b = slice[i];
+            if b != 0xff {
+                return Some(i * 8 + (!b).leading_zeros() as usize);
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+fn count_ones_in_slice(slice: &[u8]) -> usize {
+    let mut count = 0;
+    let mut i = 0;
+    while i + 8 <= slice.len() {
+        let chunk = u64::from_ne_bytes(slice[i..i + 8].try_into().unwrap());
+        count += chunk.count_ones() as usize;
+        i += 8;
+    }
+    while i < slice.len() {
+        count += slice[i].count_ones() as usize;
+        i += 1;
+    }
+    count
+}
+
+fn get_unsigned_bitfield(p: &[u8], mut offset: u64, bits: usize) -> u64 {
+    let mut value: u64 = 0;
+    for _ in 0..bits {
+        let byte_idx = (offset >> 3) as usize;
+        let bit_idx = 7 - (offset & 7);
+        let byteval = if byte_idx < p.len() { p[byte_idx] } else { 0 };
+        let bitval = ((byteval >> bit_idx) & 1) as u64;
+        value = (value << 1) | bitval;
+        offset += 1;
+    }
+    value
+}
+
+fn set_unsigned_bitfield(p: &mut [u8], mut offset: u64, bits: usize, value: u64) {
+    for j in 0..bits {
+        let bitval = ((value & (1u64 << (bits - 1 - j))) != 0) as u8;
+        let byte_idx = (offset >> 3) as usize;
+        let bit_idx = 7 - (offset & 7);
+        if byte_idx < p.len() {
+            let mut byteval = p[byte_idx];
+            byteval &= !(1 << bit_idx);
+            byteval |= bitval << bit_idx;
+            p[byte_idx] = byteval;
+        }
+        offset += 1;
+    }
+}
+
+fn get_signed_bitfield(p: &[u8], offset: u64, bits: usize) -> i64 {
+    let u = get_unsigned_bitfield(p, offset, bits);
+    let mut value = u as i64;
+    if bits < 64 && (value & (1i64 << (bits - 1))) != 0 {
+        value |= (!0i64) << bits;
+    }
+    value
+}
+
+fn set_signed_bitfield(p: &mut [u8], offset: u64, bits: usize, value: i64) {
+    set_unsigned_bitfield(p, offset, bits, value as u64);
+}
+
+fn check_unsigned_bitfield_overflow(
+    value: u64,
+    incr: i64,
+    bits: usize,
+    owtype: crate::resp::BitfieldOverflow,
+) -> (bool, u64) {
+    let max = if bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    let maxincr = max.wrapping_sub(value) as i64;
+    let minincr = -(value as i64);
+
+    let wrap = || {
+        let res = value.wrapping_add(incr as u64);
+        if bits == 64 {
+            res
+        } else {
+            let mask = (!0u64) << bits;
+            res & !mask
+        }
+    };
+
+    if value > max || (incr > 0 && incr > maxincr) {
+        let limit = match owtype {
+            crate::resp::BitfieldOverflow::Wrap => wrap(),
+            crate::resp::BitfieldOverflow::Sat => max,
+            crate::resp::BitfieldOverflow::Fail => 0,
+        };
+        (true, limit)
+    } else if incr < 0 && incr < minincr {
+        let limit = match owtype {
+            crate::resp::BitfieldOverflow::Wrap => wrap(),
+            crate::resp::BitfieldOverflow::Sat => 0,
+            crate::resp::BitfieldOverflow::Fail => 0,
+        };
+        (true, limit)
+    } else {
+        (false, value.wrapping_add(incr as u64))
+    }
+}
+
+fn check_signed_bitfield_overflow(
+    value: i64,
+    incr: i64,
+    bits: usize,
+    owtype: crate::resp::BitfieldOverflow,
+) -> (bool, i64) {
+    let max = if bits == 64 {
+        i64::MAX
+    } else {
+        (1i64 << (bits - 1)) - 1
+    };
+    let min = (-max) - 1;
+
+    let maxincr = (max as u64).wrapping_sub(value as u64) as i64;
+    let minincr = (min as u64).wrapping_sub(value as u64) as i64;
+
+    let wrap = || {
+        let msb = 1u64 << (bits - 1);
+        let a = value as u64;
+        let b = incr as u64;
+        let mut c = a.wrapping_add(b);
+        if bits < 64 {
+            let mask = (!0u64) << bits;
+            if (c & msb) != 0 {
+                c |= mask;
+            } else {
+                c &= !mask;
+            }
+        }
+        c as i64
+    };
+
+    if value > max || (bits != 64 && incr > maxincr) || (value >= 0 && incr > 0 && incr > maxincr) {
+        let limit = match owtype {
+            crate::resp::BitfieldOverflow::Wrap => wrap(),
+            crate::resp::BitfieldOverflow::Sat => max,
+            crate::resp::BitfieldOverflow::Fail => 0,
+        };
+        (true, limit)
+    } else if value < min
+        || (bits != 64 && incr < minincr)
+        || (value < 0 && incr < 0 && incr < minincr)
+    {
+        let limit = match owtype {
+            crate::resp::BitfieldOverflow::Wrap => wrap(),
+            crate::resp::BitfieldOverflow::Sat => min,
+            crate::resp::BitfieldOverflow::Fail => 0,
+        };
+        (true, limit)
+    } else {
+        (false, (value as u64).wrapping_add(incr as u64) as i64)
+    }
+}
+
 impl RudisTable {
     pub fn new() -> Self {
         let base_mem = 64 * std::mem::size_of::<Option<RudisEntry>>() + 64 + GROUP_SIZE + 16384 * 4;
@@ -9185,7 +9374,12 @@ impl RudisTable {
     }
 
     // BITMAP OPERATIONS
-    pub fn setbit(&mut self, key: Bytes, offset: usize, value: u8) -> Result<u8, &'static str> {
+    pub fn setbit(
+        &mut self,
+        key: Bytes,
+        offset: usize,
+        value: u8,
+    ) -> Result<(u8, bool), &'static str> {
         if value > 1 {
             return Err("bit is not an integer or out of range");
         }
@@ -9199,33 +9393,41 @@ impl RudisTable {
                 match &mut entry.val {
                     RudisValue::String(b) => {
                         let mut vec = b.to_vec();
-                        if vec.len() <= byte_idx {
+                        let grew = vec.len() <= byte_idx;
+                        if grew {
                             vec.resize(byte_idx + 1, 0);
                         }
                         let old_byte = vec[byte_idx];
                         let old_bit = (old_byte >> bit_idx) & 1;
-                        if value == 1 {
-                            vec[byte_idx] |= 1 << bit_idx;
-                        } else {
-                            vec[byte_idx] &= !(1 << bit_idx);
+                        let changed = grew || (old_bit != value);
+                        if changed {
+                            if value == 1 {
+                                vec[byte_idx] |= 1 << bit_idx;
+                            } else {
+                                vec[byte_idx] &= !(1 << bit_idx);
+                            }
+                            *b = Bytes::from(vec);
                         }
-                        *b = Bytes::from(vec);
-                        return Ok(old_bit);
+                        return Ok((old_bit, changed));
                     }
                     RudisValue::Int(n) => {
                         let mut vec = Self::format_i64(*n).to_vec();
-                        if vec.len() <= byte_idx {
+                        let grew = vec.len() <= byte_idx;
+                        if grew {
                             vec.resize(byte_idx + 1, 0);
                         }
                         let old_byte = vec[byte_idx];
                         let old_bit = (old_byte >> bit_idx) & 1;
-                        if value == 1 {
-                            vec[byte_idx] |= 1 << bit_idx;
-                        } else {
-                            vec[byte_idx] &= !(1 << bit_idx);
+                        let changed = grew || (old_bit != value);
+                        if changed {
+                            if value == 1 {
+                                vec[byte_idx] |= 1 << bit_idx;
+                            } else {
+                                vec[byte_idx] &= !(1 << bit_idx);
+                            }
+                            entry.val = RudisValue::String(Bytes::from(vec));
                         }
-                        entry.val = RudisValue::String(Bytes::from(vec));
-                        return Ok(old_bit);
+                        return Ok((old_bit, changed));
                     }
                     _ => {
                         return Err(
@@ -9246,7 +9448,7 @@ impl RudisTable {
             expire_at: None,
         };
         self.table.insert(entry);
-        Ok(0)
+        Ok((0, true))
     }
 
     pub fn getbit(&mut self, key: &[u8], offset: usize) -> Result<u8, &'static str> {
@@ -9293,6 +9495,7 @@ impl RudisTable {
         key: &[u8],
         start: Option<i64>,
         end: Option<i64>,
+        is_bit: bool,
     ) -> Result<usize, &'static str> {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
@@ -9300,42 +9503,87 @@ impl RudisTable {
                 return Ok(0);
             }
             if let Some(entry) = self.table.get_slot(idx) {
-                let bytes_data: Option<Vec<u8>> = match &entry.val {
-                    RudisValue::String(b) => Some(b.to_vec()),
-                    RudisValue::Int(n) => Some(Self::format_i64(*n).to_vec()),
+                let bytes_cow: Option<std::borrow::Cow<[u8]>> = match &entry.val {
+                    RudisValue::String(b) => Some(std::borrow::Cow::Borrowed(b.as_ref())),
+                    RudisValue::Int(n) => {
+                        Some(std::borrow::Cow::Owned(Self::format_i64(*n).to_vec()))
+                    }
                     _ => None,
                 };
-                if let Some(b) = bytes_data {
-                    let len = b.len() as i64;
-                    if len == 0 {
+                if let Some(b) = bytes_cow {
+                    let b = b.as_ref();
+                    let strlen = b.len() as i64;
+                    if strlen == 0 {
                         return Ok(0);
                     }
-                    let s = match start {
-                        Some(v) => {
-                            if v < 0 {
-                                (len + v).max(0) as usize
-                            } else {
-                                v.min(len) as usize
-                            }
+                    let mut s = start.unwrap_or(0);
+                    let mut e = end.unwrap_or_else(|| {
+                        if is_bit {
+                            (strlen << 3) - 1
+                        } else {
+                            strlen - 1
                         }
-                        None => 0,
-                    };
-                    let e = match end {
-                        Some(v) => {
-                            if v < 0 {
-                                (len + v).max(0) as usize
-                            } else {
-                                v.min(len - 1) as usize
-                            }
-                        }
-                        None => (len - 1) as usize,
-                    };
-                    if s > e || s >= b.len() {
+                    });
+
+                    // Redis rule: if both negative and start > end, return 0
+                    if s < 0 && e < 0 && s > e {
                         return Ok(0);
                     }
-                    let slice = &b[s..=e.min(b.len() - 1)];
-                    let count: usize = slice.iter().map(|byte| byte.count_ones() as usize).sum();
-                    return Ok(count);
+
+                    let totlen = if is_bit { strlen << 3 } else { strlen };
+                    if s < 0 {
+                        s += totlen;
+                    }
+                    if e < 0 {
+                        e += totlen;
+                    }
+                    if s < 0 {
+                        s = 0;
+                    }
+                    if e < 0 {
+                        e = 0;
+                    }
+                    if e >= totlen {
+                        e = totlen - 1;
+                    }
+                    if s > e {
+                        return Ok(0);
+                    }
+
+                    if is_bit {
+                        let first_byte_neg_mask: u8 = (!((1u16 << (8 - (s & 7))) - 1)) as u8;
+                        let last_byte_neg_mask: u8 = ((1u16 << (7 - (e & 7))) - 1) as u8;
+                        let byte_start = (s >> 3) as usize;
+                        let byte_end = (e >> 3) as usize;
+                        let slice = &b[byte_start..=byte_end];
+                        let mut count: usize = count_ones_in_slice(slice);
+                        if byte_start == byte_end {
+                            let mask = first_byte_neg_mask | last_byte_neg_mask;
+                            count =
+                                count.saturating_sub((b[byte_start] & mask).count_ones() as usize);
+                        } else {
+                            if first_byte_neg_mask != 0 {
+                                count = count.saturating_sub(
+                                    (b[byte_start] & first_byte_neg_mask).count_ones() as usize,
+                                );
+                            }
+                            if last_byte_neg_mask != 0 {
+                                count = count.saturating_sub(
+                                    (b[byte_end] & last_byte_neg_mask).count_ones() as usize,
+                                );
+                            }
+                        }
+                        return Ok(count);
+                    } else {
+                        let s_idx = s as usize;
+                        let e_idx = (e as usize).min(b.len().saturating_sub(1));
+                        if s_idx <= e_idx {
+                            let count = count_ones_in_slice(&b[s_idx..=e_idx]);
+                            return Ok(count);
+                        } else {
+                            return Ok(0);
+                        }
+                    }
                 } else {
                     return Err(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -9352,6 +9600,7 @@ impl RudisTable {
         bit: u8,
         start: Option<i64>,
         end: Option<i64>,
+        is_bit: bool,
     ) -> Result<i64, &'static str> {
         if bit > 1 {
             return Err("The bit argument must be 1 or 0.");
@@ -9362,48 +9611,88 @@ impl RudisTable {
                 return Ok(if bit == 0 { 0 } else { -1 });
             }
             if let Some(entry) = self.table.get_slot(idx) {
-                let bytes_data: Option<Vec<u8>> = match &entry.val {
-                    RudisValue::String(b) => Some(b.to_vec()),
-                    RudisValue::Int(n) => Some(Self::format_i64(*n).to_vec()),
+                let bytes_cow: Option<std::borrow::Cow<[u8]>> = match &entry.val {
+                    RudisValue::String(b) => Some(std::borrow::Cow::Borrowed(b.as_ref())),
+                    RudisValue::Int(n) => {
+                        Some(std::borrow::Cow::Owned(Self::format_i64(*n).to_vec()))
+                    }
                     _ => None,
                 };
-                if let Some(b) = bytes_data {
-                    let len = b.len() as i64;
-                    if len == 0 {
+                if let Some(b) = bytes_cow {
+                    let b = b.as_ref();
+                    let strlen = b.len() as i64;
+                    if strlen == 0 {
                         return Ok(if bit == 0 { 0 } else { -1 });
                     }
-                    let s = match start {
-                        Some(v) => {
-                            if v < 0 {
-                                (len + v).max(0) as usize
-                            } else {
-                                v.min(len) as usize
-                            }
-                        }
-                        None => 0,
-                    };
-                    let e = match end {
-                        Some(v) => {
-                            if v < 0 {
-                                (len + v).max(0) as usize
-                            } else {
-                                v.min(len - 1) as usize
-                            }
-                        }
-                        None => (len - 1) as usize,
-                    };
-                    if s > e || s >= b.len() {
+                    let totlen = if is_bit { strlen << 3 } else { strlen };
+                    let mut s = start.unwrap_or(0);
+                    let mut e = end.unwrap_or(totlen - 1);
+                    if s < 0 {
+                        s += totlen;
+                    }
+                    if e < 0 {
+                        e += totlen;
+                    }
+                    if s < 0 {
+                        s = 0;
+                    }
+                    if e < 0 {
+                        e = 0;
+                    }
+                    if e >= totlen {
+                        e = totlen - 1;
+                    }
+                    if s > e {
                         return Ok(-1);
                     }
-                    for (i, &byte) in b[s..=e.min(b.len() - 1)].iter().enumerate() {
-                        let byte_offset = s + i;
-                        for bit_idx in 0..8 {
-                            let curr_bit = (byte >> (7 - bit_idx)) & 1;
-                            if curr_bit == bit {
-                                return Ok((byte_offset * 8 + bit_idx) as i64);
+
+                    if is_bit {
+                        let start_byte = (s >> 3) as usize;
+                        let end_byte = (e >> 3) as usize;
+                        if start_byte == end_byte {
+                            let byte = b[start_byte];
+                            let start_bit = (s & 7) as usize;
+                            let end_bit = (e & 7) as usize;
+                            for bit_idx in start_bit..=end_bit {
+                                let curr_bit = (byte >> (7 - bit_idx)) & 1;
+                                if curr_bit == bit {
+                                    return Ok((start_byte * 8 + bit_idx) as i64);
+                                }
+                            }
+                        } else {
+                            let first_byte = b[start_byte];
+                            let start_bit = (s & 7) as usize;
+                            for bit_idx in start_bit..8 {
+                                let curr_bit = (first_byte >> (7 - bit_idx)) & 1;
+                                if curr_bit == bit {
+                                    return Ok((start_byte * 8 + bit_idx) as i64);
+                                }
+                            }
+                            if start_byte + 1 < end_byte
+                                && let Some(offset) =
+                                    find_bit_in_slice(&b[start_byte + 1..end_byte], bit)
+                            {
+                                return Ok(((start_byte + 1) * 8 + offset) as i64);
+                            }
+                            let last_byte = b[end_byte];
+                            let end_bit = (e & 7) as usize;
+                            for bit_idx in 0..=end_bit {
+                                let curr_bit = (last_byte >> (7 - bit_idx)) & 1;
+                                if curr_bit == bit {
+                                    return Ok((end_byte * 8 + bit_idx) as i64);
+                                }
                             }
                         }
+                    } else {
+                        let s_idx = s as usize;
+                        let e_idx = (e as usize).min(b.len().saturating_sub(1));
+                        if s_idx <= e_idx
+                            && let Some(offset) = find_bit_in_slice(&b[s_idx..=e_idx], bit)
+                        {
+                            return Ok((s_idx * 8 + offset) as i64);
+                        }
                     }
+
                     if bit == 0 && end.is_none() {
                         return Ok((b.len() * 8) as i64);
                     }
@@ -9416,6 +9705,180 @@ impl RudisTable {
             }
         }
         Ok(if bit == 0 { 0 } else { -1 })
+    }
+
+    pub fn bitfield(
+        &mut self,
+        key: Bytes,
+        ops: &[crate::resp::BitfieldSubOp],
+    ) -> Result<(Vec<Option<i64>>, usize), &'static str> {
+        let h = hash_key(&key);
+        let mut key_exists = false;
+        let mut current_vec: Vec<u8> = Vec::new();
+        if let Some(idx) = self.table.find(&key, h) {
+            let was_exp = self.check_expired_slot(idx);
+            if !was_exp && let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::String(b) => {
+                        key_exists = true;
+                        current_vec = b.to_vec();
+                    }
+                    RudisValue::Int(n) => {
+                        key_exists = true;
+                        current_vec = Self::format_i64(*n).to_vec();
+                    }
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
+                }
+            }
+        }
+
+        let has_writes = ops.iter().any(|op| {
+            matches!(
+                op.op_type,
+                crate::resp::BitfieldOpType::Set(_) | crate::resp::BitfieldOpType::Incrby(_)
+            )
+        });
+        let mut str_grow_size = 0usize;
+        if has_writes {
+            let mut highest_write_offset: u64 = 0;
+            for op in ops {
+                if matches!(
+                    op.op_type,
+                    crate::resp::BitfieldOpType::Set(_) | crate::resp::BitfieldOpType::Incrby(_)
+                ) {
+                    let end_off = op.offset + op.bits as u64 - 1;
+                    if end_off > highest_write_offset {
+                        highest_write_offset = end_off;
+                    }
+                }
+            }
+            let needed_bytes = (highest_write_offset as usize / 8) + 1;
+            if needed_bytes > current_vec.len() {
+                str_grow_size = needed_bytes - current_vec.len();
+                current_vec.resize(needed_bytes, 0);
+            }
+        }
+
+        let mut results = Vec::with_capacity(ops.len());
+        let mut changes = 0usize;
+
+        for op in ops {
+            match op.op_type {
+                crate::resp::BitfieldOpType::Get => {
+                    let mut buf = [0u8; 9];
+                    let byte_start = (op.offset >> 3) as usize;
+                    for i in 0..9 {
+                        if byte_start + i < current_vec.len() {
+                            buf[i] = current_vec[byte_start + i];
+                        }
+                    }
+                    let bit_offset_in_buf = op.offset & 7;
+                    if op.sign {
+                        let val = get_signed_bitfield(&buf, bit_offset_in_buf, op.bits);
+                        results.push(Some(val));
+                    } else {
+                        let val = get_unsigned_bitfield(&buf, bit_offset_in_buf, op.bits);
+                        results.push(Some(val as i64));
+                    }
+                }
+                crate::resp::BitfieldOpType::Set(val) => {
+                    if op.sign {
+                        let oldval = get_signed_bitfield(&current_vec, op.offset, op.bits);
+                        let (overflow, wrapped) =
+                            check_signed_bitfield_overflow(val, 0, op.bits, op.overflow);
+                        let newval = if overflow { wrapped } else { val };
+                        if overflow && op.overflow == crate::resp::BitfieldOverflow::Fail {
+                            results.push(None);
+                        } else {
+                            results.push(Some(oldval));
+                            set_signed_bitfield(&mut current_vec, op.offset, op.bits, newval);
+                            if str_grow_size > 0 || (oldval != newval) {
+                                changes += 1;
+                            }
+                        }
+                    } else {
+                        let oldval = get_unsigned_bitfield(&current_vec, op.offset, op.bits);
+                        let (overflow, wrapped) =
+                            check_unsigned_bitfield_overflow(val as u64, 0, op.bits, op.overflow);
+                        let newval = if overflow { wrapped } else { val as u64 };
+                        if overflow && op.overflow == crate::resp::BitfieldOverflow::Fail {
+                            results.push(None);
+                        } else {
+                            results.push(Some(oldval as i64));
+                            set_unsigned_bitfield(&mut current_vec, op.offset, op.bits, newval);
+                            if str_grow_size > 0 || (oldval != newval) {
+                                changes += 1;
+                            }
+                        }
+                    }
+                }
+                crate::resp::BitfieldOpType::Incrby(incr) => {
+                    if op.sign {
+                        let oldval = get_signed_bitfield(&current_vec, op.offset, op.bits);
+                        let (overflow, wrapped) =
+                            check_signed_bitfield_overflow(oldval, incr, op.bits, op.overflow);
+                        let newval = if overflow {
+                            wrapped
+                        } else {
+                            oldval.wrapping_add(incr)
+                        };
+                        if overflow && op.overflow == crate::resp::BitfieldOverflow::Fail {
+                            results.push(None);
+                        } else {
+                            results.push(Some(newval));
+                            set_signed_bitfield(&mut current_vec, op.offset, op.bits, newval);
+                            if str_grow_size > 0 || (oldval != newval) {
+                                changes += 1;
+                            }
+                        }
+                    } else {
+                        let oldval = get_unsigned_bitfield(&current_vec, op.offset, op.bits);
+                        let (overflow, wrapped) =
+                            check_unsigned_bitfield_overflow(oldval, incr, op.bits, op.overflow);
+                        let newval = if overflow {
+                            wrapped
+                        } else {
+                            oldval.wrapping_add(incr as u64)
+                        };
+                        if overflow && op.overflow == crate::resp::BitfieldOverflow::Fail {
+                            results.push(None);
+                        } else {
+                            results.push(Some(newval as i64));
+                            set_unsigned_bitfield(&mut current_vec, op.offset, op.bits, newval);
+                            if str_grow_size > 0 || (oldval != newval) {
+                                changes += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let total_dirty = if changes > 0 || str_grow_size > 0 {
+            if key_exists {
+                if let Some(idx) = self.table.find(&key, h)
+                    && let Some(entry) = self.table.get_slot_mut(idx)
+                {
+                    entry.val = RudisValue::String(Bytes::from(current_vec));
+                }
+            } else {
+                let entry = RudisEntry {
+                    key,
+                    val: RudisValue::String(Bytes::from(current_vec)),
+                    expire_at: None,
+                };
+                self.table.insert(entry);
+            }
+            if changes > 0 { changes } else { 1 }
+        } else {
+            0
+        };
+
+        Ok((results, total_dirty))
     }
 
     pub fn bitop(
@@ -9486,10 +9949,61 @@ impl RudisTable {
             }
             "NOT" => {
                 if buffers.len() != 1 {
-                    return Err("BITOP NOT takes only one source key");
+                    return Err("BITOP NOT must be called with a single source key.");
                 }
                 for (i, out) in result.iter_mut().enumerate() {
                     *out = !buffers[0].get(i).copied().unwrap_or(0);
+                }
+            }
+            "DIFF" => {
+                if buffers.len() < 2 {
+                    return Err("ERR BITOP DIFF requires at least 2 source keys");
+                }
+                for (i, out) in result.iter_mut().enumerate() {
+                    let fst = buffers[0].get(i).copied().unwrap_or(0);
+                    let mut rest_or = 0u8;
+                    for buf in &buffers[1..] {
+                        rest_or |= buf.get(i).copied().unwrap_or(0);
+                    }
+                    *out = fst & !rest_or;
+                }
+            }
+            "DIFF1" => {
+                if buffers.len() < 2 {
+                    return Err("ERR BITOP DIFF1 requires at least 2 source keys");
+                }
+                for (i, out) in result.iter_mut().enumerate() {
+                    let fst = buffers[0].get(i).copied().unwrap_or(0);
+                    let mut rest_or = 0u8;
+                    for buf in &buffers[1..] {
+                        rest_or |= buf.get(i).copied().unwrap_or(0);
+                    }
+                    *out = !fst & rest_or;
+                }
+            }
+            "ANDOR" => {
+                if buffers.len() < 2 {
+                    return Err("ERR BITOP ANDOR requires at least 2 source keys");
+                }
+                for (i, out) in result.iter_mut().enumerate() {
+                    let fst = buffers[0].get(i).copied().unwrap_or(0);
+                    let mut rest_or = 0u8;
+                    for buf in &buffers[1..] {
+                        rest_or |= buf.get(i).copied().unwrap_or(0);
+                    }
+                    *out = fst & rest_or;
+                }
+            }
+            "ONE" => {
+                for (i, out) in result.iter_mut().enumerate() {
+                    let mut ones = 0u8;
+                    let mut more_than_one = 0u8;
+                    for buf in &buffers {
+                        let byte = buf.get(i).copied().unwrap_or(0);
+                        more_than_one |= ones & byte;
+                        ones ^= byte;
+                    }
+                    *out = ones & !more_than_one;
                 }
             }
             _ => return Err("syntax error"),
@@ -12513,9 +13027,18 @@ mod tests {
 
         // 1. SETBIT & GETBIT
         // 'a' in ASCII is 0b01100001 (byte 0: bit 1, 2, 7 are 1)
-        assert_eq!(table.setbit(Bytes::from_static(b"bm"), 1, 1).unwrap(), 0);
-        assert_eq!(table.setbit(Bytes::from_static(b"bm"), 2, 1).unwrap(), 0);
-        assert_eq!(table.setbit(Bytes::from_static(b"bm"), 7, 1).unwrap(), 0);
+        assert_eq!(
+            table.setbit(Bytes::from_static(b"bm"), 1, 1).unwrap(),
+            (0, true)
+        );
+        assert_eq!(
+            table.setbit(Bytes::from_static(b"bm"), 2, 1).unwrap(),
+            (0, true)
+        );
+        assert_eq!(
+            table.setbit(Bytes::from_static(b"bm"), 7, 1).unwrap(),
+            (0, true)
+        );
         assert_eq!(table.getbit(b"bm", 1).unwrap(), 1);
         assert_eq!(table.getbit(b"bm", 2).unwrap(), 1);
         assert_eq!(table.getbit(b"bm", 3).unwrap(), 0);
@@ -12524,17 +13047,20 @@ mod tests {
         assert_eq!(table.get(b"bm").unwrap(), Some(Bytes::from_static(b"a")));
 
         // 2. BITCOUNT
-        assert_eq!(table.bitcount(b"bm", None, None).unwrap(), 3);
+        assert_eq!(table.bitcount(b"bm", None, None, false).unwrap(), 3);
         // Set bit in byte 1 (offset 15 = bit 7 of byte 1)
-        assert_eq!(table.setbit(Bytes::from_static(b"bm"), 15, 1).unwrap(), 0);
-        assert_eq!(table.bitcount(b"bm", None, None).unwrap(), 4);
-        assert_eq!(table.bitcount(b"bm", Some(0), Some(0)).unwrap(), 3);
-        assert_eq!(table.bitcount(b"bm", Some(1), Some(1)).unwrap(), 1);
+        assert_eq!(
+            table.setbit(Bytes::from_static(b"bm"), 15, 1).unwrap(),
+            (0, true)
+        );
+        assert_eq!(table.bitcount(b"bm", None, None, false).unwrap(), 4);
+        assert_eq!(table.bitcount(b"bm", Some(0), Some(0), false).unwrap(), 3);
+        assert_eq!(table.bitcount(b"bm", Some(1), Some(1), false).unwrap(), 1);
 
         // 3. BITPOS
-        assert_eq!(table.bitpos(b"bm", 1, None, None).unwrap(), 1);
-        assert_eq!(table.bitpos(b"bm", 0, None, None).unwrap(), 0);
-        assert_eq!(table.bitpos(b"bm", 1, Some(1), None).unwrap(), 15);
+        assert_eq!(table.bitpos(b"bm", 1, None, None, false).unwrap(), 1);
+        assert_eq!(table.bitpos(b"bm", 0, None, None, false).unwrap(), 0);
+        assert_eq!(table.bitpos(b"bm", 1, Some(1), None, false).unwrap(), 15);
 
         // 4. BITOP
         table.set(Bytes::from_static(b"k1"), Bytes::from_static(b"\x0f"), None); // 00001111

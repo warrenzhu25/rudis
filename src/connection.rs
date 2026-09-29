@@ -2617,6 +2617,7 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Getbit { key, .. }
         | Command::Bitcount { key, .. }
         | Command::Bitpos { key, .. }
+        | Command::Bitfield { key, .. }
         | Command::Pfadd { key, .. }
         | Command::Dump(key)
         | Command::Restore { key, .. }
@@ -2860,6 +2861,7 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
         | Command::Getbit { key, .. }
         | Command::Bitcount { key, .. }
         | Command::Bitpos { key, .. }
+        | Command::Bitfield { key, .. }
         | Command::Pfadd { key, .. }
         | Command::Restore { key, .. }
         | Command::Xadd { key, .. }
@@ -3880,6 +3882,13 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Getbit { .. } => "GETBIT",
         Command::Bitcount { .. } => "BITCOUNT",
         Command::Bitpos { .. } => "BITPOS",
+        Command::Bitfield { readonly, .. } => {
+            if *readonly {
+                "BITFIELD_RO"
+            } else {
+                "BITFIELD"
+            }
+        }
         Command::Bitop { .. } => "BITOP",
         Command::Pfadd { .. } => "PFADD",
         Command::Pfcount { .. } => "PFCOUNT",
@@ -6698,6 +6707,7 @@ async fn execute_command(
         | Command::Getbit { .. }
         | Command::Bitcount { .. }
         | Command::Bitpos { .. }
+        | Command::Bitfield { .. }
         | Command::Pfadd { .. }
         | Command::Dump(_)
         | Command::Restore { .. }
@@ -11020,6 +11030,7 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Getbit { key, .. }
         | Command::Bitcount { key, .. }
         | Command::Bitpos { key, .. }
+        | Command::Bitfield { key, .. }
         | Command::Pfadd { key, .. }
         | Command::Dump(key)
         | Command::Restore { key, .. }
@@ -13395,8 +13406,10 @@ pub fn execute_local_command(
         }
         Command::Setbit { key, offset, value } => {
             match db.setbit(key.clone(), *offset, *value) {
-                Ok(old) => {
-                    record_change!(cmd);
+                Ok((old, changed)) => {
+                    if changed {
+                        record_change!(cmd);
+                    }
                     out.extend_from_slice(format!(":{}\r\n", old).as_bytes());
                 }
                 Err(err) => {
@@ -13416,8 +13429,13 @@ pub fn execute_local_command(
             }
             false
         }
-        Command::Bitcount { key, start, end } => {
-            match db.bitcount(key, *start, *end) {
+        Command::Bitcount {
+            key,
+            start,
+            end,
+            is_bit,
+        } => {
+            match db.bitcount(key, *start, *end, *is_bit) {
                 Ok(count) => {
                     out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
                 }
@@ -13432,10 +13450,56 @@ pub fn execute_local_command(
             bit,
             start,
             end,
+            is_bit,
         } => {
-            match db.bitpos(key, *bit, *start, *end) {
+            match db.bitpos(key, *bit, *start, *end, *is_bit) {
                 Ok(pos) => {
                     out.extend_from_slice(format!(":{}\r\n", pos).as_bytes());
+                }
+                Err(err) => {
+                    write_resp_err(out, err);
+                }
+            }
+            false
+        }
+        Command::Bitfield { key, ops, readonly } => {
+            match db.bitfield(key.clone(), ops) {
+                Ok((results, changes)) => {
+                    if changes > 0 && !*readonly {
+                        for _ in 0..changes {
+                            DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                            touch_watched_key(db.port, key.as_ref());
+                        }
+                        let need_aof = aof.is_some();
+                        let need_rep = crate::replication::has_connected_replicas(db.port);
+                        if (need_aof || need_rep)
+                            && let Some(bytes) = crate::aof::command_to_resp(cmd)
+                        {
+                            if let Some(aof_w) = aof {
+                                aof_w.borrow_mut().append(&bytes);
+                            }
+                            if need_rep {
+                                crate::replication::propagate_shard_bytes(
+                                    db.port,
+                                    db.shard_id,
+                                    &bytes,
+                                );
+                            }
+                        }
+                    }
+                    write_resp_array_header(out, results.len());
+                    for res in results {
+                        match res {
+                            Some(val) => {
+                                write_resp_integer(out, val);
+                            }
+                            None => {
+                                write_resp_null(out);
+                            }
+                        }
+                    }
                 }
                 Err(err) => {
                     write_resp_err(out, err);

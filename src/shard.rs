@@ -1948,7 +1948,12 @@ impl ShardDb {
     }
 
     #[inline]
-    pub fn setbit(&mut self, key: Bytes, offset: usize, value: u8) -> Result<u8, &'static str> {
+    pub fn setbit(
+        &mut self,
+        key: Bytes,
+        offset: usize,
+        value: u8,
+    ) -> Result<(u8, bool), &'static str> {
         self.table.setbit(key, offset, value)
     }
 
@@ -1963,8 +1968,9 @@ impl ShardDb {
         key: &[u8],
         start: Option<i64>,
         end: Option<i64>,
+        is_bit: bool,
     ) -> Result<usize, &'static str> {
-        self.table.bitcount(key, start, end)
+        self.table.bitcount(key, start, end, is_bit)
     }
 
     #[inline]
@@ -1974,8 +1980,18 @@ impl ShardDb {
         bit: u8,
         start: Option<i64>,
         end: Option<i64>,
+        is_bit: bool,
     ) -> Result<i64, &'static str> {
-        self.table.bitpos(key, bit, start, end)
+        self.table.bitpos(key, bit, start, end, is_bit)
+    }
+
+    #[inline]
+    pub fn bitfield(
+        &mut self,
+        key: Bytes,
+        ops: &[crate::resp::BitfieldSubOp],
+    ) -> Result<(Vec<Option<i64>>, usize), &'static str> {
+        self.table.bitfield(key, ops)
     }
 
     #[inline]

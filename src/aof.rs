@@ -587,6 +587,54 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             buf.extend_from_slice(format!("${}\r\n{}\r\n", val_str.len(), val_str).as_bytes());
             Some(buf)
         }
+        Command::Bitfield { key, ops, readonly } => {
+            if *readonly {
+                return None;
+            }
+            let mut parts: Vec<Vec<u8>> = Vec::new();
+            parts.push(b"BITFIELD".to_vec());
+            parts.push(key.to_vec());
+            let mut last_overflow = crate::resp::BitfieldOverflow::Wrap;
+            for op in ops {
+                if op.overflow != last_overflow {
+                    parts.push(b"OVERFLOW".to_vec());
+                    match op.overflow {
+                        crate::resp::BitfieldOverflow::Wrap => parts.push(b"WRAP".to_vec()),
+                        crate::resp::BitfieldOverflow::Sat => parts.push(b"SAT".to_vec()),
+                        crate::resp::BitfieldOverflow::Fail => parts.push(b"FAIL".to_vec()),
+                    }
+                    last_overflow = op.overflow;
+                }
+                let type_str = format!("{}{}", if op.sign { "i" } else { "u" }, op.bits);
+                let off_str = op.offset.to_string();
+                match op.op_type {
+                    crate::resp::BitfieldOpType::Get => {
+                        parts.push(b"GET".to_vec());
+                        parts.push(type_str.into_bytes());
+                        parts.push(off_str.into_bytes());
+                    }
+                    crate::resp::BitfieldOpType::Set(val) => {
+                        parts.push(b"SET".to_vec());
+                        parts.push(type_str.into_bytes());
+                        parts.push(off_str.into_bytes());
+                        parts.push(val.to_string().into_bytes());
+                    }
+                    crate::resp::BitfieldOpType::Incrby(incr) => {
+                        parts.push(b"INCRBY".to_vec());
+                        parts.push(type_str.into_bytes());
+                        parts.push(off_str.into_bytes());
+                        parts.push(incr.to_string().into_bytes());
+                    }
+                }
+            }
+            buf.extend_from_slice(format!("*{}\r\n", parts.len()).as_bytes());
+            for p in parts {
+                buf.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
+                buf.extend_from_slice(&p);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
         Command::Bitop {
             op,
             destkey,

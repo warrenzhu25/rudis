@@ -266,6 +266,29 @@ pub enum VsimTarget {
     Vector(Vec<f32>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BitfieldOpType {
+    Get,
+    Set(i64),
+    Incrby(i64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitfieldOverflow {
+    Wrap,
+    Sat,
+    Fail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitfieldSubOp {
+    pub op_type: BitfieldOpType,
+    pub sign: bool,
+    pub bits: usize,
+    pub offset: u64,
+    pub overflow: BitfieldOverflow,
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum Command {
     Object(ObjectSubcommand),
@@ -759,12 +782,19 @@ pub enum Command {
         key: Bytes,
         start: Option<i64>,
         end: Option<i64>,
+        is_bit: bool,
     },
     Bitpos {
         key: Bytes,
         bit: u8,
         start: Option<i64>,
         end: Option<i64>,
+        is_bit: bool,
+    },
+    Bitfield {
+        key: Bytes,
+        ops: Vec<BitfieldSubOp>,
+        readonly: bool,
     },
     Bitop {
         op: String,
@@ -2769,10 +2799,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::Exists(SmallVec::from_vec(args))))
         }
         "INCR" => {
-            if args.len() < 2 {
-                return Err("wrong number of arguments for 'incr' command".to_string());
+            if args.len() == 2 {
+                return Ok(Some(Command::IncrBy(args[1].clone(), 1)));
             }
-            if args.len() >= 3
+            if (args.len() == 3 || args.len() == 4)
                 && let Some(val) = std::str::from_utf8(&args[2])
                     .ok()
                     .and_then(|s| s.parse::<u64>().ok())
@@ -2784,13 +2814,13 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     noreply,
                 }));
             }
-            Ok(Some(Command::IncrBy(args[1].clone(), 1)))
+            Err("wrong number of arguments for 'incr' command".to_string())
         }
         "DECR" => {
-            if args.len() < 2 {
-                return Err("wrong number of arguments for 'decr' command".to_string());
+            if args.len() == 2 {
+                return Ok(Some(Command::IncrBy(args[1].clone(), -1)));
             }
-            if args.len() >= 3
+            if (args.len() == 3 || args.len() == 4)
                 && let Some(val) = std::str::from_utf8(&args[2])
                     .ok()
                     .and_then(|s| s.parse::<u64>().ok())
@@ -2802,10 +2832,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     noreply,
                 }));
             }
-            Ok(Some(Command::IncrBy(args[1].clone(), -1)))
+            Err("wrong number of arguments for 'decr' command".to_string())
         }
         "INCRBY" => {
-            if args.len() < 3 {
+            if args.len() != 3 {
                 return Err("wrong number of arguments for 'incrby' command".to_string());
             }
             let delta = std::str::from_utf8(&args[2])
@@ -2815,13 +2845,16 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::IncrBy(args[1].clone(), delta)))
         }
         "DECRBY" => {
-            if args.len() < 3 {
+            if args.len() != 3 {
                 return Err("wrong number of arguments for 'decrby' command".to_string());
             }
             let delta = std::str::from_utf8(&args[2])
                 .ok()
                 .and_then(|s| s.parse::<i64>().ok())
                 .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+            if delta == i64::MIN {
+                return Err("increment or decrement would overflow".to_string());
+            }
             Ok(Some(Command::IncrBy(args[1].clone(), -delta)))
         }
         "EXPIRE" => {
@@ -5975,18 +6008,19 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 .map_err(|_| "bit offset is not an integer or out of range")?
                 .parse()
                 .map_err(|_| "bit offset is not an integer or out of range")?;
-            if offset_raw >= (1u64 << 32) {
+            if (offset_raw >> 3) >= get_proto_max_bulk_len() as u64 {
                 return Err("bit offset is not an integer or out of range".to_string());
             }
             let offset = offset_raw as usize;
             let val_str = std::str::from_utf8(&args[3])
                 .map_err(|_| "bit is not an integer or out of range")?;
-            let value: u8 = val_str
+            let val_num: i64 = val_str
                 .parse()
                 .map_err(|_| "bit is not an integer or out of range")?;
-            if value > 1 {
+            if val_num != 0 && val_num != 1 {
                 return Err("bit is not an integer or out of range".to_string());
             }
+            let value = val_num as u8;
             Ok(Some(Command::Setbit {
                 key: args[1].clone(),
                 offset,
@@ -5997,10 +6031,14 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() != 3 {
                 return Err("wrong number of arguments for 'getbit' command".to_string());
             }
-            let offset: usize = std::str::from_utf8(&args[2])
+            let offset_raw: u64 = std::str::from_utf8(&args[2])
                 .map_err(|_| "bit offset is not an integer or out of range")?
                 .parse()
                 .map_err(|_| "bit offset is not an integer or out of range")?;
+            if (offset_raw >> 3) >= get_proto_max_bulk_len() as u64 {
+                return Err("bit offset is not an integer or out of range".to_string());
+            }
+            let offset = offset_raw as usize;
             Ok(Some(Command::Getbit {
                 key: args[1].clone(),
                 offset,
@@ -6008,10 +6046,14 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
         }
         "BITCOUNT" => {
             if args.len() != 2 && args.len() != 4 && args.len() != 5 {
-                return Err("wrong number of arguments for 'bitcount' command".to_string());
+                if args.len() < 2 {
+                    return Err("wrong number of arguments for 'bitcount' command".to_string());
+                }
+                return Err("syntax error".to_string());
             }
             let mut start = None;
             let mut end = None;
+            let mut is_bit = false;
             if args.len() >= 4 {
                 start = Some(
                     std::str::from_utf8(&args[2])
@@ -6026,39 +6068,64 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         .map_err(|_| "value is not an integer or out of range")?,
                 );
             }
+            if args.len() == 5 {
+                if args[4].eq_ignore_ascii_case(b"BIT") {
+                    is_bit = true;
+                } else if args[4].eq_ignore_ascii_case(b"BYTE") {
+                    is_bit = false;
+                } else {
+                    return Err("syntax error".to_string());
+                }
+            }
             Ok(Some(Command::Bitcount {
                 key: args[1].clone(),
                 start,
                 end,
+                is_bit,
             }))
         }
         "BITPOS" => {
-            if args.len() < 3 || args.len() > 5 {
+            if args.len() < 3 {
                 return Err("wrong number of arguments for 'bitpos' command".to_string());
             }
-            let bit_str =
-                std::str::from_utf8(&args[2]).map_err(|_| "The bit argument must be 1 or 0.")?;
-            let bit: u8 = bit_str
+            if args.len() > 6 {
+                return Err("syntax error".to_string());
+            }
+            let bit_str = std::str::from_utf8(&args[2])
+                .map_err(|_| "value is not an integer or out of range")?;
+            let bit_val: i64 = bit_str
                 .parse()
-                .map_err(|_| "The bit argument must be 1 or 0.")?;
-            if bit > 1 {
+                .map_err(|_| "value is not an integer or out of range")?;
+            if bit_val != 0 && bit_val != 1 {
                 return Err("The bit argument must be 1 or 0.".to_string());
             }
+            let bit = bit_val as u8;
+
+            let mut is_bit = false;
             let start = if args.len() >= 4 {
                 Some(
                     std::str::from_utf8(&args[3])
                         .map_err(|_| "value is not an integer or out of range")?
-                        .parse()
+                        .parse::<i64>()
                         .map_err(|_| "value is not an integer or out of range")?,
                 )
             } else {
                 None
             };
-            let end = if args.len() == 5 {
+            if args.len() == 6 {
+                if args[5].eq_ignore_ascii_case(b"BIT") {
+                    is_bit = true;
+                } else if args[5].eq_ignore_ascii_case(b"BYTE") {
+                    is_bit = false;
+                } else {
+                    return Err("syntax error".to_string());
+                }
+            }
+            let end = if args.len() >= 5 {
                 Some(
                     std::str::from_utf8(&args[4])
                         .map_err(|_| "value is not an integer or out of range")?
-                        .parse()
+                        .parse::<i64>()
                         .map_err(|_| "value is not an integer or out of range")?,
                 )
             } else {
@@ -6069,6 +6136,146 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 bit,
                 start,
                 end,
+                is_bit,
+            }))
+        }
+        "BITFIELD" | "BITFIELD_RO" => {
+            let is_ro = cmd_name.eq_ignore_ascii_case("BITFIELD_RO");
+            if args.len() < 2 {
+                return Err(format!(
+                    "wrong number of arguments for '{}' command",
+                    if is_ro { "bitfield_ro" } else { "bitfield" }
+                ));
+            }
+            let key = args[1].clone();
+            let mut ops = Vec::new();
+            let mut cur_overflow = BitfieldOverflow::Wrap;
+            let mut j = 2;
+
+            while j < args.len() {
+                let subcmd =
+                    std::str::from_utf8(&args[j]).map_err(|_| "syntax error".to_string())?;
+                if subcmd.eq_ignore_ascii_case("OVERFLOW") {
+                    if j + 1 >= args.len() {
+                        return Err("syntax error".to_string());
+                    }
+                    let ow_type = std::str::from_utf8(&args[j + 1])
+                        .map_err(|_| "syntax error".to_string())?;
+                    if ow_type.eq_ignore_ascii_case("WRAP") {
+                        cur_overflow = BitfieldOverflow::Wrap;
+                    } else if ow_type.eq_ignore_ascii_case("SAT") {
+                        cur_overflow = BitfieldOverflow::Sat;
+                    } else if ow_type.eq_ignore_ascii_case("FAIL") {
+                        cur_overflow = BitfieldOverflow::Fail;
+                    } else {
+                        return Err("Invalid OVERFLOW type specified".to_string());
+                    }
+                    j += 2;
+                    continue;
+                }
+
+                let (is_get, is_set, _is_incrby) = if subcmd.eq_ignore_ascii_case("GET") {
+                    (true, false, false)
+                } else if subcmd.eq_ignore_ascii_case("SET") {
+                    (false, true, false)
+                } else if subcmd.eq_ignore_ascii_case("INCRBY") {
+                    (false, false, true)
+                } else {
+                    return Err("syntax error".to_string());
+                };
+
+                if is_ro && !is_get {
+                    return Err("BITFIELD_RO only supports the GET subcommand".to_string());
+                }
+
+                let required_tokens = if is_get { 3 } else { 4 };
+                if j + required_tokens > args.len() {
+                    return Err("syntax error".to_string());
+                }
+
+                let type_bytes = &args[j + 1];
+                if type_bytes.is_empty() {
+                    return Err("Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.".to_string());
+                }
+                let (sign, bits) = match type_bytes[0] {
+                    b'i' | b'I' => {
+                        let s = std::str::from_utf8(&type_bytes[1..]).map_err(|_| "Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.".to_string())?;
+                        let b: usize = s.parse().map_err(|_| "Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.".to_string())?;
+                        if !(1..=64).contains(&b) {
+                            return Err("Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.".to_string());
+                        }
+                        (true, b)
+                    }
+                    b'u' | b'U' => {
+                        let s = std::str::from_utf8(&type_bytes[1..]).map_err(|_| "Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.".to_string())?;
+                        let b: usize = s.parse().map_err(|_| "Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.".to_string())?;
+                        if !(1..=63).contains(&b) {
+                            return Err("Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.".to_string());
+                        }
+                        (false, b)
+                    }
+                    _ => return Err("Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.".to_string()),
+                };
+
+                let offset_bytes = &args[j + 2];
+                let (use_hash, num_bytes) = if !offset_bytes.is_empty() && offset_bytes[0] == b'#' {
+                    (true, &offset_bytes[1..])
+                } else {
+                    (false, &offset_bytes[..])
+                };
+                let offset_str = std::str::from_utf8(num_bytes)
+                    .map_err(|_| "bit offset is not an integer or out of range".to_string())?;
+                let mut loffset: i64 = offset_str
+                    .parse()
+                    .map_err(|_| "bit offset is not an integer or out of range".to_string())?;
+                if loffset < 0 {
+                    return Err("bit offset is not an integer or out of range".to_string());
+                }
+                if use_hash {
+                    if loffset > (i64::MAX / (bits as i64)) {
+                        return Err("bit offset is not an integer or out of range".to_string());
+                    }
+                    loffset *= bits as i64;
+                }
+                if (loffset as u64 >> 3) >= get_proto_max_bulk_len() as u64 {
+                    return Err("bit offset is not an integer or out of range".to_string());
+                }
+                let offset = loffset as u64;
+
+                let op_type = if is_get {
+                    j += 3;
+                    BitfieldOpType::Get
+                } else if is_set {
+                    let val_str = std::str::from_utf8(&args[j + 3])
+                        .map_err(|_| "value is not an integer or out of range".to_string())?;
+                    let val: i64 = val_str
+                        .parse()
+                        .map_err(|_| "value is not an integer or out of range".to_string())?;
+                    j += 4;
+                    BitfieldOpType::Set(val)
+                } else {
+                    let incr_str = std::str::from_utf8(&args[j + 3])
+                        .map_err(|_| "value is not an integer or out of range".to_string())?;
+                    let incr: i64 = incr_str
+                        .parse()
+                        .map_err(|_| "value is not an integer or out of range".to_string())?;
+                    j += 4;
+                    BitfieldOpType::Incrby(incr)
+                };
+
+                ops.push(BitfieldSubOp {
+                    op_type,
+                    sign,
+                    bits,
+                    offset,
+                    overflow: cur_overflow,
+                });
+            }
+
+            Ok(Some(Command::Bitfield {
+                key,
+                ops,
+                readonly: is_ro,
             }))
         }
         "BITOP" => {
@@ -6079,13 +6286,21 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let destkey = args[2].clone();
             let srckeys = args[3..].to_vec();
             if op == "NOT" && srckeys.len() != 1 {
-                return Err("BITOP NOT takes only one source key".to_string());
+                return Err("BITOP NOT must be called with a single source key.".to_string());
             }
-            Ok(Some(Command::Bitop {
-                op,
-                destkey,
-                srckeys,
-            }))
+            if (op == "DIFF" || op == "DIFF1" || op == "ANDOR") && srckeys.len() < 2 {
+                return Err(format!("BITOP {} requires at least 2 source keys", op));
+            }
+            match op.as_str() {
+                "AND" | "OR" | "XOR" | "NOT" | "DIFF" | "DIFF1" | "ANDOR" | "ONE" => {
+                    Ok(Some(Command::Bitop {
+                        op,
+                        destkey,
+                        srckeys,
+                    }))
+                }
+                _ => Err("syntax error".to_string()),
+            }
         }
         "PFADD" => {
             if args.len() < 2 {
@@ -7774,7 +7989,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let increment: f64 =
                 parse_redis_f64(s).ok_or_else(|| "value is not a valid float".to_string())?;
             if increment.is_nan() || increment.is_infinite() {
-                return Err("value is NaN or Infinity".to_string());
+                return Err("increment would produce NaN or Infinity".to_string());
             }
             Ok(Some(Command::Incrbyfloat {
                 key: args[1].clone(),
@@ -11371,6 +11586,7 @@ mod tests {
                 key: Bytes::from_static(b"mykey"),
                 start: Some(0),
                 end: Some(5),
+                is_bit: false,
             }
         );
 
@@ -11383,6 +11599,7 @@ mod tests {
                 bit: 1,
                 start: Some(2),
                 end: Some(4),
+                is_bit: false,
             }
         );
 

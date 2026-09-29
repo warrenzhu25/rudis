@@ -47,6 +47,9 @@ CORE_SUITES=(
     "unit/type/zset"
     "unit/expire"
     "unit/keyspace"
+    "unit/type/incr"
+    "unit/bitops"
+    "unit/bitfield"
 )
 
 if [ "$SUITE_ARG" = "all-types" ] || [ "$SUITE_ARG" = "all" ]; then
