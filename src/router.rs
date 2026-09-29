@@ -1476,6 +1476,7 @@ impl Router {
             let deleted = db.del(&key);
             if deleted {
                 db.delete_document_local(&String::from_utf8_lossy(&key));
+                crate::connection::notify_keyspace_event_sync(self, crate::connection::NOTIFY_GENERIC, "del", &key);
                 if let Some(aof) = &self.aof
                     && let Some(bytes) = crate::aof::command_to_resp(&Command::Del(smallvec![key]))
                 {

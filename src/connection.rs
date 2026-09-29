@@ -5481,6 +5481,7 @@ async fn execute_command(
         } => {
             let res = router.expire(key.clone(), duration, opts).await;
             if res {
+                notify_keyspace_event_sync(router, NOTIFY_GENERIC, "expire", key.as_ref());
                 if let Some(bytes) = crate::aof::command_to_resp(&Command::Expire {
                     key: key.clone(),
                     duration,
@@ -5497,6 +5498,7 @@ async fn execute_command(
         Command::Persist(key) => {
             let res = router.persist(key.clone()).await;
             if res {
+                notify_keyspace_event_sync(router, NOTIFY_GENERIC, "persist", key.as_ref());
                 if let Some(bytes) = crate::aof::command_to_resp(&Command::Persist(key)) {
                     crate::replication::propagate_bytes(router.port, &bytes);
                 }
@@ -12327,6 +12329,7 @@ pub fn execute_local_command(
             let res = db.expire(key, *duration, *opts);
             if res {
                 record_change!(cmd);
+                notify_keyspace_event(NOTIFY_GENERIC, "expire", key);
                 out.extend_from_slice(b":1\r\n");
             } else {
                 out.extend_from_slice(b":0\r\n");
@@ -12337,6 +12340,7 @@ pub fn execute_local_command(
             let res = db.persist(key);
             if res {
                 record_change!(cmd);
+                notify_keyspace_event(NOTIFY_GENERIC, "persist", key);
                 out.extend_from_slice(b":1\r\n");
             } else {
                 out.extend_from_slice(b":0\r\n");
