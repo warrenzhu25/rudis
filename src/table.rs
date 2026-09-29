@@ -5594,7 +5594,7 @@ impl RudisTable {
             {
                 self.expire_slot(idx);
                 if count.is_some() {
-                    crate::connection::write_resp_array_header(out, 0);
+                    crate::connection::write_resp_null_array(out);
                 } else {
                     crate::connection::write_resp_null(out);
                 }
@@ -5648,7 +5648,7 @@ impl RudisTable {
             Ok(has_written)
         } else {
             if count.is_some() {
-                crate::connection::write_resp_array_header(out, 0);
+                crate::connection::write_resp_null_array(out);
             } else {
                 crate::connection::write_resp_null(out);
             }
@@ -5684,7 +5684,7 @@ impl RudisTable {
             {
                 self.expire_slot(idx);
                 if count.is_some() {
-                    crate::connection::write_resp_array_header(out, 0);
+                    crate::connection::write_resp_null_array(out);
                 } else {
                     crate::connection::write_resp_null(out);
                 }
@@ -5738,7 +5738,7 @@ impl RudisTable {
             Ok(has_written)
         } else {
             if count.is_some() {
-                crate::connection::write_resp_array_header(out, 0);
+                crate::connection::write_resp_null_array(out);
             } else {
                 crate::connection::write_resp_null(out);
             }
@@ -13141,7 +13141,7 @@ mod tests {
             table.write_rpop_resp(key.as_ref(), Some(2), &mut out),
             Ok(false)
         );
-        assert_eq!(out, b"*0\r\n");
+        assert_eq!(out, b"*-1\r\n");
 
         // Push 3 elements: [v1, v2, v3]
         table

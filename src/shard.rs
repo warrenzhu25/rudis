@@ -67,6 +67,23 @@ impl CompactResp {
         ],
     };
 
+    pub const NULL_RESP3: Self = CompactResp::Small {
+        len: 3,
+        data: [
+            b'_', b'\r', b'\n', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0,
+        ],
+    };
+
+    #[inline(always)]
+    pub fn null(is_resp3: bool) -> Self {
+        if is_resp3 {
+            Self::NULL_RESP3
+        } else {
+            Self::NULL
+        }
+    }
+
     pub const EMPTY_ARRAY: Self = CompactResp::Small {
         len: 4,
         data: [

@@ -1833,7 +1833,7 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
                         let (s_start, s_len) = offsets[2];
                         let (m_start, m_len) = offsets[3];
                         if let Ok(score_str) = std::str::from_utf8(&frame[s_start..s_start + s_len])
-                            && let Ok(score) = score_str.parse::<f64>()
+                            && let Some(score) = parse_redis_f64(score_str)
                         {
                             return Ok(Some(Command::Zadd {
                                 key: frame.slice(k_start..k_start + k_len),

@@ -624,10 +624,10 @@ pub fn run_shard_worker(
                                                     if let Some(v) = r.stream_cold_read_local(key).await {
                                                         responder.write_slot(idx, crate::shard::CompactResp::Bulk(v));
                                                     } else {
-                                                        responder.write_slot(idx, crate::shard::CompactResp::NULL);
+                                                        responder.write_slot(idx, crate::shard::CompactResp::null(is_resp3));
                                                     }
                                                 } else {
-                                                    responder.write_slot(idx, crate::shard::CompactResp::NULL);
+                                                    responder.write_slot(idx, crate::shard::CompactResp::null(is_resp3));
                                                 }
                                                 continue;
                                             }
@@ -815,7 +815,7 @@ pub fn run_shard_worker(
                                                     continue;
                                                 }
                                                 Ok(None) => {
-                                                    responder.write_slot(idx, crate::shard::CompactResp::NULL);
+                                                    responder.write_slot(idx, crate::shard::CompactResp::null(is_resp3));
                                                     continue;
                                                 }
                                                 Err(err) => {
@@ -852,7 +852,7 @@ pub fn run_shard_worker(
                                                     continue;
                                                 }
                                                 Ok(None) => {
-                                                    responder.write_slot(idx, crate::shard::CompactResp::NULL);
+                                                    responder.write_slot(idx, crate::shard::CompactResp::null(is_resp3));
                                                     continue;
                                                 }
                                                 Err(err) => {
@@ -959,7 +959,7 @@ pub fn run_shard_worker(
                                             } else {
                                                 responder.write_slot(
                                                     idx,
-                                                    crate::shard::CompactResp::NULL,
+                                                    crate::shard::CompactResp::null(is_resp3),
                                                 );
                                             }
                                             continue;
@@ -1153,7 +1153,7 @@ pub fn run_shard_worker(
                                                 continue;
                                             }
                                             Ok(None) => {
-                                                responder.write_slot(idx, crate::shard::CompactResp::NULL);
+                                                responder.write_slot(idx, crate::shard::CompactResp::null(is_resp3));
                                                 continue;
                                             }
                                             Err(err) => {
@@ -1190,7 +1190,7 @@ pub fn run_shard_worker(
                                                 continue;
                                             }
                                             Ok(None) => {
-                                                responder.write_slot(idx, crate::shard::CompactResp::NULL);
+                                                responder.write_slot(idx, crate::shard::CompactResp::null(is_resp3));
                                                 continue;
                                             }
                                             Err(err) => {
@@ -1284,7 +1284,7 @@ pub fn run_shard_worker(
                                             );
                                         } else {
                                             responder
-                                                .write_slot(idx, crate::shard::CompactResp::NULL);
+                                                .write_slot(idx, crate::shard::CompactResp::null(is_resp3));
                                         }
                                     }
                                     responder.finish(items);

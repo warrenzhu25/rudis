@@ -16856,7 +16856,7 @@ async fn execute_commands_squashed(
                             if is_tiered {
                                 local_cold_gets.push((idx, key.clone()));
                             } else {
-                                responses[idx] = crate::shard::CompactResp::NULL;
+                                responses[idx] = crate::shard::CompactResp::null(is_resp3);
                             }
                             continue;
                         }
@@ -17147,7 +17147,7 @@ async fn execute_commands_squashed(
                                 continue;
                             }
                             Ok(None) => {
-                                responses[idx] = crate::shard::CompactResp::NULL;
+                                responses[idx] = crate::shard::CompactResp::null(is_resp3);
                                 continue;
                             }
                             Err(err) => {
@@ -17254,7 +17254,7 @@ async fn execute_commands_squashed(
                                 continue;
                             }
                             Ok(None) => {
-                                responses[idx] = crate::shard::CompactResp::NULL;
+                                responses[idx] = crate::shard::CompactResp::null(is_resp3);
                                 continue;
                             }
                             Err(err) => {
@@ -17408,7 +17408,7 @@ async fn execute_commands_squashed(
         if let Some(v) = router.stream_cold_read_local(&cold_key).await {
             responses[cold_idx] = CompactResp::Bulk(v);
         } else {
-            responses[cold_idx] = crate::shard::CompactResp::NULL;
+            responses[cold_idx] = crate::shard::CompactResp::null(is_resp3);
         }
     }
 
