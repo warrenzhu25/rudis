@@ -65,6 +65,19 @@ jobs:
             exit 1
           }
 
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Generate Code Coverage & Step Summary
+        run: |
+          ./scripts/generate_coverage.sh
+          if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+            echo "### Code Coverage Report" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cargo llvm-cov report >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Build Optimized Release Binary
         run: cargo build --release
 
