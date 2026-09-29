@@ -301,6 +301,14 @@ impl CompactResp {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ScanParams {
+    pub slot: usize,
+    pub pattern: Option<Bytes>,
+    pub count: usize,
+    pub key_type: Option<Bytes>,
+}
+
 /// Messages passed across CPU cores to access or mutate a shard's data.
 pub enum ShardMessage {
     /// Transfer an accepted connection to a less loaded shard.
@@ -502,9 +510,7 @@ pub enum ShardMessage {
         responder: flume::Sender<Vec<Bytes>>,
     },
     Scan {
-        slot: usize,
-        pattern: Option<Bytes>,
-        count: usize,
+        params: Box<ScanParams>,
         responder: flume::Sender<(usize, Vec<Bytes>)>,
     },
     RandomKey {
@@ -1213,8 +1219,9 @@ impl ShardDb {
         cursor: usize,
         pattern: Option<&[u8]>,
         count: usize,
+        no_values: bool,
     ) -> Result<(usize, Vec<Bytes>), &'static str> {
-        self.table.hscan(key, cursor, pattern, count)
+        self.table.hscan(key, cursor, pattern, count, no_values)
     }
 
     // LIST METHODS
@@ -1567,10 +1574,10 @@ impl ShardDb {
     pub fn sscan(
         &mut self,
         key: &[u8],
-        cursor: usize,
+        cursor: u64,
         pattern: Option<&[u8]>,
         count: usize,
-    ) -> Result<(usize, Vec<Bytes>), &'static str> {
+    ) -> Result<(u64, Vec<Bytes>), &'static str> {
         self.table.sscan(key, cursor, pattern, count)
     }
 
@@ -1905,6 +1912,21 @@ impl ShardDb {
     }
 
     #[inline]
+    pub fn increx(
+        &mut self,
+        key: Bytes,
+        increment: crate::resp::IncrexIncrement,
+        lbound: Option<crate::resp::IncrexBound>,
+        ubound: Option<crate::resp::IncrexBound>,
+        saturate: bool,
+        expire: Option<crate::resp::IncrexExpire>,
+        enx: bool,
+    ) -> Result<crate::table::IncrexOutput, &'static str> {
+        self.table
+            .increx(key, increment, lbound, ubound, saturate, expire, enx)
+    }
+
+    #[inline]
     pub fn setrange(
         &mut self,
         key: Bytes,
@@ -1955,8 +1977,9 @@ impl ShardDb {
         cursor: usize,
         pattern: Option<&[u8]>,
         count: usize,
+        key_type: Option<&[u8]>,
     ) -> (usize, Vec<Bytes>) {
-        self.table.scan(cursor, pattern, count)
+        self.table.scan(cursor, pattern, count, key_type)
     }
 
     #[inline]

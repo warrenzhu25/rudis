@@ -2706,41 +2706,59 @@ impl Router {
         cursor: u64,
         pattern: Option<&[u8]>,
         count: usize,
+        key_type: Option<&[u8]>,
     ) -> (u64, Vec<Bytes>) {
-        let shard_id = (cursor >> 32) as usize;
-        let slot_idx = (cursor & 0xFFFF_FFFF) as usize;
+        let mut shard_id = (cursor >> 32) as usize;
+        let mut slot_idx = (cursor & 0xFFFF_FFFF) as usize;
         if shard_id >= self.num_shards {
             return (0, Vec::new());
         }
 
-        let (next_slot, keys) = if shard_id == self.shard_id {
-            self.local_db.borrow_mut().scan(slot_idx, pattern, count)
-        } else {
-            let (tx, rx) = flume::bounded(1);
-            let msg = ShardMessage::Scan {
-                slot: slot_idx,
-                pattern: pattern.map(Bytes::copy_from_slice),
-                count,
-                responder: tx,
+        let mut all_keys = Vec::new();
+        while shard_id < self.num_shards {
+            let needed = count.saturating_sub(all_keys.len()).max(1);
+            let (next_slot, keys) = if shard_id == self.shard_id {
+                self.local_db
+                    .borrow_mut()
+                    .scan(slot_idx, pattern, needed, key_type)
+            } else {
+                let (tx, rx) = flume::bounded(1);
+                let msg = ShardMessage::Scan {
+                    params: Box::new(crate::shard::ScanParams {
+                        slot: slot_idx,
+                        pattern: pattern.map(Bytes::copy_from_slice),
+                        count: needed,
+                        key_type: key_type.map(Bytes::copy_from_slice),
+                    }),
+                    responder: tx,
+                };
+                if self.senders[shard_id].send(msg).is_ok() {
+                    rx.recv_async().await.unwrap_or((0, Vec::new()))
+                } else {
+                    (0, Vec::new())
+                }
             };
-            if self.senders[shard_id].send(msg).is_ok() {
-                rx.recv_async().await.unwrap_or((0, Vec::new()))
-            } else {
-                (0, Vec::new())
-            }
-        };
 
-        let next_cursor = if next_slot == 0 {
-            if shard_id + 1 < self.num_shards {
-                ((shard_id + 1) as u64) << 32
-            } else {
-                0
-            }
-        } else {
-            ((shard_id as u64) << 32) | (next_slot as u64)
-        };
+            all_keys.extend(keys);
 
-        (next_cursor, keys)
+            if next_slot == 0 {
+                shard_id += 1;
+                slot_idx = 0;
+                if all_keys.len() >= count || shard_id >= self.num_shards {
+                    let next_cursor = if shard_id >= self.num_shards {
+                        0
+                    } else {
+                        (shard_id as u64) << 32
+                    };
+                    return (next_cursor, all_keys);
+                }
+            } else {
+                let next_cursor = ((shard_id as u64) << 32) | (next_slot as u64);
+                return (next_cursor, all_keys);
+            }
+        }
+
+        (0, all_keys)
     }
 
     pub async fn random_key(&self) -> Option<Bytes> {

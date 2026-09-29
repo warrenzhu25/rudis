@@ -43,14 +43,18 @@ CORE_SUITES=(
     "unit/type/string"
     "unit/type/hash"
     "unit/type/list"
+    "unit/type/list-2"
+    "unit/type/list-3"
     "unit/type/list-4"
     "unit/type/set"
     "unit/type/zset"
     "unit/expire"
     "unit/keyspace"
     "unit/type/incr"
+    "unit/type/increx"
     "unit/bitops"
     "unit/bitfield"
+    "unit/scan"
 )
 
 if [ "$SUITE_ARG" = "all-types" ] || [ "$SUITE_ARG" = "all" ]; then
@@ -77,7 +81,7 @@ for suite in "${TARGET_SUITES[@]}"; do
         --singledb \
         --ignore-encoding \
         --ignore-digest \
-        --tags "-needs:repl -needs:debug -needs:config-rewrite" \
+        --tags "-needs:repl -needs:debug -needs:config-rewrite -needs:pfdebug" \
         --clients "$CLIENTS" \
         --single "$suite"; then
         PASSED_SUITES+=("$suite")

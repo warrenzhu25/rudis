@@ -189,6 +189,21 @@ pub struct ClientTracker {
 thread_local! {
     pub static CURRENT_CLIENT_RESP3: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub static IN_TX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub static CURRENT_ROUTER: std::cell::RefCell<Option<std::rc::Rc<Router>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub fn set_current_router(router: std::rc::Rc<Router>) {
+    CURRENT_ROUTER.with(|cr| {
+        *cr.borrow_mut() = Some(router);
+    });
+}
+
+pub fn notify_keyspace_event(event_type: u32, event: &str, key: &[u8]) {
+    CURRENT_ROUTER.with(|cr| {
+        if let Some(router) = cr.borrow().as_ref() {
+            notify_keyspace_event_sync(router, event_type, event, key);
+        }
+    });
 }
 
 #[inline]
@@ -1053,7 +1068,7 @@ pub fn notify_keyspace_event_sync(router: &Router, event_type: u32, event: &str,
                     .presence_table
                     .is_shard_interested(sid, channel.as_bytes())
             {
-                let (tx, _) = router.acquire_pubsub_responder();
+                let (tx, _rx) = flume::bounded(1);
                 let _ = sender.send(ShardMessage::Publish {
                     channel: Bytes::from(channel.clone().into_bytes()),
                     message: Bytes::copy_from_slice(key),
@@ -1074,7 +1089,7 @@ pub fn notify_keyspace_event_sync(router: &Router, event_type: u32, event: &str,
                     .presence_table
                     .is_shard_interested(sid, channel.as_bytes())
             {
-                let (tx, _) = router.acquire_pubsub_responder();
+                let (tx, _rx) = flume::bounded(1);
                 let _ = sender.send(ShardMessage::Publish {
                     channel: Bytes::from(channel.clone().into_bytes()),
                     message: Bytes::from(event.as_bytes().to_vec()),
@@ -1687,7 +1702,7 @@ pub async fn handle_connection(
                 if has_special
                     && let Some(psync_idx) = commands
                         .iter()
-                        .position(|c| matches!(c, Command::Psync { .. }))
+                        .position(|c| matches!(c, Command::Psync { .. } | Command::Sync))
                 {
                     for c in commands.drain(..psync_idx) {
                         let _ = execute_command(
@@ -2503,30 +2518,44 @@ async fn run_master_replica_stream(
     let (mut reader, mut writer) = stream.into_split();
     let (write_tx, write_rx) = flume::unbounded::<Vec<u8>>();
 
-    let (req_replid, req_offset) = match &psync_cmd {
-        Command::Psync { replid, offset } => (std::str::from_utf8(replid).unwrap_or(""), *offset),
-        _ => ("", -1),
-    };
+    let is_sync = matches!(&psync_cmd, Command::Sync);
 
-    let partial = hub.try_partial_resync(client_id, write_tx.clone(), req_replid, req_offset);
-    if let Some((replid, diff, _repl)) = partial {
-        let mut initial_msg = format!("+CONTINUE {}\r\n", replid).into_bytes();
-        initial_msg.extend_from_slice(&diff);
-        if writer.write_all(initial_msg).await.0.is_err() {
-            hub.unregister_replica(client_id);
-            return;
+    if !is_sync {
+        let (req_replid, req_offset) = match &psync_cmd {
+            Command::Psync { replid, offset } => (std::str::from_utf8(replid).unwrap_or(""), *offset),
+            _ => ("", -1),
+        };
+
+        let partial = hub.try_partial_resync(client_id, write_tx.clone(), req_replid, req_offset);
+        if let Some((replid, diff, _repl)) = partial {
+            let mut initial_msg = format!("+CONTINUE {}\r\n", replid).into_bytes();
+            initial_msg.extend_from_slice(&diff);
+            if writer.write_all(initial_msg).await.0.is_err() {
+                hub.unregister_replica(client_id);
+                return;
+            }
+        } else {
+            let rdb = router.generate_full_rdb().await;
+            let _repl = hub.register_replica(client_id, write_tx.clone());
+
+            let replid = hub.master_replid.clone();
+            let offset = hub
+                .master_repl_offset
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let mut initial_msg =
+                format!("+FULLRESYNC {} {}\r\n${}\r\n", replid, offset, rdb.len()).into_bytes();
+            initial_msg.extend_from_slice(&rdb);
+            if writer.write_all(initial_msg).await.0.is_err() {
+                hub.unregister_replica(client_id);
+                return;
+            }
         }
     } else {
         let rdb = router.generate_full_rdb().await;
         let _repl = hub.register_replica(client_id, write_tx.clone());
-
-        let replid = hub.master_replid.clone();
-        let offset = hub
-            .master_repl_offset
-            .load(std::sync::atomic::Ordering::SeqCst);
-        let mut initial_msg =
-            format!("+FULLRESYNC {} {}\r\n${}\r\n", replid, offset, rdb.len()).into_bytes();
+        let mut initial_msg = format!("${}\r\n", rdb.len()).into_bytes();
         initial_msg.extend_from_slice(&rdb);
+        initial_msg.extend_from_slice(b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n");
         if writer.write_all(initial_msg).await.0.is_err() {
             hub.unregister_replica(client_id);
             return;
@@ -2662,7 +2691,7 @@ async fn run_shard_replication_flow(
 pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
     match cmd {
         Command::Exists(keys) => keys.first(),
-        Command::Del(keys) => keys.first(),
+        Command::Del(keys) | Command::Unlink(keys) => keys.first(),
         Command::Sismember { key, .. } => Some(key),
         Command::Sadd { key, .. } => Some(key),
         Command::Hset { key, .. } => Some(key),
@@ -2761,6 +2790,7 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Lpos { key, .. }
         | Command::Linsert { key, .. }
         | Command::Incrbyfloat { key, .. }
+        | Command::Increx { key, .. }
         | Command::Setrange { key, .. }
         | Command::Getrange { key, .. }
         | Command::Vadd { key, .. }
@@ -3005,6 +3035,7 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
         | Command::Lpos { key, .. }
         | Command::Linsert { key, .. }
         | Command::Incrbyfloat { key, .. }
+        | Command::Increx { key, .. }
         | Command::Setrange { key, .. }
         | Command::Getrange { key, .. }
         | Command::Vadd { key, .. }
@@ -3111,7 +3142,7 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
                 f(k.as_ref());
             }
         }
-        Command::Del(keys) | Command::Exists(keys) => {
+        Command::Del(keys) | Command::Unlink(keys) | Command::Exists(keys) => {
             for k in keys {
                 f(k.as_ref());
             }
@@ -3845,6 +3876,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Lcs { .. } => "LCS",
         Command::Digest(_) => "DIGEST",
         Command::Del(_) => "DEL",
+        Command::Unlink(_) => "UNLINK",
         Command::Exists(_) => "EXISTS",
         Command::IncrBy(_, _) => "INCRBY",
         Command::Expire { .. } => "EXPIRE",
@@ -3938,6 +3970,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Zremrangebylex { .. } => "ZREMRANGEBYLEX",
         Command::Zscan { .. } => "ZSCAN",
         Command::Incrbyfloat { .. } => "INCRBYFLOAT",
+        Command::Increx { .. } => "INCREX",
         Command::Setrange { .. } => "SETRANGE",
         Command::Getrange { .. } => "GETRANGE",
         Command::Hello { .. } => "HELLO",
@@ -3969,6 +4002,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Info(_) => "INFO",
         Command::Replicaof { .. } => "REPLICAOF",
         Command::Psync { .. } => "PSYNC",
+        Command::Sync => "SYNC",
         Command::Replconf(_) => "REPLCONF",
         Command::Role => "ROLE",
         Command::Tier(_) => "TIER",
@@ -5123,6 +5157,10 @@ async fn execute_command(
                 } else {
                     out.extend_from_slice(b"+OK\r\n");
                 }
+                notify_keyspace_event_sync(router, NOTIFY_STRING, "set", key.as_ref());
+                if expire_in.is_some() {
+                    notify_keyspace_event_sync(router, NOTIFY_GENERIC, "expire", key.as_ref());
+                }
                 false
             } else {
                 notify_key_invalidation(router.port, key.as_ref(), client_id);
@@ -5133,7 +5171,11 @@ async fn execute_command(
                     && router.aof.is_none()
                     && !crate::replication::has_connected_replicas(router.port)
                 {
-                    router.set(key, value, expire_in).await;
+                    router.set(key.clone(), value, expire_in).await;
+                    notify_keyspace_event_sync(router, NOTIFY_STRING, "set", key.as_ref());
+                    if expire_in.is_some() {
+                        notify_keyspace_event_sync(router, NOTIFY_GENERIC, "expire", key.as_ref());
+                    }
                     out.extend_from_slice(b"+OK\r\n");
                 } else {
                     let resp = router
@@ -5364,6 +5406,29 @@ async fn execute_command(
                 }
                 if crate::replication::has_connected_replicas(router.port)
                     && let Some(bytes) = crate::aof::command_to_resp(&Command::Del(keys))
+                {
+                    crate::replication::propagate_bytes(router.port, &bytes);
+                }
+            }
+            write_resp_integer(out, count as i64);
+            false
+        }
+        Command::Unlink(keys) => {
+            for key in &keys {
+                notify_key_invalidation(router.port, key.as_ref(), client_id);
+            }
+            let count = if keys.len() == 1 {
+                let deleted = router.del(keys[0].clone()).await;
+                if deleted { 1 } else { 0 }
+            } else {
+                router.del_keys(keys.to_vec()).await
+            };
+            if count > 0 {
+                for key in &keys {
+                    crate::search::delete_document_hook(&String::from_utf8_lossy(key));
+                }
+                if crate::replication::has_connected_replicas(router.port)
+                    && let Some(bytes) = crate::aof::command_to_resp(&Command::Unlink(keys))
                 {
                     crate::replication::propagate_bytes(router.port, &bytes);
                 }
@@ -5841,7 +5906,7 @@ async fn execute_command(
             }
             false
         }
-        Command::Psync { .. } => {
+        Command::Psync { .. } | Command::Sync => {
             out.extend_from_slice(b"+OK\r\n");
             false
         }
@@ -6105,6 +6170,18 @@ async fn execute_command(
                     val
                 );
                 out.extend_from_slice(resp.as_bytes());
+            } else if p_str == "lazyfree-lazy-expire" {
+                let val = if crate::table::is_lazyfree_lazy_expire() {
+                    "yes"
+                } else {
+                    "no"
+                };
+                let resp = format!(
+                    "*2\r\n$20\r\nlazyfree-lazy-expire\r\n${}\r\n{}\r\n",
+                    val.len(),
+                    val
+                );
+                out.extend_from_slice(resp.as_bytes());
             } else if p_str == "*" {
                 let max_mem = crate::tiering::get_max_memory(router.port).to_string();
                 let offload = crate::tiering::get_offload_threshold_pct(router.port).to_string();
@@ -6306,6 +6383,10 @@ async fn execute_command(
                 out.extend_from_slice(b"+OK\r\n");
             } else if p_str == "notify-keyspace-events" {
                 set_notify_keyspace_events_str(&val_str);
+                out.extend_from_slice(b"+OK\r\n");
+            } else if p_str == "lazyfree-lazy-expire" {
+                let v = val_str.eq_ignore_ascii_case("yes");
+                crate::table::set_lazyfree_lazy_expire(v);
                 out.extend_from_slice(b"+OK\r\n");
             } else if p_str == "rewrite" {
                 match crate::config::rewrite_config_file(router.port) {
@@ -6984,6 +7065,101 @@ async fn execute_command(
                     let res = router.execute_remote(target, cmd).await;
                     out.extend_from_slice(&res);
                 }
+            }
+            false
+        }
+        Command::Increx {
+            ref key,
+            increment,
+            lbound,
+            ubound,
+            saturate,
+            expire,
+            enx,
+        } => {
+            let target = target_shard(key, router.num_shards);
+            if target == router.shard_id {
+                let mut db = router.local_db.borrow_mut();
+                match db.increx(
+                    key.clone(),
+                    increment,
+                    lbound,
+                    ubound,
+                    saturate,
+                    expire,
+                    enx,
+                ) {
+                    Ok(out_res) => {
+                        let rep_cmd = out_res.rep_cmd.clone();
+                        let events = out_res.events.clone();
+                        let is_float = out_res.is_float;
+                        let val_float = out_res.val_float;
+                        let delta_float = out_res.delta_float;
+                        let val_int = out_res.val_int;
+                        let delta_int = out_res.delta_int;
+                        drop(db);
+
+                        if let Some(rep) = rep_cmd {
+                            DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                for_each_cmd_key(&rep, |k| {
+                                    touch_watched_key(router.port, k);
+                                });
+                            }
+                            let need_aof = router.aof.is_some();
+                            let need_rep = crate::replication::has_connected_replicas(router.port);
+                            if need_aof || need_rep {
+                                if let Some(bytes) = crate::aof::command_to_resp(&rep) {
+                                    if let Some(aof_writer) = router.aof.as_deref() {
+                                        aof_writer.borrow_mut().append(&bytes);
+                                    }
+                                    if need_rep {
+                                        crate::replication::propagate_shard_bytes(
+                                            router.port,
+                                            router.shard_id,
+                                            &bytes,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        for ev in events {
+                            let ev_type = match ev {
+                                "incrby" | "incrbyfloat" => NOTIFY_STRING,
+                                _ => NOTIFY_GENERIC,
+                            };
+                            notify_keyspace_event_sync(router, ev_type, ev, key);
+                        }
+
+                        out.extend_from_slice(b"*2\r\n");
+                        if is_float {
+                            let s_val = val_float.to_string();
+                            out.extend_from_slice(
+                                format!("${}\r\n{}\r\n", s_val.len(), s_val).as_bytes(),
+                            );
+                            let s_delta = delta_float.to_string();
+                            out.extend_from_slice(
+                                format!("${}\r\n{}\r\n", s_delta.len(), s_delta).as_bytes(),
+                            );
+                        } else {
+                            let s_val = val_int.to_string();
+                            out.extend_from_slice(format!(":{}\r\n", s_val).as_bytes());
+                            let s_delta = delta_int.to_string();
+                            out.extend_from_slice(format!(":{}\r\n", s_delta).as_bytes());
+                        }
+                    }
+                    Err(err) => {
+                        if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                            out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                        } else {
+                            write_resp_err(out, err);
+                        }
+                    }
+                }
+            } else {
+                let res = router.execute_remote(target, cmd).await;
+                out.extend_from_slice(&res);
             }
             false
         }
@@ -10172,9 +10348,12 @@ async fn execute_command(
             cursor,
             pattern,
             count,
+            key_type,
         } => {
             let cnt = count.unwrap_or(10);
-            let (next_cursor, keys) = router.scan(cursor, pattern.as_deref(), cnt).await;
+            let (next_cursor, keys) = router
+                .scan(cursor, pattern.as_deref(), cnt, key_type.as_deref())
+                .await;
             let cursor_str = next_cursor.to_string();
             out.extend_from_slice(b"*2\r\n$");
             out.extend_from_slice(cursor_str.len().to_string().as_bytes());
@@ -11345,7 +11524,9 @@ async fn execute_command(
 pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
     match cmd {
         Command::Exists(keys) if keys.len() == 1 => Some(target_shard(&keys[0], num_shards)),
-        Command::Del(keys) if keys.len() == 1 => Some(target_shard(&keys[0], num_shards)),
+        Command::Del(keys) | Command::Unlink(keys) if keys.len() == 1 => {
+            Some(target_shard(&keys[0], num_shards))
+        }
         Command::Sismember { key, .. } => Some(target_shard(key, num_shards)),
         Command::Sadd { key, .. } => Some(target_shard(key, num_shards)),
         Command::Hset { key, .. } => Some(target_shard(key, num_shards)),
@@ -11441,6 +11622,7 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Lpos { key, .. }
         | Command::Linsert { key, .. }
         | Command::Incrbyfloat { key, .. }
+        | Command::Increx { key, .. }
         | Command::Setrange { key, .. }
         | Command::Getrange { key, .. }
         | Command::JsonSet { key, .. }
@@ -11687,7 +11869,7 @@ pub fn target_shard_and_hash_of_cmd(cmd: &Command, num_shards: usize) -> Option<
         Command::Exists(keys) if keys.len() == 1 => {
             Some(crate::router::target_shard_and_hash(&keys[0], num_shards))
         }
-        Command::Del(keys) if keys.len() == 1 => {
+        Command::Del(keys) | Command::Unlink(keys) if keys.len() == 1 => {
             Some(crate::router::target_shard_and_hash(&keys[0], num_shards))
         }
         Command::Sismember { key, .. }
@@ -11904,6 +12086,10 @@ pub fn execute_local_command(
 
             db.set_extended(key.clone(), value.clone(), *expire_in, *keepttl);
             record_change!(cmd);
+            notify_keyspace_event(NOTIFY_STRING, "set", key);
+            if expire_in.is_some() {
+                notify_keyspace_event(NOTIFY_GENERIC, "expire", key);
+            }
 
             if *get {
                 if let Some(v) = current_val {
@@ -12077,13 +12263,14 @@ pub fn execute_local_command(
             out.extend_from_slice(b"\r\n");
             false
         }
-        Command::Del(keys) => {
+        Command::Del(keys) | Command::Unlink(keys) => {
             if keys.len() == 1 {
                 let deleted = db.del(&keys[0]);
                 if deleted {
                     db.delete_document_local(&String::from_utf8_lossy(&keys[0]));
                     crate::search::delete_document_hook(&String::from_utf8_lossy(&keys[0]));
                     record_change!(cmd);
+                    notify_keyspace_event(NOTIFY_GENERIC, "del", &keys[0]);
                     out.extend_from_slice(b":1\r\n");
                 } else {
                     out.extend_from_slice(b":0\r\n");
@@ -12096,6 +12283,7 @@ pub fn execute_local_command(
                     count += 1;
                     db.delete_document_local(&String::from_utf8_lossy(k));
                     crate::search::delete_document_hook(&String::from_utf8_lossy(k));
+                    notify_keyspace_event(NOTIFY_GENERIC, "del", k);
                 }
             }
             if count > 0 {
@@ -13736,9 +13924,15 @@ pub fn execute_local_command(
             cursor,
             pattern,
             count,
+            key_type,
         } => {
             let cnt = count.unwrap_or(10);
-            let (next_cursor, keys) = db.scan(*cursor as usize, pattern.as_deref(), cnt);
+            let (next_cursor, keys) = db.scan(
+                *cursor as usize,
+                pattern.as_deref(),
+                cnt,
+                key_type.as_deref(),
+            );
             let cursor_str = next_cursor.to_string();
             out.extend_from_slice(b"*2\r\n$");
             out.extend_from_slice(cursor_str.len().to_string().as_bytes());
@@ -14514,8 +14708,15 @@ pub fn execute_local_command(
             cursor,
             pattern,
             count,
+            no_values,
         } => {
-            match db.hscan(key, *cursor, pattern.as_deref(), count.unwrap_or(10)) {
+            match db.hscan(
+                key,
+                *cursor,
+                pattern.as_deref(),
+                count.unwrap_or(10),
+                *no_values,
+            ) {
                 Ok((next_cursor, entries)) => {
                     out.extend_from_slice(b"*2\r\n");
                     let cur_str = next_cursor.to_string();
@@ -15080,6 +15281,62 @@ pub fn execute_local_command(
                 Ok(val) => {
                     record_change!(cmd);
                     write_resp_bulk(out, val.to_string().as_bytes());
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        write_resp_err(out, err);
+                    }
+                }
+            }
+            false
+        }
+        Command::Increx {
+            key,
+            increment,
+            lbound,
+            ubound,
+            saturate,
+            expire,
+            enx,
+        } => {
+            match db.increx(
+                key.clone(),
+                *increment,
+                *lbound,
+                *ubound,
+                *saturate,
+                *expire,
+                *enx,
+            ) {
+                Ok(out_res) => {
+                    if let Some(rep) = out_res.rep_cmd {
+                        record_change!(&rep);
+                    }
+                    for ev in out_res.events {
+                        let ev_type = match ev {
+                            "incrby" | "incrbyfloat" => NOTIFY_STRING,
+                            _ => NOTIFY_GENERIC,
+                        };
+                        notify_keyspace_event(ev_type, ev, key);
+                    }
+                    out.extend_from_slice(b"*2\r\n");
+                    if out_res.is_float {
+                        let s_val = out_res.val_float.to_string();
+                        out.extend_from_slice(
+                            format!("${}\r\n{}\r\n", s_val.len(), s_val).as_bytes(),
+                        );
+                        let s_delta = out_res.delta_float.to_string();
+                        out.extend_from_slice(
+                            format!("${}\r\n{}\r\n", s_delta.len(), s_delta).as_bytes(),
+                        );
+                    } else {
+                        let s_val = out_res.val_int.to_string();
+                        out.extend_from_slice(format!(":{}\r\n", s_val).as_bytes());
+                        let s_delta = out_res.delta_int.to_string();
+                        out.extend_from_slice(format!(":{}\r\n", s_delta).as_bytes());
+                    }
                 }
                 Err(err) => {
                     if err.starts_with("ERR") || err.starts_with("WRONGTYPE") {
@@ -17229,6 +17486,7 @@ fn is_special_pipeline_cmd(cmd: &Command) -> bool {
             | Command::Psubscribe(_)
             | Command::Ssubscribe(_)
             | Command::Psync { .. }
+            | Command::Sync
             | Command::DflyFlow { .. }
             | Command::Multi
             | Command::Exec
@@ -17466,6 +17724,7 @@ async fn execute_commands_squashed(
                     }
                 } else if router.aof.is_none()
                     && !crate::replication::has_connected_replicas(router.port)
+                    && NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                     && let Command::Set {
                         key,
                         value,

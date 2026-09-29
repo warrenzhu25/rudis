@@ -111,6 +111,27 @@ pub enum MsetexExpiry {
     ExpireIn(Duration),
 }
 
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum IncrexIncrement {
+    Int(i64),
+    Float(f64),
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum IncrexBound {
+    Int(i64),
+    Float(f64),
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum IncrexExpire {
+    Ex(u64),
+    Px(u64),
+    Exat(u64),
+    Pxat(u64),
+    Persist,
+}
+
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum MemorySubcommand {
     Usage { key: Bytes },
@@ -397,6 +418,7 @@ pub enum Command {
     },
     Digest(Bytes),
     Del(SmallVec<[Bytes; 1]>),
+    Unlink(SmallVec<[Bytes; 1]>),
     Exists(SmallVec<[Bytes; 1]>),
     IncrBy(Bytes, i64),
     Expire {
@@ -720,6 +742,7 @@ pub enum Command {
         replid: Bytes,
         offset: i64,
     },
+    Sync,
     Replconf(Vec<Bytes>),
     Role,
     // LUA SCRIPTING COMMANDS
@@ -771,6 +794,7 @@ pub enum Command {
         cursor: u64,
         pattern: Option<Bytes>,
         count: Option<usize>,
+        key_type: Option<Bytes>,
     },
     Randomkey,
     Expiretime(Bytes, bool),
@@ -957,6 +981,7 @@ pub enum Command {
         cursor: usize,
         pattern: Option<Bytes>,
         count: Option<usize>,
+        no_values: bool,
     },
     Smismember {
         key: Bytes,
@@ -973,7 +998,7 @@ pub enum Command {
     },
     Sscan {
         key: Bytes,
-        cursor: usize,
+        cursor: u64,
         pattern: Option<Bytes>,
         count: Option<usize>,
     },
@@ -1089,6 +1114,15 @@ pub enum Command {
     Incrbyfloat {
         key: Bytes,
         increment: f64,
+    },
+    Increx {
+        key: Bytes,
+        increment: IncrexIncrement,
+        lbound: Option<IncrexBound>,
+        ubound: Option<IncrexBound>,
+        saturate: bool,
+        expire: Option<IncrexExpire>,
+        enx: bool,
     },
     Setrange {
         key: Bytes,
@@ -5463,6 +5497,12 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             };
             Ok(Some(Command::Psync { replid, offset }))
         }
+        "SYNC" => {
+            if args.len() != 1 {
+                return Err("wrong number of arguments for 'sync' command".to_string());
+            }
+            Ok(Some(Command::Sync))
+        }
         "REPLCONF" => {
             if args.len() < 2 {
                 return Err("wrong number of arguments for 'replconf' command".to_string());
@@ -5977,6 +6017,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 .map_err(|_| "value is not an integer or out of range")?;
             let mut pattern = None;
             let mut count = None;
+            let mut key_type = None;
             let mut i = 2;
             while i < args.len() {
                 let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
@@ -6003,6 +6044,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         if i + 1 >= args.len() {
                             return Err("syntax error".to_string());
                         }
+                        key_type = Some(args[i + 1].clone());
                         i += 2;
                     }
                     _ => return Err("syntax error".to_string()),
@@ -6012,6 +6054,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 cursor,
                 pattern,
                 count,
+                key_type,
             }))
         }
         "RANDOMKEY" => {
@@ -7512,6 +7555,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 .map_err(|_| "value is not an integer or out of range".to_string())?;
             let mut pattern = None;
             let mut count = None;
+            let mut no_values = false;
             let mut i = 3;
             while i < args.len() {
                 let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
@@ -7534,6 +7578,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         count = Some(c);
                         i += 2;
                     }
+                    "NOVALUES" => {
+                        no_values = true;
+                        i += 1;
+                    }
                     _ => return Err("syntax error".to_string()),
                 }
             }
@@ -7542,6 +7590,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 cursor,
                 pattern,
                 count,
+                no_values,
             }))
         }
         "SMISMEMBER" => {
@@ -7588,7 +7637,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() < 3 {
                 return Err("wrong number of arguments for 'sscan' command".to_string());
             }
-            let cursor: usize = std::str::from_utf8(&args[2])
+            let cursor: u64 = std::str::from_utf8(&args[2])
                 .map_err(|_| "value is not an integer or out of range".to_string())?
                 .parse()
                 .map_err(|_| "value is not an integer or out of range".to_string())?;
@@ -8144,6 +8193,275 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 key: args[1].clone(),
                 increment,
             }))
+        }
+        "INCREX" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'increx' command".to_string());
+            }
+            let key = args[1].clone();
+            let mut seen_byint = false;
+            let mut seen_byfloat = false;
+            let mut seen_lbound = false;
+            let mut seen_ubound = false;
+            let mut seen_saturate = false;
+            let mut seen_expire = false;
+            let mut seen_persist = false;
+            let mut seen_enx = false;
+
+            let mut byint_val: Option<i64> = None;
+            let mut byfloat_val: Option<f64> = None;
+            let mut lbound_raw: Option<Bytes> = None;
+            let mut ubound_raw: Option<Bytes> = None;
+            let mut expire_opt: Option<IncrexExpire> = None;
+
+            let mut i = 2;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "BYINT" => {
+                        if seen_byint || seen_byfloat {
+                            return Err("syntax error".to_string());
+                        }
+                        seen_byint = true;
+                        i += 1;
+                        if i >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let s = std::str::from_utf8(&args[i])
+                            .map_err(|_| "Increment is not an integer or out of range".to_string())?;
+                        let val = s
+                            .parse::<i64>()
+                            .map_err(|_| "Increment is not an integer or out of range".to_string())?;
+                        byint_val = Some(val);
+                    }
+                    "BYFLOAT" => {
+                        if seen_byint || seen_byfloat {
+                            return Err("syntax error".to_string());
+                        }
+                        seen_byfloat = true;
+                        i += 1;
+                        if i >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let s = std::str::from_utf8(&args[i])
+                            .map_err(|_| "Increment is not a valid float".to_string())?;
+                        if s.eq_ignore_ascii_case("inf")
+                            || s.eq_ignore_ascii_case("+inf")
+                            || s.eq_ignore_ascii_case("-inf")
+                        {
+                            return Err("ERR BYFLOAT increment cannot be Infinity".to_string());
+                        }
+                        let val = parse_redis_f64(s)
+                            .ok_or_else(|| "Increment is not a valid float".to_string())?;
+                        if val.is_nan() || val.is_infinite() {
+                            return Err("Increment is not a valid float".to_string());
+                        }
+                        byfloat_val = Some(val);
+                    }
+                    "LBOUND" => {
+                        if seen_lbound {
+                            return Err("syntax error".to_string());
+                        }
+                        seen_lbound = true;
+                        i += 1;
+                        if i >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        lbound_raw = Some(args[i].clone());
+                    }
+                    "UBOUND" => {
+                        if seen_ubound {
+                            return Err("syntax error".to_string());
+                        }
+                        seen_ubound = true;
+                        i += 1;
+                        if i >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        ubound_raw = Some(args[i].clone());
+                    }
+                    "SATURATE" => {
+                        if seen_saturate {
+                            return Err("syntax error".to_string());
+                        }
+                        seen_saturate = true;
+                    }
+                    "EX" => {
+                        if seen_expire || seen_persist {
+                            return Err("syntax error".to_string());
+                        }
+                        seen_expire = true;
+                        i += 1;
+                        if i >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let s = std::str::from_utf8(&args[i])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        let val = s
+                            .parse::<i64>()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        if val <= 0 {
+                            return Err("invalid expire time in 'increx' command".to_string());
+                        }
+                        expire_opt = Some(IncrexExpire::Ex(val as u64));
+                    }
+                    "PX" => {
+                        if seen_expire || seen_persist {
+                            return Err("syntax error".to_string());
+                        }
+                        seen_expire = true;
+                        i += 1;
+                        if i >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let s = std::str::from_utf8(&args[i])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        let val = s
+                            .parse::<i64>()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        if val <= 0 {
+                            return Err("invalid expire time in 'increx' command".to_string());
+                        }
+                        expire_opt = Some(IncrexExpire::Px(val as u64));
+                    }
+                    "EXAT" => {
+                        if seen_expire || seen_persist {
+                            return Err("syntax error".to_string());
+                        }
+                        seen_expire = true;
+                        i += 1;
+                        if i >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let s = std::str::from_utf8(&args[i])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        let val = s
+                            .parse::<i64>()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        if val <= 0 {
+                            return Err("invalid expire time in 'increx' command".to_string());
+                        }
+                        expire_opt = Some(IncrexExpire::Exat(val as u64));
+                    }
+                    "PXAT" => {
+                        if seen_expire || seen_persist {
+                            return Err("syntax error".to_string());
+                        }
+                        seen_expire = true;
+                        i += 1;
+                        if i >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let s = std::str::from_utf8(&args[i])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        let val = s
+                            .parse::<i64>()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        if val <= 0 {
+                            return Err("invalid expire time in 'increx' command".to_string());
+                        }
+                        expire_opt = Some(IncrexExpire::Pxat(val as u64));
+                    }
+                    "PERSIST" => {
+                        if seen_expire || seen_persist || seen_enx {
+                            return Err("syntax error".to_string());
+                        }
+                        seen_persist = true;
+                        expire_opt = Some(IncrexExpire::Persist);
+                    }
+                    "ENX" => {
+                        if seen_enx || seen_persist {
+                            return Err("syntax error".to_string());
+                        }
+                        seen_enx = true;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+                i += 1;
+            }
+
+            if seen_enx && !seen_expire {
+                return Err("ENX flag requires an expiration".to_string());
+            }
+
+            if seen_byfloat {
+                let increment = IncrexIncrement::Float(byfloat_val.unwrap());
+                let lbound = if let Some(raw) = lbound_raw {
+                    let s = std::str::from_utf8(&raw)
+                        .map_err(|_| "Increment is not a valid float".to_string())?;
+                    let val = parse_redis_f64(s)
+                        .ok_or_else(|| "Increment is not a valid float".to_string())?;
+                    if val.is_nan() || val.is_infinite() {
+                        return Err("Increment is not a valid float".to_string());
+                    }
+                    Some(IncrexBound::Float(val))
+                } else {
+                    None
+                };
+                let ubound = if let Some(raw) = ubound_raw {
+                    let s = std::str::from_utf8(&raw)
+                        .map_err(|_| "Increment is not a valid float".to_string())?;
+                    let val = parse_redis_f64(s)
+                        .ok_or_else(|| "Increment is not a valid float".to_string())?;
+                    if val.is_nan() || val.is_infinite() {
+                        return Err("Increment is not a valid float".to_string());
+                    }
+                    Some(IncrexBound::Float(val))
+                } else {
+                    None
+                };
+                if let (Some(IncrexBound::Float(lb)), Some(IncrexBound::Float(ub))) = (lbound, ubound) {
+                    if lb > ub {
+                        return Err("LBOUND can't be greater than UBOUND".to_string());
+                    }
+                }
+                Ok(Some(Command::Increx {
+                    key,
+                    increment,
+                    lbound,
+                    ubound,
+                    saturate: seen_saturate,
+                    expire: expire_opt,
+                    enx: seen_enx,
+                }))
+            } else {
+                let delta = byint_val.unwrap_or(1);
+                let increment = IncrexIncrement::Int(delta);
+                let lbound = if let Some(raw) = lbound_raw {
+                    let s = std::str::from_utf8(&raw)
+                        .map_err(|_| "value is not an integer or out of range".to_string())?;
+                    let val = s
+                        .parse::<i64>()
+                        .map_err(|_| "value is not an integer or out of range".to_string())?;
+                    Some(IncrexBound::Int(val))
+                } else {
+                    None
+                };
+                let ubound = if let Some(raw) = ubound_raw {
+                    let s = std::str::from_utf8(&raw)
+                        .map_err(|_| "value is not an integer or out of range".to_string())?;
+                    let val = s
+                        .parse::<i64>()
+                        .map_err(|_| "value is not an integer or out of range".to_string())?;
+                    Some(IncrexBound::Int(val))
+                } else {
+                    None
+                };
+                if let (Some(IncrexBound::Int(lb)), Some(IncrexBound::Int(ub))) = (lbound, ubound) {
+                    if lb > ub {
+                        return Err("LBOUND can't be greater than UBOUND".to_string());
+                    }
+                }
+                Ok(Some(Command::Increx {
+                    key,
+                    increment,
+                    lbound,
+                    ubound,
+                    saturate: seen_saturate,
+                    expire: expire_opt,
+                    enx: seen_enx,
+                }))
+            }
         }
         "SETRANGE" => {
             if args.len() != 4 {
@@ -11673,6 +11991,7 @@ mod tests {
                 cursor: 123,
                 pattern: Some(Bytes::from_static(b"pat:*")),
                 count: Some(50),
+                key_type: None,
             }
         );
 
@@ -11989,7 +12308,8 @@ mod tests {
                 key: Bytes::from_static(b"h"),
                 cursor: 0,
                 pattern: Some(Bytes::from_static(b"pat*")),
-                count: Some(20)
+                count: Some(20),
+                no_values: false,
             }
         );
 

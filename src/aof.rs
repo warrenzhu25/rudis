@@ -170,17 +170,33 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             key,
             value,
             expire_in,
+            keepttl,
             ..
         } => {
-            if let Some(dur) = expire_in {
+            if *keepttl {
+                buf.extend_from_slice(format!("*4\r\n$3\r\nSET\r\n${}\r\n", key.len()).as_bytes());
+                buf.extend_from_slice(key);
+                buf.extend_from_slice(format!("\r\n${}\r\n", value.len()).as_bytes());
+                buf.extend_from_slice(value);
+                buf.extend_from_slice(b"\r\n$7\r\nKEEPTTL\r\n");
+            } else if let Some(dur) = expire_in {
                 let ms = dur.as_millis().max(1);
-                let ms_str = ms.to_string();
+                let abs_ms = if ms < 1_000_000_000_000 {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u128;
+                    now_ms + ms
+                } else {
+                    ms
+                };
+                let ms_str = abs_ms.to_string();
                 buf.extend_from_slice(format!("*5\r\n$3\r\nSET\r\n${}\r\n", key.len()).as_bytes());
                 buf.extend_from_slice(key);
                 buf.extend_from_slice(format!("\r\n${}\r\n", value.len()).as_bytes());
                 buf.extend_from_slice(value);
                 buf.extend_from_slice(
-                    format!("\r\n$2\r\nPX\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
+                    format!("\r\n$4\r\nPXAT\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
                 );
             } else {
                 buf.extend_from_slice(format!("*3\r\n$3\r\nSET\r\n${}\r\n", key.len()).as_bytes());
@@ -250,6 +266,15 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
         }
         Command::Del(keys) => {
             buf.extend_from_slice(format!("*{}\r\n$3\r\nDEL\r\n", 1 + keys.len()).as_bytes());
+            for k in keys {
+                buf.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
+                buf.extend_from_slice(k);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
+        Command::Unlink(keys) => {
+            buf.extend_from_slice(format!("*{}\r\n$6\r\nUNLINK\r\n", 1 + keys.len()).as_bytes());
             for k in keys {
                 buf.extend_from_slice(format!("${}\r\n", k.len()).as_bytes());
                 buf.extend_from_slice(k);

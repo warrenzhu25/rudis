@@ -238,6 +238,7 @@ pub fn run_shard_worker(
         r.base_port = base_port;
         r.cluster_enabled = cluster_enabled;
         let router = Rc::new(r);
+        crate::connection::set_current_router(router.clone());
 
         // Active expiration cycle: run every 100ms
         let active_db = local_db.clone();
@@ -450,6 +451,10 @@ pub fn run_shard_worker(
                         cross_shard_db
                             .borrow_mut()
                             .set(descriptor.key.clone(), descriptor.value.clone(), descriptor.expire_in);
+                        crate::connection::notify_keyspace_event_sync(&cross_shard_router, crate::connection::NOTIFY_STRING, "set", &descriptor.key);
+                        if descriptor.expire_in.is_some() {
+                            crate::connection::notify_keyspace_event_sync(&cross_shard_router, crate::connection::NOTIFY_GENERIC, "expire", &descriptor.key);
+                        }
                         cross_shard_router.check_auto_tier_after_write();
                         descriptor.finish();
                     }
@@ -458,6 +463,7 @@ pub fn run_shard_worker(
                         let deleted = db.del(&key);
                         if deleted {
                             db.delete_document_local(&String::from_utf8_lossy(&key));
+                            crate::connection::notify_keyspace_event_sync(&cross_shard_router, crate::connection::NOTIFY_GENERIC, "del", &key);
                             if let Some(aof) = &cross_shard_aof
                                 && let Some(bytes) =
                                     crate::aof::command_to_resp(&crate::resp::Command::Del(smallvec![
@@ -642,6 +648,7 @@ pub fn run_shard_worker(
                                         }
                                     } else if aof_ref.is_none()
                                         && !crate::replication::has_connected_replicas(r.port)
+                                        && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                                         && let Command::Set {
                                             key,
                                             value,
@@ -976,6 +983,7 @@ pub fn run_shard_worker(
                                     }
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
+                                    && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                                     && let Command::Set {
                                         key,
                                         value,
@@ -1635,15 +1643,13 @@ pub fn run_shard_worker(
                         let keys = cross_shard_db.borrow_mut().keys(&pattern);
                         let _ = responder.send(keys);
                     }
-                    ShardMessage::Scan {
-                        slot,
-                        pattern,
-                        count,
-                        responder,
-                    } => {
-                        let res = cross_shard_db
-                            .borrow_mut()
-                            .scan(slot, pattern.as_deref(), count);
+                    ShardMessage::Scan { params, responder } => {
+                        let res = cross_shard_db.borrow_mut().scan(
+                            params.slot,
+                            params.pattern.as_deref(),
+                            params.count,
+                            params.key_type.as_deref(),
+                        );
                         let _ = responder.send(res);
                     }
                     ShardMessage::RandomKey { responder } => {

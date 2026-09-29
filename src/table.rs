@@ -4,6 +4,7 @@ use hashbrown::HashMap;
 
 pub type RudisHashMap = HashMap<Bytes, Bytes, FxBuildHasher>;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use crate::resp::Command;
 
 pub const GROUP_SIZE: usize = 16;
 pub const EMPTY: u8 = 0xFF;
@@ -2333,6 +2334,37 @@ fn check_signed_bitfield_overflow(
     }
 }
 
+pub static LAZYFREE_LAZY_EXPIRE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[inline]
+pub fn set_lazyfree_lazy_expire(val: bool) {
+    LAZYFREE_LAZY_EXPIRE.store(val, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub fn is_lazyfree_lazy_expire() -> bool {
+    LAZYFREE_LAZY_EXPIRE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncrexTtlAction {
+    KeepTtl,
+    Persist,
+    SetPxat(u64),
+}
+
+#[derive(Debug)]
+pub struct IncrexOutput {
+    pub is_float: bool,
+    pub val_int: i64,
+    pub delta_int: i64,
+    pub val_float: f64,
+    pub delta_float: f64,
+    pub rep_cmd: Option<Command>,
+    pub events: smallvec::SmallVec<[&'static str; 2]>,
+}
+
 impl RudisTable {
     pub fn new() -> Self {
         let base_mem = 64 * std::mem::size_of::<Option<RudisEntry>>() + 64 + GROUP_SIZE + 16384 * 4;
@@ -3170,6 +3202,7 @@ impl RudisTable {
         cursor: usize,
         pattern: Option<&[u8]>,
         count: usize,
+        key_type: Option<&[u8]>,
     ) -> (usize, Vec<Bytes>) {
         let bound = self.table.cursor_bound();
         if cursor >= bound || bound == 0 {
@@ -3186,7 +3219,42 @@ impl RudisTable {
                     Some(pat) => crate::pubsub::glob_match(pat, &entry.key),
                     None => true,
                 };
-                if matches {
+                let type_matches = match key_type {
+                    Some(t) => {
+                        let actual_type = match &entry.val {
+                            RudisValue::String(_) | RudisValue::Int(_) => "string",
+                            RudisValue::Hash(_) | RudisValue::SmallHash(_) => "hash",
+                            RudisValue::List(_) => "list",
+                            RudisValue::Set(_) => "set",
+                            RudisValue::ZSet(_) => "zset",
+                            RudisValue::HyperLogLog(_) => "string",
+                            RudisValue::Stream(_) => "stream",
+                            RudisValue::Tiered(ptr) => match ptr.value_type {
+                                0 => "string",
+                                1 => "list",
+                                2 => "set",
+                                3 => "zset",
+                                4 => "hash",
+                                5 => "string",
+                                6 => "stream",
+                                _ => "none",
+                            },
+                            RudisValue::Cooled { val, .. } => match &**val {
+                                RudisValue::String(_) | RudisValue::Int(_) => "string",
+                                RudisValue::Hash(_) | RudisValue::SmallHash(_) => "hash",
+                                RudisValue::List(_) => "list",
+                                RudisValue::Set(_) => "set",
+                                RudisValue::ZSet(_) => "zset",
+                                RudisValue::HyperLogLog(_) => "string",
+                                RudisValue::Stream(_) => "stream",
+                                _ => "none",
+                            },
+                        };
+                        actual_type.as_bytes().eq_ignore_ascii_case(t)
+                    }
+                    None => true,
+                };
+                if matches && type_matches {
                     res.push(entry.key.clone());
                 }
             }
@@ -3836,6 +3904,525 @@ impl RudisTable {
         };
         self.table.insert(entry);
         Ok(delta)
+    }
+
+    pub fn increx(
+        &mut self,
+        key: Bytes,
+        increment: crate::resp::IncrexIncrement,
+        lbound: Option<crate::resp::IncrexBound>,
+        ubound: Option<crate::resp::IncrexBound>,
+        saturate: bool,
+        expire: Option<crate::resp::IncrexExpire>,
+        enx: bool,
+    ) -> Result<IncrexOutput, &'static str> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let now_instant = Instant::now();
+
+        let h = hash_key(&key);
+        let (existing, _) = self.table.find_or_prepare_insert(&key, h);
+
+        let (key_exists, prior_expire_at, existing_slot) = if let Some(idx) = existing {
+            if self.check_expired_slot(idx) {
+                (false, None, None)
+            } else if let Some(entry) = self.table.get_slot(idx) {
+                match &entry.val {
+                    RudisValue::String(_) | RudisValue::Int(_) | RudisValue::HyperLogLog(_) => {
+                        (true, entry.expire_at, Some(idx))
+                    }
+                    _ => {
+                        return Err(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        );
+                    }
+                }
+            } else {
+                (false, None, None)
+            }
+        } else {
+            (false, None, None)
+        };
+
+        match increment {
+            crate::resp::IncrexIncrement::Int(delta) => {
+                let prior_val: i64 = if key_exists {
+                    let entry = self.table.get_slot(existing_slot.unwrap()).unwrap();
+                    match &entry.val {
+                        RudisValue::Int(n) => *n,
+                        RudisValue::String(s) => {
+                            let str_val = std::str::from_utf8(s)
+                                .map_err(|_| "ERR value is not an integer or out of range")?;
+                            str_val
+                                .parse::<i64>()
+                                .map_err(|_| "ERR value is not an integer or out of range")?
+                        }
+                        _ => unreachable!(),
+                    }
+                } else {
+                    0i64
+                };
+
+                let lb_opt = lbound.map(|b| match b {
+                    crate::resp::IncrexBound::Int(n) => n,
+                    _ => unreachable!(),
+                });
+                let ub_opt = ubound.map(|b| match b {
+                    crate::resp::IncrexBound::Int(n) => n,
+                    _ => unreachable!(),
+                });
+
+                let (val, applied_delta) = if saturate {
+                    let unbounded = match prior_val.checked_add(delta) {
+                        Some(v) => v,
+                        None => {
+                            if delta > 0 {
+                                i64::MAX
+                            } else {
+                                i64::MIN
+                            }
+                        }
+                    };
+                    let mut saturated_val = unbounded;
+                    if delta >= 0 {
+                        if let Some(ub) = ub_opt {
+                            saturated_val = saturated_val.min(ub);
+                        }
+                        if let Some(lb) = lb_opt {
+                            saturated_val = saturated_val.max(lb);
+                        }
+                    } else {
+                        if let Some(lb) = lb_opt {
+                            saturated_val = saturated_val.max(lb);
+                        }
+                        if let Some(ub) = ub_opt {
+                            saturated_val = saturated_val.min(ub);
+                        }
+                    }
+                    let ad = saturated_val
+                        .checked_sub(prior_val)
+                        .ok_or("ERR applied increment would overflow")?;
+                    (saturated_val, ad)
+                } else {
+                    let unbounded = prior_val.checked_add(delta);
+                    let is_rejected = match unbounded {
+                        None => true,
+                        Some(v) => {
+                            if let Some(ub) = ub_opt && v > ub {
+                                true
+                            } else if let Some(lb) = lb_opt && v < lb {
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    };
+                    if is_rejected {
+                        let current = if key_exists { prior_val } else { 0 };
+                        return Ok(IncrexOutput {
+                            is_float: false,
+                            val_int: current,
+                            delta_int: 0,
+                            val_float: 0.0,
+                            delta_float: 0.0,
+                            rep_cmd: None,
+                            events: smallvec::SmallVec::new(),
+                        });
+                    }
+                    (unbounded.unwrap(), delta)
+                };
+
+                // Expiration logic
+                let ttl_action;
+                let mut new_expire_at = prior_expire_at;
+                let mut expire_event = None;
+                let mut is_past_expired = false;
+
+                match expire {
+                    Some(crate::resp::IncrexExpire::Persist) => {
+                        if prior_expire_at.is_some() {
+                            expire_event = Some("persist");
+                        }
+                        ttl_action = IncrexTtlAction::Persist;
+                        new_expire_at = None;
+                    }
+                    Some(crate::resp::IncrexExpire::Ex(secs)) => {
+                        if enx && prior_expire_at.is_some() {
+                            ttl_action = IncrexTtlAction::KeepTtl;
+                        } else {
+                            let exp = now_ms.saturating_add(secs.saturating_mul(1000));
+                            new_expire_at = Some(now_instant + Duration::from_secs(secs));
+                            ttl_action = IncrexTtlAction::SetPxat(exp);
+                            expire_event = Some("expire");
+                        }
+                    }
+                    Some(crate::resp::IncrexExpire::Px(ms)) => {
+                        if enx && prior_expire_at.is_some() {
+                            ttl_action = IncrexTtlAction::KeepTtl;
+                        } else {
+                            let exp = now_ms.saturating_add(ms);
+                            new_expire_at = Some(now_instant + Duration::from_millis(ms));
+                            ttl_action = IncrexTtlAction::SetPxat(exp);
+                            expire_event = Some("expire");
+                        }
+                    }
+                    Some(crate::resp::IncrexExpire::Exat(secs)) => {
+                        if enx && prior_expire_at.is_some() {
+                            ttl_action = IncrexTtlAction::KeepTtl;
+                        } else {
+                            let exp = secs.saturating_mul(1000);
+                            if exp <= now_ms {
+                                is_past_expired = true;
+                            } else {
+                                new_expire_at =
+                                    Some(now_instant + Duration::from_millis(exp - now_ms));
+                            }
+                            ttl_action = IncrexTtlAction::SetPxat(exp);
+                            expire_event = Some("expire");
+                        }
+                    }
+                    Some(crate::resp::IncrexExpire::Pxat(ms)) => {
+                        if enx && prior_expire_at.is_some() {
+                            ttl_action = IncrexTtlAction::KeepTtl;
+                        } else {
+                            if ms <= now_ms {
+                                is_past_expired = true;
+                            } else {
+                                new_expire_at =
+                                    Some(now_instant + Duration::from_millis(ms - now_ms));
+                            }
+                            ttl_action = IncrexTtlAction::SetPxat(ms);
+                            expire_event = Some("expire");
+                        }
+                    }
+                    None => {
+                        ttl_action = IncrexTtlAction::KeepTtl;
+                    }
+                }
+
+                if is_past_expired {
+                    if key_exists {
+                        let h = hash_key(&key);
+                        if let Some(idx) = self.table.find(&key, h) {
+                            self.table.remove(idx);
+                        }
+                    }
+                    let rep_cmd = if is_lazyfree_lazy_expire() {
+                        Command::Unlink(smallvec::smallvec![key.clone()])
+                    } else {
+                        Command::Del(smallvec::smallvec![key.clone()])
+                    };
+                    let mut events = smallvec::SmallVec::new();
+                    events.push("del");
+                    return Ok(IncrexOutput {
+                        is_float: false,
+                        val_int: val,
+                        delta_int: applied_delta,
+                        val_float: 0.0,
+                        delta_float: 0.0,
+                        rep_cmd: Some(rep_cmd),
+                        events,
+                    });
+                }
+
+                if let Some(idx) = existing_slot {
+                    let entry = self.table.get_slot_mut(idx).unwrap();
+                    entry.val = RudisValue::Int(val);
+                    entry.expire_at = new_expire_at;
+                } else {
+                    self.table.insert(RudisEntry {
+                        key: key.clone(),
+                        val: RudisValue::Int(val),
+                        expire_at: new_expire_at,
+                    });
+                }
+
+                let mut events = smallvec::SmallVec::new();
+                events.push("incrby");
+                if let Some(ev) = expire_event {
+                    events.push(ev);
+                }
+
+                let rep_val = Bytes::from(val.to_string());
+                let rep_cmd = match ttl_action {
+                    IncrexTtlAction::KeepTtl => Command::Set {
+                        key,
+                        value: rep_val,
+                        expire_in: None,
+                        condition: crate::resp::SetCondition::None,
+                        get: false,
+                        keepttl: true,
+                        past_expired: false,
+                    },
+                    IncrexTtlAction::Persist => Command::Set {
+                        key,
+                        value: rep_val,
+                        expire_in: None,
+                        condition: crate::resp::SetCondition::None,
+                        get: false,
+                        keepttl: false,
+                        past_expired: false,
+                    },
+                    IncrexTtlAction::SetPxat(ms) => Command::Set {
+                        key,
+                        value: rep_val,
+                        expire_in: Some(std::time::Duration::from_millis(ms as u64)),
+                        condition: crate::resp::SetCondition::None,
+                        get: false,
+                        keepttl: false,
+                        past_expired: false,
+                    },
+                };
+
+                Ok(IncrexOutput {
+                    is_float: false,
+                    val_int: val,
+                    delta_int: applied_delta,
+                    val_float: 0.0,
+                    delta_float: 0.0,
+                    rep_cmd: Some(rep_cmd),
+                    events,
+                })
+            }
+            crate::resp::IncrexIncrement::Float(delta) => {
+                let prior_val: f64 = if key_exists {
+                    let entry = self.table.get_slot(existing_slot.unwrap()).unwrap();
+                    match &entry.val {
+                        RudisValue::Int(n) => *n as f64,
+                        RudisValue::String(s) => {
+                            let str_val = std::str::from_utf8(s)
+                                .map_err(|_| "ERR value is not a valid float")?;
+                            if str_val.eq_ignore_ascii_case("inf")
+                                || str_val.eq_ignore_ascii_case("+inf")
+                                || str_val.eq_ignore_ascii_case("-inf")
+                            {
+                                return Err("ERR value cannot be Infinity");
+                            }
+                            str_val
+                                .parse::<f64>()
+                                .map_err(|_| "ERR value is not a valid float")?
+                        }
+                        _ => unreachable!(),
+                    }
+                } else {
+                    0.0f64
+                };
+
+                let lb_opt = lbound.map(|b| match b {
+                    crate::resp::IncrexBound::Float(f) => f,
+                    _ => unreachable!(),
+                });
+                let ub_opt = ubound.map(|b| match b {
+                    crate::resp::IncrexBound::Float(f) => f,
+                    _ => unreachable!(),
+                });
+
+                let (val, applied_delta) = if saturate {
+                    let unbounded = prior_val + delta;
+                    if unbounded.is_nan() || unbounded.is_infinite() {
+                        return Err("ERR increment would produce NaN or Infinity");
+                    }
+                    let mut saturated_val = unbounded;
+                    if delta >= 0.0 {
+                        if let Some(ub) = ub_opt {
+                            saturated_val = saturated_val.min(ub);
+                        }
+                        if let Some(lb) = lb_opt {
+                            saturated_val = saturated_val.max(lb);
+                        }
+                    } else {
+                        if let Some(lb) = lb_opt {
+                            saturated_val = saturated_val.max(lb);
+                        }
+                        if let Some(ub) = ub_opt {
+                            saturated_val = saturated_val.min(ub);
+                        }
+                    }
+                    let ad = saturated_val - prior_val;
+                    (saturated_val, ad)
+                } else {
+                    let unbounded = prior_val + delta;
+                    if unbounded.is_nan() || unbounded.is_infinite() {
+                        return Err("ERR increment would produce NaN or Infinity");
+                    }
+                    let is_rejected = if let Some(ub) = ub_opt && unbounded > ub {
+                        true
+                    } else if let Some(lb) = lb_opt && unbounded < lb {
+                        true
+                    } else {
+                        false
+                    };
+                    if is_rejected {
+                        let current = if key_exists { prior_val } else { 0.0 };
+                        return Ok(IncrexOutput {
+                            is_float: true,
+                            val_int: 0,
+                            delta_int: 0,
+                            val_float: current,
+                            delta_float: 0.0,
+                            rep_cmd: None,
+                            events: smallvec::SmallVec::new(),
+                        });
+                    }
+                    (unbounded, delta)
+                };
+
+                // Expiration logic
+                let ttl_action;
+                let mut new_expire_at = prior_expire_at;
+                let mut expire_event = None;
+                let mut is_past_expired = false;
+
+                match expire {
+                    Some(crate::resp::IncrexExpire::Persist) => {
+                        if prior_expire_at.is_some() {
+                            expire_event = Some("persist");
+                        }
+                        ttl_action = IncrexTtlAction::Persist;
+                        new_expire_at = None;
+                    }
+                    Some(crate::resp::IncrexExpire::Ex(secs)) => {
+                        if enx && prior_expire_at.is_some() {
+                            ttl_action = IncrexTtlAction::KeepTtl;
+                        } else {
+                            let exp = now_ms.saturating_add(secs.saturating_mul(1000));
+                            new_expire_at = Some(now_instant + Duration::from_secs(secs));
+                            ttl_action = IncrexTtlAction::SetPxat(exp);
+                            expire_event = Some("expire");
+                        }
+                    }
+                    Some(crate::resp::IncrexExpire::Px(ms)) => {
+                        if enx && prior_expire_at.is_some() {
+                            ttl_action = IncrexTtlAction::KeepTtl;
+                        } else {
+                            let exp = now_ms.saturating_add(ms);
+                            new_expire_at = Some(now_instant + Duration::from_millis(ms));
+                            ttl_action = IncrexTtlAction::SetPxat(exp);
+                            expire_event = Some("expire");
+                        }
+                    }
+                    Some(crate::resp::IncrexExpire::Exat(secs)) => {
+                        if enx && prior_expire_at.is_some() {
+                            ttl_action = IncrexTtlAction::KeepTtl;
+                        } else {
+                            let exp = secs.saturating_mul(1000);
+                            if exp <= now_ms {
+                                is_past_expired = true;
+                            } else {
+                                new_expire_at =
+                                    Some(now_instant + Duration::from_millis(exp - now_ms));
+                            }
+                            ttl_action = IncrexTtlAction::SetPxat(exp);
+                            expire_event = Some("expire");
+                        }
+                    }
+                    Some(crate::resp::IncrexExpire::Pxat(ms)) => {
+                        if enx && prior_expire_at.is_some() {
+                            ttl_action = IncrexTtlAction::KeepTtl;
+                        } else {
+                            if ms <= now_ms {
+                                is_past_expired = true;
+                            } else {
+                                new_expire_at =
+                                    Some(now_instant + Duration::from_millis(ms - now_ms));
+                            }
+                            ttl_action = IncrexTtlAction::SetPxat(ms);
+                            expire_event = Some("expire");
+                        }
+                    }
+                    None => {
+                        ttl_action = IncrexTtlAction::KeepTtl;
+                    }
+                }
+
+                if is_past_expired {
+                    if key_exists {
+                        let h = hash_key(&key);
+                        if let Some(idx) = self.table.find(&key, h) {
+                            self.table.remove(idx);
+                        }
+                    }
+                    let rep_cmd = if is_lazyfree_lazy_expire() {
+                        Command::Unlink(smallvec::smallvec![key.clone()])
+                    } else {
+                        Command::Del(smallvec::smallvec![key.clone()])
+                    };
+                    let mut events = smallvec::SmallVec::new();
+                    events.push("del");
+                    return Ok(IncrexOutput {
+                        is_float: true,
+                        val_int: 0,
+                        delta_int: 0,
+                        val_float: val,
+                        delta_float: applied_delta,
+                        rep_cmd: Some(rep_cmd),
+                        events,
+                    });
+                }
+
+                let val_str = val.to_string();
+                if let Some(idx) = existing_slot {
+                    let entry = self.table.get_slot_mut(idx).unwrap();
+                    entry.val = RudisValue::String(Bytes::from(val_str.clone()));
+                    entry.expire_at = new_expire_at;
+                } else {
+                    self.table.insert(RudisEntry {
+                        key: key.clone(),
+                        val: RudisValue::String(Bytes::from(val_str.clone())),
+                        expire_at: new_expire_at,
+                    });
+                }
+
+                let mut events = smallvec::SmallVec::new();
+                events.push("incrbyfloat");
+                if let Some(ev) = expire_event {
+                    events.push(ev);
+                }
+
+                let rep_val = Bytes::from(val_str);
+                let rep_cmd = match ttl_action {
+                    IncrexTtlAction::KeepTtl => Command::Set {
+                        key,
+                        value: rep_val,
+                        expire_in: None,
+                        condition: crate::resp::SetCondition::None,
+                        get: false,
+                        keepttl: true,
+                        past_expired: false,
+                    },
+                    IncrexTtlAction::Persist => Command::Set {
+                        key,
+                        value: rep_val,
+                        expire_in: None,
+                        condition: crate::resp::SetCondition::None,
+                        get: false,
+                        keepttl: false,
+                        past_expired: false,
+                    },
+                    IncrexTtlAction::SetPxat(ms) => Command::Set {
+                        key,
+                        value: rep_val,
+                        expire_in: Some(std::time::Duration::from_millis(ms as u64)),
+                        condition: crate::resp::SetCondition::None,
+                        get: false,
+                        keepttl: false,
+                        past_expired: false,
+                    },
+                };
+
+                Ok(IncrexOutput {
+                    is_float: true,
+                    val_int: 0,
+                    delta_int: 0,
+                    val_float: val,
+                    delta_float: applied_delta,
+                    rep_cmd: Some(rep_cmd),
+                    events,
+                })
+            }
+        }
     }
 
     #[inline(always)]
@@ -5593,6 +6180,7 @@ impl RudisTable {
         cursor: usize,
         pattern: Option<&[u8]>,
         count: usize,
+        no_values: bool,
     ) -> Result<(usize, Vec<Bytes>), &'static str> {
         let h = hash_key(key);
         let pairs: Vec<(Bytes, Bytes)> = if let Some(idx) = self.table.find(key, h) {
@@ -5622,7 +6210,8 @@ impl RudisTable {
 
         let mut res = Vec::new();
         let mut idx = cursor;
-        while idx < pairs.len() && res.len() < count * 2 {
+        let limit = if no_values { count } else { count * 2 };
+        while idx < pairs.len() && res.len() < limit {
             let (f, v) = &pairs[idx];
             let matches = match pattern {
                 Some(pat) => crate::pubsub::glob_match(pat, f),
@@ -5630,7 +6219,9 @@ impl RudisTable {
             };
             if matches {
                 res.push(f.clone());
-                res.push(v.clone());
+                if !no_values {
+                    res.push(v.clone());
+                }
             }
             idx += 1;
         }
@@ -7894,39 +8485,53 @@ impl RudisTable {
     pub fn sscan(
         &mut self,
         key: &[u8],
-        cursor: usize,
+        cursor: u64,
         pattern: Option<&[u8]>,
         count: usize,
-    ) -> Result<(usize, Vec<Bytes>), &'static str> {
+    ) -> Result<(u64, Vec<Bytes>), &'static str> {
         let h = hash_key(key);
-        let items: Vec<Bytes> = if let Some(idx) = self.table.find(key, h) {
-            if self.check_expired_slot(idx) {
-                return Ok((0, Vec::new()));
-            }
-            if let Some(entry) = self.table.get_slot(idx) {
-                match &entry.val {
-                    RudisValue::Set(s) => s.to_vec(),
-                    _ => {
-                        return Err(
-                            "WRONGTYPE Operation against a key holding the wrong kind of value",
-                        );
-                    }
+        let idx = match self.table.find(key, h) {
+            Some(i) => {
+                if self.check_expired_slot(i) {
+                    return Ok((0, Vec::new()));
                 }
-            } else {
-                return Ok((0, Vec::new()));
+                i
             }
-        } else {
-            return Ok((0, Vec::new()));
+            None => return Ok((0, Vec::new())),
         };
 
-        if cursor >= items.len() || items.is_empty() {
+        let entry = match self.table.get_slot(idx) {
+            Some(e) => e,
+            None => return Ok((0, Vec::new())),
+        };
+
+        let s = match &entry.val {
+            RudisValue::Set(s) => s,
+            _ => {
+                return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
+            }
+        };
+
+        if s.is_empty() {
             return Ok((0, Vec::new()));
         }
 
+        // Use stable 64-bit hash of each member to guarantee cursor monotonicity
+        // even across concurrent SREM deletions or table shrink/rehash (Redis issue #4906).
+        let mut candidates: Vec<(u64, Bytes)> = Vec::with_capacity(s.len());
+        for m in s.iter() {
+            let eh = xxhash_rust::xxh3::xxh3_64(m).max(1);
+            if cursor == 0 || eh >= cursor {
+                candidates.push((eh, m.clone()));
+            }
+        }
+
+        candidates.sort_unstable_by_key(|(eh, _)| *eh);
+
         let mut res = Vec::new();
-        let mut idx = cursor;
-        while idx < items.len() && res.len() < count {
-            let m = &items[idx];
+        let mut next_cursor = 0u64;
+
+        for (i, (eh, m)) in candidates.iter().enumerate() {
             let matches = match pattern {
                 Some(pat) => crate::pubsub::glob_match(pat, m),
                 None => true,
@@ -7934,9 +8539,17 @@ impl RudisTable {
             if matches {
                 res.push(m.clone());
             }
-            idx += 1;
+            if res.len() >= count {
+                for next_cand in &candidates[i + 1..] {
+                    if next_cand.0 > *eh {
+                        next_cursor = next_cand.0;
+                        break;
+                    }
+                }
+                break;
+            }
         }
-        let next_cursor = if idx >= items.len() { 0 } else { idx };
+
         Ok((next_cursor, res))
     }
 
@@ -13129,7 +13742,7 @@ mod tests {
         assert!(rk.is_some());
 
         // SCAN
-        let (next_cursor, scanned) = table.scan(0, Some(b"alpha:*"), 10);
+        let (next_cursor, scanned) = table.scan(0, Some(b"alpha:*"), 10, None);
         assert_eq!(next_cursor, 0); // Scanned whole small table
         assert_eq!(scanned.len(), 2);
 
