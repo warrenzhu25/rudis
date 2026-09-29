@@ -15851,6 +15851,9 @@ pub fn execute_local_command(
             input,
         } => {
             let res = db.agent_tool_claim(key.clone(), call_id.clone(), *ttl_ms, input.clone());
+            if res.state == crate::agent::ToolClaimState::Claimed {
+                record_change!(cmd);
+            }
             write_resp_array_header(out, 3);
             let status_str = match res.state {
                 crate::agent::ToolClaimState::Claimed => b"CLAIMED" as &[u8],

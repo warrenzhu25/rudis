@@ -2291,6 +2291,179 @@ impl ShardDb {
                 }
             }
         }
+
+        let write_bytes = |b: &mut Vec<u8>, slice: &[u8]| {
+            b.extend_from_slice(&(slice.len() as u32).to_le_bytes());
+            b.extend_from_slice(slice);
+        };
+        let write_opt_bytes = |b: &mut Vec<u8>, opt: Option<&Bytes>| {
+            if let Some(s) = opt {
+                b.push(1u8);
+                write_bytes(b, s);
+            } else {
+                b.push(0u8);
+            }
+        };
+        let write_f32_slice = |b: &mut Vec<u8>, v: &[f32]| {
+            b.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            for &coord in v {
+                b.extend_from_slice(&coord.to_bits().to_le_bytes());
+            }
+        };
+
+        // 9. Semantic caches (SEMANTIC.*)
+        if !self.semantic_caches.is_empty() {
+            let now = std::time::Instant::now();
+            let unix_now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            for (ns, cache) in &self.semantic_caches {
+                #[allow(clippy::type_complexity)]
+                let active_entries: Vec<(
+                    &Bytes,
+                    &crate::vector::SemanticEntry,
+                    std::borrow::Cow<'_, [f32]>,
+                    bool,
+                    u64,
+                )> = cache
+                    .entries
+                    .iter()
+                    .filter_map(|(id, entry)| {
+                        let exp_unix_ms = if let Some(exp) = entry.expire_at {
+                            if exp <= now {
+                                return None;
+                            }
+                            unix_now + exp.duration_since(now).as_millis().max(1) as u64
+                        } else {
+                            0
+                        };
+                        let &node_id = cache.index.key_to_id.get(id)?;
+                        let node = cache.index.nodes.get(node_id)?.as_ref()?;
+                        let vec = cache.index.node_vector_cow(node);
+                        let quantize = node.quantized.is_some();
+                        Some((id, entry, vec, quantize, exp_unix_ms))
+                    })
+                    .collect();
+                if !active_entries.is_empty() || cache.hits > 0 || cache.misses > 0 {
+                    write_bytes(buf, ns);
+                    buf.push(15u8);
+                    buf.extend_from_slice(&(cache.index.dim as u32).to_le_bytes());
+                    buf.extend_from_slice(&cache.hits.to_le_bytes());
+                    buf.extend_from_slice(&cache.misses.to_le_bytes());
+                    buf.extend_from_slice(&cache.tokens_saved.to_le_bytes());
+                    buf.extend_from_slice(&cache.evicted_expired.to_le_bytes());
+                    buf.extend_from_slice(&(active_entries.len() as u32).to_le_bytes());
+                    for (id, entry, vec, quantize, exp_unix_ms) in active_entries {
+                        write_bytes(buf, id);
+                        write_bytes(buf, &entry.prompt);
+                        write_bytes(buf, &entry.response);
+                        write_opt_bytes(buf, entry.scope.as_ref());
+                        buf.extend_from_slice(&exp_unix_ms.to_le_bytes());
+                        buf.extend_from_slice(&entry.tokens.to_le_bytes());
+                        buf.push(u8::from(quantize));
+                        write_f32_slice(buf, &vec);
+                    }
+                }
+            }
+        }
+
+        // 10. Agent memory sessions (AGENT.MEM.*)
+        for (sess_key, session) in &self.agent_memories {
+            write_bytes(buf, sess_key);
+            buf.push(16u8);
+            buf.extend_from_slice(&session.next_turn_id.to_le_bytes());
+            buf.extend_from_slice(&session.active_tokens.to_le_bytes());
+            buf.extend_from_slice(&session.compactions.to_le_bytes());
+            buf.extend_from_slice(&(session.turns.len() as u32).to_le_bytes());
+            for turn in &session.turns {
+                buf.extend_from_slice(&turn.id.to_le_bytes());
+                write_bytes(buf, &turn.role);
+                write_bytes(buf, &turn.content);
+                buf.extend_from_slice(&turn.tokens.to_le_bytes());
+                write_opt_bytes(buf, turn.meta.as_ref());
+                buf.push(u8::from(turn.compacted));
+                let vec_cow = session
+                    .index
+                    .as_ref()
+                    .and_then(|idx| idx.get_vector_cow(&Bytes::from(turn.id.to_string())));
+                if let Some(v) = vec_cow {
+                    write_f32_slice(buf, &v);
+                } else {
+                    buf.extend_from_slice(&0u32.to_le_bytes());
+                }
+            }
+        }
+
+        // 11. Agent DAG checkpoints (AGENT.CHECKPOINT.*)
+        for (ck_key, thread) in &self.agent_checkpoints {
+            let ordered_nodes: Vec<&crate::agent::AgentCheckpointNode> = thread
+                .order
+                .iter()
+                .filter_map(|step_id| thread.nodes.get(step_id))
+                .collect();
+            if !ordered_nodes.is_empty() {
+                write_bytes(buf, ck_key);
+                buf.push(17u8);
+                buf.extend_from_slice(&thread.next_seq.to_le_bytes());
+                write_opt_bytes(buf, thread.head_step_id.as_ref());
+                buf.extend_from_slice(&(ordered_nodes.len() as u32).to_le_bytes());
+                for node in ordered_nodes {
+                    write_bytes(buf, &node.step_id);
+                    write_opt_bytes(buf, node.parent_id.as_ref());
+                    buf.extend_from_slice(&node.seq.to_le_bytes());
+                    buf.extend_from_slice(&node.timestamp_ms.to_le_bytes());
+                    write_bytes(buf, &node.state);
+                    write_opt_bytes(buf, node.metadata.as_ref());
+                }
+            }
+        }
+
+        // 12. Agent tool registries (AGENT.TOOL.*)
+        if !self.agent_tools.is_empty() {
+            let now = std::time::Instant::now();
+            let unix_now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            for (tool_key, reg) in &self.agent_tools {
+                let active_calls: Vec<(&Bytes, &crate::agent::ToolCallEntry, u64, u64)> = reg
+                    .calls
+                    .iter()
+                    .filter_map(|(call_id, entry)| {
+                        let exp_unix_ms = if let Some(exp) = entry.expire_at {
+                            if exp <= now {
+                                return None;
+                            }
+                            unix_now + exp.duration_since(now).as_millis().max(1) as u64
+                        } else {
+                            0
+                        };
+                        let lease_unix_ms = if let Some(lease) = entry.lease_until
+                            && lease > now
+                        {
+                            unix_now + lease.duration_since(now).as_millis().max(1) as u64
+                        } else {
+                            0
+                        };
+                        Some((call_id, entry, lease_unix_ms, exp_unix_ms))
+                    })
+                    .collect();
+                if !active_calls.is_empty() {
+                    write_bytes(buf, tool_key);
+                    buf.push(18u8);
+                    buf.extend_from_slice(&(active_calls.len() as u32).to_le_bytes());
+                    for (call_id, entry, lease_unix_ms, exp_unix_ms) in active_calls {
+                        write_bytes(buf, call_id);
+                        write_opt_bytes(buf, entry.input.as_ref());
+                        write_opt_bytes(buf, entry.output.as_ref());
+                        buf.extend_from_slice(&entry.attempt.to_le_bytes());
+                        buf.extend_from_slice(&lease_unix_ms.to_le_bytes());
+                        buf.extend_from_slice(&exp_unix_ms.to_le_bytes());
+                    }
+                }
+            }
+        }
     }
 
     pub fn restore_rdb_chunk(&mut self, mut data: &[u8]) -> Result<(), &'static str> {
@@ -2638,6 +2811,10 @@ impl ShardDb {
                     let _ = self.table.hdel(&key, &expired_on_disk);
                 }
                 continue;
+            } else if matches!(type_byte, 15..=18) {
+                data = &data[1..];
+                self.restore_ai_native_rdb_record(type_byte, key, &mut data, unix_now, true)?;
+                continue;
             }
 
             let (val, consumed) = crate::table::RudisTable::deserialize_val_payload(data)?;
@@ -2650,6 +2827,249 @@ impl ShardDb {
             });
         }
         Ok(())
+    }
+
+    pub(crate) fn restore_ai_native_rdb_record(
+        &mut self,
+        type_byte: u8,
+        key: Bytes,
+        data: &mut &[u8],
+        unix_now: u64,
+        is_owned: bool,
+    ) -> Result<(), &'static str> {
+        fn read_u8(d: &mut &[u8]) -> Result<u8, &'static str> {
+            if d.is_empty() {
+                return Err("Truncated RDB u8");
+            }
+            let v = d[0];
+            *d = &d[1..];
+            Ok(v)
+        }
+        fn read_u32(d: &mut &[u8]) -> Result<u32, &'static str> {
+            if d.len() < 4 {
+                return Err("Truncated RDB u32");
+            }
+            let v = u32::from_le_bytes(d[0..4].try_into().unwrap());
+            *d = &d[4..];
+            Ok(v)
+        }
+        fn read_u64(d: &mut &[u8]) -> Result<u64, &'static str> {
+            if d.len() < 8 {
+                return Err("Truncated RDB u64");
+            }
+            let v = u64::from_le_bytes(d[0..8].try_into().unwrap());
+            *d = &d[8..];
+            Ok(v)
+        }
+        fn read_bytes(d: &mut &[u8]) -> Result<Bytes, &'static str> {
+            let len = read_u32(d)? as usize;
+            if d.len() < len {
+                return Err("Truncated RDB bytes");
+            }
+            let b = Bytes::copy_from_slice(&d[..len]);
+            *d = &d[len..];
+            Ok(b)
+        }
+        fn read_opt_bytes(d: &mut &[u8]) -> Result<Option<Bytes>, &'static str> {
+            let has = read_u8(d)?;
+            if has != 0 {
+                Ok(Some(read_bytes(d)?))
+            } else {
+                Ok(None)
+            }
+        }
+        fn read_f32_vec(d: &mut &[u8]) -> Result<Vec<f32>, &'static str> {
+            let len = read_u32(d)? as usize;
+            if d.len() < len * 4 {
+                return Err("Truncated RDB f32 vector");
+            }
+            let mut v = Vec::with_capacity(len);
+            for i in 0..len {
+                let bits = u32::from_le_bytes(d[i * 4..(i + 1) * 4].try_into().unwrap());
+                v.push(f32::from_bits(bits));
+            }
+            *d = &d[len * 4..];
+            Ok(v)
+        }
+
+        match type_byte {
+            15 => {
+                let dim = read_u32(data)? as usize;
+                let hits = read_u64(data)?;
+                let misses = read_u64(data)?;
+                let tokens_saved = read_u64(data)?;
+                let mut evicted_expired = read_u64(data)?;
+                let count = read_u32(data)? as usize;
+                if is_owned {
+                    let ns_str = String::from_utf8_lossy(&key).to_string();
+                    self.semantic_caches
+                        .entry(key.clone())
+                        .or_insert_with(|| crate::vector::SemanticCache::new(ns_str, dim.max(1)));
+                }
+                for _ in 0..count {
+                    let id = read_bytes(data)?;
+                    let prompt = read_bytes(data)?;
+                    let response = read_bytes(data)?;
+                    let scope = read_opt_bytes(data)?;
+                    let exp_unix_ms = read_u64(data)?;
+                    let tokens = read_u64(data)?;
+                    let quantize = read_u8(data)? != 0;
+                    let vector = read_f32_vec(data)?;
+                    if !is_owned {
+                        continue;
+                    }
+                    if exp_unix_ms != 0 && exp_unix_ms <= unix_now {
+                        evicted_expired += 1;
+                        continue;
+                    }
+                    let ttl = if exp_unix_ms > unix_now {
+                        Some(std::time::Duration::from_millis(exp_unix_ms - unix_now))
+                    } else {
+                        None
+                    };
+                    let _ = self.semantic_set(
+                        key.clone(),
+                        id,
+                        prompt,
+                        response,
+                        vector,
+                        ttl,
+                        scope,
+                        quantize,
+                        Some(tokens),
+                    );
+                }
+                if is_owned && let Some(cache) = self.semantic_caches.get_mut(&key) {
+                    cache.hits = hits;
+                    cache.misses = misses;
+                    cache.tokens_saved = tokens_saved;
+                    cache.evicted_expired = evicted_expired;
+                }
+                Ok(())
+            }
+            16 => {
+                let next_turn_id = read_u64(data)?;
+                let active_tokens = read_u64(data)?;
+                let compactions = read_u64(data)?;
+                let turns_len = read_u32(data)? as usize;
+                let sess_str = String::from_utf8_lossy(&key).to_string();
+                let mut session = crate::agent::AgentMemorySession::new(sess_str.clone());
+                session.next_turn_id = next_turn_id;
+                session.active_tokens = active_tokens;
+                session.compactions = compactions;
+                for pos in 0..turns_len {
+                    let id = read_u64(data)?;
+                    let role = read_bytes(data)?;
+                    let content = read_bytes(data)?;
+                    let tokens = read_u64(data)?;
+                    let meta = read_opt_bytes(data)?;
+                    let compacted = read_u8(data)? != 0;
+                    let vec = read_f32_vec(data)?;
+                    if !is_owned {
+                        continue;
+                    }
+                    if !vec.is_empty() {
+                        let idx = session.index.get_or_insert_with(|| {
+                            crate::vector::HnswIndex::new(
+                                sess_str.clone(),
+                                vec.len(),
+                                crate::vector::VectorMetric::Cosine,
+                            )
+                        });
+                        let _ = idx.add(Bytes::from(id.to_string()), vec);
+                    }
+                    session.turns.push(crate::agent::AgentTurn {
+                        id,
+                        role,
+                        content,
+                        tokens,
+                        meta,
+                        compacted,
+                    });
+                    session.id_to_pos.insert(id, pos);
+                }
+                if is_owned {
+                    self.agent_memories.insert(key, session);
+                }
+                Ok(())
+            }
+            17 => {
+                let next_seq = read_u64(data)?;
+                let head_step_id = read_opt_bytes(data)?;
+                let nodes_len = read_u32(data)? as usize;
+                let mut thread = crate::agent::AgentCheckpointThread::new();
+                thread.next_seq = next_seq;
+                thread.head_step_id = head_step_id;
+                for _ in 0..nodes_len {
+                    let step_id = read_bytes(data)?;
+                    let parent_id = read_opt_bytes(data)?;
+                    let seq = read_u64(data)?;
+                    let timestamp_ms = read_u64(data)?;
+                    let state = read_bytes(data)?;
+                    let metadata = read_opt_bytes(data)?;
+                    if !is_owned {
+                        continue;
+                    }
+                    thread.order.push(step_id.clone());
+                    thread.nodes.insert(
+                        step_id.clone(),
+                        crate::agent::AgentCheckpointNode {
+                            step_id,
+                            parent_id,
+                            seq,
+                            timestamp_ms,
+                            state,
+                            metadata,
+                        },
+                    );
+                }
+                if is_owned {
+                    self.agent_checkpoints.insert(key, thread);
+                }
+                Ok(())
+            }
+            18 => {
+                let calls_len = read_u32(data)? as usize;
+                let now = std::time::Instant::now();
+                let mut reg = crate::agent::AgentToolRegistry::new();
+                for _ in 0..calls_len {
+                    let call_id = read_bytes(data)?;
+                    let input = read_opt_bytes(data)?;
+                    let output = read_opt_bytes(data)?;
+                    let attempt = read_u64(data)?;
+                    let lease_unix_ms = read_u64(data)?;
+                    let exp_unix_ms = read_u64(data)?;
+                    if !is_owned || (exp_unix_ms != 0 && exp_unix_ms <= unix_now) {
+                        continue;
+                    }
+                    let lease_until = if lease_unix_ms > unix_now {
+                        Some(now + std::time::Duration::from_millis(lease_unix_ms - unix_now))
+                    } else {
+                        None
+                    };
+                    let expire_at = if exp_unix_ms > unix_now {
+                        Some(now + std::time::Duration::from_millis(exp_unix_ms - unix_now))
+                    } else {
+                        None
+                    };
+                    reg.calls.insert(
+                        call_id,
+                        crate::agent::ToolCallEntry {
+                            input,
+                            output,
+                            attempt,
+                            lease_until,
+                            expire_at,
+                        },
+                    );
+                }
+                if is_owned && !reg.calls.is_empty() {
+                    self.agent_tools.insert(key, reg);
+                }
+                Ok(())
+            }
+            _ => Err("Unknown AI-native RDB record type"),
+        }
     }
 
     #[inline]

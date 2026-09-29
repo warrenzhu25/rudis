@@ -496,18 +496,18 @@ pub struct ToolClaimResult {
 }
 
 #[derive(Debug, Clone)]
-struct ToolCallEntry {
-    input: Option<Bytes>,
-    output: Option<Bytes>,
-    attempt: u64,
-    lease_until: Option<std::time::Instant>,
-    expire_at: Option<std::time::Instant>,
+pub(crate) struct ToolCallEntry {
+    pub(crate) input: Option<Bytes>,
+    pub(crate) output: Option<Bytes>,
+    pub(crate) attempt: u64,
+    pub(crate) lease_until: Option<std::time::Instant>,
+    pub(crate) expire_at: Option<std::time::Instant>,
 }
 
 /// Idempotent tool-call lease & result deduplication registry (`AGENT.TOOL.*`).
 #[derive(Debug, Clone, Default)]
 pub struct AgentToolRegistry {
-    calls: hashbrown::HashMap<Bytes, ToolCallEntry>,
+    pub(crate) calls: hashbrown::HashMap<Bytes, ToolCallEntry>,
 }
 
 impl AgentToolRegistry {

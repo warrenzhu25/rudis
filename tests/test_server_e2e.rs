@@ -13580,3 +13580,318 @@ fn test_nvme_tiered_vector_and_rerank_e2e() {
         vq_resp
     );
 }
+
+#[test]
+fn test_ai_native_durability_and_replication_e2e() {
+    let primary_port = 19160;
+    let replica_port = 19161;
+    let cold_port = 19162;
+    let data_dir =
+        std::env::temp_dir().join(format!("rudis-ai-durability-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    let _ = std::fs::create_dir_all(&data_dir);
+
+    start_test_server_with_aof(
+        primary_port,
+        2,
+        rudis::aof::AofConfig {
+            enabled: true,
+            dir: data_dir.clone(),
+            fsync_every_sec: false,
+        },
+    );
+    start_test_server(replica_port, 2);
+
+    let mut primary = TcpStream::connect(("127.0.0.1", primary_port)).unwrap();
+    let mut replica = TcpStream::connect(("127.0.0.1", replica_port)).unwrap();
+    primary
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    replica
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    // 1. Pre-populate AI-native state on primary before replica connects
+    assert_eq!(
+        send_and_read(
+            &mut primary,
+            &format_resp_cmd(&[
+                "SEMANTIC.SET",
+                "llm:e2e",
+                "q_init",
+                "What is Rudis?",
+                "Rudis is an AI-native data store.",
+                "VECTOR",
+                "3",
+                "1.0",
+                "0.0",
+                "0.0",
+                "SCOPE",
+                "org:alpha",
+                "TOKENS",
+                "20",
+            ]),
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut primary,
+            &format_resp_cmd(&[
+                "AGENT.MEM.ADD",
+                "sess:e2e",
+                "user",
+                "Remember launch code 9911.",
+                "TOKENS",
+                "6",
+                "VEC",
+                "3",
+                "1.0",
+                "0.0",
+                "0.0",
+            ]),
+        ),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut primary,
+            &format_resp_cmd(&[
+                "AGENT.CHECKPOINT.PUT",
+                "ckpt:e2e",
+                "step1",
+                "STATE",
+                r#"{"stage":"init"}"#,
+            ]),
+        ),
+        ":1\r\n"
+    );
+
+    // 2. Connect replica via REPLICAOF and wait for full-resync RDB transfer
+    assert_eq!(
+        send_and_read(
+            &mut replica,
+            format!("REPLICAOF 127.0.0.1 {}\r\n", primary_port).as_bytes(),
+        ),
+        "+OK\r\n"
+    );
+    for _ in 0..40 {
+        let role = send_and_read(&mut replica, b"ROLE\r\n");
+        if role.contains("slave") && role.contains("connected") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // Verify full-resync RDB restored AI state on replica
+    let rep_sem = send_and_read(
+        &mut replica,
+        &format_resp_cmd(&[
+            "SEMANTIC.GET",
+            "llm:e2e",
+            "THRESHOLD",
+            "0.90",
+            "VECTOR",
+            "3",
+            "1.0",
+            "0.0",
+            "0.0",
+            "SCOPE",
+            "org:alpha",
+        ]),
+    );
+    assert!(
+        rep_sem.contains("Rudis is an AI-native data store."),
+        "Replica should serve SEMANTIC.GET after RDB full-resync: {}",
+        rep_sem
+    );
+
+    // 3. Write live AI-native mutations on primary and verify incremental replication + BGREWRITEAOF + SAVE
+    assert_eq!(
+        send_and_read(
+            &mut primary,
+            &format_resp_cmd(&[
+                "AGENT.MEM.COMPACT",
+                "sess:e2e",
+                "KEEP_RECENT",
+                "0",
+                "SUMMARY",
+                "User shared launch code.",
+                "TOKENS",
+                "5",
+                "VEC",
+                "3",
+                "0.5",
+                "0.5",
+                "0.0",
+            ]),
+        ),
+        ":1\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut primary,
+            &format_resp_cmd(&[
+                "AGENT.MEM.ADD",
+                "sess:e2e",
+                "user",
+                "Ready for liftoff.",
+                "TOKENS",
+                "4",
+                "VEC",
+                "3",
+                "0.0",
+                "1.0",
+                "0.0",
+            ]),
+        ),
+        ":3\r\n"
+    );
+    assert_eq!(
+        send_and_read(
+            &mut primary,
+            &format_resp_cmd(&[
+                "AGENT.CHECKPOINT.PUT",
+                "ckpt:e2e",
+                "step2",
+                "PARENT",
+                "step1",
+                "STATE",
+                r#"{"stage":"ready"}"#,
+            ]),
+        ),
+        ":2\r\n"
+    );
+    let claim_resp = send_and_read(
+        &mut primary,
+        &format_resp_cmd(&[
+            "AGENT.TOOL.CLAIM",
+            "tools:e2e",
+            "call:1",
+            "TTL",
+            "60000",
+            "INPUT",
+            r#"{"fn":"deploy"}"#,
+        ]),
+    );
+    assert!(
+        claim_resp.contains("CLAIMED"),
+        "Expected CLAIMED response: {}",
+        claim_resp
+    );
+    assert_eq!(
+        send_and_read(
+            &mut primary,
+            &format_resp_cmd(&[
+                "AGENT.TOOL.COMPLETE",
+                "tools:e2e",
+                "call:1",
+                "OUTPUT",
+                r#"{"ok":true}"#,
+                "TTL",
+                "60000",
+            ]),
+        ),
+        ":1\r\n"
+    );
+
+    // Wait for incremental replication to reach replica
+    for _ in 0..40 {
+        let hist = send_and_read(
+            &mut replica,
+            &format_resp_cmd(&["AGENT.CHECKPOINT.HISTORY", "ckpt:e2e"]),
+        );
+        if hist.contains("step2") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let rep_ctx = send_and_read(
+        &mut replica,
+        &format_resp_cmd(&[
+            "AGENT.MEM.CONTEXT",
+            "sess:e2e",
+            "MAX_TOKENS",
+            "100",
+            "QUERY",
+            "3",
+            "1.0",
+            "0.0",
+            "0.0",
+            "RECALL",
+            "2",
+        ]),
+    );
+    assert!(
+        rep_ctx.contains("User shared launch code.")
+            && rep_ctx.contains("Ready for liftoff.")
+            && rep_ctx.contains("Remember launch code 9911."),
+        "Replica should have compacted working window and recalled episode: {}",
+        rep_ctx
+    );
+
+    // 4. Compact AOF and save RDB on primary, then verify cold-start restore
+    let bg_resp = send_and_read(&mut primary, b"BGREWRITEAOF\r\n");
+    assert!(
+        bg_resp.starts_with('+'),
+        "BGREWRITEAOF response: {}",
+        bg_resp
+    );
+    let mut save_ok = false;
+    for _ in 0..40 {
+        let save_resp = send_and_read(&mut primary, b"SAVE\r\n");
+        if save_resp == "+OK\r\n" {
+            save_ok = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    assert!(save_ok, "SAVE did not succeed after BGREWRITEAOF");
+
+    start_test_server_with_aof(
+        cold_port,
+        2,
+        rudis::aof::AofConfig {
+            enabled: false,
+            dir: data_dir.clone(),
+            fsync_every_sec: false,
+        },
+    );
+    let mut cold = TcpStream::connect(("127.0.0.1", cold_port)).unwrap();
+    cold.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let cold_ctx = send_and_read(
+        &mut cold,
+        &format_resp_cmd(&[
+            "AGENT.MEM.CONTEXT",
+            "sess:e2e",
+            "MAX_TOKENS",
+            "100",
+            "QUERY",
+            "3",
+            "1.0",
+            "0.0",
+            "0.0",
+            "RECALL",
+            "2",
+        ]),
+    );
+    assert!(
+        cold_ctx.contains("User shared launch code.")
+            && cold_ctx.contains("Ready for liftoff.")
+            && cold_ctx.contains("Remember launch code 9911."),
+        "Cold-start server should restore AGENT.MEM state from RDB: {}",
+        cold_ctx
+    );
+    let cold_tool = send_and_read(
+        &mut cold,
+        &format_resp_cmd(&["AGENT.TOOL.CLAIM", "tools:e2e", "call:1"]),
+    );
+    assert!(
+        cold_tool.contains("COMPLETED") && cold_tool.contains(r#"{"ok":true}"#),
+        "Cold-start server should restore completed tool call from RDB: {}",
+        cold_tool
+    );
+
+    let _ = std::fs::remove_dir_all(&data_dir);
+}

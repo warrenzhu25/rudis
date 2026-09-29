@@ -11361,7 +11361,8 @@ pub fn load_rdb_bytes(
                 break;
             }
             let metric_byte = data[cursor];
-            let metric = match metric_byte {
+            let has_vset_ext = (metric_byte & 0x80) != 0;
+            let metric = match metric_byte & 0x07 {
                 0 => crate::vector::VectorMetric::Cosine,
                 1 => crate::vector::VectorMetric::L2,
                 _ => crate::vector::VectorMetric::IP,
@@ -11382,7 +11383,54 @@ pub fn load_rdb_bytes(
                 vector.push(f32::from_bits(bits));
             }
             cursor += vec_len * 4;
-            if crate::router::target_shard(&doc_key, num_shards) == shard_id {
+            let is_owned = crate::router::target_shard(idx_name.as_bytes(), num_shards) == shard_id;
+            if has_vset_ext {
+                if cursor + 10 > content_len {
+                    break;
+                }
+                let vset_flags = data[cursor];
+                let is_redis_vset = (vset_flags & 0x01) != 0;
+                let quantize = (vset_flags & 0x02) != 0;
+                let pq = (vset_flags & 0x04) != 0;
+                let tiered = (vset_flags & 0x08) != 0;
+                let quant = match data[cursor + 1] {
+                    0 => crate::vector::VQuant::NoQuant,
+                    1 => crate::vector::VQuant::Q8,
+                    _ => crate::vector::VQuant::Bin,
+                };
+                let m =
+                    u32::from_le_bytes(data[cursor + 2..cursor + 6].try_into().unwrap()) as usize;
+                let attr_len =
+                    u32::from_le_bytes(data[cursor + 6..cursor + 10].try_into().unwrap()) as usize;
+                cursor += 10;
+                if cursor + attr_len > content_len {
+                    break;
+                }
+                let setattr = if attr_len > 0 {
+                    Some(String::from_utf8_lossy(&data[cursor..cursor + attr_len]).to_string())
+                } else {
+                    None
+                };
+                cursor += attr_len;
+                if is_owned {
+                    let _ = db.vadd_ext(
+                        &idx_name,
+                        doc_key,
+                        vector,
+                        Some(metric),
+                        quantize,
+                        pq,
+                        tiered,
+                        None,
+                        Some(quant),
+                        None,
+                        setattr,
+                        Some(m),
+                        is_redis_vset,
+                    );
+                    count += 1;
+                }
+            } else if is_owned {
                 let _ = db.vadd(
                     &idx_name,
                     doc_key,
@@ -11561,6 +11609,22 @@ pub fn load_rdb_bytes(
             }
             if is_owned && !expired_on_disk.is_empty() {
                 let _ = db.table.hdel(&key, &expired_on_disk);
+            }
+            continue;
+        } else if matches!(type_byte, 15..=18) {
+            cursor += 1;
+            let is_owned = crate::router::target_shard(&key, num_shards) == shard_id;
+            let mut slice = &data[cursor..content_len];
+            let before_len = slice.len();
+            if db
+                .restore_ai_native_rdb_record(type_byte, key, &mut slice, unix_now, is_owned)
+                .is_err()
+            {
+                break;
+            }
+            cursor += before_len - slice.len();
+            if is_owned {
+                count += 1;
             }
             continue;
         }

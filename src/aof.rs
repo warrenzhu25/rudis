@@ -1494,6 +1494,31 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             Some(buf)
         }
+        Command::AgentToolClaim {
+            key,
+            call_id,
+            ttl_ms,
+            input,
+        } => {
+            let mut args: Vec<Vec<u8>> = vec![
+                b"AGENT.TOOL.CLAIM".to_vec(),
+                key.to_vec(),
+                call_id.to_vec(),
+                b"TTL".to_vec(),
+                ttl_ms.to_string().into_bytes(),
+            ];
+            if let Some(inp) = input {
+                args.push(b"INPUT".to_vec());
+                args.push(inp.to_vec());
+            }
+            buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+            for a in args {
+                buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                buf.extend_from_slice(&a);
+                buf.extend_from_slice(b"\r\n");
+            }
+            Some(buf)
+        }
         Command::AgentToolComplete {
             key,
             call_id,
@@ -1945,6 +1970,169 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
         }
     }
 
+    // 4. Snapshot Semantic Caches (SEMANTIC.*)
+    for (ns, cache) in &db.semantic_caches {
+        for (id, entry) in &cache.entries {
+            if let Some(exp) = entry.expire_at
+                && exp <= now
+            {
+                continue;
+            }
+            let ttl = entry
+                .expire_at
+                .map(|exp| exp.saturating_duration_since(now));
+            if let Some(&node_id) = cache.index.key_to_id.get(id)
+                && let Some(Some(node)) = cache.index.nodes.get(node_id)
+            {
+                let cmd = Command::SemanticSet {
+                    namespace: ns.clone(),
+                    id: id.clone(),
+                    prompt: entry.prompt.clone(),
+                    response: entry.response.clone(),
+                    vector: cache.index.node_vector_cow(node).into_owned(),
+                    ttl,
+                    scope: entry.scope.clone(),
+                    quantize: node.quantized.is_some(),
+                    tokens: Some(entry.tokens),
+                };
+                if let Some(resp) = command_to_resp(&cmd) {
+                    writer.write_all(&resp)?;
+                    count += 1;
+                }
+            }
+        }
+    }
+
+    // 5. Snapshot Agent Memory Sessions (AGENT.MEM.*)
+    for (sess_key, session) in &db.agent_memories {
+        let get_turn_vec = |turn_id: u64| -> Option<Vec<f32>> {
+            session
+                .index
+                .as_ref()
+                .and_then(|idx| idx.get_vector_cow(&bytes::Bytes::from(turn_id.to_string())))
+                .map(|c| c.into_owned())
+        };
+        let has_compacted = session.turns.iter().any(|t| t.compacted);
+        if has_compacted {
+            for turn in session.turns.iter().filter(|t| t.compacted) {
+                let cmd = Command::AgentMemAdd {
+                    session: sess_key.clone(),
+                    role: turn.role.clone(),
+                    content: turn.content.clone(),
+                    tokens: Some(turn.tokens),
+                    vector: get_turn_vec(turn.id),
+                    meta: turn.meta.clone(),
+                };
+                if let Some(resp) = command_to_resp(&cmd) {
+                    writer.write_all(&resp)?;
+                    count += 1;
+                }
+            }
+            let mut active_iter = session.turns.iter().filter(|t| !t.compacted);
+            if let Some(summary_turn) = active_iter.next() {
+                let compact_cmd = Command::AgentMemCompact {
+                    session: sess_key.clone(),
+                    keep_recent: 0,
+                    summary: summary_turn.content.clone(),
+                    tokens: Some(summary_turn.tokens),
+                    vector: get_turn_vec(summary_turn.id),
+                };
+                if let Some(resp) = command_to_resp(&compact_cmd) {
+                    writer.write_all(&resp)?;
+                    count += 1;
+                }
+                for turn in active_iter {
+                    let cmd = Command::AgentMemAdd {
+                        session: sess_key.clone(),
+                        role: turn.role.clone(),
+                        content: turn.content.clone(),
+                        tokens: Some(turn.tokens),
+                        vector: get_turn_vec(turn.id),
+                        meta: turn.meta.clone(),
+                    };
+                    if let Some(resp) = command_to_resp(&cmd) {
+                        writer.write_all(&resp)?;
+                        count += 1;
+                    }
+                }
+            }
+        } else {
+            for turn in &session.turns {
+                let cmd = Command::AgentMemAdd {
+                    session: sess_key.clone(),
+                    role: turn.role.clone(),
+                    content: turn.content.clone(),
+                    tokens: Some(turn.tokens),
+                    vector: get_turn_vec(turn.id),
+                    meta: turn.meta.clone(),
+                };
+                if let Some(resp) = command_to_resp(&cmd) {
+                    writer.write_all(&resp)?;
+                    count += 1;
+                }
+            }
+        }
+    }
+
+    // 6. Snapshot Agent Checkpoints (AGENT.CHECKPOINT.*)
+    for (ck_key, thread) in &db.agent_checkpoints {
+        for step_id in &thread.order {
+            if let Some(node) = thread.nodes.get(step_id) {
+                let cmd = Command::AgentCheckpointPut {
+                    key: ck_key.clone(),
+                    step_id: node.step_id.clone(),
+                    parent_id: node.parent_id.clone(),
+                    state: node.state.clone(),
+                    meta: node.metadata.clone(),
+                };
+                if let Some(resp) = command_to_resp(&cmd) {
+                    writer.write_all(&resp)?;
+                    count += 1;
+                }
+            }
+        }
+    }
+
+    // 7. Snapshot Agent Tool Registries (AGENT.TOOL.*)
+    for (tool_key, reg) in &db.agent_tools {
+        for (call_id, entry) in &reg.calls {
+            if let Some(exp) = entry.expire_at
+                && exp <= now
+            {
+                continue;
+            }
+            if let Some(ref output) = entry.output {
+                let ttl_ms = entry
+                    .expire_at
+                    .map(|exp| exp.saturating_duration_since(now).as_millis().max(1) as u64);
+                let cmd = Command::AgentToolComplete {
+                    key: tool_key.clone(),
+                    call_id: call_id.clone(),
+                    output: output.clone(),
+                    ttl_ms,
+                };
+                if let Some(resp) = command_to_resp(&cmd) {
+                    writer.write_all(&resp)?;
+                    count += 1;
+                }
+            } else if let Some(lease_until) = entry.lease_until
+                && lease_until > now
+            {
+                let rem_ms = lease_until.duration_since(now).as_millis().max(1) as u64;
+                let cmd = Command::AgentToolClaim {
+                    key: tool_key.clone(),
+                    call_id: call_id.clone(),
+                    ttl_ms: rem_ms,
+                    input: entry.input.clone(),
+                };
+                if let Some(resp) = command_to_resp(&cmd) {
+                    writer.write_all(&resp)?;
+                    count += 1;
+                }
+            }
+        }
+    }
+
     writer.flush()?;
     let file = writer.into_inner().map_err(|e| e.into_error())?;
     file.sync_all()?;
@@ -2266,6 +2454,187 @@ mod tests {
             restored_aof.vgetattr("movies", &Bytes::from("m1")).unwrap(),
             Some(r#"{"genre":"action","year":2001}"#.to_string())
         );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_rdb_and_aof_ai_native_state_persistence() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("rudis-ai-persist-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let mut db = ShardDb::new(6379);
+
+        // 1. Populate Semantic Cache
+        db.semantic_set(
+            Bytes::from("llm:prod"),
+            Bytes::from("q1"),
+            Bytes::from("What is Rudis?"),
+            Bytes::from("Rudis is a thread-per-core AI-native data platform."),
+            vec![1.0, 0.0, 0.0],
+            Some(Duration::from_secs(3600)),
+            Some(Bytes::from("tenant:acme")),
+            false,
+            Some(42),
+        )
+        .unwrap();
+
+        // 2. Populate Agent Memory (with compaction + episodic vectors)
+        db.agent_mem_add(
+            Bytes::from("sess:agent1"),
+            Bytes::from("user"),
+            Bytes::from(" Secret code is 7788."),
+            Some(8),
+            Some(vec![1.0, 0.0, 0.0]),
+            Some(Bytes::from(r#"{"turn":1}"#)),
+        )
+        .unwrap();
+        db.agent_mem_add(
+            Bytes::from("sess:agent1"),
+            Bytes::from("assistant"),
+            Bytes::from("Understood, I stored 7788."),
+            Some(8),
+            Some(vec![0.9, 0.1, 0.0]),
+            None,
+        )
+        .unwrap();
+        let compacted = db
+            .agent_mem_compact(
+                &Bytes::from("sess:agent1"),
+                0,
+                Bytes::from("User shared secret code."),
+                Some(6),
+                Some(vec![0.5, 0.5, 0.0]),
+            )
+            .unwrap();
+        assert_eq!(compacted, 2);
+        db.agent_mem_add(
+            Bytes::from("sess:agent1"),
+            Bytes::from("user"),
+            Bytes::from("Now help me deploy."),
+            Some(5),
+            Some(vec![0.0, 1.0, 0.0]),
+            None,
+        )
+        .unwrap();
+
+        // 3. Populate Agent Checkpoints (DAG lineage)
+        db.agent_checkpoint_put(
+            Bytes::from("thread:wf1"),
+            Bytes::from("step1"),
+            None,
+            Bytes::from(r#"{"phase":"plan"}"#),
+            Some(Bytes::from(r#"{"agent":"planner"}"#)),
+        );
+        db.agent_checkpoint_put(
+            Bytes::from("thread:wf1"),
+            Bytes::from("step2"),
+            Some(Bytes::from("step1")),
+            Bytes::from(r#"{"phase":"act"}"#),
+            Some(Bytes::from(r#"{"agent":"executor"}"#)),
+        );
+
+        // 4. Populate Agent Tool Registry (one completed, one in-flight lease)
+        let claim_done = db.agent_tool_claim(
+            Bytes::from("tools:wf1"),
+            Bytes::from("call:done"),
+            60_000,
+            Some(Bytes::from(r#"{"q":"weather"}"#)),
+        );
+        assert_eq!(claim_done.state, crate::agent::ToolClaimState::Claimed);
+        db.agent_tool_complete(
+            Bytes::from("tools:wf1"),
+            Bytes::from("call:done"),
+            Bytes::from(r#"{"temp":72}"#),
+            Some(3_600_000),
+        );
+        let claim_inflight = db.agent_tool_claim(
+            Bytes::from("tools:wf1"),
+            Bytes::from("call:inflight"),
+            60_000,
+            Some(Bytes::from(r#"{"q":"search"}"#)),
+        );
+        assert_eq!(claim_inflight.state, crate::agent::ToolClaimState::Claimed);
+
+        let verify_restored = |target: &mut ShardDb| {
+            // Verify Semantic Cache
+            let hit = target
+                .semantic_get(
+                    &Bytes::from("llm:prod"),
+                    &[1.0, 0.0, 0.0],
+                    0.95,
+                    Some(b"tenant:acme"),
+                )
+                .unwrap()
+                .expect("semantic cache hit expected");
+            assert_eq!(hit.id, Bytes::from("q1"));
+            assert_eq!(
+                hit.response,
+                Bytes::from("Rudis is a thread-per-core AI-native data platform.")
+            );
+
+            // Verify Agent Memory working window + episodic recall
+            let ctx = target
+                .agent_mem_context(&Bytes::from("sess:agent1"), 100, Some(&[1.0, 0.0, 0.0]), 2)
+                .unwrap();
+            assert_eq!(ctx.recent_turns.len(), 2);
+            assert_eq!(
+                ctx.recent_turns[0].content,
+                Bytes::from("User shared secret code.")
+            );
+            assert_eq!(
+                ctx.recent_turns[1].content,
+                Bytes::from("Now help me deploy.")
+            );
+            assert!(!ctx.recalled_episodes.is_empty());
+            assert_eq!(
+                ctx.recalled_episodes[0].content,
+                Bytes::from(" Secret code is 7788.")
+            );
+
+            // Verify Agent Checkpoint DAG history
+            let history = target.agent_checkpoint_history(&Bytes::from("thread:wf1"), None, 10);
+            assert_eq!(history.len(), 2);
+            assert_eq!(history[0].step_id, Bytes::from("step2"));
+            assert_eq!(history[0].parent_id, Some(Bytes::from("step1")));
+            assert_eq!(history[1].step_id, Bytes::from("step1"));
+
+            // Verify Agent Tool Registry (completed & in-flight)
+            let check_done = target.agent_tool_claim(
+                Bytes::from("tools:wf1"),
+                Bytes::from("call:done"),
+                30_000,
+                None,
+            );
+            assert_eq!(check_done.state, crate::agent::ToolClaimState::Completed);
+            assert_eq!(check_done.output, Some(Bytes::from(r#"{"temp":72}"#)));
+
+            let check_inflight = target.agent_tool_claim(
+                Bytes::from("tools:wf1"),
+                Bytes::from("call:inflight"),
+                30_000,
+                None,
+            );
+            assert_eq!(
+                check_inflight.state,
+                crate::agent::ToolClaimState::InProgress
+            );
+        };
+
+        // Test 1: RDB chunk save & restore round-trip
+        let mut rdb_chunk = Vec::new();
+        db.save_rdb_chunk(&mut rdb_chunk);
+        let mut rdb_restored = ShardDb::new(6379);
+        rdb_restored.restore_rdb_chunk(&rdb_chunk).unwrap();
+        verify_restored(&mut rdb_restored);
+
+        // Test 2: AOF rewrite & replay round-trip
+        rewrite_shard_aof(&mut db, &temp_dir, 0).unwrap();
+        let aof_file = temp_dir.join("appendonly-0.aof");
+        let mut aof_restored = ShardDb::new(6379);
+        replay_aof(&aof_file, &mut aof_restored).unwrap();
+        verify_restored(&mut aof_restored);
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
