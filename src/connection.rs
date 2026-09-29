@@ -18447,4 +18447,77 @@ mod tests {
         assert!(std::str::from_utf8(&out).unwrap().contains("1000-0"));
         out.clear();
     }
+
+    #[test]
+    fn test_client_tracking_invalidation_and_watch_flow() {
+        let port = 21001;
+        let (tx, rx) = flume::bounded::<Vec<u8>>(10);
+        register_client_tracking(port, 100, false, vec![], tx, false);
+        record_client_read(port, 100, b"my_tracked_key");
+
+        // Invalidate from another client
+        notify_key_invalidation(port, b"my_tracked_key", 101);
+        let msg = rx.try_recv().expect("should receive invalidation");
+        assert!(std::str::from_utf8(&msg).unwrap().contains("my_tracked_key"));
+
+        unregister_client_tracking(port, 100);
+
+        // Watch keys test
+        let watch_port = 21002;
+        watch_keys(watch_port, 200, &[Bytes::from("watched_k1")]);
+        assert!(!is_watch_tainted(watch_port, 200));
+
+        touch_watched_key(watch_port, b"watched_k1");
+        assert!(is_watch_tainted(watch_port, 200));
+
+        unwatch_keys(watch_port, 200);
+        assert!(!is_watch_tainted(watch_port, 200));
+    }
+
+    #[test]
+    fn test_resp_formatting_and_limit_bytes() {
+        // format_score
+        assert_eq!(format_score(1.5), "1.5");
+        assert_eq!(format_score(f64::NAN), "nan");
+        assert_eq!(format_score(f64::INFINITY), "inf");
+        assert_eq!(format_score(f64::NEG_INFINITY), "-inf");
+
+        // parse_limit_bytes
+        assert_eq!(parse_limit_bytes("1gb"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_limit_bytes("2mb"), Some(2 * 1024 * 1024));
+        assert_eq!(parse_limit_bytes("4kb"), Some(4 * 1024));
+        assert_eq!(parse_limit_bytes("500b"), Some(500));
+        assert_eq!(parse_limit_bytes("100"), Some(100));
+        assert_eq!(parse_limit_bytes("invalid"), None);
+
+        // max clients and memory policy
+        set_max_clients(5000);
+        assert_eq!(get_max_clients(), 5000);
+
+        set_max_memory_policy("allkeys-lru");
+        assert_eq!(get_max_memory_policy(), "allkeys-lru");
+        set_max_memory_policy("volatile-random");
+        assert_eq!(get_max_memory_policy(), "volatile-random");
+
+        // write_resp primitives
+        let mut out = Vec::new();
+        write_resp_integer(&mut out, -42);
+        assert_eq!(out, b":-42\r\n");
+
+        out.clear();
+        write_resp_bulk(&mut out, b"hello_world");
+        assert_eq!(out, b"$11\r\nhello_world\r\n");
+
+        out.clear();
+        write_resp_err(&mut out, "custom error");
+        assert_eq!(out, b"-ERR custom error\r\n");
+
+        out.clear();
+        format_zmpop_response(&mut out, &Bytes::from("zk"), &[(Bytes::from("m1"), 10.0)]);
+        assert!(out.starts_with(b"*2\r\n"));
+
+        out.clear();
+        format_bzpop_response(&mut out, &Bytes::from("zk"), &Bytes::from("m1"), 10.0);
+        assert!(out.starts_with(b"*3\r\n"));
+    }
 }
