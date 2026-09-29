@@ -6786,6 +6786,180 @@ impl RudisTable {
         Ok(Some(val))
     }
 
+    pub fn lmovem(
+        &mut self,
+        source: &[u8],
+        destination: Bytes,
+        where_from: ListDirection,
+        where_to: ListDirection,
+        mode: crate::resp::LmovemMode,
+        count: usize,
+        ordering: crate::resp::LmovemOrdering,
+    ) -> Result<Option<Vec<Bytes>>, &'static str> {
+        let samekey = source == destination.as_ref();
+
+        // 1. Destination type check (if exists)
+        let h_dst = hash_key(&destination);
+        if let Some(dst_idx) = self.table.find(&destination, h_dst)
+            && !self.check_expired_slot(dst_idx)
+            && let Some(entry) = self.table.get_slot(dst_idx)
+            && !matches!(entry.val, RudisValue::List(_))
+        {
+            return Err("WRONGTYPE Operation against a key holding the wrong kind of value");
+        }
+
+        // 2. Source lookup
+        let h_src = hash_key(source);
+        let src_idx = match self.table.find(source, h_src) {
+            Some(idx) => {
+                if self.check_expired_slot(idx) {
+                    return Ok(None);
+                }
+                idx
+            }
+            None => return Ok(None),
+        };
+
+        let srclen = match self.table.get_slot(src_idx) {
+            Some(entry) => match &entry.val {
+                RudisValue::List(deque) => deque.len(),
+                _ => {
+                    return Err(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
+                }
+            },
+            None => return Ok(None),
+        };
+
+        let tomove = match mode {
+            crate::resp::LmovemMode::Exactly => {
+                if srclen < count {
+                    return Ok(None);
+                }
+                count
+            }
+            crate::resp::LmovemMode::Count => {
+                let m = count.min(srclen);
+                if m == 0 {
+                    return Ok(None);
+                }
+                m
+            }
+        };
+
+        if samekey {
+            let mut vals = Vec::with_capacity(tomove);
+            if let Some(entry) = self.table.get_slot_mut(src_idx)
+                && let RudisValue::List(deque) = &mut entry.val
+            {
+                for _ in 0..tomove {
+                    let elem = match where_from {
+                        ListDirection::Left => deque.pop_front(),
+                        ListDirection::Right => deque.pop_back(),
+                    };
+                    if let Some(v) = elem {
+                        vals.push(v);
+                    }
+                }
+                let should_reverse = match ordering {
+                    crate::resp::LmovemOrdering::Obo => where_to == ListDirection::Left,
+                    crate::resp::LmovemOrdering::Bulk => where_from == ListDirection::Right,
+                };
+                if should_reverse {
+                    vals.reverse();
+                }
+                match where_to {
+                    ListDirection::Left => {
+                        for v in vals.iter().rev() {
+                            deque.push_front(v.clone());
+                        }
+                    }
+                    ListDirection::Right => {
+                        for v in &vals {
+                            deque.push_back(v.clone());
+                        }
+                    }
+                }
+                return Ok(Some(vals));
+            }
+            return Ok(None);
+        }
+
+        // Distinct keys
+        let mut vals = Vec::with_capacity(tomove);
+        let src_is_empty = {
+            let entry = self.table.get_slot_mut(src_idx).unwrap();
+            let deque = match &mut entry.val {
+                RudisValue::List(d) => d,
+                _ => unreachable!(),
+            };
+            for _ in 0..tomove {
+                let elem = match where_from {
+                    ListDirection::Left => deque.pop_front(),
+                    ListDirection::Right => deque.pop_back(),
+                };
+                if let Some(v) = elem {
+                    vals.push(v);
+                }
+            }
+            deque.is_empty()
+        };
+
+        if src_is_empty {
+            self.table.remove(src_idx);
+        }
+
+        let should_reverse = match ordering {
+            crate::resp::LmovemOrdering::Obo => where_to == ListDirection::Left,
+            crate::resp::LmovemOrdering::Bulk => where_from == ListDirection::Right,
+        };
+        if should_reverse {
+            vals.reverse();
+        }
+
+        let h_dst = hash_key(&destination);
+        let (existing, _) = self.table.find_or_prepare_insert(&destination, h_dst);
+        if let Some(dst_idx) = existing
+            && !self.check_expired_slot(dst_idx)
+            && let Some(entry) = self.table.get_slot_mut(dst_idx)
+        {
+            match &mut entry.val {
+                RudisValue::List(deque) => {
+                    match where_to {
+                        ListDirection::Left => {
+                            for v in vals.iter().rev() {
+                                deque.push_front(v.clone());
+                            }
+                        }
+                        ListDirection::Right => {
+                            for v in &vals {
+                                deque.push_back(v.clone());
+                            }
+                        }
+                    }
+                    return Ok(Some(vals));
+                }
+                _ => {
+                    return Err(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
+                }
+            }
+        }
+
+        let mut deque = std::collections::VecDeque::with_capacity(vals.len());
+        for v in &vals {
+            deque.push_back(v.clone());
+        }
+        self.table.insert(RudisEntry {
+            key: destination,
+            val: RudisValue::List(deque),
+            expire_at: None,
+        });
+        Ok(Some(vals))
+    }
+
     // SET METHODS
     #[inline(always)]
     pub fn sadd_slice_fast(

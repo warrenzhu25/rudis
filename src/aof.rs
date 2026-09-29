@@ -1120,6 +1120,68 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             );
             Some(buf)
         }
+        Command::Lmovem {
+            source,
+            destination,
+            where_from,
+            where_to,
+            mode,
+            count,
+            ordering,
+            raw_tokens,
+        } => {
+            let (from_s, to_s, mode_s, order_s) = if let Some(tokens) = raw_tokens {
+                (
+                    &tokens[0][..],
+                    &tokens[1][..],
+                    &tokens[2][..],
+                    &tokens[3][..],
+                )
+            } else {
+                let from_s = match where_from {
+                    crate::table::ListDirection::Left => b"left".as_slice(),
+                    crate::table::ListDirection::Right => b"right".as_slice(),
+                };
+                let to_s = match where_to {
+                    crate::table::ListDirection::Left => b"left".as_slice(),
+                    crate::table::ListDirection::Right => b"right".as_slice(),
+                };
+                let mode_s = match mode {
+                    crate::resp::LmovemMode::Count => b"COUNT".as_slice(),
+                    crate::resp::LmovemMode::Exactly => b"EXACTLY".as_slice(),
+                };
+                let order_s = match ordering {
+                    crate::resp::LmovemOrdering::Obo => b"OBO".as_slice(),
+                    crate::resp::LmovemOrdering::Bulk => b"BULK".as_slice(),
+                };
+                (from_s, to_s, mode_s, order_s)
+            };
+            let count_s = count.to_string();
+            buf.extend_from_slice(
+                format!("*8\r\n$6\r\nLMOVEM\r\n${}\r\n", source.len()).as_bytes(),
+            );
+            buf.extend_from_slice(source);
+            buf.extend_from_slice(format!("\r\n${}\r\n", destination.len()).as_bytes());
+            buf.extend_from_slice(destination);
+            buf.extend_from_slice(format!("\r\n${}\r\n", from_s.len(),).as_bytes());
+            buf.extend_from_slice(from_s);
+            buf.extend_from_slice(format!("\r\n${}\r\n", to_s.len(),).as_bytes());
+            buf.extend_from_slice(to_s);
+            buf.extend_from_slice(format!("\r\n${}\r\n", mode_s.len(),).as_bytes());
+            buf.extend_from_slice(mode_s);
+            buf.extend_from_slice(
+                format!(
+                    "\r\n${}\r\n{}\r\n${}\r\n",
+                    count_s.len(),
+                    count_s,
+                    order_s.len(),
+                )
+                .as_bytes(),
+            );
+            buf.extend_from_slice(order_s);
+            buf.extend_from_slice(b"\r\n");
+            Some(buf)
+        }
         Command::Incrbyfloat { key, increment } => {
             let s = increment.to_string();
             buf.extend_from_slice(

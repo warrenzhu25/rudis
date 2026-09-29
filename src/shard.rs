@@ -1408,6 +1408,28 @@ impl ShardDb {
         self.table.lmove(source, destination, where_from, where_to)
     }
 
+    #[inline]
+    pub fn lmovem(
+        &mut self,
+        source: &[u8],
+        destination: Bytes,
+        where_from: crate::table::ListDirection,
+        where_to: crate::table::ListDirection,
+        mode: crate::resp::LmovemMode,
+        count: usize,
+        ordering: crate::resp::LmovemOrdering,
+    ) -> Result<Option<Vec<Bytes>>, &'static str> {
+        self.table.lmovem(
+            source,
+            destination,
+            where_from,
+            where_to,
+            mode,
+            count,
+            ordering,
+        )
+    }
+
     // SET METHODS
     #[inline(always)]
     pub fn sadd_slice_fast(

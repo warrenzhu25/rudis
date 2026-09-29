@@ -289,6 +289,18 @@ pub struct BitfieldSubOp {
     pub overflow: BitfieldOverflow,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LmovemMode {
+    Count,
+    Exactly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LmovemOrdering {
+    Obo,
+    Bulk,
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum Command {
     Object(ObjectSubcommand),
@@ -1042,6 +1054,26 @@ pub enum Command {
         where_from: crate::table::ListDirection,
         where_to: crate::table::ListDirection,
         timeout: f64,
+    },
+    Lmovem {
+        source: Bytes,
+        destination: Bytes,
+        where_from: crate::table::ListDirection,
+        where_to: crate::table::ListDirection,
+        mode: LmovemMode,
+        count: usize,
+        ordering: LmovemOrdering,
+        raw_tokens: Option<[Bytes; 4]>,
+    },
+    Blmovem {
+        source: Bytes,
+        destination: Bytes,
+        where_from: crate::table::ListDirection,
+        where_to: crate::table::ListDirection,
+        timeout: f64,
+        mode: LmovemMode,
+        count: usize,
+        ordering: LmovemOrdering,
     },
     Lmpop {
         keys: Vec<Bytes>,
@@ -2094,6 +2126,36 @@ fn parse_inline_command(buf: &mut BytesMut) -> Result<Option<Command>, String> {
     }
 
     build_command(parts)
+}
+
+fn parse_lmovem_trailer(args: &[Bytes]) -> Result<(LmovemMode, usize, LmovemOrdering), String> {
+    if args.is_empty() {
+        return Ok((LmovemMode::Count, 1, LmovemOrdering::Bulk));
+    }
+    if args.len() != 3 {
+        return Err("syntax error".to_string());
+    }
+    let mode_str = String::from_utf8_lossy(&args[0]).to_uppercase();
+    let mode = match mode_str.as_str() {
+        "COUNT" => LmovemMode::Count,
+        "EXACTLY" => LmovemMode::Exactly,
+        _ => return Err("syntax error".to_string()),
+    };
+    let count_str =
+        std::str::from_utf8(&args[1]).map_err(|_| "count should be greater than 0".to_string())?;
+    let count_num: i64 = count_str
+        .parse()
+        .map_err(|_| "count should be greater than 0".to_string())?;
+    if count_num <= 0 {
+        return Err("count should be greater than 0".to_string());
+    }
+    let order_str = String::from_utf8_lossy(&args[2]).to_uppercase();
+    let ordering = match order_str.as_str() {
+        "OBO" => LmovemOrdering::Obo,
+        "BULK" => LmovemOrdering::Bulk,
+        _ => return Err("syntax error".to_string()),
+    };
+    Ok((mode, count_num as usize, ordering))
 }
 
 pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
@@ -7885,6 +7947,93 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 where_from,
                 where_to,
                 timeout,
+            }))
+        }
+        "LMOVEM" => {
+            if args.len() < 5 {
+                return Err("wrong number of arguments for 'lmovem' command".to_string());
+            }
+            if args.len() != 5 && args.len() != 8 {
+                return Err("syntax error".to_string());
+            }
+            let from_str = String::from_utf8_lossy(&args[3]).to_uppercase();
+            let where_from = match from_str.as_str() {
+                "LEFT" => crate::table::ListDirection::Left,
+                "RIGHT" => crate::table::ListDirection::Right,
+                _ => return Err("syntax error".to_string()),
+            };
+            let to_str = String::from_utf8_lossy(&args[4]).to_uppercase();
+            let where_to = match to_str.as_str() {
+                "LEFT" => crate::table::ListDirection::Left,
+                "RIGHT" => crate::table::ListDirection::Right,
+                _ => return Err("syntax error".to_string()),
+            };
+            let (mode, count, ordering) = parse_lmovem_trailer(&args[5..])?;
+            let raw_tokens = if args.len() == 8 {
+                Some([
+                    args[3].clone(),
+                    args[4].clone(),
+                    args[5].clone(),
+                    args[7].clone(),
+                ])
+            } else {
+                Some([
+                    args[3].clone(),
+                    args[4].clone(),
+                    Bytes::from_static(b"count"),
+                    Bytes::from_static(b"bulk"),
+                ])
+            };
+            Ok(Some(Command::Lmovem {
+                source: args[1].clone(),
+                destination: args[2].clone(),
+                where_from,
+                where_to,
+                mode,
+                count,
+                ordering,
+                raw_tokens,
+            }))
+        }
+        "BLMOVEM" => {
+            if args.len() < 6 {
+                return Err("wrong number of arguments for 'blmovem' command".to_string());
+            }
+            if args.len() != 6 && args.len() != 9 {
+                return Err("syntax error".to_string());
+            }
+            let from_str = String::from_utf8_lossy(&args[3]).to_uppercase();
+            let where_from = match from_str.as_str() {
+                "LEFT" => crate::table::ListDirection::Left,
+                "RIGHT" => crate::table::ListDirection::Right,
+                _ => return Err("syntax error".to_string()),
+            };
+            let to_str = String::from_utf8_lossy(&args[4]).to_uppercase();
+            let where_to = match to_str.as_str() {
+                "LEFT" => crate::table::ListDirection::Left,
+                "RIGHT" => crate::table::ListDirection::Right,
+                _ => return Err("syntax error".to_string()),
+            };
+            let timeout: f64 = std::str::from_utf8(&args[5])
+                .map_err(|_| "timeout is not a float or out of range".to_string())?
+                .parse()
+                .map_err(|_| "timeout is not a float or out of range".to_string())?;
+            if timeout < 0.0 || timeout.is_nan() {
+                return Err("timeout is negative".to_string());
+            }
+            if timeout > (i64::MAX / 1000) as f64 {
+                return Err("timeout is out of range".to_string());
+            }
+            let (mode, count, ordering) = parse_lmovem_trailer(&args[6..])?;
+            Ok(Some(Command::Blmovem {
+                source: args[1].clone(),
+                destination: args[2].clone(),
+                where_from,
+                where_to,
+                timeout,
+                mode,
+                count,
+                ordering,
             }))
         }
         "SORT" | "SORT_RO" => {

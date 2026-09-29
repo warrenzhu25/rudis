@@ -58,6 +58,14 @@ pub enum WaiterOp {
         where_to: ListPopType,
         destination: Bytes,
     },
+    Movem {
+        where_from: ListPopType,
+        where_to: ListPopType,
+        destination: Bytes,
+        mode: crate::resp::LmovemMode,
+        count: usize,
+        ordering: crate::resp::LmovemOrdering,
+    },
 }
 
 pub struct ListWaiter {
@@ -272,6 +280,37 @@ impl BlockHub {
         self.sync_atomic_waiters_count();
     }
 
+    pub fn register_movem_waiter(
+        &mut self,
+        client_id: u64,
+        source: Bytes,
+        where_from: ListPopType,
+        where_to: ListPopType,
+        destination: Bytes,
+        mode: crate::resp::LmovemMode,
+        count: usize,
+        ordering: crate::resp::LmovemOrdering,
+        sender: Sender<BlockedListResult>,
+    ) {
+        self.list_waiters
+            .entry(source.clone())
+            .or_default()
+            .push_back(ListWaiter {
+                client_id,
+                key: source,
+                op: WaiterOp::Movem {
+                    where_from,
+                    where_to,
+                    destination,
+                    mode,
+                    count,
+                    ordering,
+                },
+                sender,
+            });
+        self.sync_atomic_waiters_count();
+    }
+
     /// Called when LPUSH or RPUSH adds values to a list.
     /// If there is an active waiter, pop from table directly and deliver to the waiter.
     pub fn notify_list(&mut self, table: &mut crate::table::RudisTable, key: &Bytes) {
@@ -356,6 +395,68 @@ impl BlockHub {
                         } else {
                             waiters.push_front(waiter);
                             break;
+                        }
+                    }
+                    WaiterOp::Movem {
+                        where_from,
+                        where_to,
+                        ref destination,
+                        mode,
+                        count,
+                        ordering,
+                    } => {
+                        let dst_type = table.type_of(destination.as_ref());
+                        if dst_type != "none" && dst_type != "list" {
+                            let _ = waiter
+                                .sender
+                                .send(BlockedListResult::Unblocked(ClientUnblockType::WrongType));
+                            satisfied_clients.push(waiter.client_id);
+                            continue;
+                        }
+                        let from_dir = match where_from {
+                            ListPopType::Left => crate::table::ListDirection::Left,
+                            ListPopType::Right => crate::table::ListDirection::Right,
+                        };
+                        let to_dir = match where_to {
+                            ListPopType::Left => crate::table::ListDirection::Left,
+                            ListPopType::Right => crate::table::ListDirection::Right,
+                        };
+                        match table.lmovem(
+                            key.as_ref(),
+                            destination.clone(),
+                            from_dir,
+                            to_dir,
+                            mode,
+                            count,
+                            ordering,
+                        ) {
+                            Ok(Some(vals)) => {
+                                crate::connection::DIRTY_CHANGES
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                crate::connection::touch_watched_key(self.port, key.as_ref());
+                                crate::connection::touch_watched_key(
+                                    self.port,
+                                    destination.as_ref(),
+                                );
+                                let dest_clone = destination.clone();
+                                let _ = waiter
+                                    .sender
+                                    .send(BlockedListResult::Popped(key.clone(), vals));
+                                satisfied_clients.push(waiter.client_id);
+                                dest_to_notify = Some(dest_clone);
+                                break;
+                            }
+                            Ok(None) => {
+                                waiters.push_front(waiter);
+                                break;
+                            }
+                            Err(_) => {
+                                let _ = waiter.sender.send(BlockedListResult::Unblocked(
+                                    ClientUnblockType::WrongType,
+                                ));
+                                satisfied_clients.push(waiter.client_id);
+                                continue;
+                            }
                         }
                     }
                 }

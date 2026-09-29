@@ -43,6 +43,7 @@ CORE_SUITES=(
     "unit/type/string"
     "unit/type/hash"
     "unit/type/list"
+    "unit/type/list-4"
     "unit/type/set"
     "unit/type/zset"
     "unit/expire"

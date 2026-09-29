@@ -980,6 +980,111 @@ pub fn get_max_memory_policy() -> String {
     }
 }
 
+pub const NOTIFY_KEYSPACE: u32 = 1 << 0; // K
+pub const NOTIFY_KEYEVENT: u32 = 1 << 1; // E
+pub const NOTIFY_GENERIC: u32 = 1 << 2; // g
+pub const NOTIFY_STRING: u32 = 1 << 3; // $
+pub const NOTIFY_LIST: u32 = 1 << 4; // l
+pub const NOTIFY_SET: u32 = 1 << 5; // s
+pub const NOTIFY_HASH: u32 = 1 << 6; // h
+pub const NOTIFY_ZSET: u32 = 1 << 7; // z
+pub const NOTIFY_EXPIRED: u32 = 1 << 8; // x
+pub const NOTIFY_EVICTED: u32 = 1 << 9; // e
+pub const NOTIFY_STREAM: u32 = 1 << 10; // t
+pub const NOTIFY_ALL: u32 = NOTIFY_GENERIC
+    | NOTIFY_STRING
+    | NOTIFY_LIST
+    | NOTIFY_SET
+    | NOTIFY_HASH
+    | NOTIFY_ZSET
+    | NOTIFY_EXPIRED
+    | NOTIFY_EVICTED
+    | NOTIFY_STREAM; // A
+
+pub static NOTIFY_KEYSPACE_FLAGS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+pub static NOTIFY_KEYSPACE_STR: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+
+pub fn get_notify_keyspace_events_str() -> String {
+    if let Ok(lock) = NOTIFY_KEYSPACE_STR.read() {
+        lock.clone()
+    } else {
+        String::new()
+    }
+}
+
+pub fn set_notify_keyspace_events_str(s: &str) {
+    let mut flags = 0u32;
+    for c in s.chars() {
+        match c {
+            'K' => flags |= NOTIFY_KEYSPACE,
+            'E' => flags |= NOTIFY_KEYEVENT,
+            'g' => flags |= NOTIFY_GENERIC,
+            '$' => flags |= NOTIFY_STRING,
+            'l' => flags |= NOTIFY_LIST,
+            's' => flags |= NOTIFY_SET,
+            'h' => flags |= NOTIFY_HASH,
+            'z' => flags |= NOTIFY_ZSET,
+            'x' => flags |= NOTIFY_EXPIRED,
+            'e' => flags |= NOTIFY_EVICTED,
+            't' => flags |= NOTIFY_STREAM,
+            'A' => flags |= NOTIFY_ALL,
+            _ => {}
+        }
+    }
+    NOTIFY_KEYSPACE_FLAGS.store(flags, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut lock) = NOTIFY_KEYSPACE_STR.write() {
+        *lock = s.to_string();
+    }
+}
+
+pub fn notify_keyspace_event_sync(router: &Router, event_type: u32, event: &str, key: &[u8]) {
+    let flags = NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed);
+    if flags == 0 || (flags & event_type == 0) {
+        return;
+    }
+    let db_id = 0;
+    if flags & NOTIFY_KEYEVENT != 0 {
+        let channel = format!("__keyevent@{}__:{}", db_id, event);
+        let _ = router.pubsub.borrow().publish(channel.as_bytes(), key);
+        for (sid, sender) in router.senders.iter().enumerate() {
+            if sid != router.shard_id
+                && router
+                    .presence_table
+                    .is_shard_interested(sid, channel.as_bytes())
+            {
+                let (tx, _) = router.acquire_pubsub_responder();
+                let _ = sender.send(ShardMessage::Publish {
+                    channel: Bytes::from(channel.clone().into_bytes()),
+                    message: Bytes::copy_from_slice(key),
+                    responder: tx,
+                });
+            }
+        }
+    }
+    if flags & NOTIFY_KEYSPACE != 0 {
+        let channel = format!("__keyspace@{}__:{}", db_id, String::from_utf8_lossy(key));
+        let _ = router
+            .pubsub
+            .borrow()
+            .publish(channel.as_bytes(), event.as_bytes());
+        for (sid, sender) in router.senders.iter().enumerate() {
+            if sid != router.shard_id
+                && router
+                    .presence_table
+                    .is_shard_interested(sid, channel.as_bytes())
+            {
+                let (tx, _) = router.acquire_pubsub_responder();
+                let _ = sender.send(ShardMessage::Publish {
+                    channel: Bytes::from(channel.clone().into_bytes()),
+                    message: Bytes::from(event.as_bytes().to_vec()),
+                    responder: tx,
+                });
+            }
+        }
+    }
+}
+
 pub static ISOLATED_PANICS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[inline]
@@ -1686,6 +1791,7 @@ pub async fn handle_connection(
                                 Command::Blpop { .. }
                                     | Command::Brpop { .. }
                                     | Command::Blmove { .. }
+                                    | Command::Blmovem { .. }
                                     | Command::Blmpop { .. }
                                     | Command::Bzpopmin { .. }
                                     | Command::Bzpopmax { .. }
@@ -1707,6 +1813,7 @@ pub async fn handle_connection(
                                 Command::Blpop { .. }
                                     | Command::Brpop { .. }
                                     | Command::Blmove { .. }
+                                    | Command::Blmovem { .. }
                                     | Command::Blmpop { .. }
                                     | Command::Bzpopmin { .. }
                                     | Command::Bzpopmax { .. }
@@ -2742,7 +2849,9 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
 
         Command::Smove { source, .. }
         | Command::Lmove { source, .. }
-        | Command::Blmove { source, .. } => Some(source),
+        | Command::Blmove { source, .. }
+        | Command::Lmovem { source, .. }
+        | Command::Blmovem { source, .. } => Some(source),
         Command::Touch(keys) | Command::Mget(keys) => keys.first(),
         Command::Pfcount { keys } => keys.first(),
         Command::Xread { keys, .. } | Command::Xreadgroup { keys, .. } => keys.first(),
@@ -2973,6 +3082,16 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
             ..
         }
         | Command::Blmove {
+            source,
+            destination,
+            ..
+        }
+        | Command::Lmovem {
+            source,
+            destination,
+            ..
+        }
+        | Command::Blmovem {
             source,
             destination,
             ..
@@ -3783,6 +3902,8 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Sort { .. } => "SORT",
         Command::Lmove { .. } => "LMOVE",
         Command::Blmove { .. } => "BLMOVE",
+        Command::Lmovem { .. } => "LMOVEM",
+        Command::Blmovem { .. } => "BLMOVEM",
         Command::Sadd { .. } => "SADD",
         Command::Srem { .. } => "SREM",
         Command::Smembers(_) => "SMEMBERS",
@@ -5976,6 +6097,14 @@ async fn execute_command(
                     val
                 );
                 out.extend_from_slice(resp.as_bytes());
+            } else if p_str == "notify-keyspace-events" {
+                let val = get_notify_keyspace_events_str();
+                let resp = format!(
+                    "*2\r\n$22\r\nnotify-keyspace-events\r\n${}\r\n{}\r\n",
+                    val.len(),
+                    val
+                );
+                out.extend_from_slice(resp.as_bytes());
             } else if p_str == "*" {
                 let max_mem = crate::tiering::get_max_memory(router.port).to_string();
                 let offload = crate::tiering::get_offload_threshold_pct(router.port).to_string();
@@ -6008,6 +6137,7 @@ async fn execute_command(
                     "no".to_string()
                 };
                 let proto_bulk = crate::resp::get_proto_max_bulk_len().to_string();
+                let notify_ev = get_notify_keyspace_events_str();
 
                 let pairs = [
                     ("maxmemory", max_mem),
@@ -6023,6 +6153,7 @@ async fn execute_command(
                     ("requirepass", pass),
                     ("appendonly", app),
                     ("proto-max-bulk-len", proto_bulk),
+                    ("notify-keyspace-events", notify_ev),
                 ];
                 out.extend_from_slice(format!("*{}\r\n", pairs.len() * 2).as_bytes());
                 for (k, v) in pairs {
@@ -6172,6 +6303,9 @@ async fn execute_command(
                 }
                 out.extend_from_slice(b"+OK\r\n");
             } else if p_str == "appendonly" {
+                out.extend_from_slice(b"+OK\r\n");
+            } else if p_str == "notify-keyspace-events" {
+                set_notify_keyspace_events_str(&val_str);
                 out.extend_from_slice(b"+OK\r\n");
             } else if p_str == "rewrite" {
                 match crate::config::rewrite_config_file(router.port) {
@@ -7614,6 +7748,246 @@ async fn execute_command(
                 }
                 _ => {
                     write_resp_null(out);
+                }
+            }
+            false
+        }
+        Command::Lmovem {
+            ref source,
+            ref destination,
+            where_from,
+            where_to,
+            ..
+        } => {
+            let s_target = router.target_shard(source);
+            let d_target = router.target_shard(destination);
+            if s_target != d_target {
+                out.extend_from_slice(
+                    b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                );
+                return false;
+            }
+            let start_len = out.len();
+            if s_target == router.shard_id {
+                execute_local_command(
+                    &cmd,
+                    &mut router.local_db.borrow_mut(),
+                    out,
+                    router.aof.as_deref(),
+                );
+            } else {
+                let res = router.execute_remote(s_target, cmd.clone()).await;
+                out.extend_from_slice(&res);
+            }
+            let reply = &out[start_len..];
+            if !reply.starts_with(b"-")
+                && !reply.starts_with(b"*-1")
+                && !reply.starts_with(b"_\r\n")
+            {
+                let samekey = source == destination;
+                let push_event = if where_to == crate::table::ListDirection::Left {
+                    "lpush"
+                } else {
+                    "rpush"
+                };
+                let pop_event = if where_from == crate::table::ListDirection::Left {
+                    "lpop"
+                } else {
+                    "rpop"
+                };
+                notify_keyspace_event_sync(router, NOTIFY_LIST, push_event, destination.as_ref());
+                notify_keyspace_event_sync(router, NOTIFY_LIST, pop_event, source.as_ref());
+                let source_exists = if s_target == router.shard_id {
+                    router.local_db.borrow_mut().exists(source.as_ref())
+                } else {
+                    router.exists(source.clone()).await
+                };
+                if !samekey && !source_exists {
+                    notify_keyspace_event_sync(router, NOTIFY_GENERIC, "del", source.as_ref());
+                }
+            }
+            false
+        }
+        Command::Blmovem {
+            ref source,
+            ref destination,
+            where_from,
+            where_to,
+            timeout,
+            mode,
+            count,
+            ordering,
+        } => {
+            let s_target = router.target_shard(source);
+            let d_target = router.target_shard(destination);
+            if s_target != d_target {
+                out.extend_from_slice(
+                    b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                );
+                return false;
+            }
+            let start_len = out.len();
+            let non_blocking_cmd = Command::Lmovem {
+                source: source.clone(),
+                destination: destination.clone(),
+                where_from,
+                where_to,
+                mode,
+                count,
+                ordering,
+                raw_tokens: None,
+            };
+            if s_target == router.shard_id {
+                execute_local_command(
+                    &non_blocking_cmd,
+                    &mut router.local_db.borrow_mut(),
+                    out,
+                    router.aof.as_deref(),
+                );
+            } else {
+                let res = router.execute_remote(s_target, non_blocking_cmd).await;
+                out.extend_from_slice(&res);
+            }
+
+            let reply = &out[start_len..];
+            if !reply.starts_with(b"*-1") && !reply.starts_with(b"_\r\n") {
+                if !reply.starts_with(b"-") {
+                    let samekey = source == destination;
+                    let push_event = if where_to == crate::table::ListDirection::Left {
+                        "lpush"
+                    } else {
+                        "rpush"
+                    };
+                    let pop_event = if where_from == crate::table::ListDirection::Left {
+                        "lpop"
+                    } else {
+                        "rpop"
+                    };
+                    notify_keyspace_event_sync(
+                        router,
+                        NOTIFY_LIST,
+                        push_event,
+                        destination.as_ref(),
+                    );
+                    notify_keyspace_event_sync(router, NOTIFY_LIST, pop_event, source.as_ref());
+                    let source_exists = if s_target == router.shard_id {
+                        router.local_db.borrow_mut().exists(source.as_ref())
+                    } else {
+                        router.exists(source.clone()).await
+                    };
+                    if !samekey && !source_exists {
+                        notify_keyspace_event_sync(router, NOTIFY_GENERIC, "del", source.as_ref());
+                    }
+                }
+                return false;
+            }
+            if IN_TX.get() {
+                return false;
+            }
+            out.truncate(start_len);
+
+            let _guard = BlockedClientGuard {
+                port: router.port,
+                client_id,
+            };
+            let (tx, rx) = flume::bounded(1);
+            {
+                let hub_arc = crate::block::get_block_hub_for_port(router.port);
+                let mut hub = hub_arc.lock().unwrap();
+                hub.register_blocked_client(client_id, tx.clone());
+                let from_type = match where_from {
+                    crate::table::ListDirection::Left => crate::block::ListPopType::Left,
+                    crate::table::ListDirection::Right => crate::block::ListPopType::Right,
+                };
+                let to_type = match where_to {
+                    crate::table::ListDirection::Left => crate::block::ListPopType::Left,
+                    crate::table::ListDirection::Right => crate::block::ListPopType::Right,
+                };
+                hub.register_movem_waiter(
+                    client_id,
+                    source.clone(),
+                    from_type,
+                    to_type,
+                    destination.clone(),
+                    mode,
+                    count,
+                    ordering,
+                    tx,
+                );
+            }
+
+            let raw_fd = client_registry.borrow().get(&client_id).map(|c| c.raw_fd);
+            let (recv_res, client_disconnected) =
+                wait_for_blocked_result(&rx, timeout, raw_fd).await;
+            if client_disconnected {
+                return true;
+            }
+
+            match recv_res {
+                Some(crate::block::BlockedListResult::Popped(_, vals)) => {
+                    let rep_cmd = Command::Lmovem {
+                        source: source.clone(),
+                        destination: destination.clone(),
+                        where_from,
+                        where_to,
+                        mode: crate::resp::LmovemMode::Exactly,
+                        count: vals.len(),
+                        ordering,
+                        raw_tokens: None,
+                    };
+                    if let Some(bytes) = crate::aof::command_to_resp(&rep_cmd) {
+                        if let Some(aof_w) = &router.aof {
+                            aof_w.borrow_mut().append(&bytes);
+                        }
+                        if crate::replication::has_connected_replicas(router.port) {
+                            crate::replication::propagate_bytes(router.port, &bytes);
+                        }
+                    }
+                    let samekey = source == destination;
+                    let push_event = if where_to == crate::table::ListDirection::Left {
+                        "lpush"
+                    } else {
+                        "rpush"
+                    };
+                    let pop_event = if where_from == crate::table::ListDirection::Left {
+                        "lpop"
+                    } else {
+                        "rpop"
+                    };
+                    notify_keyspace_event_sync(
+                        router,
+                        NOTIFY_LIST,
+                        push_event,
+                        destination.as_ref(),
+                    );
+                    notify_keyspace_event_sync(router, NOTIFY_LIST, pop_event, source.as_ref());
+                    let source_exists = if s_target == router.shard_id {
+                        router.local_db.borrow_mut().exists(source.as_ref())
+                    } else {
+                        router.exists(source.clone()).await
+                    };
+                    if !samekey && !source_exists {
+                        notify_keyspace_event_sync(router, NOTIFY_GENERIC, "del", source.as_ref());
+                    }
+                    write_resp_array_header(out, vals.len());
+                    for v in &vals {
+                        write_resp_bulk(out, v);
+                    }
+                }
+                Some(crate::block::BlockedListResult::Unblocked(
+                    crate::block::ClientUnblockType::WrongType,
+                )) => {
+                    out.extend_from_slice(
+                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                    );
+                }
+                Some(crate::block::BlockedListResult::Unblocked(
+                    crate::block::ClientUnblockType::Error,
+                )) => {
+                    out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n");
+                }
+                _ => {
+                    write_resp_null_array(out);
                 }
             }
             false
@@ -11192,6 +11566,16 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
             source,
             destination,
             ..
+        }
+        | Command::Lmovem {
+            source,
+            destination,
+            ..
+        }
+        | Command::Blmovem {
+            source,
+            destination,
+            ..
         } => {
             let s1 = target_shard(source, num_shards);
             let s2 = target_shard(destination, num_shards);
@@ -14655,6 +15039,42 @@ pub fn execute_local_command(
             }
             false
         }
+        Command::Lmovem {
+            source,
+            destination,
+            where_from,
+            where_to,
+            mode,
+            count,
+            ordering,
+            ..
+        } => {
+            match db.lmovem(
+                source,
+                destination.clone(),
+                *where_from,
+                *where_to,
+                *mode,
+                *count,
+                *ordering,
+            ) {
+                Ok(Some(vals)) => {
+                    record_change!(cmd);
+                    notify_list_or_defer(db, destination);
+                    write_resp_array_header(out, vals.len());
+                    for v in &vals {
+                        write_resp_bulk(out, v);
+                    }
+                }
+                Ok(None) => {
+                    write_resp_null_array(out);
+                }
+                Err(err) => {
+                    write_resp_err(out, err);
+                }
+            }
+            false
+        }
         Command::Incrbyfloat { key, increment } => {
             match db.incrbyfloat(key.clone(), *increment) {
                 Ok(val) => {
@@ -16818,6 +17238,7 @@ fn is_special_pipeline_cmd(cmd: &Command) -> bool {
             | Command::Blpop { .. }
             | Command::Brpop { .. }
             | Command::Blmove { .. }
+            | Command::Blmovem { .. }
             | Command::Blmpop { .. }
             | Command::Bzpopmin { .. }
             | Command::Bzpopmax { .. }
