@@ -17173,6 +17173,7 @@ async fn execute_commands_squashed(
                     }
                 } else if router.aof.is_none()
                     && !crate::replication::has_connected_replicas(router.port)
+                    && !crate::block::has_blocked_waiters(router.port)
                     && let Command::Zadd {
                         ref key,
                         ref elements,

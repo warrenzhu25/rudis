@@ -897,6 +897,7 @@ pub fn run_shard_worker(
                                         }
                                     } else if aof_ref.is_none()
                                         && !crate::replication::has_connected_replicas(r.port)
+                                        && !crate::block::has_blocked_waiters(r.port)
                                         && let Command::Zadd { ref key, ref elements, flags } = cmd
                                     {
                                         has_writes = true;
@@ -1235,6 +1236,7 @@ pub fn run_shard_worker(
                                     }
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
+                                    && !crate::block::has_blocked_waiters(cross_shard_router.port)
                                     && let Command::Zadd { ref key, ref elements, flags } = cmd
                                 {
                                     has_writes = true;
