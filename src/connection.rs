@@ -2612,6 +2612,7 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Strlen(key)
         | Command::Expiretime(key, _)
         | Command::Rename { key, .. }
+        | Command::Copy { source: key, .. }
         | Command::Setbit { key, .. }
         | Command::Getbit { key, .. }
         | Command::Bitcount { key, .. }
@@ -2629,6 +2630,7 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::XgroupDestroy { key, .. }
         | Command::XgroupCreateConsumer { key, .. }
         | Command::XgroupDelConsumer { key, .. }
+        | Command::XgroupSetId { key, .. }
         | Command::Xack { key, .. }
         | Command::Xpending { key, .. }
         | Command::Hincrby { key, .. }
@@ -2869,6 +2871,7 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
         | Command::XgroupDestroy { key, .. }
         | Command::XgroupCreateConsumer { key, .. }
         | Command::XgroupDelConsumer { key, .. }
+        | Command::XgroupSetId { key, .. }
         | Command::Xack { key, .. }
         | Command::Xpending { key, .. }
         | Command::Hincrby { key, .. }
@@ -3069,6 +3072,15 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
         Command::Rename { key, newkey, .. } => {
             f(key.as_ref());
             f(newkey.as_ref());
+        }
+
+        Command::Copy {
+            source,
+            destination,
+            ..
+        } => {
+            f(source.as_ref());
+            f(destination.as_ref());
         }
 
         Command::Bitop {
@@ -3818,6 +3830,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Touch(_) => "TOUCH",
         Command::Rename { nx: false, .. } => "RENAME",
         Command::Rename { nx: true, .. } => "RENAMENX",
+        Command::Copy { .. } => "COPY",
         Command::Setnx { .. } => "SETNX",
         Command::Getset { .. } => "GETSET",
         Command::Getdel(_) => "GETDEL",
@@ -3883,7 +3896,8 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::XgroupCreate { .. }
         | Command::XgroupDestroy { .. }
         | Command::XgroupCreateConsumer { .. }
-        | Command::XgroupDelConsumer { .. } => "XGROUP",
+        | Command::XgroupDelConsumer { .. }
+        | Command::XgroupSetId { .. } => "XGROUP",
         Command::Xreadgroup { .. } => "XREADGROUP",
         Command::Xack { .. } => "XACK",
         Command::Xpending { .. } => "XPENDING",
@@ -6697,6 +6711,7 @@ async fn execute_command(
         | Command::XgroupDestroy { .. }
         | Command::XgroupCreateConsumer { .. }
         | Command::XgroupDelConsumer { .. }
+        | Command::XgroupSetId { .. }
         | Command::Xack { .. }
         | Command::Xpending { .. }
         | Command::Hincrby { .. }
@@ -9087,6 +9102,32 @@ async fn execute_command(
             }
             false
         }
+        Command::Copy {
+            ref source,
+            ref destination,
+            ..
+        } => {
+            let target_src = router.target_shard(source);
+            let target_dst = router.target_shard(destination);
+            if target_src != target_dst {
+                out.extend_from_slice(
+                    b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                );
+                return false;
+            }
+            if target_src == router.shard_id {
+                execute_local_command(
+                    &cmd,
+                    &mut router.local_db.borrow_mut(),
+                    out,
+                    router.aof.as_deref(),
+                );
+            } else {
+                let res = router.execute_remote(target_src, cmd).await;
+                out.extend_from_slice(&res);
+            }
+            false
+        }
         Command::Msetnx(ref pairs) => {
             if pairs.is_empty() {
                 out.extend_from_slice(b":0\r\n");
@@ -10992,6 +11033,7 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::XgroupDestroy { key, .. }
         | Command::XgroupCreateConsumer { key, .. }
         | Command::XgroupDelConsumer { key, .. }
+        | Command::XgroupSetId { key, .. }
         | Command::Xack { key, .. }
         | Command::Xpending { key, .. }
         | Command::Hincrby { key, .. }
@@ -11160,6 +11202,15 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         Command::Rename { key, newkey, .. } => {
             let s1 = target_shard(key, num_shards);
             let s2 = target_shard(newkey, num_shards);
+            if s1 == s2 { Some(s1) } else { None }
+        }
+        Command::Copy {
+            source,
+            destination,
+            ..
+        } => {
+            let s1 = target_shard(source, num_shards);
+            let s2 = target_shard(destination, num_shards);
             if s1 == s2 { Some(s1) } else { None }
         }
         Command::Pfmerge { destkey, srckeys }
@@ -13145,6 +13196,33 @@ pub fn execute_local_command(
             }
             false
         }
+        Command::Copy {
+            source,
+            destination,
+            replace,
+            ..
+        } => {
+            match db.copy(source, destination.clone(), *replace) {
+                Ok(success) => {
+                    if success {
+                        record_change!(cmd);
+                        match db.type_of(destination) {
+                            "list" => notify_list_or_defer(db, destination),
+                            "zset" => notify_zset_or_defer(db, destination),
+                            "stream" => notify_stream_or_defer(db, destination),
+                            _ => touch_watched_key(db.port, destination.as_ref()),
+                        }
+                        out.extend_from_slice(b":1\r\n");
+                    } else {
+                        out.extend_from_slice(b":0\r\n");
+                    }
+                }
+                Err(err) => {
+                    write_resp_err(out, err);
+                }
+            }
+            false
+        }
         // EXTENDED STRING COMMANDS
         Command::Setnx { key, value } => {
             let set = db.setnx(key.clone(), value.clone());
@@ -13725,6 +13803,27 @@ pub fn execute_local_command(
             match db.xgroup_delconsumer(key, group, consumer) {
                 Ok(pending_count) => {
                     out.extend_from_slice(format!(":{}\r\n", pending_count).as_bytes());
+                }
+                Err(err) => {
+                    if err.starts_with("ERR") || err.starts_with("NOGROUP") {
+                        out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
+                    } else {
+                        write_resp_err(out, err);
+                    }
+                }
+            }
+            false
+        }
+        Command::XgroupSetId {
+            key,
+            group,
+            id,
+            entries_read,
+        } => {
+            match db.xgroup_setid(key, group, id, *entries_read) {
+                Ok(()) => {
+                    record_change!(cmd);
+                    out.extend_from_slice(b"+OK\r\n");
                 }
                 Err(err) => {
                     if err.starts_with("ERR") || err.starts_with("NOGROUP") {

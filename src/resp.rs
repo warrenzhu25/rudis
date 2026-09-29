@@ -369,6 +369,12 @@ pub enum Command {
         duration: Duration,
         opts: ExpireOptions,
     },
+    Copy {
+        source: Bytes,
+        destination: Bytes,
+        destination_db: Option<u32>,
+        replace: bool,
+    },
     Persist(Bytes),
     Ttl(Bytes, bool), // true for PTTL (milliseconds), false for TTL (seconds)
     Cluster(ClusterSubcommand),
@@ -849,6 +855,12 @@ pub enum Command {
         key: Bytes,
         group: Bytes,
         consumer: Bytes,
+    },
+    XgroupSetId {
+        key: Bytes,
+        group: Bytes,
+        id: String,
+        entries_read: Option<u64>,
     },
     Xreadgroup {
         group: Bytes,
@@ -5123,6 +5135,51 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 nx: true,
             }))
         }
+        "COPY" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'copy' command".to_string());
+            }
+            let source = args[1].clone();
+            let destination = args[2].clone();
+            if source == destination {
+                return Err("source and destination objects are the same".to_string());
+            }
+            let mut replace = false;
+            let mut destination_db = None;
+            let mut i = 3;
+            while i < args.len() {
+                let opt = std::str::from_utf8(&args[i])
+                    .map_err(|_| "syntax error".to_string())?
+                    .to_uppercase();
+                match opt.as_str() {
+                    "REPLACE" => {
+                        replace = true;
+                        i += 1;
+                    }
+                    "DB" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let db_id: i64 = std::str::from_utf8(&args[i + 1])
+                            .ok()
+                            .and_then(|s| s.parse().ok())
+                            .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+                        if db_id != 0 {
+                            return Err("DB index is out of range".to_string());
+                        }
+                        destination_db = Some(db_id as u32);
+                        i += 2;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            Ok(Some(Command::Copy {
+                source,
+                destination,
+                destination_db,
+                replace,
+            }))
+        }
         "FLUSHDB" => Ok(Some(Command::Flushdb)),
         "FLUSHALL" => Ok(Some(Command::Flushall)),
         "SETNX" => {
@@ -6438,6 +6495,37 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         key,
                         group,
                         consumer,
+                    }))
+                }
+                "SETID" => {
+                    if args.len() < 5 {
+                        return Err(
+                            "wrong number of arguments for 'xgroup setid' command".to_string()
+                        );
+                    }
+                    let key = args[2].clone();
+                    let group = args[3].clone();
+                    let id = String::from_utf8_lossy(&args[4]).to_string();
+                    let mut entries_read = None;
+                    let mut i = 5;
+                    while i < args.len() {
+                        if args[i].eq_ignore_ascii_case(b"ENTRIESREAD") && i + 1 < args.len() {
+                            let s = std::str::from_utf8(&args[i + 1]).map_err(|_| {
+                                "value is not an integer or out of range".to_string()
+                            })?;
+                            entries_read = Some(s.parse::<u64>().map_err(|_| {
+                                "value is not an integer or out of range".to_string()
+                            })?);
+                            i += 2;
+                        } else {
+                            return Err("syntax error".to_string());
+                        }
+                    }
+                    Ok(Some(Command::XgroupSetId {
+                        key,
+                        group,
+                        id,
+                        entries_read,
                     }))
                 }
                 _ => Ok(Some(Command::Unknown(format!("XGROUP {}", sub)))),

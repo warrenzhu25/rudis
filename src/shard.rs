@@ -1843,6 +1843,16 @@ impl ShardDb {
     }
 
     #[inline]
+    pub fn copy(&mut self, src: &[u8], dst: Bytes, replace: bool) -> Result<bool, &'static str> {
+        self.table.copy(src, dst, replace)
+    }
+
+    #[inline]
+    pub fn next_rand(&mut self) -> usize {
+        self.table.next_rand()
+    }
+
+    #[inline]
     pub fn setnx(&mut self, key: Bytes, value: Bytes) -> bool {
         self.table.setnx(key, value)
     }
@@ -3109,6 +3119,17 @@ impl ShardDb {
     #[inline]
     pub fn xgroup_destroy(&mut self, key: &[u8], group: &[u8]) -> Result<bool, &'static str> {
         self.table.xgroup_destroy(key, group)
+    }
+
+    #[inline]
+    pub fn xgroup_setid(
+        &mut self,
+        key: &[u8],
+        group: &[u8],
+        id_str: &str,
+        entries_read: Option<u64>,
+    ) -> Result<(), &'static str> {
+        self.table.xgroup_setid(key, group, id_str, entries_read)
     }
 
     #[inline]

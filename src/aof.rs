@@ -532,6 +532,36 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             buf.extend_from_slice(b"\r\n");
             Some(buf)
         }
+        Command::Copy {
+            source,
+            destination,
+            destination_db,
+            replace,
+        } => {
+            let mut count = 3;
+            if destination_db.is_some() {
+                count += 2;
+            }
+            if *replace {
+                count += 1;
+            }
+            buf.extend_from_slice(
+                format!("*{}\r\n$4\r\nCOPY\r\n${}\r\n", count, source.len()).as_bytes(),
+            );
+            buf.extend_from_slice(source);
+            buf.extend_from_slice(format!("\r\n${}\r\n", destination.len()).as_bytes());
+            buf.extend_from_slice(destination);
+            if let Some(db_id) = destination_db {
+                buf.extend_from_slice(
+                    format!("\r\n$2\r\nDB\r\n${}\r\n{}", db_id.to_string().len(), db_id).as_bytes(),
+                );
+            }
+            if *replace {
+                buf.extend_from_slice(b"\r\n$7\r\nREPLACE");
+            }
+            buf.extend_from_slice(b"\r\n");
+            Some(buf)
+        }
         Command::Flushdb | Command::Flushall => {
             buf.extend_from_slice(b"*1\r\n$7\r\nFLUSHDB\r\n");
             Some(buf)
@@ -780,6 +810,36 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             buf.extend_from_slice(format!("\r\n${}\r\n", group.len()).as_bytes());
             buf.extend_from_slice(group);
             buf.extend_from_slice(b"\r\n");
+            Some(buf)
+        }
+        Command::XgroupSetId {
+            key,
+            group,
+            id,
+            entries_read,
+        } => {
+            let mut num_args = 5;
+            if entries_read.is_some() {
+                num_args += 2;
+            }
+            buf.extend_from_slice(
+                format!(
+                    "*{}\r\n$6\r\nXGROUP\r\n$5\r\nSETID\r\n${}\r\n",
+                    num_args,
+                    key.len()
+                )
+                .as_bytes(),
+            );
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n", group.len()).as_bytes());
+            buf.extend_from_slice(group);
+            buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", id.len(), id).as_bytes());
+            if let Some(er) = entries_read {
+                let er_str = er.to_string();
+                buf.extend_from_slice(
+                    format!("$11\r\nENTRIESREAD\r\n${}\r\n{}\r\n", er_str.len(), er_str).as_bytes(),
+                );
+            }
             Some(buf)
         }
         Command::Xack { key, group, ids } => {

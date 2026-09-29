@@ -1,33 +1,141 @@
 use bytes::Bytes;
 
 pub fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
-    let mut p = 0;
-    let mut t = 0;
-    let mut star_p = None;
-    let mut match_t = 0;
+    let mut skip_longer_matches = false;
+    stringmatchlen_impl(pattern, text, false, &mut skip_longer_matches, 0)
+}
 
-    while t < text.len() {
-        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == text[t]) {
-            p += 1;
-            t += 1;
-        } else if p < pattern.len() && pattern[p] == b'*' {
-            star_p = Some(p);
-            p += 1;
-            match_t = t;
-        } else if let Some(sp) = star_p {
-            p = sp + 1;
-            match_t += 1;
-            t = match_t;
-        } else {
-            return false;
+fn stringmatchlen_impl(
+    mut pattern: &[u8],
+    mut text: &[u8],
+    nocase: bool,
+    skip_longer_matches: &mut bool,
+    nesting: usize,
+) -> bool {
+    if nesting > 1000 {
+        return false;
+    }
+
+    while !pattern.is_empty() && !text.is_empty() {
+        match pattern[0] {
+            b'*' => {
+                while pattern.len() > 1 && pattern[1] == b'*' {
+                    pattern = &pattern[1..];
+                }
+                if pattern.len() == 1 {
+                    return true;
+                }
+                while !text.is_empty() {
+                    if stringmatchlen_impl(
+                        &pattern[1..],
+                        text,
+                        nocase,
+                        skip_longer_matches,
+                        nesting + 1,
+                    ) {
+                        return true;
+                    }
+                    if *skip_longer_matches {
+                        return false;
+                    }
+                    text = &text[1..];
+                }
+                *skip_longer_matches = true;
+                return false;
+            }
+            b'?' => {
+                text = &text[1..];
+            }
+            b'[' => {
+                pattern = &pattern[1..];
+                let not_op = if !pattern.is_empty() && pattern[0] == b'^' {
+                    pattern = &pattern[1..];
+                    true
+                } else {
+                    false
+                };
+                let mut matched = false;
+                while !pattern.is_empty() {
+                    if pattern[0] == b'\\' && pattern.len() >= 2 {
+                        pattern = &pattern[1..];
+                        if pattern[0] == text[0] {
+                            matched = true;
+                        }
+                    } else if pattern[0] == b']' {
+                        break;
+                    } else if pattern.len() >= 3 && pattern[1] == b'-' {
+                        let mut start = pattern[0];
+                        let mut end = pattern[2];
+                        let mut c = text[0];
+                        if start > end {
+                            std::mem::swap(&mut start, &mut end);
+                        }
+                        if nocase {
+                            start = start.to_ascii_lowercase();
+                            end = end.to_ascii_lowercase();
+                            c = c.to_ascii_lowercase();
+                        }
+                        pattern = &pattern[2..];
+                        if c >= start && c <= end {
+                            matched = true;
+                        }
+                    } else {
+                        if !nocase {
+                            if pattern[0] == text[0] {
+                                matched = true;
+                            }
+                        } else if pattern[0].eq_ignore_ascii_case(&text[0]) {
+                            matched = true;
+                        }
+                    }
+                    pattern = &pattern[1..];
+                }
+                if not_op {
+                    matched = !matched;
+                }
+                if !matched {
+                    return false;
+                }
+                text = &text[1..];
+                if pattern.is_empty() {
+                    return false;
+                }
+            }
+            b'\\' => {
+                if pattern.len() >= 2 {
+                    pattern = &pattern[1..];
+                }
+                let matched = if nocase {
+                    pattern[0].eq_ignore_ascii_case(&text[0])
+                } else {
+                    pattern[0] == text[0]
+                };
+                if !matched {
+                    return false;
+                }
+                text = &text[1..];
+            }
+            _ => {
+                let matched = if nocase {
+                    pattern[0].eq_ignore_ascii_case(&text[0])
+                } else {
+                    pattern[0] == text[0]
+                };
+                if !matched {
+                    return false;
+                }
+                text = &text[1..];
+            }
+        }
+        pattern = &pattern[1..];
+        if text.is_empty() {
+            while !pattern.is_empty() && pattern[0] == b'*' {
+                pattern = &pattern[1..];
+            }
+            break;
         }
     }
-
-    while p < pattern.len() && pattern[p] == b'*' {
-        p += 1;
-    }
-
-    p == pattern.len()
+    pattern.is_empty() && text.is_empty()
 }
 
 #[inline]

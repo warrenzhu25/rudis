@@ -2744,13 +2744,20 @@ impl Router {
     }
 
     pub async fn random_key(&self) -> Option<Bytes> {
-        if let Some(k) = self.local_db.borrow_mut().random_key() {
-            return Some(k);
+        let num_shards = self.senders.len();
+        if num_shards <= 1 {
+            return self.local_db.borrow_mut().random_key();
         }
-        for (sid, sender) in self.senders.iter().enumerate() {
-            if sid != self.shard_id {
+        let start = self.local_db.borrow_mut().next_rand() % num_shards;
+        for i in 0..num_shards {
+            let sid = (start + i) % num_shards;
+            if sid == self.shard_id {
+                if let Some(k) = self.local_db.borrow_mut().random_key() {
+                    return Some(k);
+                }
+            } else {
                 let (tx, rx) = flume::bounded(1);
-                if sender
+                if self.senders[sid]
                     .send(ShardMessage::RandomKey { responder: tx })
                     .is_ok()
                     && let Ok(Some(k)) = rx.recv_async().await

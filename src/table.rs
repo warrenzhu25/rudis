@@ -944,6 +944,12 @@ impl std::fmt::Display for StreamId {
 impl StreamId {
     pub fn parse_exact(s: &str) -> Result<Self, &'static str> {
         let parts: Vec<&str> = s.split('-').collect();
+        if parts.len() == 1 {
+            let ms: u64 = parts[0]
+                .parse()
+                .map_err(|_| "Invalid stream ID specified as stream command argument")?;
+            return Ok(Self { ms, seq: 0 });
+        }
         if parts.len() != 2 {
             return Err("Invalid stream ID specified as stream command argument");
         }
@@ -1000,6 +1006,8 @@ impl StreamAddId {
                 .parse()
                 .map_err(|_| "Invalid stream ID specified as stream command argument")?;
             return Ok(StreamAddId::Explicit(StreamId::new(ms, seq)));
+        } else if let Ok(ms) = s.parse::<u64>() {
+            return Ok(StreamAddId::Explicit(StreamId::new(ms, 0)));
         }
         Err("Invalid stream ID specified as stream command argument")
     }
@@ -3007,8 +3015,7 @@ impl RudisTable {
         if self.table.is_empty() || bound == 0 {
             return None;
         }
-        self.sample_cursor = (self.sample_cursor + 17) % bound;
-        let start = self.sample_cursor;
+        let start = self.next_rand() % bound;
         for i in 0..bound {
             let cur = (start + i) % bound;
             let idx = self.table.cursor_to_global_idx(cur);
@@ -3306,6 +3313,49 @@ impl RudisTable {
         entry.key = dst;
         self.table.insert(entry);
 
+        Ok(true)
+    }
+
+    pub fn copy(&mut self, src: &[u8], dst: Bytes, replace: bool) -> Result<bool, &'static str> {
+        if src == dst.as_ref() {
+            return Err("source and destination objects are the same");
+        }
+
+        let h_src = hash_key(src);
+        if let Some(src_idx) = self.table.find(src, h_src) {
+            if self.check_expired_slot(src_idx) {
+                return Ok(false);
+            }
+        } else {
+            return Ok(false);
+        }
+
+        let (_, entry) = self.table.find_entry(src, h_src).unwrap();
+        let val = entry.val.clone();
+        let expire_at = entry.expire_at;
+
+        let h_dst = hash_key(&dst);
+        if let Some(dst_idx) = self.table.find(&dst, h_dst) {
+            if self.check_expired_slot(dst_idx) {
+                // Was expired and removed
+            } else if !replace {
+                return Ok(false);
+            } else if let Some(removed) = self.table.remove(dst_idx)
+                && removed.expire_at.is_some()
+            {
+                self.num_expires = self.num_expires.saturating_sub(1);
+            }
+        }
+
+        if expire_at.is_some() {
+            self.num_expires += 1;
+        }
+        let entry = RudisEntry {
+            key: dst,
+            val,
+            expire_at,
+        };
+        self.table.insert(entry);
         Ok(true)
     }
 
@@ -10662,6 +10712,47 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot_mut(idx) {
                 match &mut entry.val {
                     RudisValue::Stream(stream) => Ok(stream.groups.remove(group).is_some()),
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Err("ERR The XGROUP subcommand requires the key to exist")
+            }
+        } else {
+            Err("ERR The XGROUP subcommand requires the key to exist")
+        }
+    }
+
+    pub fn xgroup_setid(
+        &mut self,
+        key: &[u8],
+        group: &[u8],
+        id_str: &str,
+        entries_read_opt: Option<u64>,
+    ) -> Result<(), &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if self.check_expired_slot(idx) {
+                return Err("ERR The XGROUP subcommand requires the key to exist");
+            }
+            if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::Stream(stream) => {
+                        let grp = stream
+                            .groups
+                            .get_mut(group)
+                            .ok_or("NOGROUP No such consumer group for key name")?;
+                        let last_delivered_id = if id_str == "$" {
+                            stream.last_id
+                        } else {
+                            StreamId::parse(id_str)?
+                        };
+                        let entries_read = entries_read_opt.unwrap_or_else(|| {
+                            stream.entries.range(..=last_delivered_id).count() as u64
+                        });
+                        grp.last_delivered_id = last_delivered_id;
+                        grp.entries_read = entries_read;
+                        Ok(())
+                    }
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
