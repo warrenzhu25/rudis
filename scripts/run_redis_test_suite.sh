@@ -42,6 +42,7 @@ fi
 CORE_SUITES=(
     "unit/type/string"
     "unit/type/hash"
+    "unit/type/hash-field-expire"
     "unit/type/list"
     "unit/type/list-2"
     "unit/type/list-3"
