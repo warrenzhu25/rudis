@@ -5290,6 +5290,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "PURGE" => Ok(Some(Command::Memory(MemorySubcommand::Purge))),
                 "DOCTOR" => Ok(Some(Command::Memory(MemorySubcommand::Doctor))),
                 "DEFRAG" => Ok(Some(Command::Memory(MemorySubcommand::Defrag))),
+                "HELP" => Ok(Some(Command::Unknown("MEMORY HELP".to_string()))),
                 _ => Err(format!("unknown subcommand '{}' for 'memory'", sub)),
             }
         }
@@ -5570,6 +5571,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 match sub.as_str() {
                     "COUNT" => Ok(Some(Command::CommandCount)),
                     "LIST" => Ok(Some(Command::CommandList)),
+                    "HELP" => Ok(Some(Command::Unknown("COMMAND HELP".to_string()))),
                     _ => Ok(Some(Command::CommandDocs)),
                 }
             }
@@ -6008,6 +6010,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     Bytes::from_static(b"rewrite"),
                     Bytes::new(),
                 ))),
+                "HELP" => Ok(Some(Command::Unknown("CONFIG HELP".to_string()))),
                 _ => Err(format!("ERR unknown subcommand '{}' for CONFIG", sub)),
             }
         }
