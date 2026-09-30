@@ -880,6 +880,11 @@ pub enum Command {
         destkey: Bytes,
         srckeys: Vec<Bytes>,
     },
+    PfdebugGetreg(Bytes),
+    PfdebugEncoding(Bytes),
+    PfdebugTodense(Bytes),
+    PfdebugSimd(bool),
+    Pfselftest,
     // RDB SERIALIZATION
     Dump(Bytes),
     Restore {
@@ -6540,6 +6545,44 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let destkey = args[1].clone();
             let srckeys = args[2..].to_vec();
             Ok(Some(Command::Pfmerge { destkey, srckeys }))
+        }
+        "PFSELFTEST" => Ok(Some(Command::Pfselftest)),
+        "PFDEBUG" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'pfdebug' command".to_string());
+            }
+            let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
+            match sub.as_str() {
+                "GETREG" => {
+                    if args.len() != 3 {
+                        return Err("wrong number of arguments for 'pfdebug' command".to_string());
+                    }
+                    Ok(Some(Command::PfdebugGetreg(args[2].clone())))
+                }
+                "ENCODING" => {
+                    if args.len() != 3 {
+                        return Err("wrong number of arguments for 'pfdebug' command".to_string());
+                    }
+                    Ok(Some(Command::PfdebugEncoding(args[2].clone())))
+                }
+                "TODENSE" => {
+                    if args.len() != 3 {
+                        return Err("wrong number of arguments for 'pfdebug' command".to_string());
+                    }
+                    Ok(Some(Command::PfdebugTodense(args[2].clone())))
+                }
+                "SIMD" => {
+                    if args.len() != 3 {
+                        return Err("wrong number of arguments for 'pfdebug' command".to_string());
+                    }
+                    let on = match args[2].to_ascii_lowercase().as_slice() {
+                        b"on" | b"1" | b"yes" => true,
+                        _ => false,
+                    };
+                    Ok(Some(Command::PfdebugSimd(on)))
+                }
+                _ => Err("unknown subcommand for 'pfdebug' command".to_string()),
+            }
         }
         "DUMP" => {
             if args.len() != 2 {

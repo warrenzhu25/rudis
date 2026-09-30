@@ -11346,6 +11346,76 @@ impl RudisTable {
         Ok(())
     }
 
+    pub fn pfdebug_getreg(&mut self, key: &Bytes) -> Result<[u8; 16384], &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h)
+            && !self.check_expired_slot(idx)
+            && let Some(entry) = self.table.get_slot(idx)
+        {
+            match &entry.val {
+                RudisValue::String(s) => crate::hll::hll_decode_registers(s),
+                RudisValue::HyperLogLog(regs) => Ok(**regs),
+                _ => Err("WRONGTYPE Key is not a valid HyperLogLog string value."),
+            }
+        } else {
+            Err("ERR The specified key does not exist")
+        }
+    }
+
+    pub fn pfdebug_encoding(&mut self, key: &Bytes) -> Result<&'static str, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h)
+            && !self.check_expired_slot(idx)
+            && let Some(entry) = self.table.get_slot(idx)
+        {
+            match &entry.val {
+                RudisValue::String(s) => {
+                    let enc = crate::hll::hll_validate(s)?;
+                    if enc == crate::hll::HLL_DENSE {
+                        Ok("dense")
+                    } else {
+                        Ok("sparse")
+                    }
+                }
+                RudisValue::HyperLogLog(_) => Ok("dense"),
+                _ => Err("WRONGTYPE Key is not a valid HyperLogLog string value."),
+            }
+        } else {
+            Err("ERR The specified key does not exist")
+        }
+    }
+
+    pub fn pfdebug_todense(&mut self, key: &Bytes) -> Result<bool, &'static str> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h)
+            && !self.check_expired_slot(idx)
+            && let Some(entry) = self.table.get_slot_mut(idx)
+        {
+            match &mut entry.val {
+                RudisValue::String(s) => {
+                    let enc = crate::hll::hll_validate(s)?;
+                    if enc == crate::hll::HLL_DENSE {
+                        Ok(false)
+                    } else {
+                        let regs = crate::hll::hll_decode_registers(s)?;
+                        let dense = crate::hll::hll_encode_dense(&regs);
+                        let mut hdr = vec![0u8; crate::hll::HLL_HDR_SIZE];
+                        hdr[0..4].copy_from_slice(b"HYLL");
+                        hdr[4] = crate::hll::HLL_DENSE;
+                        hdr[8..16].copy_from_slice(&s[8..16]);
+                        hdr.extend_from_slice(&dense);
+                        *s = Bytes::from(hdr);
+                        Ok(true)
+                    }
+                }
+                RudisValue::HyperLogLog(_) => Ok(false),
+                _ => Err("WRONGTYPE Key is not a valid HyperLogLog string value."),
+            }
+        } else {
+            Err("ERR The specified key does not exist")
+        }
+    }
+
     fn compute_stream_id(
         stream: &mut RudisStream,
         add_id: StreamAddId,

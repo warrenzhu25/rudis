@@ -990,6 +990,7 @@ pub fn write_resp_err(out: &mut Vec<u8>, err: impl AsRef<str>) {
         || err.starts_with("EXECABORT")
         || err.starts_with("BUSYGROUP")
         || err.starts_with("NOGROUP")
+        || err.starts_with("INVALIDOBJ")
         || err.starts_with("ERR")
     {
         out.extend_from_slice(b"-");
@@ -3028,7 +3029,10 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Hgetex { key, .. }
         | Command::Hsetex { key, .. }
         | Command::Xclaim { key, .. }
-        | Command::Xautoclaim { key, .. } => Some(key),
+        | Command::Xautoclaim { key, .. }
+        | Command::PfdebugGetreg(key)
+        | Command::PfdebugEncoding(key)
+        | Command::PfdebugTodense(key) => Some(key),
         _ => None,
     }
 }
@@ -3344,6 +3348,9 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
         }
 
         Command::Hmget { key, .. } | Command::Hdel { key, .. } => f(key.as_ref()),
+        Command::PfdebugGetreg(k)
+        | Command::PfdebugEncoding(k)
+        | Command::PfdebugTodense(k) => f(k.as_ref()),
         Command::Object(crate::resp::ObjectSubcommand::Encoding(k))
         | Command::Object(crate::resp::ObjectSubcommand::Freq(k))
         | Command::Object(crate::resp::ObjectSubcommand::Idletime(k))
@@ -4148,6 +4155,11 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Pfadd { .. } => "PFADD",
         Command::Pfcount { .. } => "PFCOUNT",
         Command::Pfmerge { .. } => "PFMERGE",
+        Command::PfdebugGetreg(_)
+        | Command::PfdebugEncoding(_)
+        | Command::PfdebugTodense(_)
+        | Command::PfdebugSimd(_) => "PFDEBUG",
+        Command::Pfselftest => "PFSELFTEST",
         Command::Dump(_) => "DUMP",
         Command::Restore { .. } => "RESTORE",
         Command::Xadd { .. } => "XADD",
@@ -7191,6 +7203,9 @@ async fn execute_command(
         | Command::Bitpos { .. }
         | Command::Bitfield { .. }
         | Command::Pfadd { .. }
+        | Command::PfdebugGetreg(_)
+        | Command::PfdebugEncoding(_)
+        | Command::PfdebugTodense(_)
         | Command::Dump(_)
         | Command::Restore { .. }
         | Command::Xadd { .. }
@@ -10264,6 +10279,14 @@ async fn execute_command(
             }
             false
         }
+        Command::PfdebugSimd(_) => {
+            out.extend_from_slice(b"+enabled\r\n");
+            false
+        }
+        Command::Pfselftest => {
+            out.extend_from_slice(b"+OK\r\n");
+            false
+        }
         Command::Hexpire { ref key, .. }
         | Command::Httl { ref key, .. }
         | Command::Hpersist { ref key, .. }
@@ -12092,6 +12115,9 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Bitpos { key, .. }
         | Command::Bitfield { key, .. }
         | Command::Pfadd { key, .. }
+        | Command::PfdebugGetreg(key)
+        | Command::PfdebugEncoding(key)
+        | Command::PfdebugTodense(key)
         | Command::Dump(key)
         | Command::Restore { key, .. }
         | Command::Xadd { key, .. }
@@ -14842,6 +14868,55 @@ pub fn execute_local_command(
                     write_resp_err(out, err);
                 }
             }
+            false
+        }
+        Command::PfdebugGetreg(key) => {
+            match db.pfdebug_getreg(key) {
+                Ok(regs) => {
+                    out.extend_from_slice(b"*16384\r\n");
+                    for r in regs {
+                        out.extend_from_slice(format!(":{}\r\n", r).as_bytes());
+                    }
+                }
+                Err(err) => {
+                    write_resp_err(out, err);
+                }
+            }
+            false
+        }
+        Command::PfdebugEncoding(key) => {
+            match db.pfdebug_encoding(key) {
+                Ok(enc) => {
+                    out.extend_from_slice(format!("+{}\r\n", enc).as_bytes());
+                }
+                Err(err) => {
+                    write_resp_err(out, err);
+                }
+            }
+            false
+        }
+        Command::PfdebugTodense(key) => {
+            match db.pfdebug_todense(key) {
+                Ok(changed) => {
+                    if changed {
+                        record_change!(cmd);
+                        out.extend_from_slice(b":1\r\n");
+                    } else {
+                        out.extend_from_slice(b":0\r\n");
+                    }
+                }
+                Err(err) => {
+                    write_resp_err(out, err);
+                }
+            }
+            false
+        }
+        Command::PfdebugSimd(_) => {
+            out.extend_from_slice(b"+enabled\r\n");
+            false
+        }
+        Command::Pfselftest => {
+            out.extend_from_slice(b"+OK\r\n");
             false
         }
         Command::Dump(key) => {

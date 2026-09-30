@@ -2065,6 +2065,21 @@ impl ShardDb {
     }
 
     #[inline]
+    pub fn pfdebug_getreg(&mut self, key: &Bytes) -> Result<[u8; 16384], &'static str> {
+        self.table.pfdebug_getreg(key)
+    }
+
+    #[inline]
+    pub fn pfdebug_encoding(&mut self, key: &Bytes) -> Result<&'static str, &'static str> {
+        self.table.pfdebug_encoding(key)
+    }
+
+    #[inline]
+    pub fn pfdebug_todense(&mut self, key: &Bytes) -> Result<bool, &'static str> {
+        self.table.pfdebug_todense(key)
+    }
+
+    #[inline]
     pub fn dump(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         self.table.dump(key)
     }
