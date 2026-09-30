@@ -6010,7 +6010,14 @@ async fn execute_command(
                 }
                 s
             };
+            let server_str = format!(
+                "# Server\r\nredis_version:7.2.4\r\nredis_git_sha1:00000000\r\nredis_git_dirty:0\r\nredis_build_id:0\r\nredis_mode:standalone\r\nos:Linux\r\narch_bits:64\r\nmultiplexing_api:io_uring\r\nrudis_version:0.1.0\r\narch:shared-nothing-io_uring\r\nshard_id:{}\r\nnum_shards:{}\r\ntcp_port:{}\r\n",
+                router.shard_id,
+                router.num_shards,
+                router.port,
+            );
             let info_str = match section.as_deref() {
+                Some(b"server") | Some(b"SERVER") => server_str,
                 Some(b"clients") | Some(b"CLIENTS") => clients_str,
                 Some(b"persistence") | Some(b"PERSISTENCE") => persistence_str,
                 Some(b"replication") | Some(b"REPLICATION") => hub.format_info_replication(),
@@ -6026,7 +6033,7 @@ async fn execute_command(
                 }
                 _ => {
                     format!(
-                        "# Server\r\nrudis_version:0.1.0\r\narch:shared-nothing-io_uring\r\nshard_id:{}\r\nnum_shards:{}\r\n\
+                        "{}\
                          {}\
                          {}\
                          # Replication\r\n{}\
@@ -6035,8 +6042,7 @@ async fn execute_command(
                          {}\
                          {}\
                          {}",
-                        router.shard_id,
-                        router.num_shards,
+                        server_str,
                         clients_str,
                         persistence_str,
                         hub.format_info_replication(),
