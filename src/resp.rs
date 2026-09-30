@@ -1538,7 +1538,10 @@ pub enum Command {
         withdist: bool,
         withhash: bool,
         count: Option<usize>,
+        any: bool,
         asc: Option<bool>,
+        store: Option<Bytes>,
+        storedist: Option<Bytes>,
     },
     Georadiusbymember {
         key: Bytes,
@@ -1549,7 +1552,10 @@ pub enum Command {
         withdist: bool,
         withhash: bool,
         count: Option<usize>,
+        any: bool,
         asc: Option<bool>,
+        store: Option<Bytes>,
+        storedist: Option<Bytes>,
     },
     Geosearch {
         key: Bytes,
@@ -1559,9 +1565,22 @@ pub enum Command {
         by_box: Option<(f64, f64, crate::geo::GeoUnit)>,
         asc: Option<bool>,
         count: Option<usize>,
+        any: bool,
         withcoord: bool,
         withdist: bool,
         withhash: bool,
+    },
+    Geosearchstore {
+        dest: Bytes,
+        key: Bytes,
+        from_member: Option<Bytes>,
+        from_lonlat: Option<(f64, f64)>,
+        by_radius: Option<(f64, crate::geo::GeoUnit)>,
+        by_box: Option<(f64, f64, crate::geo::GeoUnit)>,
+        asc: Option<bool>,
+        count: Option<usize>,
+        any: bool,
+        storedist: bool,
     },
     // PROBABILISTIC COMMANDS
     BfReserve {
@@ -10421,7 +10440,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     break;
                 }
             }
-            if !(args.len() - idx).is_multiple_of(3) || idx == args.len() {
+            if !(args.len() - idx).is_multiple_of(3) || idx == args.len() || (nx && xx) {
                 return Err("syntax error".to_string());
             }
             let mut items = Vec::new();
@@ -10434,6 +10453,13 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     .map_err(|_| "value is not a valid float")?
                     .parse()
                     .map_err(|_| "value is not a valid float")?;
+                if lon < crate::geo::GEO_LON_MIN
+                    || lon > crate::geo::GEO_LON_MAX
+                    || lat < crate::geo::GEO_LAT_MIN
+                    || lat > crate::geo::GEO_LAT_MAX
+                {
+                    return Err(format!("invalid longitude,latitude pair {:.6},{:.6}", lon, lat));
+                }
                 let member = args[idx + 2].clone();
                 items.push((lon, lat, member));
                 idx += 3;
@@ -10463,7 +10489,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::Geodist { key, m1, m2, unit }))
         }
         "GEOPOS" => {
-            if args.len() < 3 {
+            if args.len() < 2 {
                 return Err("wrong number of arguments for 'geopos' command".to_string());
             }
             let key = args[1].clone();
@@ -10471,7 +10497,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::Geopos { key, members }))
         }
         "GEOHASH" => {
-            if args.len() < 3 {
+            if args.len() < 2 {
                 return Err("wrong number of arguments for 'geohash' command".to_string());
             }
             let key = args[1].clone();
@@ -10479,8 +10505,12 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::Geohash { key, members }))
         }
         "GEORADIUS" | "GEORADIUS_RO" => {
+            let is_ro = args[0].eq_ignore_ascii_case(b"GEORADIUS_RO");
             if args.len() < 6 {
-                return Err("wrong number of arguments for 'georadius' command".to_string());
+                return Err(format!(
+                    "wrong number of arguments for '{}' command",
+                    if is_ro { "georadius_ro" } else { "georadius" }
+                ));
             }
             let key = args[1].clone();
             let lon: f64 = std::str::from_utf8(&args[2])
@@ -10491,16 +10521,29 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 .map_err(|_| "value is not a valid float")?
                 .parse()
                 .map_err(|_| "value is not a valid float")?;
+            if lon < crate::geo::GEO_LON_MIN
+                || lon > crate::geo::GEO_LON_MAX
+                || lat < crate::geo::GEO_LAT_MIN
+                || lat > crate::geo::GEO_LAT_MAX
+            {
+                return Err(format!("invalid longitude,latitude pair {:.6},{:.6}", lon, lat));
+            }
             let radius: f64 = std::str::from_utf8(&args[4])
                 .map_err(|_| "value is not a valid float")?
                 .parse()
                 .map_err(|_| "value is not a valid float")?;
+            if radius < 0.0 {
+                return Err("radius cannot be negative".to_string());
+            }
             let unit = crate::geo::GeoUnit::parse(&String::from_utf8_lossy(&args[5]))?;
             let mut withcoord = false;
             let mut withdist = false;
             let mut withhash = false;
+            let mut any = false;
             let mut count = None;
             let mut asc = None;
+            let mut store = None;
+            let mut storedist = None;
             let mut idx = 6;
             while idx < args.len() {
                 let opt = String::from_utf8_lossy(&args[idx]).to_uppercase();
@@ -10508,6 +10551,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     "WITHCOORD" => withcoord = true,
                     "WITHDIST" => withdist = true,
                     "WITHHASH" => withhash = true,
+                    "ANY" => any = true,
                     "ASC" => asc = Some(true),
                     "DESC" => asc = Some(false),
                     "COUNT" => {
@@ -10519,11 +10563,38 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             .map_err(|_| "value is not an integer or out of range")?
                             .parse()
                             .map_err(|_| "value is not an integer or out of range")?;
+                        if c == 0 {
+                            return Err("COUNT must be > 0".to_string());
+                        }
                         count = Some(c);
+                        if idx + 1 < args.len() && args[idx + 1].eq_ignore_ascii_case(b"ANY") {
+                            any = true;
+                            idx += 1;
+                        }
                     }
-                    _ => {}
+                    "STORE" => {
+                        if is_ro || idx + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        idx += 1;
+                        store = Some(args[idx].clone());
+                    }
+                    "STOREDIST" => {
+                        if is_ro || idx + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        idx += 1;
+                        storedist = Some(args[idx].clone());
+                    }
+                    _ => return Err("syntax error".to_string()),
                 }
                 idx += 1;
+            }
+            if any && count.is_none() {
+                return Err("the ANY argument requires COUNT argument".to_string());
+            }
+            if (store.is_some() || storedist.is_some()) && (withdist || withhash || withcoord) {
+                return Err("STORE option in GEORADIUS is not compatible with WITHDIST, WITHHASH and WITHCOORD options".to_string());
             }
             Ok(Some(Command::Georadius {
                 key,
@@ -10535,12 +10606,19 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 withdist,
                 withhash,
                 count,
+                any,
                 asc,
+                store,
+                storedist,
             }))
         }
         "GEORADIUSBYMEMBER" | "GEORADIUSBYMEMBER_RO" => {
+            let is_ro = args[0].eq_ignore_ascii_case(b"GEORADIUSBYMEMBER_RO");
             if args.len() < 5 {
-                return Err("wrong number of arguments for 'georadiusbymember' command".to_string());
+                return Err(format!(
+                    "wrong number of arguments for '{}' command",
+                    if is_ro { "georadiusbymember_ro" } else { "georadiusbymember" }
+                ));
             }
             let key = args[1].clone();
             let member = args[2].clone();
@@ -10548,12 +10626,18 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 .map_err(|_| "value is not a valid float")?
                 .parse()
                 .map_err(|_| "value is not a valid float")?;
+            if radius < 0.0 {
+                return Err("radius cannot be negative".to_string());
+            }
             let unit = crate::geo::GeoUnit::parse(&String::from_utf8_lossy(&args[4]))?;
             let mut withcoord = false;
             let mut withdist = false;
             let mut withhash = false;
+            let mut any = false;
             let mut count = None;
             let mut asc = None;
+            let mut store = None;
+            let mut storedist = None;
             let mut idx = 5;
             while idx < args.len() {
                 let opt = String::from_utf8_lossy(&args[idx]).to_uppercase();
@@ -10561,6 +10645,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     "WITHCOORD" => withcoord = true,
                     "WITHDIST" => withdist = true,
                     "WITHHASH" => withhash = true,
+                    "ANY" => any = true,
                     "ASC" => asc = Some(true),
                     "DESC" => asc = Some(false),
                     "COUNT" => {
@@ -10572,11 +10657,38 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             .map_err(|_| "value is not an integer or out of range")?
                             .parse()
                             .map_err(|_| "value is not an integer or out of range")?;
+                        if c == 0 {
+                            return Err("COUNT must be > 0".to_string());
+                        }
                         count = Some(c);
+                        if idx + 1 < args.len() && args[idx + 1].eq_ignore_ascii_case(b"ANY") {
+                            any = true;
+                            idx += 1;
+                        }
                     }
-                    _ => {}
+                    "STORE" => {
+                        if is_ro || idx + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        idx += 1;
+                        store = Some(args[idx].clone());
+                    }
+                    "STOREDIST" => {
+                        if is_ro || idx + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        idx += 1;
+                        storedist = Some(args[idx].clone());
+                    }
+                    _ => return Err("syntax error".to_string()),
                 }
                 idx += 1;
+            }
+            if any && count.is_none() {
+                return Err("the ANY argument requires COUNT argument".to_string());
+            }
+            if (store.is_some() || storedist.is_some()) && (withdist || withhash || withcoord) {
+                return Err("STORE option in GEORADIUS is not compatible with WITHDIST, WITHHASH and WITHCOORD options".to_string());
             }
             Ok(Some(Command::Georadiusbymember {
                 key,
@@ -10587,7 +10699,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 withdist,
                 withhash,
                 count,
+                any,
                 asc,
+                store,
+                storedist,
             }))
         }
         "GEOSEARCH" => {
@@ -10601,6 +10716,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let mut by_box = None;
             let mut asc = None;
             let mut count = None;
+            let mut any = false;
             let mut withcoord = false;
             let mut withdist = false;
             let mut withhash = false;
@@ -10609,14 +10725,14 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 let opt = String::from_utf8_lossy(&args[idx]).to_uppercase();
                 match opt.as_str() {
                     "FROMMEMBER" => {
-                        if idx + 1 >= args.len() {
+                        if from_lonlat.is_some() || from_member.is_some() || idx + 1 >= args.len() {
                             return Err("syntax error".to_string());
                         }
                         idx += 1;
                         from_member = Some(args[idx].clone());
                     }
                     "FROMLONLAT" => {
-                        if idx + 2 >= args.len() {
+                        if from_member.is_some() || from_lonlat.is_some() || idx + 2 >= args.len() {
                             return Err("syntax error".to_string());
                         }
                         let lon: f64 = std::str::from_utf8(&args[idx + 1])
@@ -10627,24 +10743,34 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             .map_err(|_| "value is not a valid float")?
                             .parse()
                             .map_err(|_| "value is not a valid float")?;
+                        if lon < crate::geo::GEO_LON_MIN
+                            || lon > crate::geo::GEO_LON_MAX
+                            || lat < crate::geo::GEO_LAT_MIN
+                            || lat > crate::geo::GEO_LAT_MAX
+                        {
+                            return Err(format!("invalid longitude,latitude pair {:.6},{:.6}", lon, lat));
+                        }
                         idx += 2;
                         from_lonlat = Some((lon, lat));
                     }
                     "BYRADIUS" => {
-                        if idx + 2 >= args.len() {
+                        if by_box.is_some() || by_radius.is_some() || idx + 2 >= args.len() {
                             return Err("syntax error".to_string());
                         }
                         let rad: f64 = std::str::from_utf8(&args[idx + 1])
                             .map_err(|_| "value is not a valid float")?
                             .parse()
                             .map_err(|_| "value is not a valid float")?;
+                        if rad < 0.0 {
+                            return Err("radius cannot be negative".to_string());
+                        }
                         let u =
                             crate::geo::GeoUnit::parse(&String::from_utf8_lossy(&args[idx + 2]))?;
                         idx += 2;
                         by_radius = Some((rad, u));
                     }
                     "BYBOX" => {
-                        if idx + 3 >= args.len() {
+                        if by_radius.is_some() || by_box.is_some() || idx + 3 >= args.len() {
                             return Err("syntax error".to_string());
                         }
                         let w: f64 = std::str::from_utf8(&args[idx + 1])
@@ -10655,6 +10781,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             .map_err(|_| "value is not a valid float")?
                             .parse()
                             .map_err(|_| "value is not a valid float")?;
+                        if w < 0.0 || h < 0.0 {
+                            return Err("height or width cannot be negative".to_string());
+                        }
                         let u =
                             crate::geo::GeoUnit::parse(&String::from_utf8_lossy(&args[idx + 3]))?;
                         idx += 3;
@@ -10662,6 +10791,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     }
                     "ASC" => asc = Some(true),
                     "DESC" => asc = Some(false),
+                    "ANY" => any = true,
                     "COUNT" => {
                         if idx + 1 >= args.len() {
                             return Err("syntax error".to_string());
@@ -10671,14 +10801,30 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             .map_err(|_| "value is not an integer or out of range")?
                             .parse()
                             .map_err(|_| "value is not an integer or out of range")?;
+                        if c == 0 {
+                            return Err("COUNT must be > 0".to_string());
+                        }
                         count = Some(c);
+                        if idx + 1 < args.len() && args[idx + 1].eq_ignore_ascii_case(b"ANY") {
+                            any = true;
+                            idx += 1;
+                        }
                     }
                     "WITHCOORD" => withcoord = true,
                     "WITHDIST" => withdist = true,
                     "WITHHASH" => withhash = true,
-                    _ => {}
+                    _ => return Err("syntax error".to_string()),
                 }
                 idx += 1;
+            }
+            if from_member.is_none() && from_lonlat.is_none() {
+                return Err("exactly one of FROMMEMBER or FROMLONLAT can be specified for GEOSEARCH".to_string());
+            }
+            if by_radius.is_none() && by_box.is_none() {
+                return Err("exactly one of BYRADIUS and BYBOX can be specified for GEOSEARCH".to_string());
+            }
+            if any && count.is_none() {
+                return Err("the ANY argument requires COUNT argument".to_string());
             }
             Ok(Some(Command::Geosearch {
                 key,
@@ -10688,9 +10834,144 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 by_box,
                 asc,
                 count,
+                any,
                 withcoord,
                 withdist,
                 withhash,
+            }))
+        }
+        "GEOSEARCHSTORE" => {
+            if args.len() < 5 {
+                return Err("wrong number of arguments for 'geosearchstore' command".to_string());
+            }
+            let dest = args[1].clone();
+            let key = args[2].clone();
+            let mut from_member = None;
+            let mut from_lonlat = None;
+            let mut by_radius = None;
+            let mut by_box = None;
+            let mut asc = None;
+            let mut count = None;
+            let mut any = false;
+            let mut storedist = false;
+            let mut idx = 3;
+            while idx < args.len() {
+                let opt = String::from_utf8_lossy(&args[idx]).to_uppercase();
+                match opt.as_str() {
+                    "FROMMEMBER" => {
+                        if from_lonlat.is_some() || from_member.is_some() || idx + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        idx += 1;
+                        from_member = Some(args[idx].clone());
+                    }
+                    "FROMLONLAT" => {
+                        if from_member.is_some() || from_lonlat.is_some() || idx + 2 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let lon: f64 = std::str::from_utf8(&args[idx + 1])
+                            .map_err(|_| "value is not a valid float")?
+                            .parse()
+                            .map_err(|_| "value is not a valid float")?;
+                        let lat: f64 = std::str::from_utf8(&args[idx + 2])
+                            .map_err(|_| "value is not a valid float")?
+                            .parse()
+                            .map_err(|_| "value is not a valid float")?;
+                        if lon < crate::geo::GEO_LON_MIN
+                            || lon > crate::geo::GEO_LON_MAX
+                            || lat < crate::geo::GEO_LAT_MIN
+                            || lat > crate::geo::GEO_LAT_MAX
+                        {
+                            return Err(format!("invalid longitude,latitude pair {:.6},{:.6}", lon, lat));
+                        }
+                        idx += 2;
+                        from_lonlat = Some((lon, lat));
+                    }
+                    "BYRADIUS" => {
+                        if by_box.is_some() || by_radius.is_some() || idx + 2 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let rad: f64 = std::str::from_utf8(&args[idx + 1])
+                            .map_err(|_| "value is not a valid float")?
+                            .parse()
+                            .map_err(|_| "value is not a valid float")?;
+                        if rad < 0.0 {
+                            return Err("radius cannot be negative".to_string());
+                        }
+                        let u =
+                            crate::geo::GeoUnit::parse(&String::from_utf8_lossy(&args[idx + 2]))?;
+                        idx += 2;
+                        by_radius = Some((rad, u));
+                    }
+                    "BYBOX" => {
+                        if by_radius.is_some() || by_box.is_some() || idx + 3 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let w: f64 = std::str::from_utf8(&args[idx + 1])
+                            .map_err(|_| "value is not a valid float")?
+                            .parse()
+                            .map_err(|_| "value is not a valid float")?;
+                        let h: f64 = std::str::from_utf8(&args[idx + 2])
+                            .map_err(|_| "value is not a valid float")?
+                            .parse()
+                            .map_err(|_| "value is not a valid float")?;
+                        if w < 0.0 || h < 0.0 {
+                            return Err("height or width cannot be negative".to_string());
+                        }
+                        let u =
+                            crate::geo::GeoUnit::parse(&String::from_utf8_lossy(&args[idx + 3]))?;
+                        idx += 3;
+                        by_box = Some((w, h, u));
+                    }
+                    "ASC" => asc = Some(true),
+                    "DESC" => asc = Some(false),
+                    "ANY" => any = true,
+                    "COUNT" => {
+                        if idx + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        idx += 1;
+                        let c: usize = std::str::from_utf8(&args[idx])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        if c == 0 {
+                            return Err("COUNT must be > 0".to_string());
+                        }
+                        count = Some(c);
+                        if idx + 1 < args.len() && args[idx + 1].eq_ignore_ascii_case(b"ANY") {
+                            any = true;
+                            idx += 1;
+                        }
+                    }
+                    "STOREDIST" => storedist = true,
+                    "WITHCOORD" | "WITHDIST" | "WITHHASH" => {
+                        return Err("GEOSEARCHSTORE is not compatible with WITHDIST, WITHHASH and WITHCOORD options".to_string());
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+                idx += 1;
+            }
+            if from_member.is_none() && from_lonlat.is_none() {
+                return Err("exactly one of FROMMEMBER or FROMLONLAT can be specified for GEOSEARCHSTORE".to_string());
+            }
+            if by_radius.is_none() && by_box.is_none() {
+                return Err("exactly one of BYRADIUS and BYBOX can be specified for GEOSEARCHSTORE".to_string());
+            }
+            if any && count.is_none() {
+                return Err("the ANY argument requires COUNT argument".to_string());
+            }
+            Ok(Some(Command::Geosearchstore {
+                dest,
+                key,
+                from_member,
+                from_lonlat,
+                by_radius,
+                by_box,
+                asc,
+                count,
+                any,
+                storedist,
             }))
         }
         "BF.RESERVE" => {

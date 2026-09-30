@@ -2921,6 +2921,7 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::Georadius { key, .. }
         | Command::Georadiusbymember { key, .. }
         | Command::Geosearch { key, .. }
+        | Command::Geosearchstore { key, .. }
         | Command::BfReserve { key, .. }
         | Command::BfAdd { key, .. }
         | Command::BfMadd { key, .. }
@@ -3173,9 +3174,21 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
         | Command::Geodist { key, .. }
         | Command::Geopos { key, .. }
         | Command::Geohash { key, .. }
-        | Command::Georadius { key, .. }
-        | Command::Georadiusbymember { key, .. }
-        | Command::Geosearch { key, .. }
+        | Command::Geosearch { key, .. } => f(key.as_ref()),
+        Command::Geosearchstore { dest, key, .. } => {
+            f(dest.as_ref());
+            f(key.as_ref());
+        }
+        Command::Georadius { key, store, storedist, .. }
+        | Command::Georadiusbymember { key, store, storedist, .. } => {
+            f(key.as_ref());
+            if let Some(s) = store {
+                f(s.as_ref());
+            }
+            if let Some(s) = storedist {
+                f(s.as_ref());
+            }
+        }
         | Command::BfReserve { key, .. }
         | Command::BfAdd { key, .. }
         | Command::BfMadd { key, .. }
@@ -4256,7 +4269,8 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         | Command::Geohash { .. }
         | Command::Georadius { .. }
         | Command::Georadiusbymember { .. }
-        | Command::Geosearch { .. } => "GEO",
+        | Command::Geosearch { .. }
+        | Command::Geosearchstore { .. } => "GEO",
         Command::BfReserve { .. }
         | Command::BfAdd { .. }
         | Command::BfMadd { .. }
@@ -7302,6 +7316,7 @@ async fn execute_command(
         | Command::Georadius { .. }
         | Command::Georadiusbymember { .. }
         | Command::Geosearch { .. }
+        | Command::Geosearchstore { .. }
         | Command::BfReserve { .. }
         | Command::BfAdd { .. }
         | Command::BfMadd { .. }
@@ -12449,6 +12464,7 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Georadius { key, .. }
         | Command::Georadiusbymember { key, .. }
         | Command::Geosearch { key, .. }
+        | Command::Geosearchstore { key, .. }
         | Command::BfReserve { key, .. }
         | Command::BfAdd { key, .. }
         | Command::BfMadd { key, .. }
@@ -17012,6 +17028,11 @@ pub fn execute_local_command(
             false
         }
         Command::Geodist { key, m1, m2, unit } => {
+            let t = db.type_of(key);
+            if t != "none" && t != "zset" {
+                out.extend_from_slice(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+                return false;
+            }
             let s1 = db.zscore(key, m1);
             let s2 = db.zscore(key, m2);
             match (s1, s2) {
@@ -17032,14 +17053,19 @@ pub fn execute_local_command(
             false
         }
         Command::Geopos { key, members } => {
+            let t = db.type_of(key);
+            if t != "none" && t != "zset" {
+                out.extend_from_slice(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+                return false;
+            }
             out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
             for m in members {
                 match db.zscore(key, m) {
                     Ok(Some(score)) => {
                         let (lon, lat) = crate::geo::decode_geohash(score as u64);
                         out.extend_from_slice(b"*2\r\n");
-                        let lon_str = format!("{:.6}", lon);
-                        let lat_str = format!("{:.6}", lat);
+                        let lon_str = format!("{}", lon);
+                        let lat_str = format!("{}", lat);
                         write_resp_bulk(out, lon_str.as_bytes());
                         write_resp_bulk(out, lat_str.as_bytes());
                     }
@@ -17051,6 +17077,11 @@ pub fn execute_local_command(
             false
         }
         Command::Geohash { key, members } => {
+            let t = db.type_of(key);
+            if t != "none" && t != "zset" {
+                out.extend_from_slice(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+                return false;
+            }
             out.extend_from_slice(format!("*{}\r\n", members.len()).as_bytes());
             for m in members {
                 match db.zscore(key, m) {
@@ -17075,15 +17106,56 @@ pub fn execute_local_command(
             withdist,
             withhash,
             count,
+            any,
             asc,
+            store,
+            storedist,
         } => {
+            let key_type = db.type_of(key);
+            if key_type != "none" && key_type != "zset" {
+                out.extend_from_slice(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+                return false;
+            }
+            let storekey = store.as_ref().or(storedist.as_ref());
+            let is_storedist = storedist.is_some();
+            if key_type == "none" {
+                if let Some(store_dest) = storekey {
+                    db.del(store_dest);
+                    write_resp_integer(out, 0);
+                    return true;
+                } else {
+                    out.extend_from_slice(b"*0\r\n");
+                    return false;
+                }
+            }
             let radius_m = unit.to_meters(*radius);
             let shape = crate::geo::GeoSearchShape::Radius { radius_m };
             let results = crate::geo::execute_geo_query(
-                db, key, *lon, *lat, shape, *unit, *withdist, *withhash, *withcoord, *count, *asc,
+                db, key, *lon, *lat, shape, *unit, *withdist, *withhash, *withcoord, *count, *any, *asc,
             );
             let has_options = *withcoord || *withdist || *withhash;
-            crate::geo::format_geo_results(out, &results, has_options);
+            if let Some(store_dest) = storekey {
+                if results.is_empty() {
+                    db.del(store_dest);
+                    write_resp_integer(out, 0);
+                } else {
+                    db.del(store_dest);
+                    let mut zset_elements = Vec::with_capacity(results.len());
+                    for item in &results {
+                        let sc = if is_storedist {
+                            unit.from_meters(item.dist_m)
+                        } else {
+                            item.score as f64
+                        };
+                        zset_elements.push((sc, item.member.clone()));
+                    }
+                    let _ = db.zadd(store_dest.clone(), zset_elements, crate::table::ZAddFlags::default());
+                    write_resp_integer(out, results.len() as i64);
+                }
+                record_change!(cmd);
+            } else {
+                crate::geo::format_geo_results(out, &results, has_options);
+            }
             false
         }
         Command::Georadiusbymember {
@@ -17095,23 +17167,62 @@ pub fn execute_local_command(
             withdist,
             withhash,
             count,
+            any,
             asc,
+            store,
+            storedist,
         } => {
-            match db.zscore(key, member) {
-                Ok(Some(score)) => {
-                    let (center_lon, center_lat) = crate::geo::decode_geohash(score as u64);
-                    let radius_m = unit.to_meters(*radius);
-                    let shape = crate::geo::GeoSearchShape::Radius { radius_m };
-                    let results = crate::geo::execute_geo_query(
-                        db, key, center_lon, center_lat, shape, *unit, *withdist, *withhash,
-                        *withcoord, *count, *asc,
-                    );
-                    let has_options = *withcoord || *withdist || *withhash;
-                    crate::geo::format_geo_results(out, &results, has_options);
+            let key_type = db.type_of(key);
+            if key_type != "none" && key_type != "zset" {
+                out.extend_from_slice(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+                return false;
+            }
+            let storekey = store.as_ref().or(storedist.as_ref());
+            let is_storedist = storedist.is_some();
+            if key_type == "none" {
+                if let Some(store_dest) = storekey {
+                    db.del(store_dest);
+                    write_resp_integer(out, 0);
+                    return true;
+                } else {
+                    out.extend_from_slice(b"*0\r\n");
+                    return false;
                 }
+            }
+            let center = match db.zscore(key, member) {
+                Ok(Some(score)) => crate::geo::decode_geohash(score as u64),
                 _ => {
                     out.extend_from_slice(b"-ERR could not decode requested zset member\r\n");
+                    return false;
                 }
+            };
+            let radius_m = unit.to_meters(*radius);
+            let shape = crate::geo::GeoSearchShape::Radius { radius_m };
+            let results = crate::geo::execute_geo_query(
+                db, key, center.0, center.1, shape, *unit, *withdist, *withhash, *withcoord, *count, *any, *asc,
+            );
+            let has_options = *withcoord || *withdist || *withhash;
+            if let Some(store_dest) = storekey {
+                if results.is_empty() {
+                    db.del(store_dest);
+                    write_resp_integer(out, 0);
+                } else {
+                    db.del(store_dest);
+                    let mut zset_elements = Vec::with_capacity(results.len());
+                    for item in &results {
+                        let sc = if is_storedist {
+                            unit.from_meters(item.dist_m)
+                        } else {
+                            item.score as f64
+                        };
+                        zset_elements.push((sc, item.member.clone()));
+                    }
+                    let _ = db.zadd(store_dest.clone(), zset_elements, crate::table::ZAddFlags::default());
+                    write_resp_integer(out, results.len() as i64);
+                }
+                record_change!(cmd);
+            } else {
+                crate::geo::format_geo_results(out, &results, has_options);
             }
             false
         }
@@ -17123,10 +17234,20 @@ pub fn execute_local_command(
             by_box,
             asc,
             count,
+            any,
             withcoord,
             withdist,
             withhash,
         } => {
+            let key_type = db.type_of(key);
+            if key_type != "none" && key_type != "zset" {
+                out.extend_from_slice(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+                return false;
+            }
+            if key_type == "none" {
+                out.extend_from_slice(b"*0\r\n");
+                return false;
+            }
             let center_opt = if let Some((lon, lat)) = from_lonlat {
                 Some((*lon, *lat))
             } else if let Some(m) = from_member {
@@ -17137,15 +17258,13 @@ pub fn execute_local_command(
             } else {
                 None
             };
-
             let (center_lon, center_lat) = match center_opt {
                 Some(c) => c,
                 None => {
-                    out.extend_from_slice(b"-ERR could not determine search origin\r\n");
+                    out.extend_from_slice(b"-ERR could not decode requested zset member\r\n");
                     return false;
                 }
             };
-
             let (shape, unit) = if let Some((rad, u)) = by_radius {
                 (
                     crate::geo::GeoSearchShape::Radius {
@@ -17167,13 +17286,96 @@ pub fn execute_local_command(
                     crate::geo::GeoUnit::Meters,
                 )
             };
-
             let results = crate::geo::execute_geo_query(
                 db, key, center_lon, center_lat, shape, unit, *withdist, *withhash, *withcoord,
-                *count, *asc,
+                *count, *any, *asc,
             );
             let has_options = *withcoord || *withdist || *withhash;
             crate::geo::format_geo_results(out, &results, has_options);
+            false
+        }
+        Command::Geosearchstore {
+            dest,
+            key,
+            from_member,
+            from_lonlat,
+            by_radius,
+            by_box,
+            asc,
+            count,
+            any,
+            storedist,
+        } => {
+            let key_type = db.type_of(key);
+            if key_type != "none" && key_type != "zset" {
+                out.extend_from_slice(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+                return false;
+            }
+            if key_type == "none" {
+                db.del(dest);
+                write_resp_integer(out, 0);
+                return true;
+            }
+            let center_opt = if let Some((lon, lat)) = from_lonlat {
+                Some((*lon, *lat))
+            } else if let Some(m) = from_member {
+                match db.zscore(key, m) {
+                    Ok(Some(score)) => Some(crate::geo::decode_geohash(score as u64)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let (center_lon, center_lat) = match center_opt {
+                Some(c) => c,
+                None => {
+                    out.extend_from_slice(b"-ERR could not decode requested zset member\r\n");
+                    return false;
+                }
+            };
+            let (shape, unit) = if let Some((rad, u)) = by_radius {
+                (
+                    crate::geo::GeoSearchShape::Radius {
+                        radius_m: u.to_meters(*rad),
+                    },
+                    *u,
+                )
+            } else if let Some((w, h, u)) = by_box {
+                (
+                    crate::geo::GeoSearchShape::Box {
+                        width_m: u.to_meters(*w),
+                        height_m: u.to_meters(*h),
+                    },
+                    *u,
+                )
+            } else {
+                (
+                    crate::geo::GeoSearchShape::Radius { radius_m: 0.0 },
+                    crate::geo::GeoUnit::Meters,
+                )
+            };
+            let results = crate::geo::execute_geo_query(
+                db, key, center_lon, center_lat, shape, unit, false, false, false,
+                *count, *any, *asc,
+            );
+            if results.is_empty() {
+                db.del(dest);
+                write_resp_integer(out, 0);
+            } else {
+                db.del(dest);
+                let mut zset_elements = Vec::with_capacity(results.len());
+                for item in &results {
+                    let sc = if *storedist {
+                        unit.from_meters(item.dist_m)
+                    } else {
+                        item.score as f64
+                    };
+                    zset_elements.push((sc, item.member.clone()));
+                }
+                let _ = db.zadd(dest.clone(), zset_elements, crate::table::ZAddFlags::default());
+                write_resp_integer(out, results.len() as i64);
+            }
+            record_change!(cmd);
             false
         }
         // PROBABILISTIC COMMANDS
