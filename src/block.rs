@@ -76,6 +76,7 @@ pub struct ListWaiter {
 }
 
 pub struct StreamWaiter {
+    pub client_id: u64,
     pub key: Bytes,
     pub sender: Sender<()>,
 }
@@ -87,6 +88,7 @@ pub struct BlockHub {
     stream_waiters: HashMap<Bytes, Vec<StreamWaiter>>,
     blocked_clients: HashMap<u64, Sender<BlockedListResult>>,
     blocked_zset_clients: HashMap<u64, Sender<BlockedZSetResult>>,
+    blocked_stream_clients: HashMap<u64, Sender<()>>,
     paused_count: usize,
     pending_notifies: Vec<Bytes>,
 }
@@ -123,6 +125,7 @@ impl BlockHub {
             stream_waiters: HashMap::new(),
             blocked_clients: HashMap::new(),
             blocked_zset_clients: HashMap::new(),
+            blocked_stream_clients: HashMap::new(),
             paused_count: 0,
             pending_notifies: Vec::new(),
         }
@@ -135,7 +138,8 @@ impl BlockHub {
             + self.zset_waiters.values().map(|w| w.len()).sum::<usize>()
             + self.stream_waiters.values().map(|w| w.len()).sum::<usize>()
             + self.blocked_clients.len()
-            + self.blocked_zset_clients.len();
+            + self.blocked_zset_clients.len()
+            + self.blocked_stream_clients.len();
         TOTAL_BLOCKED_WAITERS.store(count, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -175,7 +179,33 @@ impl BlockHub {
     }
 
     pub fn blocked_clients_count(&self) -> usize {
-        self.blocked_clients.len() + self.blocked_zset_clients.len()
+        self.blocked_clients.len()
+            + self.blocked_zset_clients.len()
+            + self.blocked_stream_clients.len()
+    }
+
+    pub fn blocking_keys_count(&self) -> usize {
+        let mut keys: hashbrown::HashSet<&Bytes> = hashbrown::HashSet::new();
+        for (k, v) in &self.list_waiters {
+            if !v.is_empty() {
+                keys.insert(k);
+            }
+        }
+        for (k, v) in &self.zset_waiters {
+            if !v.is_empty() {
+                keys.insert(k);
+            }
+        }
+        for (k, v) in &self.stream_waiters {
+            if !v.is_empty() {
+                keys.insert(k);
+            }
+        }
+        keys.len()
+    }
+
+    pub fn blocking_keys_on_nokey_count(&self) -> usize {
+        self.stream_waiters.values().filter(|v| !v.is_empty()).count()
     }
 
     pub fn register_blocked_client(&mut self, client_id: u64, sender: Sender<BlockedListResult>) {
@@ -195,17 +225,25 @@ impl BlockHub {
     pub fn is_blocked(&self, client_id: u64) -> bool {
         self.blocked_clients.contains_key(&client_id)
             || self.blocked_zset_clients.contains_key(&client_id)
+            || self.blocked_stream_clients.contains_key(&client_id)
     }
 
     pub fn remove_waiters_for_client(&mut self, client_id: u64) {
         for waiters in self.list_waiters.values_mut() {
             waiters.retain(|w| w.client_id != client_id);
         }
+        self.list_waiters.retain(|_, v| !v.is_empty());
         for waiters in self.zset_waiters.values_mut() {
             waiters.retain(|w| w.client_id != client_id);
         }
+        self.zset_waiters.retain(|_, v| !v.is_empty());
+        for waiters in self.stream_waiters.values_mut() {
+            waiters.retain(|w| w.client_id != client_id);
+        }
+        self.stream_waiters.retain(|_, v| !v.is_empty());
         self.blocked_clients.remove(&client_id);
         self.blocked_zset_clients.remove(&client_id);
+        self.blocked_stream_clients.remove(&client_id);
         self.sync_atomic_waiters_count();
     }
 
@@ -225,6 +263,13 @@ impl BlockHub {
         if let Some(sender) = self.blocked_zset_clients.remove(&client_id) {
             let _ = sender.send(BlockedZSetResult::Unblocked(unblock_type));
             for waiters in self.zset_waiters.values_mut() {
+                waiters.retain(|w| w.client_id != client_id);
+            }
+            unblocked = true;
+        }
+        if let Some(sender) = self.blocked_stream_clients.remove(&client_id) {
+            let _ = sender.try_send(());
+            for waiters in self.stream_waiters.values_mut() {
                 waiters.retain(|w| w.client_id != client_id);
             }
             unblocked = true;
@@ -538,21 +583,38 @@ impl BlockHub {
         }
     }
 
-    pub fn register_stream_waiter(&mut self, key: Bytes, sender: Sender<()>) {
-        self.stream_waiters
-            .entry(key.clone())
-            .or_default()
-            .push(StreamWaiter { key, sender });
+    pub fn register_stream_waiter(&mut self, client_id: u64, key: Bytes, sender: Sender<()>) {
+        self.blocked_stream_clients.insert(client_id, sender.clone());
+        let entry = self.stream_waiters.entry(key.clone()).or_default();
+        if !entry.iter().any(|w| w.client_id == client_id) {
+            entry.push(StreamWaiter { client_id, key, sender });
+        }
         self.sync_atomic_waiters_count();
     }
 
     /// Called when XADD adds an entry to a stream.
     pub fn notify_stream(&mut self, key: &Bytes) {
         if let Some(waiters) = self.stream_waiters.remove(key) {
+            for (idx, waiter) in waiters.iter().enumerate() {
+                self.blocked_stream_clients.remove(&waiter.client_id);
+                if idx > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let _ = waiter.sender.try_send(());
+            }
             for waiter in waiters {
-                let _ = waiter.sender.send(());
+                for other_waiters in self.stream_waiters.values_mut() {
+                    other_waiters.retain(|w| w.client_id != waiter.client_id);
+                }
             }
             self.sync_atomic_waiters_count();
+        }
+    }
+
+    pub fn notify_all_streams(&mut self) {
+        let keys: Vec<Bytes> = self.stream_waiters.keys().cloned().collect();
+        for k in keys {
+            self.notify_stream(&k);
         }
     }
 }
@@ -585,8 +647,7 @@ mod tests {
         assert_eq!(
             hub.list_waiters
                 .get(&Bytes::from_static(b"k1"))
-                .unwrap()
-                .len(),
+                .map_or(0, |v| v.len()),
             0
         );
         assert!(!has_blocked_waiters(12345));
@@ -685,7 +746,7 @@ mod tests {
         // Test Stream waiter
         let sk = Bytes::from_static(b"skey");
         let (tx_s, rx_s) = unbounded();
-        hub.register_stream_waiter(sk.clone(), tx_s);
+        hub.register_stream_waiter(1001, sk.clone(), tx_s);
         assert_eq!(hub.stream_waiters.len(), 1);
 
         hub.notify_stream(&sk);

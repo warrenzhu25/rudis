@@ -2090,9 +2090,23 @@ impl ShardDb {
         nomkstream: bool,
         maxlen: Option<usize>,
         minid: Option<crate::table::StreamId>,
-    ) -> Result<Option<crate::table::StreamId>, &'static str> {
-        self.table
-            .xadd(key, add_id, fields, nomkstream, maxlen, minid)
+        approx: bool,
+        trim_strategy: crate::table::StreamTrimStrategy,
+        idmp: Option<crate::table::StreamIdmpOption>,
+        limit: Option<usize>,
+    ) -> Result<crate::table::StreamAddResult, &'static str> {
+        self.table.xadd(
+            key,
+            add_id,
+            fields,
+            nomkstream,
+            maxlen,
+            minid,
+            approx,
+            trim_strategy,
+            idmp,
+            limit,
+        )
     }
 
     #[inline]
@@ -2128,9 +2142,11 @@ impl ShardDb {
         keys: &[Bytes],
         ids: &[String],
         count: Option<usize>,
+        maxcount: Option<usize>,
+        maxsize: Option<usize>,
     ) -> Result<Vec<(Bytes, Vec<(crate::table::StreamId, Vec<(Bytes, Bytes)>)>)>, &'static str>
     {
-        self.table.xread(keys, ids, count)
+        self.table.xread(keys, ids, count, maxcount, maxsize)
     }
 
     #[inline]
@@ -2148,13 +2164,78 @@ impl ShardDb {
         key: &[u8],
         maxlen: Option<usize>,
         minid: Option<crate::table::StreamId>,
+        approx: bool,
+        trim_strategy: crate::table::StreamTrimStrategy,
+        limit: Option<usize>,
     ) -> Result<usize, &'static str> {
-        self.table.xtrim(key, maxlen, minid)
+        self.table.xtrim(key, maxlen, minid, approx, trim_strategy, limit)
+    }
+
+    #[inline]
+    pub fn xcfgset(
+        &mut self,
+        key: &[u8],
+        duration: Option<u64>,
+        maxsize: Option<usize>,
+    ) -> Result<(), &'static str> {
+        self.table.xcfgset(key, duration, maxsize)
+    }
+
+    #[inline]
+    pub fn xsetid(
+        &mut self,
+        key: &[u8],
+        last_id: crate::table::StreamId,
+        entries_added: Option<u64>,
+        max_deleted_id: Option<crate::table::StreamId>,
+    ) -> Result<(), &'static str> {
+        self.table.xsetid(key, last_id, entries_added, max_deleted_id)
+    }
+
+    #[inline]
+    pub fn xdelex(
+        &mut self,
+        key: &[u8],
+        strategy: crate::table::StreamTrimStrategy,
+        ids: &[crate::table::StreamId],
+    ) -> (Vec<i64>, usize) {
+        self.table.xdelex(key, strategy, ids)
+    }
+
+    #[inline]
+    pub fn xackdel(
+        &mut self,
+        key: &[u8],
+        group: &[u8],
+        strategy: crate::table::StreamTrimStrategy,
+        ids: &[crate::table::StreamId],
+    ) -> (Vec<i64>, usize) {
+        self.table.xackdel(key, group, strategy, ids)
+    }
+
+    #[inline]
+    pub fn xidmprecord(
+        &mut self,
+        key: &[u8],
+        pid: Bytes,
+        iid: Bytes,
+        id_raw: &[u8],
+    ) -> Result<(), &'static str> {
+        self.table.xidmprecord(key, pid, iid, id_raw)
     }
 
     #[inline]
     pub fn xinfo_stream(&mut self, key: &[u8]) -> Result<crate::table::StreamInfo, &'static str> {
         self.table.xinfo_stream(key)
+    }
+
+    #[inline]
+    pub fn xinfo_stream_full(
+        &mut self,
+        key: &[u8],
+        count: Option<usize>,
+    ) -> Result<crate::table::StreamFullInfo, &'static str> {
+        self.table.xinfo_stream_full(key, count)
     }
 
     #[inline]
@@ -3173,8 +3254,9 @@ impl ShardDb {
         group: Bytes,
         id_str: &str,
         mkstream: bool,
+        entries_read: Option<u64>,
     ) -> Result<(), &'static str> {
-        self.table.xgroup_create(key, group, id_str, mkstream)
+        self.table.xgroup_create(key, group, id_str, mkstream, entries_read)
     }
 
     #[inline]
@@ -3222,9 +3304,31 @@ impl ShardDb {
         id_str: &str,
         count: Option<usize>,
         noack: bool,
-    ) -> Result<Vec<(crate::table::StreamId, Vec<(Bytes, Bytes)>)>, &'static str> {
+        claim: Option<u64>,
+        max_bytes: usize,
+        total_entries: &mut usize,
+        total_bytes: &mut usize,
+    ) -> Result<(Vec<(crate::table::StreamId, Vec<(Bytes, Bytes)>, Option<(u64, usize)>)>, bool), &'static str> {
         self.table
-            .xreadgroup(key, group, consumer, id_str, count, noack)
+            .xreadgroup(key, group, consumer, id_str, count, noack, claim, max_bytes, total_entries, total_bytes)
+    }
+
+    #[inline]
+    pub fn xnack(
+        &mut self,
+        key: &[u8],
+        group: &[u8],
+        mode: crate::resp::XnackMode,
+        ids: &[crate::table::StreamId],
+        retrycount: Option<usize>,
+        force: bool,
+    ) -> Result<usize, &'static str> {
+        self.table.xnack(key, group, mode, ids, retrycount, force)
+    }
+
+    #[inline]
+    pub fn earliest_claim_wait_ms(&mut self, key: &[u8], group: &[u8], min_idle: u64) -> Option<u64> {
+        self.table.earliest_claim_wait_ms(key, group, min_idle)
     }
 
     #[inline]
@@ -3259,13 +3363,14 @@ impl ShardDb {
         &mut self,
         key: &[u8],
         group: &[u8],
-        start: crate::table::StreamId,
-        end: crate::table::StreamId,
+        start: std::ops::Bound<crate::table::StreamId>,
+        end: std::ops::Bound<crate::table::StreamId>,
         count: usize,
         consumer: Option<&[u8]>,
-    ) -> Result<Vec<(crate::table::StreamId, Bytes, u64, usize)>, &'static str> {
+        min_idle: Option<u64>,
+    ) -> Result<Vec<(crate::table::StreamId, Bytes, i64, usize)>, &'static str> {
         self.table
-            .xpending_range(key, group, start, end, count, consumer)
+            .xpending_range(key, group, start, end, count, consumer, min_idle)
     }
 
     // Vector operations

@@ -452,6 +452,7 @@ pub fn run_shard_worker(
                             .borrow_mut()
                             .set(descriptor.key.clone(), descriptor.value.clone(), descriptor.expire_in);
                         crate::connection::notify_keyspace_event_sync(&cross_shard_router, crate::connection::NOTIFY_STRING, "set", &descriptor.key);
+                        crate::connection::notify_stream_or_defer(&mut cross_shard_db.borrow_mut(), &descriptor.key);
                         if descriptor.expire_in.is_some() {
                             crate::connection::notify_keyspace_event_sync(&cross_shard_router, crate::connection::NOTIFY_GENERIC, "expire", &descriptor.key);
                         }
@@ -464,6 +465,7 @@ pub fn run_shard_worker(
                         if deleted {
                             db.delete_document_local(&String::from_utf8_lossy(&key));
                             crate::connection::notify_keyspace_event_sync(&cross_shard_router, crate::connection::NOTIFY_GENERIC, "del", &key);
+                            crate::connection::notify_stream_or_defer(&mut db, &key);
                             if let Some(aof) = &cross_shard_aof
                                 && let Some(bytes) =
                                     crate::aof::command_to_resp(&crate::resp::Command::Del(smallvec![
@@ -1711,6 +1713,7 @@ pub fn run_shard_worker(
                         let hub_arc = crate::block::get_block_hub_for_port(db.port);
                         let mut hub = hub_arc.lock().unwrap();
                         for k in keys {
+                            hub.notify_stream(&k);
                             hub.notify_list(&mut db.table, &k);
                             hub.notify_zset(&mut db.table, &k);
                         }

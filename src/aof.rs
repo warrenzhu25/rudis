@@ -763,8 +763,12 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             nomkstream,
             maxlen,
             minid,
+            approx: _,
+            trim_strategy: _,
+            idmp: _,
             id,
             fields,
+            limit: _,
         } => {
             let mut num_args = 2 + 1 + fields.len() * 2;
             if *nomkstream {
@@ -822,7 +826,33 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             Some(buf)
         }
-        Command::Xtrim { key, maxlen, minid } => {
+        Command::Xidmprecord {
+            key,
+            pid,
+            iid,
+            id_raw,
+        } => {
+            buf.extend_from_slice(
+                format!("*5\r\n$11\r\nXIDMPRECORD\r\n${}\r\n", key.len()).as_bytes(),
+            );
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n", pid.len()).as_bytes());
+            buf.extend_from_slice(pid);
+            buf.extend_from_slice(format!("\r\n${}\r\n", iid.len()).as_bytes());
+            buf.extend_from_slice(iid);
+            buf.extend_from_slice(format!("\r\n${}\r\n", id_raw.len()).as_bytes());
+            buf.extend_from_slice(id_raw);
+            buf.extend_from_slice(b"\r\n");
+            Some(buf)
+        }
+        Command::Xtrim {
+            key,
+            maxlen,
+            minid,
+            approx: _,
+            trim_strategy: _,
+            limit: _,
+        } => {
             let mut num_args = 2;
             if maxlen.is_some() {
                 num_args += 2;
@@ -852,11 +882,15 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             group,
             id,
             mkstream,
+            entries_read,
         } => {
             let id_str = id.to_string();
             let mut num_args = 5;
             if *mkstream {
                 num_args += 1;
+            }
+            if entries_read.is_some() {
+                num_args += 2;
             }
             buf.extend_from_slice(
                 format!(
@@ -872,6 +906,11 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", id_str.len(), id_str).as_bytes());
             if *mkstream {
                 buf.extend_from_slice(b"$8\r\nMKSTREAM\r\n");
+            }
+            if let Some(er) = entries_read {
+                let er_str = er.to_string();
+                buf.extend_from_slice(b"$11\r\nENTRIESREAD\r\n");
+                buf.extend_from_slice(format!("${}\r\n{}\r\n", er_str.len(), er_str).as_bytes());
             }
             Some(buf)
         }
@@ -926,6 +965,51 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             for id in ids {
                 let s = id.to_string();
                 buf.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
+            }
+            Some(buf)
+        }
+        Command::Xnack {
+            key,
+            group,
+            mode,
+            ids,
+            retrycount,
+            force,
+        } => {
+            let mut num_args = 3 + 1 + 2 + ids.len();
+            if retrycount.is_some() {
+                num_args += 2;
+            }
+            if *force {
+                num_args += 1;
+            }
+            buf.extend_from_slice(
+                format!("*{}\r\n$5\r\nXNACK\r\n${}\r\n", num_args, key.len()).as_bytes(),
+            );
+            buf.extend_from_slice(key);
+            buf.extend_from_slice(format!("\r\n${}\r\n", group.len()).as_bytes());
+            buf.extend_from_slice(group);
+            buf.extend_from_slice(b"\r\n");
+            let mode_str = match mode {
+                crate::resp::XnackMode::Silent => "SILENT",
+                crate::resp::XnackMode::Fail => "FAIL",
+                crate::resp::XnackMode::Fatal => "FATAL",
+            };
+            buf.extend_from_slice(format!("${}\r\n{}\r\n", mode_str.len(), mode_str).as_bytes());
+            buf.extend_from_slice(b"$3\r\nIDS\r\n");
+            let numids_s = ids.len().to_string();
+            buf.extend_from_slice(format!("${}\r\n{}\r\n", numids_s.len(), numids_s).as_bytes());
+            for id in ids {
+                let id_s = id.to_string();
+                buf.extend_from_slice(format!("${}\r\n{}\r\n", id_s.len(), id_s).as_bytes());
+            }
+            if let Some(rc) = retrycount {
+                let rc_s = rc.to_string();
+                buf.extend_from_slice(b"$10\r\nRETRYCOUNT\r\n");
+                buf.extend_from_slice(format!("${}\r\n{}\r\n", rc_s.len(), rc_s).as_bytes());
+            }
+            if *force {
+                buf.extend_from_slice(b"$5\r\nFORCE\r\n");
             }
             Some(buf)
         }
@@ -2062,24 +2146,159 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
                 writer.write_all(b"\r\n")?;
                 count += 1;
             }
-            crate::table::RudisValue::Stream(stream) if !stream.entries.is_empty() => {
-                for (sid, fields) in &stream.entries {
-                    let id_str = sid.to_string();
-                    let num_args = 2 + 1 + fields.len() * 2;
+            crate::table::RudisValue::Stream(stream) => {
+                if !stream.entries.is_empty() {
+                    for (sid, fields) in &stream.entries {
+                        let id_str = sid.to_string();
+                        let num_args = 2 + 1 + fields.len() * 2;
+                        writer.write_all(
+                            format!("*{}\r\n$4\r\nXADD\r\n${}\r\n", num_args, k.len()).as_bytes(),
+                        )?;
+                        writer.write_all(k)?;
+                        writer
+                            .write_all(format!("\r\n${}\r\n{}\r\n", id_str.len(), id_str).as_bytes())?;
+                        for (f, v) in fields {
+                            writer.write_all(format!("${}\r\n", f.len()).as_bytes())?;
+                            writer.write_all(f.as_ref())?;
+                            writer.write_all(format!("\r\n${}\r\n", v.len()).as_bytes())?;
+                            writer.write_all(v.as_ref())?;
+                            writer.write_all(b"\r\n")?;
+                        }
+                        count += 1;
+                    }
+                }
+                if stream.last_id != crate::table::StreamId::default() || stream.entries_added > 0 {
+                    let last_id_str = stream.last_id.to_string();
+                    let ea_str = stream.entries_added.to_string();
+                    let md_str = stream.max_deleted_entry_id.to_string();
                     writer.write_all(
-                        format!("*{}\r\n$4\r\nXADD\r\n${}\r\n", num_args, k.len()).as_bytes(),
+                        format!("*7\r\n$6\r\nXSETID\r\n${}\r\n", k.len()).as_bytes(),
                     )?;
                     writer.write_all(k)?;
-                    writer
-                        .write_all(format!("\r\n${}\r\n{}\r\n", id_str.len(), id_str).as_bytes())?;
-                    for (f, v) in fields {
-                        writer.write_all(format!("${}\r\n", f.len()).as_bytes())?;
-                        writer.write_all(f.as_ref())?;
-                        writer.write_all(format!("\r\n${}\r\n", v.len()).as_bytes())?;
-                        writer.write_all(v.as_ref())?;
-                        writer.write_all(b"\r\n")?;
+                    writer.write_all(
+                        format!(
+                            "\r\n${}\r\n{}\r\n$12\r\nENTRIESADDED\r\n${}\r\n{}\r\n$12\r\nMAXDELETEDID\r\n${}\r\n{}\r\n",
+                            last_id_str.len(), last_id_str,
+                            ea_str.len(), ea_str,
+                            md_str.len(), md_str
+                        ).as_bytes()
+                    )?;
+                    count += 1;
+                }
+                for grp in stream.groups.values() {
+                    let last_deliv_str = grp.last_delivered_id.to_string();
+                    if let Some(er) = grp.entries_read {
+                        let er_str = er.to_string();
+                        writer.write_all(
+                            format!(
+                                "*7\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n${}\r\n",
+                                k.len()
+                            ).as_bytes()
+                        )?;
+                        writer.write_all(k)?;
+                        writer.write_all(
+                            format!(
+                                "\r\n${}\r\n", grp.name.len()
+                            ).as_bytes()
+                        )?;
+                        writer.write_all(&grp.name)?;
+                        writer.write_all(
+                            format!(
+                                "\r\n${}\r\n{}\r\n$11\r\nENTRIESREAD\r\n${}\r\n{}\r\n",
+                                last_deliv_str.len(), last_deliv_str,
+                                er_str.len(), er_str
+                            ).as_bytes()
+                        )?;
+                    } else {
+                        writer.write_all(
+                            format!(
+                                "*5\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n${}\r\n",
+                                k.len()
+                            ).as_bytes()
+                        )?;
+                        writer.write_all(k)?;
+                        writer.write_all(
+                            format!(
+                                "\r\n${}\r\n", grp.name.len()
+                            ).as_bytes()
+                        )?;
+                        writer.write_all(&grp.name)?;
+                        writer.write_all(
+                            format!(
+                                "\r\n${}\r\n{}\r\n",
+                                last_deliv_str.len(), last_deliv_str
+                            ).as_bytes()
+                        )?;
                     }
                     count += 1;
+
+                    for (c_name, cons) in &grp.consumers {
+                        for (&sid, &deliv_time) in &cons.pel {
+                            let pe = match grp.pel.get(&sid) {
+                                Some(p) => p,
+                                None => continue,
+                            };
+                            let sid_str = sid.to_string();
+                            let dt_str = deliv_time.to_string();
+                            let rc_str = pe.delivery_count.to_string();
+                            writer.write_all(
+                                format!(
+                                    "*10\r\n$6\r\nXCLAIM\r\n${}\r\n",
+                                    k.len()
+                                ).as_bytes()
+                            )?;
+                            writer.write_all(k)?;
+                            writer.write_all(
+                                format!(
+                                    "\r\n${}\r\n", grp.name.len()
+                                ).as_bytes()
+                            )?;
+                            writer.write_all(&grp.name)?;
+                            writer.write_all(
+                                format!(
+                                    "\r\n${}\r\n", c_name.len()
+                                ).as_bytes()
+                            )?;
+                            writer.write_all(c_name)?;
+                            writer.write_all(
+                                format!(
+                                    "\r\n$1\r\n0\r\n${}\r\n{}\r\n$4\r\nTIME\r\n${}\r\n{}\r\n$10\r\nRETRYCOUNT\r\n${}\r\n{}\r\n$6\r\nJUSTID\r\n",
+                                    sid_str.len(), sid_str,
+                                    dt_str.len(), dt_str,
+                                    rc_str.len(), rc_str,
+                                ).as_bytes()
+                            )?;
+                            count += 1;
+                        }
+                    }
+
+                    for (&sid, pe) in &grp.pel {
+                        if pe.consumer.is_empty() {
+                            let sid_str = sid.to_string();
+                            let rc_str = pe.delivery_count.to_string();
+                            writer.write_all(
+                                format!(
+                                    "*10\r\n$5\r\nXNACK\r\n${}\r\n",
+                                    k.len()
+                                ).as_bytes()
+                            )?;
+                            writer.write_all(k)?;
+                            writer.write_all(
+                                format!(
+                                    "\r\n${}\r\n", grp.name.len()
+                                ).as_bytes()
+                            )?;
+                            writer.write_all(&grp.name)?;
+                            writer.write_all(
+                                format!(
+                                    "\r\n$4\r\nFAIL\r\n$3\r\nIDS\r\n$1\r\n1\r\n${}\r\n{}\r\n$10\r\nRETRYCOUNT\r\n${}\r\n{}\r\n$5\r\nFORCE\r\n",
+                                    sid_str.len(), sid_str,
+                                    rc_str.len(), rc_str,
+                                ).as_bytes()
+                            )?;
+                            count += 1;
+                        }
+                    }
                 }
             }
             _ => {}

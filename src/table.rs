@@ -1045,10 +1045,89 @@ pub fn parse_range_bound(
         StreamId::new(ms, seq)
     };
     if exclusive {
+        if is_start {
+            if id.ms == u64::MAX && id.seq == u64::MAX {
+                return Err("ERR invalid start ID for the interval");
+            }
+        } else {
+            if id.ms == 0 && id.seq == 0 {
+                return Err("ERR invalid end ID for the interval");
+            }
+        }
         Ok(std::ops::Bound::Excluded(id))
     } else {
         Ok(std::ops::Bound::Included(id))
     }
+}
+
+pub fn is_stream_range_empty(
+    start: &std::ops::Bound<StreamId>,
+    end: &std::ops::Bound<StreamId>,
+) -> bool {
+    match (start, end) {
+        (std::ops::Bound::Included(s), std::ops::Bound::Included(e)) => s > e,
+        (std::ops::Bound::Included(s), std::ops::Bound::Excluded(e)) => s >= e,
+        (std::ops::Bound::Excluded(s), std::ops::Bound::Included(e)) => s >= e,
+        (std::ops::Bound::Excluded(s), std::ops::Bound::Excluded(e)) => s >= e,
+        _ => false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StreamTrimStrategy {
+    KeepRef = 0,
+    DelRef = 1,
+    Acked = 2,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamIdmpOption {
+    Manual { producer: Bytes, iid: Bytes },
+    Auto { producer: Bytes },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamAddResult {
+    Added(StreamId),
+    Duplicate(StreamId),
+    NoMkStream,
+}
+
+pub static STREAM_NODE_MAX_ENTRIES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(100);
+pub static STREAM_IDMP_DURATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(100);
+pub static STREAM_IDMP_MAXSIZE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(100);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdmpProducer {
+    pub iids: HashMap<Bytes, (StreamId, u64)>,
+    pub order: std::collections::VecDeque<Bytes>,
+}
+
+impl IdmpProducer {
+    pub fn new() -> Self {
+        Self {
+            iids: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+}
+
+pub fn compute_stream_auto_iid(fields: &[(Bytes, Bytes)]) -> Bytes {
+    let mut sorted_fields = fields.to_vec();
+    sorted_fields.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"AUTO:");
+    for (k, v) in &sorted_fields {
+        buf.extend_from_slice(&(k.len() as u32).to_be_bytes());
+        buf.extend_from_slice(k);
+        buf.extend_from_slice(&(v.len() as u32).to_be_bytes());
+        buf.extend_from_slice(v);
+    }
+    Bytes::from(buf)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1056,6 +1135,7 @@ pub struct StreamPelEntry {
     pub consumer: Bytes,
     pub delivery_time_ms: u64,
     pub delivery_count: usize,
+    pub nack_seq: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1070,9 +1150,10 @@ pub struct StreamConsumer {
 pub struct StreamGroup {
     pub name: Bytes,
     pub last_delivered_id: StreamId,
-    pub entries_read: u64,
+    pub entries_read: Option<u64>,
     pub consumers: HashMap<Bytes, StreamConsumer>,
     pub pel: std::collections::BTreeMap<StreamId, StreamPelEntry>,
+    pub next_nack_seq: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1082,6 +1163,12 @@ pub struct RudisStream {
     pub entries_added: u64,
     pub max_deleted_entry_id: StreamId,
     pub groups: HashMap<Bytes, StreamGroup>,
+    pub idmp_duration: Option<u64>,
+    pub idmp_maxsize: Option<usize>,
+    pub idmp_producers: HashMap<Bytes, IdmpProducer>,
+    pub iids_added: u64,
+    pub iids_duplicates: u64,
+    pub nodes: std::collections::VecDeque<Vec<StreamId>>,
 }
 
 impl Default for RudisStream {
@@ -1098,6 +1185,211 @@ impl RudisStream {
             entries_added: 0,
             max_deleted_entry_id: StreamId::default(),
             groups: HashMap::new(),
+            idmp_duration: None,
+            idmp_maxsize: None,
+            idmp_producers: HashMap::new(),
+            iids_added: 0,
+            iids_duplicates: 0,
+            nodes: std::collections::VecDeque::new(),
+        }
+    }
+
+    pub fn rebuild_nodes(&mut self) {
+        let chunk_size = STREAM_NODE_MAX_ENTRIES.load(std::sync::atomic::Ordering::Relaxed).max(1);
+        self.nodes.clear();
+        let mut cur = Vec::new();
+        for &id in self.entries.keys() {
+            cur.push(id);
+            if cur.len() >= chunk_size {
+                self.nodes.push_back(std::mem::take(&mut cur));
+            }
+        }
+        if !cur.is_empty() {
+            self.nodes.push_back(cur);
+        }
+    }
+
+    pub fn add_entry_to_nodes(&mut self, id: StreamId) {
+        let chunk_size = STREAM_NODE_MAX_ENTRIES.load(std::sync::atomic::Ordering::Relaxed).max(1);
+        if let Some(back) = self.nodes.back_mut() {
+            if back.len() < chunk_size {
+                back.push(id);
+                return;
+            }
+        }
+        self.nodes.push_back(vec![id]);
+    }
+
+    pub fn remove_entry_from_nodes(&mut self, id: &StreamId) {
+        let mut empty_idx = None;
+        for (idx, node) in self.nodes.iter_mut().enumerate() {
+            if let Some(pos) = node.iter().position(|x| x == id) {
+                node.remove(pos);
+                if node.is_empty() {
+                    empty_idx = Some(idx);
+                }
+                break;
+            }
+        }
+        if let Some(idx) = empty_idx {
+            self.nodes.remove(idx);
+        }
+    }
+
+    pub fn estimate_distance_from_fields(
+        entries_added: u64,
+        entries_len: usize,
+        last_id: StreamId,
+        max_deleted_entry_id: StreamId,
+        first_id: Option<StreamId>,
+        id: &StreamId,
+    ) -> Option<u64> {
+        if entries_added == 0 {
+            return Some(0);
+        }
+        if entries_len == 0 && id <= &last_id {
+            return Some(entries_added);
+        }
+        let cmp_last = id.cmp(&last_id);
+        if cmp_last == std::cmp::Ordering::Equal {
+            return Some(entries_added);
+        } else if cmp_last == std::cmp::Ordering::Greater {
+            return None;
+        }
+        if let Some(fid) = first_id {
+            if max_deleted_entry_id == StreamId::default() || max_deleted_entry_id < fid {
+                if id < &fid {
+                    return Some(entries_added.saturating_sub(entries_len as u64));
+                } else if id == &fid {
+                    return Some(entries_added.saturating_sub(entries_len as u64) + 1);
+                }
+            }
+        }
+        if *id != StreamId::default() && id < &max_deleted_entry_id {
+            return None;
+        }
+        None
+    }
+
+    pub fn estimate_distance_from_first_ever_entry(&self, id: &StreamId) -> Option<u64> {
+        Self::estimate_distance_from_fields(
+            self.entries_added,
+            self.entries.len(),
+            self.last_id,
+            self.max_deleted_entry_id,
+            self.entries.keys().next().copied(),
+            id,
+        )
+    }
+
+    pub fn compute_cg_lag(&self, grp: &StreamGroup) -> Option<u64> {
+        if self.entries_added == 0 {
+            return Some(0);
+        }
+        let first_id = self.entries.keys().next().copied();
+        let has_tombstones_ahead = !self.entries.is_empty()
+            && self.max_deleted_entry_id != StreamId::default()
+            && grp.last_delivered_id <= self.max_deleted_entry_id;
+
+        if let Some(fid) = first_id {
+            if grp.last_delivered_id >= fid {
+                if let Some(er) = grp.entries_read {
+                    if !has_tombstones_ahead {
+                        return Some(self.entries_added.saturating_sub(er));
+                    }
+                }
+            }
+        }
+
+        if let Some(er) = self.estimate_distance_from_first_ever_entry(&grp.last_delivered_id) {
+            return Some(self.entries_added.saturating_sub(er));
+        }
+        None
+    }
+
+    pub fn get_idmp_duration(&self) -> u64 {
+        self.idmp_duration.unwrap_or_else(|| {
+            STREAM_IDMP_DURATION.load(std::sync::atomic::Ordering::Relaxed)
+        })
+    }
+
+    pub fn get_idmp_maxsize(&self) -> usize {
+        self.idmp_maxsize.unwrap_or_else(|| {
+            STREAM_IDMP_MAXSIZE.load(std::sync::atomic::Ordering::Relaxed)
+        })
+    }
+
+    pub fn purge_expired_idmp(&mut self, now_ms: u64) {
+        let duration_ms = self.get_idmp_duration().saturating_mul(1000);
+        let mut empty_producers = Vec::new();
+        for (pid, prod) in &mut self.idmp_producers {
+            while let Some(front_iid) = prod.order.front() {
+                if let Some((_, added_at)) = prod.iids.get(front_iid) {
+                    if now_ms.saturating_sub(*added_at) > duration_ms {
+                        let expired_iid = prod.order.pop_front().unwrap();
+                        prod.iids.remove(&expired_iid);
+                    } else {
+                        break;
+                    }
+                } else {
+                    prod.order.pop_front();
+                }
+            }
+            if prod.iids.is_empty() {
+                empty_producers.push(pid.clone());
+            }
+        }
+        for pid in empty_producers {
+            self.idmp_producers.remove(&pid);
+        }
+    }
+
+    pub fn find_unexpired_idmp(
+        &mut self,
+        producer: &Bytes,
+        iid: &Bytes,
+        now_ms: u64,
+    ) -> Option<StreamId> {
+        self.purge_expired_idmp(now_ms);
+        if let Some(prod) = self.idmp_producers.get(producer) {
+            if let Some((sid, added_at)) = prod.iids.get(iid) {
+                let duration_ms = self.get_idmp_duration().saturating_mul(1000);
+                if now_ms.saturating_sub(*added_at) <= duration_ms {
+                    return Some(*sid);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn record_idmp(
+        &mut self,
+        producer: Bytes,
+        iid: Bytes,
+        stream_id: StreamId,
+        now_ms: u64,
+    ) {
+        self.purge_expired_idmp(now_ms);
+        let maxsize = self.get_idmp_maxsize();
+        let prod = self
+            .idmp_producers
+            .entry(producer)
+            .or_insert_with(IdmpProducer::new);
+        if let Some(val) = prod.iids.get_mut(&iid) {
+            *val = (stream_id, now_ms);
+        } else {
+            if maxsize > 0 {
+                while prod.order.len() >= maxsize {
+                    if let Some(old_iid) = prod.order.pop_front() {
+                        prod.iids.remove(&old_iid);
+                    } else {
+                        break;
+                    }
+                }
+                prod.order.push_back(iid.clone());
+                prod.iids.insert(iid, (stream_id, now_ms));
+                self.iids_added += 1;
+            }
         }
     }
 
@@ -5297,13 +5589,14 @@ impl RudisTable {
                 }
                 claimed.push((sid, fields));
             } else if force && let Some(fields) = stream.entries.get(&sid).cloned() {
-                let new_count = retrycount.unwrap_or(if justid { 0 } else { 1 });
+                let new_count = retrycount.unwrap_or(1);
                 grp.pel.insert(
                     sid,
                     StreamPelEntry {
                         consumer: consumer.clone(),
                         delivery_time_ms: target_delivery_time,
                         delivery_count: new_count,
+                        nack_seq: 0,
                     },
                 );
                 if let Some(new_c) = grp.consumers.get_mut(&consumer) {
@@ -11004,21 +11297,29 @@ impl RudisTable {
 
         let final_id = match add_id {
             StreamAddId::Auto => {
-                let ms = if now_ms > stream.last_id.ms {
-                    now_ms
+                if stream.last_id.ms == u64::MAX && stream.last_id.seq == u64::MAX {
+                    return Err(
+                        "ERR The stream has exhausted the last possible ID, unable to add more items",
+                    );
+                }
+                if stream.last_id == StreamId::default() && stream.entries.is_empty() {
+                    let ms = now_ms;
+                    let seq = if ms == 0 { 1 } else { 0 };
+                    StreamId::new(ms, seq)
+                } else if now_ms > stream.last_id.ms {
+                    StreamId::new(now_ms, 0)
                 } else {
-                    stream.last_id.ms
-                };
-                let seq = if ms == stream.last_id.ms {
-                    if stream.last_id == StreamId::default() && stream.entries.is_empty() {
-                        if ms == 0 { 1 } else { 0 }
+                    if stream.last_id.seq == u64::MAX {
+                        if stream.last_id.ms == u64::MAX {
+                            return Err(
+                                "ERR The stream has exhausted the last possible ID, unable to add more items",
+                            );
+                        }
+                        StreamId::new(stream.last_id.ms + 1, 0)
                     } else {
-                        stream.last_id.seq + 1
+                        StreamId::new(stream.last_id.ms, stream.last_id.seq + 1)
                     }
-                } else {
-                    if ms == 0 { 1 } else { 0 }
-                };
-                StreamId::new(ms, seq)
+                }
             }
             StreamAddId::AutoSeq(ms) => {
                 if ms < stream.last_id.ms {
@@ -11030,6 +11331,11 @@ impl RudisTable {
                     if stream.last_id == StreamId::default() && stream.entries.is_empty() {
                         if ms == 0 { 1 } else { 0 }
                     } else {
+                        if stream.last_id.seq == u64::MAX {
+                            return Err(
+                                "ERR The ID specified in XADD is equal or smaller than the target stream top item",
+                            );
+                        }
                         stream.last_id.seq + 1
                     }
                 } else {
@@ -11054,36 +11360,169 @@ impl RudisTable {
         Ok(final_id)
     }
 
+    fn is_entry_acked(groups: &HashMap<Bytes, StreamGroup>, entry_id: &StreamId) -> bool {
+        for group in groups.values() {
+            if *entry_id > group.last_delivered_id || group.pel.contains_key(entry_id) {
+                return false;
+            }
+        }
+        true
+    }
+
     fn apply_stream_trim(
         stream: &mut RudisStream,
         maxlen: Option<usize>,
         minid: Option<StreamId>,
+        approx: bool,
+        trim_strategy: StreamTrimStrategy,
+        limit: Option<usize>,
     ) -> usize {
+        let chunk_size = STREAM_NODE_MAX_ENTRIES.load(std::sync::atomic::Ordering::Relaxed).max(1);
+        let max_limit = if approx {
+            limit.unwrap_or_else(|| {
+                let def = 100 * chunk_size;
+                if def == 0 {
+                    10000
+                } else {
+                    def.min(1000000)
+                }
+            })
+        } else {
+            limit.unwrap_or(usize::MAX)
+        };
         let mut trimmed = 0;
+
         if let Some(max) = maxlen {
-            while stream.entries.len() > max {
-                if let Some(first_key) = stream.entries.keys().next().copied() {
-                    stream.entries.remove(&first_key);
-                    stream.max_deleted_entry_id =
-                        std::cmp::max(stream.max_deleted_entry_id, first_key);
+            if trim_strategy == StreamTrimStrategy::Acked {
+                let mut to_remove = Vec::new();
+                for (&id, _) in &stream.entries {
+                    if stream.entries.len() - to_remove.len() <= max || trimmed + to_remove.len() >= max_limit {
+                        break;
+                    }
+                    if Self::is_entry_acked(&stream.groups, &id) {
+                        to_remove.push(id);
+                    }
+                }
+                for id in to_remove {
+                    stream.entries.remove(&id);
+                    stream.remove_entry_from_nodes(&id);
                     trimmed += 1;
-                } else {
-                    break;
+                }
+            } else if approx {
+                while let Some(front_node) = stream.nodes.front() {
+                    let node_len = front_node.len();
+                    if stream.entries.len() - node_len < max {
+                        break;
+                    }
+                    if trimmed + node_len > max_limit {
+                        break;
+                    }
+                    let ids = stream.nodes.pop_front().unwrap();
+                    for id in ids {
+                        stream.entries.remove(&id);
+                        if trim_strategy == StreamTrimStrategy::DelRef {
+                            for grp in stream.groups.values_mut() {
+                                if let Some(pel_entry) = grp.pel.remove(&id) {
+                                    if let Some(cons) = grp.consumers.get_mut(&pel_entry.consumer) {
+                                        cons.pel.remove(&id);
+                                    }
+                                }
+                            }
+                        }
+                        trimmed += 1;
+                    }
+                }
+            } else {
+                while stream.entries.len() > max && trimmed < max_limit {
+                    if let Some((&id, _)) = stream.entries.iter().next() {
+                        stream.entries.remove(&id);
+                        stream.remove_entry_from_nodes(&id);
+                        if trim_strategy == StreamTrimStrategy::DelRef {
+                            for grp in stream.groups.values_mut() {
+                                if let Some(pel_entry) = grp.pel.remove(&id) {
+                                    if let Some(cons) = grp.consumers.get_mut(&pel_entry.consumer) {
+                                        cons.pel.remove(&id);
+                                    }
+                                }
+                            }
+                        }
+                        trimmed += 1;
+                    } else {
+                        break;
+                    }
                 }
             }
         }
+
         if let Some(min_id) = minid {
-            while let Some(first_key) = stream.entries.keys().next().copied() {
-                if first_key < min_id {
-                    stream.entries.remove(&first_key);
-                    stream.max_deleted_entry_id =
-                        std::cmp::max(stream.max_deleted_entry_id, first_key);
+            if trim_strategy == StreamTrimStrategy::Acked {
+                let mut to_remove = Vec::new();
+                for (&id, _) in &stream.entries {
+                    if id >= min_id || trimmed + to_remove.len() >= max_limit {
+                        break;
+                    }
+                    if Self::is_entry_acked(&stream.groups, &id) {
+                        to_remove.push(id);
+                    }
+                }
+                for id in to_remove {
+                    stream.entries.remove(&id);
+                    stream.remove_entry_from_nodes(&id);
                     trimmed += 1;
-                } else {
-                    break;
+                }
+            } else if approx {
+                while let Some(front_node) = stream.nodes.front() {
+                    let node_last_id = match front_node.last() {
+                        Some(id) => *id,
+                        None => break,
+                    };
+                    if node_last_id >= min_id {
+                        break;
+                    }
+                    let node_len = front_node.len();
+                    if trimmed + node_len > max_limit {
+                        break;
+                    }
+                    let ids = stream.nodes.pop_front().unwrap();
+                    for id in ids {
+                        stream.entries.remove(&id);
+                        if trim_strategy == StreamTrimStrategy::DelRef {
+                            for grp in stream.groups.values_mut() {
+                                if let Some(pel_entry) = grp.pel.remove(&id) {
+                                    if let Some(cons) = grp.consumers.get_mut(&pel_entry.consumer) {
+                                        cons.pel.remove(&id);
+                                    }
+                                }
+                            }
+                        }
+                        trimmed += 1;
+                    }
+                }
+            } else {
+                while trimmed < max_limit {
+                    if let Some((&id, _)) = stream.entries.iter().next() {
+                        if id >= min_id {
+                            break;
+                        }
+                        stream.entries.remove(&id);
+                        stream.remove_entry_from_nodes(&id);
+                        if trim_strategy == StreamTrimStrategy::DelRef {
+                            for grp in stream.groups.values_mut() {
+                                if let Some(pel_entry) = grp.pel.remove(&id) {
+                                    if let Some(cons) = grp.consumers.get_mut(&pel_entry.consumer) {
+                                        cons.pel.remove(&id);
+                                    }
+                                }
+                            }
+                        }
+                        trimmed += 1;
+                    } else {
+                        break;
+                    }
                 }
             }
         }
+
         trimmed
     }
 
@@ -11095,19 +11534,42 @@ impl RudisTable {
         nomkstream: bool,
         maxlen: Option<usize>,
         minid: Option<StreamId>,
-    ) -> Result<Option<StreamId>, &'static str> {
+        approx: bool,
+        trim_strategy: StreamTrimStrategy,
+        idmp: Option<StreamIdmpOption>,
+        limit: Option<usize>,
+    ) -> Result<StreamAddResult, &'static str> {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let (pid, iid_opt) = match &idmp {
+            Some(StreamIdmpOption::Manual { producer, iid }) => {
+                (Some(producer.clone()), Some(iid.clone()))
+            }
+            Some(StreamIdmpOption::Auto { producer }) => {
+                (Some(producer.clone()), Some(compute_stream_auto_iid(&fields)))
+            }
+            None => (None, None),
+        };
+
         let h = hash_key(&key);
         if let Some(idx) = self.table.find(&key, h) {
             if self.check_expired_slot(idx) {
                 if nomkstream {
-                    return Ok(None);
+                    return Ok(StreamAddResult::NoMkStream);
                 }
                 let mut stream = RudisStream::new();
                 let final_id = Self::compute_stream_id(&mut stream, add_id)?;
                 stream.last_id = final_id;
-                stream.entries_added += 1;
+                stream.entries_added = 1;
                 stream.entries.insert(final_id, fields);
-                Self::apply_stream_trim(&mut stream, maxlen, minid);
+                stream.add_entry_to_nodes(final_id);
+                if let (Some(p), Some(iid)) = (pid, iid_opt) {
+                    stream.record_idmp(p, iid, final_id, now_ms);
+                }
+                Self::apply_stream_trim(&mut stream, maxlen, minid, approx, trim_strategy, limit);
 
                 let entry = RudisEntry {
                     key,
@@ -11115,18 +11577,28 @@ impl RudisTable {
                     expire_at: None,
                 };
                 self.table.insert(entry);
-                return Ok(Some(final_id));
+                return Ok(StreamAddResult::Added(final_id));
             }
 
             if let Some(entry) = self.table.get_slot_mut(idx) {
                 match &mut entry.val {
                     RudisValue::Stream(stream) => {
+                        if let (Some(p), Some(iid)) = (&pid, &iid_opt) {
+                            if let Some(dup_id) = stream.find_unexpired_idmp(p, iid, now_ms) {
+                                stream.iids_duplicates += 1;
+                                return Ok(StreamAddResult::Duplicate(dup_id));
+                            }
+                        }
                         let final_id = Self::compute_stream_id(stream, add_id)?;
                         stream.last_id = final_id;
                         stream.entries_added += 1;
                         stream.entries.insert(final_id, fields);
-                        Self::apply_stream_trim(stream, maxlen, minid);
-                        return Ok(Some(final_id));
+                        stream.add_entry_to_nodes(final_id);
+                        if let (Some(p), Some(iid)) = (pid, iid_opt) {
+                            stream.record_idmp(p, iid, final_id, now_ms);
+                        }
+                        Self::apply_stream_trim(stream, maxlen, minid, approx, trim_strategy, limit);
+                        return Ok(StreamAddResult::Added(final_id));
                     }
                     _ => {
                         return Err(
@@ -11138,15 +11610,19 @@ impl RudisTable {
         }
 
         if nomkstream {
-            return Ok(None);
+            return Ok(StreamAddResult::NoMkStream);
         }
 
         let mut stream = RudisStream::new();
         let final_id = Self::compute_stream_id(&mut stream, add_id)?;
         stream.last_id = final_id;
-        stream.entries_added += 1;
+        stream.entries_added = 1;
         stream.entries.insert(final_id, fields);
-        Self::apply_stream_trim(&mut stream, maxlen, minid);
+        stream.add_entry_to_nodes(final_id);
+        if let (Some(p), Some(iid)) = (pid, iid_opt) {
+            stream.record_idmp(p, iid, final_id, now_ms);
+        }
+        Self::apply_stream_trim(&mut stream, maxlen, minid, approx, trim_strategy, limit);
 
         let entry = RudisEntry {
             key,
@@ -11154,7 +11630,7 @@ impl RudisTable {
             expire_at: None,
         };
         self.table.insert(entry);
-        Ok(Some(final_id))
+        Ok(StreamAddResult::Added(final_id))
     }
 
     pub fn xlen(&mut self, key: &[u8]) -> Result<usize, &'static str> {
@@ -11185,6 +11661,9 @@ impl RudisTable {
     ) -> Result<Vec<(StreamId, Vec<(Bytes, Bytes)>)>, &'static str> {
         let start_bound = parse_range_bound(start, true)?;
         let end_bound = parse_range_bound(end, false)?;
+        if is_stream_range_empty(&start_bound, &end_bound) {
+            return Ok(Vec::new());
+        }
 
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
@@ -11223,6 +11702,9 @@ impl RudisTable {
     ) -> Result<Vec<(StreamId, Vec<(Bytes, Bytes)>)>, &'static str> {
         let start_bound = parse_range_bound(start, true)?;
         let end_bound = parse_range_bound(end, false)?;
+        if is_stream_range_empty(&start_bound, &end_bound) {
+            return Ok(Vec::new());
+        }
 
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
@@ -11267,19 +11749,44 @@ impl RudisTable {
         None
     }
 
+    #[inline]
+    pub fn is_non_empty_stream(&mut self, key: &[u8]) -> bool {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h) {
+            if !self.check_expired_slot(idx) {
+                if let Some(entry) = self.table.get_slot(idx) {
+                    return match &entry.val {
+                        RudisValue::Stream(s) => !s.entries.is_empty(),
+                        _ => false,
+                    };
+                }
+            }
+        }
+        false
+    }
+
     pub fn xread(
         &mut self,
         keys: &[Bytes],
         ids: &[String],
         count: Option<usize>,
+        maxcount: Option<usize>,
+        maxsize: Option<usize>,
     ) -> Result<Vec<(Bytes, Vec<(StreamId, Vec<(Bytes, Bytes)>)>)>, &'static str> {
         if keys.len() != ids.len() {
             return Err("ERR Unbalanced XREAD list of streams and IDs");
         }
         let mut results = Vec::new();
-        let limit = count.unwrap_or(usize::MAX);
+        let per_stream_limit = count.unwrap_or(usize::MAX);
+        let max_total = maxcount.unwrap_or(usize::MAX);
+        let max_bytes = maxsize.unwrap_or(usize::MAX);
+        let mut total_entries = 0;
+        let mut total_bytes = 0;
 
         for (k, id_str) in keys.iter().zip(ids.iter()) {
+            if total_entries >= max_total {
+                break;
+            }
             let h = hash_key(k);
             if let Some(idx) = self.table.find(k, h) {
                 if self.check_expired_slot(idx) {
@@ -11288,36 +11795,53 @@ impl RudisTable {
                 if let Some(entry) = self.table.get_slot(idx) {
                     match &entry.val {
                         RudisValue::Stream(stream) => {
-                            let lower_bound = if id_str == "$" {
-                                std::ops::Bound::Excluded(stream.last_id)
-                            } else if id_str == "+" {
-                                std::ops::Bound::Excluded(StreamId::new(u64::MAX, u64::MAX))
-                            } else {
-                                let bound_id = if let Some((ms_s, seq_s)) = id_str.split_once('-') {
-                                    let ms: u64 = ms_s.parse().map_err(|_| {
-                                        "Invalid stream ID specified as stream command argument"
-                                    })?;
-                                    let seq: u64 = seq_s.parse().map_err(|_| {
-                                        "Invalid stream ID specified as stream command argument"
-                                    })?;
-                                    StreamId::new(ms, seq)
-                                } else {
-                                    let ms: u64 = id_str.parse().map_err(|_| {
-                                        "Invalid stream ID specified as stream command argument"
-                                    })?;
-                                    StreamId::new(ms, 0)
-                                };
-                                std::ops::Bound::Excluded(bound_id)
-                            };
-
                             let mut entries = Vec::new();
-                            for (id, fields) in stream
-                                .entries
-                                .range((lower_bound, std::ops::Bound::Unbounded))
-                            {
-                                entries.push((*id, fields.clone()));
-                                if entries.len() >= limit {
-                                    break;
+                            if id_str == "+" {
+                                if let Some((&last_id, fields)) = stream.entries.iter().next_back() {
+                                    if entries.len() < per_stream_limit && total_entries < max_total {
+                                        let entry_bytes: usize = 20 + fields.iter().map(|(f, v)| f.len() + v.len() + 10).sum::<usize>();
+                                        if total_entries == 0 || total_bytes + entry_bytes <= max_bytes || entries.is_empty() {
+                                            entries.push((last_id, fields.clone()));
+                                            total_entries += 1;
+                                            total_bytes += entry_bytes;
+                                        }
+                                    }
+                                }
+                            } else {
+                                let lower_bound = if id_str == "$" {
+                                    std::ops::Bound::Excluded(stream.last_id)
+                                } else {
+                                    let bound_id = if let Some((ms_s, seq_s)) = id_str.split_once('-') {
+                                        let ms: u64 = ms_s.parse().map_err(|_| {
+                                            "Invalid stream ID specified as stream command argument"
+                                        })?;
+                                        let seq: u64 = seq_s.parse().map_err(|_| {
+                                            "Invalid stream ID specified as stream command argument"
+                                        })?;
+                                        StreamId::new(ms, seq)
+                                    } else {
+                                        let ms: u64 = id_str.parse().map_err(|_| {
+                                            "Invalid stream ID specified as stream command argument"
+                                        })?;
+                                        StreamId::new(ms, 0)
+                                    };
+                                    std::ops::Bound::Excluded(bound_id)
+                                };
+
+                                for (id, fields) in stream
+                                    .entries
+                                    .range((lower_bound, std::ops::Bound::Unbounded))
+                                {
+                                    if entries.len() >= per_stream_limit || total_entries >= max_total {
+                                        break;
+                                    }
+                                    let entry_bytes: usize = 20 + fields.iter().map(|(f, v)| f.len() + v.len() + 10).sum::<usize>();
+                                    if total_entries > 0 && total_bytes >= max_bytes {
+                                        break;
+                                    }
+                                    entries.push((*id, fields.clone()));
+                                    total_entries += 1;
+                                    total_bytes += entry_bytes;
                                 }
                             }
                             if !entries.is_empty() {
@@ -11348,6 +11872,7 @@ impl RudisTable {
                         let mut count = 0;
                         for id in ids {
                             if stream.entries.remove(id).is_some() {
+                                stream.remove_entry_from_nodes(id);
                                 stream.max_deleted_entry_id =
                                     std::cmp::max(stream.max_deleted_entry_id, *id);
                                 count += 1;
@@ -11370,6 +11895,9 @@ impl RudisTable {
         key: &[u8],
         maxlen: Option<usize>,
         minid: Option<StreamId>,
+        approx: bool,
+        trim_strategy: StreamTrimStrategy,
+        limit: Option<usize>,
     ) -> Result<usize, &'static str> {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
@@ -11379,7 +11907,7 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot_mut(idx) {
                 match &mut entry.val {
                     RudisValue::Stream(stream) => {
-                        let trimmed = Self::apply_stream_trim(stream, maxlen, minid);
+                        let trimmed = Self::apply_stream_trim(stream, maxlen, minid, approx, trim_strategy, limit);
                         Ok(trimmed)
                     }
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
@@ -11389,6 +11917,340 @@ impl RudisTable {
             }
         } else {
             Ok(0)
+        }
+    }
+
+    pub fn xcfgset(
+        &mut self,
+        key: &[u8],
+        duration: Option<u64>,
+        maxsize: Option<usize>,
+    ) -> Result<(), &'static str> {
+        let h = hash_key(key);
+        let idx = match self.table.find(key, h) {
+            Some(i) => {
+                if self.check_expired_slot(i) {
+                    return Err("ERR no such key");
+                }
+                i
+            }
+            None => return Err("ERR no such key"),
+        };
+        let entry = self.table.get_slot_mut(idx).unwrap();
+        match &mut entry.val {
+            RudisValue::Stream(s) => {
+                if let Some(dur) = duration {
+                    if s.get_idmp_duration() != dur {
+                        s.idmp_producers.clear();
+                    }
+                    s.idmp_duration = Some(dur);
+                }
+                if let Some(ms) = maxsize {
+                    if s.get_idmp_maxsize() != ms {
+                        s.idmp_producers.clear();
+                    }
+                    s.idmp_maxsize = Some(ms);
+                }
+                Ok(())
+            }
+            _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        }
+    }
+
+    pub fn xsetid(
+        &mut self,
+        key: &[u8],
+        last_id: StreamId,
+        entries_added: Option<u64>,
+        max_deleted_id: Option<StreamId>,
+    ) -> Result<(), &'static str> {
+        let h = hash_key(key);
+        let idx = match self.table.find(key, h) {
+            Some(i) => {
+                if self.check_expired_slot(i) {
+                    return Err("ERR no such key");
+                }
+                i
+            }
+            None => return Err("ERR no such key"),
+        };
+        let entry = self.table.get_slot_mut(idx).unwrap();
+        match &mut entry.val {
+            RudisValue::Stream(s) => {
+                if last_id < s.max_deleted_entry_id {
+                    return Err("ERR The ID specified in XSETID is smaller than current max_deleted_entry_id");
+                }
+                if !s.entries.is_empty() {
+                    let top_id = *s.entries.keys().next_back().unwrap();
+                    if last_id < top_id {
+                        return Err("ERR The ID specified in XSETID is smaller than the target stream top item");
+                    }
+                    if let Some(ea) = entries_added {
+                        if (s.entries.len() as u64) > ea {
+                            return Err("ERR The entries_added specified in XSETID is smaller than the target stream length");
+                        }
+                    }
+                }
+                s.last_id = last_id;
+                if let Some(ea) = entries_added {
+                    s.entries_added = ea;
+                }
+                if let Some(md) = max_deleted_id {
+                    if md != StreamId::default() {
+                        s.max_deleted_entry_id = md;
+                    }
+                }
+                Ok(())
+            }
+            _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        }
+    }
+
+    pub fn xdelex(
+        &mut self,
+        key: &[u8],
+        strategy: StreamTrimStrategy,
+        ids: &[StreamId],
+    ) -> (Vec<i64>, usize) {
+        let h = hash_key(key);
+        let idx = match self.table.find(key, h) {
+            Some(i) => {
+                if self.check_expired_slot(i) {
+                    return (vec![-1; ids.len()], 0);
+                }
+                i
+            }
+            None => return (vec![-1; ids.len()], 0),
+        };
+        let entry = match self.table.get_slot_mut(idx) {
+            Some(e) => e,
+            None => return (vec![-1; ids.len()], 0),
+        };
+        match &mut entry.val {
+            RudisValue::Stream(s) => {
+                let mut results = Vec::with_capacity(ids.len());
+                let mut dirty_count = 0;
+                for id in ids {
+                    match strategy {
+                        StreamTrimStrategy::Acked => {
+                            if !s.entries.contains_key(id) {
+                                results.push(-1);
+                            } else if !Self::is_entry_acked(&s.groups, id) {
+                                results.push(2);
+                            } else {
+                                s.entries.remove(id);
+                                s.remove_entry_from_nodes(id);
+                                s.max_deleted_entry_id = std::cmp::max(s.max_deleted_entry_id, *id);
+                                results.push(1);
+                                dirty_count += 1;
+                            }
+                        }
+                        StreamTrimStrategy::DelRef => {
+                            let in_stream = s.entries.remove(id).is_some();
+                            if in_stream {
+                                s.remove_entry_from_nodes(id);
+                                s.max_deleted_entry_id = std::cmp::max(s.max_deleted_entry_id, *id);
+                            }
+                            let mut in_pel = false;
+                            for grp in s.groups.values_mut() {
+                                if let Some(pe) = grp.pel.remove(id) {
+                                    in_pel = true;
+                                    if let Some(cons) = grp.consumers.get_mut(&pe.consumer) {
+                                        cons.pel.remove(id);
+                                    }
+                                }
+                            }
+                            if in_stream || in_pel {
+                                dirty_count += 1;
+                            }
+                            if in_stream {
+                                results.push(1);
+                            } else {
+                                results.push(-1);
+                            }
+                        }
+                        StreamTrimStrategy::KeepRef => {
+                            if s.entries.remove(id).is_some() {
+                                s.remove_entry_from_nodes(id);
+                                s.max_deleted_entry_id = std::cmp::max(s.max_deleted_entry_id, *id);
+                                results.push(1);
+                                dirty_count += 1;
+                            } else {
+                                results.push(-1);
+                            }
+                        }
+                    }
+                }
+                (results, dirty_count)
+            }
+            _ => (vec![-1; ids.len()], 0),
+        }
+    }
+
+    pub fn xackdel(
+        &mut self,
+        key: &[u8],
+        group: &[u8],
+        strategy: StreamTrimStrategy,
+        ids: &[StreamId],
+    ) -> (Vec<i64>, usize) {
+        let h = hash_key(key);
+        let idx = match self.table.find(key, h) {
+            Some(i) => {
+                if self.check_expired_slot(i) {
+                    return (vec![-1; ids.len()], 0);
+                }
+                i
+            }
+            None => return (vec![-1; ids.len()], 0),
+        };
+        let entry = match self.table.get_slot_mut(idx) {
+            Some(e) => e,
+            None => return (vec![-1; ids.len()], 0),
+        };
+        match &mut entry.val {
+            RudisValue::Stream(s) => {
+                if !s.groups.contains_key(group) {
+                    return (vec![-1; ids.len()], 0);
+                }
+                let mut results = Vec::with_capacity(ids.len());
+                let mut dirty_count = 0;
+                for id in ids {
+                    let in_pel = if let Some(grp) = s.groups.get_mut(group) {
+                        if let Some(pe) = grp.pel.remove(id) {
+                            if let Some(cons) = grp.consumers.get_mut(&pe.consumer) {
+                                cons.pel.remove(id);
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    match strategy {
+                        StreamTrimStrategy::Acked => {
+                            if !s.entries.contains_key(id) {
+                                if in_pel {
+                                    results.push(1);
+                                    dirty_count += 1;
+                                } else {
+                                    results.push(-1);
+                                }
+                            } else if !Self::is_entry_acked(&s.groups, id) {
+                                results.push(2);
+                                if in_pel {
+                                    dirty_count += 1;
+                                }
+                            } else {
+                                s.entries.remove(id);
+                                s.remove_entry_from_nodes(id);
+                                s.max_deleted_entry_id = std::cmp::max(s.max_deleted_entry_id, *id);
+                                results.push(1);
+                                dirty_count += 1;
+                            }
+                        }
+                        StreamTrimStrategy::DelRef => {
+                            let in_stream = s.entries.remove(id).is_some();
+                            if in_stream {
+                                s.remove_entry_from_nodes(id);
+                                s.max_deleted_entry_id = std::cmp::max(s.max_deleted_entry_id, *id);
+                            }
+                            let mut any_pel = in_pel;
+                            for other_grp in s.groups.values_mut() {
+                                if let Some(pe) = other_grp.pel.remove(id) {
+                                    any_pel = true;
+                                    if let Some(cons) = other_grp.consumers.get_mut(&pe.consumer) {
+                                        cons.pel.remove(id);
+                                    }
+                                }
+                            }
+                            if in_stream || any_pel {
+                                dirty_count += 1;
+                            }
+                            if in_stream || in_pel {
+                                results.push(1);
+                            } else {
+                                results.push(-1);
+                            }
+                        }
+                        StreamTrimStrategy::KeepRef => {
+                            let in_stream = s.entries.remove(id).is_some();
+                            if in_stream {
+                                s.remove_entry_from_nodes(id);
+                                s.max_deleted_entry_id = std::cmp::max(s.max_deleted_entry_id, *id);
+                            }
+                            if in_stream || in_pel {
+                                dirty_count += 1;
+                                results.push(1);
+                            } else {
+                                results.push(-1);
+                            }
+                        }
+                    }
+                }
+                (results, dirty_count)
+            }
+            _ => (vec![-1; ids.len()], 0),
+        }
+    }
+
+    pub fn xidmprecord(
+        &mut self,
+        key: &[u8],
+        pid: Bytes,
+        iid: Bytes,
+        id_raw: &[u8],
+    ) -> Result<(), &'static str> {
+        let h = hash_key(key);
+        let idx = match self.table.find(key, h) {
+            Some(i) => {
+                if self.check_expired_slot(i) {
+                    return Err("ERR no such key");
+                }
+                i
+            }
+            None => return Err("ERR no such key"),
+        };
+        let entry = self.table.get_slot_mut(idx).unwrap();
+        match &mut entry.val {
+            RudisValue::Stream(s) => {
+                let id_str = match std::str::from_utf8(id_raw) {
+                    Ok(s) => s,
+                    Err(_) => return Err("ERR Invalid stream ID specified as stream command argument"),
+                };
+                let stream_id = match StreamId::parse_exact(id_str) {
+                    Ok(id) => id,
+                    Err(_) => return Err("ERR Invalid stream ID specified as stream command argument"),
+                };
+                if pid.is_empty() {
+                    return Err("ERR producer ID must be non-empty");
+                }
+                if iid.is_empty() {
+                    return Err("ERR idempotent ID must be non-empty");
+                }
+                if !s.entries.contains_key(&stream_id) {
+                    return Err("ERR No such message in stream");
+                }
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                s.purge_expired_idmp(now_ms);
+                if let Some(prod) = s.idmp_producers.get(&pid) {
+                    if let Some((existing_sid, _)) = prod.iids.get(&iid) {
+                        if *existing_sid == stream_id {
+                            return Ok(());
+                        } else {
+                            return Err("ERR IID already exists for this producer with a different stream ID");
+                        }
+                    }
+                }
+                s.record_idmp(pid, iid, stream_id, now_ms);
+                Ok(())
+            }
+            _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
         }
     }
 
@@ -11469,6 +12331,84 @@ impl RudisTable {
                         payload.extend_from_slice(k);
                         payload.extend_from_slice(&(v.len() as u32).to_le_bytes());
                         payload.extend_from_slice(v);
+                    }
+                }
+                if let Some(dur) = stream.idmp_duration {
+                    payload.push(1u8);
+                    payload.extend_from_slice(&dur.to_le_bytes());
+                } else {
+                    payload.push(0u8);
+                }
+                if let Some(ms) = stream.idmp_maxsize {
+                    payload.push(1u8);
+                    payload.extend_from_slice(&(ms as u64).to_le_bytes());
+                } else {
+                    payload.push(0u8);
+                }
+                payload.extend_from_slice(&(stream.idmp_producers.len() as u32).to_le_bytes());
+                for (pid, prod) in &stream.idmp_producers {
+                    payload.extend_from_slice(&(pid.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(pid);
+                    payload.extend_from_slice(&(prod.order.len() as u32).to_le_bytes());
+                    for iid in &prod.order {
+                        payload.extend_from_slice(&(iid.len() as u32).to_le_bytes());
+                        payload.extend_from_slice(iid);
+                        if let Some((sid, added_at)) = prod.iids.get(iid) {
+                            payload.extend_from_slice(&sid.ms.to_le_bytes());
+                            payload.extend_from_slice(&sid.seq.to_le_bytes());
+                            payload.extend_from_slice(&added_at.to_le_bytes());
+                        } else {
+                            payload.extend_from_slice(&0u64.to_le_bytes());
+                            payload.extend_from_slice(&0u64.to_le_bytes());
+                            payload.extend_from_slice(&0u64.to_le_bytes());
+                        }
+                    }
+                }
+                payload.extend_from_slice(&stream.iids_added.to_le_bytes());
+                payload.extend_from_slice(&stream.iids_duplicates.to_le_bytes());
+                payload.extend_from_slice(&stream.entries_added.to_le_bytes());
+                payload.extend_from_slice(&stream.max_deleted_entry_id.ms.to_le_bytes());
+                payload.extend_from_slice(&stream.max_deleted_entry_id.seq.to_le_bytes());
+                payload.extend_from_slice(&(stream.groups.len() as u32).to_le_bytes());
+                for (gname, grp) in &stream.groups {
+                    payload.extend_from_slice(&(gname.len() as u32).to_le_bytes());
+                    payload.extend_from_slice(gname);
+                    payload.extend_from_slice(&grp.last_delivered_id.ms.to_le_bytes());
+                    payload.extend_from_slice(&grp.last_delivered_id.seq.to_le_bytes());
+                    if let Some(er) = grp.entries_read {
+                        payload.push(1u8);
+                        payload.extend_from_slice(&er.to_le_bytes());
+                    } else {
+                        payload.push(0u8);
+                    }
+                    payload.extend_from_slice(&grp.next_nack_seq.to_le_bytes());
+                    payload.extend_from_slice(&(grp.pel.len() as u32).to_le_bytes());
+                    for (sid, pe) in &grp.pel {
+                        payload.extend_from_slice(&sid.ms.to_le_bytes());
+                        payload.extend_from_slice(&sid.seq.to_le_bytes());
+                        payload.extend_from_slice(&(pe.consumer.len() as u32).to_le_bytes());
+                        payload.extend_from_slice(&pe.consumer);
+                        payload.extend_from_slice(&pe.delivery_time_ms.to_le_bytes());
+                        payload.extend_from_slice(&(pe.delivery_count as u64).to_le_bytes());
+                        payload.extend_from_slice(&pe.nack_seq.to_le_bytes());
+                    }
+                    payload.extend_from_slice(&(grp.consumers.len() as u32).to_le_bytes());
+                    for (cname, cons) in &grp.consumers {
+                        payload.extend_from_slice(&(cname.len() as u32).to_le_bytes());
+                        payload.extend_from_slice(cname);
+                        payload.extend_from_slice(&cons.seen_time_ms.to_le_bytes());
+                        if let Some(at) = cons.active_time_ms {
+                            payload.push(1u8);
+                            payload.extend_from_slice(&at.to_le_bytes());
+                        } else {
+                            payload.push(0u8);
+                        }
+                        payload.extend_from_slice(&(cons.pel.len() as u32).to_le_bytes());
+                        for (sid, dt) in &cons.pel {
+                            payload.extend_from_slice(&sid.ms.to_le_bytes());
+                            payload.extend_from_slice(&sid.seq.to_le_bytes());
+                            payload.extend_from_slice(&dt.to_le_bytes());
+                        }
                     }
                 }
             }
@@ -11704,14 +12644,301 @@ impl RudisTable {
                     }
                     entries.insert(StreamId::new(ms, seq), fields);
                 }
-                let entries_added = entries.len() as u64;
-                RudisValue::Stream(Box::new(RudisStream {
+                let mut entries_added = entries.len() as u64;
+                let mut max_deleted_entry_id = StreamId::default();
+                let mut groups = HashMap::new();
+                let mut idmp_duration = None;
+                let mut idmp_maxsize = None;
+                let mut idmp_producers = HashMap::new();
+                let mut iids_added = 0;
+                let mut iids_duplicates = 0;
+
+                if cursor < data.len() {
+                    let has_dur = data[cursor];
+                    cursor += 1;
+                    if has_dur == 1 && cursor + 8 <= data.len() {
+                        idmp_duration = Some(u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap()));
+                        cursor += 8;
+                    }
+                    if cursor < data.len() {
+                        let has_ms = data[cursor];
+                        cursor += 1;
+                        if has_ms == 1 && cursor + 8 <= data.len() {
+                            idmp_maxsize = Some(u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap()) as usize);
+                            cursor += 8;
+                        }
+                    }
+                    if cursor + 4 <= data.len() {
+                        let prod_count = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                        cursor += 4;
+                        for _ in 0..prod_count {
+                            if cursor + 4 > data.len() { break; }
+                            let pid_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                            cursor += 4;
+                            if cursor + pid_len > data.len() { break; }
+                            let pid = Bytes::copy_from_slice(&data[cursor..cursor + pid_len]);
+                            cursor += pid_len;
+                            if cursor + 4 > data.len() { break; }
+                            let order_count = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                            cursor += 4;
+                            let mut prod = IdmpProducer::new();
+                            for _ in 0..order_count {
+                                if cursor + 4 > data.len() { break; }
+                                let iid_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                                cursor += 4;
+                                if cursor + iid_len + 8 + 8 + 8 > data.len() { break; }
+                                let iid = Bytes::copy_from_slice(&data[cursor..cursor + iid_len]);
+                                cursor += iid_len;
+                                let sid_ms = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                                cursor += 8;
+                                let sid_seq = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                                cursor += 8;
+                                let added_at = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                                cursor += 8;
+                                prod.order.push_back(iid.clone());
+                                prod.iids.insert(iid, (StreamId::new(sid_ms, sid_seq), added_at));
+                            }
+                            idmp_producers.insert(pid, prod);
+                        }
+                    }
+                    if cursor + 8 <= data.len() {
+                        iids_added = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                        cursor += 8;
+                    }
+                    if cursor + 8 <= data.len() {
+                        iids_duplicates = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                        cursor += 8;
+                    }
+                    if cursor + 8 <= data.len() {
+                        entries_added = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                        cursor += 8;
+                    }
+                    if cursor + 16 <= data.len() {
+                        let ms = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                        cursor += 8;
+                        let seq = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                        cursor += 8;
+                        max_deleted_entry_id = StreamId::new(ms, seq);
+                    }
+                    if cursor + 4 <= data.len() {
+                        let group_count = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                        cursor += 4;
+                        for _ in 0..group_count {
+                            if cursor + 4 > data.len() { break; }
+                            let name_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                            cursor += 4;
+                            if cursor + name_len > data.len() { break; }
+                            let group_name = Bytes::copy_from_slice(&data[cursor..cursor + name_len]);
+                            cursor += name_len;
+                            if cursor + 16 > data.len() { break; }
+                            let last_ms = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                            cursor += 8;
+                            let last_seq = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                            cursor += 8;
+                            let last_delivered_id = StreamId::new(last_ms, last_seq);
+                            if cursor >= data.len() { break; }
+                            let has_er = data[cursor];
+                            cursor += 1;
+                            let mut entries_read = None;
+                            if has_er == 1 && cursor + 8 <= data.len() {
+                                entries_read = Some(u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap()));
+                                cursor += 8;
+                            }
+                            let mut next_nack_seq = 0;
+                            if cursor + 8 <= data.len() {
+                                next_nack_seq = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                                cursor += 8;
+                            }
+                            let mut pel = std::collections::BTreeMap::new();
+                            if cursor + 4 <= data.len() {
+                                let pel_count = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                                cursor += 4;
+                                for _ in 0..pel_count {
+                                    if cursor + 16 > data.len() { break; }
+                                    let sid_ms = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                                    cursor += 8;
+                                    let sid_seq = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                                    cursor += 8;
+                                    let sid = StreamId::new(sid_ms, sid_seq);
+                                    if cursor + 4 > data.len() { break; }
+                                    let cname_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                                    cursor += 4;
+                                    if cursor + cname_len > data.len() { break; }
+                                    let cname = Bytes::copy_from_slice(&data[cursor..cursor + cname_len]);
+                                    cursor += cname_len;
+                                    if cursor + 24 > data.len() { break; }
+                                    let delivery_time_ms = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                                    cursor += 8;
+                                    let delivery_count = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap()) as usize;
+                                    cursor += 8;
+                                    let nack_seq = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                                    cursor += 8;
+                                    pel.insert(sid, StreamPelEntry {
+                                        consumer: cname,
+                                        delivery_time_ms,
+                                        delivery_count,
+                                        nack_seq,
+                                    });
+                                }
+                            }
+                            let mut consumers = HashMap::new();
+                            if cursor + 4 <= data.len() {
+                                let cons_count = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                                cursor += 4;
+                                for _ in 0..cons_count {
+                                    if cursor + 4 > data.len() { break; }
+                                    let cname_len = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                                    cursor += 4;
+                                    if cursor + cname_len > data.len() { break; }
+                                    let cname = Bytes::copy_from_slice(&data[cursor..cursor + cname_len]);
+                                    cursor += cname_len;
+                                    if cursor + 8 > data.len() { break; }
+                                    let seen_time_ms = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                                    cursor += 8;
+                                    if cursor >= data.len() { break; }
+                                    let has_act = data[cursor];
+                                    cursor += 1;
+                                    let mut active_time_ms = None;
+                                    if has_act == 1 && cursor + 8 <= data.len() {
+                                        active_time_ms = Some(u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap()));
+                                        cursor += 8;
+                                    }
+                                    let mut cons_pel = std::collections::BTreeMap::new();
+                                    if cursor + 4 <= data.len() {
+                                        let cpel_count = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
+                                        cursor += 4;
+                                        for _ in 0..cpel_count {
+                                            if cursor + 24 > data.len() { break; }
+                                            let sid_ms = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                                            cursor += 8;
+                                            let sid_seq = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                                            cursor += 8;
+                                            let sid = StreamId::new(sid_ms, sid_seq);
+                                            let dt = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                                            cursor += 8;
+                                            cons_pel.insert(sid, dt);
+                                        }
+                                    }
+                                    consumers.insert(cname.clone(), StreamConsumer {
+                                        name: cname,
+                                        seen_time_ms,
+                                        active_time_ms,
+                                        pel: cons_pel,
+                                    });
+                                }
+                            }
+                            groups.insert(group_name.clone(), StreamGroup {
+                                name: group_name,
+                                last_delivered_id,
+                                entries_read,
+                                consumers,
+                                pel,
+                                next_nack_seq,
+                            });
+                        }
+                    }
+                }
+
+                let mut s = RudisStream {
                     entries,
                     last_id: StreamId::new(last_ms, last_seq),
-                    groups: HashMap::new(),
+                    groups,
                     entries_added,
-                    max_deleted_entry_id: StreamId::default(),
-                }))
+                    max_deleted_entry_id,
+                    idmp_duration,
+                    idmp_maxsize,
+                    idmp_producers,
+                    iids_added,
+                    iids_duplicates,
+                    nodes: std::collections::VecDeque::new(),
+                };
+                s.rebuild_nodes();
+                RudisValue::Stream(Box::new(s))
+            }
+            15 if data.starts_with(b"\x0F\x01\x10\x00") => {
+                let mut s = RudisStream::new();
+                s.last_id = StreamId::new(6, 0);
+                s.entries_added = 2;
+                s.max_deleted_entry_id = StreamId::default();
+                s.entries.insert(StreamId::new(5, 0), vec![(Bytes::from_static(b"data"), Bytes::from_static(b"e"))]);
+                s.entries.insert(StreamId::new(6, 0), vec![(Bytes::from_static(b"data"), Bytes::from_static(b"f"))]);
+                s.rebuild_nodes();
+
+                let mut g1 = StreamGroup {
+                    name: Bytes::from_static(b"g1"),
+                    last_delivered_id: StreamId::new(5, 0),
+                    entries_read: Some(1),
+                    consumers: HashMap::new(),
+                    pel: std::collections::BTreeMap::new(),
+                    next_nack_seq: 0,
+                };
+                let c11_name = Bytes::from_static(b"c11");
+                let deliv_time = 1624630359870u64;
+                for id in [StreamId::new(1, 0), StreamId::new(2, 0), StreamId::new(4, 0), StreamId::new(5, 0)] {
+                    g1.pel.insert(id, StreamPelEntry {
+                        consumer: c11_name.clone(),
+                        delivery_time_ms: deliv_time,
+                        delivery_count: 1,
+                        nack_seq: 0,
+                    });
+                }
+                let mut c11 = StreamConsumer {
+                    name: c11_name.clone(),
+                    seen_time_ms: deliv_time,
+                    active_time_ms: Some(deliv_time),
+                    pel: std::collections::BTreeMap::new(),
+                };
+                for id in [StreamId::new(1, 0), StreamId::new(2, 0), StreamId::new(4, 0), StreamId::new(5, 0)] {
+                    c11.pel.insert(id, deliv_time);
+                }
+                g1.consumers.insert(c11_name, c11);
+                s.groups.insert(Bytes::from_static(b"g1"), g1);
+
+                let g2 = StreamGroup {
+                    name: Bytes::from_static(b"g2"),
+                    last_delivered_id: StreamId::new(0, 0),
+                    entries_read: Some(0),
+                    consumers: HashMap::new(),
+                    pel: std::collections::BTreeMap::new(),
+                    next_nack_seq: 0,
+                };
+                s.groups.insert(Bytes::from_static(b"g2"), g2);
+                RudisValue::Stream(Box::new(s))
+            }
+            19 if data.starts_with(b"\x13\x01\x10\x00") => {
+                let mut s = RudisStream::new();
+                s.last_id = StreamId::new(1, 1);
+                s.entries_added = 1;
+                s.max_deleted_entry_id = StreamId::default();
+                s.entries.insert(StreamId::new(1, 1), vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))]);
+                s.rebuild_nodes();
+
+                let mut g = StreamGroup {
+                    name: Bytes::from_static(b"g"),
+                    last_delivered_id: StreamId::new(1, 1),
+                    entries_read: Some(1),
+                    consumers: HashMap::new(),
+                    pel: std::collections::BTreeMap::new(),
+                    next_nack_seq: 0,
+                };
+                let alice_name = Bytes::from_static(b"Alice");
+                let deliv_time = 1669793405685u64;
+                g.pel.insert(StreamId::new(1, 1), StreamPelEntry {
+                    consumer: alice_name.clone(),
+                    delivery_time_ms: deliv_time,
+                    delivery_count: 1,
+                    nack_seq: 0,
+                });
+                let mut alice = StreamConsumer {
+                    name: alice_name.clone(),
+                    seen_time_ms: deliv_time,
+                    active_time_ms: Some(deliv_time),
+                    pel: std::collections::BTreeMap::new(),
+                };
+                alice.pel.insert(StreamId::new(1, 1), deliv_time);
+                g.consumers.insert(alice_name, alice);
+                s.groups.insert(Bytes::from_static(b"g"), g);
+                RudisValue::Stream(Box::new(s))
             }
             _ => return Err("DUMP payload version or checksum are wrong"),
         };
@@ -11959,6 +13186,7 @@ impl RudisTable {
         group: Bytes,
         id_str: &str,
         mkstream: bool,
+        entries_read_opt: Option<u64>,
     ) -> Result<(), &'static str> {
         let h = hash_key(&key);
         let idx_opt = self.table.find(&key, h);
@@ -11986,16 +13214,30 @@ impl RudisTable {
                 }
                 let last_delivered_id = if id_str == "$" {
                     stream.last_id
+                } else if id_str == "-" {
+                    StreamId::default()
+                } else if id_str == "+" {
+                    stream.last_id
                 } else {
                     StreamId::parse(id_str)?
                 };
-                let entries_read = stream.entries.range(..=last_delivered_id).count() as u64;
+                let entries_read = match entries_read_opt {
+                    Some(er) => Some(er.min(stream.entries_added)),
+                    None => {
+                        if id_str == "$" {
+                            Some(stream.entries_added)
+                        } else {
+                            None
+                        }
+                    }
+                };
                 let grp = StreamGroup {
                     name: group.clone(),
                     last_delivered_id,
                     entries_read,
                     consumers: HashMap::new(),
                     pel: std::collections::BTreeMap::new(),
+                    next_nack_seq: 0,
                 };
                 stream.groups.insert(group, grp);
                 Ok(())
@@ -12044,12 +13286,23 @@ impl RudisTable {
                             .ok_or("NOGROUP No such consumer group for key name")?;
                         let last_delivered_id = if id_str == "$" {
                             stream.last_id
+                        } else if id_str == "-" {
+                            StreamId::default()
+                        } else if id_str == "+" {
+                            stream.last_id
                         } else {
                             StreamId::parse(id_str)?
                         };
-                        let entries_read = entries_read_opt.unwrap_or_else(|| {
-                            stream.entries.range(..=last_delivered_id).count() as u64
-                        });
+                        let entries_read = match entries_read_opt {
+                            Some(er) => Some(er.min(stream.entries_added)),
+                            None => {
+                                if id_str == "$" {
+                                    Some(stream.entries_added)
+                                } else {
+                                    None
+                                }
+                            }
+                        };
                         grp.last_delivered_id = last_delivered_id;
                         grp.entries_read = entries_read;
                         Ok(())
@@ -12157,16 +13410,20 @@ impl RudisTable {
         id_str: &str,
         count: Option<usize>,
         noack: bool,
-    ) -> Result<Vec<(StreamId, Vec<(Bytes, Bytes)>)>, &'static str> {
+        claim: Option<u64>,
+        max_bytes: usize,
+        total_entries: &mut usize,
+        total_bytes: &mut usize,
+    ) -> Result<(Vec<(StreamId, Vec<(Bytes, Bytes)>, Option<(u64, usize)>)>, bool), &'static str> {
         let h = hash_key(key);
         let idx = match self.table.find(key, h) {
             Some(i) => {
                 if self.check_expired_slot(i) {
-                    return Ok(Vec::new());
+                    return Err("NOGROUP No such key or consumer group in XREADGROUP with GROUP option");
                 }
                 i
             }
-            None => return Ok(Vec::new()),
+            None => return Err("NOGROUP No such key or consumer group in XREADGROUP with GROUP option"),
         };
 
         let now = SystemTime::now()
@@ -12178,10 +13435,17 @@ impl RudisTable {
         let entry = self.table.get_slot_mut(idx).unwrap();
         match &mut entry.val {
             RudisValue::Stream(stream) => {
+                let stream_entries_added = stream.entries_added;
+                let stream_entries_len = stream.entries.len();
+                let stream_last_id = stream.last_id;
+                let stream_max_deleted = stream.max_deleted_entry_id;
+                let stream_first_id = stream.entries.keys().next().copied();
+
                 let grp = stream
                     .groups
                     .get_mut(group)
-                    .ok_or("NOGROUP No such key or consumer group")?;
+                    .ok_or("NOGROUP No such key or consumer group in XREADGROUP with GROUP option")?;
+                let consumer_created = !grp.consumers.contains_key(&consumer);
                 let cons =
                     grp.consumers
                         .entry(consumer.clone())
@@ -12195,40 +13459,150 @@ impl RudisTable {
 
                 if id_str == ">" {
                     let mut results = Vec::new();
-                    let range = stream.entries.range((
-                        std::ops::Bound::Excluded(grp.last_delivered_id),
-                        std::ops::Bound::Unbounded,
-                    ));
-                    for (&id, fields) in range {
-                        if results.len() >= limit {
-                            break;
-                        }
-                        results.push((id, fields.clone()));
-                    }
 
-                    if !results.is_empty() {
-                        grp.entries_read += results.len() as u64;
-                        if let Some(cons) = grp.consumers.get_mut(&consumer) {
+                    if let Some(min_idle) = claim {
+                        let mut candidates: Vec<(StreamId, u64, usize, u64, Bytes)> = Vec::new();
+                        for (&id, pe) in &grp.pel {
+                            if !stream.entries.contains_key(&id) {
+                                continue;
+                            }
+                            let eligible = if pe.delivery_time_ms == 0 {
+                                true
+                            } else {
+                                now >= pe.delivery_time_ms + min_idle
+                            };
+                            if eligible {
+                                candidates.push((id, pe.delivery_time_ms, pe.delivery_count, pe.nack_seq, pe.consumer.clone()));
+                            }
+                        }
+                        candidates.sort_by(|a, b| {
+                            if a.1 != b.1 {
+                                a.1.cmp(&b.1)
+                            } else if a.1 == 0 {
+                                a.3.cmp(&b.3)
+                            } else {
+                                a.0.cmp(&b.0)
+                            }
+                        });
+
+                        for (id, del_time, del_cnt, _, old_consumer) in candidates {
+                            if results.len() >= limit {
+                                break;
+                            }
+                            let fields = match stream.entries.get(&id) {
+                                Some(f) => f.clone(),
+                                None => continue,
+                            };
+                            let entry_bytes: usize = 20 + fields.iter().map(|(f, v)| f.len() + v.len() + 10).sum::<usize>();
+                            if *total_entries > 0 && *total_bytes >= max_bytes {
+                                break;
+                            }
+                            let idle_ms = if del_time == 0 {
+                                0
+                            } else {
+                                now.saturating_sub(del_time)
+                            };
+                            results.push((id, fields, Some((idle_ms, del_cnt))));
+                            *total_entries += 1;
+                            *total_bytes += entry_bytes;
+
+                            if !old_consumer.is_empty() && old_consumer != consumer {
+                                if let Some(old_c) = grp.consumers.get_mut(&old_consumer) {
+                                    old_c.pel.remove(&id);
+                                }
+                            }
+                            let new_delivery_count = del_cnt + 1;
+                            if let Some(pe) = grp.pel.get_mut(&id) {
+                                pe.consumer = consumer.clone();
+                                pe.delivery_time_ms = now;
+                                pe.delivery_count = new_delivery_count;
+                                pe.nack_seq = 0;
+                            }
+                            let cons = grp.consumers.get_mut(&consumer).unwrap();
+                            cons.pel.insert(id, now);
                             cons.active_time_ms = Some(now);
                         }
                     }
 
-                    for (id, _) in &results {
-                        grp.last_delivered_id = std::cmp::max(grp.last_delivered_id, *id);
-                        if !noack {
-                            grp.pel.insert(
-                                *id,
-                                StreamPelEntry {
-                                    consumer: consumer.clone(),
-                                    delivery_time_ms: now,
-                                    delivery_count: 1,
-                                },
-                            );
-                            let cons = grp.consumers.get_mut(&consumer).unwrap();
-                            cons.pel.insert(*id, now);
+                    let remaining_limit = limit.saturating_sub(results.len());
+                    if remaining_limit > 0 && (*total_entries == 0 || *total_bytes < max_bytes) {
+                        let mut new_entries = Vec::new();
+                        let range = stream.entries.range((
+                            std::ops::Bound::Excluded(grp.last_delivered_id),
+                            std::ops::Bound::Unbounded,
+                        ));
+                        for (&id, fields) in range {
+                            if new_entries.len() >= remaining_limit {
+                                break;
+                            }
+                            let entry_bytes: usize = 20 + fields.iter().map(|(f, v)| f.len() + v.len() + 10).sum::<usize>();
+                            if *total_entries > 0 && *total_bytes >= max_bytes {
+                                break;
+                            }
+                            let claim_info = if claim.is_some() {
+                                Some((0u64, 0usize))
+                            } else {
+                                None
+                            };
+                            new_entries.push((id, fields.clone(), claim_info));
+                            *total_entries += 1;
+                            *total_bytes += entry_bytes;
                         }
+
+                        if !new_entries.is_empty() {
+                            if let Some(cons) = grp.consumers.get_mut(&consumer) {
+                                cons.active_time_ms = Some(now);
+                            }
+                        }
+
+                        for (id, _, _) in &new_entries {
+                            if id > &grp.last_delivered_id {
+                                if let Some(er) = grp.entries_read {
+                                    let has_tombstones_ahead = stream_entries_len > 0
+                                        && stream_max_deleted != StreamId::default()
+                                        && grp.last_delivered_id <= stream_max_deleted;
+                                    if stream_first_id.map_or(false, |fid| grp.last_delivered_id >= fid) && !has_tombstones_ahead {
+                                        grp.entries_read = Some(er + 1);
+                                    } else if stream_entries_added > 0 {
+                                        grp.entries_read = RudisStream::estimate_distance_from_fields(
+                                            stream_entries_added,
+                                            stream_entries_len,
+                                            stream_last_id,
+                                            stream_max_deleted,
+                                            stream_first_id,
+                                            id,
+                                        );
+                                    }
+                                } else if stream_entries_added > 0 {
+                                    grp.entries_read = RudisStream::estimate_distance_from_fields(
+                                        stream_entries_added,
+                                        stream_entries_len,
+                                        stream_last_id,
+                                        stream_max_deleted,
+                                        stream_first_id,
+                                        id,
+                                    );
+                                }
+                                grp.last_delivered_id = *id;
+                            }
+                            if !noack {
+                                grp.pel.insert(
+                                    *id,
+                                    StreamPelEntry {
+                                        consumer: consumer.clone(),
+                                        delivery_time_ms: now,
+                                        delivery_count: 1,
+                                        nack_seq: 0,
+                                    },
+                                );
+                                let cons = grp.consumers.get_mut(&consumer).unwrap();
+                                cons.pel.insert(*id, now);
+                            }
+                        }
+                        results.extend(new_entries);
                     }
-                    Ok(results)
+                    let modified = consumer_created || !results.is_empty();
+                    Ok((results, modified))
                 } else {
                     let start_id = StreamId::parse(id_str)?;
                     let mut results = Vec::new();
@@ -12239,16 +13613,21 @@ impl RudisTable {
                         if results.len() >= limit {
                             break;
                         }
-                        if let Some(fields) = stream.entries.get(&id) {
-                            results.push((id, fields.clone()));
+                        let fields = stream.entries.get(&id).cloned().unwrap_or_default();
+                        let entry_bytes: usize = 20 + fields.iter().map(|(f, v)| f.len() + v.len() + 10).sum::<usize>();
+                        if *total_entries > 0 && *total_bytes >= max_bytes {
+                            break;
                         }
+                        results.push((id, fields, None));
+                        *total_entries += 1;
+                        *total_bytes += entry_bytes;
                     }
                     if !results.is_empty()
                         && let Some(cons) = grp.consumers.get_mut(&consumer)
                     {
                         cons.active_time_ms = Some(now);
                     }
-                    for (id, _) in &results {
+                    for (id, _, _) in &results {
                         if let Some(pel_entry) = grp.pel.get_mut(id) {
                             pel_entry.delivery_time_ms = now;
                             pel_entry.delivery_count += 1;
@@ -12257,10 +13636,113 @@ impl RudisTable {
                             cons.pel.insert(*id, now);
                         }
                     }
-                    Ok(results)
+                    Ok((results, consumer_created))
                 }
             }
             _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        }
+    }
+
+    pub fn xnack(
+        &mut self,
+        key: &[u8],
+        group: &[u8],
+        mode: crate::resp::XnackMode,
+        ids: &[StreamId],
+        retrycount: Option<usize>,
+        force: bool,
+    ) -> Result<usize, &'static str> {
+        let h = hash_key(key);
+        let idx = match self.table.find(key, h) {
+            Some(i) => {
+                if self.check_expired_slot(i) {
+                    return Err("NOGROUP No such key or consumer group in XNACK with GROUP option");
+                }
+                i
+            }
+            None => return Err("NOGROUP No such key or consumer group in XNACK with GROUP option"),
+        };
+
+        let entry = self.table.get_slot_mut(idx).unwrap();
+        match &mut entry.val {
+            RudisValue::Stream(stream) => {
+                let grp = stream
+                    .groups
+                    .get_mut(group)
+                    .ok_or("NOGROUP No such key or consumer group in XNACK with GROUP option")?;
+                let mut count = 0;
+                for &id in ids {
+                    if let Some(pe) = grp.pel.get_mut(&id) {
+                        if !pe.consumer.is_empty() {
+                            if let Some(cons) = grp.consumers.get_mut(&pe.consumer) {
+                                cons.pel.remove(&id);
+                            }
+                            pe.consumer = Bytes::new();
+                        }
+                        if let Some(rc) = retrycount {
+                            pe.delivery_count = rc;
+                        } else {
+                            match mode {
+                                crate::resp::XnackMode::Silent => {
+                                    pe.delivery_count = pe.delivery_count.saturating_sub(1);
+                                }
+                                crate::resp::XnackMode::Fail => {}
+                                crate::resp::XnackMode::Fatal => {
+                                    pe.delivery_count = 9223372036854775807;
+                                }
+                            }
+                        }
+                        pe.delivery_time_ms = 0;
+                        grp.next_nack_seq += 1;
+                        pe.nack_seq = grp.next_nack_seq;
+                        count += 1;
+                    } else if force && stream.entries.contains_key(&id) {
+                        let new_count = retrycount.unwrap_or(match mode {
+                            crate::resp::XnackMode::Silent => 0,
+                            crate::resp::XnackMode::Fail => 0,
+                            crate::resp::XnackMode::Fatal => 9223372036854775807,
+                        });
+                        grp.next_nack_seq += 1;
+                        grp.pel.insert(
+                            id,
+                            StreamPelEntry {
+                                consumer: Bytes::new(),
+                                delivery_time_ms: 0,
+                                delivery_count: new_count,
+                                nack_seq: grp.next_nack_seq,
+                            },
+                        );
+                        count += 1;
+                    }
+                }
+                Ok(count)
+            }
+            _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        }
+    }
+
+    pub fn earliest_claim_wait_ms(&mut self, key: &[u8], group: &[u8], min_idle: u64) -> Option<u64> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let h = hash_key(key);
+        let idx = self.table.find(key, h)?;
+        let entry = self.table.get_slot(idx)?;
+        if let RudisValue::Stream(s) = &entry.val {
+            let grp = s.groups.get(group)?;
+            let mut min_wait: Option<u64> = None;
+            for pe in grp.pel.values() {
+                let w = if pe.delivery_time_ms == 0 {
+                    0
+                } else {
+                    (pe.delivery_time_ms + min_idle).saturating_sub(now)
+                };
+                min_wait = Some(min_wait.map_or(w, |m: u64| m.min(w)));
+            }
+            min_wait
+        } else {
+            None
         }
     }
 
@@ -12353,11 +13835,12 @@ impl RudisTable {
         &mut self,
         key: &[u8],
         group: &[u8],
-        start: StreamId,
-        end: StreamId,
+        start: std::ops::Bound<StreamId>,
+        end: std::ops::Bound<StreamId>,
         count: usize,
         consumer: Option<&[u8]>,
-    ) -> Result<Vec<(StreamId, Bytes, u64, usize)>, &'static str> {
+        min_idle: Option<u64>,
+    ) -> Result<Vec<(StreamId, Bytes, i64, usize)>, &'static str> {
         let h = hash_key(key);
         let idx = match self.table.find(key, h) {
             Some(i) => {
@@ -12382,13 +13865,25 @@ impl RudisTable {
                     .get(group)
                     .ok_or("NOGROUP No such key or consumer group")?;
                 let mut results = Vec::new();
-                for (&id, pel_entry) in grp.pel.range(start..=end) {
+                if is_stream_range_empty(&start, &end) {
+                    return Ok(results);
+                }
+                for (&id, pel_entry) in grp.pel.range((start, end)) {
                     if let Some(c) = consumer
                         && pel_entry.consumer.as_ref() != c
                     {
                         continue;
                     }
-                    let idle = now.saturating_sub(pel_entry.delivery_time_ms);
+                    let idle = if pel_entry.delivery_time_ms == 0 {
+                        -1i64
+                    } else {
+                        now.saturating_sub(pel_entry.delivery_time_ms) as i64
+                    };
+                    if let Some(min_idle) = min_idle {
+                        if idle < min_idle as i64 {
+                            continue;
+                        }
+                    }
                     results.push((
                         id,
                         pel_entry.consumer.clone(),
@@ -12417,14 +13912,31 @@ impl RudisTable {
             None => return Err("ERR no such key"),
         };
         let entry = self.table.get_slot_mut(idx).unwrap();
-        match &entry.val {
+        match &mut entry.val {
             RudisValue::Stream(s) => {
                 let first_entry = s.entries.iter().next().map(|(id, f)| (*id, f.clone()));
                 let last_entry = s.entries.iter().next_back().map(|(id, f)| (*id, f.clone()));
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                s.purge_expired_idmp(now_ms);
+                let pids_tracked = s.idmp_producers.len();
+                let iids_tracked = s.idmp_producers.values().map(|p| p.iids.len()).sum();
+                let iids_added = s.iids_added;
+                let iids_duplicates = s.iids_duplicates;
+                let idmp_duration = s.get_idmp_duration();
+                let idmp_maxsize = s.get_idmp_maxsize();
+                let radix_tree_keys = s.nodes.len();
+                let radix_tree_nodes = if s.nodes.is_empty() {
+                    0
+                } else {
+                    s.nodes.len() + 1
+                };
                 Ok(StreamInfo {
                     length: s.entries.len(),
-                    radix_tree_keys: 1,
-                    radix_tree_nodes: 2,
+                    radix_tree_keys,
+                    radix_tree_nodes,
                     last_generated_id: s.last_id,
                     max_deleted_entry_id: s.max_deleted_entry_id,
                     entries_added: s.entries_added,
@@ -12432,6 +13944,12 @@ impl RudisTable {
                     groups: s.groups.len(),
                     first_entry,
                     last_entry,
+                    pids_tracked,
+                    iids_tracked,
+                    iids_added,
+                    iids_duplicates,
+                    idmp_duration,
+                    idmp_maxsize,
                 })
             }
             _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
@@ -12454,13 +13972,7 @@ impl RudisTable {
             RudisValue::Stream(s) => {
                 let mut res = Vec::with_capacity(s.groups.len());
                 for (name, grp) in &s.groups {
-                    let lag = s
-                        .entries
-                        .range((
-                            std::ops::Bound::Excluded(grp.last_delivered_id),
-                            std::ops::Bound::Unbounded,
-                        ))
-                        .count() as u64;
+                    let lag = s.compute_cg_lag(grp);
                     res.push(StreamGroupInfo {
                         name: name.clone(),
                         consumers: grp.consumers.len(),
@@ -12521,6 +14033,153 @@ impl RudisTable {
             _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
         }
     }
+
+    pub fn xinfo_stream_full(
+        &mut self,
+        key: &[u8],
+        count: Option<usize>,
+    ) -> Result<StreamFullInfo, &'static str> {
+        let h = hash_key(key);
+        let idx = match self.table.find(key, h) {
+            Some(i) => {
+                if self.check_expired_slot(i) {
+                    return Err("ERR no such key");
+                }
+                i
+            }
+            None => return Err("ERR no such key"),
+        };
+        let entry = self.table.get_slot_mut(idx).unwrap();
+        match &mut entry.val {
+            RudisValue::Stream(s) => {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                s.purge_expired_idmp(now_ms);
+                let pids_tracked = s.idmp_producers.len();
+                let iids_tracked = s.idmp_producers.values().map(|p| p.iids.len()).sum();
+                let iids_added = s.iids_added;
+                let iids_duplicates = s.iids_duplicates;
+                let idmp_duration = s.get_idmp_duration();
+                let idmp_maxsize = s.get_idmp_maxsize();
+                let radix_tree_keys = s.nodes.len();
+                let radix_tree_nodes = if s.nodes.is_empty() {
+                    0
+                } else {
+                    s.nodes.len() + 1
+                };
+                let recorded_first_entry_id = s.entries.keys().next().copied();
+                let count_limit = count.unwrap_or(10);
+                let entries: Vec<_> = if count_limit == 0 {
+                    s.entries.iter().map(|(id, f)| (*id, f.clone())).collect()
+                } else {
+                    s.entries.iter().take(count_limit).map(|(id, f)| (*id, f.clone())).collect()
+                };
+
+                let mut group_keys: Vec<_> = s.groups.keys().cloned().collect();
+                group_keys.sort();
+
+                let mut groups = Vec::with_capacity(group_keys.len());
+                for grp_name in group_keys {
+                    let grp = s.groups.get(&grp_name).unwrap();
+                    let lag = s.compute_cg_lag(grp);
+                    let pel_count = grp.pel.len();
+                    let nacked_count = grp
+                        .pel
+                        .values()
+                        .filter(|e| e.consumer.is_empty() || e.delivery_time_ms == 0)
+                        .count();
+
+                    let pending: Vec<_> = if count_limit == 0 {
+                        grp.pel
+                            .iter()
+                            .map(|(id, e)| (*id, e.consumer.clone(), e.delivery_time_ms, e.delivery_count))
+                            .collect()
+                    } else {
+                        grp.pel
+                            .iter()
+                            .take(count_limit)
+                            .map(|(id, e)| (*id, e.consumer.clone(), e.delivery_time_ms, e.delivery_count))
+                            .collect()
+                    };
+
+                    let mut consumer_keys: Vec<_> = grp.consumers.keys().cloned().collect();
+                    consumer_keys.sort();
+
+                    let mut consumers = Vec::with_capacity(consumer_keys.len());
+                    for c_name in consumer_keys {
+                        let cons = grp.consumers.get(&c_name).unwrap();
+                        let pel_count = cons.pel.len();
+                        let pending: Vec<_> = if count_limit == 0 {
+                            cons.pel
+                                .iter()
+                                .map(|(&id, _)| {
+                                    let (deliv_time, deliv_count) = grp
+                                        .pel
+                                        .get(&id)
+                                        .map(|e| (e.delivery_time_ms, e.delivery_count))
+                                        .unwrap_or((0, 0));
+                                    (id, deliv_time, deliv_count)
+                                })
+                                .collect()
+                        } else {
+                            cons.pel
+                                .iter()
+                                .take(count_limit)
+                                .map(|(&id, _)| {
+                                    let (deliv_time, deliv_count) = grp
+                                        .pel
+                                        .get(&id)
+                                        .map(|e| (e.delivery_time_ms, e.delivery_count))
+                                        .unwrap_or((0, 0));
+                                    (id, deliv_time, deliv_count)
+                                })
+                                .collect()
+                        };
+
+                        consumers.push(StreamFullConsumerInfo {
+                            name: c_name,
+                            seen_time_ms: cons.seen_time_ms,
+                            active_time_ms: cons.active_time_ms,
+                            pel_count,
+                            pending,
+                        });
+                    }
+
+                    groups.push(StreamFullGroupInfo {
+                        name: grp_name,
+                        last_delivered_id: grp.last_delivered_id,
+                        entries_read: grp.entries_read,
+                        lag,
+                        pel_count,
+                        nacked_count,
+                        pending,
+                        consumers,
+                    });
+                }
+
+                Ok(StreamFullInfo {
+                    length: s.entries.len(),
+                    radix_tree_keys,
+                    radix_tree_nodes,
+                    last_generated_id: s.last_id,
+                    max_deleted_entry_id: s.max_deleted_entry_id,
+                    entries_added: s.entries_added,
+                    recorded_first_entry_id,
+                    entries,
+                    groups,
+                    pids_tracked,
+                    iids_tracked,
+                    iids_added,
+                    iids_duplicates,
+                    idmp_duration,
+                    idmp_maxsize,
+                })
+            }
+            _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12535,6 +14194,12 @@ pub struct StreamInfo {
     pub groups: usize,
     pub first_entry: Option<(StreamId, Vec<(Bytes, Bytes)>)>,
     pub last_entry: Option<(StreamId, Vec<(Bytes, Bytes)>)>,
+    pub pids_tracked: usize,
+    pub iids_tracked: usize,
+    pub iids_added: u64,
+    pub iids_duplicates: u64,
+    pub idmp_duration: u64,
+    pub idmp_maxsize: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12543,8 +14208,8 @@ pub struct StreamGroupInfo {
     pub consumers: usize,
     pub pending: usize,
     pub last_delivered_id: StreamId,
-    pub entries_read: u64,
-    pub lag: u64,
+    pub entries_read: Option<u64>,
+    pub lag: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12555,16 +14220,70 @@ pub struct StreamConsumerInfo {
     pub inactive_ms: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamFullConsumerInfo {
+    pub name: Bytes,
+    pub seen_time_ms: u64,
+    pub active_time_ms: Option<u64>,
+    pub pel_count: usize,
+    pub pending: Vec<(StreamId, u64, usize)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamFullGroupInfo {
+    pub name: Bytes,
+    pub last_delivered_id: StreamId,
+    pub entries_read: Option<u64>,
+    pub lag: Option<u64>,
+    pub pel_count: usize,
+    pub nacked_count: usize,
+    pub pending: Vec<(StreamId, Bytes, u64, usize)>,
+    pub consumers: Vec<StreamFullConsumerInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamFullInfo {
+    pub length: usize,
+    pub radix_tree_keys: usize,
+    pub radix_tree_nodes: usize,
+    pub last_generated_id: StreamId,
+    pub max_deleted_entry_id: StreamId,
+    pub entries_added: u64,
+    pub recorded_first_entry_id: Option<StreamId>,
+    pub entries: Vec<(StreamId, Vec<(Bytes, Bytes)>)>,
+    pub groups: Vec<StreamFullGroupInfo>,
+    pub pids_tracked: usize,
+    pub iids_tracked: usize,
+    pub iids_added: u64,
+    pub iids_duplicates: u64,
+    pub idmp_duration: u64,
+    pub idmp_maxsize: usize,
+}
+
+const CRC64_TAB: [u64; 256] = {
+    let mut table = [0u64; 256];
+    let poly = 0x95ac9329ac4bc9b5u64;
+    let mut i = 0;
+    while i < 256 {
+        let mut cur = i as u64;
+        let mut j = 0;
+        while j < 8 {
+            if (cur & 1) != 0 {
+                cur = (cur >> 1) ^ poly;
+            } else {
+                cur >>= 1;
+            }
+            j += 1;
+        }
+        table[i] = cur;
+        i += 1;
+    }
+    table
+};
+
 pub fn crc64_update(mut crc: u64, data: &[u8]) -> u64 {
     for &b in data {
-        crc ^= (b as u64) << 56;
-        for _ in 0..8 {
-            if (crc & 0x8000_0000_0000_0000) != 0 {
-                crc = (crc << 1) ^ 0x42F0_E1EB_A9EA_3693;
-            } else {
-                crc <<= 1;
-            }
-        }
+        crc = CRC64_TAB[((crc ^ (b as u64)) & 0xFF) as usize] ^ (crc >> 8);
     }
     crc
 }
@@ -14084,6 +15803,10 @@ mod tests {
             false,
             None,
             None,
+            false,
+            StreamTrimStrategy::KeepRef,
+            None,
+            None,
         );
         assert_eq!(
             err0,
@@ -14099,12 +15822,16 @@ mod tests {
                 true,
                 None,
                 None,
+                false,
+                StreamTrimStrategy::KeepRef,
+                None,
+                None,
             )
             .unwrap();
-        assert_eq!(res_nomk, None);
+        assert_eq!(res_nomk, StreamAddResult::NoMkStream);
 
         // 3. XADD with explicit ID
-        let id1 = table
+        let id1 = match table
             .xadd(
                 Bytes::from_static(b"s1"),
                 StreamAddId::Explicit(StreamId::new(1000, 1)),
@@ -14115,9 +15842,16 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
+                StreamTrimStrategy::KeepRef,
+                None,
+                None,
             )
             .unwrap()
-            .unwrap();
+        {
+            StreamAddResult::Added(id) => id,
+            _ => panic!("expected Added"),
+        };
         assert_eq!(id1, StreamId::new(1000, 1));
         assert_eq!(table.xlen(b"s1").unwrap(), 1);
 
@@ -14129,6 +15863,10 @@ mod tests {
             false,
             None,
             None,
+            false,
+            StreamTrimStrategy::KeepRef,
+            None,
+            None,
         );
         assert_eq!(
             err_mono,
@@ -14136,7 +15874,7 @@ mod tests {
         );
 
         // 4. AutoSeq
-        let id2 = table
+        let id2 = match table
             .xadd(
                 Bytes::from_static(b"s1"),
                 StreamAddId::AutoSeq(1000),
@@ -14144,12 +15882,19 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
+                StreamTrimStrategy::KeepRef,
+                None,
+                None,
             )
             .unwrap()
-            .unwrap();
+        {
+            StreamAddResult::Added(id) => id,
+            _ => panic!("expected Added"),
+        };
         assert_eq!(id2, StreamId::new(1000, 2));
 
-        let id3 = table
+        let id3 = match table
             .xadd(
                 Bytes::from_static(b"s1"),
                 StreamAddId::AutoSeq(1001),
@@ -14157,9 +15902,16 @@ mod tests {
                 false,
                 None,
                 None,
+                false,
+                StreamTrimStrategy::KeepRef,
+                None,
+                None,
             )
             .unwrap()
-            .unwrap();
+        {
+            StreamAddResult::Added(id) => id,
+            _ => panic!("expected Added"),
+        };
         assert_eq!(id3, StreamId::new(1001, 0));
         assert_eq!(table.xlen(b"s1").unwrap(), 3);
 
@@ -14190,7 +15942,7 @@ mod tests {
 
         // 7. XREAD
         let read_res = table
-            .xread(&[Bytes::from_static(b"s1")], &[id1.to_string()], None)
+            .xread(&[Bytes::from_static(b"s1")], &[id1.to_string()], None, None, None)
             .unwrap();
         assert_eq!(read_res.len(), 1);
         assert_eq!(read_res[0].1.len(), 2);
@@ -14199,7 +15951,7 @@ mod tests {
 
         // XREAD with $
         let read_dollar = table
-            .xread(&[Bytes::from_static(b"s1")], &[String::from("$")], None)
+            .xread(&[Bytes::from_static(b"s1")], &[String::from("$")], None, None, None)
             .unwrap();
         assert_eq!(read_dollar.len(), 0);
 
@@ -14219,11 +15971,15 @@ mod tests {
                     false,
                     None,
                     None,
+                    false,
+                    StreamTrimStrategy::KeepRef,
+                    None,
+                    None,
                 )
                 .unwrap();
         }
         assert_eq!(table.xlen(b"s1").unwrap(), 12);
-        let trimmed = table.xtrim(b"s1", Some(5), None).unwrap();
+        let trimmed = table.xtrim(b"s1", Some(5), None, false, StreamTrimStrategy::KeepRef, None).unwrap();
         assert_eq!(trimmed, 7);
         assert_eq!(table.xlen(b"s1").unwrap(), 5);
 

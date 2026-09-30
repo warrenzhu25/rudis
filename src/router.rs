@@ -834,7 +834,11 @@ impl Router {
             {
                 aof.borrow_mut().append(&bytes);
             }
-            self.local_db.borrow_mut().set(key, value, expire_in);
+            {
+                let mut db = self.local_db.borrow_mut();
+                db.set(key.clone(), value, expire_in);
+                crate::connection::notify_stream_or_defer(&mut db, &key);
+            }
             let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed);
             if max_mem > 0 {
                 let used = self.local_db.borrow().table.used_memory;
@@ -1477,6 +1481,7 @@ impl Router {
             if deleted {
                 db.delete_document_local(&String::from_utf8_lossy(&key));
                 crate::connection::notify_keyspace_event_sync(self, crate::connection::NOTIFY_GENERIC, "del", &key);
+                crate::connection::notify_stream_or_defer(&mut db, &key);
                 if let Some(aof) = &self.aof
                     && let Some(bytes) = crate::aof::command_to_resp(&Command::Del(smallvec![key]))
                 {
@@ -1516,6 +1521,7 @@ impl Router {
                 for k in keys {
                     if db.del(&k) {
                         count += 1;
+                        crate::connection::notify_stream_or_defer(&mut db, &k);
                         deleted_keys.push(k);
                     }
                 }
@@ -1554,6 +1560,7 @@ impl Router {
                 for k in local_keys {
                     if db.del(&k) {
                         total_deleted += 1;
+                        crate::connection::notify_stream_or_defer(&mut db, &k);
                         deleted_local.push(k);
                     }
                 }

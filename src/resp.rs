@@ -216,6 +216,7 @@ pub enum ObjectSubcommand {
 #[derive(Debug, PartialEq, Clone)]
 pub enum XinfoSubcommand {
     Stream(Bytes),
+    StreamFull { key: Bytes, count: Option<usize> },
     Groups(Bytes),
     Consumers { key: Bytes, group: Bytes },
     Help,
@@ -328,6 +329,13 @@ pub enum LmovemMode {
 pub enum LmovemOrdering {
     Obo,
     Bulk,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XnackMode {
+    Silent,
+    Fail,
+    Fatal,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -879,8 +887,12 @@ pub enum Command {
         nomkstream: bool,
         maxlen: Option<usize>,
         minid: Option<crate::table::StreamId>,
+        approx: bool,
+        trim_strategy: crate::table::StreamTrimStrategy,
+        idmp: Option<crate::table::StreamIdmpOption>,
         id: crate::table::StreamAddId,
         fields: Vec<(Bytes, Bytes)>,
+        limit: Option<usize>,
     },
     Xlen(Bytes),
     Xrange {
@@ -897,6 +909,8 @@ pub enum Command {
     },
     Xread {
         count: Option<usize>,
+        maxcount: Option<usize>,
+        maxsize: Option<usize>,
         block_ms: Option<u64>,
         keys: Vec<Bytes>,
         ids: Vec<String>,
@@ -909,12 +923,44 @@ pub enum Command {
         key: Bytes,
         maxlen: Option<usize>,
         minid: Option<crate::table::StreamId>,
+        approx: bool,
+        trim_strategy: crate::table::StreamTrimStrategy,
+        limit: Option<usize>,
+    },
+    Xcfgset {
+        key: Bytes,
+        duration: Option<u64>,
+        maxsize: Option<usize>,
+    },
+    Xsetid {
+        key: Bytes,
+        last_id: crate::table::StreamId,
+        entries_added: Option<u64>,
+        max_deleted_id: Option<crate::table::StreamId>,
+    },
+    Xdelex {
+        key: Bytes,
+        strategy: crate::table::StreamTrimStrategy,
+        ids: Vec<crate::table::StreamId>,
+    },
+    Xackdel {
+        key: Bytes,
+        group: Bytes,
+        strategy: crate::table::StreamTrimStrategy,
+        ids: Vec<crate::table::StreamId>,
+    },
+    Xidmprecord {
+        key: Bytes,
+        pid: Bytes,
+        iid: Bytes,
+        id_raw: Bytes,
     },
     XgroupCreate {
         key: Bytes,
         group: Bytes,
         id: String,
         mkstream: bool,
+        entries_read: Option<u64>,
     },
     XgroupDestroy {
         key: Bytes,
@@ -936,12 +982,16 @@ pub enum Command {
         id: String,
         entries_read: Option<u64>,
     },
+    XgroupHelp,
     Xreadgroup {
         group: Bytes,
         consumer: Bytes,
         count: Option<usize>,
+        maxcount: Option<usize>,
+        maxsize: Option<usize>,
         block_ms: Option<u64>,
         noack: bool,
+        claim: Option<u64>,
         keys: Vec<Bytes>,
         ids: Vec<String>,
     },
@@ -950,14 +1000,23 @@ pub enum Command {
         group: Bytes,
         ids: Vec<crate::table::StreamId>,
     },
+    Xnack {
+        key: Bytes,
+        group: Bytes,
+        mode: XnackMode,
+        ids: Vec<crate::table::StreamId>,
+        retrycount: Option<usize>,
+        force: bool,
+    },
     Xpending {
         key: Bytes,
         group: Bytes,
         range: Option<(
-            crate::table::StreamId,
-            crate::table::StreamId,
+            std::ops::Bound<crate::table::StreamId>,
+            std::ops::Bound<crate::table::StreamId>,
             usize,
             Option<Bytes>,
+            Option<u64>,
         )>,
     },
     // VALKEY EXTENDED COMMANDS
@@ -1776,6 +1835,24 @@ fn parse_memcached_storage_command(buf: &mut BytesMut) -> Result<Option<Option<C
         }
     };
     Ok(Some(Some(cmd)))
+}
+
+fn parse_min_idle_time(s: &str) -> Result<u64, String> {
+    if s.is_empty() || s.starts_with('+') || s == "-0" {
+        return Err("ERR min-idle-time is not an integer".to_string());
+    }
+    if s.starts_with('-') {
+        if let Ok(val) = s.parse::<i64>() {
+            if val < 0 {
+                return Err("ERR min-idle-time must be a positive integer".to_string());
+            }
+        }
+        return Err("ERR min-idle-time is not an integer".to_string());
+    }
+    match s.parse::<u64>() {
+        Ok(val) => Ok(val),
+        Err(_) => Err("ERR min-idle-time is not an integer".to_string()),
+    }
 }
 
 /// Parse a single Redis command from the buffer.
@@ -6493,6 +6570,12 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let mut nomkstream = false;
             let mut maxlen = None;
             let mut minid = None;
+            let mut approx = false;
+            let mut limit = None;
+            let mut limit_seen = false;
+            let mut trim_strategy = crate::table::StreamTrimStrategy::KeepRef;
+            let mut trim_strategy_seen = false;
+            let mut idmp = None;
             let mut i = 2;
             while i < args.len() {
                 let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
@@ -6503,9 +6586,13 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     }
                     "MAXLEN" => {
                         i += 1;
-                        if i < args.len() && (args[i].as_ref() == b"=" || args[i].as_ref() == b"~")
-                        {
-                            i += 1;
+                        if i < args.len() {
+                            if args[i].as_ref() == b"=" {
+                                i += 1;
+                            } else if args[i].as_ref() == b"~" {
+                                approx = true;
+                                i += 1;
+                            }
                         }
                         if i >= args.len() {
                             return Err("syntax error".to_string());
@@ -6519,9 +6606,13 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     }
                     "MINID" => {
                         i += 1;
-                        if i < args.len() && (args[i].as_ref() == b"=" || args[i].as_ref() == b"~")
-                        {
-                            i += 1;
+                        if i < args.len() {
+                            if args[i].as_ref() == b"=" {
+                                i += 1;
+                            } else if args[i].as_ref() == b"~" {
+                                approx = true;
+                                i += 1;
+                            }
                         }
                         if i >= args.len() {
                             return Err("syntax error".to_string());
@@ -6538,10 +6629,81 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         if i + 1 >= args.len() {
                             return Err("syntax error".to_string());
                         }
+                        let l_str = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        let l: i64 = l_str.parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        if l < 0 {
+                            return Err("ERR The LIMIT argument must be >= 0.".to_string());
+                        }
+                        limit = Some(l as usize);
+                        limit_seen = true;
+                        i += 2;
+                    }
+                    "ACKED" => {
+                        if trim_strategy_seen {
+                            return Err("syntax error".to_string());
+                        }
+                        trim_strategy = crate::table::StreamTrimStrategy::Acked;
+                        trim_strategy_seen = true;
+                        i += 1;
+                    }
+                    "DELREF" => {
+                        if trim_strategy_seen {
+                            return Err("syntax error".to_string());
+                        }
+                        trim_strategy = crate::table::StreamTrimStrategy::DelRef;
+                        trim_strategy_seen = true;
+                        i += 1;
+                    }
+                    "KEEPREF" => {
+                        if trim_strategy_seen {
+                            return Err("syntax error".to_string());
+                        }
+                        trim_strategy = crate::table::StreamTrimStrategy::KeepRef;
+                        trim_strategy_seen = true;
+                        i += 1;
+                    }
+                    "IDMP" => {
+                        if idmp.is_some() {
+                            return Err("ERR IDMP/IDMPAUTO specified multiple times".to_string());
+                        }
+                        if i + 2 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let producer = args[i + 1].clone();
+                        if producer.is_empty() {
+                            return Err("ERR IDMP requires a non-empty producer ID".to_string());
+                        }
+                        let iid = args[i + 2].clone();
+                        if iid.is_empty() {
+                            return Err("ERR IDMP requires a non-empty idempotent ID".to_string());
+                        }
+                        idmp = Some(crate::table::StreamIdmpOption::Manual { producer, iid });
+                        i += 3;
+                    }
+                    "IDMPAUTO" => {
+                        if idmp.is_some() {
+                            return Err("ERR IDMP/IDMPAUTO specified multiple times".to_string());
+                        }
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let producer = args[i + 1].clone();
+                        if producer.is_empty() {
+                            return Err("ERR IDMPAUTO requires a non-empty producer ID".to_string());
+                        }
+                        idmp = Some(crate::table::StreamIdmpOption::Auto { producer });
                         i += 2;
                     }
                     _ => break,
                 }
+            }
+            if limit_seen && maxlen.is_none() && minid.is_none() {
+                return Err("syntax error, LIMIT cannot be used without specifying a trimming strategy".to_string());
+            }
+            if limit_seen && !approx {
+                return Err("syntax error, LIMIT cannot be used without the special ~ option".to_string());
             }
             if i >= args.len() {
                 return Err("wrong number of arguments for 'xadd' command".to_string());
@@ -6549,6 +6711,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let id_str = std::str::from_utf8(&args[i])
                 .map_err(|_| "Invalid stream ID specified as stream command argument")?;
             let id = crate::table::StreamAddId::parse(id_str).map_err(|e| e.to_string())?;
+            if idmp.is_some() && !matches!(id, crate::table::StreamAddId::Auto) {
+                return Err("ERR IDMP/IDMPAUTO can be used only with auto-generated IDs".to_string());
+            }
             i += 1;
             let rem = args.len() - i;
             if rem == 0 || !rem.is_multiple_of(2) {
@@ -6564,8 +6729,12 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 nomkstream,
                 maxlen,
                 minid,
+                approx,
+                trim_strategy,
+                idmp,
                 id,
                 fields,
+                limit,
             }))
         }
         "XLEN" => {
@@ -6635,6 +6804,8 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'xread' command".to_string());
             }
             let mut count = None;
+            let mut maxcount = None;
+            let mut maxsize = None;
             let mut block_ms = None;
             let mut i = 1;
             while i < args.len() {
@@ -6649,6 +6820,34 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             .parse()
                             .map_err(|_| "value is not an integer or out of range")?;
                         count = Some(cnt);
+                        i += 2;
+                    }
+                    "MAXCOUNT" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let mc: i64 = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        if mc <= 0 {
+                            return Err("ERR MAXCOUNT must be a positive integer".to_string());
+                        }
+                        maxcount = Some(mc as usize);
+                        i += 2;
+                    }
+                    "MAXSIZE" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let ms: i64 = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        if ms <= 0 {
+                            return Err("ERR MAXSIZE must be a positive integer".to_string());
+                        }
+                        maxsize = Some(ms as usize);
                         i += 2;
                     }
                     "BLOCK" => {
@@ -6666,12 +6865,20 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         i += 1;
                         break;
                     }
+                    "CLAIM" => {
+                        return Err("ERR The CLAIM option is only supported with XREADGROUP".to_string());
+                    }
                     _ => return Err("syntax error".to_string()),
+                }
+            }
+            if let (Some(c), Some(mc)) = (count, maxcount) {
+                if mc < c {
+                    return Err("ERR MAXCOUNT must be greater than or equal to COUNT".to_string());
                 }
             }
             let rem = args.len() - i;
             if rem < 2 || !rem.is_multiple_of(2) {
-                return Err("ERR Unbalanced XREAD list of streams and IDs".to_string());
+                return Err("ERR Unbalanced 'xread' list of streams: for each stream key an ID, '+', or '$' must be specified.".to_string());
             }
             let n = rem / 2;
             let keys: Vec<Bytes> = args[i..i + n].to_vec();
@@ -6681,6 +6888,8 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 .collect();
             Ok(Some(Command::Xread {
                 count,
+                maxcount,
+                maxsize,
                 block_ms,
                 keys,
                 ids,
@@ -6707,15 +6916,24 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let key = args[1].clone();
             let mut maxlen = None;
             let mut minid = None;
+            let mut approx = false;
+            let mut limit = None;
+            let mut limit_seen = false;
+            let mut trim_strategy = crate::table::StreamTrimStrategy::KeepRef;
+            let mut trim_strategy_seen = false;
             let mut i = 2;
             while i < args.len() {
                 let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
                 match opt.as_str() {
                     "MAXLEN" => {
                         i += 1;
-                        if i < args.len() && (args[i].as_ref() == b"=" || args[i].as_ref() == b"~")
-                        {
-                            i += 1;
+                        if i < args.len() {
+                            if args[i].as_ref() == b"=" {
+                                i += 1;
+                            } else if args[i].as_ref() == b"~" {
+                                approx = true;
+                                i += 1;
+                            }
                         }
                         if i >= args.len() {
                             return Err("syntax error".to_string());
@@ -6729,9 +6947,13 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     }
                     "MINID" => {
                         i += 1;
-                        if i < args.len() && (args[i].as_ref() == b"=" || args[i].as_ref() == b"~")
-                        {
-                            i += 1;
+                        if i < args.len() {
+                            if args[i].as_ref() == b"=" {
+                                i += 1;
+                            } else if args[i].as_ref() == b"~" {
+                                approx = true;
+                                i += 1;
+                            }
                         }
                         if i >= args.len() {
                             return Err("syntax error".to_string());
@@ -6748,14 +6970,319 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         if i + 1 >= args.len() {
                             return Err("syntax error".to_string());
                         }
+                        let l_str = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        let l: i64 = l_str.parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        if l < 0 {
+                            return Err("ERR The LIMIT argument must be >= 0.".to_string());
+                        }
+                        limit = Some(l as usize);
+                        limit_seen = true;
                         i += 2;
+                    }
+                    "ACKED" => {
+                        if trim_strategy_seen {
+                            return Err("syntax error".to_string());
+                        }
+                        trim_strategy = crate::table::StreamTrimStrategy::Acked;
+                        trim_strategy_seen = true;
+                        i += 1;
+                    }
+                    "DELREF" => {
+                        if trim_strategy_seen {
+                            return Err("syntax error".to_string());
+                        }
+                        trim_strategy = crate::table::StreamTrimStrategy::DelRef;
+                        trim_strategy_seen = true;
+                        i += 1;
+                    }
+                    "KEEPREF" => {
+                        if trim_strategy_seen {
+                            return Err("syntax error".to_string());
+                        }
+                        trim_strategy = crate::table::StreamTrimStrategy::KeepRef;
+                        trim_strategy_seen = true;
+                        i += 1;
                     }
                     _ => {
                         i += 1;
                     }
                 }
             }
-            Ok(Some(Command::Xtrim { key, maxlen, minid }))
+            if limit_seen && maxlen.is_none() && minid.is_none() {
+                return Err("syntax error, LIMIT cannot be used without specifying a trimming strategy".to_string());
+            }
+            if limit_seen && !approx {
+                return Err("syntax error, LIMIT cannot be used without the special ~ option".to_string());
+            }
+            Ok(Some(Command::Xtrim {
+                key,
+                maxlen,
+                minid,
+                approx,
+                trim_strategy,
+                limit,
+            }))
+        }
+        "XCFGSET" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'xcfgset' command".to_string());
+            }
+            if args.len() == 2 {
+                return Err("ERR At least one parameter must be specified for XCFGSET".to_string());
+            }
+            let key = args[1].clone();
+            let mut duration = None;
+            let mut maxsize = None;
+            let mut i = 2;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "IDMP-DURATION" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let s = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "ERR value is not an integer or out of range")?;
+                        if s.starts_with("00") || s.contains('.') {
+                            return Err("ERR value is not an integer or out of range".to_string());
+                        }
+                        let val: i64 = s.parse()
+                            .map_err(|_| "ERR value is not an integer or out of range")?;
+                        if val < 1 || val > 86400 {
+                            return Err("ERR IDMP-DURATION must be between 1 and 86400".to_string());
+                        }
+                        duration = Some(val as u64);
+                        i += 2;
+                    }
+                    "IDMP-MAXSIZE" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let s = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "ERR value is not an integer or out of range")?;
+                        if s.starts_with("00") || s.contains('.') {
+                            return Err("ERR value is not an integer or out of range".to_string());
+                        }
+                        let val: i64 = s.parse()
+                            .map_err(|_| "ERR value is not an integer or out of range")?;
+                        if val < 1 || val > 10000 {
+                            return Err("ERR IDMP-MAXSIZE must be between 1 and 10000".to_string());
+                        }
+                        maxsize = Some(val as usize);
+                        i += 2;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            Ok(Some(Command::Xcfgset {
+                key,
+                duration,
+                maxsize,
+            }))
+        }
+        "XSETID" => {
+            if args.len() < 3 {
+                return Err("wrong number of arguments for 'xsetid' command".to_string());
+            }
+            let key = args[1].clone();
+            let last_id_str = std::str::from_utf8(&args[2])
+                .map_err(|_| "Invalid stream ID specified as stream command argument")?;
+            let last_id = crate::table::StreamId::parse_exact(last_id_str)
+                .map_err(|e| e.to_string())?;
+
+            let mut entries_added = None;
+            let mut max_deleted_id = None;
+            let mut i = 3;
+            while i < args.len() {
+                let moreargs = (args.len() - 1) - i;
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                if opt == "ENTRIESADDED" && moreargs > 0 {
+                    let ea_str = std::str::from_utf8(&args[i + 1])
+                        .map_err(|_| "value is not an integer or out of range")?;
+                    let ea_i: i64 = ea_str.parse()
+                        .map_err(|_| "value is not an integer or out of range")?;
+                    if ea_i < 0 {
+                        return Err("ERR entries_added must be positive".to_string());
+                    }
+                    entries_added = Some(ea_i as u64);
+                    i += 2;
+                } else if opt == "MAXDELETEDID" && moreargs > 0 {
+                    let md_str = std::str::from_utf8(&args[i + 1])
+                        .map_err(|_| "Invalid stream ID specified as stream command argument")?;
+                    let md = crate::table::StreamId::parse_exact(md_str).map_err(|e| e.to_string())?;
+                    if last_id < md {
+                        return Err("ERR The ID specified in XSETID is smaller than the provided max_deleted_entry_id".to_string());
+                    }
+                    max_deleted_id = Some(md);
+                    i += 2;
+                } else {
+                    return Err("syntax error".to_string());
+                }
+            }
+            Ok(Some(Command::Xsetid {
+                key,
+                last_id,
+                entries_added,
+                max_deleted_id,
+            }))
+        }
+        "XDELEX" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'xdelex' command".to_string());
+            }
+            let key = args[1].clone();
+            let mut strategy = crate::table::StreamTrimStrategy::KeepRef;
+            let mut strategy_seen = false;
+            let mut i = 2;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "KEEPREF" => {
+                        if strategy_seen {
+                            return Err("syntax error".to_string());
+                        }
+                        strategy = crate::table::StreamTrimStrategy::KeepRef;
+                        strategy_seen = true;
+                        i += 1;
+                    }
+                    "DELREF" => {
+                        if strategy_seen {
+                            return Err("syntax error".to_string());
+                        }
+                        strategy = crate::table::StreamTrimStrategy::DelRef;
+                        strategy_seen = true;
+                        i += 1;
+                    }
+                    "ACKED" => {
+                        if strategy_seen {
+                            return Err("syntax error".to_string());
+                        }
+                        strategy = crate::table::StreamTrimStrategy::Acked;
+                        strategy_seen = true;
+                        i += 1;
+                    }
+                    "IDS" => {
+                        i += 1;
+                        break;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            if i >= args.len() {
+                return Err("syntax error".to_string());
+            }
+            let numids_i: i64 = std::str::from_utf8(&args[i])
+                .map_err(|_| "ERR Number of IDs must be a positive integer")?
+                .parse()
+                .map_err(|_| "ERR Number of IDs must be a positive integer")?;
+            if numids_i <= 0 {
+                return Err("ERR Number of IDs must be a positive integer".to_string());
+            }
+            let numids = numids_i as usize;
+            i += 1;
+            let remaining = args.len() - i;
+            if numids > remaining {
+                return Err("ERR The `numids` parameter must match the number of arguments".to_string());
+            }
+            if numids < remaining {
+                return Err("syntax error".to_string());
+            }
+            let mut ids = Vec::with_capacity(numids);
+            for arg in &args[i..] {
+                let s = std::str::from_utf8(arg)
+                    .map_err(|_| "Invalid stream ID specified as stream command argument")?;
+                let id = crate::table::StreamId::parse_exact(s).map_err(|e| e.to_string())?;
+                ids.push(id);
+            }
+            Ok(Some(Command::Xdelex { key, strategy, ids }))
+        }
+        "XACKDEL" => {
+            if args.len() < 4 {
+                return Err("wrong number of arguments for 'xackdel' command".to_string());
+            }
+            let key = args[1].clone();
+            let group = args[2].clone();
+            let mut strategy = crate::table::StreamTrimStrategy::KeepRef;
+            let mut strategy_seen = false;
+            let mut i = 3;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "KEEPREF" => {
+                        if strategy_seen {
+                            return Err("syntax error".to_string());
+                        }
+                        strategy = crate::table::StreamTrimStrategy::KeepRef;
+                        strategy_seen = true;
+                        i += 1;
+                    }
+                    "DELREF" => {
+                        if strategy_seen {
+                            return Err("syntax error".to_string());
+                        }
+                        strategy = crate::table::StreamTrimStrategy::DelRef;
+                        strategy_seen = true;
+                        i += 1;
+                    }
+                    "ACKED" => {
+                        if strategy_seen {
+                            return Err("syntax error".to_string());
+                        }
+                        strategy = crate::table::StreamTrimStrategy::Acked;
+                        strategy_seen = true;
+                        i += 1;
+                    }
+                    "IDS" => {
+                        i += 1;
+                        break;
+                    }
+                    _ => return Err("syntax error".to_string()),
+                }
+            }
+            if i >= args.len() {
+                return Err("syntax error".to_string());
+            }
+            let numids_i: i64 = std::str::from_utf8(&args[i])
+                .map_err(|_| "ERR Number of IDs must be a positive integer")?
+                .parse()
+                .map_err(|_| "ERR Number of IDs must be a positive integer")?;
+            if numids_i <= 0 {
+                return Err("ERR Number of IDs must be a positive integer".to_string());
+            }
+            let numids = numids_i as usize;
+            i += 1;
+            let remaining = args.len() - i;
+            if numids > remaining {
+                return Err("ERR The `numids` parameter must match the number of arguments".to_string());
+            }
+            if numids < remaining {
+                return Err("syntax error".to_string());
+            }
+            let mut ids = Vec::with_capacity(numids);
+            for arg in &args[i..] {
+                let s = std::str::from_utf8(arg)
+                    .map_err(|_| "Invalid stream ID specified as stream command argument")?;
+                let id = crate::table::StreamId::parse_exact(s).map_err(|e| e.to_string())?;
+                ids.push(id);
+            }
+            Ok(Some(Command::Xackdel { key, group, strategy, ids }))
+        }
+        "XIDMPRECORD" => {
+            if args.len() != 5 {
+                return Err("wrong number of arguments for 'xidmprecord' command".to_string());
+            }
+            let key = args[1].clone();
+            let pid = args[2].clone();
+            let iid = args[3].clone();
+            let id_raw = args[4].clone();
+            Ok(Some(Command::Xidmprecord {
+                key,
+                pid,
+                iid,
+                id_raw,
+            }))
         }
         "XGROUP" => {
             if args.len() < 2 {
@@ -6773,9 +7300,32 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     let group = args[3].clone();
                     let id = String::from_utf8_lossy(&args[4]).to_string();
                     let mut mkstream = false;
-                    for arg in &args[5..] {
-                        if arg.eq_ignore_ascii_case(b"MKSTREAM") {
-                            mkstream = true;
+                    let mut entries_read = None;
+                    let mut i = 5;
+                    while i < args.len() {
+                        let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                        match opt.as_str() {
+                            "MKSTREAM" => {
+                                mkstream = true;
+                                i += 1;
+                            }
+                            "ENTRIESREAD" => {
+                                if i + 1 >= args.len() {
+                                    return Err("syntax error".to_string());
+                                }
+                                let s = std::str::from_utf8(&args[i + 1])
+                                    .map_err(|_| "value is not an integer or out of range".to_string())?;
+                                let er: i64 = s.parse()
+                                    .map_err(|_| "value is not an integer or out of range".to_string())?;
+                                if er < -1 {
+                                    return Err("ERR value for ENTRIESREAD must be positive or -1".to_string());
+                                }
+                                if er >= 0 {
+                                    entries_read = Some(er as u64);
+                                }
+                                i += 2;
+                            }
+                            _ => return Err("syntax error".to_string()),
                         }
                     }
                     Ok(Some(Command::XgroupCreate {
@@ -6783,6 +7333,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         group,
                         id,
                         mkstream,
+                        entries_read,
                     }))
                 }
                 "DESTROY" => {
@@ -6841,9 +7392,15 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             let s = std::str::from_utf8(&args[i + 1]).map_err(|_| {
                                 "value is not an integer or out of range".to_string()
                             })?;
-                            entries_read = Some(s.parse::<u64>().map_err(|_| {
+                            let er: i64 = s.parse().map_err(|_| {
                                 "value is not an integer or out of range".to_string()
-                            })?);
+                            })?;
+                            if er < -1 {
+                                return Err("ERR value for ENTRIESREAD must be positive or -1".to_string());
+                            }
+                            if er >= 0 {
+                                entries_read = Some(er as u64);
+                            }
                             i += 2;
                         } else {
                             return Err("syntax error".to_string());
@@ -6856,25 +7413,48 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         entries_read,
                     }))
                 }
+                "HELP" => {
+                    if args.len() != 2 {
+                        return Err("wrong number of arguments for 'xgroup|help' command".to_string());
+                    }
+                    Ok(Some(Command::XgroupHelp))
+                }
                 _ => Ok(Some(Command::Unknown(format!("XGROUP {}", sub)))),
             }
         }
         "XREADGROUP" => {
-            if args.len() < 6 {
+            if args.len() < 7 {
                 return Err("wrong number of arguments for 'xreadgroup' command".to_string());
             }
-            if !args[1].eq_ignore_ascii_case(b"GROUP") {
-                return Err("syntax error".to_string());
-            }
-            let group = args[2].clone();
-            let consumer = args[3].clone();
+            let mut group = None;
+            let mut consumer = None;
             let mut count = None;
+            let mut maxcount = None;
+            let mut maxsize = None;
             let mut block_ms = None;
             let mut noack = false;
-            let mut i = 4;
+            let mut claim = None;
+            let mut i = 1;
             while i < args.len() {
                 let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
                 match opt.as_str() {
+                    "GROUP" => {
+                        if i + 2 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        group = Some(args[i + 1].clone());
+                        consumer = Some(args[i + 2].clone());
+                        i += 3;
+                    }
+                    "CLAIM" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let s = std::str::from_utf8(&args[i + 1]).map_err(|_| "ERR min-idle-time is not an integer")?;
+                        let min_idle = parse_min_idle_time(s)?;
+                        claim = Some(min_idle);
+                        i += 2;
+                    }
                     "COUNT" => {
                         if i + 1 >= args.len() {
                             return Err("syntax error".to_string());
@@ -6886,15 +7466,46 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         count = Some(c);
                         i += 2;
                     }
-                    "BLOCK" => {
+                    "MAXCOUNT" => {
                         if i + 1 >= args.len() {
                             return Err("syntax error".to_string());
                         }
-                        let b: u64 = std::str::from_utf8(&args[i + 1])
+                        let mc: i64 = std::str::from_utf8(&args[i + 1])
                             .map_err(|_| "value is not an integer or out of range")?
                             .parse()
                             .map_err(|_| "value is not an integer or out of range")?;
-                        block_ms = Some(b);
+                        if mc <= 0 {
+                            return Err("ERR MAXCOUNT must be a positive integer".to_string());
+                        }
+                        maxcount = Some(mc as usize);
+                        i += 2;
+                    }
+                    "MAXSIZE" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        let ms: i64 = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "value is not an integer or out of range")?
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range")?;
+                        if ms <= 0 {
+                            return Err("ERR MAXSIZE must be a positive integer".to_string());
+                        }
+                        maxsize = Some(ms as usize);
+                        i += 2;
+                    }
+                    "BLOCK" => {
+                        if i + 1 >= args.len() || args[i + 1].eq_ignore_ascii_case(b"STREAMS") {
+                            return Err("ERR timeout is not an integer or out of range".to_string());
+                        }
+                        let b_i: i64 = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "ERR timeout is not an integer or out of range".to_string())?
+                            .parse()
+                            .map_err(|_| "ERR timeout is not an integer or out of range".to_string())?;
+                        if b_i < 0 {
+                            return Err("ERR timeout is negative".to_string());
+                        }
+                        block_ms = Some(b_i as u64);
                         i += 2;
                     }
                     "NOACK" => {
@@ -6908,9 +7519,18 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     _ => return Err("syntax error".to_string()),
                 }
             }
+            let (group, consumer) = match (group, consumer) {
+                (Some(g), Some(c)) => (g, c),
+                _ => return Err("syntax error".to_string()),
+            };
+            if let (Some(c), Some(mc)) = (count, maxcount) {
+                if mc < c {
+                    return Err("ERR MAXCOUNT must be greater than or equal to COUNT".to_string());
+                }
+            }
             let rem = args.len() - i;
             if rem < 2 || !rem.is_multiple_of(2) {
-                return Err("ERR Unbalanced XREADGROUP list of streams and IDs".to_string());
+                return Err("ERR Unbalanced 'xreadgroup' list of streams: for each stream key an ID or '>' must be specified.".to_string());
             }
             let n = rem / 2;
             let keys: Vec<Bytes> = args[i..i + n].to_vec();
@@ -6922,10 +7542,136 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 group,
                 consumer,
                 count,
+                maxcount,
+                maxsize,
                 block_ms,
                 noack,
+                claim,
                 keys,
                 ids,
+            }))
+        }
+        "XNACK" => {
+            if args.len() < 7 {
+                return Err("wrong number of arguments for 'xnack' command".to_string());
+            }
+            let key = args[1].clone();
+            let group = args[2].clone();
+            let mut mode = None;
+            let mut ids = None;
+            let mut retrycount = None;
+            let mut force = false;
+
+            let mut i = 3;
+            while i < args.len() {
+                let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+                match opt.as_str() {
+                    "SILENT" => {
+                        if mode.is_some() {
+                            return Err(format!("ERR Unrecognized XNACK option '{}'", opt));
+                        }
+                        mode = Some(XnackMode::Silent);
+                        i += 1;
+                    }
+                    "FAIL" => {
+                        if mode.is_some() {
+                            return Err(format!("ERR Unrecognized XNACK option '{}'", opt));
+                        }
+                        mode = Some(XnackMode::Fail);
+                        i += 1;
+                    }
+                    "FATAL" => {
+                        if mode.is_some() {
+                            return Err(format!("ERR Unrecognized XNACK option '{}'", opt));
+                        }
+                        mode = Some(XnackMode::Fatal);
+                        i += 1;
+                    }
+                    "FORCE" => {
+                        force = true;
+                        i += 1;
+                    }
+                    "RETRYCOUNT" => {
+                        if i + 1 >= args.len() {
+                            if ids.is_none() {
+                                return Err("wrong number of arguments for 'xnack' command".to_string());
+                            } else {
+                                return Err("ERR Unrecognized XNACK option 'RETRYCOUNT'".to_string());
+                            }
+                        }
+                        let s = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "ERR value is not an integer or out of range")?;
+                        if s.starts_with('-') {
+                            if let Ok(rc_i) = s.parse::<i64>() {
+                                if rc_i < 0 {
+                                    return Err("ERR Invalid RETRYCOUNT value, must be >= 0".to_string());
+                                }
+                            }
+                            return Err("ERR value is not an integer or out of range".to_string());
+                        }
+                        match s.parse::<usize>() {
+                            Ok(rc) => {
+                                retrycount = Some(rc);
+                                i += 2;
+                            }
+                            Err(_) => {
+                                return Err("ERR value is not an integer or out of range".to_string());
+                            }
+                        }
+                    }
+                    "IDS" => {
+                        if i + 1 >= args.len() {
+                            return Err("wrong number of arguments for 'xnack' command".to_string());
+                        }
+                        let numids_i: i64 = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "ERR numids must be a positive integer")?
+                            .parse()
+                            .map_err(|_| "ERR numids must be a positive integer")?;
+                        if numids_i <= 0 {
+                            return Err("ERR numids must be a positive integer".to_string());
+                        }
+                        let numids = numids_i as usize;
+                        i += 2;
+                        let remaining = args.len() - i;
+                        if remaining < numids {
+                            return Err("ERR number of IDs doesn't match numids".to_string());
+                        }
+                        let mut parsed_ids = Vec::with_capacity(numids);
+                        for id_arg in &args[i..i + numids] {
+                            let s = std::str::from_utf8(id_arg)
+                                .map_err(|_| "ERR Invalid stream ID specified as stream command argument")?;
+                            let id = crate::table::StreamId::parse_exact(s)
+                                .map_err(|_| "ERR Invalid stream ID specified as stream command argument")?;
+                            parsed_ids.push(id);
+                        }
+                        ids = Some(parsed_ids);
+                        i += numids;
+                    }
+                    _ => {
+                        if mode.is_none() && i == 3 {
+                            return Err("ERR mode must be SILENT, FAIL, or FATAL".to_string());
+                        }
+                        return Err(format!("ERR Unrecognized XNACK option '{}'", String::from_utf8_lossy(&args[i])));
+                    }
+                }
+            }
+
+            let mode = match mode {
+                Some(m) => m,
+                None => return Err("ERR mode must be SILENT, FAIL, or FATAL".to_string()),
+            };
+            let ids = match ids {
+                Some(id_list) => id_list,
+                None => return Err("ERR syntax error, expected IDS keyword".to_string()),
+            };
+
+            Ok(Some(Command::Xnack {
+                key,
+                group,
+                mode,
+                ids,
+                retrycount,
+                force,
             }))
         }
         "XACK" => {
@@ -6957,25 +7703,26 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }))
             } else {
                 let mut start_idx = 3;
+                let mut min_idle = None;
                 if args[start_idx].eq_ignore_ascii_case(b"IDLE") {
+                    if args.len() < start_idx + 2 {
+                        return Err("syntax error".to_string());
+                    }
+                    let idle_ms: u64 = std::str::from_utf8(&args[start_idx + 1])
+                        .map_err(|_| "value is not an integer or out of range")?
+                        .parse()
+                        .map_err(|_| "value is not an integer or out of range")?;
+                    min_idle = Some(idle_ms);
                     start_idx += 2;
                 }
                 if args.len() < start_idx + 3 {
                     return Err("syntax error".to_string());
                 }
                 let start_s = std::str::from_utf8(&args[start_idx]).map_err(|_| "syntax error")?;
-                let start = if start_s == "-" {
-                    crate::table::StreamId::default()
-                } else {
-                    crate::table::StreamId::parse(start_s)?
-                };
+                let start = crate::table::parse_range_bound(start_s, true)?;
                 let end_s =
                     std::str::from_utf8(&args[start_idx + 1]).map_err(|_| "syntax error")?;
-                let end = if end_s == "+" {
-                    crate::table::StreamId::new(u64::MAX, u64::MAX)
-                } else {
-                    crate::table::StreamId::parse(end_s)?
-                };
+                let end = crate::table::parse_range_bound(end_s, false)?;
                 let count: usize = std::str::from_utf8(&args[start_idx + 2])
                     .map_err(|_| "value is not an integer or out of range")?
                     .parse()
@@ -6988,7 +7735,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 Ok(Some(Command::Xpending {
                     key,
                     group,
-                    range: Some((start, end, count, consumer)),
+                    range: Some((start, end, count, consumer, min_idle)),
                 }))
             }
         }
@@ -7512,10 +8259,13 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         if i + 1 >= args.len() {
                             return Err("syntax error".to_string());
                         }
-                        count = std::str::from_utf8(&args[i + 1])
-                            .map_err(|_| "value is not an integer or out of range")?
-                            .parse()
-                            .map_err(|_| "value is not an integer or out of range")?;
+                        let s = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "ERR COUNT must be > 0".to_string())?;
+                        let val: i64 = s.parse().map_err(|_| "ERR COUNT must be > 0".to_string())?;
+                        if val <= 0 || val > i32::MAX as i64 {
+                            return Err("ERR COUNT must be > 0".to_string());
+                        }
+                        count = val as usize;
                         i += 2;
                     }
                     "JUSTID" => {
@@ -7548,7 +8298,30 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         );
                     }
                     let key = args[2].clone();
-                    Ok(Some(Command::Xinfo(XinfoSubcommand::Stream(key))))
+                    if args.len() == 3 {
+                        Ok(Some(Command::Xinfo(XinfoSubcommand::Stream(key))))
+                    } else if args.len() == 4 && args[3].eq_ignore_ascii_case(b"FULL") {
+                        Ok(Some(Command::Xinfo(XinfoSubcommand::StreamFull {
+                            key,
+                            count: None,
+                        })))
+                    } else if args.len() == 6
+                        && args[3].eq_ignore_ascii_case(b"FULL")
+                        && args[4].eq_ignore_ascii_case(b"COUNT")
+                    {
+                        let count_str = std::str::from_utf8(&args[5])
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        let count: i64 = count_str
+                            .parse()
+                            .map_err(|_| "value is not an integer or out of range".to_string())?;
+                        let count = if count < 0 { 10 } else { count as usize };
+                        Ok(Some(Command::Xinfo(XinfoSubcommand::StreamFull {
+                            key,
+                            count: Some(count),
+                        })))
+                    } else {
+                        Err("ERR syntax error".to_string())
+                    }
                 }
                 "GROUPS" => {
                     if args.len() < 3 {
@@ -7572,7 +8345,12 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         group,
                     })))
                 }
-                "HELP" => Ok(Some(Command::Xinfo(XinfoSubcommand::Help))),
+                "HELP" => {
+                    if args.len() != 2 {
+                        return Err("wrong number of arguments for 'xinfo|help' command".to_string());
+                    }
+                    Ok(Some(Command::Xinfo(XinfoSubcommand::Help)))
+                }
                 _ => Ok(Some(Command::Unknown(format!("XINFO {}", sub)))),
             }
         }
@@ -12313,8 +13091,12 @@ mod tests {
                 nomkstream: false,
                 maxlen: None,
                 minid: None,
+                approx: false,
+                trim_strategy: crate::table::StreamTrimStrategy::KeepRef,
+                idmp: None,
                 id: crate::table::StreamAddId::Auto,
                 fields: vec![(Bytes::from_static(b"field1"), Bytes::from_static(b"val1"))],
+                limit: None,
             }
         );
 
@@ -12327,8 +13109,12 @@ mod tests {
                 nomkstream: true,
                 maxlen: Some(1000),
                 minid: None,
+                approx: true,
+                trim_strategy: crate::table::StreamTrimStrategy::KeepRef,
+                idmp: None,
                 id: crate::table::StreamAddId::Explicit(crate::table::StreamId::new(100, 0)),
                 fields: vec![(Bytes::from_static(b"f1"), Bytes::from_static(b"v1"))],
+                limit: None,
             }
         );
 
@@ -12369,6 +13155,8 @@ mod tests {
             parse_command(&mut buf).unwrap().unwrap(),
             Command::Xread {
                 count: Some(2),
+                maxcount: None,
+                maxsize: None,
                 block_ms: None,
                 keys: vec![Bytes::from_static(b"s1"), Bytes::from_static(b"s2")],
                 ids: vec!["0-0".to_string(), "$".to_string()],
@@ -12396,6 +13184,9 @@ mod tests {
                 key: Bytes::from_static(b"s1"),
                 maxlen: Some(50),
                 minid: None,
+                approx: false,
+                trim_strategy: crate::table::StreamTrimStrategy::KeepRef,
+                limit: None,
             }
         );
     }
