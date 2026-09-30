@@ -65,6 +65,11 @@ CORE_SUITES=(
     "unit/protocol"
     "unit/other"
     "unit/hyperloglog"
+    "unit/sort"
+    "unit/geo"
+    "unit/auth"
+    "unit/printver"
+    "unit/limits"
 )
 
 if [ "$SUITE_ARG" = "all-types" ] || [ "$SUITE_ARG" = "all" ]; then
