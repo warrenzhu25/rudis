@@ -2765,6 +2765,9 @@ impl RudisTable {
             let freed = removed.key.len() + removed.val.approx_bytes() + 64;
             self.used_memory = self.used_memory.saturating_sub(freed);
             inc_expired_keys();
+            if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::connection::touch_watched_key_any_port(removed.key.as_ref());
+            }
         }
     }
 
@@ -3052,10 +3055,13 @@ impl RudisTable {
         }
         let (neg, s) = match bytes[0] {
             b'-' => (true, &bytes[1..]),
-            b'+' => (false, &bytes[1..]),
+            b'+' => return None,
             _ => (false, bytes),
         };
         if s.is_empty() {
+            return None;
+        }
+        if s.len() > 1 && s[0] == b'0' {
             return None;
         }
         let mut val: u64 = 0;
@@ -3066,6 +3072,9 @@ impl RudisTable {
             val = val.checked_mul(10)?.checked_add((b - b'0') as u64)?;
         }
         if neg {
+            if val == 0 {
+                return None;
+            }
             if val > (i64::MIN.unsigned_abs()) {
                 return None;
             }
@@ -12970,6 +12979,22 @@ impl RudisTable {
         replace: bool,
         absttl: bool,
     ) -> Result<(), &'static str> {
+        if self.exists(&key) && !replace {
+            return Err("BUSYKEY Target key name already exists.");
+        }
+
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        if ttl_ms > i64::MAX as u64 {
+            return Err("ERR invalid expire time in 'restore' command");
+        }
+        if !absttl && ttl_ms > 0 && ttl_ms > (i64::MAX as u64).saturating_sub(now_unix) {
+            return Err("ERR invalid expire time in 'restore' command");
+        }
+
         if serialized.len() < 10 {
             return Err("DUMP payload version or checksum are wrong");
         }
@@ -12979,9 +13004,11 @@ impl RudisTable {
                 .try_into()
                 .map_err(|_| "DUMP payload version or checksum are wrong")?,
         );
-        let actual_crc = crc64(&serialized[..data_len]);
-        if expected_crc != actual_crc {
-            return Err("DUMP payload version or checksum are wrong");
+        if expected_crc != 0 {
+            let actual_crc = crc64(&serialized[..data_len]);
+            if expected_crc != actual_crc {
+                return Err("DUMP payload version or checksum are wrong");
+            }
         }
 
         let rdb_ver = u16::from_le_bytes(
@@ -12993,15 +13020,13 @@ impl RudisTable {
             return Err("DUMP payload version or checksum are wrong");
         }
 
+        let payload_len = data_len - 2;
+        let (decoded_value, _) = Self::deserialize_val_payload(&serialized[..payload_len])
+            .map_err(|_| "ERR Bad data format")?;
+
         if self.exists(&key) {
-            if !replace {
-                return Err("BUSYKEY Target key name already exists.");
-            }
             self.del(&key);
         }
-
-        let payload_len = data_len - 2;
-        let (decoded_value, _) = Self::deserialize_val_payload(&serialized[..payload_len])?;
 
         let expire_at = if ttl_ms == 0 {
             None
@@ -16076,7 +16101,9 @@ mod tests {
         assert_eq!(RudisTable::parse_i64_bytes(b"0"), Some(0));
         assert_eq!(RudisTable::parse_i64_bytes(b"12345"), Some(12345));
         assert_eq!(RudisTable::parse_i64_bytes(b"-9876"), Some(-9876));
-        assert_eq!(RudisTable::parse_i64_bytes(b"+42"), Some(42));
+        assert_eq!(RudisTable::parse_i64_bytes(b"+42"), None);
+        assert_eq!(RudisTable::parse_i64_bytes(b"0123"), None);
+        assert_eq!(RudisTable::parse_i64_bytes(b"-0"), None);
         assert_eq!(
             RudisTable::parse_i64_bytes(b"9223372036854775807"),
             Some(i64::MAX)

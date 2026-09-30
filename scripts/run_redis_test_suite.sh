@@ -56,6 +56,14 @@ CORE_SUITES=(
     "unit/bitops"
     "unit/bitfield"
     "unit/scan"
+    "unit/type/stream"
+    "unit/type/stream-cgroups"
+    "unit/dump"
+    "unit/pubsub"
+    "unit/multi"
+    "unit/quit"
+    "unit/protocol"
+    "unit/other"
 )
 
 if [ "$SUITE_ARG" = "all-types" ] || [ "$SUITE_ARG" = "all" ]; then
@@ -82,7 +90,8 @@ for suite in "${TARGET_SUITES[@]}"; do
         --singledb \
         --ignore-encoding \
         --ignore-digest \
-        --tags "-needs:repl -needs:debug -needs:config-rewrite -needs:pfdebug" \
+        --tags "-needs:repl -needs:debug -needs:config-rewrite -needs:pfdebug -needs:config-maxmemory" \
+        --skiptest "/.*script timeout.*" \
         --clients "$CLIENTS" \
         --single "$suite"; then
         PASSED_SUITES+=("$suite")

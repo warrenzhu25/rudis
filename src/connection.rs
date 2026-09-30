@@ -37,6 +37,7 @@ pub struct ClientInfo {
     pub track_tx: Option<flume::Sender<Vec<u8>>>,
     pub raw_fd: std::os::unix::io::RawFd,
     pub omem: usize,
+    pub reply_mode: crate::resp::ClientReplyMode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -639,6 +640,22 @@ pub fn touch_watched_key(port: u16, key: &[u8]) {
     }
 }
 
+#[inline(always)]
+pub fn touch_watched_key_any_port(key: &[u8]) {
+    if !HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let map = WATCHED_KEYS.read().unwrap();
+    let mut tainted = CLIENT_WATCH_TAINTED.write().unwrap();
+    for (&port, port_map) in map.iter() {
+        if let Some(clients) = port_map.get(key) {
+            for &cid in clients {
+                tainted.insert((port, cid), true);
+            }
+        }
+    }
+}
+
 static TRACKING_CLIENTS: std::sync::LazyLock<
     std::sync::RwLock<hashbrown::HashMap<(u16, u64), ClientTracker>>,
 > = std::sync::LazyLock::new(|| std::sync::RwLock::new(hashbrown::HashMap::new()));
@@ -1175,6 +1192,7 @@ pub async fn handle_tls_connection(
             track_tx: None,
             raw_fd,
             omem: 0,
+            reply_mode: crate::resp::ClientReplyMode::On,
         },
     );
 
@@ -1451,6 +1469,18 @@ async fn execute_tx_step(
                 out_buf.extend_from_slice(b"+OK\r\n");
                 true
             }
+            Command::Save | Command::Bgsave | Command::Shutdown { .. } => {
+                *tx_has_error = true;
+                out_buf.extend_from_slice(b"-ERR Command not allowed inside a transaction\r\n");
+                false
+            }
+            Command::Unknown(cmd_name) => {
+                *tx_has_error = true;
+                out_buf.extend_from_slice(
+                    format!("-ERR unknown command '{}'\r\n", cmd_name).as_bytes(),
+                );
+                false
+            }
             _ => {
                 tx_queue.push(cmd);
                 out_buf.extend_from_slice(b"+QUEUED\r\n");
@@ -1535,6 +1565,7 @@ pub async fn handle_connection(
             track_tx: Some(track_tx),
             raw_fd,
             omem: 0,
+            reply_mode: crate::resp::ClientReplyMode::On,
         },
     );
 
@@ -1652,10 +1683,15 @@ pub async fn handle_connection(
                 while !buf.is_empty() {
                     match parse_command(&mut buf) {
                         Ok(Some(cmd)) => {
+                            let is_quit = matches!(cmd, Command::Quit);
                             if !has_special && is_special_pipeline_cmd(&cmd) {
                                 has_special = true;
                             }
                             commands.push(cmd);
+                            if is_quit {
+                                buf.clear();
+                                break;
+                            }
                         }
                         Ok(None) => {
                             // Incomplete frame: check if remaining bytes just arrived in kernel buffer
@@ -2395,17 +2431,37 @@ async fn run_pubsub_loop(
                 false
             }
             Command::Ping(msg) => {
-                match msg {
-                    Some(m) => {
-                        out.extend_from_slice(
-                            format!("*2\r\n$4\r\npong\r\n${}\r\n", m.len()).as_bytes(),
-                        );
-                        out.extend_from_slice(&m);
-                        out.extend_from_slice(b"\r\n");
+                if is_resp3 {
+                    match msg {
+                        Some(m) => {
+                            write_resp_bulk(out, &m);
+                        }
+                        None => {
+                            out.extend_from_slice(b"+PONG\r\n");
+                        }
                     }
-                    None => {
-                        out.extend_from_slice(b"*2\r\n$4\r\npong\r\n$0\r\n\r\n");
+                } else {
+                    match msg {
+                        Some(m) => {
+                            out.extend_from_slice(
+                                format!("*2\r\n$4\r\npong\r\n${}\r\n", m.len()).as_bytes(),
+                            );
+                            out.extend_from_slice(&m);
+                            out.extend_from_slice(b"\r\n");
+                        }
+                        None => {
+                            out.extend_from_slice(b"*2\r\n$4\r\npong\r\n$0\r\n\r\n");
+                        }
                     }
+                }
+                false
+            }
+            Command::Client(ClientSubcommand::Reply(mode)) => {
+                if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                    c.reply_mode = mode;
+                }
+                if mode == crate::resp::ClientReplyMode::On {
+                    out.extend_from_slice(b"+OK\r\n");
                 }
                 false
             }
@@ -3940,6 +3996,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
             ClientSubcommand::Unpause => "client|unpause",
             ClientSubcommand::NoTouch(_) => "client|no-touch",
             ClientSubcommand::SetInfo { .. } => "client|setinfo",
+            ClientSubcommand::Reply(_) => "client|reply",
         },
         Command::Asking => "ASKING",
         Command::Migrate { .. } => "MIGRATE",
@@ -5260,10 +5317,6 @@ async fn execute_command(
                     && !crate::replication::has_connected_replicas(router.port)
                 {
                     router.set(key.clone(), value, expire_in).await;
-                    notify_keyspace_event_sync(router, NOTIFY_STRING, "set", key.as_ref());
-                    if expire_in.is_some() {
-                        notify_keyspace_event_sync(router, NOTIFY_GENERIC, "expire", key.as_ref());
-                    }
                     out.extend_from_slice(b"+OK\r\n");
                 } else {
                     let resp = router
@@ -5569,6 +5622,12 @@ async fn execute_command(
         } => {
             let res = router.expire(key.clone(), duration, opts).await;
             if res {
+                if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                    touch_watched_key(router.port, key.as_ref());
+                }
+                if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                    notify_key_invalidation(router.port, key.as_ref(), client_id);
+                }
                 notify_keyspace_event_sync(router, NOTIFY_GENERIC, "expire", key.as_ref());
                 if let Some(bytes) = crate::aof::command_to_resp(&Command::Expire {
                     key: key.clone(),
@@ -5586,6 +5645,12 @@ async fn execute_command(
         Command::Persist(key) => {
             let res = router.persist(key.clone()).await;
             if res {
+                if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                    touch_watched_key(router.port, key.as_ref());
+                }
+                if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                    notify_key_invalidation(router.port, key.as_ref(), client_id);
+                }
                 notify_keyspace_event_sync(router, NOTIFY_GENERIC, "persist", key.as_ref());
                 if let Some(bytes) = crate::aof::command_to_resp(&Command::Persist(key)) {
                     crate::replication::propagate_bytes(router.port, &bytes);
@@ -5820,7 +5885,7 @@ async fn execute_command(
             let slowlog_max_us = crate::slowlog::SLOWLOG_COMMANDS_TIME_US_MAX
                 .load(std::sync::atomic::Ordering::Relaxed);
             let stats_str = format!(
-                "# Stats\r\ntotal_connections_received:0\r\ntotal_commands_processed:0\r\ninstantaneous_ops_per_sec:0\r\ntotal_net_input_bytes:0\r\ntotal_net_output_bytes:0\r\ninstantaneous_input_kbps:0.00\r\ninstantaneous_output_kbps:0.00\r\nrejected_connections:0\r\nsync_full:0\r\nsync_partial_ok:0\r\nsync_partial_err:0\r\nexpired_keys:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nkeyspace_hits:0\r\nkeyspace_misses:0\r\npubsub_channels:0\r\npubsub_patterns:0\r\nlatest_fork_usec:0\r\ntotal_error_replies:{}\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\n",
+                "# Stats\r\ntotal_connections_received:0\r\ntotal_commands_processed:0\r\ninstantaneous_ops_per_sec:0\r\ntotal_net_input_bytes:0\r\ntotal_net_output_bytes:0\r\ninstantaneous_input_kbps:0.00\r\ninstantaneous_output_kbps:0.00\r\nrejected_connections:0\r\nsync_full:0\r\nsync_partial_ok:0\r\nsync_partial_err:0\r\nexpired_keys:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nkeyspace_hits:0\r\nkeyspace_misses:0\r\npubsub_channels:0\r\npubsub_patterns:0\r\nlatest_fork_usec:0\r\ntotal_error_replies:{}\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\nmigrate_cached_sockets:0\r\n",
                 crate::table::get_expired_keys(),
                 crate::table::get_expired_keys_active(),
                 crate::table::get_evicted_keys(),
@@ -6404,7 +6469,9 @@ async fn execute_command(
                     crate::tiering::set_max_memory(router.port, bytes);
                     out.extend_from_slice(b"+OK\r\n");
                 } else {
-                    out.extend_from_slice(b"-ERR Invalid argument for CONFIG SET maxmemory\r\n");
+                    out.extend_from_slice(
+                        b"-ERR CONFIG SET failed (Invalid argument for 'maxmemory')\r\n",
+                    );
                 }
             } else if p_str == "tiered-offload-threshold" {
                 if let Ok(pct) = val_str.parse::<u64>() {
@@ -7061,6 +7128,14 @@ async fn execute_command(
                 | ClientSubcommand::Unpause
                 | ClientSubcommand::NoTouch(_) => {
                     out.extend_from_slice(b"+OK\r\n");
+                }
+                ClientSubcommand::Reply(mode) => {
+                    if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                        c.reply_mode = mode;
+                    }
+                    if mode == crate::resp::ClientReplyMode::On {
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
                 }
             }
             false
@@ -9924,6 +9999,19 @@ async fn execute_command(
             false
         }
         Command::Flushdb | Command::Flushall => {
+            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                let watched_keys_for_port: Vec<Bytes> = {
+                    let map = WATCHED_KEYS.read().unwrap();
+                    map.get(&router.port)
+                        .map(|m| m.keys().cloned().collect())
+                        .unwrap_or_default()
+                };
+                for k in watched_keys_for_port {
+                    if router.exists(k.clone()).await {
+                        touch_watched_key(router.port, k.as_ref());
+                    }
+                }
+            }
             router.flushdb().await;
             out.extend_from_slice(b"+OK\r\n");
             false
@@ -11594,6 +11682,7 @@ async fn execute_command(
         }
         Command::Object(crate::resp::ObjectSubcommand::Help) => {
             let help_items = [
+                "OBJECT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
                 "ENCODING <key> -- Return the kind of internal representation used in the object stored at <key>.",
                 "FREQ <key> -- Return the logarithmic access frequency counter of the object stored at <key>.",
                 "IDLETIME <key> -- Return the idle time of the object stored at <key>, in seconds.",
@@ -11711,6 +11800,18 @@ async fn execute_command(
             true
         }
         Command::Unknown(cmd_name) => {
+            if let Some(cmd_prefix) = cmd_name.strip_suffix(" HELP") {
+                let first_line = format!("{} <subcommand> [<arg> [value] [opt] ...]. Subcommands are:", cmd_prefix);
+                let help_lines = [
+                    first_line.as_str(),
+                    "HELP -- Print this help.",
+                ];
+                write_resp_array_header(out, help_lines.len());
+                for line in help_lines {
+                    write_resp_bulk(out, line.as_bytes());
+                }
+                return false;
+            }
             let resp = format!("-ERR unknown command '{}'\r\n", cmd_name);
             out.extend_from_slice(resp.as_bytes());
             false
@@ -12670,6 +12771,12 @@ pub fn execute_local_command(
             let res = db.expire(key, *duration, *opts);
             if res {
                 record_change!(cmd);
+                if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                    touch_watched_key(db.port, key.as_ref());
+                }
+                if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                    notify_key_invalidation(db.port, key.as_ref(), 0);
+                }
                 notify_keyspace_event(NOTIFY_GENERIC, "expire", key);
                 out.extend_from_slice(b":1\r\n");
             } else {
@@ -12681,6 +12788,12 @@ pub fn execute_local_command(
             let res = db.persist(key);
             if res {
                 record_change!(cmd);
+                if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                    touch_watched_key(db.port, key.as_ref());
+                }
+                if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                    notify_key_invalidation(db.port, key.as_ref(), 0);
+                }
                 notify_keyspace_event(NOTIFY_GENERIC, "persist", key);
                 out.extend_from_slice(b":1\r\n");
             } else {
@@ -13840,6 +13953,7 @@ pub fn execute_local_command(
                 }
                 crate::resp::ObjectSubcommand::Help => {
                     let help_items = [
+                        "OBJECT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
                         "ENCODING <key> -- Return the kind of internal representation used in the object stored at <key>.",
                         "FREQ <key> -- Return the logarithmic access frequency counter of the object stored at <key>.",
                         "IDLETIME <key> -- Return the idle time of the object stored at <key>, in seconds.",
@@ -14249,6 +14363,19 @@ pub fn execute_local_command(
             false
         }
         Command::Flushdb | Command::Flushall => {
+            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                let watched_keys_for_port: Vec<Bytes> = {
+                    let map = WATCHED_KEYS.read().unwrap();
+                    map.get(&db.port)
+                        .map(|m| m.keys().cloned().collect())
+                        .unwrap_or_default()
+                };
+                for k in watched_keys_for_port {
+                    if db.exists(k.as_ref()) {
+                        touch_watched_key(db.port, k.as_ref());
+                    }
+                }
+            }
             db.flushdb();
             record_change!(cmd);
             crate::block::get_block_hub_for_port(db.port).lock().unwrap().notify_all_streams();
@@ -14672,7 +14799,7 @@ pub fn execute_local_command(
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 Err(err) => {
-                    if err.starts_with("BUSYKEY") {
+                    if err.starts_with("BUSYKEY") || err.starts_with("ERR") {
                         out.extend_from_slice(format!("-{}\r\n", err).as_bytes());
                     } else {
                         write_resp_err(out, err);
@@ -18218,6 +18345,7 @@ fn is_special_pipeline_cmd(cmd: &Command) -> bool {
             | Command::MemcachedStats
             | Command::MemcachedVersion
             | Command::MemcachedQuit
+            | Command::Quit
             | Command::Wait { .. }
             | Command::WaitAof { .. }
     )

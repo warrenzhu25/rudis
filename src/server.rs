@@ -529,28 +529,42 @@ pub fn run_shard_worker(
                         responder,
                     } => {
                         let res = cross_shard_db.borrow_mut().expire(&key, duration, opts);
-                        if res
-                            && let Some(aof) = &cross_shard_aof
-                            && let Some(bytes) = crate::aof::command_to_resp(
-                                &crate::resp::Command::Expire {
-                                    key,
-                                    duration,
-                                    opts,
-                                },
-                            ) {
-                            aof.borrow_mut().append(&bytes);
+                        if res {
+                            if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
+                            }
+                            if crate::connection::HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                crate::connection::notify_key_invalidation(cross_shard_router.port, key.as_ref(), 0);
+                            }
+                            if let Some(aof) = &cross_shard_aof
+                                && let Some(bytes) = crate::aof::command_to_resp(
+                                    &crate::resp::Command::Expire {
+                                        key,
+                                        duration,
+                                        opts,
+                                    },
+                                ) {
+                                aof.borrow_mut().append(&bytes);
+                            }
                         }
                         let _ = responder.send(res);
                     }
                     ShardMessage::Persist { key, responder } => {
                         let res = cross_shard_db.borrow_mut().persist(&key);
-                        if res
-                            && let Some(aof) = &cross_shard_aof
+                        if res {
+                            if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                                crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
+                            }
+                            if crate::connection::HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                crate::connection::notify_key_invalidation(cross_shard_router.port, key.as_ref(), 0);
+                            }
+                            if let Some(aof) = &cross_shard_aof
                                 && let Some(bytes) =
                                     crate::aof::command_to_resp(&crate::resp::Command::Persist(key))
                                 {
                                     aof.borrow_mut().append(&bytes);
                                 }
+                        }
                         let _ = responder.send(res);
                     }
                     ShardMessage::Ttl {

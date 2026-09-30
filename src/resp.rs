@@ -178,6 +178,14 @@ pub enum ClientSubcommand {
         attr: String,
         val: String,
     },
+    Reply(ClientReplyMode),
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ClientReplyMode {
+    On,
+    Off,
+    Skip,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -3672,6 +3680,21 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     let opt = String::from_utf8_lossy(&args[2]).to_uppercase();
                     let enabled = opt == "ON" || opt == "YES" || opt == "1";
                     Ok(Some(Command::Client(ClientSubcommand::NoTouch(enabled))))
+                }
+                "REPLY" => {
+                    if args.len() < 3 {
+                        return Err(
+                            "wrong number of arguments for 'client reply' command".to_string()
+                        );
+                    }
+                    let mode_str = String::from_utf8_lossy(&args[2]).to_uppercase();
+                    let mode = match mode_str.as_str() {
+                        "ON" => ClientReplyMode::On,
+                        "OFF" => ClientReplyMode::Off,
+                        "SKIP" => ClientReplyMode::Skip,
+                        _ => return Err("syntax error, try CLIENT REPLY ON|OFF|SKIP".to_string()),
+                    };
+                    Ok(Some(Command::Client(ClientSubcommand::Reply(mode))))
                 }
                 _ => Ok(Some(Command::Unknown(format!("CLIENT {}", sub)))),
             }
