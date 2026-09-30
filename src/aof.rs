@@ -1317,12 +1317,23 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             alpha,
             store: Some(dest),
             limit,
+            by,
+            get,
+            readonly: _,
         } => {
             let mut args: Vec<Vec<u8>> = vec![b"SORT".to_vec(), key.to_vec()];
+            if let Some(by_pat) = by {
+                args.push(b"BY".to_vec());
+                args.push(by_pat.to_vec());
+            }
             if let Some((offset, count)) = limit {
                 args.push(b"LIMIT".to_vec());
                 args.push(offset.to_string().into_bytes());
                 args.push(count.to_string().into_bytes());
+            }
+            for get_pat in get {
+                args.push(b"GET".to_vec());
+                args.push(get_pat.to_vec());
             }
             if *desc {
                 args.push(b"DESC".to_vec());

@@ -4332,8 +4332,39 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Xautoclaim { .. } => "XAUTOCLAIM",
         Command::Xackdel { .. } => "XACKDEL",
         Command::Xnack { .. } => "XNACK",
-        Command::CommandCount | Command::CommandList => "COMMAND",
+        Command::CommandCount | Command::CommandList | Command::CommandGetkeys(_) => "COMMAND",
         Command::Unknown(_) => "UNKNOWN",
+    }
+}
+
+pub fn pattern_subst_and_field(pattern: &[u8], item: &[u8]) -> (Bytes, Option<Bytes>) {
+    let mut arrow_pos = None;
+    if let Some(star_pos) = pattern.iter().position(|&b| b == b'*') {
+        if let Some(arrow_rel) = pattern[star_pos..].windows(2).position(|w| w == b"->") {
+            let actual_arrow = star_pos + arrow_rel;
+            if actual_arrow + 2 < pattern.len() {
+                arrow_pos = Some(actual_arrow);
+            }
+        }
+    } else if let Some(arrow) = pattern.windows(2).position(|w| w == b"->") {
+        if arrow + 2 < pattern.len() {
+            arrow_pos = Some(arrow);
+        }
+    }
+
+    let (key_pat, field) = match arrow_pos {
+        Some(pos) => (&pattern[..pos], Some(Bytes::copy_from_slice(&pattern[pos + 2..]))),
+        None => (pattern, None),
+    };
+
+    if let Some(star_idx) = key_pat.iter().position(|&b| b == b'*') {
+        let mut key_buf = Vec::with_capacity(key_pat.len() + item.len());
+        key_buf.extend_from_slice(&key_pat[..star_idx]);
+        key_buf.extend_from_slice(item);
+        key_buf.extend_from_slice(&key_pat[star_idx + 1..]);
+        (Bytes::from(key_buf), field)
+    } else {
+        (Bytes::copy_from_slice(key_pat), field)
     }
 }
 
@@ -8150,28 +8181,220 @@ async fn execute_command(
             false
         }
         Command::Sort {
-            ref key, ref store, ..
+            ref key,
+            desc,
+            alpha,
+            ref store,
+            limit,
+            ref by,
+            ref get,
+            readonly: _,
         } => {
-            let s_target = router.target_shard(key);
-            if let Some(dest) = store {
-                let d_target = router.target_shard(dest);
-                if s_target != d_target {
-                    out.extend_from_slice(
-                        b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
-                    );
-                    return false;
+            // 1. Cluster checks
+            if router.cluster_enabled {
+                let key_slot = crate::router::key_slot(key);
+                if let Some(dest) = store {
+                    if key_slot != crate::router::key_slot(dest) {
+                        out.extend_from_slice(
+                            b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                        );
+                        return false;
+                    }
+                }
+                if let Some(by_pat) = by {
+                    if by_pat.contains(&b'*') {
+                        let by_slot = crate::router::pattern_hash_slot(by_pat);
+                        if by_slot != Some(key_slot) {
+                            out.extend_from_slice(
+                                b"-ERR BY option of SORT denied in Cluster mode when keys formed by the pattern may be in different slots.\r\n",
+                            );
+                            return false;
+                        }
+                    }
+                }
+                for get_pat in get {
+                    if get_pat.as_ref() != b"#" && get_pat.contains(&b'*') {
+                        let get_slot = crate::router::pattern_hash_slot(get_pat);
+                        if get_slot != Some(key_slot) {
+                            out.extend_from_slice(
+                                b"-ERR GET option of SORT denied in Cluster mode when keys formed by the pattern may be in different slots.\r\n",
+                            );
+                            return false;
+                        }
+                    }
                 }
             }
-            if s_target == router.shard_id {
-                execute_local_command(
-                    &cmd,
-                    &mut router.local_db.borrow_mut(),
-                    out,
-                    router.aof.as_deref(),
-                );
+
+            // 2. Fetch collection elements
+            let (key_type, mut items) = match router.get_collection_for_sort(key).await {
+                Ok(res) => res,
+                Err(err) => {
+                    write_resp_err(out, err);
+                    return false;
+                }
+            };
+
+            // 3. Determine sorting mode
+            let mut by_pattern = by.clone();
+            let mut sort_alpha = alpha;
+            let mut dontsort = match &by_pattern {
+                Some(p) => !p.contains(&b'*'),
+                None => false,
+            };
+
+            if dontsort && key_type == "set" && store.is_some() {
+                dontsort = false;
+                sort_alpha = true;
+                by_pattern = None;
+            }
+
+            // 4. Perform sorting if not dontsort
+            if !dontsort {
+                let mut sort_items = Vec::with_capacity(items.len());
+                let mut int_conversion_error = false;
+
+                for item in items {
+                    let by_val: Option<Bytes> = if let Some(ref pat) = by_pattern {
+                        let (lookup_key, field_opt) = pattern_subst_and_field(pat, &item);
+                        if let Some(field) = field_opt {
+                            router.hget(lookup_key, field).await
+                        } else {
+                            router.get(lookup_key).await
+                        }
+                    } else {
+                        Some(item.clone())
+                    };
+
+                    if sort_alpha {
+                        sort_items.push((0.0f64, by_val, item));
+                    } else {
+                        let score = match by_val {
+                            Some(ref s_bytes) => {
+                                match std::str::from_utf8(s_bytes.as_ref())
+                                    .ok()
+                                    .and_then(|s| s.parse::<f64>().ok())
+                                {
+                                    Some(val) if !val.is_nan() => val,
+                                    _ => {
+                                        int_conversion_error = true;
+                                        0.0
+                                    }
+                                }
+                            }
+                            None => 0.0,
+                        };
+                        sort_items.push((score, None, item));
+                    }
+                }
+
+                if int_conversion_error {
+                    write_resp_err(out, "One or more scores can't be converted into double");
+                    return false;
+                }
+
+                if sort_alpha {
+                    sort_items.sort_by(|a, b| {
+                        let cmp = match (&a.1, &b.1) {
+                            (Some(v1), Some(v2)) => v1.cmp(v2),
+                            (None, Some(_)) => std::cmp::Ordering::Less,
+                            (Some(_), None) => std::cmp::Ordering::Greater,
+                            (None, None) => std::cmp::Ordering::Equal,
+                        };
+                        let cmp = if cmp == std::cmp::Ordering::Equal {
+                            a.2.cmp(&b.2)
+                        } else {
+                            cmp
+                        };
+                        if desc {
+                            cmp.reverse()
+                        } else {
+                            cmp
+                        }
+                    });
+                } else {
+                    sort_items.sort_by(|a, b| {
+                        let cmp = a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal);
+                        let cmp = if cmp == std::cmp::Ordering::Equal {
+                            a.2.cmp(&b.2)
+                        } else {
+                            cmp
+                        };
+                        if desc {
+                            cmp.reverse()
+                        } else {
+                            cmp
+                        }
+                    });
+                }
+
+                items = sort_items.into_iter().map(|(_, _, item)| item).collect();
+            } else if desc {
+                items.reverse();
+            }
+
+            // 5. Apply LIMIT
+            let (start, count) = match limit {
+                Some((offset, count)) => {
+                    let start = offset.max(0) as usize;
+                    let count = if count < 0 { items.len() } else { count as usize };
+                    (start, count)
+                }
+                None => (0, items.len()),
+            };
+
+            let sliced_items: Vec<Bytes> = if start >= items.len() {
+                Vec::new()
             } else {
-                let res = router.execute_remote(s_target, cmd).await;
-                out.extend_from_slice(&res);
+                items.into_iter().skip(start).take(count).collect()
+            };
+
+            // 6. Perform GET operations
+            let mut results: Vec<Option<Bytes>> = Vec::new();
+            if get.is_empty() {
+                for item in sliced_items {
+                    results.push(Some(item));
+                }
+            } else {
+                for item in sliced_items {
+                    for get_pat in get {
+                        if get_pat.as_ref() == b"#" {
+                            results.push(Some(item.clone()));
+                        } else {
+                            let (lookup_key, field_opt) = pattern_subst_and_field(get_pat, &item);
+                            let val = if let Some(field) = field_opt {
+                                router.hget(lookup_key, field).await
+                            } else {
+                                router.get(lookup_key).await
+                            };
+                            results.push(val);
+                        }
+                    }
+                }
+            }
+
+            // 7. STORE or deliver to client
+            if let Some(dest) = store {
+                if results.is_empty() {
+                    router.del(dest.clone()).await;
+                    out.extend_from_slice(b":0\r\n");
+                } else {
+                    let count = results.len();
+                    let list_items: Vec<Bytes> = results
+                        .into_iter()
+                        .map(|opt| opt.unwrap_or_else(|| Bytes::from_static(b"")))
+                        .collect();
+                    router.del(dest.clone()).await;
+                    router.rpush(dest.clone(), list_items).await;
+                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                }
+            } else {
+                out.extend_from_slice(format!("*{}\r\n", results.len()).as_bytes());
+                for res in results {
+                    match res {
+                        Some(b) => write_resp_bulk(out, &b),
+                        None => write_resp_null(out),
+                    }
+                }
             }
             false
         }
@@ -10900,6 +11123,16 @@ async fn execute_command(
             false
         }
         Command::Eval { script, keys, args } => {
+            if let Some(first_key) = keys.first() {
+                let target = router.target_shard(first_key);
+                if target != router.shard_id {
+                    let res = router
+                        .execute_remote(target, Command::Eval { script, keys, args })
+                        .await;
+                    out.extend_from_slice(&res);
+                    return false;
+                }
+            }
             let script_str = String::from_utf8_lossy(&script);
             crate::scripting::load_script(&script);
             match crate::scripting::eval_script(
@@ -10918,6 +11151,16 @@ async fn execute_command(
             false
         }
         Command::Evalsha { sha, keys, args } => {
+            if let Some(first_key) = keys.first() {
+                let target = router.target_shard(first_key);
+                if target != router.shard_id {
+                    let res = router
+                        .execute_remote(target, Command::Evalsha { sha, keys, args })
+                        .await;
+                    out.extend_from_slice(&res);
+                    return false;
+                }
+            }
             let sha_str = String::from_utf8_lossy(&sha);
             if let Some(script) = crate::scripting::get_script(&sha_str) {
                 match crate::scripting::eval_script(
@@ -11886,6 +12129,28 @@ async fn execute_command(
             write_resp_array_header(out, cmd_names.len());
             for name in cmd_names {
                 write_resp_bulk(out, name.as_bytes());
+            }
+            false
+        }
+        Command::CommandGetkeys(ref cmd_args) => {
+            if cmd_args.is_empty() {
+                out.extend_from_slice(b"*0\r\n");
+            } else {
+                match crate::resp::build_command(cmd_args.clone()) {
+                    Ok(Some(inner_cmd)) => {
+                        let mut keys = Vec::new();
+                        for_each_cmd_key(&inner_cmd, |k| keys.push(Bytes::copy_from_slice(k)));
+                        out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
+                        for k in keys {
+                            write_resp_bulk(out, &k);
+                        }
+                    }
+                    _ => {
+                        out.extend_from_slice(
+                            b"-ERR The command has no key arguments or syntax error\r\n",
+                        );
+                    }
+                }
             }
             false
         }
@@ -14399,6 +14664,28 @@ pub fn execute_local_command(
             }
             false
         }
+        Command::CommandGetkeys(cmd_args) => {
+            if cmd_args.is_empty() {
+                out.extend_from_slice(b"*0\r\n");
+            } else {
+                match crate::resp::build_command(cmd_args.clone()) {
+                    Ok(Some(inner_cmd)) => {
+                        let mut keys = Vec::new();
+                        for_each_cmd_key(&inner_cmd, |k| keys.push(Bytes::copy_from_slice(k)));
+                        out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
+                        for k in keys {
+                            write_resp_bulk(out, &k);
+                        }
+                    }
+                    _ => {
+                        out.extend_from_slice(
+                            b"-ERR The command has no key arguments or syntax error\r\n",
+                        );
+                    }
+                }
+            }
+            false
+        }
         Command::Dbsize => {
             let n = db.dbsize();
             out.extend_from_slice(format!(":{}\r\n", n).as_bytes());
@@ -16098,6 +16385,9 @@ pub fn execute_local_command(
             alpha,
             store,
             limit,
+            by,
+            get,
+            readonly: _,
         } => {
             let t = db.type_of(key);
             let mut items: Vec<Bytes> = match t {
@@ -16124,65 +16414,163 @@ pub fn execute_local_command(
                 }
             };
 
-            if *alpha {
-                items.sort();
-            } else {
-                let mut float_items = Vec::with_capacity(items.len());
-                for item in &items {
-                    let s = match std::str::from_utf8(item) {
-                        Ok(s) => s,
-                        Err(_) => {
-                            write_resp_err(
-                                out,
-                                "ERR One or more scores can't be converted into double",
-                            );
-                            return false;
-                        }
-                    };
-                    let val: f64 = match s.parse() {
-                        Ok(v) => v,
-                        Err(_) => {
-                            write_resp_err(
-                                out,
-                                "ERR One or more scores can't be converted into double",
-                            );
-                            return false;
-                        }
-                    };
-                    float_items.push((val, item.clone()));
-                }
-                float_items
-                    .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-                items = float_items.into_iter().map(|(_, item)| item).collect();
+            let mut by_pattern = by.clone();
+            let mut sort_alpha = *alpha;
+            let mut dontsort = match &by_pattern {
+                Some(p) => !p.contains(&b'*'),
+                None => false,
+            };
+
+            if dontsort && t == "set" && store.is_some() {
+                dontsort = false;
+                sort_alpha = true;
+                by_pattern = None;
             }
 
-            if *desc {
+            if !dontsort {
+                let mut sort_items = Vec::with_capacity(items.len());
+                let mut int_conversion_error = false;
+
+                for item in items {
+                    let by_val: Option<Bytes> = if let Some(ref pat) = by_pattern {
+                        let (lookup_key, field_opt) = pattern_subst_and_field(pat, &item);
+                        if let Some(field) = field_opt {
+                            db.hget(&lookup_key, &field).ok().flatten()
+                        } else {
+                            db.get(&lookup_key)
+                        }
+                    } else {
+                        Some(item.clone())
+                    };
+
+                    if sort_alpha {
+                        sort_items.push((0.0f64, by_val, item));
+                    } else {
+                        let score = match by_val {
+                            Some(ref s_bytes) => {
+                                match std::str::from_utf8(s_bytes.as_ref())
+                                    .ok()
+                                    .and_then(|s| s.parse::<f64>().ok())
+                                {
+                                    Some(val) if !val.is_nan() => val,
+                                    _ => {
+                                        int_conversion_error = true;
+                                        0.0
+                                    }
+                                }
+                            }
+                            None => 0.0,
+                        };
+                        sort_items.push((score, None, item));
+                    }
+                }
+
+                if int_conversion_error {
+                    write_resp_err(out, "One or more scores can't be converted into double");
+                    return false;
+                }
+
+                if sort_alpha {
+                    sort_items.sort_by(|a, b| {
+                        let cmp = match (&a.1, &b.1) {
+                            (Some(v1), Some(v2)) => v1.cmp(v2),
+                            (None, Some(_)) => std::cmp::Ordering::Less,
+                            (Some(_), None) => std::cmp::Ordering::Greater,
+                            (None, None) => std::cmp::Ordering::Equal,
+                        };
+                        let cmp = if cmp == std::cmp::Ordering::Equal {
+                            a.2.cmp(&b.2)
+                        } else {
+                            cmp
+                        };
+                        if *desc {
+                            cmp.reverse()
+                        } else {
+                            cmp
+                        }
+                    });
+                } else {
+                    sort_items.sort_by(|a, b| {
+                        let cmp = a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal);
+                        let cmp = if cmp == std::cmp::Ordering::Equal {
+                            a.2.cmp(&b.2)
+                        } else {
+                            cmp
+                        };
+                        if *desc {
+                            cmp.reverse()
+                        } else {
+                            cmp
+                        }
+                    });
+                }
+
+                items = sort_items.into_iter().map(|(_, _, item)| item).collect();
+            } else if *desc {
                 items.reverse();
             }
 
-            if let Some((offset, count)) = *limit {
-                if offset < 0 || count <= 0 || (offset as usize) >= items.len() {
-                    items.clear();
-                } else {
-                    let offset = offset as usize;
-                    let count = count as usize;
-                    items = items.into_iter().skip(offset).take(count).collect();
+            let (start, count) = match limit {
+                Some((offset, count)) => {
+                    let start = (*offset).max(0) as usize;
+                    let count = if *count < 0 { items.len() } else { *count as usize };
+                    (start, count)
+                }
+                None => (0, items.len()),
+            };
+
+            let sliced_items: Vec<Bytes> = if start >= items.len() {
+                Vec::new()
+            } else {
+                items.into_iter().skip(start).take(count).collect()
+            };
+
+            let mut results: Vec<Option<Bytes>> = Vec::new();
+            if get.is_empty() {
+                for item in sliced_items {
+                    results.push(Some(item));
+                }
+            } else {
+                for item in sliced_items {
+                    for get_pat in get {
+                        if get_pat.as_ref() == b"#" {
+                            results.push(Some(item.clone()));
+                        } else {
+                            let (lookup_key, field_opt) = pattern_subst_and_field(get_pat, &item);
+                            let val = if let Some(field) = field_opt {
+                                db.hget(&lookup_key, &field).ok().flatten()
+                            } else {
+                                db.get(&lookup_key)
+                            };
+                            results.push(val);
+                        }
+                    }
                 }
             }
 
             if let Some(dest) = store {
                 record_change!(cmd);
-                db.del(dest);
-                let count = items.len();
-                if !items.is_empty() {
-                    let _ = db.rpush(dest.clone(), items);
+                if results.is_empty() {
+                    db.del(dest);
+                    out.extend_from_slice(b":0\r\n");
+                } else {
+                    let count = results.len();
+                    let list_items: Vec<Bytes> = results
+                        .into_iter()
+                        .map(|opt| opt.unwrap_or_else(|| Bytes::from_static(b"")))
+                        .collect();
+                    db.del(dest);
+                    let _ = db.rpush(dest.clone(), list_items);
+                    notify_list_or_defer(db, dest);
+                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
                 }
-                notify_list_or_defer(db, dest);
-                write_resp_integer(out, count as i64);
             } else {
-                out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
-                for item in items {
-                    write_resp_bulk(out, &item);
+                out.extend_from_slice(format!("*{}\r\n", results.len()).as_bytes());
+                for res in results {
+                    match res {
+                        Some(b) => write_resp_bulk(out, &b),
+                        None => write_resp_null(out),
+                    }
                 }
             }
             false

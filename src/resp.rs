@@ -356,6 +356,7 @@ pub enum Command {
     FunctionKill,
     CommandCount,
     CommandList,
+    CommandGetkeys(Vec<Bytes>),
     Hexpire {
         key: Bytes,
         expire_ms: i64,
@@ -867,6 +868,9 @@ pub enum Command {
         alpha: bool,
         store: Option<Bytes>,
         limit: Option<(i64, i64)>,
+        by: Option<Bytes>,
+        get: Vec<Bytes>,
+        readonly: bool,
     },
     // HYPERLOGLOG COMMANDS
     Pfadd {
@@ -5576,6 +5580,12 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 match sub.as_str() {
                     "COUNT" => Ok(Some(Command::CommandCount)),
                     "LIST" => Ok(Some(Command::CommandList)),
+                    "GETKEYS" => {
+                        if args.len() < 3 {
+                            return Err("wrong number of arguments for 'command|getkeys' command".to_string());
+                        }
+                        Ok(Some(Command::CommandGetkeys(args[2..].to_vec())))
+                    }
                     "HELP" => Ok(Some(Command::Unknown("COMMAND HELP".to_string()))),
                     _ => Ok(Some(Command::CommandDocs)),
                 }
@@ -9085,13 +9095,19 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
         }
         "SORT" | "SORT_RO" => {
             if args.len() < 2 {
-                return Err("wrong number of arguments for 'sort' command".to_string());
+                return Err(format!(
+                    "wrong number of arguments for '{}' command",
+                    cmd_name.to_ascii_lowercase()
+                ));
             }
+            let readonly = cmd_name == "SORT_RO";
             let key = args[1].clone();
             let mut desc = false;
             let mut alpha = false;
             let mut store = None;
             let mut limit = None;
+            let mut by = None;
+            let mut get = Vec::new();
             let mut i = 2;
             while i < args.len() {
                 let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
@@ -9108,13 +9124,6 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         alpha = true;
                         i += 1;
                     }
-                    "STORE" => {
-                        if i + 1 >= args.len() {
-                            return Err("syntax error".to_string());
-                        }
-                        store = Some(args[i + 1].clone());
-                        i += 2;
-                    }
                     "LIMIT" => {
                         if i + 2 >= args.len() {
                             return Err("syntax error".to_string());
@@ -9130,8 +9139,32 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         limit = Some((offset, count));
                         i += 3;
                     }
+                    "STORE" => {
+                        if readonly {
+                            return Err("syntax error".to_string());
+                        }
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        store = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "BY" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        by = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    "GET" => {
+                        if i + 1 >= args.len() {
+                            return Err("syntax error".to_string());
+                        }
+                        get.push(args[i + 1].clone());
+                        i += 2;
+                    }
                     _ => {
-                        i += 1;
+                        return Err("syntax error".to_string());
                     }
                 }
             }
@@ -9141,6 +9174,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 alpha,
                 store,
                 limit,
+                by,
+                get,
+                readonly,
             }))
         }
         "RPOPLPUSH" => {
