@@ -10119,22 +10119,52 @@ async fn execute_command(
             }
             let first_shard = router.target_shard(&keys[0]);
             let all_same = keys.iter().all(|k| router.target_shard(k) == first_shard);
-            if !all_same {
+            if !all_same && router.cluster_enabled {
                 out.extend_from_slice(
                     b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
                 );
                 return false;
             }
-            if first_shard == router.shard_id {
-                execute_local_command(
-                    &cmd,
-                    &mut router.local_db.borrow_mut(),
-                    out,
-                    router.aof.as_deref(),
-                );
+            if all_same {
+                if first_shard == router.shard_id {
+                    execute_local_command(
+                        &cmd,
+                        &mut router.local_db.borrow_mut(),
+                        out,
+                        router.aof.as_deref(),
+                    );
+                } else {
+                    let res = router.execute_remote(first_shard, cmd).await;
+                    out.extend_from_slice(&res);
+                }
             } else {
-                let res = router.execute_remote(first_shard, cmd).await;
-                out.extend_from_slice(&res);
+                let mut max_regs = [0u8; 16384];
+                let mut has_hll = false;
+                for k in keys {
+                    let val_opt = router.get(k.clone()).await;
+                    if let Some(val) = val_opt {
+                        match crate::hll::hll_decode_registers(&val) {
+                            Ok(regs) => {
+                                has_hll = true;
+                                for i in 0..16384 {
+                                    if regs[i] > max_regs[i] {
+                                        max_regs[i] = regs[i];
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                write_resp_err(out, err);
+                                return false;
+                            }
+                        }
+                    }
+                }
+                if !has_hll {
+                    out.extend_from_slice(b":0\r\n");
+                } else {
+                    let count = crate::hll::hll_compute_card(&max_regs);
+                    out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
+                }
             }
             false
         }
@@ -10174,22 +10204,63 @@ async fn execute_command(
             let all_same = srckeys
                 .iter()
                 .all(|k| router.target_shard(k) == first_shard);
-            if !all_same {
+            if !all_same && router.cluster_enabled {
                 out.extend_from_slice(
                     b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
                 );
                 return false;
             }
-            if first_shard == router.shard_id {
-                execute_local_command(
-                    &cmd,
-                    &mut router.local_db.borrow_mut(),
-                    out,
-                    router.aof.as_deref(),
-                );
+            if all_same {
+                if first_shard == router.shard_id {
+                    execute_local_command(
+                        &cmd,
+                        &mut router.local_db.borrow_mut(),
+                        out,
+                        router.aof.as_deref(),
+                    );
+                } else {
+                    let res = router.execute_remote(first_shard, cmd).await;
+                    out.extend_from_slice(&res);
+                }
             } else {
-                let res = router.execute_remote(first_shard, cmd).await;
-                out.extend_from_slice(&res);
+                let mut max_regs = [0u8; 16384];
+                let dest_val = router.get(destkey.clone()).await;
+                if let Some(val) = dest_val {
+                    match crate::hll::hll_decode_registers(&val) {
+                        Ok(regs) => {
+                            for i in 0..16384 {
+                                if regs[i] > max_regs[i] {
+                                    max_regs[i] = regs[i];
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            write_resp_err(out, err);
+                            return false;
+                        }
+                    }
+                }
+                for k in srckeys {
+                    let val_opt = router.get(k.clone()).await;
+                    if let Some(val) = val_opt {
+                        match crate::hll::hll_decode_registers(&val) {
+                            Ok(regs) => {
+                                for i in 0..16384 {
+                                    if regs[i] > max_regs[i] {
+                                        max_regs[i] = regs[i];
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                write_resp_err(out, err);
+                                return false;
+                            }
+                        }
+                    }
+                }
+                let new_hll = crate::hll::hll_create_from_regs(&max_regs, None);
+                router.set(destkey.clone(), Bytes::from(new_hll), None).await;
+                out.extend_from_slice(b"+OK\r\n");
             }
             false
         }

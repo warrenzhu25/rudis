@@ -12,6 +12,7 @@ pub mod conn_balance;
 pub mod connection;
 pub mod crdt;
 pub mod geo;
+pub mod hll;
 pub mod json;
 pub mod mailbox;
 pub mod mcp;

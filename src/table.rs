@@ -4024,6 +4024,13 @@ impl RudisTable {
                         entry.val = RudisValue::String(Bytes::from(combined));
                         Ok(len)
                     }
+                    RudisValue::HyperLogLog(regs) => {
+                        let mut combined = crate::hll::hll_create_from_regs(regs, None);
+                        combined.extend_from_slice(val_to_append);
+                        let len = combined.len();
+                        entry.val = RudisValue::String(Bytes::from(combined));
+                        Ok(len)
+                    }
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
@@ -4050,6 +4057,10 @@ impl RudisTable {
                 match &entry.val {
                     RudisValue::String(s) => Ok(s.len()),
                     RudisValue::Int(n) => Ok(Self::format_i64(*n).len()),
+                    RudisValue::HyperLogLog(regs) => {
+                        let hll_bytes = crate::hll::hll_create_from_regs(regs, None);
+                        Ok(hll_bytes.len())
+                    }
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
                 }
             } else {
@@ -4104,6 +4115,10 @@ impl RudisTable {
                         let formatted = Self::format_i64(*n);
                         return Self::slice_range(&formatted, start, end);
                     }
+                    RudisValue::HyperLogLog(regs) => {
+                        let hll_bytes = crate::hll::hll_create_from_regs(regs, None);
+                        return Self::slice_range(&hll_bytes, start, end);
+                    }
                     _ => {
                         return Err(
                             "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -4134,6 +4149,7 @@ impl RudisTable {
             let mut bytes: Vec<u8> = match &entry.val {
                 RudisValue::String(s) => s.to_vec(),
                 RudisValue::Int(n) => Self::format_i64(*n).to_vec(),
+                RudisValue::HyperLogLog(regs) => crate::hll::hll_create_from_regs(regs, None),
                 _ => {
                     return Err(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -11105,21 +11121,119 @@ impl RudisTable {
 
     // HYPERLOGLOG OPERATIONS
     pub fn pfadd(&mut self, key: Bytes, elements: &[Bytes]) -> Result<bool, &'static str> {
-        let mut updated = false;
         let h = hash_key(&key);
-        let existing_registers = if let Some(idx) = self.table.find(&key, h) {
-            let was_exp = self.check_expired_slot(idx);
-            if !was_exp {
-                if let Some(entry) = self.table.get_slot_mut(idx) {
-                    match &mut entry.val {
-                        RudisValue::HyperLogLog(regs) => Some(regs),
-                        RudisValue::String(s) if s.len() == 16384 => {
-                            let mut arr = Box::new([0u8; 16384]);
-                            arr.copy_from_slice(s);
-                            entry.val = RudisValue::HyperLogLog(arr);
-                            match &mut entry.val {
-                                RudisValue::HyperLogLog(regs) => Some(regs),
-                                _ => unreachable!(),
+        let (existing, _) = self.table.find_or_prepare_insert(&key, h);
+        if let Some(idx) = existing
+            && !self.check_expired_slot(idx)
+        {
+            if let Some(entry) = self.table.get_slot_mut(idx) {
+                match &mut entry.val {
+                    RudisValue::String(s) => {
+                        crate::hll::hll_validate(s)?;
+                        if elements.is_empty() {
+                            return Ok(false);
+                        }
+                        let mut bytes = s.to_vec();
+                        let updated = crate::hll::hll_add(&mut bytes, elements)?;
+                        if updated {
+                            *s = Bytes::from(bytes);
+                        }
+                        Ok(updated)
+                    }
+                    RudisValue::HyperLogLog(regs) => {
+                        if elements.is_empty() {
+                            return Ok(false);
+                        }
+                        let mut updated = false;
+                        for elem in elements {
+                            let (index, count) = crate::hll::hll_pat_len(elem.as_ref());
+                            if count > regs[index] {
+                                regs[index] = count;
+                                updated = true;
+                            }
+                        }
+                        Ok(updated)
+                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                let bytes = if elements.is_empty() {
+                    crate::hll::hll_create_sparse_empty()
+                } else {
+                    let mut b = crate::hll::hll_create_sparse_empty();
+                    let _ = crate::hll::hll_add(&mut b, elements)?;
+                    b
+                };
+                self.set(key, Bytes::from(bytes), None);
+                Ok(true)
+            }
+        } else {
+            let bytes = if elements.is_empty() {
+                crate::hll::hll_create_sparse_empty()
+            } else {
+                let mut b = crate::hll::hll_create_sparse_empty();
+                let _ = crate::hll::hll_add(&mut b, elements)?;
+                b
+            };
+            self.set(key, Bytes::from(bytes), None);
+            Ok(true)
+        }
+    }
+
+    pub fn pfcount(&mut self, keys: &[Bytes]) -> Result<u64, &'static str> {
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        if keys.len() == 1 {
+            let k = &keys[0];
+            let h = hash_key(k);
+            if let Some(idx) = self.table.find(k, h)
+                && !self.check_expired_slot(idx)
+                && let Some(entry) = self.table.get_slot_mut(idx)
+            {
+                match &mut entry.val {
+                    RudisValue::String(s) => {
+                        crate::hll::hll_validate(s)?;
+                        let mut bytes = s.to_vec();
+                        let count = crate::hll::hll_count(&mut bytes)?;
+                        if &bytes[..] != s.as_ref() {
+                            *s = Bytes::from(bytes);
+                        }
+                        Ok(count)
+                    }
+                    RudisValue::HyperLogLog(regs) => {
+                        Ok(crate::hll::hll_compute_card(regs))
+                    }
+                    _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+                }
+            } else {
+                Ok(0)
+            }
+        } else {
+            let mut merged = [0u8; 16384];
+            let mut has_hll = false;
+            for k in keys {
+                let h = hash_key(k);
+                if let Some(idx) = self.table.find(k, h)
+                    && !self.check_expired_slot(idx)
+                    && let Some(entry) = self.table.get_slot(idx)
+                {
+                    match &entry.val {
+                        RudisValue::String(s) => {
+                            let regs = crate::hll::hll_decode_registers(s)?;
+                            has_hll = true;
+                            for i in 0..16384 {
+                                if regs[i] > merged[i] {
+                                    merged[i] = regs[i];
+                                }
+                            }
+                        }
+                        RudisValue::HyperLogLog(regs) => {
+                            has_hll = true;
+                            for i in 0..16384 {
+                                if regs[i] > merged[i] {
+                                    merged[i] = regs[i];
+                                }
                             }
                         }
                         _ => {
@@ -11128,122 +11242,27 @@ impl RudisTable {
                             );
                         }
                     }
-                } else {
-                    None
                 }
+            }
+            if !has_hll {
+                Ok(0)
             } else {
-                None
+                Ok(crate::hll::hll_compute_card(&merged))
             }
-        } else {
-            None
-        };
-
-        if let Some(regs) = existing_registers {
-            for elem in elements {
-                let h = hash_key(elem);
-                let reg_idx = (h & 0x3FFF) as usize; // 14 bits (0..16383)
-                let rho = ((h >> 14).leading_zeros() as u8 + 1).min(51);
-                if rho > regs[reg_idx] {
-                    regs[reg_idx] = rho;
-                    updated = true;
-                }
-            }
-            return Ok(updated);
-        }
-
-        let mut regs = Box::new([0u8; 16384]);
-        for elem in elements {
-            let h = hash_key(elem);
-            let reg_idx = (h & 0x3FFF) as usize;
-            let rho = ((h >> 14).leading_zeros() as u8 + 1).min(51);
-            if rho > regs[reg_idx] {
-                regs[reg_idx] = rho;
-                updated = true;
-            }
-        }
-        let entry = RudisEntry {
-            key,
-            val: RudisValue::HyperLogLog(regs),
-            expire_at: None,
-        };
-        self.table.insert(entry);
-        Ok(updated)
-    }
-
-    pub fn pfcount(&mut self, keys: &[Bytes]) -> Result<u64, &'static str> {
-        let mut merged = [0u8; 16384];
-        let mut has_hll = false;
-
-        for k in keys {
-            let h = hash_key(k);
-            if let Some(idx) = self.table.find(k, h)
-                && !self.check_expired_slot(idx)
-                && let Some(entry) = self.table.get_slot(idx)
-            {
-                match &entry.val {
-                    RudisValue::HyperLogLog(regs) => {
-                        has_hll = true;
-                        for i in 0..16384 {
-                            merged[i] = merged[i].max(regs[i]);
-                        }
-                    }
-                    RudisValue::String(s) if s.len() == 16384 => {
-                        has_hll = true;
-                        for i in 0..16384 {
-                            merged[i] = merged[i].max(s[i]);
-                        }
-                    }
-                    _ => {
-                        return Err(
-                            "WRONGTYPE Operation against a key holding the wrong kind of value",
-                        );
-                    }
-                }
-            }
-        }
-
-        if !has_hll {
-            return Ok(0);
-        }
-
-        const M: f64 = 16384.0;
-        const ALPHA: f64 = 0.7213475;
-        let mut sum = 0.0;
-        let mut zeros = 0;
-        for &val in merged.iter() {
-            sum += 2.0_f64.powi(-(val as i32));
-            if val == 0 {
-                zeros += 1;
-            }
-        }
-
-        let raw_estimate = ALPHA * M * M / sum;
-        if raw_estimate <= 2.5 * M && zeros > 0 {
-            let count = M * (M / zeros as f64).ln();
-            Ok(count.round() as u64)
-        } else {
-            Ok(raw_estimate.round() as u64)
         }
     }
 
     pub fn pfmerge(&mut self, destkey: Bytes, srckeys: &[Bytes]) -> Result<(), &'static str> {
-        let mut merged = [0u8; 16384];
-        let h = hash_key(&destkey);
-        if let Some(idx) = self.table.find(&destkey, h)
+        let dest_h = hash_key(&destkey);
+        if let Some(idx) = self.table.find(&destkey, dest_h)
             && !self.check_expired_slot(idx)
             && let Some(entry) = self.table.get_slot(idx)
         {
             match &entry.val {
-                RudisValue::HyperLogLog(regs) => {
-                    for i in 0..16384 {
-                        merged[i] = merged[i].max(regs[i]);
-                    }
+                RudisValue::String(s) => {
+                    crate::hll::hll_validate(s)?;
                 }
-                RudisValue::String(s) if s.len() == 16384 => {
-                    for i in 0..16384 {
-                        merged[i] = merged[i].max(s[i]);
-                    }
-                }
+                RudisValue::HyperLogLog(_) => {}
                 _ => {
                     return Err(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -11251,7 +11270,6 @@ impl RudisTable {
                 }
             }
         }
-
         for k in srckeys {
             let h = hash_key(k);
             if let Some(idx) = self.table.find(k, h)
@@ -11259,16 +11277,10 @@ impl RudisTable {
                 && let Some(entry) = self.table.get_slot(idx)
             {
                 match &entry.val {
-                    RudisValue::HyperLogLog(regs) => {
-                        for i in 0..16384 {
-                            merged[i] = merged[i].max(regs[i]);
-                        }
+                    RudisValue::String(s) => {
+                        crate::hll::hll_validate(s)?;
                     }
-                    RudisValue::String(s) if s.len() == 16384 => {
-                        for i in 0..16384 {
-                            merged[i] = merged[i].max(s[i]);
-                        }
-                    }
+                    RudisValue::HyperLogLog(_) => {}
                     _ => {
                         return Err(
                             "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -11278,20 +11290,59 @@ impl RudisTable {
             }
         }
 
-        let h = hash_key(&destkey);
-        if let Some(idx) = self.table.find(&destkey, h)
-            && let Some(entry) = self.table.get_slot_mut(idx)
+        let mut merged = [0u8; 16384];
+        if let Some(idx) = self.table.find(&destkey, dest_h)
+            && !self.check_expired_slot(idx)
+            && let Some(entry) = self.table.get_slot(idx)
         {
-            entry.val = RudisValue::HyperLogLog(Box::new(merged));
-            return Ok(());
+            match &entry.val {
+                RudisValue::String(s) => {
+                    let regs = crate::hll::hll_decode_registers(s)?;
+                    for i in 0..16384 {
+                        if regs[i] > merged[i] {
+                            merged[i] = regs[i];
+                        }
+                    }
+                }
+                RudisValue::HyperLogLog(regs) => {
+                    for i in 0..16384 {
+                        if regs[i] > merged[i] {
+                            merged[i] = regs[i];
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        for k in srckeys {
+            let h = hash_key(k);
+            if let Some(idx) = self.table.find(k, h)
+                && !self.check_expired_slot(idx)
+                && let Some(entry) = self.table.get_slot(idx)
+            {
+                match &entry.val {
+                    RudisValue::String(s) => {
+                        let regs = crate::hll::hll_decode_registers(s)?;
+                        for i in 0..16384 {
+                            if regs[i] > merged[i] {
+                                merged[i] = regs[i];
+                            }
+                        }
+                    }
+                    RudisValue::HyperLogLog(regs) => {
+                        for i in 0..16384 {
+                            if regs[i] > merged[i] {
+                                merged[i] = regs[i];
+                            }
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
         }
 
-        let entry = RudisEntry {
-            key: destkey,
-            val: RudisValue::HyperLogLog(Box::new(merged)),
-            expire_at: None,
-        };
-        self.table.insert(entry);
+        let new_bytes = crate::hll::hll_create_from_regs(&merged, None);
+        self.set(destkey, Bytes::from(new_bytes), None);
         Ok(())
     }
 

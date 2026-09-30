@@ -64,6 +64,7 @@ CORE_SUITES=(
     "unit/quit"
     "unit/protocol"
     "unit/other"
+    "unit/hyperloglog"
 )
 
 if [ "$SUITE_ARG" = "all-types" ] || [ "$SUITE_ARG" = "all" ]; then
