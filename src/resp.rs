@@ -1437,7 +1437,10 @@ pub enum Command {
         read_only: bool,
         auth_user: String,
     },
-    FunctionList,
+    FunctionList {
+        library_name_pattern: Option<String>,
+        with_code: bool,
+    },
     FunctionDelete(String),
     FunctionFlush,
     FunctionDump,
@@ -10423,8 +10426,51 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     };
                     Ok(Some(Command::FunctionRestore { payload, policy }))
                 }
-                "LIST" => Ok(Some(Command::FunctionList)),
-                "FLUSH" => Ok(Some(Command::FunctionFlush)),
+                "LIST" => {
+                    let mut library_name_pattern = None;
+                    let mut with_code = false;
+                    let mut i = 2;
+                    while i < args.len() {
+                        let arg = String::from_utf8_lossy(&args[i]);
+                        if arg.eq_ignore_ascii_case("WITHCODE") && !with_code {
+                            with_code = true;
+                        } else if arg.eq_ignore_ascii_case("LIBRARYNAME")
+                            && library_name_pattern.is_none()
+                        {
+                            if i + 1 >= args.len() {
+                                return Err("ERR library name argument was not given".to_string());
+                            }
+                            i += 1;
+                            library_name_pattern =
+                                Some(String::from_utf8_lossy(&args[i]).to_string());
+                        } else {
+                            let sanitized: String = arg
+                                .chars()
+                                .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
+                                .collect();
+                            return Err(format!("ERR Unknown argument {}", sanitized));
+                        }
+                        i += 1;
+                    }
+                    Ok(Some(Command::FunctionList {
+                        library_name_pattern,
+                        with_code,
+                    }))
+                }
+                "FLUSH" => {
+                    if args.len() > 3 {
+                        return Err("ERR unknown subcommand or wrong number of arguments for 'flush'. Try FUNCTION HELP.".to_string());
+                    }
+                    if args.len() == 3 {
+                        let mode = String::from_utf8_lossy(&args[2]).to_uppercase();
+                        if mode != "ASYNC" && mode != "SYNC" {
+                            return Err(
+                                "ERR FUNCTION FLUSH only supports SYNC|ASYNC option".to_string(),
+                            );
+                        }
+                    }
+                    Ok(Some(Command::FunctionFlush))
+                }
                 "STATS" => Ok(Some(Command::FunctionStats)),
                 "KILL" => Ok(Some(Command::FunctionKill)),
                 "DELETE" => {

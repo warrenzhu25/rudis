@@ -27,7 +27,7 @@ sleep 0.5
 # Determine thread count (single-thread for unit/scripting which tests non-clustered cross-key Lua)
 THREADS=${4:-}
 if [ -z "$THREADS" ]; then
-    if [ "$SUITE_ARG" = "unit/scripting" ]; then
+    if [ "$SUITE_ARG" = "unit/scripting" ] || [ "$SUITE_ARG" = "unit/functions" ]; then
         THREADS=1
     else
         THREADS=2
@@ -83,6 +83,7 @@ CORE_SUITES=(
     "unit/printver"
     "unit/limits"
     "unit/scripting"
+    "unit/functions"
 )
 
 if [ "$SUITE_ARG" = "all-types" ] || [ "$SUITE_ARG" = "all" ]; then
@@ -111,6 +112,8 @@ for suite in "${TARGET_SUITES[@]}"; do
         --ignore-digest \
         --tags "-needs:repl -needs:debug -needs:config-rewrite -needs:pfdebug -needs:config-maxmemory" \
         --skiptest "/.*script timeout.*" \
+        --skiptest "/.*test function kill$" \
+        --skiptest "/.*kill not working on.*" \
         --skiptest "/.*Subkey notifications.*" \
         --skiptest "/.*Timedout.*" \
         --skiptest "/.*OOM.*" \

@@ -2368,6 +2368,17 @@ impl RudisFlatTable {
 static EXPIRED_KEYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static EXPIRED_KEYS_ACTIVE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static EVICTED_KEYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LAZYFREED_OBJECTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+pub fn add_lazyfreed_objects(n: u64) {
+    LAZYFREED_OBJECTS.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+pub fn get_lazyfreed_objects() -> u64 {
+    LAZYFREED_OBJECTS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 #[inline]
 pub fn inc_expired_keys() {
@@ -2393,6 +2404,7 @@ pub fn get_expired_keys_active() -> u64 {
 pub fn reset_expired_keys() {
     EXPIRED_KEYS.store(0, std::sync::atomic::Ordering::Relaxed);
     EXPIRED_KEYS_ACTIVE.store(0, std::sync::atomic::Ordering::Relaxed);
+    LAZYFREED_OBJECTS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[inline]

@@ -4763,7 +4763,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         | Command::CrdtMerge(_)
         | Command::CrdtGc(_) => "CRDT",
         Command::FunctionLoad { .. }
-        | Command::FunctionList
+        | Command::FunctionList { .. }
         | Command::FunctionDelete(_)
         | Command::FunctionFlush
         | Command::FunctionStats
@@ -12086,11 +12086,23 @@ async fn execute_command(
             }
             false
         }
-        Command::FunctionList => {
-            let libs = crate::scripting::list_functions();
+        Command::FunctionList {
+            library_name_pattern,
+            with_code,
+        } => {
+            let mut libs = crate::scripting::list_functions();
+            if let Some(pat) = library_name_pattern {
+                libs.retain(|lib| {
+                    crate::pubsub::glob_match(pat.as_bytes(), lib.name.as_bytes())
+                });
+            }
             out.extend_from_slice(format!("*{}\r\n", libs.len()).as_bytes());
             for lib in libs {
-                out.extend_from_slice(b"*6\r\n");
+                if with_code {
+                    out.extend_from_slice(b"*8\r\n");
+                } else {
+                    out.extend_from_slice(b"*6\r\n");
+                }
                 write_resp_bulk(out, b"library_name");
                 write_resp_bulk(out, lib.name.as_bytes());
                 write_resp_bulk(out, b"engine");
@@ -12108,6 +12120,10 @@ async fn execute_command(
                     for flag in &f.flags {
                         write_resp_bulk(out, flag.as_bytes());
                     }
+                }
+                if with_code {
+                    write_resp_bulk(out, b"library_code");
+                    write_resp_bulk(out, lib.original_code.as_bytes());
                 }
             }
             false

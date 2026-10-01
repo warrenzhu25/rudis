@@ -69,6 +69,8 @@ pub struct FunctionLib {
     pub name: String,
     pub engine: String,
     pub raw_code: String,
+    #[serde(default)]
+    pub original_code: String,
     pub functions: Vec<FunctionDef>,
 }
 
@@ -79,7 +81,7 @@ pub fn is_function_read_only(name: &str) -> bool {
     let cache = FUNCTION_LIBS.read().unwrap();
     for l in cache.values() {
         for f in &l.functions {
-            if f.name == name {
+            if f.name.eq_ignore_ascii_case(name) {
                 return f.flags.iter().any(|flag| flag == "no-writes");
             }
         }
@@ -87,54 +89,114 @@ pub fn is_function_read_only(name: &str) -> bool {
     false
 }
 
+pub fn count_functions() -> usize {
+    let cache = FUNCTION_LIBS.read().unwrap();
+    cache.values().map(|l| l.functions.len()).sum()
+}
+
+pub fn count_libraries() -> usize {
+    FUNCTION_LIBS.read().unwrap().len()
+}
+
 thread_local! {
     pub static SCRIPT_RECORDED_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+fn validate_library_or_function_name(bytes: &[u8]) -> Result<(), &'static str> {
+    if bytes.is_empty() || !bytes.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_') {
+        Err("Library names can only contain letters, numbers, or underscores(_) and must be at least one character long")
+    } else {
+        Ok(())
+    }
+}
+
+fn is_valid_function_flag(flag: &str) -> bool {
+    matches!(
+        flag,
+        "no-writes" | "allow-oom" | "allow-stale" | "no-cluster" | "allow-cross-slot-keys"
+    )
+}
+
+fn create_load_redis_proxy(
+    lua: &Lua,
+    reg_fn: mlua::Function,
+) -> mlua::Result<mlua::Table> {
+    let raw_load_redis = lua.create_table()?;
+    raw_load_redis.set("register_function", reg_fn)?;
+    raw_load_redis.set("REDIS_VERSION", "7.2.0")?;
+    raw_load_redis.set("REDIS_VERSION_NUM", 0x00070200i64)?;
+    raw_load_redis.set("LOG_DEBUG", 0i64)?;
+    raw_load_redis.set("LOG_VERBOSE", 1i64)?;
+    raw_load_redis.set("LOG_NOTICE", 2i64)?;
+    raw_load_redis.set("LOG_WARNING", 3i64)?;
+
+    let make_proxy: mlua::Function = lua
+        .load(
+            r#"
+        local raw_load_redis = ...
+        local setmetatable = setmetatable
+        local error = error
+        local tostring = tostring
+        local string = string
+        local proxy = {}
+        local mt = {
+            __index = function(t, k)
+                local v = raw_load_redis[k]
+                if v ~= nil then return v end
+                error(string.format("Script attempted to access nonexistent global variable '%s'", tostring(k)), 2)
+            end,
+            __newindex = function(t, k, v)
+                error("Attempt to modify a readonly table", 2)
+            end
+        }
+        setmetatable(proxy, mt)
+        return proxy
+        "#,
+        )
+        .into_function()?;
+    make_proxy.call(raw_load_redis)
+}
+
 /// Load a Redis 7 Function Library
 pub fn load_function(code: &str, replace: bool) -> Result<String, String> {
-    let mut lib_name = String::new();
-    let mut engine = "LUA".to_string();
-    let mut default_flags = Vec::new();
+    let first_line = code.lines().next().unwrap_or("");
+    if !first_line.starts_with("#!") {
+        return Err("ERR Missing library metadata".to_string());
+    }
+    let after_shebang = &first_line[2..];
+    let (eng_raw, rest_meta) = match after_shebang.find(char::is_whitespace) {
+        Some(idx) => (&after_shebang[..idx], &after_shebang[idx..]),
+        None => (after_shebang, ""),
+    };
 
-    for line in code.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("#!") {
-            let after = trimmed[2..].trim();
-            let mut parts = after.split_whitespace();
-            if let Some(eng) = parts.next() {
-                engine = eng.to_uppercase();
+    if !eng_raw.eq_ignore_ascii_case("lua") {
+        return Err(format!("ERR Engine '{}' not found", eng_raw));
+    }
+    let engine = "LUA".to_string();
+
+    let mut name_opt: Option<String> = None;
+    for part in rest_meta.split_whitespace() {
+        if let Some(val_raw) = part.strip_prefix("name=") {
+            if name_opt.is_some() {
+                return Err(
+                    "ERR Invalid metadata value, name argument was given multiple times"
+                        .to_string(),
+                );
             }
-            for part in parts {
-                if let Some(pos) = part.find('=') {
-                    let key = &part[..pos];
-                    let val = part[pos + 1..].trim_matches('"');
-                    if key == "name" {
-                        lib_name = val.to_string();
-                    } else if key == "flags" {
-                        for f in val.split(',') {
-                            let f_trim = f.trim();
-                            if !f_trim.is_empty() {
-                                default_flags.push(f_trim.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            break;
+            let val = val_raw.trim_matches('"');
+            name_opt = Some(val.to_string());
+        } else {
+            return Err(format!("ERR Invalid metadata value given: {}", part));
         }
     }
 
-    if engine != "LUA" {
-        return Err(format!("ERR Engine '{}' not found", engine));
-    }
+    let lib_name = match name_opt {
+        Some(n) => n,
+        None => return Err("ERR Library name was not given".to_string()),
+    };
 
-    if lib_name.is_empty()
-        || !lib_name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        return Err("ERR Library names can only contain letters, numbers, or underscores(_) and must be at least one character".to_string());
+    if let Err(msg) = validate_library_or_function_name(lib_name.as_bytes()) {
+        return Err(format!("ERR {}", msg));
     }
 
     {
@@ -144,70 +206,274 @@ pub fn load_function(code: &str, replace: bool) -> Result<String, String> {
         }
     }
 
-    // Execute with mock redis.register_function to collect function names & flags
     let lua = Lua::new();
-    let func_defs = Rc::new(RefCell::new(Vec::new()));
-    let func_defs_clone = func_defs.clone();
-    let default_flags_clone = default_flags.clone();
+    let real_g = lua.create_table().map_err(|e| e.to_string())?;
+    let globals = lua.globals();
+    for pair in globals.clone().pairs::<Value, Value>() {
+        let (k, v) = pair.map_err(|e| e.to_string())?;
+        real_g.set(k, v).map_err(|e| e.to_string())?;
+    }
+    if let Ok(table_mod) = real_g.get::<mlua::Table>("table") {
+        if let Ok(unpack_fn) = table_mod.get::<mlua::Function>("unpack") {
+            let _ = real_g.set("unpack", unpack_fn);
+        }
+    }
+    // Remove globals not allowed during FUNCTION LOAD
+    for disallowed in [
+        "math",
+        "os",
+        "getmetatable",
+        "setmetatable",
+        "load",
+        "loadstring",
+        "dofile",
+        "loadfile",
+        "print",
+        "rawget",
+        "rawset",
+        "rawequal",
+        "collectgarbage",
+        "package",
+        "coroutine",
+        "io",
+        "debug",
+    ] {
+        let _ = real_g.set(disallowed, Value::Nil);
+    }
 
-    let redis_tbl = lua.create_table().map_err(|e| e.to_string())?;
+    register_bit_module(&lua, &real_g).map_err(|e| e.to_string())?;
+    register_cjson_module(&lua, &real_g).map_err(|e| e.to_string())?;
+    register_cmsgpack_module(&lua, &real_g).map_err(|e| e.to_string())?;
+
+    let func_defs: Rc<RefCell<Vec<FunctionDef>>> = Rc::new(RefCell::new(Vec::new()));
+    let func_defs_clone = func_defs.clone();
+
     let reg_fn = lua
         .create_function(move |_, args: MultiValue| {
-            let mut name_opt = None;
-            let mut desc_opt = None;
-            let mut flags_opt = None;
-            if let Some(first) = args.iter().next() {
-                match first {
-                    Value::String(s) => {
-                        if let Ok(name_str) = s.to_str() {
-                            name_opt = Some(name_str.to_string());
-                        }
+            let args_vec: Vec<Value> = args.into_iter().collect();
+            if args_vec.is_empty() || args_vec.len() > 2 {
+                return Err(mlua::Error::RuntimeError(
+                    "wrong number of arguments to redis.register_function".to_string(),
+                ));
+            }
+
+            let (name, desc, flags) = if args_vec.len() == 2 {
+                let name_s = match &args_vec[0] {
+                    Value::String(s) => s,
+                    _ => {
+                        return Err(mlua::Error::RuntimeError(
+                            "first argument to redis.register_function must be a string"
+                                .to_string(),
+                        ))
                     }
-                    Value::Table(t) => {
-                        if let Ok(name_str) = t
-                            .raw_get::<String>("function_name")
-                            .or_else(|_| t.raw_get::<String>("name"))
-                        {
-                            name_opt = Some(name_str);
+                };
+                if let Err(msg) = validate_library_or_function_name(&name_s.as_bytes()) {
+                    return Err(mlua::Error::RuntimeError(msg.to_string()));
+                }
+                let name_str = String::from_utf8_lossy(&name_s.as_bytes()).to_string();
+                match &args_vec[1] {
+                    Value::Function(_) => {}
+                    _ => {
+                        return Err(mlua::Error::RuntimeError(
+                            "second argument to redis.register_function must be a function"
+                                .to_string(),
+                        ))
+                    }
+                }
+                (name_str, String::new(), Vec::new())
+            } else {
+                let t = match &args_vec[0] {
+                    Value::Table(t) => t,
+                    _ => {
+                        return Err(mlua::Error::RuntimeError(
+                            "calling redis.register_function with a single argument is only applicable to Lua table (representing named arguments).".to_string(),
+                        ))
+                    }
+                };
+                let mut fn_name_opt: Option<String> = None;
+                let mut callback_set = false;
+                let mut desc_opt: Option<String> = None;
+                let mut flags_vec: Vec<String> = Vec::new();
+
+                for pair in t.clone().pairs::<Value, Value>() {
+                    let (k, v) = pair?;
+                    let key_str = match k {
+                        Value::String(s) => s.to_str().map(|s| s.to_string()).unwrap_or_default(),
+                        _ => {
+                            return Err(mlua::Error::RuntimeError(
+                                "unknown argument given to redis.register_function".to_string(),
+                            ))
                         }
-                        if let Ok(desc_str) = t.raw_get::<String>("description") {
-                            desc_opt = Some(desc_str);
-                        }
-                        if let Ok(flags_tbl) = t.raw_get::<mlua::Table>("flags") {
-                            let mut flags = Vec::new();
-                            for i in 1..=flags_tbl.raw_len() {
-                                if let Ok(flag_str) = flags_tbl.raw_get::<String>(i) {
-                                    flags.push(flag_str);
+                    };
+                    match key_str.as_str() {
+                        "function_name" => match v {
+                            Value::String(s) => {
+                                if let Err(msg) = validate_library_or_function_name(&s.as_bytes()) {
+                                    return Err(mlua::Error::RuntimeError(msg.to_string()));
+                                }
+                                fn_name_opt =
+                                    Some(String::from_utf8_lossy(&s.as_bytes()).to_string());
+                            }
+                            _ => {
+                                return Err(mlua::Error::RuntimeError(
+                                    "function_name argument given to redis.register_function must be a string".to_string(),
+                                ))
+                            }
+                        },
+                        "callback" => match v {
+                            Value::Function(_) => {
+                                callback_set = true;
+                            }
+                            _ => {
+                                return Err(mlua::Error::RuntimeError(
+                                    "callback argument given to redis.register_function must be a function".to_string(),
+                                ))
+                            }
+                        },
+                        "description" => match v {
+                            Value::String(s) => {
+                                desc_opt = Some(String::from_utf8_lossy(&s.as_bytes()).to_string());
+                            }
+                            _ => {
+                                return Err(mlua::Error::RuntimeError(
+                                    "description argument given to redis.register_function must be a string".to_string(),
+                                ))
+                            }
+                        },
+                        "flags" => match v {
+                            Value::Table(flags_tbl) => {
+                                for fpair in flags_tbl.pairs::<Value, Value>() {
+                                    let (fk, fv) = fpair?;
+                                    if !matches!(fk, Value::Integer(_)) {
+                                        return Err(mlua::Error::RuntimeError(
+                                            "unknown flag given".to_string(),
+                                        ));
+                                    }
+                                    match fv {
+                                        Value::String(fs) => {
+                                            let f_str =
+                                                String::from_utf8_lossy(&fs.as_bytes()).to_string();
+                                            if !is_valid_function_flag(&f_str) {
+                                                return Err(mlua::Error::RuntimeError(
+                                                    "unknown flag given".to_string(),
+                                                ));
+                                            }
+                                            if !flags_vec.contains(&f_str) {
+                                                flags_vec.push(f_str);
+                                            }
+                                        }
+                                        _ => {
+                                            return Err(mlua::Error::RuntimeError(
+                                                "unknown flag given".to_string(),
+                                            ))
+                                        }
+                                    }
                                 }
                             }
-                            flags_opt = Some(flags);
+                            _ => {
+                                return Err(mlua::Error::RuntimeError(
+                                    "flags argument to redis.register_function must be a table representing function flags".to_string(),
+                                ))
+                            }
+                        },
+                        _ => {
+                            return Err(mlua::Error::RuntimeError(
+                                "unknown argument given to redis.register_function".to_string(),
+                            ))
                         }
                     }
-                    _ => {}
                 }
+
+                let name_str = match fn_name_opt {
+                    Some(n) => n,
+                    None => {
+                        return Err(mlua::Error::RuntimeError(
+                            "redis.register_function must get a function name argument".to_string(),
+                        ))
+                    }
+                };
+                if !callback_set {
+                    return Err(mlua::Error::RuntimeError(
+                        "redis.register_function must get a callback argument".to_string(),
+                    ));
+                }
+                (name_str, desc_opt.unwrap_or_default(), flags_vec)
+            };
+
+            let mut defs = func_defs_clone.borrow_mut();
+            if defs.iter().any(|d| d.name.eq_ignore_ascii_case(&name)) {
+                return Err(mlua::Error::RuntimeError(
+                    "Function already exists in the library".to_string(),
+                ));
             }
-            if let Some(name) = name_opt {
-                let flags = flags_opt.unwrap_or_else(|| default_flags_clone.clone());
-                func_defs_clone.borrow_mut().push(FunctionDef {
-                    name,
-                    description: desc_opt.unwrap_or_default(),
-                    flags,
-                });
-            }
+            defs.push(FunctionDef {
+                name,
+                description: desc,
+                flags,
+            });
             Ok(())
         })
         .map_err(|e| e.to_string())?;
-    redis_tbl
-        .set("register_function", reg_fn)
+
+    let load_redis_proxy = create_load_redis_proxy(&lua, reg_fn).map_err(|e| e.to_string())?;
+    real_g
+        .set("redis", load_redis_proxy)
         .map_err(|e| e.to_string())?;
-    lua.globals()
-        .set("redis", redis_tbl)
+
+    let setup_load_sandbox: mlua::Function = lua
+        .load(
+            r#"
+        local real_g = ...
+        local globals = _G
+        local setmetatable = setmetatable
+        local error = error
+        local pairs = pairs
+        local tostring = tostring
+        local string = string
+
+        for k in pairs(globals) do
+            globals[k] = nil
+        end
+
+        local g_mt = {
+            __index = function(t, k)
+                if k == "_G" then return globals end
+                local v = real_g[k]
+                if v ~= nil then return v end
+                error(string.format("Script attempted to access nonexistent global variable '%s'", tostring(k)), 2)
+            end,
+            __newindex = function(t, k, v)
+                error("Attempt to modify a readonly table", 2)
+            end
+        }
+        setmetatable(globals, g_mt)
+        "#,
+        )
+        .into_function()
         .map_err(|e| e.to_string())?;
+    setup_load_sandbox
+        .call::<()>(real_g)
+        .map_err(|e| e.to_string())?;
+
+    let start_time = std::time::Instant::now();
+    let _ = lua.set_hook(
+        mlua::HookTriggers::new().every_nth_instruction(1000),
+        move |_, _| {
+            if start_time.elapsed() > std::time::Duration::from_millis(500) {
+                Err(mlua::Error::RuntimeError(
+                    "FUNCTION LOAD timeout".to_string(),
+                ))
+            } else {
+                Ok(mlua::VmState::Continue)
+            }
+        },
+    );
 
     let lua_code: String = code
         .lines()
-        .map(|line| {
-            if line.trim_start().starts_with("#!") {
+        .enumerate()
+        .map(|(i, line)| {
+            if i == 0 && line.starts_with("#!") {
                 format!("--{}", line)
             } else {
                 line.to_string()
@@ -218,19 +484,51 @@ pub fn load_function(code: &str, replace: bool) -> Result<String, String> {
 
     lua.load(&lua_code).exec().map_err(|e| {
         let s = e.to_string();
+        if s.contains("FUNCTION LOAD timeout") {
+            return "ERR FUNCTION LOAD timeout".to_string();
+        }
         let first = s.lines().next().unwrap_or(&s);
         format!("ERR Error compiling function: {}", first)
     })?;
 
     let registered = func_defs.borrow().clone();
+    if registered.is_empty() {
+        return Err("ERR No functions registered".to_string());
+    }
+
+    let mut cache = FUNCTION_LIBS.write().unwrap();
+    // Check cross-library function name collision
+    for existing_lib in cache.values() {
+        if !existing_lib.name.eq_ignore_ascii_case(&lib_name) {
+            for f in &registered {
+                if existing_lib
+                    .functions
+                    .iter()
+                    .any(|ef| ef.name.eq_ignore_ascii_case(&f.name))
+                {
+                    return Err(format!("ERR Function {} already exists", f.name));
+                }
+            }
+        }
+    }
+
+    if let Some(existing_key) = cache
+        .keys()
+        .find(|k| k.eq_ignore_ascii_case(&lib_name))
+        .cloned()
+    {
+        cache.remove(&existing_key);
+    }
+
     let lib = FunctionLib {
         name: lib_name.clone(),
         engine,
         raw_code: lua_code,
+        original_code: code.to_string(),
         functions: registered,
     };
 
-    FUNCTION_LIBS.write().unwrap().insert(lib_name.clone(), lib);
+    cache.insert(lib_name.clone(), lib);
     Ok(lib_name)
 }
 
@@ -256,7 +554,12 @@ pub fn delete_function(lib_name: &str) -> bool {
 
 /// Flush all registered function libraries
 pub fn flush_functions() {
-    FUNCTION_LIBS.write().unwrap().clear();
+    let mut cache = FUNCTION_LIBS.write().unwrap();
+    let func_count: usize = cache.values().map(|l| l.functions.len()).sum();
+    if func_count > 64 {
+        crate::table::add_lazyfreed_objects((func_count + 1) as u64);
+    }
+    cache.clear();
 }
 
 pub fn dump_functions() -> Vec<u8> {
@@ -293,14 +596,49 @@ pub fn restore_functions(payload: &[u8], policy: &str) -> Result<(), String> {
     } else if policy == "APPEND" {
         for lib in &libs {
             if cache.keys().any(|k| k.eq_ignore_ascii_case(&lib.name)) {
-                return Err(format!("ERR Library '{}' already exists", lib.name));
+                return Err(format!("ERR Library {} already exists", lib.name));
+            }
+            for f in &lib.functions {
+                for existing_lib in cache.values() {
+                    if existing_lib
+                        .functions
+                        .iter()
+                        .any(|ef| ef.name.eq_ignore_ascii_case(&f.name))
+                    {
+                        return Err(format!("ERR Function {} already exists", f.name));
+                    }
+                }
             }
         }
         for lib in libs {
             cache.insert(lib.name.clone(), lib);
         }
     } else if policy == "REPLACE" {
+        for lib in &libs {
+            for f in &lib.functions {
+                for existing_lib in cache.values() {
+                    let being_replaced = libs
+                        .iter()
+                        .any(|nl| nl.name.eq_ignore_ascii_case(&existing_lib.name));
+                    if !being_replaced
+                        && existing_lib
+                            .functions
+                            .iter()
+                            .any(|ef| ef.name.eq_ignore_ascii_case(&f.name))
+                    {
+                        return Err(format!("ERR Function {} already exists", f.name));
+                    }
+                }
+            }
+        }
         for lib in libs {
+            if let Some(existing_key) = cache
+                .keys()
+                .find(|k| k.eq_ignore_ascii_case(&lib.name))
+                .cloned()
+            {
+                cache.remove(&existing_key);
+            }
             cache.insert(lib.name.clone(), lib);
         }
     }
@@ -405,6 +743,10 @@ pub fn call_function(
         found.ok_or_else(|| "ERR Function not found".to_string())?
     };
 
+    if read_only && !func_def.flags.iter().any(|f| f == "no-writes") {
+        return Err("ERR Can not execute a script with write flag using *_ro command.".to_string());
+    }
+
     let effective_read_only = read_only || func_def.flags.iter().any(|f| f == "no-writes");
 
     let lua = Lua::new();
@@ -432,13 +774,21 @@ pub fn call_function(
         argv_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
     }
 
-    // Capture target function
+    // Capture target function during library load phase
     let target_fn = Rc::new(RefCell::new(None));
     let target_fn_clone = target_fn.clone();
     let target_name_lower = func_name.to_lowercase();
+    let in_load_phase = Rc::new(std::cell::Cell::new(true));
+    let in_load_phase_clone = in_load_phase.clone();
 
     let reg_fn = lua
         .create_function(move |lua, margs: MultiValue| {
+            if !in_load_phase_clone.get() {
+                return Err(mlua::Error::RuntimeError(
+                    "redis.register_function can only be called on FUNCTION LOAD command"
+                        .to_string(),
+                ));
+            }
             let mut name_opt = None;
             let mut func_opt = None;
             if let Some(first) = margs.iter().next() {
@@ -475,16 +825,24 @@ pub fn call_function(
         })
         .map_err(|e| e.to_string())?;
 
-    if let Ok(real_redis) = lua.named_registry_value::<mlua::Table>("__real_redis") {
-        real_redis
-            .set("register_function", reg_fn)
-            .map_err(|e| e.to_string())?;
-    }
+    let load_redis_proxy = create_load_redis_proxy(&lua, reg_fn).map_err(|e| e.to_string())?;
+    let real_g: mlua::Table = lua
+        .named_registry_value("__real_G")
+        .map_err(|e| e.to_string())?;
+    let runtime_redis: Value = real_g.get("redis").map_err(|e| e.to_string())?;
+    real_g
+        .set("redis", load_redis_proxy)
+        .map_err(|e| e.to_string())?;
 
     // Run library script to define functions
     lua.load(&lib.raw_code)
         .exec()
         .map_err(|e| format!("ERR Failed to compile library: {}", e))?;
+
+    in_load_phase.set(false);
+    real_g
+        .set("redis", runtime_redis)
+        .map_err(|e| e.to_string())?;
 
     let fn_key = target_fn.borrow_mut().take().ok_or_else(|| {
         format!(
@@ -1992,6 +2350,8 @@ fn register_redis_module(
     redis.set("LOG_VERBOSE", 1)?;
     redis.set("LOG_NOTICE", 2)?;
     redis.set("LOG_WARNING", 3)?;
+    redis.set("REDIS_VERSION", "7.2.0")?;
+    redis.set("REDIS_VERSION_NUM", 0x00070200i64)?;
 
     let port = db.borrow().port;
     let acl_check_fn = lua.create_function(move |_lua, margs: MultiValue| {
