@@ -357,7 +357,13 @@ pub enum Command {
     FunctionKill,
     CommandCount,
     CommandList,
+    CommandListFiltered {
+        filter_type: String,
+        filter_val: String,
+    },
     CommandGetkeys(Vec<Bytes>),
+    CommandGetkeysAndFlags(Vec<Bytes>),
+    CommandInfo(Vec<String>),
     Hexpire {
         key: Bytes,
         expire_ms: i64,
@@ -5849,13 +5855,47 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             } else {
                 let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
                 match sub.as_str() {
-                    "COUNT" => Ok(Some(Command::CommandCount)),
-                    "LIST" => Ok(Some(Command::CommandList)),
+                    "COUNT" => {
+                        if args.len() != 2 {
+                            return Err("wrong number of arguments for 'command|count' command".to_string());
+                        }
+                        Ok(Some(Command::CommandCount))
+                    }
+                    "LIST" => {
+                        if args.len() == 2 {
+                            Ok(Some(Command::CommandList))
+                        } else if args.len() == 5 && args[2].eq_ignore_ascii_case(b"FILTERBY") {
+                            let ftype = String::from_utf8_lossy(&args[3]).to_uppercase();
+                            if ftype != "MODULE" && ftype != "ACLCAT" && ftype != "PATTERN" {
+                                return Err("syntax error".to_string());
+                            }
+                            let fval = String::from_utf8_lossy(&args[4]).to_string();
+                            Ok(Some(Command::CommandListFiltered {
+                                filter_type: ftype,
+                                filter_val: fval,
+                            }))
+                        } else {
+                            Err("syntax error".to_string())
+                        }
+                    }
                     "GETKEYS" => {
                         if args.len() < 3 {
                             return Err("wrong number of arguments for 'command|getkeys' command".to_string());
                         }
                         Ok(Some(Command::CommandGetkeys(args[2..].to_vec())))
+                    }
+                    "GETKEYSANDFLAGS" => {
+                        if args.len() < 3 {
+                            return Err("wrong number of arguments for 'command|getkeysandflags' command".to_string());
+                        }
+                        Ok(Some(Command::CommandGetkeysAndFlags(args[2..].to_vec())))
+                    }
+                    "INFO" => {
+                        let cmds = args[2..]
+                            .iter()
+                            .map(|b| String::from_utf8_lossy(b).to_lowercase())
+                            .collect();
+                        Ok(Some(Command::CommandInfo(cmds)))
                     }
                     "HELP" => Ok(Some(Command::Unknown("COMMAND HELP".to_string()))),
                     _ => Ok(Some(Command::CommandDocs)),
@@ -5863,8 +5903,17 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
         }
         "INFO" => {
-            let section = if args.len() > 1 {
+            let section = if args.len() == 2 {
                 Some(args[1].clone())
+            } else if args.len() > 2 {
+                let mut joined = Vec::new();
+                for (i, a) in args[1..].iter().enumerate() {
+                    if i > 0 {
+                        joined.push(b' ');
+                    }
+                    joined.extend_from_slice(a);
+                }
+                Some(Bytes::from(joined))
             } else {
                 None
             };

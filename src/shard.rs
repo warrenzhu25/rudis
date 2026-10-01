@@ -1867,6 +1867,16 @@ impl ShardDb {
     }
 
     #[inline]
+    pub fn idletime(&mut self, key: &[u8]) -> Option<u64> {
+        self.table.idletime(key)
+    }
+
+    #[inline]
+    pub fn lru_and_idletime(&mut self, key: &[u8]) -> Option<(u32, u64)> {
+        self.table.lru_and_idletime(key)
+    }
+
+    #[inline]
     pub fn rename(&mut self, src: &[u8], dst: Bytes, nx: bool) -> Result<bool, &'static str> {
         self.table.rename(src, dst, nx)
     }

@@ -37,8 +37,48 @@ pub struct ClientInfo {
     pub track_tx: Option<flume::Sender<Vec<u8>>>,
     pub raw_fd: std::os::unix::io::RawFd,
     pub omem: usize,
+    pub qbuf_len: usize,
+    pub qbuf_cap: usize,
     pub reply_mode: crate::resp::ClientReplyMode,
     pub is_monitor: bool,
+}
+
+impl ClientInfo {
+    pub fn effective_qbuf(&self, idle_secs: u64) -> (usize, usize) {
+        if self.qbuf_cap == 0 && self.qbuf_len == 0 {
+            (0, 0)
+        } else if !PAUSE_CRON.load(std::sync::atomic::Ordering::Relaxed) && idle_secs >= 2 {
+            (self.qbuf_len, 0)
+        } else {
+            (self.qbuf_len, self.qbuf_cap.saturating_sub(self.qbuf_len))
+        }
+    }
+}
+
+pub fn estimate_incomplete_qbuf_cap(buf: &[u8]) -> usize {
+    let mut max_bulk = 0usize;
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] == b'$' {
+            let start = i + 1;
+            let mut end = start;
+            while end < buf.len() && buf[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > start && end + 1 < buf.len() && buf[end] == b'\r' && buf[end + 1] == b'\n' {
+                if let Ok(s) = std::str::from_utf8(&buf[start..end])
+                    && let Ok(n) = s.parse::<usize>()
+                    && n <= 512 * 1024 * 1024
+                {
+                    max_bulk = max_bulk.max(n);
+                }
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    (buf.len() + max_bulk).max(16384)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1404,6 +1444,10 @@ pub static HASH_MAX_ENTRIES: std::sync::atomic::AtomicUsize =
 pub static HASH_MAX_VALUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64);
 pub static ALLOW_ACCESS_EXPIRED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+pub static CLIENT_NO_TOUCH: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub static PAUSE_CRON: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 pub static ACTIVE_CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 pub static MAX_CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(10000);
 pub static MAX_MEMORY_POLICY: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
@@ -1697,6 +1741,8 @@ pub async fn handle_tls_connection(
             track_tx: None,
             raw_fd,
             omem: 0,
+            qbuf_len: 0,
+            qbuf_cap: 0,
             reply_mode: crate::resp::ClientReplyMode::On,
             is_monitor: false,
         },
@@ -1826,18 +1872,26 @@ async fn execute_tx_step(
     if *in_multi {
         match cmd {
             Command::Multi => {
+                record_cmd_stat("MULTI");
+                record_failed_stat("MULTI");
+                record_error_stat("ERR", None);
                 out_buf.extend_from_slice(b"-ERR MULTI calls can not be nested\r\n");
                 false
             }
             Command::Watch(_) => {
+                record_cmd_stat("WATCH");
+                record_failed_stat("WATCH");
+                record_error_stat("ERR", None);
                 out_buf.extend_from_slice(b"-ERR WATCH inside MULTI is not allowed\r\n");
                 false
             }
             Command::Unwatch => {
+                record_cmd_stat("UNWATCH");
                 out_buf.extend_from_slice(b"+OK\r\n");
                 false
             }
             Command::Discard => {
+                record_cmd_stat("DISCARD");
                 *in_multi = false;
                 tx_queue.clear();
                 *tx_has_error = false;
@@ -1850,6 +1904,7 @@ async fn execute_tx_step(
                 false
             }
             Command::Reset => {
+                record_cmd_stat("RESET");
                 *in_multi = false;
                 tx_queue.clear();
                 *tx_has_error = false;
@@ -1879,8 +1934,11 @@ async fn execute_tx_step(
                 false
             }
             Command::Exec => {
+                record_cmd_stat("EXEC");
                 *in_multi = false;
                 if *tx_has_error {
+                    record_failed_stat("EXEC");
+                    record_error_stat("EXECABORT", None);
                     tx_queue.clear();
                     *tx_has_error = false;
                     unwatch_keys(router.port, client_id);
@@ -1893,6 +1951,8 @@ async fn execute_tx_step(
                     );
                     false
                 } else if router.cluster_enabled && tx_has_cross_slot(tx_queue) {
+                    record_failed_stat("EXEC");
+                    record_error_stat("CROSSSLOT", None);
                     tx_queue.clear();
                     *tx_has_error = false;
                     unwatch_keys(router.port, client_id);
@@ -2014,6 +2074,7 @@ async fn execute_tx_step(
     } else {
         match cmd {
             Command::Multi => {
+                record_cmd_stat("MULTI");
                 *in_multi = true;
                 tx_queue.clear();
                 *tx_has_error = false;
@@ -2021,19 +2082,27 @@ async fn execute_tx_step(
                 false
             }
             Command::Discard => {
+                record_cmd_stat("DISCARD");
+                record_failed_stat("DISCARD");
+                record_error_stat("ERR", None);
                 out_buf.extend_from_slice(b"-ERR DISCARD without MULTI\r\n");
                 false
             }
             Command::Exec => {
+                record_cmd_stat("EXEC");
+                record_failed_stat("EXEC");
+                record_error_stat("ERR", None);
                 out_buf.extend_from_slice(b"-ERR EXEC without MULTI\r\n");
                 false
             }
             Command::Watch(keys) => {
+                record_cmd_stat("WATCH");
                 watch_keys(router.port, client_id, &keys);
                 out_buf.extend_from_slice(b"+OK\r\n");
                 false
             }
             Command::Unwatch => {
+                record_cmd_stat("UNWATCH");
                 unwatch_keys(router.port, client_id);
                 out_buf.extend_from_slice(b"+OK\r\n");
                 false
@@ -2089,6 +2158,8 @@ pub async fn handle_connection(
             track_tx: Some(track_tx),
             raw_fd,
             omem: 0,
+            qbuf_len: 0,
+            qbuf_cap: 0,
             reply_mode: crate::resp::ClientReplyMode::On,
             is_monitor: false,
         },
@@ -2201,6 +2272,24 @@ pub async fn handle_connection(
                     }
                 }
 
+                let batch_bytes = buf.len();
+                let pause_cron = PAUSE_CRON.load(std::sync::atomic::Ordering::Relaxed);
+                if batch_bytes > 16384 {
+                    if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                        c.qbuf_cap = if pause_cron {
+                            c.qbuf_cap.max(batch_bytes)
+                        } else {
+                            batch_bytes
+                        };
+                    }
+                } else if !pause_cron {
+                    if let Some(c) = client_registry.borrow_mut().get_mut(&client_id)
+                        && c.qbuf_cap > 32768
+                    {
+                        c.qbuf_cap = 16384;
+                    }
+                }
+
                 // 1. Parse all complete commands currently in the buffer
                 commands.clear();
                 let mut should_quit = false;
@@ -2237,6 +2326,11 @@ pub async fn handle_connection(
                                     buf.set_len(buf.len() + drain_n as usize);
                                 }
                                 continue;
+                            }
+                            if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                                c.last_active = Instant::now();
+                                c.qbuf_len = buf.len();
+                                c.qbuf_cap = c.qbuf_cap.max(estimate_incomplete_qbuf_cap(&buf));
                             }
                             break;
                         }
@@ -2563,6 +2657,11 @@ pub async fn handle_connection(
                     commands.clear();
                 }
                 if buf.is_empty() {
+                    if let Some(c) = client_registry.borrow_mut().get_mut(&client_id)
+                        && c.qbuf_len > 0
+                    {
+                        c.qbuf_len = 0;
+                    }
                     let _ = buf.try_reclaim(READ_BUFFER_SIZE);
                 }
 
@@ -5246,8 +5345,352 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Xautoclaim { .. } => "XAUTOCLAIM",
         Command::Xackdel { .. } => "XACKDEL",
         Command::Xnack { .. } => "XNACK",
-        Command::CommandCount | Command::CommandList | Command::CommandGetkeys(_) => "COMMAND",
+        Command::CommandCount
+        | Command::CommandList
+        | Command::CommandListFiltered { .. }
+        | Command::CommandGetkeys(_)
+        | Command::CommandGetkeysAndFlags(_)
+        | Command::CommandInfo(_) => "COMMAND",
         Command::Unknown(_) => "UNKNOWN",
+    }
+}
+
+pub fn write_command_list(out: &mut Vec<u8>, filter: Option<(&str, &str)>) {
+    const ALL_CMD_NAMES: &[&str] = &[
+        "get",
+        "set",
+        "del",
+        "delex",
+        "exists",
+        "unlink",
+        "incr",
+        "decr",
+        "mget",
+        "mset",
+        "msetnx",
+        "msetex",
+        "hget",
+        "hset",
+        "hdel",
+        "hlen",
+        "hgetall",
+        "lpush",
+        "rpush",
+        "lpop",
+        "rpop",
+        "lrange",
+        "lmove",
+        "blmove",
+        "sadd",
+        "srem",
+        "smembers",
+        "sismember",
+        "zadd",
+        "zrem",
+        "zrange",
+        "zscore",
+        "zcard",
+        "xadd",
+        "xread",
+        "xreadgroup",
+        "xrange",
+        "xgroup",
+        "xack",
+        "xlen",
+        "xinfo",
+        "ping",
+        "echo",
+        "info",
+        "config",
+        "config|get",
+        "config|set",
+        "config|resetstat",
+        "config|rewrite",
+        "config|help",
+        "client",
+        "client|list",
+        "client|help",
+        "client|info",
+        "client|setname",
+        "client|getname",
+        "client|id",
+        "client|kill",
+        "cluster",
+        "cluster|help",
+        "memory",
+        "memory|usage",
+        "memory|help",
+        "eval",
+        "eval_ro",
+        "evalsha",
+        "evalsha_ro",
+        "script",
+        "script|kill",
+        "script|load",
+        "script|exists",
+        "script|flush",
+        "script|help",
+        "select",
+        "quit",
+        "publish",
+        "subscribe",
+        "psubscribe",
+        "wait",
+        "waitaof",
+        "readonly",
+        "readwrite",
+        "object",
+        "sort",
+        "sort_ro",
+    ];
+    match filter {
+        None => {
+            write_resp_array_header(out, ALL_CMD_NAMES.len());
+            for name in ALL_CMD_NAMES {
+                write_resp_bulk(out, name.as_bytes());
+            }
+        }
+        Some(("MODULE", _)) => {
+            write_resp_array_header(out, 0);
+        }
+        Some(("ACLCAT", cat)) => {
+            if cat.eq_ignore_ascii_case("scripting") {
+                const SCRIPTING_CMDS: &[&str] = &[
+                    "eval",
+                    "eval_ro",
+                    "evalsha",
+                    "evalsha_ro",
+                    "script",
+                    "script|kill",
+                    "script|load",
+                    "script|exists",
+                    "script|flush",
+                    "script|help",
+                ];
+                write_resp_array_header(out, SCRIPTING_CMDS.len());
+                for name in SCRIPTING_CMDS {
+                    write_resp_bulk(out, name.as_bytes());
+                }
+            } else {
+                write_resp_array_header(out, 0);
+            }
+        }
+        Some(("PATTERN", pat)) => {
+            let pat_lower = pat.to_lowercase();
+            let matched: Vec<&&str> = ALL_CMD_NAMES
+                .iter()
+                .filter(|name| crate::pubsub::glob_match(pat_lower.as_bytes(), name.as_bytes()))
+                .collect();
+            write_resp_array_header(out, matched.len());
+            for name in matched {
+                write_resp_bulk(out, name.as_bytes());
+            }
+        }
+        Some(_) => {
+            write_resp_array_header(out, 0);
+        }
+    }
+}
+
+pub fn write_command_getkeys(out: &mut Vec<u8>, cmd_args: &[Bytes]) {
+    if cmd_args.is_empty() {
+        out.extend_from_slice(b"-ERR Invalid number of arguments specified for command\r\n");
+        return;
+    }
+    match crate::resp::build_command(cmd_args.to_vec()) {
+        Ok(Some(Command::Unknown(_))) | Ok(None) => {
+            out.extend_from_slice(b"-ERR Invalid command specified\r\n");
+        }
+        Err(_) => {
+            out.extend_from_slice(b"-ERR Invalid arguments specified for command\r\n");
+        }
+        Ok(Some(inner_cmd)) => {
+            let mut keys = Vec::new();
+            for_each_cmd_key(&inner_cmd, |k| keys.push(Bytes::copy_from_slice(k)));
+            write_resp_array_header(out, keys.len());
+            for k in keys {
+                write_resp_bulk(out, &k);
+            }
+        }
+    }
+}
+
+pub fn write_command_getkeys_and_flags(out: &mut Vec<u8>, cmd_args: &[Bytes]) {
+    if cmd_args.is_empty() {
+        out.extend_from_slice(b"-ERR Invalid number of arguments specified for command\r\n");
+        return;
+    }
+    match crate::resp::build_command(cmd_args.to_vec()) {
+        Ok(Some(Command::Unknown(_))) | Ok(None) => {
+            out.extend_from_slice(b"-ERR Invalid command specified\r\n");
+        }
+        Err(_) => {
+            out.extend_from_slice(b"-ERR Invalid arguments specified for command\r\n");
+        }
+        Ok(Some(inner_cmd)) => {
+            let mut items: Vec<(Bytes, &'static [&'static str])> = Vec::new();
+            match &inner_cmd {
+                Command::Set {
+                    key,
+                    condition,
+                    get,
+                    ..
+                } => {
+                    let flags: &'static [&'static str] = if *get {
+                        &["RW", "access", "update"]
+                    } else if !matches!(condition, crate::resp::SetCondition::None) {
+                        &["RW", "update"]
+                    } else {
+                        &["OW", "update"]
+                    };
+                    items.push((key.clone(), flags));
+                }
+                Command::Mset(pairs) | Command::Msetex { pairs, .. } => {
+                    for (k, _) in pairs {
+                        items.push((k.clone(), &["OW", "update"]));
+                    }
+                }
+                Command::Lmove {
+                    source,
+                    destination,
+                    ..
+                }
+                | Command::Blmove {
+                    source,
+                    destination,
+                    ..
+                } => {
+                    items.push((source.clone(), &["RW", "access", "delete"]));
+                    items.push((destination.clone(), &["RW", "insert"]));
+                }
+                Command::Sort { key, store, .. } => {
+                    items.push((key.clone(), &["RO", "access"]));
+                    if let Some(dst) = store {
+                        items.push((dst.clone(), &["OW", "update"]));
+                    }
+                }
+                Command::Delex { key, condition } => {
+                    let flags: &'static [&'static str] = if condition.is_some() {
+                        &["RW", "delete"]
+                    } else {
+                        &["RM", "delete"]
+                    };
+                    items.push((key.clone(), flags));
+                }
+                _ => {
+                    let default_flags: &'static [&'static str] = if inner_cmd.is_write_command() {
+                        &["RW", "access", "update"]
+                    } else {
+                        &["RO", "access"]
+                    };
+                    for_each_cmd_key(&inner_cmd, |k| {
+                        items.push((Bytes::copy_from_slice(k), default_flags))
+                    });
+                }
+            }
+            write_resp_array_header(out, items.len());
+            for (k, flags) in items {
+                write_resp_array_header(out, 2);
+                write_resp_bulk(out, &k);
+                write_resp_array_header(out, flags.len());
+                for f in flags {
+                    write_resp_bulk(out, f.as_bytes());
+                }
+            }
+        }
+    }
+}
+
+pub fn write_command_info(out: &mut Vec<u8>, cmds: &[String]) {
+    let default_cmds = [
+        "get".to_string(),
+        "set".to_string(),
+        "eval".to_string(),
+        "zunionstore".to_string(),
+    ];
+    let list = if cmds.is_empty() {
+        &default_cmds[..]
+    } else {
+        cmds
+    };
+    write_resp_array_header(out, list.len());
+    for cmd_str in list {
+        let c = cmd_str.to_lowercase();
+        let is_invalid_sub = c.contains('|')
+            && !matches!(
+                c.as_str(),
+                "memory|usage"
+                    | "memory|help"
+                    | "config|get"
+                    | "config|set"
+                    | "config|resetstat"
+                    | "config|rewrite"
+                    | "config|help"
+                    | "client|list"
+                    | "client|help"
+                    | "client|info"
+                    | "client|setname"
+                    | "client|getname"
+                    | "client|id"
+                    | "client|kill"
+                    | "script|kill"
+                    | "script|load"
+                    | "script|exists"
+                    | "script|flush"
+                    | "script|help"
+                    | "cluster|help"
+            );
+        if is_invalid_sub || c == "unknown" || c == "nonexistent" {
+            write_resp_null(out);
+            continue;
+        }
+        let is_movable = matches!(
+            c.as_str(),
+            "zunionstore"
+                | "zinterstore"
+                | "zdiffstore"
+                | "zunion"
+                | "zinter"
+                | "zdiff"
+                | "zintercard"
+                | "xread"
+                | "xreadgroup"
+                | "eval"
+                | "eval_ro"
+                | "evalsha"
+                | "evalsha_ro"
+                | "fcall"
+                | "fcall_ro"
+                | "sort"
+                | "sort_ro"
+                | "migrate"
+                | "georadius"
+                | "georadiusbymember"
+                | "geosearchstore"
+                | "sintercard"
+                | "lmpop"
+                | "blmpop"
+                | "zmpop"
+                | "bzmpop"
+        );
+        write_resp_array_header(out, 10);
+        write_resp_bulk(out, c.as_bytes());
+        write_resp_integer(out, -1);
+        if is_movable {
+            write_resp_array_header(out, 2);
+            write_resp_bulk(out, b"write");
+            write_resp_bulk(out, b"movablekeys");
+        } else {
+            write_resp_array_header(out, 1);
+            write_resp_bulk(out, b"readonly");
+        }
+        write_resp_integer(out, 0);
+        write_resp_integer(out, 0);
+        write_resp_integer(out, 0);
+        write_resp_array_header(out, 0);
+        write_resp_array_header(out, 0);
+        write_resp_array_header(out, 0);
+        write_resp_array_header(out, 0);
     }
 }
 
@@ -7012,43 +7455,93 @@ async fn execute_command(
                 router.num_shards,
                 router.port,
             );
-            let info_str = match section.as_deref() {
-                Some(b"server") | Some(b"SERVER") => server_str,
-                Some(b"clients") | Some(b"CLIENTS") => clients_str,
-                Some(b"persistence") | Some(b"PERSISTENCE") => persistence_str,
-                Some(b"replication") | Some(b"REPLICATION") => hub.format_info_replication(),
-                Some(b"storage") | Some(b"STORAGE") | Some(b"tiered") | Some(b"TIERED") => {
-                    storage_str
+            let cpu_str = "# CPU\r\nused_cpu_sys:0.000000\r\nused_cpu_user:0.000000\r\nused_cpu_sys_children:0.000000\r\nused_cpu_user_children:0.000000\r\nused_cpu_sys_main_thread:0.000000\r\nused_cpu_user_main_thread:0.000000\r\n";
+            let repl_str = format!("# Replication\r\n{}", hub.format_info_replication());
+            let sec_raw = section.as_deref().unwrap_or(b"default");
+            let sec_text = String::from_utf8_lossy(sec_raw);
+            let tokens: Vec<String> = sec_text
+                .split_whitespace()
+                .map(|t| t.to_lowercase())
+                .collect();
+            let tokens = if tokens.is_empty() {
+                vec!["default".to_string()]
+            } else {
+                tokens
+            };
+            let info_str = if tokens.len() == 1
+                && matches!(tokens[0].as_str(), "metrics" | "prometheus")
+            {
+                crate::telemetry::format_prometheus_metrics(router.port, used_mem)
+            } else {
+                let mut expanded: Vec<&str> = Vec::new();
+                let mut push_unique = |name: &'static str| {
+                    if !expanded.contains(&name) {
+                        expanded.push(name);
+                    }
+                };
+                for tok in &tokens {
+                    match tok.as_str() {
+                        "default" => {
+                            for s in [
+                                "server",
+                                "clients",
+                                "memory",
+                                "persistence",
+                                "stats",
+                                "replication",
+                                "cpu",
+                                "storage",
+                                "errorstats",
+                            ] {
+                                push_unique(s);
+                            }
+                        }
+                        "all" | "everything" => {
+                            for s in [
+                                "server",
+                                "clients",
+                                "memory",
+                                "persistence",
+                                "stats",
+                                "replication",
+                                "cpu",
+                                "storage",
+                                "commandstats",
+                                "errorstats",
+                            ] {
+                                push_unique(s);
+                            }
+                        }
+                        "server" => push_unique("server"),
+                        "clients" => push_unique("clients"),
+                        "memory" => push_unique("memory"),
+                        "persistence" => push_unique("persistence"),
+                        "stats" => push_unique("stats"),
+                        "replication" => push_unique("replication"),
+                        "cpu" => push_unique("cpu"),
+                        "storage" | "tiered" => push_unique("storage"),
+                        "commandstats" => push_unique("commandstats"),
+                        "errorstats" => push_unique("errorstats"),
+                        _ => {}
+                    }
                 }
-                Some(b"memory") | Some(b"MEMORY") => memory_str,
-                Some(b"stats") | Some(b"STATS") => stats_str,
-                Some(b"commandstats") | Some(b"COMMANDSTATS") => cmdstat_str,
-                Some(b"errorstats") | Some(b"ERRORSTATS") => errorstat_str,
-                Some(b"metrics") | Some(b"METRICS") | Some(b"prometheus") | Some(b"PROMETHEUS") => {
-                    crate::telemetry::format_prometheus_metrics(router.port, used_mem)
+                let mut acc = String::new();
+                for sec_name in expanded {
+                    match sec_name {
+                        "server" => acc.push_str(&server_str),
+                        "clients" => acc.push_str(&clients_str),
+                        "memory" => acc.push_str(&memory_str),
+                        "persistence" => acc.push_str(&persistence_str),
+                        "stats" => acc.push_str(&stats_str),
+                        "replication" => acc.push_str(&repl_str),
+                        "cpu" => acc.push_str(cpu_str),
+                        "storage" => acc.push_str(&storage_str),
+                        "commandstats" => acc.push_str(&cmdstat_str),
+                        "errorstats" => acc.push_str(&errorstat_str),
+                        _ => {}
+                    }
                 }
-                _ => {
-                    format!(
-                        "{}\
-                         {}\
-                         {}\
-                         # Replication\r\n{}\
-                         {}\
-                         {}\
-                         {}\
-                         {}\
-                         {}",
-                        server_str,
-                        clients_str,
-                        persistence_str,
-                        hub.format_info_replication(),
-                        memory_str,
-                        stats_str,
-                        storage_str,
-                        cmdstat_str,
-                        errorstat_str
-                    )
-                }
+                acc
             };
             out.extend_from_slice(format!("${}\r\n", info_str.len()).as_bytes());
             out.extend_from_slice(info_str.as_bytes());
@@ -8111,8 +8604,9 @@ async fn execute_command(
                             .unwrap()
                             .is_blocked(c.id);
                         let flags = if c.is_monitor { "O" } else if is_blocked { "b" } else { "N" };
+                        let (qbuf, qbuf_free) = c.effective_qbuf(idle);
                         let info = format!(
-                            "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=20448 argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name={} lib-ver={} io-thread=0 tot-net-in=0 tot-net-out=0 tot-cmds=0 read-events=0 avg-pipeline-len-sum=0 avg-pipeline-len-cnt=0\n",
+                            "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf={} qbuf-free={} argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name={} lib-ver={} io-thread=0 tot-net-in=0 tot-net-out=0 tot-cmds=0 read-events=0 avg-pipeline-len-sum=0 avg-pipeline-len-cnt=0\n",
                             c.id,
                             c.addr,
                             router.port,
@@ -8120,6 +8614,8 @@ async fn execute_command(
                             age,
                             idle,
                             flags,
+                            qbuf,
+                            qbuf_free,
                             c.omem,
                             c.last_cmd.to_lowercase(),
                             c.lib_name.as_deref().unwrap_or(""),
@@ -8221,7 +8717,8 @@ async fn execute_command(
                     }
                     out.extend_from_slice(b"+OK\r\n");
                 }
-                ClientSubcommand::NoTouch(_) => {
+                ClientSubcommand::NoTouch(enabled) => {
+                    CLIENT_NO_TOUCH.store(enabled, std::sync::atomic::Ordering::Relaxed);
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 ClientSubcommand::Reply(mode) => {
@@ -13329,83 +13826,26 @@ async fn execute_command(
             false
         }
         Command::CommandList => {
-            let cmd_names = [
-                "get",
-                "set",
-                "del",
-                "exists",
-                "unlink",
-                "incr",
-                "decr",
-                "mget",
-                "mset",
-                "hget",
-                "hset",
-                "hdel",
-                "hlen",
-                "hgetall",
-                "lpush",
-                "rpush",
-                "lpop",
-                "rpop",
-                "lrange",
-                "sadd",
-                "srem",
-                "smembers",
-                "sismember",
-                "zadd",
-                "zrem",
-                "zrange",
-                "zscore",
-                "zcard",
-                "xadd",
-                "xread",
-                "xrange",
-                "xgroup",
-                "xack",
-                "xlen",
-                "xinfo",
-                "ping",
-                "echo",
-                "info",
-                "config",
-                "select",
-                "quit",
-                "publish",
-                "subscribe",
-                "psubscribe",
-                "wait",
-                "waitaof",
-                "readonly",
-                "readwrite",
-                "object",
-            ];
-            write_resp_array_header(out, cmd_names.len());
-            for name in cmd_names {
-                write_resp_bulk(out, name.as_bytes());
-            }
+            write_command_list(out, None);
+            false
+        }
+        Command::CommandListFiltered {
+            ref filter_type,
+            ref filter_val,
+        } => {
+            write_command_list(out, Some((filter_type.as_str(), filter_val.as_str())));
             false
         }
         Command::CommandGetkeys(ref cmd_args) => {
-            if cmd_args.is_empty() {
-                out.extend_from_slice(b"*0\r\n");
-            } else {
-                match crate::resp::build_command(cmd_args.clone()) {
-                    Ok(Some(inner_cmd)) => {
-                        let mut keys = Vec::new();
-                        for_each_cmd_key(&inner_cmd, |k| keys.push(Bytes::copy_from_slice(k)));
-                        out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
-                        for k in keys {
-                            write_resp_bulk(out, &k);
-                        }
-                    }
-                    _ => {
-                        out.extend_from_slice(
-                            b"-ERR The command has no key arguments or syntax error\r\n",
-                        );
-                    }
-                }
-            }
+            write_command_getkeys(out, cmd_args);
+            false
+        }
+        Command::CommandGetkeysAndFlags(ref cmd_args) => {
+            write_command_getkeys_and_flags(out, cmd_args);
+            false
+        }
+        Command::CommandInfo(ref cmds) => {
+            write_command_info(out, cmds);
             false
         }
         Command::Quit => {
@@ -13474,8 +13914,10 @@ async fn execute_command(
                     if let Some(key) = args.get(1) {
                         let shard_id = router.target_shard(key);
                         if shard_id == router.shard_id {
-                            if let Some(enc) = router.local_db.borrow_mut().object_encoding(key) {
-                                out.extend_from_slice(format!("+Value at:0x12345678 refcount:1 encoding:{} serializedlength:10 lru:0 lru_seconds_idle:0\r\n", enc).as_bytes());
+                            let mut db = router.local_db.borrow_mut();
+                            if let Some(enc) = db.object_encoding(key) {
+                                let (lru, idle) = db.lru_and_idletime(key).unwrap_or((0, 0));
+                                out.extend_from_slice(format!("+Value at:0x12345678 refcount:1 encoding:{} serializedlength:10 lru:{} lru_seconds_idle:{}\r\n", enc, lru, idle).as_bytes());
                             } else {
                                 out.extend_from_slice(b"-ERR no such key\r\n");
                             }
@@ -13485,6 +13927,11 @@ async fn execute_command(
                         }
                         return false;
                     }
+                } else if sub.eq_ignore_ascii_case(b"pause-cron") {
+                    let flag = args.get(1).map(|v| v.as_ref() == b"1").unwrap_or(false);
+                    PAUSE_CRON.store(flag, std::sync::atomic::Ordering::Relaxed);
+                    out.extend_from_slice(b"+OK\r\n");
+                    return false;
                 } else if sub.eq_ignore_ascii_case(b"set-allow-access-expired") {
                     let flag = args.get(1).map(|v| v.as_ref() == b"1").unwrap_or(false);
                     ALLOW_ACCESS_EXPIRED.store(flag, std::sync::atomic::Ordering::Relaxed);
@@ -15587,8 +16034,8 @@ pub fn execute_local_command(
                     }
                 }
                 crate::resp::ObjectSubcommand::Idletime(key) => {
-                    if db.exists(key) {
-                        out.extend_from_slice(b":0\r\n");
+                    if let Some(idle) = db.idletime(key) {
+                        write_resp_integer(out, idle as i64);
                     } else {
                         out.extend_from_slice(b"$-1\r\n");
                     }
@@ -15894,83 +16341,26 @@ pub fn execute_local_command(
             false
         }
         Command::CommandList => {
-            let cmd_names = [
-                "get",
-                "set",
-                "del",
-                "exists",
-                "unlink",
-                "incr",
-                "decr",
-                "mget",
-                "mset",
-                "hget",
-                "hset",
-                "hdel",
-                "hlen",
-                "hgetall",
-                "lpush",
-                "rpush",
-                "lpop",
-                "rpop",
-                "lrange",
-                "sadd",
-                "srem",
-                "smembers",
-                "sismember",
-                "zadd",
-                "zrem",
-                "zrange",
-                "zscore",
-                "zcard",
-                "xadd",
-                "xread",
-                "xrange",
-                "xgroup",
-                "xack",
-                "xlen",
-                "xinfo",
-                "ping",
-                "echo",
-                "info",
-                "config",
-                "select",
-                "quit",
-                "publish",
-                "subscribe",
-                "psubscribe",
-                "wait",
-                "waitaof",
-                "readonly",
-                "readwrite",
-                "object",
-            ];
-            write_resp_array_header(out, cmd_names.len());
-            for name in cmd_names {
-                write_resp_bulk(out, name.as_bytes());
-            }
+            write_command_list(out, None);
+            false
+        }
+        Command::CommandListFiltered {
+            filter_type,
+            filter_val,
+        } => {
+            write_command_list(out, Some((filter_type.as_str(), filter_val.as_str())));
             false
         }
         Command::CommandGetkeys(cmd_args) => {
-            if cmd_args.is_empty() {
-                out.extend_from_slice(b"*0\r\n");
-            } else {
-                match crate::resp::build_command(cmd_args.clone()) {
-                    Ok(Some(inner_cmd)) => {
-                        let mut keys = Vec::new();
-                        for_each_cmd_key(&inner_cmd, |k| keys.push(Bytes::copy_from_slice(k)));
-                        out.extend_from_slice(format!("*{}\r\n", keys.len()).as_bytes());
-                        for k in keys {
-                            write_resp_bulk(out, &k);
-                        }
-                    }
-                    _ => {
-                        out.extend_from_slice(
-                            b"-ERR The command has no key arguments or syntax error\r\n",
-                        );
-                    }
-                }
-            }
+            write_command_getkeys(out, cmd_args);
+            false
+        }
+        Command::CommandGetkeysAndFlags(cmd_args) => {
+            write_command_getkeys_and_flags(out, cmd_args);
+            false
+        }
+        Command::CommandInfo(cmds) => {
+            write_command_info(out, cmds);
             false
         }
         Command::Dbsize => {
@@ -19069,12 +19459,18 @@ pub fn execute_local_command(
                 if sub.eq_ignore_ascii_case(b"object") {
                     if let Some(key) = args.get(1) {
                         if let Some(enc) = db.object_encoding(key) {
-                            out.extend_from_slice(format!("+Value at:0x12345678 refcount:1 encoding:{} serializedlength:10 lru:0 lru_seconds_idle:0\r\n", enc).as_bytes());
+                            let (lru, idle) = db.lru_and_idletime(key).unwrap_or((0, 0));
+                            out.extend_from_slice(format!("+Value at:0x12345678 refcount:1 encoding:{} serializedlength:10 lru:{} lru_seconds_idle:{}\r\n", enc, lru, idle).as_bytes());
                         } else {
                             out.extend_from_slice(b"-ERR no such key\r\n");
                         }
                         return false;
                     }
+                } else if sub.eq_ignore_ascii_case(b"pause-cron") {
+                    let flag = args.get(1).map(|v| v.as_ref() == b"1").unwrap_or(false);
+                    PAUSE_CRON.store(flag, std::sync::atomic::Ordering::Relaxed);
+                    out.extend_from_slice(b"+OK\r\n");
+                    return false;
                 } else if sub.eq_ignore_ascii_case(b"set-allow-access-expired") {
                     let flag = args.get(1).map(|v| v.as_ref() == b"1").unwrap_or(false);
                     ALLOW_ACCESS_EXPIRED.store(flag, std::sync::atomic::Ordering::Relaxed);

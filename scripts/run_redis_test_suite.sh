@@ -89,6 +89,11 @@ CORE_SUITES=(
     "unit/latency-monitor"
     "unit/lazyfree"
     "unit/pause"
+    "unit/info-command"
+    "unit/introspection-2"
+    "unit/obuf-limits"
+    "unit/replybufsize"
+    "unit/querybuf"
 )
 
 if [ "$SUITE_ARG" = "all-types" ] || [ "$SUITE_ARG" = "all" ]; then

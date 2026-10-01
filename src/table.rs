@@ -1579,11 +1579,24 @@ const STASH_CAP: usize = 4; // 4 DashTable-style overflow stash slots per segmen
 const GLOBAL_IDX_SHIFT: usize = 11;
 const GLOBAL_IDX_MASK: usize = (1 << GLOBAL_IDX_SHIFT) - 1;
 
+#[inline(always)]
+pub fn coarse_now_secs() -> u32 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe {
+        libc::clock_gettime(libc::CLOCK_MONOTONIC_COARSE, &mut ts);
+    }
+    ts.tv_sec as u32
+}
+
 /// Fixed-size SwissTable segment with a 4-slot DashTable-style overflow stash,
 /// managed by `RudisFlatTable`'s extendible hashing directory.
 pub struct RawSegment {
     pub ctrl: Vec<u8>,
     pub slots: Vec<Option<RudisEntry>>,
+    pub last_access: Vec<u32>,
     pub capacity: usize,
     mask: usize,
     pub items: usize,
@@ -1599,11 +1612,13 @@ impl RawSegment {
         let ctrl = vec![EMPTY; cap + GROUP_SIZE];
         let mut slots = Vec::with_capacity(cap + STASH_CAP);
         slots.resize_with(cap + STASH_CAP, || None);
+        let last_access = vec![0u32; cap + STASH_CAP];
         let stash_bonus = if cap == SEG_CAP { STASH_CAP } else { 0 };
 
         Self {
             ctrl,
             slots,
+            last_access,
             capacity: cap,
             mask: cap - 1,
             items: 0,
@@ -1887,6 +1902,7 @@ impl RawSegment {
             let was_empty = self.ctrl[insert_idx] == EMPTY;
             self.set_ctrl(insert_idx, tag);
             self.slots[insert_idx] = Some(entry);
+            self.last_access[insert_idx] = coarse_now_secs();
             self.items += 1;
             if was_empty {
                 self.growth_left = self.growth_left.saturating_sub(1);
@@ -1896,15 +1912,17 @@ impl RawSegment {
             self.stash_ctrl[s] = tag;
             self.stash_count += 1;
             self.slots[insert_idx] = Some(entry);
+            self.last_access[insert_idx] = coarse_now_secs();
             self.items += 1;
             self.growth_left = self.growth_left.saturating_sub(1);
         }
     }
 
     #[inline(always)]
-    fn insert_migrated(&mut self, entry: RudisEntry, h: u64) {
+    fn insert_migrated(&mut self, entry: RudisEntry, h: u64, access: u32) {
         let (_, idx) = self.find_or_prepare_insert_raw(&entry.key, h);
         self.insert_at(entry, h, idx);
+        self.last_access[idx] = access;
     }
 
     #[inline(always)]
@@ -1963,9 +1981,12 @@ impl RawSegment {
 
     pub fn rebuild(&mut self, new_cap: usize) {
         let mut next = RawSegment::new(new_cap, self.local_depth);
-        for entry in self.slots.drain(..).flatten() {
-            let h = mix_hash(hash_key(&entry.key));
-            next.insert_migrated(entry, h);
+        let old_access = std::mem::take(&mut self.last_access);
+        for (i, opt_entry) in self.slots.drain(..).enumerate() {
+            if let Some(entry) = opt_entry {
+                let h = mix_hash(hash_key(&entry.key));
+                next.insert_migrated(entry, h, old_access.get(i).copied().unwrap_or(0));
+            }
         }
         *self = next;
     }
@@ -2044,12 +2065,16 @@ impl RudisFlatTable {
             let mut seg_one = RawSegment::new(SEG_CAP, d + 1);
             let bit_shift = SEG_SHIFT + (d as usize);
 
-            for entry in self.segments[seg_id].slots.drain(..).flatten() {
-                let h = mix_hash(hash_key(&entry.key));
-                if ((h >> bit_shift) & 1) == 0 {
-                    seg_zero.insert_migrated(entry, h);
-                } else {
-                    seg_one.insert_migrated(entry, h);
+            let old_access = std::mem::take(&mut self.segments[seg_id].last_access);
+            for (i, opt_entry) in self.segments[seg_id].slots.drain(..).enumerate() {
+                if let Some(entry) = opt_entry {
+                    let h = mix_hash(hash_key(&entry.key));
+                    let acc = old_access.get(i).copied().unwrap_or(0);
+                    if ((h >> bit_shift) & 1) == 0 {
+                        seg_zero.insert_migrated(entry, h, acc);
+                    } else {
+                        seg_one.insert_migrated(entry, h, acc);
+                    }
                 }
             }
 
@@ -2105,8 +2130,15 @@ impl RudisFlatTable {
         let dir_idx = self.dir_index(h);
         let seg_id = unsafe { *self.directory.get_unchecked(dir_idx) as usize };
         let seg = unsafe { self.segments.get_unchecked_mut(seg_id) };
-        seg.find_entry_mut(key, h)
-            .map(|(local_idx, entry)| ((seg_id << GLOBAL_IDX_SHIFT) | local_idx, entry))
+        let (local_idx, _) = seg.find_entry(key, h)?;
+        seg.last_access[local_idx] = coarse_now_secs();
+        let entry = unsafe {
+            seg.slots
+                .get_unchecked_mut(local_idx)
+                .as_mut()
+                .unwrap_unchecked()
+        };
+        Some(((seg_id << GLOBAL_IDX_SHIFT) | local_idx, entry))
     }
 
     #[inline(always)]
@@ -2158,6 +2190,7 @@ impl RudisFlatTable {
         let local_idx = global_idx & GLOBAL_IDX_MASK;
 
         if existing.is_some() {
+            self.segments[seg_id].last_access[local_idx] = coarse_now_secs();
             self.segments[seg_id].slots[local_idx].replace(entry)
         } else {
             if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2236,11 +2269,31 @@ impl RudisFlatTable {
     pub fn get_slot_mut(&mut self, global_idx: usize) -> Option<&mut RudisEntry> {
         let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
         let local_idx = global_idx & GLOBAL_IDX_MASK;
+        let seg = self.segments.get_mut(seg_id)?;
+        let entry = seg.slots.get_mut(local_idx)?.as_mut()?;
+        seg.last_access[local_idx] = coarse_now_secs();
+        Some(entry)
+    }
+
+    #[inline(always)]
+    pub fn touch_slot(&mut self, global_idx: usize) {
+        let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
+        let local_idx = global_idx & GLOBAL_IDX_MASK;
+        if let Some(seg) = self.segments.get_mut(seg_id)
+            && let Some(acc) = seg.last_access.get_mut(local_idx)
+        {
+            *acc = coarse_now_secs();
+        }
+    }
+
+    #[inline(always)]
+    pub fn get_slot_last_access(&self, global_idx: usize) -> u32 {
+        let seg_id = global_idx >> GLOBAL_IDX_SHIFT;
+        let local_idx = global_idx & GLOBAL_IDX_MASK;
         self.segments
-            .get_mut(seg_id)?
-            .slots
-            .get_mut(local_idx)?
-            .as_mut()
+            .get(seg_id)
+            .and_then(|s| s.last_access.get(local_idx).copied())
+            .unwrap_or(0)
     }
 
     #[inline]
@@ -2338,9 +2391,12 @@ impl RudisFlatTable {
             let target_cap = optimal_cap.clamp(64, SEG_CAP);
             let mut single = RawSegment::new(target_cap, 0);
             for seg in self.segments.iter_mut() {
-                for entry in seg.slots.drain(..).flatten() {
-                    let h = mix_hash(hash_key(&entry.key));
-                    single.insert_migrated(entry, h);
+                let old_access = std::mem::take(&mut seg.last_access);
+                for (i, opt_entry) in seg.slots.drain(..).enumerate() {
+                    if let Some(entry) = opt_entry {
+                        let h = mix_hash(hash_key(&entry.key));
+                        single.insert_migrated(entry, h, old_access.get(i).copied().unwrap_or(0));
+                    }
                 }
             }
             self.segments.clear();
@@ -2922,12 +2978,16 @@ impl RudisTable {
                 RudisValue::Cooled { val, .. } => val.as_ref(),
                 other => other,
             };
-            match val_ref {
+            let res = match val_ref {
                 RudisValue::String(b) => Ok(Some(b.clone())),
                 RudisValue::Int(n) => Ok(Some(Self::format_i64(*n))),
                 RudisValue::HyperLogLog(regs) => Ok(Some(Bytes::copy_from_slice(&regs[..]))),
                 _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+            };
+            if !crate::connection::CLIENT_NO_TOUCH.load(std::sync::atomic::Ordering::Relaxed) {
+                self.table.touch_slot(idx);
             }
+            res
         } else {
             Ok(None)
         }
@@ -2962,7 +3022,7 @@ impl RudisTable {
                 RudisValue::Cooled { val, .. } => val.as_ref(),
                 other => other,
             };
-            match val_ref {
+            let res = match val_ref {
                 RudisValue::String(b) => Ok(Some(crate::shard::CompactResp::from_bulk(b))),
                 RudisValue::Int(n) => {
                     let formatted = Self::format_i64(*n);
@@ -2972,7 +3032,11 @@ impl RudisTable {
                     &Bytes::copy_from_slice(&regs[..]),
                 ))),
                 _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+            };
+            if !crate::connection::CLIENT_NO_TOUCH.load(std::sync::atomic::Ordering::Relaxed) {
+                self.table.touch_slot(idx);
             }
+            res
         } else {
             Ok(None)
         }
@@ -2995,7 +3059,7 @@ impl RudisTable {
                 RudisValue::Cooled { val, .. } => val.as_ref(),
                 other => other,
             };
-            match val_ref {
+            let res = match val_ref {
                 RudisValue::String(b) => {
                     crate::connection::write_resp_bulk(out, b);
                     Ok(true)
@@ -3010,7 +3074,11 @@ impl RudisTable {
                     Ok(true)
                 }
                 _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
+            };
+            if !crate::connection::CLIENT_NO_TOUCH.load(std::sync::atomic::Ordering::Relaxed) {
+                self.table.touch_slot(idx);
             }
+            res
         } else {
             Ok(false)
         }
@@ -3856,10 +3924,37 @@ impl RudisTable {
             if let Some(idx) = self.table.find(k, h)
                 && !self.check_expired_slot(idx)
             {
+                self.table.touch_slot(idx);
                 count += 1;
             }
         }
         count
+    }
+
+    pub fn idletime(&mut self, key: &[u8]) -> Option<u64> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h)
+            && !self.check_expired_slot(idx)
+        {
+            let last = self.table.get_slot_last_access(idx);
+            let now = coarse_now_secs();
+            Some(now.saturating_sub(last) as u64)
+        } else {
+            None
+        }
+    }
+
+    pub fn lru_and_idletime(&mut self, key: &[u8]) -> Option<(u32, u64)> {
+        let h = hash_key(key);
+        if let Some(idx) = self.table.find(key, h)
+            && !self.check_expired_slot(idx)
+        {
+            let last = self.table.get_slot_last_access(idx);
+            let now = coarse_now_secs();
+            Some((last, now.saturating_sub(last) as u64))
+        } else {
+            None
+        }
     }
 
     pub fn rename(&mut self, src: &[u8], dst: Bytes, nx: bool) -> Result<bool, &'static str> {
