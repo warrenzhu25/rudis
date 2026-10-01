@@ -2383,6 +2383,7 @@ pub fn get_lazyfreed_objects() -> u64 {
 #[inline]
 pub fn inc_expired_keys() {
     EXPIRED_KEYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::connection::record_latency_event("expire-cycle", 25);
 }
 
 #[inline]
@@ -2393,6 +2394,7 @@ pub fn get_expired_keys() -> u64 {
 #[inline]
 pub fn inc_expired_keys_active() {
     EXPIRED_KEYS_ACTIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::connection::record_latency_event("expire-cycle", 25);
 }
 
 #[inline]
@@ -2768,8 +2770,27 @@ impl RudisTable {
         freed
     }
 
+    pub fn is_lazyfree_worthy(&self, key: &[u8]) -> bool {
+        let h = hash_key(key);
+        if let Some((_, entry)) = self.table.find_entry(key, h) {
+            match &entry.val {
+                RudisValue::Set(s) => s.len() > 64,
+                RudisValue::List(l) => l.len() > 64,
+                RudisValue::Hash(h) => h.len() > 64,
+                RudisValue::ZSet(z) => z.len() > 64,
+                RudisValue::Stream(s) => s.len() > 64 || !s.groups.is_empty(),
+                _ => false,
+            }
+        } else {
+            false
+        }
+    }
+
     #[inline]
     fn expire_slot(&mut self, slot_idx: usize) {
+        if crate::connection::is_client_paused().is_some() {
+            return;
+        }
         if let Some(removed) = self.table.remove(slot_idx) {
             if removed.expire_at.is_some() {
                 self.num_expires = self.num_expires.saturating_sub(1);
@@ -3591,7 +3612,7 @@ impl RudisTable {
         for i in 0..bound {
             let cur = (start + i) % bound;
             let idx = self.table.cursor_to_global_idx(cur);
-            if self.check_expired_slot(idx) {
+            if crate::connection::is_client_paused().is_none() && self.check_expired_slot(idx) {
                 continue;
             }
             if let Some(entry) = self.table.get_slot(idx) {
@@ -7937,6 +7958,7 @@ impl RudisTable {
                                 hash: m_hash,
                                 member: member.clone(),
                             });
+                            self.used_memory += 32;
                             return Ok(1);
                         }
                         RudisSet::Small(v) if v.is_empty() => {
@@ -7946,10 +7968,14 @@ impl RudisTable {
                                 hash: m_hash,
                                 member: member.clone(),
                             });
+                            self.used_memory += 32;
                             return Ok(1);
                         }
                         set => {
                             let added = if set.insert_slice(member) { 1 } else { 0 };
+                            if added > 0 {
+                                self.used_memory += 32;
+                            }
                             return Ok(added);
                         }
                     },
@@ -7975,6 +8001,7 @@ impl RudisTable {
             val: RudisValue::Set(Box::new(RudisSet::Small(v))),
             expire_at: None,
         };
+        self.used_memory += key.len() + 32 + 64;
         self.table.insert_prepared(entry, h, insert_idx);
         Ok(1)
     }
@@ -8005,6 +8032,9 @@ impl RudisTable {
                     RudisValue::Set(set) => {
                         if members.len() == 1 {
                             let added = if set.insert_slice(&members[0]) { 1 } else { 0 };
+                            if added > 0 {
+                                self.used_memory += 32;
+                            }
                             return Ok(added);
                         }
                         let mut added = 0;
@@ -8012,6 +8042,9 @@ impl RudisTable {
                             if set.insert_slice(m) {
                                 added += 1;
                             }
+                        }
+                        if added > 0 {
+                            self.used_memory += added * 32;
                         }
                         return Ok(added);
                     }
@@ -8069,6 +8102,7 @@ impl RudisTable {
             val: RudisValue::Set(Box::new(set)),
             expire_at: None,
         };
+        self.used_memory += key.len() + added * 32 + 64;
         self.table.insert_prepared(entry, h, insert_idx);
         Ok(added)
     }
@@ -8107,7 +8141,12 @@ impl RudisTable {
             };
 
             if is_empty && let Some(entry) = self.table.remove(idx) {
+                self.used_memory = self
+                    .used_memory
+                    .saturating_sub(entry.key.len() + removed_count * 32 + 64);
                 self.recycle_value(entry.val);
+            } else if removed_count > 0 {
+                self.used_memory = self.used_memory.saturating_sub(removed_count * 32);
             }
             Ok(removed_count)
         } else {
@@ -10451,6 +10490,9 @@ impl RudisTable {
     /// Active sampling cycle: samples up to 20 slots starting from cursor and evicts expired keys
     /// and expired hash fields (`HEXPIRE`).
     pub fn active_expire_cycle(&mut self) -> usize {
+        if crate::connection::is_client_paused().is_some() {
+            return 0;
+        }
         let mut expired_count = 0;
         if !self.hash_field_expires.is_empty() {
             expired_count += self.evict_expired_hash_fields_sample(8);

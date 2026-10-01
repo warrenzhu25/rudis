@@ -171,7 +171,7 @@ pub enum ClientSubcommand {
         client_id: u64,
         unblock_type: crate::block::ClientUnblockType,
     },
-    Pause(u64),
+    Pause(u64, bool),
     Unpause,
     NoTouch(bool),
     SetInfo {
@@ -195,6 +195,7 @@ pub enum LatencySubcommand {
     Doctor,
     Reset(Vec<String>),
     Graph(String),
+    Histogram(Vec<String>),
     Help,
 }
 
@@ -2332,7 +2333,7 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
                     if cmd_bytes.eq_ignore_ascii_case(b"UNLINK") && num_args >= 2 {
                         let (k_start, k_len) = offsets[1];
                         if num_args == 2 {
-                            return Ok(Some(Command::Del(smallvec![
+                            return Ok(Some(Command::Unlink(smallvec![
                                 frame.slice(k_start..k_start + k_len),
                             ])));
                         }
@@ -2340,7 +2341,7 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
                         for &(k_s, k_l) in offsets[1..num_args].iter() {
                             keys.push(frame.slice(k_s..k_s + k_l));
                         }
-                        return Ok(Some(Command::Del(keys)));
+                        return Ok(Some(Command::Unlink(keys)));
                     }
                 }
                 8 => {
@@ -2714,7 +2715,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
         }
         "SET" | "PUT" => {
             if args.len() < 3 {
-                return Err("wrong number of arguments for 'set'/'put' command".to_string());
+                return Err("wrong number of arguments for 'set' command".to_string());
             }
             let mut expire_in = None;
             let mut condition = SetCondition::None;
@@ -3098,7 +3099,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
         }
         "DEL" | "DELETE" | "UNLINK" => {
             if args.len() < 2 {
-                return Err("wrong number of arguments for 'del' command".to_string());
+                return Err(format!(
+                    "wrong number of arguments for '{}' command",
+                    cmd_name.to_lowercase()
+                ));
             }
             if cmd_name == "DELETE" {
                 let noreply = args.len() > 2 && args[2].eq_ignore_ascii_case(b"noreply");
@@ -3106,6 +3110,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     key: args[1].clone(),
                     noreply,
                 }))
+            } else if cmd_name == "UNLINK" {
+                args.remove(0);
+                Ok(Some(Command::Unlink(SmallVec::from_vec(args))))
             } else {
                 args.remove(0);
                 Ok(Some(Command::Del(SmallVec::from_vec(args))))
@@ -3884,16 +3891,30 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     })))
                 }
                 "PAUSE" => {
-                    if args.len() < 3 {
+                    if args.len() < 3 || args.len() > 4 {
                         return Err(
-                            "wrong number of arguments for 'client pause' command".to_string()
+                            "wrong number of arguments for 'client|pause' command".to_string()
                         );
                     }
                     let timeout: u64 = std::str::from_utf8(&args[2])
-                        .map_err(|_| "value is not an integer or out of range".to_string())?
+                        .map_err(|_| "timeout is not an integer or out of range".to_string())?
                         .parse()
-                        .map_err(|_| "value is not an integer or out of range".to_string())?;
-                    Ok(Some(Command::Client(ClientSubcommand::Pause(timeout))))
+                        .map_err(|_| "timeout is not an integer or out of range".to_string())?;
+                    let write_only = if args.len() == 4 {
+                        let mode = String::from_utf8_lossy(&args[3]).to_uppercase();
+                        if mode == "WRITE" {
+                            true
+                        } else if mode == "ALL" {
+                            false
+                        } else {
+                            return Err("CLIENT PAUSE mode must be WRITE or ALL".to_string());
+                        }
+                    } else {
+                        false
+                    };
+                    Ok(Some(Command::Client(ClientSubcommand::Pause(
+                        timeout, write_only,
+                    ))))
                 }
                 "UNPAUSE" => Ok(Some(Command::Client(ClientSubcommand::Unpause))),
                 "NO-TOUCH" => {
@@ -5804,7 +5825,21 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     };
                     Ok(Some(Command::Latency(LatencySubcommand::Graph(ev))))
                 }
-                "HELP" => Ok(Some(Command::Latency(LatencySubcommand::Help))),
+                "HISTOGRAM" => {
+                    let cmds = args[2..]
+                        .iter()
+                        .map(|b| String::from_utf8_lossy(b).to_string())
+                        .collect();
+                    Ok(Some(Command::Latency(LatencySubcommand::Histogram(cmds))))
+                }
+                "HELP" => {
+                    if args.len() > 2 {
+                        return Err(
+                            "wrong number of arguments for 'latency|help' command".to_string()
+                        );
+                    }
+                    Ok(Some(Command::Latency(LatencySubcommand::Help)))
+                }
                 _ => Ok(Some(Command::Unknown(format!("LATENCY {}", sub)))),
             }
         }
@@ -14399,12 +14434,12 @@ mod tests {
         let mut buf = BytesMut::from("*3\r\n$6\r\nUNLINK\r\n$2\r\nk1\r\n$2\r\nk2\r\n");
         let cmd = parse_command(&mut buf).unwrap().unwrap();
         match cmd {
-            Command::Del(keys) => {
+            Command::Unlink(keys) => {
                 assert_eq!(keys.len(), 2);
                 assert_eq!(keys[0], Bytes::from_static(b"k1"));
                 assert_eq!(keys[1], Bytes::from_static(b"k2"));
             }
-            _ => panic!("Expected Del command for UNLINK"),
+            _ => panic!("Expected Unlink command for UNLINK"),
         }
 
         // READONLY

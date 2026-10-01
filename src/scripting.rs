@@ -77,6 +77,31 @@ pub struct FunctionLib {
 static FUNCTION_LIBS: LazyLock<RwLock<HashMap<String, FunctionLib>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+pub fn is_script_read_only(script: &[u8]) -> bool {
+    if let Ok(s) = std::str::from_utf8(script)
+        && let Some(rest) = s.strip_prefix("#!")
+    {
+        let header = rest.lines().next().unwrap_or("");
+        for token in header.split_whitespace() {
+            if let Some(flags_str) = token.strip_prefix("flags=") {
+                if flags_str.split(',').any(|f| f == "no-writes") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+pub fn is_sha_read_only(sha: &[u8]) -> bool {
+    if let Ok(sha_str) = std::str::from_utf8(sha)
+        && let Some(script) = get_script(sha_str)
+    {
+        return is_script_read_only(script.as_bytes());
+    }
+    false
+}
+
 pub fn is_function_read_only(name: &str) -> bool {
     let cache = FUNCTION_LIBS.read().unwrap();
     for l in cache.values() {
@@ -677,7 +702,7 @@ fn format_lua_error(s: &str) -> String {
 }
 
 fn format_eval_error(err: &str, sha: &str) -> String {
-    let mut msg = err.trim_start();
+    let mut msg = err.lines().next().unwrap_or(err).trim_start();
     if let Some(pos) = msg.find("runtime error: ") {
         msg = &msg[pos + 15..];
     }
@@ -2102,7 +2127,13 @@ fn register_redis_module(
             ));
         }
         let cmd_name = crate::connection::get_cmd_name(&cmd);
-        if read_only && cmd.is_write_command() {
+        if read_only
+            && (cmd.is_write_command()
+                || matches!(
+                    cmd,
+                    Command::Publish { .. } | Command::Spublish { .. } | Command::Pfcount { .. }
+                ))
+        {
             crate::connection::record_rejected_stat(cmd_name);
             crate::connection::record_error_stat("ERR", None);
             SCRIPT_RECORDED_ERROR.set(true);
@@ -2239,7 +2270,13 @@ fn register_redis_module(
             return Ok(Value::Table(tbl));
         }
         let cmd_name = crate::connection::get_cmd_name(&cmd);
-        if read_only && cmd.is_write_command() {
+        if read_only
+            && (cmd.is_write_command()
+                || matches!(
+                    cmd,
+                    Command::Publish { .. } | Command::Spublish { .. } | Command::Pfcount { .. }
+                ))
+        {
             crate::connection::record_rejected_stat(cmd_name);
             crate::connection::record_error_stat("ERR", None);
             SCRIPT_RECORDED_ERROR.set(true);

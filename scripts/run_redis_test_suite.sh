@@ -84,6 +84,11 @@ CORE_SUITES=(
     "unit/limits"
     "unit/scripting"
     "unit/functions"
+    "unit/pubsubshard"
+    "unit/slowlog"
+    "unit/latency-monitor"
+    "unit/lazyfree"
+    "unit/pause"
 )
 
 if [ "$SUITE_ARG" = "all-types" ] || [ "$SUITE_ARG" = "all" ]; then

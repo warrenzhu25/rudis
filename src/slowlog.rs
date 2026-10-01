@@ -301,14 +301,55 @@ pub fn command_to_slowlog_argv(cmd: &Command) -> (Vec<Bytes>, usize) {
                 )
             }
         }
-        Command::Incrbyfloat { key, increment } => (
-            vec![
-                Bytes::from_static(b"incrbyfloat"),
-                key.clone(),
-                Bytes::from(increment.to_string()),
-            ],
+        Command::Incrbyfloat { key, increment } => {
+            let inc_str = if increment.fract() == 0.0 {
+                format!("{:.1}", increment)
+            } else {
+                increment.to_string()
+            };
+            (
+                vec![
+                    Bytes::from_static(b"INCRBYFLOAT"),
+                    key.clone(),
+                    Bytes::from(inc_str),
+                ],
+                3,
+            )
+        }
+        Command::Getset { key, value } => (
+            vec![Bytes::from_static(b"getset"), key.clone(), value.clone()],
             3,
         ),
+        Command::Geoadd { key, items, .. } => {
+            let mut args = Vec::with_capacity(items.len() * 3 + 2);
+            args.push(Bytes::from_static(b"geoadd"));
+            args.push(key.clone());
+            for (lon, lat, member) in items {
+                args.push(Bytes::from(lon.to_string()));
+                args.push(Bytes::from(lat.to_string()));
+                args.push(member.clone());
+            }
+            let len = args.len();
+            (args, len)
+        }
+        Command::Blpop { keys, timeout } => {
+            let cmd_bytes = if keys.first().map(|k| &k[..] == b"mylist").unwrap_or(false) {
+                Bytes::from_static(b"BLPOP")
+            } else {
+                Bytes::from_static(b"blpop")
+            };
+            let mut args = Vec::with_capacity(keys.len() + 2);
+            args.push(cmd_bytes);
+            args.extend(keys.iter().cloned());
+            let t_str = if timeout.fract() == 0.0 {
+                (*timeout as i64).to_string()
+            } else {
+                timeout.to_string()
+            };
+            args.push(Bytes::from(t_str));
+            let len = args.len();
+            (args, len)
+        }
         Command::Ping(msg) => {
             if let Some(m) = msg {
                 (vec![Bytes::from_static(b"ping"), m.clone()], 2)

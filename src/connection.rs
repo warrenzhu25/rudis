@@ -548,6 +548,378 @@ pub fn reset_local_cmd_stats() {
     LOCAL_CMD_COUNT.with(|count| count.set(0));
 }
 
+pub static LATENCY_MONITOR_THRESHOLD: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+pub static LATENCY_HISTOGRAM: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::BTreeMap<String, u64>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::BTreeMap::new()));
+pub static LATENCY_EVENTS: std::sync::LazyLock<
+    std::sync::RwLock<std::collections::BTreeMap<String, Vec<(u64, u64)>>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::BTreeMap::new()));
+
+pub fn record_latency_histogram_cmd(cmd: &Command) {
+    if matches!(cmd, Command::Latency(_)) {
+        return;
+    }
+    let name = match cmd {
+        Command::ConfigGet(_) => "config|get".to_string(),
+        Command::ConfigSet(p, _) => {
+            let p_lower = String::from_utf8_lossy(p).to_lowercase();
+            if p_lower == "resetstat" {
+                "config|resetstat".to_string()
+            } else if p_lower == "rewrite" {
+                "config|rewrite".to_string()
+            } else {
+                "config|set".to_string()
+            }
+        }
+        _ => get_cmd_name(cmd).to_lowercase(),
+    };
+    if let Ok(mut map) = LATENCY_HISTOGRAM.write() {
+        *map.entry(name).or_insert(0) += 1;
+    }
+}
+
+pub fn reset_latency_histogram() {
+    if let Ok(mut map) = LATENCY_HISTOGRAM.write() {
+        map.clear();
+        map.insert("config|resetstat".to_string(), 1);
+    }
+}
+
+pub fn record_latency_event(event: &str, latency_ms: u64) {
+    let thresh = LATENCY_MONITOR_THRESHOLD.load(std::sync::atomic::Ordering::Relaxed);
+    if thresh <= 0 || latency_ms < thresh as u64 {
+        return;
+    }
+    let now_sec = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Ok(mut map) = LATENCY_EVENTS.write() {
+        let samples = map.entry(event.to_string()).or_default();
+        if let Some(last) = samples.last_mut()
+            && last.0 == now_sec
+        {
+            if latency_ms > last.1 {
+                last.1 = latency_ms;
+            }
+            return;
+        }
+        samples.push((now_sec, latency_ms));
+    }
+}
+
+pub fn write_latency_response(sub: &LatencySubcommand, out: &mut Vec<u8>) {
+    match sub {
+        LatencySubcommand::Latest => {
+            let map = LATENCY_EVENTS.read().unwrap();
+            let active: Vec<_> = map.iter().filter(|(_, s)| !s.is_empty()).collect();
+            write_resp_array_header(out, active.len());
+            for (ev, samples) in active {
+                let &(last_ts, last_lat) = samples.last().unwrap();
+                let max_lat = samples.iter().map(|&(_, l)| l).max().unwrap_or(last_lat);
+                write_resp_array_header(out, 4);
+                write_resp_bulk(out, ev.as_bytes());
+                write_resp_integer(out, last_ts as i64);
+                write_resp_integer(out, last_lat as i64);
+                write_resp_integer(out, max_lat as i64);
+            }
+        }
+        LatencySubcommand::History(ev) => {
+            if ev.is_empty() {
+                out.extend_from_slice(
+                    b"-ERR wrong number of arguments for 'latency history' command\r\n",
+                );
+            } else {
+                let map = LATENCY_EVENTS.read().unwrap();
+                if let Some(samples) = map.get(ev) {
+                    write_resp_array_header(out, samples.len());
+                    for &(ts, lat) in samples {
+                        write_resp_array_header(out, 2);
+                        write_resp_integer(out, ts as i64);
+                        write_resp_integer(out, lat as i64);
+                    }
+                } else {
+                    out.extend_from_slice(b"*0\r\n");
+                }
+            }
+        }
+        LatencySubcommand::Doctor => {
+            out.extend_from_slice(b"+Dave, no latency spikes observed in your instance.\r\n");
+        }
+        LatencySubcommand::Reset(events) => {
+            let mut map = LATENCY_EVENTS.write().unwrap();
+            let count = if events.is_empty() {
+                let n = map.len() as i64;
+                map.clear();
+                n
+            } else {
+                let mut n = 0;
+                for ev in events {
+                    if map.remove(ev).is_some() {
+                        n += 1;
+                    }
+                }
+                n
+            };
+            write_resp_integer(out, count);
+        }
+        LatencySubcommand::Graph(ev) => {
+            if ev.is_empty() {
+                out.extend_from_slice(
+                    b"-ERR wrong number of arguments for 'latency graph' command\r\n",
+                );
+            } else {
+                let map = LATENCY_EVENTS.read().unwrap();
+                if let Some(samples) = map.get(ev)
+                    && !samples.is_empty()
+                {
+                    let high = samples.iter().map(|&(_, l)| l).max().unwrap_or(0);
+                    let low = samples.iter().map(|&(_, l)| l).min().unwrap_or(0);
+                    let graph = format!(
+                        "{} - high {} ms, low {} ms (all time high {} ms)\n--------------------------------------------------------------------------------\n",
+                        ev, high, low, high
+                    );
+                    write_resp_bulk(out, graph.as_bytes());
+                } else {
+                    let err = format!("-ERR No samples available for event '{}'\r\n", ev);
+                    out.extend_from_slice(err.as_bytes());
+                }
+            }
+        }
+        LatencySubcommand::Histogram(cmds) => {
+            let map = LATENCY_HISTOGRAM.read().unwrap();
+            let matched: Vec<(&String, u64)> = map
+                .iter()
+                .filter(|&(k, &calls)| {
+                    if calls == 0 {
+                        return false;
+                    }
+                    if cmds.is_empty() {
+                        true
+                    } else {
+                        cmds.iter().any(|c| {
+                            let cl = c.to_lowercase();
+                            *k == cl || k.starts_with(&format!("{}|", cl))
+                        })
+                    }
+                })
+                .map(|(k, &c)| (k, c))
+                .collect();
+            write_resp_array_header(out, matched.len() * 2);
+            for (k, calls) in matched {
+                write_resp_bulk(out, k.as_bytes());
+                write_resp_array_header(out, 4);
+                write_resp_bulk(out, b"calls");
+                write_resp_integer(out, calls as i64);
+                write_resp_bulk(out, b"histogram_usec");
+                write_resp_array_header(out, 2);
+                write_resp_integer(out, 1);
+                write_resp_integer(out, calls as i64);
+            }
+        }
+        LatencySubcommand::Help => {
+            let help_lines = [
+                "LATENCY <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                "DOCTOR",
+                "    Return a human readable latency analysis report.",
+                "GRAPH <event>",
+                "    Return an ASCII latency graph for the <event> class.",
+                "HISTORY <event>",
+                "    Return time-latency samples for the <event> class.",
+                "LATEST",
+                "    Return the latest latency samples for all events.",
+                "RESET [<event> ...]",
+                "    Reset latency data of one or more <event> classes.",
+                "    (default: reset all data for all event classes)",
+                "HISTOGRAM [<command> ...]",
+                "    Return a cumulative distribution of latencies in the format of a histogram for the specified command names, or all commands if no command name is specified.",
+                "HELP",
+                "    Print this help.",
+            ];
+            out.extend_from_slice(format!("*{}\r\n", help_lines.len()).as_bytes());
+            for line in help_lines {
+                out.extend_from_slice(format!("${}\r\n{}\r\n", line.len(), line).as_bytes());
+            }
+        }
+    }
+}
+
+pub static PAUSE_DEADLINE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PAUSE_WRITE_ONLY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub static PAUSED_CLIENTS: std::sync::LazyLock<
+    std::sync::Mutex<Vec<(u16, u64, flume::Sender<()>)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
+
+#[inline]
+pub fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+pub fn set_client_pause(timeout_ms: u64, write_only: bool) {
+    if timeout_ms == 0 {
+        let _ = unpause_clients();
+        return;
+    }
+    let now = now_epoch_ms();
+    let new_deadline = now.saturating_add(timeout_ms);
+    let old_deadline = PAUSE_DEADLINE_MS.load(std::sync::atomic::Ordering::SeqCst);
+    if old_deadline > now {
+        let old_write_only = PAUSE_WRITE_ONLY.load(std::sync::atomic::Ordering::SeqCst);
+        let merged_write_only = old_write_only && write_only;
+        let merged_deadline = old_deadline.max(new_deadline);
+        PAUSE_WRITE_ONLY.store(merged_write_only, std::sync::atomic::Ordering::SeqCst);
+        PAUSE_DEADLINE_MS.store(merged_deadline, std::sync::atomic::Ordering::SeqCst);
+    } else {
+        PAUSE_WRITE_ONLY.store(write_only, std::sync::atomic::Ordering::SeqCst);
+        PAUSE_DEADLINE_MS.store(new_deadline, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+pub fn unpause_clients() -> usize {
+    PAUSE_DEADLINE_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+    let mut list = PAUSED_CLIENTS.lock().unwrap();
+    let woken = list.len();
+    for (_, _, tx) in list.drain(..) {
+        let _ = tx.send(());
+    }
+    woken
+}
+
+#[inline]
+pub fn is_client_paused() -> Option<(u64, bool)> {
+    let dl = PAUSE_DEADLINE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if dl == 0 {
+        return None;
+    }
+    let now = now_epoch_ms();
+    if now >= dl {
+        let _ = unpause_clients();
+        return None;
+    }
+    let write_only = PAUSE_WRITE_ONLY.load(std::sync::atomic::Ordering::Relaxed);
+    Some((dl - now, write_only))
+}
+
+#[inline]
+pub fn paused_clients_count() -> usize {
+    if is_client_paused().is_none() {
+        return 0;
+    }
+    PAUSED_CLIENTS.lock().unwrap().len()
+}
+
+pub fn should_pause_command(cmd: &Command, write_only: bool) -> bool {
+    if matches!(
+        cmd,
+        Command::Client(ClientSubcommand::Unpause | ClientSubcommand::Pause(..)) | Command::Quit
+    ) {
+        return false;
+    }
+    if !write_only {
+        return true;
+    }
+    match cmd {
+        Command::Eval {
+            script, read_only, ..
+        } => !*read_only && !crate::scripting::is_script_read_only(script),
+        Command::Evalsha { sha, read_only, .. } => {
+            !*read_only && !crate::scripting::is_sha_read_only(sha)
+        }
+        Command::Fcall {
+            function,
+            read_only,
+            ..
+        } => !*read_only && !crate::scripting::is_function_read_only(function),
+        Command::Publish { .. }
+        | Command::Spublish { .. }
+        | Command::Pfcount { .. }
+        | Command::Blpop { .. }
+        | Command::Brpop { .. }
+        | Command::Blmove { .. }
+        | Command::Blmovem { .. }
+        | Command::Blmpop { .. }
+        | Command::Bzpopmin { .. }
+        | Command::Bzpopmax { .. }
+        | Command::Bzmpop { .. }
+        | Command::Xreadgroup { .. } => true,
+        _ => cmd.is_write_command(),
+    }
+}
+
+struct PausedClientGuard {
+    client_id: u64,
+}
+
+impl Drop for PausedClientGuard {
+    fn drop(&mut self) {
+        let mut list = PAUSED_CLIENTS.lock().unwrap();
+        list.retain(|&(_, cid, _)| cid != self.client_id);
+    }
+}
+
+pub async fn wait_if_client_paused(port: u16, client_id: u64, cmd: &Command) {
+    if IN_TX.get() {
+        return;
+    }
+    while let Some((rem_ms, write_only)) = is_client_paused() {
+        if !should_pause_command(cmd, write_only) {
+            return;
+        }
+        let (tx, rx) = flume::bounded(1);
+        {
+            let mut list = PAUSED_CLIENTS.lock().unwrap();
+            if !list.iter().any(|&(_, cid, _)| cid == client_id) {
+                list.push((port, client_id, tx));
+            }
+        }
+        let _guard = PausedClientGuard { client_id };
+        let _ = monoio::time::timeout(
+            std::time::Duration::from_millis(rem_ms.max(1)),
+            rx.recv_async(),
+        )
+        .await;
+        drop(_guard);
+        if now_epoch_ms() >= PAUSE_DEADLINE_MS.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = unpause_clients();
+            return;
+        }
+    }
+}
+
+pub async fn wait_if_tx_paused(port: u16, client_id: u64, tx_queue: &[Command]) {
+    while let Some((rem_ms, write_only)) = is_client_paused() {
+        let should_pause =
+            !write_only || tx_queue.iter().any(|c| should_pause_command(c, write_only));
+        if !should_pause {
+            return;
+        }
+        let (tx, rx) = flume::bounded(1);
+        {
+            let mut list = PAUSED_CLIENTS.lock().unwrap();
+            if !list.iter().any(|&(_, cid, _)| cid == client_id) {
+                list.push((port, client_id, tx));
+            }
+        }
+        let _guard = PausedClientGuard { client_id };
+        let _ = monoio::time::timeout(
+            std::time::Duration::from_millis(rem_ms.max(1)),
+            rx.recv_async(),
+        )
+        .await;
+        drop(_guard);
+        if now_epoch_ms() >= PAUSE_DEADLINE_MS.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = unpause_clients();
+            return;
+        }
+    }
+}
+
 pub static TOTAL_ERROR_REPLIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static ERROR_STATS: std::sync::LazyLock<std::sync::RwLock<hashbrown::HashMap<String, u64>>> =
     std::sync::LazyLock::new(|| std::sync::RwLock::new(hashbrown::HashMap::new()));
@@ -1543,6 +1915,7 @@ async fn execute_tx_step(
                     write_resp_null_array(out_buf);
                     false
                 } else {
+                    wait_if_tx_paused(router.port, client_id, tx_queue).await;
                     unwatch_keys(router.port, client_id);
                     let mut shards = hashbrown::HashSet::new();
                     for cmd in tx_queue.iter() {
@@ -2069,49 +2442,52 @@ pub async fn handle_connection(
                                 break;
                             }
                         }
-                    } else if has_special
-                        && commands.iter().any(|c| {
-                            matches!(
-                                c,
-                                Command::Blpop { .. }
-                                    | Command::Brpop { .. }
-                                    | Command::Blmove { .. }
-                                    | Command::Blmovem { .. }
-                                    | Command::Blmpop { .. }
-                                    | Command::Bzpopmin { .. }
-                                    | Command::Bzpopmax { .. }
-                                    | Command::Bzmpop { .. }
-                                    | Command::Xread {
-                                        block_ms: Some(_),
-                                        ..
-                                    }
-                                    | Command::Xreadgroup {
-                                        block_ms: Some(_),
-                                        ..
-                                    }
-                            )
-                        })
+                    } else if is_client_paused().is_some()
+                        || (has_special
+                            && commands.iter().any(|c| {
+                                matches!(
+                                    c,
+                                    Command::Blpop { .. }
+                                        | Command::Brpop { .. }
+                                        | Command::Blmove { .. }
+                                        | Command::Blmovem { .. }
+                                        | Command::Blmpop { .. }
+                                        | Command::Bzpopmin { .. }
+                                        | Command::Bzpopmax { .. }
+                                        | Command::Bzmpop { .. }
+                                        | Command::Xread {
+                                            block_ms: Some(_),
+                                            ..
+                                        }
+                                        | Command::Xreadgroup {
+                                            block_ms: Some(_),
+                                            ..
+                                        }
+                                )
+                            }))
                     {
                         for cmd in commands.drain(..) {
-                            if matches!(
-                                cmd,
-                                Command::Blpop { .. }
-                                    | Command::Brpop { .. }
-                                    | Command::Blmove { .. }
-                                    | Command::Blmovem { .. }
-                                    | Command::Blmpop { .. }
-                                    | Command::Bzpopmin { .. }
-                                    | Command::Bzpopmax { .. }
-                                    | Command::Bzmpop { .. }
-                                    | Command::Xread {
-                                        block_ms: Some(_),
-                                        ..
-                                    }
-                                    | Command::Xreadgroup {
-                                        block_ms: Some(_),
-                                        ..
-                                    }
-                            ) && !out_buf.is_empty()
+                            if (is_client_paused().is_some()
+                                || matches!(
+                                    cmd,
+                                    Command::Blpop { .. }
+                                        | Command::Brpop { .. }
+                                        | Command::Blmove { .. }
+                                        | Command::Blmovem { .. }
+                                        | Command::Blmpop { .. }
+                                        | Command::Bzpopmin { .. }
+                                        | Command::Bzpopmax { .. }
+                                        | Command::Bzmpop { .. }
+                                        | Command::Xread {
+                                            block_ms: Some(_),
+                                            ..
+                                        }
+                                        | Command::Xreadgroup {
+                                            block_ms: Some(_),
+                                            ..
+                                        }
+                                ))
+                                && !out_buf.is_empty()
                             {
                                 let write_chunk = std::mem::take(&mut out_buf);
                                 let (res, returned_buf) = stream.write_all(write_chunk).await;
@@ -4533,7 +4909,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
             ClientSubcommand::Caching(_) => "client|caching",
             ClientSubcommand::Kill(_) => "client|kill",
             ClientSubcommand::Unblock { .. } => "client|unblock",
-            ClientSubcommand::Pause(_) => "client|pause",
+            ClientSubcommand::Pause(_, _) => "client|pause",
             ClientSubcommand::Unpause => "client|unpause",
             ClientSubcommand::NoTouch(_) => "client|no-touch",
             ClientSubcommand::SetInfo { .. } => "client|setinfo",
@@ -5457,14 +5833,17 @@ async fn execute_command(
     if let Some(client) = client_registry.borrow().get(&client_id) {
         CURRENT_CLIENT_RESP3.set(client.is_resp3);
     }
+    wait_if_client_paused(router.port, client_id, &cmd).await;
     let cmd_name = get_cmd_name(&cmd);
     record_cmd_stat(cmd_name);
+    record_latency_histogram_cmd(&cmd);
 
     let slow_threshold =
         crate::slowlog::SLOWLOG_LOG_SLOWER_THAN.load(std::sync::atomic::Ordering::Relaxed);
-    let skip_slowlog = matches!(cmd, Command::Slowlog(_) | Command::Quit)
+    let lat_threshold = LATENCY_MONITOR_THRESHOLD.load(std::sync::atomic::Ordering::Relaxed);
+    let skip_slowlog = matches!(cmd, Command::Quit)
         || (slow_threshold >= 10_000 && matches!(cmd, Command::Mset(_) | Command::Mget(_)));
-    let (cmd_for_slowlog, exec_start) = if slow_threshold >= 0 && !skip_slowlog {
+    let (cmd_for_slowlog, exec_start) = if (slow_threshold >= 0 && !skip_slowlog) || lat_threshold > 0 {
         (Some(cmd.clone()), Some(std::time::Instant::now()))
     } else {
         (None, None)
@@ -5473,14 +5852,20 @@ async fn execute_command(
         cmd: Option<Command>,
         start: Option<std::time::Instant>,
         threshold: i64,
+        skip_slowlog: bool,
         client_id: u64,
         client_registry: &'a RefCell<hashbrown::HashMap<u64, ClientInfo>>,
     }
     impl<'a> Drop for SlowlogTracker<'a> {
         fn drop(&mut self) {
             if let (Some(cmd), Some(start)) = (self.cmd.take(), self.start.take()) {
-                let duration_us = start.elapsed().as_micros() as u64;
-                if self.threshold >= 0 && duration_us >= self.threshold as u64 {
+                let elapsed = start.elapsed();
+                let duration_us = elapsed.as_micros() as u64;
+                let duration_ms = elapsed.as_millis() as u64;
+                if duration_ms > 0 {
+                    record_latency_event("command", duration_ms);
+                }
+                if !self.skip_slowlog && self.threshold >= 0 && duration_us >= self.threshold as u64 {
                     let (addr_str, name_str) =
                         if let Some(c) = self.client_registry.borrow().get(&self.client_id) {
                             (c.addr.to_string(), c.name.clone().unwrap_or_default())
@@ -5496,6 +5881,7 @@ async fn execute_command(
         cmd: cmd_for_slowlog,
         start: exec_start,
         threshold: slow_threshold,
+        skip_slowlog,
         client_id,
         client_registry,
     };
@@ -6184,12 +6570,26 @@ async fn execute_command(
             for key in &keys {
                 notify_key_invalidation(router.port, key.as_ref(), client_id);
             }
-            let count = if keys.len() == 1 {
-                let deleted = router.del(keys[0].clone()).await;
-                if deleted { 1 } else { 0 }
-            } else {
-                router.del_keys(keys.to_vec()).await
-            };
+            let mut count = 0usize;
+            for key in &keys {
+                let target = router.target_shard(key);
+                if target == router.shard_id {
+                    let lazy = router.local_db.borrow().table.is_lazyfree_worthy(key);
+                    if router.del(key.clone()).await {
+                        count += 1;
+                        if lazy {
+                            crate::table::add_lazyfreed_objects(1);
+                        }
+                    }
+                } else {
+                    let resp = router
+                        .execute_remote(target, Command::Unlink(smallvec![key.clone()]))
+                        .await;
+                    if resp == b":1\r\n" {
+                        count += 1;
+                    }
+                }
+            }
             if count > 0 {
                 for key in &keys {
                     crate::search::delete_document_hook(&String::from_utf8_lossy(key));
@@ -6530,7 +6930,11 @@ async fn execute_command(
             let (blocked_clients_count, total_blocking_keys, total_blocking_keys_on_nokey) = {
                 let hub_arc = crate::block::get_block_hub_for_port(router.port);
                 let hub = hub_arc.lock().unwrap();
-                (hub.blocked_clients_count(), hub.blocking_keys_count(), hub.blocking_keys_on_nokey_count())
+                (
+                    hub.blocked_clients_count() + paused_clients_count(),
+                    hub.blocking_keys_count(),
+                    hub.blocking_keys_on_nokey_count(),
+                )
             };
             // Per-shard connection census. Exposes whether connections are
             // evenly spread across shards; a skewed distribution caps
@@ -7047,6 +7451,16 @@ async fn execute_command(
                     val
                 );
                 out.extend_from_slice(resp.as_bytes());
+            } else if p_str == "latency-monitor-threshold" {
+                let val = LATENCY_MONITOR_THRESHOLD
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .to_string();
+                let resp = format!(
+                    "*2\r\n$25\r\nlatency-monitor-threshold\r\n${}\r\n{}\r\n",
+                    val.len(),
+                    val
+                );
+                out.extend_from_slice(resp.as_bytes());
             } else if p_str == "*" {
                 let max_mem = crate::tiering::get_max_memory(router.port).to_string();
                 let offload = crate::tiering::get_offload_threshold_pct(router.port).to_string();
@@ -7269,9 +7683,19 @@ async fn execute_command(
             } else if p_str == "resetstat" {
                 router.reset_command_stats().await;
                 reset_error_stats();
+                reset_latency_histogram();
                 crate::slowlog::reset_slowlog_stats();
                 crate::table::reset_expired_keys();
                 out.extend_from_slice(b"+OK\r\n");
+            } else if p_str == "latency-monitor-threshold" {
+                if let Ok(v) = val_str.parse::<i64>() {
+                    LATENCY_MONITOR_THRESHOLD.store(v, std::sync::atomic::Ordering::Relaxed);
+                    out.extend_from_slice(b"+OK\r\n");
+                } else {
+                    out.extend_from_slice(
+                        b"-ERR Invalid argument for CONFIG SET latency-monitor-threshold\r\n",
+                    );
+                }
             } else if p_str == "maxclients" {
                 if let Ok(n) = val_str.parse::<usize>() {
                     set_max_clients(n);
@@ -7786,9 +8210,18 @@ async fn execute_command(
                         out.extend_from_slice(b":0\r\n");
                     }
                 }
-                ClientSubcommand::Pause(_)
-                | ClientSubcommand::Unpause
-                | ClientSubcommand::NoTouch(_) => {
+                ClientSubcommand::Pause(timeout_ms, write_only) => {
+                    set_client_pause(timeout_ms, write_only);
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                ClientSubcommand::Unpause => {
+                    let woken = unpause_clients();
+                    if woken > 0 {
+                        monoio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    }
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                ClientSubcommand::NoTouch(_) => {
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 ClientSubcommand::Reply(mode) => {
@@ -10960,6 +11393,12 @@ async fn execute_command(
                     }
                 }
             }
+            if !IN_TX.get() {
+                let n = router.dbsize().await;
+                if n > 0 {
+                    crate::table::add_lazyfreed_objects(n as u64);
+                }
+            }
             router.flushdb().await;
             out.extend_from_slice(b"+OK\r\n");
             false
@@ -13026,62 +13465,7 @@ async fn execute_command(
             false
         }
         Command::Latency(sub) => {
-            match sub {
-                LatencySubcommand::Latest => {
-                    out.extend_from_slice(b"*0\r\n");
-                }
-                LatencySubcommand::History(ev) => {
-                    if ev.is_empty() {
-                        out.extend_from_slice(
-                            b"-ERR wrong number of arguments for 'latency history' command\r\n",
-                        );
-                    } else {
-                        out.extend_from_slice(b"*0\r\n");
-                    }
-                }
-                LatencySubcommand::Doctor => {
-                    out.extend_from_slice(
-                        b"+Dave, no latency spikes observed in your instance.\r\n",
-                    );
-                }
-                LatencySubcommand::Reset(_) => {
-                    out.extend_from_slice(b":0\r\n");
-                }
-                LatencySubcommand::Graph(ev) => {
-                    if ev.is_empty() {
-                        out.extend_from_slice(
-                            b"-ERR wrong number of arguments for 'latency graph' command\r\n",
-                        );
-                    } else {
-                        let err = format!("-ERR No samples available for event '{}'\r\n", ev);
-                        out.extend_from_slice(err.as_bytes());
-                    }
-                }
-                LatencySubcommand::Help => {
-                    let help_lines = [
-                        "LATENCY <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
-                        "DOCTOR",
-                        "    Return a human readable latency analysis report.",
-                        "GRAPH <event>",
-                        "    Return an ASCII latency graph for the <event> class.",
-                        "HISTORY <event>",
-                        "    Return time-latency samples for the <event> class.",
-                        "LATEST",
-                        "    Return the latest latency samples for all events.",
-                        "RESET [<event> ...]",
-                        "    Reset latency data of one or more <event> classes.",
-                        "    (default: reset all data for all event classes)",
-                        "HELP",
-                        "    Print this help.",
-                    ];
-                    out.extend_from_slice(format!("*{}\r\n", help_lines.len()).as_bytes());
-                    for line in help_lines {
-                        out.extend_from_slice(
-                            format!("${}\r\n{}\r\n", line.len(), line).as_bytes(),
-                        );
-                    }
-                }
-            }
+            write_latency_response(&sub, out);
             false
         }
         Command::Debug(ref args) => {
@@ -13886,9 +14270,14 @@ pub fn execute_local_command(
             false
         }
         Command::Del(keys) | Command::Unlink(keys) => {
+            let is_unlink = matches!(cmd, Command::Unlink(_));
             if keys.len() == 1 {
+                let lazy = is_unlink && db.table.is_lazyfree_worthy(&keys[0]);
                 let deleted = db.del(&keys[0]);
                 if deleted {
+                    if lazy {
+                        crate::table::add_lazyfreed_objects(1);
+                    }
                     db.delete_document_local(&String::from_utf8_lossy(&keys[0]));
                     crate::search::delete_document_hook(&String::from_utf8_lossy(&keys[0]));
                     record_change!(cmd);
@@ -13902,8 +14291,12 @@ pub fn execute_local_command(
             }
             let mut count = 0usize;
             for k in keys {
+                let lazy = is_unlink && db.table.is_lazyfree_worthy(k);
                 if db.del(k) {
                     count += 1;
+                    if lazy {
+                        crate::table::add_lazyfreed_objects(1);
+                    }
                     db.delete_document_local(&String::from_utf8_lossy(k));
                     crate::search::delete_document_hook(&String::from_utf8_lossy(k));
                     notify_keyspace_event(NOTIFY_GENERIC, "del", k);
@@ -19680,62 +20073,7 @@ pub fn execute_local_command(
             false
         }
         Command::Latency(sub) => {
-            match sub {
-                LatencySubcommand::Latest => {
-                    out.extend_from_slice(b"*0\r\n");
-                }
-                LatencySubcommand::History(ev) => {
-                    if ev.is_empty() {
-                        out.extend_from_slice(
-                            b"-ERR wrong number of arguments for 'latency history' command\r\n",
-                        );
-                    } else {
-                        out.extend_from_slice(b"*0\r\n");
-                    }
-                }
-                LatencySubcommand::Doctor => {
-                    out.extend_from_slice(
-                        b"+Dave, no latency spikes observed in your instance.\r\n",
-                    );
-                }
-                LatencySubcommand::Reset(_) => {
-                    out.extend_from_slice(b":0\r\n");
-                }
-                LatencySubcommand::Graph(ev) => {
-                    if ev.is_empty() {
-                        out.extend_from_slice(
-                            b"-ERR wrong number of arguments for 'latency graph' command\r\n",
-                        );
-                    } else {
-                        let err = format!("-ERR No samples available for event '{}'\r\n", ev);
-                        out.extend_from_slice(err.as_bytes());
-                    }
-                }
-                LatencySubcommand::Help => {
-                    let help_lines = [
-                        "LATENCY <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
-                        "DOCTOR",
-                        "    Return a human readable latency analysis report.",
-                        "GRAPH <event>",
-                        "    Return an ASCII latency graph for the <event> class.",
-                        "HISTORY <event>",
-                        "    Return time-latency samples for the <event> class.",
-                        "LATEST",
-                        "    Return the latest latency samples for all events.",
-                        "RESET [<event> ...]",
-                        "    Reset latency data of one or more <event> classes.",
-                        "    (default: reset all data for all event classes)",
-                        "HELP",
-                        "    Print this help.",
-                    ];
-                    out.extend_from_slice(format!("*{}\r\n", help_lines.len()).as_bytes());
-                    for line in help_lines {
-                        out.extend_from_slice(
-                            format!("${}\r\n{}\r\n", line.len(), line).as_bytes(),
-                        );
-                    }
-                }
-            }
+            write_latency_response(&sub, out);
             false
         }
         Command::PubsubHelp => {
