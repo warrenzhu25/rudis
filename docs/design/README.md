@@ -30,7 +30,8 @@ For low-level implementation details, data structures, and line-by-line code ref
 | 17 | **Geospatial Commands** | 52-bit geohash indexing over ZSet scores with geohash-interval-pruned Haversine distance queries | `src/geo.rs` | [17_geospatial.md](17_geospatial.md) |
 | 18 | **Probabilistic Data Structures** | Bloom, Cuckoo, Count-Min Sketch, and Top-K structures for bounded-memory approximate queries | `src/probabilistic.rs` | [18_probabilistic.md](18_probabilistic.md) |
 | 19 | **Pub/Sub Messaging Hub** | Per-shard Pub/Sub hubs with presence-bitmask-pruned cross-shard fan-out, plus sharded Pub/Sub | `src/pubsub.rs` | [19_pubsub.md](19_pubsub.md) |
-| 20 | **AI-Native Agent Runtime, Semantic Cache & MCP Server** | Working + HNSW episodic memory, RPM/TPM quota governor, DAG checkpoints, tool leases, MCP JSON-RPC 2.0, and semantic cache | `src/agent.rs, src/mcp.rs, src/semcache.rs` | [20_ai_native_runtime.md](20_ai_native_runtime.md) |
+| 20 | **Agent Memory, LLM Quota & Checkpoints** | Working + HNSW episodic memory, dual RPM/TPM quota governor, DAG checkpoint threads, idempotent tool leases | `src/agent.rs` | [20_agent_memory.md](20_agent_memory.md) |
+| 21 | **MCP Server** | Built-in Model Context Protocol server translating MCP tool calls into ordinary Rudis commands over RESP and JSON-RPC 2.0 | `src/mcp.rs` | [21_mcp_server.md](21_mcp_server.md) |
 
 ---
 

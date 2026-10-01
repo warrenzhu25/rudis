@@ -30,7 +30,8 @@ For high-level architectural design and rationale, see [`docs/design/`](../desig
 | 17 | **Geospatial Commands** | Bit-interleaved geohash encode/decode, `ZADD` delegation, geohash-interval-pruned radius/box search | `src/geo.rs` | [17_geospatial.md](17_geospatial.md) |
 | 18 | **Probabilistic Data Structures** | FNV-1a double-hashing, cuckoo eviction kicks, Space-Saving Top-K, RDB-persisted structures | `src/probabilistic.rs` | [18_probabilistic.md](18_probabilistic.md) |
 | 19 | **Pub/Sub Messaging Hub** | `PubSubHub` registry, `ShardedPresenceTable` bitmask, hand-written glob matcher, CRC16 sharded-channel routing | `src/pubsub.rs` | [19_pubsub.md](19_pubsub.md) |
-| 20 | **AI-Native Agent Runtime, Semantic Cache & MCP Server** | `AgentMemoryBank`, `LlmQuotaTracker`, `AgentCheckpointStore`, `AgentToolRegistry`, `SemanticCache`, and MCP JSON-RPC 2.0 | `src/agent.rs, src/mcp.rs, src/semcache.rs` | [20_ai_native_runtime.md](20_ai_native_runtime.md) |
+| 20 | **Agent Memory, LLM Quota & Checkpoints** | `AgentMemorySession` working+episodic memory, `LlmQuotaBucket` RPM/TPM governor, `AgentCheckpointThread` DAG, `AgentToolRegistry` leases | `src/agent.rs` | [20_agent_memory.md](20_agent_memory.md) |
+| 21 | **MCP Server** | `McpToolDef` catalog, `plan_tool_command` tool-to-Command translation, `MCP.TOOLS`/`MCP.CALL`/`MCP.RPC` dispatch via the normal command path | `src/mcp.rs` | [21_mcp_server.md](21_mcp_server.md) |
 
 ---
 
