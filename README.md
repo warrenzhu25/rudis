@@ -58,7 +58,7 @@ are called out explicitly rather than left implicit, both here and in the linked
   - [6. NVMe Tiered Storage (SmallBins & Direct I/O)](#6-nvme-tiered-storage-smallbins--direct-io)
   - [7. Kernel-Bypass Networking & TLS: Status](#7-kernel-bypass-networking--tls-status)
   - [8. Dual-Protocol Engine: Redis + Memcached](#8-dual-protocol-engine-redis--memcached)
-  - [9. AI-Native Agent Runtime, Semantic Cache & MCP Server](#9-ai-native-agent-runtime-semantic-cache--mcp-server)
+  - [9. Agent Memory, LLM Quota, Checkpoints & MCP Server](#9-agent-memory-llm-quota-checkpoints--mcp-server)
 - [Subsystem & Feature Matrix](#subsystem--feature-matrix)
 - [Documentation & Contributor Guides](#documentation--contributor-guides)
 
@@ -589,20 +589,30 @@ including *why* this direction is still worth pursuing despite not being wired u
 - Protocol framing is auto-detected from the first bytes read on a new connection; both
   protocols share database 0.
 
-### 9. AI-Native Agent Runtime, Semantic Cache & MCP Server
+### 9. Agent Memory, LLM Quota, Checkpoints & MCP Server
 
-- **Hierarchical Agent Memory (`AGENT.MEM.*`)**: token-budgeted FIFO working memory window paired
-  with automatic HNSW episodic spill and hybrid recall (`AGENT.MEM.WINDOW`, `AGENT.MEM.SEARCH`,
-  `AGENT.MEM.COMPACT`).
-- **Dual RPM/TPM LLM Quota Governor (`LLM.QUOTA.*`)**: sliding-window Requests-Per-Minute and
-  Tokens-Per-Minute rate limiting with pre-flight token reservation (`LLM.QUOTA.RESERVE`) and
-  post-stream actual token settlement (`LLM.QUOTA.SETTLE`).
-- **DAG State Checkpointing & Idempotent Tool Leases (`AGENT.CHECKPOINT.*`, `AGENT.TOOL.*`)**:
-  parent-linked execution state lineage (`PUT`/`GET`/`HISTORY`) and TTL-guarded exactly-once tool
-  call execution leases (`CLAIM`/`COMPLETE`).
-- **Built-in Model Context Protocol Server (`MCP.*`) & Semantic Cache (`SEMCACHE.*`)**: native
-  JSON-RPC 2.0 MCP server (`MCP.TOOLS`, `MCP.CALL`, `MCP.RPC`) and cosine-similarity LLM prompt
-  cache. Details: [`docs/design/20_ai_native_runtime.md`](docs/design/20_ai_native_runtime.md).
+- **Hierarchical Agent Memory (`AGENT.MEM.*`, `src/agent.rs`)**: token-budgeted FIFO working
+  memory window paired with automatic HNSW episodic spill and hybrid recall (`AGENT.MEM.WINDOW`,
+  `AGENT.MEM.SEARCH`, `AGENT.MEM.COMPACT`). Gets RDB and AOF/replication coverage.
+- **Dual RPM/TPM LLM Quota Governor (`LLM.QUOTA.*`, `src/agent.rs`)**: sliding-window
+  Requests-Per-Minute and Tokens-Per-Minute rate limiting with pre-flight token reservation
+  (`LLM.QUOTA.RESERVE`) and post-stream actual token settlement (`LLM.QUOTA.SETTLE`). Unlike the
+  other agent.rs stores, this state has **no persistence or replication** — it resets on restart.
+- **DAG State Checkpointing & Idempotent Tool Leases (`AGENT.CHECKPOINT.*`, `AGENT.TOOL.*`,
+  `src/agent.rs`)**: parent-linked execution state lineage (`PUT`/`GET`/`HISTORY`) and
+  TTL-guarded exactly-once tool call execution leases (`CLAIM`/`COMPLETE`). Checkpoint timestamps
+  are computed server-side at execution time, so they can diverge between a primary and a
+  replica/AOF-replay of the same logical checkpoint.
+- **Built-in Model Context Protocol Server (`MCP.*`, `src/mcp.rs`)**: native JSON-RPC 2.0 MCP
+  server (`MCP.TOOLS`, `MCP.CALL`, `MCP.RPC`) exposing 11 tools that translate into ordinary
+  Rudis commands via the normal `execute_command` dispatch path (same ACL/routing as any client
+  command).
+- **Semantic Cache (`SEMANTIC.*`, implemented in `src/vector.rs`, not a separate file)**:
+  cosine-similarity LLM prompt cache (`SEMANTIC.SET`/`GET`/`DEL`/`FLUSH`/`INFO`).
+
+Details: [Component 20 — Agent Memory, LLM Quota & Checkpoints](docs/design/20_agent_memory.md),
+[Component 21 — MCP Server](docs/design/21_mcp_server.md), and
+[Component 08 — Vector Search Engine](docs/design/08_vector_engine.md) for `SemanticCache`.
 
 ---
 
@@ -631,7 +641,8 @@ links go to the corresponding source-verified subsystem specification.
 | **RediSearch (`FT.*`)** | Implemented | Inverted index, BM25, `RangeTree`, `FLAT` & `HNSW` vector fields, pre-filtered KNN, `VECTOR_RANGE`, `FT.HYBRID` (RRF/Linear), `FT.ALTER`, `FT.PROFILE`, multi-vector JSON chunks (`$.chunks[*].emb`). | [09](docs/design/09_redisearch.md) |
 | **RedisBloom-style probabilistic types** | Implemented | Bloom, Cuckoo, Count-Min Sketch, Top-K. | [18](docs/design/18_probabilistic.md) |
 | **HNSW & Redis 8 Vector Sets (`V*`)** | Implemented | Redis 8 Vector Sets (`VADD`/`VSIM`/`VEMB`/`VLINKS`/`VSETATTR`), Cosine/L2/IP SIMD kernels, SQ8/BIN/PQ compression, `REDUCE` projection, NVMe `.vtier` disk reranking (`TIERED` + `RERANK`). | [08](docs/design/08_vector_engine.md) |
-| **AI-Native Agent Runtime & MCP** | Implemented | Working + HNSW episodic memory (`AGENT.MEM.*`), dual RPM/TPM quota governor (`LLM.QUOTA.*`), DAG checkpoints (`AGENT.CHECKPOINT.*`), tool leases (`AGENT.TOOL.*`), MCP JSON-RPC 2.0 (`MCP.*`), semantic cache (`SEMCACHE.*`). | [20](docs/design/20_ai_native_runtime.md) |
+| **Agent memory, LLM quota & checkpoints** | Implemented, with a gap | Working + HNSW episodic memory (`AGENT.MEM.*`), DAG checkpoints (`AGENT.CHECKPOINT.*`), tool leases (`AGENT.TOOL.*`) all get RDB+AOF/replication coverage; the RPM/TPM quota governor (`LLM.QUOTA.*`) has none and resets on restart. | [20](docs/design/20_agent_memory.md) |
+| **MCP server & semantic cache** | Implemented | Built-in MCP JSON-RPC 2.0 server (`MCP.*`, 11 tools) translating into ordinary commands via the normal dispatch path; semantic cache (`SEMANTIC.*`) lives in `src/vector.rs`. | [21](docs/design/21_mcp_server.md), [08](docs/design/08_vector_engine.md) |
 | **NVMe tiered storage** | Implemented, with a known gap | Hot/Cooled/Cold lifecycle, `SmallBins`, Direct I/O; see tiered-value RDB gap above. | [07](docs/design/07_nvme_tiering.md), [tiered_storage.md](docs/design/tiered_storage.md) |
 | **`TIER.SNAPSHOT` reflink checkpoints** | Implemented | Real `ioctl(FICLONE)` cloning of the NVMe tier's backing file — unrelated to `SAVE`/`BGSAVE`. | [tiered_storage.md](docs/design/tiered_storage.md) |
 | **Multi-region CRDTs** | Implemented, manual sync only | LWW-Register, OR-Set, PN-Counter with HLC ordering; export/merge (`CRDT.DUMP`/`CRDT.MERGE`) is explicit and manual — there is no automatic peer discovery or background cross-region streaming. | [12](docs/design/12_crdt_types.md) |

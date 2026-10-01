@@ -1,6 +1,6 @@
 # Rudis Subsystem Architecture & High-Level Design Guide
 
-This document provides the high-level architectural specifications for all 19 core subsystems of **Rudis**.
+This document provides the high-level architectural specifications for all 21 core subsystems of **Rudis**.
 It summarizes **what** each subsystem does, **why** it was designed that way, its **key concurrency invariants**,
 and the most important findings from this session's source-verification pass against the current codebase.
 
@@ -33,6 +33,8 @@ step-by-step algorithms, and source line references.
 - [17. Geospatial Commands](#component-17-geospatial-commands) (`src/geo.rs`)
 - [18. Probabilistic Data Structures](#component-18-probabilistic-data-structures) (`src/probabilistic.rs`)
 - [19. Pub/Sub Messaging Hub](#component-19-pubsub-messaging-hub) (`src/pubsub.rs`)
+- [20. Agent Memory, LLM Quota & Checkpoints](#component-20-agent-memory-llm-quota--checkpoints) (`src/agent.rs`)
+- [21. MCP Server](#component-21-mcp-server) (`src/mcp.rs`)
 
 ---
 
@@ -829,3 +831,117 @@ under-approximating) behavior, the glob matcher's lack of character classes, and
 single-shard-only delivery scope are all documented as deliberate, stated design trade-offs.
 
 **Further reading:** [`docs/internal/19_pubsub.md`](../internal/19_pubsub.md)
+
+---
+
+## Component 20: Agent Memory, LLM Quota & Checkpoints
+
+**Source files:** `src/agent.rs` (802 lines)
+
+**Purpose & problem statement.** Building an LLM-driven agent on top of a key/value store means
+reinventing the same handful of primitives on every project: a token-budgeted conversation window with
+semantic recall over older turns, admission control for paid LLM calls before they're made (not just
+after), a way to durably checkpoint a branching agent execution graph, and an idempotency mechanism so a
+retried tool call doesn't re-run (or double-charge for) a non-idempotent side effect. `src/agent.rs` gives
+each of these four problems its own purpose-built, typed in-memory structure — `AgentMemorySession`,
+`LlmQuotaBucket`, `AgentCheckpointThread`, `AgentToolRegistry` — rather than asking every caller to
+re-derive them from generic Lists/Hashes/`SET NX`.
+
+**Key design choice.** The four stores share no data-structure-level coupling — they are four independent
+`HashMap<Bytes, T>` fields embedded directly on `ShardDb`, mirroring exactly how `CrdtStore` and
+`vector_indexes` are already embedded (Components 08, 12) — because each has a genuinely different key,
+value shape, and lifecycle (a growing turn log vs. a sliding-window counter vs. a DAG vs. a lease table),
+and folding them into one struct would only force every operation to pay for fields it doesn't use.
+Episodic memory reuses Component 08's `HnswIndex` directly rather than a bespoke ANN structure.
+`AgentMemorySession::compact` is deliberately **lossy for the prompt budget but not for retrieval**: it
+flips old turns to `compacted: true` (removing them from the token-budgeted working window) without ever
+deleting their HNSW embeddings, so a compacted turn can still be semantically recalled. `LlmQuotaBucket`
+uses a two-phase reserve/settle split — `reserve` commits an *estimated* token cost against the RPM/TPM
+ceilings before the caller is told "go ahead," and `settle` reconciles against the real usage once known —
+because counting tokens only after a call completes can't prevent an over-quota call from being made at
+all. `AgentToolRegistry::claim` models three lease states (`CLAIMED`/`IN_PROGRESS`/`COMPLETED`) rather than
+a simple `SETNX` lock, since a naive lock only prevents simultaneous execution, not a caller retrying a
+logical call whose previous attempt already finished.
+
+**Key invariants.**
+- A memory session's working window is token-budgeted, not turn-count-budgeted — `AGENT.MEM.CONTEXT` walks
+  turns newest-first and stops the instant the next turn would exceed `max_tokens`.
+- Episodic recall never duplicates a turn already present in the working window (an exclusion filter built
+  from the selected `recent_turns` ids is passed into the HNSW search) — but a *compacted* turn is always
+  eligible for recall, since compaction only touches the working window, not the index.
+- A tool call's `COMPLETED` result is authoritative over any in-flight lease: `claim` checks for a stored
+  result before checking the lease, so once `AGENT.TOOL.COMPLETE` has recorded an output, every subsequent
+  `CLAIM` returns the cached result instead of granting a new lease.
+- Checkpoint lineage walks (`AGENT.CHECKPOINT.HISTORY`) track visited step ids while following `parent_id`
+  pointers, so a malformed DAG (a step's parent pointing at one of its own descendants) terminates rather
+  than looping forever.
+- No cross-store coupling and no cross-shard fan-out: every `AGENT.*`/`LLM.*` command carries exactly one
+  key and is routed to the single shard that owns it via the same CRC16 mechanism as any other keyed
+  command — unlike CRDT's whole-store `DUMP`/`MERGE`, nothing here aggregates across shards.
+
+**Performance characteristics.** Every operation is single-key, single-shard, and lock-free by
+construction (plain `Rc<RefCell<ShardDb>>` access, same as every other per-shard structure), so the hot
+paths (`AGENT.MEM.ADD`, `AGENT.TOOL.CLAIM`) cost no more than any other keyed Rudis command. The HNSW
+index backing episodic memory has no independent size cap and is never pruned by compaction, so a very
+long-running session's index grows unboundedly until the session is dropped via `AGENT.MEM.CLEAR`.
+
+**Verified findings.** See the companion internal doc for the concrete persistence picture — `LLM.QUOTA.*`
+bucket state and the other three stores' RDB/AOF/replication coverage are detailed there, including that
+this state does not survive a restart the way ordinary keys do.
+
+**Further reading:** [`docs/internal/20_agent_memory.md`](../internal/20_agent_memory.md)
+
+---
+
+## Component 21: MCP Server
+
+**Source files:** `src/mcp.rs` (748 lines)
+
+**Purpose & problem statement.** MCP (Model Context Protocol) is the standard way an LLM agent framework
+discovers and invokes a fixed menu of named "tools" with JSON Schema signatures. The conventional
+deployment shape is a stand-alone sidecar process speaking JSON-RPC over stdio/HTTP to whatever backend it
+wraps — an extra process and network hop between "agent decides to call a tool" and "data is read or
+written." Rudis instead embeds the MCP surface directly in the server process as three ordinary RESP
+commands (`MCP.TOOLS`, `MCP.CALL`, `MCP.RPC`), so a tool call executes on the same shard, in the same
+event-loop tick family, as any other Rudis command.
+
+**Key design choice.** The central decision is that `plan_tool_command(tool, args)` translates an MCP tool
+name plus a JSON arguments object into a genuine `crate::resp::Command` — the exact enum the wire parser
+itself builds — and `MCP.CALL`/`MCP.RPC`'s handlers then **recursively re-enter `execute_command`**, the
+same top-level dispatcher every ordinary client command runs through. This means a tool call inherits real
+per-command/per-key ACL enforcement, correct cross-shard routing, and normal AOF/replication behavior for
+free, with no logic duplicated inside `mcp.rs` itself — a deliberately different, heavier-but-safer posture
+than Component 13's Lua `redis.call` bridge, which calls the lower-level `execute_local_command` directly
+and bypasses the top-level ACL gate. The tool menu itself (`builtin_mcp_tools()`) is a fixed, hand-curated
+list of 11 tools compiled into the binary, not an auto-generated wrapper over every `Command` variant and
+not runtime-configurable — a deliberate safety boundary so an agent can never reach `FLUSHALL`/`CONFIG
+SET`/`CLUSTER`/`SHUTDOWN` or any administrative surface through MCP.
+
+**Key invariants.**
+- Every MCP tool call becomes a real `Command` and re-enters `execute_command` — there is no tool whose
+  effect is implemented inline inside `mcp.rs`; `plan_tool_command` either returns a translatable `Command`
+  or an `Err` before any execution happens.
+- The tool catalog (`MCP.TOOLS`/`tools/list`) and the tool planner (`plan_tool_command`) are two
+  independently hand-written descriptions of the same contract — nothing in the type system enforces that
+  a declared JSON Schema's `properties`/`required` list actually matches what the planner reads back out of
+  `args`.
+- `MCP.CALL`/`tools/call` never return a RESP `-ERR`/JSON-RPC transport error for a tool-level failure
+  (unknown tool, missing argument, failing underlying command) — only a malformed outer payload does; tool
+  failures surface as a successful envelope with `"isError": true`, matching MCP convention.
+- Tool calls carry the calling connection's authentication context unchanged into the recursive
+  `execute_command` call, so an MCP tool cannot be used to execute a command the connection's own ACL user
+  would not otherwise be allowed to run.
+- The tool menu is exactly the 11 tools `builtin_mcp_tools()` lists, enforced by `plan_tool_command`'s
+  catch-all `Err` arm — nothing configurable at runtime.
+
+**Performance characteristics.** The translation layer costs one extra recursive `execute_command` stack
+frame per tool call (with its own ACL check, command-stat increment, and slowlog bookkeeping run a second
+time) in exchange for zero-sidecar deployment and full inheritance of the normal command-execution
+contract — `src/mcp.rs` itself never imports `src/agent.rs`/`src/vector.rs`/`src/search.rs` directly, only
+`crate::resp::Command` and the few option enums needed to construct one.
+
+**Verified findings.** See the companion internal doc for the concrete `McpToolDef` catalog, the full
+tool-by-tool argument mapping, and verified gaps (including the tool-schema/planner drift and JSON-RPC
+method-coverage specifics).
+
+**Further reading:** [`docs/internal/21_mcp_server.md`](../internal/21_mcp_server.md)
