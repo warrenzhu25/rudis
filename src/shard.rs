@@ -558,6 +558,10 @@ pub enum ShardMessage {
     GetUsedMemory {
         responder: flume::Sender<usize>,
     },
+    TryEvictOneKey {
+        policy: String,
+        responder: flume::Sender<Option<usize>>,
+    },
     StreamColdRead {
         key: Bytes,
         responder: flume::Sender<Option<Bytes>>,

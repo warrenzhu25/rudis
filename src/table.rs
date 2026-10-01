@@ -2857,6 +2857,9 @@ impl RudisTable {
             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                 crate::connection::touch_watched_key_any_port(removed.key.as_ref());
             }
+            if crate::connection::HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::connection::notify_key_invalidation_any_port(removed.key.as_ref(), 0);
+            }
             crate::connection::notify_keyspace_event(crate::connection::NOTIFY_EXPIRED, "expired", &removed.key);
         }
     }
@@ -2940,6 +2943,12 @@ impl RudisTable {
             let freed = removed.key.len() + removed.val.approx_bytes() + 64;
             self.used_memory = self.used_memory.saturating_sub(freed);
             inc_evicted_keys();
+            if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::connection::touch_watched_key_any_port(removed.key.as_ref());
+            }
+            if crate::connection::HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::connection::notify_key_invalidation_any_port(removed.key.as_ref(), 0);
+            }
             crate::connection::notify_keyspace_event(crate::connection::NOTIFY_EVICTED, "evicted", &removed.key);
             return Some(freed);
         }
@@ -10585,7 +10594,9 @@ impl RudisTable {
     /// Active sampling cycle: samples up to 20 slots starting from cursor and evicts expired keys
     /// and expired hash fields (`HEXPIRE`).
     pub fn active_expire_cycle(&mut self) -> usize {
-        if crate::connection::is_client_paused().is_some() {
+        if crate::connection::is_client_paused().is_some()
+            || crate::connection::PAUSE_CRON.load(std::sync::atomic::Ordering::Relaxed)
+        {
             return 0;
         }
         let mut expired_count = 0;
@@ -10650,10 +10661,12 @@ impl RudisTable {
             if !was_exp && let Some(entry) = self.table.get_slot_mut(idx) {
                 match &mut entry.val {
                     RudisValue::String(b) => {
+                        let old_len = b.len();
                         let mut vec = b.to_vec();
                         let grew = vec.len() <= byte_idx;
                         if grew {
                             vec.resize(byte_idx + 1, 0);
+                            self.used_memory += (byte_idx + 1).saturating_sub(old_len);
                         }
                         let old_byte = vec[byte_idx];
                         let old_bit = (old_byte >> bit_idx) & 1;
@@ -10674,6 +10687,7 @@ impl RudisTable {
                         if grew {
                             vec.resize(byte_idx + 1, 0);
                         }
+                        self.used_memory += vec.len().saturating_sub(8);
                         let old_byte = vec[byte_idx];
                         let old_bit = (old_byte >> bit_idx) & 1;
                         let changed = grew || (old_bit != value);
@@ -10700,12 +10714,14 @@ impl RudisTable {
         if value == 1 {
             vec[byte_idx] |= 1 << bit_idx;
         }
+        let added_mem = key.len() + vec.len() + 64;
         let entry = RudisEntry {
             key,
             val: RudisValue::String(Bytes::from(vec)),
             expire_at: None,
         };
         self.table.insert(entry);
+        self.used_memory += added_mem;
         Ok((0, true))
     }
 

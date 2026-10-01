@@ -218,21 +218,49 @@ pub fn set_client_output_buffer_limit_str(val: &str) -> Result<(), &'static str>
 }
 
 #[derive(Clone, Debug)]
+pub struct GlobalClientEntry {
+    pub raw_fd: std::os::unix::io::RawFd,
+    pub track_tx: flume::Sender<Vec<u8>>,
+    pub is_resp3: bool,
+    pub auth_user: String,
+    pub is_pubsub: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct ClientTracker {
     pub port: u16,
     pub client_id: u64,
+    pub redirect_id: u64,
+    pub broken_redirect: bool,
     pub bcast: bool,
     pub prefixes: Vec<Bytes>,
+    pub optin: bool,
+    pub optout: bool,
+    pub noloop: bool,
+    pub caching: Option<bool>,
     pub tracked_keys: hashbrown::HashSet<Vec<u8>>,
-    pub sender: flume::Sender<Vec<u8>>,
-    pub is_resp3: bool,
+    pub pending_bcast: Vec<(Bytes, Vec<Vec<u8>>)>,
 }
 
 thread_local! {
     pub static CURRENT_CLIENT_RESP3: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub static CURRENT_CLIENT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub static EXECUTING_CLIENT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub static DEFER_BCAST_FLUSH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub static IN_MAXMEMORY_EVICT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub static PRE_CMD_TRACK_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     pub static IN_TX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub static CURRENT_ROUTER: std::cell::RefCell<Option<std::rc::Rc<Router>>> = const { std::cell::RefCell::new(None) };
 }
+
+pub static ACTIVE_COMMAND_CLIENT_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static DEFER_BCAST_FLUSH_GLOBAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub static IN_MAXMEMORY_EVICT_GLOBAL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub static PRE_CMD_TRACK_BUF_GLOBAL: std::sync::LazyLock<std::sync::Mutex<Vec<u8>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(Vec::new()));
 
 pub fn set_current_router(router: std::rc::Rc<Router>) {
     CURRENT_ROUTER.with(|cr| {
@@ -1088,6 +1116,53 @@ pub fn touch_watched_key_any_port(key: &[u8]) {
     }
 }
 
+static GLOBAL_CLIENTS: std::sync::LazyLock<
+    std::sync::RwLock<hashbrown::HashMap<(u16, u64), GlobalClientEntry>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(hashbrown::HashMap::new()));
+
+pub fn register_global_client(
+    port: u16,
+    client_id: u64,
+    raw_fd: std::os::unix::io::RawFd,
+    track_tx: flume::Sender<Vec<u8>>,
+    is_resp3: bool,
+    auth_user: String,
+    is_pubsub: bool,
+) {
+    GLOBAL_CLIENTS.write().unwrap().insert(
+        (port, client_id),
+        GlobalClientEntry {
+            raw_fd,
+            track_tx,
+            is_resp3,
+            auth_user,
+            is_pubsub,
+        },
+    );
+}
+
+pub fn unregister_global_client(port: u16, client_id: u64) {
+    GLOBAL_CLIENTS.write().unwrap().remove(&(port, client_id));
+}
+
+pub fn update_global_client_resp3(port: u16, client_id: u64, is_resp3: bool) {
+    if let Some(entry) = GLOBAL_CLIENTS.write().unwrap().get_mut(&(port, client_id)) {
+        entry.is_resp3 = is_resp3;
+    }
+}
+
+pub fn update_global_client_auth(port: u16, client_id: u64, auth_user: &str) {
+    if let Some(entry) = GLOBAL_CLIENTS.write().unwrap().get_mut(&(port, client_id)) {
+        entry.auth_user = auth_user.to_string();
+    }
+}
+
+pub fn update_global_client_pubsub(port: u16, client_id: u64, is_pubsub: bool) {
+    if let Some(entry) = GLOBAL_CLIENTS.write().unwrap().get_mut(&(port, client_id)) {
+        entry.is_pubsub = is_pubsub;
+    }
+}
+
 static TRACKING_CLIENTS: std::sync::LazyLock<
     std::sync::RwLock<hashbrown::HashMap<(u16, u64), ClientTracker>>,
 > = std::sync::LazyLock::new(|| std::sync::RwLock::new(hashbrown::HashMap::new()));
@@ -1095,28 +1170,102 @@ static TRACKING_CLIENTS: std::sync::LazyLock<
 pub static HAS_TRACKING_CLIENTS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+pub static TRACKING_TABLE_MAX_KEYS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(1_000_000);
+
+#[allow(clippy::too_many_arguments)]
 pub fn register_client_tracking(
     port: u16,
     client_id: u64,
+    redirect: Option<i64>,
     bcast: bool,
-    prefixes: Vec<Bytes>,
-    sender: flume::Sender<Vec<u8>>,
-    is_resp3: bool,
-) {
+    mut prefixes: Vec<Bytes>,
+    optin: bool,
+    optout: bool,
+    noloop: bool,
+) -> Result<(), String> {
+    let redirect_id = match redirect {
+        Some(id) if id < 0 => {
+            return Err("REDIRECT client ID must be a positive integer".to_string());
+        }
+        Some(id) => id as u64,
+        None => 0,
+    };
+    if redirect_id > 0 {
+        let clients = GLOBAL_CLIENTS.read().unwrap();
+        if !clients.contains_key(&(port, redirect_id)) {
+            return Err("The client ID you want to redirect to does not exist".to_string());
+        }
+    }
+
+    if bcast && prefixes.is_empty() {
+        prefixes.push(Bytes::new());
+    }
+
+    // Check overlap among provided prefixes
+    if bcast {
+        for i in 0..prefixes.len() {
+            for j in (i + 1)..prefixes.len() {
+                if prefixes[i].starts_with(&prefixes[j]) || prefixes[j].starts_with(&prefixes[i]) {
+                    return Err(format!(
+                        "Prefix '{}' overlaps with another provided prefix '{}'",
+                        String::from_utf8_lossy(&prefixes[i]),
+                        String::from_utf8_lossy(&prefixes[j])
+                    ));
+                }
+            }
+        }
+    }
+
     let mut map = TRACKING_CLIENTS.write().unwrap();
+    if let Some(existing) = map.get_mut(&(port, client_id))
+        && existing.bcast
+        && bcast
+    {
+        for new_p in &prefixes {
+            for old_p in &existing.prefixes {
+                if new_p != old_p
+                    && (new_p.starts_with(old_p.as_ref()) || old_p.starts_with(new_p.as_ref()))
+                {
+                    return Err(format!(
+                        "Prefix '{}' overlaps with an existing prefix '{}'",
+                        String::from_utf8_lossy(new_p),
+                        String::from_utf8_lossy(old_p)
+                    ));
+                }
+            }
+        }
+        for new_p in prefixes {
+            if !existing.prefixes.contains(&new_p) {
+                existing.prefixes.push(new_p);
+            }
+        }
+        existing.redirect_id = redirect_id;
+        existing.broken_redirect = false;
+        existing.noloop = noloop;
+        HAS_TRACKING_CLIENTS.store(true, std::sync::atomic::Ordering::Release);
+        return Ok(());
+    }
+
     map.insert(
         (port, client_id),
         ClientTracker {
             port,
             client_id,
+            redirect_id,
+            broken_redirect: false,
             bcast,
             prefixes,
+            optin,
+            optout,
+            noloop,
+            caching: None,
             tracked_keys: hashbrown::HashSet::new(),
-            sender,
-            is_resp3,
+            pending_bcast: Vec::new(),
         },
     );
     HAS_TRACKING_CLIENTS.store(!map.is_empty(), std::sync::atomic::Ordering::Release);
+    Ok(())
 }
 
 pub fn unregister_client_tracking(port: u16, client_id: u64) {
@@ -1129,16 +1278,342 @@ pub fn unregister_client_tracking(port: u16, client_id: u64) {
     }
 }
 
+pub fn set_client_caching(port: u16, client_id: u64, yes: bool) -> Result<(), &'static str> {
+    if !HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(
+            "CLIENT CACHING can be called only when the client is in tracking mode with OPTIN or OPTOUT mode enabled",
+        );
+    }
+    let mut map = TRACKING_CLIENTS.write().unwrap();
+    let Some(tracker) = map.get_mut(&(port, client_id)) else {
+        return Err(
+            "CLIENT CACHING can be called only when the client is in tracking mode with OPTIN or OPTOUT mode enabled",
+        );
+    };
+    if (!tracker.optin && !tracker.optout) || tracker.bcast {
+        return Err(
+            "CLIENT CACHING can be called only when the client is in tracking mode with OPTIN or OPTOUT mode enabled",
+        );
+    }
+    if yes && !tracker.optin {
+        return Err("CLIENT CACHING YES is only valid when OPTIN is enabled");
+    }
+    if !yes && !tracker.optout {
+        return Err("CLIENT CACHING NO is only valid when OPTOUT is enabled");
+    }
+    tracker.caching = Some(yes);
+    Ok(())
+}
+
 #[inline(always)]
-pub fn record_client_read(port: u16, client_id: u64, key: &[u8]) {
+pub fn reset_client_caching(port: u16, client_id: u64) {
     if !HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     let mut map = TRACKING_CLIENTS.write().unwrap();
-    if let Some(tracker) = map.get_mut(&(port, client_id))
-        && !tracker.bcast
+    if let Some(tracker) = map.get_mut(&(port, client_id)) {
+        tracker.caching = None;
+    }
+}
+
+pub fn get_client_redir(port: u16, client_id: u64) -> i64 {
+    if !HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+        return -1;
+    }
+    let map = TRACKING_CLIENTS.read().unwrap();
+    if let Some(tracker) = map.get(&(port, client_id)) {
+        tracker.redirect_id as i64
+    } else {
+        -1
+    }
+}
+
+pub fn write_client_tracking_info(port: u16, client_id: u64, is_resp3: bool, out: &mut Vec<u8>) {
+    let map = TRACKING_CLIENTS.read().unwrap();
+    let tracker_opt = map.get(&(port, client_id));
+
+    let mut flags: Vec<&'static str> = Vec::new();
+    let redirect: i64;
+    let mut prefixes: Vec<Bytes> = Vec::new();
+
+    if let Some(t) = tracker_opt {
+        flags.push("on");
+        if t.bcast {
+            flags.push("bcast");
+        }
+        if t.optin {
+            flags.push("optin");
+        }
+        if t.optout {
+            flags.push("optout");
+        }
+        if t.caching == Some(true) {
+            flags.push("caching-yes");
+        } else if t.caching == Some(false) {
+            flags.push("caching-no");
+        }
+        if t.noloop {
+            flags.push("noloop");
+        }
+        if t.broken_redirect {
+            flags.push("broken_redirect");
+        }
+        redirect = t.redirect_id as i64;
+        if t.bcast {
+            prefixes = t.prefixes.clone();
+        }
+    } else {
+        flags.push("off");
+        redirect = -1;
+    }
+
+    if is_resp3 {
+        out.extend_from_slice(b"%3\r\n");
+    } else {
+        out.extend_from_slice(b"*6\r\n");
+    }
+    write_resp_bulk(out, b"flags");
+    if is_resp3 {
+        out.extend_from_slice(format!("~{}\r\n", flags.len()).as_bytes());
+    } else {
+        out.extend_from_slice(format!("*{}\r\n", flags.len()).as_bytes());
+    }
+    for f in flags {
+        write_resp_bulk(out, f.as_bytes());
+    }
+    write_resp_bulk(out, b"redirect");
+    write_resp_integer(out, redirect);
+    write_resp_bulk(out, b"prefixes");
+    out.extend_from_slice(format!("*{}\r\n", prefixes.len()).as_bytes());
+    for p in prefixes {
+        write_resp_bulk(out, &p);
+    }
+}
+
+pub fn get_tracking_info_stats(port: u16) -> (usize, usize, usize, usize) {
+    if !HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+        return (0, 0, 0, 0);
+    }
+    let map = TRACKING_CLIENTS.read().unwrap();
+    let mut tracking_clients = 0usize;
+    let mut tracking_total_items = 0usize;
+    let mut unique_keys: hashbrown::HashSet<&[u8]> = hashbrown::HashSet::new();
+    let mut tracking_total_prefixes = 0usize;
+
+    for tracker in map.values() {
+        if tracker.port != port {
+            continue;
+        }
+        tracking_clients += 1;
+        if tracker.bcast {
+            tracking_total_prefixes += tracker.prefixes.len();
+        } else {
+            tracking_total_items += tracker.tracked_keys.len();
+            for k in &tracker.tracked_keys {
+                unique_keys.insert(k.as_slice());
+            }
+        }
+    }
+    (
+        tracking_clients,
+        tracking_total_items,
+        unique_keys.len(),
+        tracking_total_prefixes,
+    )
+}
+
+fn send_raw_to_client_entry(target_id: u64, entry: &GlobalClientEntry, msg: Vec<u8>) {
+    let exec_cid = {
+        let local = EXECUTING_CLIENT_ID.get();
+        if local != 0 {
+            local
+        } else {
+            ACTIVE_COMMAND_CLIENT_ID.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    };
+    if target_id == exec_cid {
+        if IN_MAXMEMORY_EVICT.get()
+            || IN_MAXMEMORY_EVICT_GLOBAL.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            PRE_CMD_TRACK_BUF_GLOBAL
+                .lock()
+                .unwrap()
+                .extend_from_slice(&msg);
+        } else {
+            let _ = entry.track_tx.send(msg);
+        }
+    } else {
+        unsafe {
+            libc::send(
+                entry.raw_fd,
+                msg.as_ptr() as *const libc::c_void,
+                msg.len(),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            );
+        }
+    }
+}
+
+fn format_invalidation_msg(
+    is_resp3: bool,
+    is_redir_or_pubsub: bool,
+    keys: Option<&[&[u8]]>,
+) -> Option<Vec<u8>> {
+    if is_resp3 {
+        let mut msg = Vec::new();
+        match keys {
+            Some(ks) => {
+                msg.extend_from_slice(
+                    format!(">2\r\n$10\r\ninvalidate\r\n*{}\r\n", ks.len()).as_bytes(),
+                );
+                for k in ks {
+                    write_resp_bulk(&mut msg, k);
+                }
+            }
+            None => {
+                msg.extend_from_slice(b">2\r\n$10\r\ninvalidate\r\n_\r\n");
+            }
+        }
+        Some(msg)
+    } else if is_redir_or_pubsub {
+        let mut msg = Vec::new();
+        match keys {
+            Some(ks) => {
+                msg.extend_from_slice(
+                    format!(
+                        "*3\r\n$7\r\nmessage\r\n$20\r\n__redis__:invalidate\r\n*{}\r\n",
+                        ks.len()
+                    )
+                    .as_bytes(),
+                );
+                for k in ks {
+                    write_resp_bulk(&mut msg, k);
+                }
+            }
+            None => {
+                msg.extend_from_slice(b"*3\r\n$7\r\nmessage\r\n$20\r\n__redis__:invalidate\r\n$-1\r\n");
+            }
+        }
+        Some(msg)
+    } else {
+        None
+    }
+}
+
+fn deliver_invalidation_to_tracker(
+    tracker: &mut ClientTracker,
+    clients: &hashbrown::HashMap<(u16, u64), GlobalClientEntry>,
+    keys: Option<&[&[u8]]>,
+) {
+    let target_id = if tracker.redirect_id > 0 {
+        tracker.redirect_id
+    } else {
+        tracker.client_id
+    };
+    if let Some(target_entry) = clients.get(&(tracker.port, target_id)) {
+        let is_redir_or_pubsub = tracker.redirect_id > 0 || target_entry.is_pubsub;
+        if let Some(msg) = format_invalidation_msg(target_entry.is_resp3, is_redir_or_pubsub, keys)
+        {
+            send_raw_to_client_entry(target_id, target_entry, msg);
+        }
+    } else if tracker.redirect_id > 0 {
+        tracker.broken_redirect = true;
+        if let Some(owner_entry) = clients.get(&(tracker.port, tracker.client_id))
+            && owner_entry.is_resp3
+        {
+            let msg = format!(
+                ">2\r\n$21\r\ntracking-redir-broken\r\n:{}\r\n",
+                tracker.redirect_id
+            )
+            .into_bytes();
+            send_raw_to_client_entry(tracker.client_id, owner_entry, msg);
+        }
+    }
+}
+
+fn can_tracker_read_key(
+    port: u16,
+    client_id: u64,
+    clients: &hashbrown::HashMap<(u16, u64), GlobalClientEntry>,
+    key: &[u8],
+) -> bool {
+    let user_name = clients
+        .get(&(port, client_id))
+        .map(|c| c.auth_user.as_str())
+        .unwrap_or("default");
+    if !crate::acl::HAS_CUSTOM_ACL.load(std::sync::atomic::Ordering::Relaxed)
+        && user_name == "default"
     {
-        tracker.tracked_keys.insert(key.to_vec());
+        return true;
+    }
+    let acl = crate::acl::get_acl_for_port(port);
+    let guard = acl.read().unwrap();
+    guard
+        .get_user(user_name)
+        .map(|u| u.can_access_key(key))
+        .unwrap_or(true)
+}
+
+pub fn enforce_tracking_max_keys(port: u16) {
+    if !HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let max_keys = TRACKING_TABLE_MAX_KEYS.load(std::sync::atomic::Ordering::Relaxed);
+    let mut map = TRACKING_CLIENTS.write().unwrap();
+    let clients = GLOBAL_CLIENTS.read().unwrap();
+
+    loop {
+        let total_keys: usize = map
+            .values()
+            .filter(|t| t.port == port && !t.bcast)
+            .map(|t| t.tracked_keys.len())
+            .sum();
+        if total_keys <= max_keys {
+            break;
+        }
+        let mut evicted_any = false;
+        for tracker in map.values_mut() {
+            if tracker.port != port || tracker.bcast || tracker.tracked_keys.is_empty() {
+                continue;
+            }
+            if let Some(k) = tracker.tracked_keys.iter().next().cloned() {
+                tracker.tracked_keys.remove(&k);
+                deliver_invalidation_to_tracker(tracker, &clients, Some(&[k.as_slice()]));
+                evicted_any = true;
+                break;
+            }
+        }
+        if !evicted_any {
+            break;
+        }
+    }
+}
+
+#[inline(always)]
+pub fn record_client_read(port: u16, client_id: u64, key: &[u8]) {
+    if !HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) || client_id == 0 {
+        return;
+    }
+    let needs_evict = {
+        let mut map = TRACKING_CLIENTS.write().unwrap();
+        if let Some(tracker) = map.get_mut(&(port, client_id))
+            && !tracker.bcast
+        {
+            if tracker.optin && tracker.caching != Some(true) {
+                return;
+            }
+            if tracker.optout && tracker.caching == Some(false) {
+                return;
+            }
+            tracker.tracked_keys.insert(key.to_vec());
+            let max_keys = TRACKING_TABLE_MAX_KEYS.load(std::sync::atomic::Ordering::Relaxed);
+            tracker.tracked_keys.len() > max_keys
+        } else {
+            false
+        }
+    };
+    if needs_evict {
+        enforce_tracking_max_keys(port);
     }
 }
 
@@ -1147,35 +1622,106 @@ pub fn notify_key_invalidation(port: u16, key: &[u8], sender_client_id: u64) {
     if !HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    let defer_bcast = DEFER_BCAST_FLUSH.get()
+        || DEFER_BCAST_FLUSH_GLOBAL.load(std::sync::atomic::Ordering::Relaxed);
     let mut map = TRACKING_CLIENTS.write().unwrap();
+    let clients = GLOBAL_CLIENTS.read().unwrap();
     for tracker in map.values_mut() {
         if tracker.port != port {
             continue;
         }
-        if tracker.client_id == sender_client_id && !tracker.bcast {
+        if tracker.noloop && sender_client_id != 0 && tracker.client_id == sender_client_id {
+            if !tracker.bcast {
+                tracker.tracked_keys.remove(key);
+            }
             continue;
         }
         if tracker.bcast {
-            if !tracker.prefixes.is_empty() {
-                let matched = tracker.prefixes.iter().any(|pfx| key.starts_with(pfx));
-                if !matched {
-                    continue;
-                }
-            }
-        } else {
-            if !tracker.tracked_keys.remove(key) {
+            if !can_tracker_read_key(port, tracker.client_id, &clients, key) {
                 continue;
             }
+            for pfx_idx in 0..tracker.prefixes.len() {
+                if key.starts_with(&tracker.prefixes[pfx_idx]) {
+                    if defer_bcast {
+                        let pfx = tracker.prefixes[pfx_idx].clone();
+                        if let Some((_, list)) =
+                            tracker.pending_bcast.iter_mut().find(|(p, _)| *p == pfx)
+                        {
+                            if !list.iter().any(|k| k.as_slice() == key) {
+                                list.push(key.to_vec());
+                            }
+                        } else {
+                            tracker.pending_bcast.push((pfx, vec![key.to_vec()]));
+                        }
+                    } else {
+                        deliver_invalidation_to_tracker(tracker, &clients, Some(&[key]));
+                    }
+                }
+            }
+        } else if tracker.tracked_keys.remove(key)
+            && can_tracker_read_key(port, tracker.client_id, &clients, key)
+        {
+            deliver_invalidation_to_tracker(tracker, &clients, Some(&[key]));
         }
-        let mut msg = Vec::new();
-        if tracker.is_resp3 {
-            msg.extend_from_slice(b">2\r\n$10\r\ninvalidate\r\n*1\r\n");
-            write_resp_bulk(&mut msg, key);
-        } else {
-            msg.extend_from_slice(b"*2\r\n$10\r\ninvalidate\r\n*1\r\n");
-            write_resp_bulk(&mut msg, key);
+    }
+}
+
+pub fn flush_pending_bcast(port: u16) {
+    if !HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut map = TRACKING_CLIENTS.write().unwrap();
+    let clients = GLOBAL_CLIENTS.read().unwrap();
+    for tracker in map.values_mut() {
+        if tracker.port == port && !tracker.pending_bcast.is_empty() {
+            let pending = std::mem::take(&mut tracker.pending_bcast);
+            for (_pfx, keys) in pending {
+                let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+                deliver_invalidation_to_tracker(tracker, &clients, Some(&refs));
+            }
         }
-        let _ = tracker.sender.send(msg);
+    }
+}
+
+pub fn notify_key_invalidation_any_port(key: &[u8], sender_client_id: u64) {
+    if !HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let ports: smallvec::SmallVec<[u16; 4]> = {
+        let map = TRACKING_CLIENTS.read().unwrap();
+        let mut p = smallvec::SmallVec::new();
+        for &(port, _) in map.keys() {
+            if !p.contains(&port) {
+                p.push(port);
+            }
+        }
+        p
+    };
+    for port in ports {
+        notify_key_invalidation(port, key, sender_client_id);
+    }
+}
+
+pub fn notify_flush_invalidation(port: u16, sender_client_id: u64) {
+    if !HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut map = TRACKING_CLIENTS.write().unwrap();
+    let clients = GLOBAL_CLIENTS.read().unwrap();
+    for tracker in map.values_mut() {
+        if tracker.port != port {
+            continue;
+        }
+        let had_keys = !tracker.tracked_keys.is_empty();
+        tracker.tracked_keys.clear();
+        tracker.pending_bcast.clear();
+        if !tracker.bcast && !had_keys {
+            continue;
+        }
+        if tracker.noloop && sender_client_id != 0 && tracker.client_id == sender_client_id {
+            continue;
+        }
+        deliver_invalidation_to_tracker(tracker, &clients, None);
     }
 }
 
@@ -1918,6 +2464,9 @@ async fn execute_tx_step(
                     c.is_resp3 = false;
                     c.is_monitor = false;
                 }
+                update_global_client_resp3(router.port, client_id, false);
+                update_global_client_auth(router.port, client_id, "default");
+                unregister_client_tracking(router.port, client_id);
                 reset_client_pubsub(router, client_id);
 
                 let acl = crate::acl::get_acl_for_port(router.port);
@@ -2005,6 +2554,10 @@ async fn execute_tx_step(
                     let queued = std::mem::take(tx_queue);
                     let mut should_quit = false;
                     IN_TX.set(true);
+                    DEFER_BCAST_FLUSH.set(true);
+                    DEFER_BCAST_FLUSH_GLOBAL.store(true, std::sync::atomic::Ordering::Relaxed);
+                    EXECUTING_CLIENT_ID.set(client_id);
+                    ACTIVE_COMMAND_CLIENT_ID.store(client_id, std::sync::atomic::Ordering::Relaxed);
                     for q_cmd in queued {
                         let quit = execute_command(
                             q_cmd,
@@ -2022,7 +2575,12 @@ async fn execute_tx_step(
                             break;
                         }
                     }
+                    DEFER_BCAST_FLUSH.set(false);
+                    DEFER_BCAST_FLUSH_GLOBAL.store(false, std::sync::atomic::Ordering::Relaxed);
                     IN_TX.set(false);
+                    flush_pending_bcast(router.port);
+                    EXECUTING_CLIENT_ID.set(0);
+                    ACTIVE_COMMAND_CLIENT_ID.store(0, std::sync::atomic::Ordering::Relaxed);
                     if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                         c.last_active = Instant::now();
                         c.last_cmd = "EXEC";
@@ -2066,6 +2624,9 @@ async fn execute_tx_step(
                 false
             }
             _ => {
+                if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                    enforce_tracking_max_keys(router.port);
+                }
                 tx_queue.push(cmd);
                 out_buf.extend_from_slice(b"+QUEUED\r\n");
                 false
@@ -2143,6 +2704,15 @@ pub async fn handle_connection(
     let raw_fd = stream.as_raw_fd();
     let now = Instant::now();
     let (track_tx, track_rx) = flume::unbounded::<Vec<u8>>();
+    register_global_client(
+        router.port,
+        client_id,
+        raw_fd,
+        track_tx.clone(),
+        false,
+        "default".to_string(),
+        false,
+    );
     client_registry.borrow_mut().insert(
         client_id,
         ClientInfo {
@@ -2176,6 +2746,7 @@ pub async fn handle_connection(
             ACTIVE_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             flush_local_cmd_stats();
             self.registry.borrow_mut().remove(&self.client_id);
+            unregister_global_client(self.port, self.client_id);
             if !self.router.pubsub.borrow().clients.is_empty() {
                 self.router.pubsub.borrow_mut().remove_client_with_presence(
                     self.client_id,
@@ -2421,6 +2992,7 @@ pub async fn handle_connection(
                         let _ = stream.write_all(write_chunk).await.0;
                     }
                     let initial_sub = commands.remove(0);
+                    update_global_client_pubsub(router.port, client_id, true);
                     std::mem::forget(_cleanup);
                     run_pubsub_loop(
                         stream,
@@ -2535,13 +3107,25 @@ pub async fn handle_connection(
                                 should_quit = true;
                                 break;
                             }
+                            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                while let Ok(inval) = track_rx.try_recv() {
+                                    out_buf.extend_from_slice(&inval);
+                                }
+                            }
                         }
                     } else if is_client_paused().is_some()
+                        || HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
+                        || client_registry
+                            .borrow()
+                            .get(&client_id)
+                            .map(|c| c.reply_mode != crate::resp::ClientReplyMode::On)
+                            .unwrap_or(false)
                         || (has_special
                             && commands.iter().any(|c| {
                                 matches!(
                                     c,
-                                    Command::Blpop { .. }
+                                    Command::Client(_)
+                                        | Command::Blpop { .. }
                                         | Command::Brpop { .. }
                                         | Command::Blmove { .. }
                                         | Command::Blmovem { .. }
@@ -2607,6 +3191,11 @@ pub async fn handle_connection(
                                 &mut auth_user,
                             )
                             .await;
+                            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                                while let Ok(inval) = track_rx.try_recv() {
+                                    out_buf.extend_from_slice(&inval);
+                                }
+                            }
                             if quit {
                                 should_quit = true;
                                 break;
@@ -2886,6 +3475,8 @@ async fn run_pubsub_loop(
             ACTIVE_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             flush_local_cmd_stats();
             self.client_registry.borrow_mut().remove(&self.client_id);
+            unregister_global_client(self.router.port, self.client_id);
+            unregister_client_tracking(self.router.port, self.client_id);
             self.router.pubsub.borrow_mut().remove_client_with_presence(
                 self.client_id,
                 Some((self.router.shard_id, &self.router.presence_table)),
@@ -5006,6 +5597,8 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
             ClientSubcommand::Id => "client|id",
             ClientSubcommand::Tracking { .. } => "client|tracking",
             ClientSubcommand::Caching(_) => "client|caching",
+            ClientSubcommand::GetRedir => "client|getredir",
+            ClientSubcommand::TrackingInfo => "client|trackinginfo",
             ClientSubcommand::Kill(_) => "client|kill",
             ClientSubcommand::Unblock { .. } => "client|unblock",
             ClientSubcommand::Pause(_, _) => "client|pause",
@@ -6273,9 +6866,60 @@ async fn execute_command(
     authenticated: &mut bool,
     auth_user: &mut String,
 ) -> bool {
+    let mut initial_reply_mode = crate::resp::ClientReplyMode::On;
     if let Some(client) = client_registry.borrow().get(&client_id) {
         CURRENT_CLIENT_RESP3.set(client.is_resp3);
+        initial_reply_mode = client.reply_mode;
     }
+    struct ExecutingClientGuard {
+        prev_local: u64,
+        prev_exec: u64,
+        has_tracking: bool,
+    }
+    impl Drop for ExecutingClientGuard {
+        fn drop(&mut self) {
+            CURRENT_CLIENT_ID.set(self.prev_local);
+            EXECUTING_CLIENT_ID.set(self.prev_exec);
+            if self.has_tracking {
+                ACTIVE_COMMAND_CLIENT_ID
+                    .store(self.prev_exec, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+    let has_tracking = HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed);
+    let _exec_client_guard = ExecutingClientGuard {
+        prev_local: CURRENT_CLIENT_ID.replace(client_id),
+        prev_exec: EXECUTING_CLIENT_ID.replace(client_id),
+        has_tracking,
+    };
+    if has_tracking {
+        ACTIVE_COMMAND_CLIENT_ID.store(client_id, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    let is_caching_or_trackinginfo = matches!(
+        cmd,
+        Command::Client(ClientSubcommand::Caching(_) | ClientSubcommand::TrackingInfo)
+            | Command::Multi
+    );
+    struct CachingResetGuard {
+        port: u16,
+        client_id: u64,
+        should_reset: bool,
+    }
+    impl Drop for CachingResetGuard {
+        fn drop(&mut self) {
+            if self.should_reset && HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                reset_client_caching(self.port, self.client_id);
+            }
+        }
+    }
+    let _caching_guard = CachingResetGuard {
+        port: router.port,
+        client_id,
+        should_reset: !is_caching_or_trackinginfo,
+    };
+
     wait_if_client_paused(router.port, client_id, &cmd).await;
     let cmd_name = get_cmd_name(&cmd);
     record_cmd_stat(cmd_name);
@@ -6504,10 +7148,40 @@ async fn execute_command(
         return false;
     }
 
-    // Enforce maxmemory with noeviction: return OOM if memory limit is exceeded
-    if cmd.is_write_command() && !cmd.allows_oom() {
-        let max_mem = crate::tiering::get_max_memory(router.port);
-        if max_mem > 0 && get_max_memory_policy() == "noeviction" {
+    // Enforce maxmemory: evict or return OOM if memory limit is exceeded
+    let max_mem = crate::tiering::get_max_memory(router.port);
+    if max_mem > 0 {
+        let policy = get_max_memory_policy();
+        if policy != "noeviction" {
+            if !matches!(
+                cmd,
+                Command::ConfigGet(_) | Command::ConfigSet { .. } | Command::Info(_)
+            ) {
+                IN_MAXMEMORY_EVICT.set(true);
+                IN_MAXMEMORY_EVICT_GLOBAL.store(true, std::sync::atomic::Ordering::Relaxed);
+                let under = router
+                    .evict_until_under_maxmemory(max_mem as usize, &policy)
+                    .await;
+                IN_MAXMEMORY_EVICT.set(false);
+                IN_MAXMEMORY_EVICT_GLOBAL.store(false, std::sync::atomic::Ordering::Relaxed);
+                {
+                    let mut pre_buf = PRE_CMD_TRACK_BUF_GLOBAL.lock().unwrap();
+                    if !pre_buf.is_empty() {
+                        out.extend_from_slice(&pre_buf);
+                        pre_buf.clear();
+                    }
+                }
+                if !under && cmd.is_write_command() && !cmd.allows_oom() {
+                    let c_name = get_cmd_name(&cmd);
+                    record_rejected_stat(c_name);
+                    record_error_stat("OOM", Some(c_name));
+                    out.extend_from_slice(
+                        b"-OOM command not allowed when used memory > 'maxmemory'.\r\n",
+                    );
+                    return false;
+                }
+            }
+        } else if cmd.is_write_command() && !cmd.allows_oom() {
             let used = router.local_db.borrow().table.used_memory;
             let shard_max = (max_mem / router.num_shards.max(1) as u64) as usize;
             if used > shard_max {
@@ -6522,9 +7196,40 @@ async fn execute_command(
         }
     }
 
+    let is_client_reply_cmd = matches!(cmd, Command::Client(ClientSubcommand::Reply(_)));
+    struct ReplyModeTracker<'a> {
+        start_len: usize,
+        out: *mut Vec<u8>,
+        mode: crate::resp::ClientReplyMode,
+        is_reply_cmd: bool,
+        client_id: u64,
+        client_registry: &'a RefCell<hashbrown::HashMap<u64, ClientInfo>>,
+    }
+    impl<'a> Drop for ReplyModeTracker<'a> {
+        fn drop(&mut self) {
+            if !self.is_reply_cmd && self.mode != crate::resp::ClientReplyMode::On {
+                unsafe {
+                    (*self.out).truncate(self.start_len);
+                }
+                if self.mode == crate::resp::ClientReplyMode::Skip
+                    && let Some(c) = self.client_registry.borrow_mut().get_mut(&self.client_id)
+                {
+                    c.reply_mode = crate::resp::ClientReplyMode::On;
+                }
+            }
+        }
+    }
+    let _reply_mode_guard = ReplyModeTracker {
+        start_len: out.len(),
+        out: out as *mut Vec<u8>,
+        mode: initial_reply_mode,
+        is_reply_cmd: is_client_reply_cmd,
+        client_id,
+        client_registry,
+    };
+
     match cmd {
         Command::Get(key) => {
-            record_client_read(router.port, client_id, key.as_ref());
             let target = target_shard(&key, router.num_shards);
             let val = if target == router.shard_id {
                 let local_val = router.local_db.borrow_mut().get(&key);
@@ -6537,11 +7242,12 @@ async fn execute_command(
                 } else if router.local_db.borrow_mut().table.is_tiered(&key).is_none() {
                     None
                 } else {
-                    router.get(key).await
+                    router.get(key.clone()).await
                 }
             } else {
-                router.get(key).await
+                router.get(key.clone()).await
             };
+            record_client_read(router.port, client_id, key.as_ref());
             match val {
                 Some(v) => {
                     write_resp_bulk(out, &v);
@@ -6795,11 +7501,13 @@ async fn execute_command(
         }
         Command::Mget(keys) => {
             if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                router.write_mget_resp(keys.clone(), out).await;
                 for key in &keys {
                     record_client_read(router.port, client_id, key.as_ref());
                 }
+            } else {
+                router.write_mget_resp(keys, out).await;
             }
-            router.write_mget_resp(keys, out).await;
             false
         }
         Command::Mset(pairs) => {
@@ -6809,8 +7517,15 @@ async fn execute_command(
                 crate::replication::propagate_bytes(router.port, &bytes);
             }
             if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                let was_defer = DEFER_BCAST_FLUSH.replace(true);
+                DEFER_BCAST_FLUSH_GLOBAL.store(true, std::sync::atomic::Ordering::Relaxed);
                 for (key, _) in &pairs {
                     notify_key_invalidation(router.port, key.as_ref(), client_id);
+                }
+                DEFER_BCAST_FLUSH.set(was_defer);
+                DEFER_BCAST_FLUSH_GLOBAL.store(was_defer, std::sync::atomic::Ordering::Relaxed);
+                if !was_defer {
+                    flush_pending_bcast(router.port);
                 }
             }
             router.mset(pairs).await;
@@ -7058,14 +7773,16 @@ async fn execute_command(
                 } else {
                     router.exists(keys[0].clone()).await
                 };
+                record_client_read(router.port, client_id, keys[0].as_ref());
                 write_resp_integer(out, if exists { 1 } else { 0 });
                 return false;
             }
             let mut count = 0usize;
             for key in keys {
-                if router.exists(key).await {
+                if router.exists(key.clone()).await {
                     count += 1;
                 }
+                record_client_read(router.port, client_id, key.as_ref());
             }
             write_resp_integer(out, count as i64);
             false
@@ -7073,6 +7790,7 @@ async fn execute_command(
         Command::IncrBy(key, delta) => {
             match router.incr_by(key.clone(), delta).await {
                 Ok(val) => {
+                    notify_key_invalidation(router.port, key.as_ref(), client_id);
                     if let Some(bytes) = crate::aof::command_to_resp(&Command::IncrBy(key, delta)) {
                         crate::replication::propagate_bytes(router.port, &bytes);
                     }
@@ -7360,8 +8078,14 @@ async fn execute_command(
                 .load(std::sync::atomic::Ordering::Relaxed);
             let slowlog_max_us = crate::slowlog::SLOWLOG_COMMANDS_TIME_US_MAX
                 .load(std::sync::atomic::Ordering::Relaxed);
+            let (
+                tracking_clients,
+                tracking_total_items,
+                tracking_total_keys,
+                tracking_total_prefixes,
+            ) = get_tracking_info_stats(router.port);
             let stats_str = format!(
-                "# Stats\r\ntotal_connections_received:0\r\ntotal_commands_processed:0\r\ninstantaneous_ops_per_sec:0\r\ntotal_net_input_bytes:0\r\ntotal_net_output_bytes:0\r\ninstantaneous_input_kbps:0.00\r\ninstantaneous_output_kbps:0.00\r\nrejected_connections:0\r\nsync_full:0\r\nsync_partial_ok:0\r\nsync_partial_err:0\r\nexpired_keys:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nkeyspace_hits:0\r\nkeyspace_misses:0\r\npubsub_channels:0\r\npubsub_patterns:0\r\nlatest_fork_usec:0\r\ntotal_error_replies:{}\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\nmigrate_cached_sockets:0\r\n",
+                "# Stats\r\ntotal_connections_received:0\r\ntotal_commands_processed:0\r\ninstantaneous_ops_per_sec:0\r\ntotal_net_input_bytes:0\r\ntotal_net_output_bytes:0\r\ninstantaneous_input_kbps:0.00\r\ninstantaneous_output_kbps:0.00\r\nrejected_connections:0\r\nsync_full:0\r\nsync_partial_ok:0\r\nsync_partial_err:0\r\nexpired_keys:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nkeyspace_hits:0\r\nkeyspace_misses:0\r\npubsub_channels:0\r\npubsub_patterns:0\r\nlatest_fork_usec:0\r\ntotal_error_replies:{}\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\nmigrate_cached_sockets:0\r\ntracking_total_items:{}\r\ntracking_total_keys:{}\r\ntracking_total_prefixes:{}\r\n",
                 crate::table::get_expired_keys(),
                 crate::table::get_expired_keys_active(),
                 crate::table::get_evicted_keys(),
@@ -7369,6 +8093,9 @@ async fn execute_command(
                 slowlog_count,
                 slowlog_sum_us as f64 / 1000.0,
                 slowlog_max_us as f64 / 1000.0,
+                tracking_total_items,
+                tracking_total_keys,
+                tracking_total_prefixes,
             );
             let (blocked_clients_count, total_blocking_keys, total_blocking_keys_on_nokey) = {
                 let hub_arc = crate::block::get_block_hub_for_port(router.port);
@@ -7386,10 +8113,11 @@ async fn execute_command(
                 .map(|s| crate::conn_balance::conn_count(s).to_string())
                 .collect();
             let clients_str = format!(
-                "# Clients\r\nconnected_clients:{}\r\nmaxclients:{}\r\nblocked_clients:{}\r\ntracking_clients:0\r\ntotal_blocking_keys:{}\r\ntotal_blocking_keys_on_nokey:{}\r\nisolated_panics:{}\r\nshard_connections:{}\r\n",
+                "# Clients\r\nconnected_clients:{}\r\nmaxclients:{}\r\nblocked_clients:{}\r\ntracking_clients:{}\r\ntotal_blocking_keys:{}\r\ntotal_blocking_keys_on_nokey:{}\r\nisolated_panics:{}\r\nshard_connections:{}\r\n",
                 get_active_clients(),
                 get_max_clients(),
                 blocked_clients_count,
+                tracking_clients,
                 total_blocking_keys,
                 total_blocking_keys_on_nokey,
                 get_isolated_panics(),
@@ -7954,6 +8682,16 @@ async fn execute_command(
                     val
                 );
                 out.extend_from_slice(resp.as_bytes());
+            } else if p_str == "tracking-table-max-keys" {
+                let val = TRACKING_TABLE_MAX_KEYS
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    .to_string();
+                let resp = format!(
+                    "*2\r\n$23\r\ntracking-table-max-keys\r\n${}\r\n{}\r\n",
+                    val.len(),
+                    val
+                );
+                out.extend_from_slice(resp.as_bytes());
             } else if p_str == "*" {
                 let max_mem = crate::tiering::get_max_memory(router.port).to_string();
                 let offload = crate::tiering::get_offload_threshold_pct(router.port).to_string();
@@ -8226,6 +8964,18 @@ async fn execute_command(
                 let v = val_str.eq_ignore_ascii_case("yes");
                 crate::table::set_lazyfree_lazy_expire(v);
                 out.extend_from_slice(b"+OK\r\n");
+            } else if p_str == "tracking-table-max-keys" {
+                if let Ok(n) = val_str.parse::<usize>() {
+                    TRACKING_TABLE_MAX_KEYS.store(n, std::sync::atomic::Ordering::Relaxed);
+                    if !PAUSE_CRON.load(std::sync::atomic::Ordering::Relaxed) {
+                        enforce_tracking_max_keys(router.port);
+                    }
+                    out.extend_from_slice(b"+OK\r\n");
+                } else {
+                    out.extend_from_slice(
+                        b"-ERR Invalid argument for CONFIG SET tracking-table-max-keys\r\n",
+                    );
+                }
             } else if p_str == "rewrite" {
                 match crate::config::rewrite_config_file(router.port) {
                     Ok(()) => out.extend_from_slice(b"+OK\r\n"),
@@ -8665,30 +9415,50 @@ async fn execute_command(
                 }
                 ClientSubcommand::Tracking {
                     enabled,
+                    redirect,
                     bcast,
                     prefixes,
+                    optin,
+                    optout,
+                    noloop,
                 } => {
                     if enabled {
-                        let reg = client_registry.borrow();
-                        if let Some(c) = reg.get(&client_id)
-                            && let Some(tx) = &c.track_tx
-                        {
-                            register_client_tracking(
-                                router.port,
-                                client_id,
-                                bcast,
-                                prefixes,
-                                tx.clone(),
-                                c.is_resp3,
-                            );
+                        if let Err(err) = register_client_tracking(
+                            router.port,
+                            client_id,
+                            redirect,
+                            bcast,
+                            prefixes,
+                            optin,
+                            optout,
+                            noloop,
+                        ) {
+                            write_resp_err(out, &err);
+                            return false;
                         }
                     } else {
                         unregister_client_tracking(router.port, client_id);
                     }
                     out.extend_from_slice(b"+OK\r\n");
                 }
-                ClientSubcommand::Caching(_) => {
-                    out.extend_from_slice(b"+OK\r\n");
+                ClientSubcommand::Caching(yes) => {
+                    if let Err(err) = set_client_caching(router.port, client_id, yes) {
+                        write_resp_err(out, err);
+                    } else {
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                }
+                ClientSubcommand::GetRedir => {
+                    let redir = get_client_redir(router.port, client_id);
+                    write_resp_integer(out, redir);
+                }
+                ClientSubcommand::TrackingInfo => {
+                    let is_resp3 = client_registry
+                        .borrow()
+                        .get(&client_id)
+                        .map(|c| c.is_resp3)
+                        .unwrap_or(false);
+                    write_client_tracking_info(router.port, client_id, is_resp3, out);
                 }
                 ClientSubcommand::Kill(_) => {
                     out.extend_from_slice(b"+OK\r\n");
@@ -9411,7 +10181,8 @@ async fn execute_command(
             let acl_guard = acl.read().unwrap();
             if let Ok(authed_user) = acl_guard.check_auth(Some(uname), pass) {
                 *authenticated = true;
-                *auth_user = authed_user;
+                *auth_user = authed_user.clone();
+                update_global_client_auth(router.port, client_id, &authed_user);
                 out.extend_from_slice(b"+OK\r\n");
             } else {
                 out.extend_from_slice(
@@ -9473,6 +10244,7 @@ async fn execute_command(
                     }
                 }
                 crate::resp::AclSubcommand::SetUser { username, rules } => {
+                    flush_pending_bcast(router.port);
                     match acl.write().unwrap().set_user(&username, &rules) {
                         Ok(()) => out.extend_from_slice(b"+OK\r\n"),
                         Err(e) => out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes()),
@@ -9855,6 +10627,10 @@ async fn execute_command(
             }
 
             // 2. Fetch collection elements
+            record_client_read(router.port, client_id, key.as_ref());
+            if let Some(dest) = store {
+                notify_key_invalidation(router.port, dest.as_ref(), client_id);
+            }
             let (key_type, mut items) = match router.get_collection_for_sort(key).await {
                 Ok(res) => res,
                 Err(err) => {
@@ -10101,7 +10877,7 @@ async fn execute_command(
                 out.extend_from_slice(&res);
             }
 
-            if &out[start_len..] != b"$-1\r\n" {
+            if &out[start_len..] != b"$-1\r\n" && &out[start_len..] != b"_\r\n" {
                 return false;
             }
             if IN_TX.get() {
@@ -10139,6 +10915,11 @@ async fn execute_command(
             let raw_fd = client_registry.borrow().get(&client_id).map(|c| c.raw_fd);
             let (recv_res, client_disconnected) =
                 wait_for_blocked_result(&rx, timeout, raw_fd).await;
+            CURRENT_CLIENT_ID.set(client_id);
+            EXECUTING_CLIENT_ID.set(client_id);
+            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                ACTIVE_COMMAND_CLIENT_ID.store(client_id, std::sync::atomic::Ordering::Relaxed);
+            }
             if client_disconnected {
                 return true;
             }
@@ -10161,6 +10942,10 @@ async fn execute_command(
                             }
                         }
                         write_resp_bulk(out, &val);
+                        notify_key_invalidation(router.port, source.as_ref(), client_id);
+                        if source != destination {
+                            notify_key_invalidation(router.port, destination.as_ref(), client_id);
+                        }
                     } else {
                         write_resp_null(out);
                     }
@@ -10954,7 +11739,8 @@ async fn execute_command(
             if let Some((uname, pass)) = auth {
                 if let Ok(user) = acl.read().unwrap().check_auth(Some(uname), pass) {
                     *authenticated = true;
-                    *auth_user = user;
+                    *auth_user = user.clone();
+                    update_global_client_auth(router.port, client_id, &user);
                 } else {
                     out.extend_from_slice(
                         b"-WRONGPASS invalid username-password pair or user is disabled.\r\n",
@@ -10974,18 +11760,25 @@ async fn execute_command(
                 c.name = Some(name.clone());
             }
 
-            let proto_ver = proto.unwrap_or(2);
+            let cur_resp3 = client_registry
+                .borrow()
+                .get(&client_id)
+                .map(|c| c.is_resp3)
+                .unwrap_or(false);
+            let proto_ver = proto.unwrap_or(if cur_resp3 { 3 } else { 2 });
             if proto_ver == 3 {
                 if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                     c.is_resp3 = true;
                 }
                 CURRENT_CLIENT_RESP3.set(true);
+                update_global_client_resp3(router.port, client_id, true);
                 out.extend_from_slice(b"%7\r\n");
             } else {
                 if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                     c.is_resp3 = false;
                 }
                 CURRENT_CLIENT_RESP3.set(false);
+                update_global_client_resp3(router.port, client_id, false);
                 out.extend_from_slice(b"*14\r\n");
             }
             out.extend_from_slice(b"$6\r\nserver\r\n$6\r\nvalkey\r\n");
@@ -11020,8 +11813,11 @@ async fn execute_command(
                 c.name = None;
                 c.is_resp3 = false;
                 c.is_monitor = false;
+                c.reply_mode = crate::resp::ClientReplyMode::On;
             }
             CURRENT_CLIENT_RESP3.set(false);
+            update_global_client_resp3(router.port, client_id, false);
+            update_global_client_auth(router.port, client_id, "default");
             unregister_client_tracking(router.port, client_id);
             *asking = false;
             reset_client_pubsub(router, client_id);
@@ -11897,6 +12693,7 @@ async fn execute_command(
                 }
             }
             router.flushdb().await;
+            notify_flush_invalidation(router.port, client_id);
             out.extend_from_slice(b"+OK\r\n");
             false
         }
@@ -13938,6 +14735,8 @@ async fn execute_command(
                     out.extend_from_slice(b"+OK\r\n");
                     return false;
                 } else if sub.eq_ignore_ascii_case(b"set-active-expire") {
+                    let enabled = args.get(1).map(|v| v.as_ref() != b"0").unwrap_or(true);
+                    PAUSE_CRON.store(!enabled, std::sync::atomic::Ordering::Relaxed);
                     out.extend_from_slice(b"+OK\r\n");
                     return false;
                 } else if sub.eq_ignore_ascii_case(b"sleep") {
@@ -14362,12 +15161,24 @@ pub fn execute_local_command(
     out: &mut Vec<u8>,
     aof: Option<&RefCell<crate::aof::AofWriter>>,
 ) -> bool {
+    let cid = {
+        let local = CURRENT_CLIENT_ID.get();
+        if local != 0 {
+            local
+        } else if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+            ACTIVE_COMMAND_CLIENT_ID.load(std::sync::atomic::Ordering::Relaxed)
+        } else {
+            0
+        }
+    };
     macro_rules! record_change {
         ($cmd_expr:expr) => {
             DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed)
+                || HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
+            {
                 for_each_cmd_key($cmd_expr, |k| {
-                    touch_watched_key(db.port, k);
+                    notify_key_invalidation(db.port, k, cid);
                 });
             }
             let need_aof = aof.is_some();
@@ -14384,6 +15195,98 @@ pub fn execute_local_command(
             }
         };
     }
+    struct ReadTrackGuard<'a> {
+        port: u16,
+        cid: u64,
+        cmd: &'a Command,
+    }
+    impl<'a> Drop for ReadTrackGuard<'a> {
+        fn drop(&mut self) {
+            if self.cid != 0 && HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                match self.cmd {
+                    Command::Get(k)
+                    | Command::Ttl(k, _)
+                    | Command::Expiretime(k, _)
+                    | Command::Hlen(k)
+                    | Command::Hgetall(k)
+                    | Command::Hkeys(k)
+                    | Command::Hvals(k)
+                    | Command::Llen(k)
+                    | Command::Smembers(k)
+                    | Command::Scard(k)
+                    | Command::Zcard(k)
+                    | Command::Type(k)
+                    | Command::Strlen(k)
+                    | Command::Dump(k)
+                    | Command::Xlen(k) => record_client_read(self.port, self.cid, k.as_ref()),
+                    Command::Hget { key, .. }
+                    | Command::Hmget { key, .. }
+                    | Command::Hexists { key, .. }
+                    | Command::Hstrlen { key, .. }
+                    | Command::Hrandfield { key, .. }
+                    | Command::Hscan { key, .. }
+                    | Command::Lrange { key, .. }
+                    | Command::Lindex { key, .. }
+                    | Command::Lpos { key, .. }
+                    | Command::Sismember { key, .. }
+                    | Command::Smismember { key, .. }
+                    | Command::Srandmember { key, .. }
+                    | Command::Sscan { key, .. }
+                    | Command::Zscore { key, .. }
+                    | Command::Zmscore { key, .. }
+                    | Command::Zrank { key, .. }
+                    | Command::Zrevrank { key, .. }
+                    | Command::Zcount { key, .. }
+                    | Command::Zlexcount { key, .. }
+                    | Command::Zrange { key, .. }
+                    | Command::Zrandmember { key, .. }
+                    | Command::Zscan { key, .. }
+                    | Command::Getbit { key, .. }
+                    | Command::Bitcount { key, .. }
+                    | Command::Bitpos { key, .. }
+                    | Command::Getrange { key, .. }
+                    | Command::Xrange { key, .. }
+                    | Command::Xrevrange { key, .. }
+                    | Command::Xpending { key, .. } => {
+                        record_client_read(self.port, self.cid, key.as_ref())
+                    }
+                    Command::Exists(keys) => {
+                        for k in keys {
+                            record_client_read(self.port, self.cid, k.as_ref());
+                        }
+                    }
+                    Command::Mget(keys)
+                    | Command::Pfcount { keys }
+                    | Command::Sinter(keys)
+                    | Command::Sunion(keys)
+                    | Command::Sdiff(keys) => {
+                        for k in keys {
+                            record_client_read(self.port, self.cid, k.as_ref());
+                        }
+                    }
+                    Command::Sintercard { keys, .. }
+                    | Command::Sunioncard { keys, .. }
+                    | Command::Sdiffcard { keys, .. }
+                    | Command::Zdiff { keys, .. }
+                    | Command::Zinter { keys, .. }
+                    | Command::Zunion { keys, .. } => {
+                        for k in keys {
+                            record_client_read(self.port, self.cid, k.as_ref());
+                        }
+                    }
+                    Command::Sort {
+                        key, store: None, ..
+                    } => record_client_read(self.port, self.cid, key.as_ref()),
+                    _ => {}
+                }
+            }
+        }
+    }
+    let _read_track_guard = ReadTrackGuard {
+        port: db.port,
+        cid,
+        cmd,
+    };
     match cmd {
         Command::Get(key) => {
             match db.get(key) {

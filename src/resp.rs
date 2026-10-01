@@ -163,10 +163,16 @@ pub enum ClientSubcommand {
     Kill(Vec<Bytes>),
     Tracking {
         enabled: bool,
+        redirect: Option<i64>,
         bcast: bool,
         prefixes: Vec<Bytes>,
+        optin: bool,
+        optout: bool,
+        noloop: bool,
     },
     Caching(bool),
+    GetRedir,
+    TrackingInfo,
     Unblock {
         client_id: u64,
         unblock_type: crate::block::ClientUnblockType,
@@ -3827,21 +3833,33 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "TRACKING" => {
                     if args.len() < 3 {
                         return Err(
-                            "wrong number of arguments for 'client tracking' command".to_string()
+                            "wrong number of arguments for 'client|tracking' command".to_string()
                         );
                     }
                     let state = String::from_utf8_lossy(&args[2]).to_uppercase();
                     let enabled = match state.as_str() {
                         "ON" => true,
                         "OFF" => false,
-                        _ => return Err("syntax error: expected 'on' or 'off'".to_string()),
+                        _ => return Err("syntax error".to_string()),
                     };
+                    let mut redirect = None;
                     let mut bcast = false;
                     let mut prefixes = Vec::new();
+                    let mut optin = false;
+                    let mut optout = false;
+                    let mut noloop = false;
                     let mut i = 3;
                     while i < args.len() {
                         let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
                         match opt.as_str() {
+                            "REDIRECT" if i + 1 < args.len() => {
+                                let id_str = String::from_utf8_lossy(&args[i + 1]);
+                                let id = id_str.parse::<i64>().map_err(|_| {
+                                    "value is not an integer or out of range".to_string()
+                                })?;
+                                redirect = Some(id);
+                                i += 2;
+                            }
                             "BCAST" => {
                                 bcast = true;
                                 i += 1;
@@ -3850,26 +3868,75 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                                 prefixes.push(args[i + 1].clone());
                                 i += 2;
                             }
-                            _ => {
+                            "OPTIN" => {
+                                optin = true;
                                 i += 1;
+                            }
+                            "OPTOUT" => {
+                                optout = true;
+                                i += 1;
+                            }
+                            "NOLOOP" => {
+                                noloop = true;
+                                i += 1;
+                            }
+                            _ => {
+                                return Err("syntax error".to_string());
                             }
                         }
                     }
+                    if !bcast && !prefixes.is_empty() {
+                        return Err("PREFIX option requires BCAST mode to be enabled".to_string());
+                    }
+                    if bcast && (optin || optout) {
+                        return Err(
+                            "OPTIN and OPTOUT are not compatible with BCAST mode to be enabled"
+                                .to_string(),
+                        );
+                    }
+                    if optin && optout {
+                        return Err("You can't provide both OPTIN and OPTOUT options".to_string());
+                    }
                     Ok(Some(Command::Client(ClientSubcommand::Tracking {
                         enabled,
+                        redirect,
                         bcast,
                         prefixes,
+                        optin,
+                        optout,
+                        noloop,
                     })))
                 }
                 "CACHING" => {
-                    if args.len() < 3 {
+                    if args.len() != 3 {
                         return Err(
-                            "wrong number of arguments for 'client caching' command".to_string()
+                            "wrong number of arguments for 'client|caching' command".to_string()
                         );
                     }
                     let state = String::from_utf8_lossy(&args[2]).to_uppercase();
-                    let flag = state == "YES";
+                    let flag = match state.as_str() {
+                        "YES" => true,
+                        "NO" => false,
+                        _ => return Err("syntax error".to_string()),
+                    };
                     Ok(Some(Command::Client(ClientSubcommand::Caching(flag))))
+                }
+                "GETREDIR" => {
+                    if args.len() != 2 {
+                        return Err(
+                            "wrong number of arguments for 'client|getredir' command".to_string()
+                        );
+                    }
+                    Ok(Some(Command::Client(ClientSubcommand::GetRedir)))
+                }
+                "TRACKINGINFO" => {
+                    if args.len() != 2 {
+                        return Err(
+                            "wrong number of arguments for 'client|trackinginfo' command"
+                                .to_string(),
+                        );
+                    }
+                    Ok(Some(Command::Client(ClientSubcommand::TrackingInfo)))
                 }
                 "UNBLOCK" => {
                     if args.len() < 3 || args.len() > 4 {

@@ -1019,6 +1019,13 @@ pub fn run_shard_worker(
                             });
                         } else {
                             crate::connection::CURRENT_CLIENT_RESP3.set(is_resp3);
+                            let has_tracking = crate::connection::HAS_TRACKING_CLIENTS
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            let prev_cid = if has_tracking {
+                                crate::connection::CURRENT_CLIENT_ID.replace(0)
+                            } else {
+                                0
+                            };
                             let mut db = cross_shard_db.borrow_mut();
                             let aof_ref = cross_shard_aof.as_deref();
                             let mut temp_buf = Vec::new();
@@ -1027,7 +1034,7 @@ pub fn run_shard_worker(
                                 smallvec::SmallVec::new();
                             for (idx, key_hash, cmd) in items.drain(..) {
                                 temp_buf.clear();
-                                if let Command::Get(ref key) = cmd {
+                                if !has_tracking && let Command::Get(ref key) = cmd {
                                     match db.table.get_compact_with_hash(key.as_ref(), key_hash) {
                                         Ok(Some(resp)) => {
                                             responder.write_slot(idx, resp);
@@ -1050,7 +1057,8 @@ pub fn run_shard_worker(
                                             crate::connection::write_resp_err(&mut temp_buf, err);
                                         }
                                     }
-                                } else if aof_ref.is_none()
+                                } else if !has_tracking
+                                    && aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
                                     && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                                     && let Command::Set {
@@ -1067,9 +1075,6 @@ pub fn run_shard_worker(
                                     if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                         crate::connection::touch_watched_key(cross_shard_router.port, key.as_ref());
                                     }
-                                    if crate::connection::HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
-                                        crate::connection::notify_key_invalidation(cross_shard_router.port, key.as_ref(), 0);
-                                    }
                                     if let Some((ptr, is_cooled)) =
                                         db.table.set_with_hash(key, key_hash, value, expire_in)
                                         && let Some(tm) = &db.tier_manager
@@ -1078,7 +1083,8 @@ pub fn run_shard_worker(
                                     }
                                     responder.write_slot(idx, crate::shard::CompactResp::OK);
                                     continue;
-                                } else if aof_ref.is_none()
+                                } else if !has_tracking
+                                    && aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
                                     && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                                     && let Command::IncrBy(ref key, delta) = cmd
@@ -1102,15 +1108,20 @@ pub fn run_shard_worker(
                                             crate::connection::write_resp_err(&mut temp_buf, err);
                                         }
                                     }
-                                } else if let Command::Exists(ref keys) = cmd && keys.len() == 1 {
+                                } else if !has_tracking
+                                    && let Command::Exists(ref keys) = cmd
+                                    && keys.len() == 1
+                                {
                                     let exists = db.table.exists_with_hash(keys[0].as_ref(), key_hash);
                                     responder.write_slot(idx, if exists { crate::shard::CompactResp::INT_1 } else { crate::shard::CompactResp::INT_0 });
                                     continue;
-                                } else if aof_ref.is_none()
+                                } else if !has_tracking
+                                    && aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
                                     && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                                     && !crate::search::has_active_search_indices()
-                                    && let Command::Del(ref keys) = cmd && keys.len() == 1
+                                    && let Command::Del(ref keys) = cmd
+                                    && keys.len() == 1
                                 {
                                     let deleted = db.del_with_hash(keys[0].as_ref(), key_hash);
                                     if deleted {
@@ -1123,7 +1134,9 @@ pub fn run_shard_worker(
                                         responder.write_slot(idx, crate::shard::CompactResp::INT_0);
                                     }
                                     continue;
-                                } else if let Command::Hget { ref key, ref field } = cmd {
+                                } else if !has_tracking
+                                    && let Command::Hget { ref key, ref field } = cmd
+                                {
                                     match db.table.hget_compact_with_hash(key.as_ref(), key_hash, field.as_ref()) {
                                         Ok(resp) => {
                                             responder.write_slot(idx, resp);
@@ -1133,7 +1146,8 @@ pub fn run_shard_worker(
                                             crate::connection::write_resp_err(&mut temp_buf, err);
                                         }
                                     }
-                                } else if aof_ref.is_none()
+                                } else if !has_tracking
+                                    && aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
                                     && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                                     && !crate::search::has_active_search_indices()
@@ -1164,7 +1178,9 @@ pub fn run_shard_worker(
                                             crate::connection::write_resp_err(&mut temp_buf, err);
                                         }
                                     }
-                                } else if let Command::Sismember { ref key, ref member } = cmd {
+                                } else if !has_tracking
+                                    && let Command::Sismember { ref key, ref member } = cmd
+                                {
                                     match db.table.sismember_compact_with_hash(key.as_ref(), key_hash, member.as_ref()) {
                                         Ok(resp) => {
                                             responder.write_slot(idx, resp);
@@ -1172,7 +1188,8 @@ pub fn run_shard_worker(
                                         }
                                         Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
                                     }
-                                } else if aof_ref.is_none()
+                                } else if !has_tracking
+                                    && aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
                                     && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                                     && let Command::Sadd { ref key, ref members } = cmd
@@ -1201,7 +1218,8 @@ pub fn run_shard_worker(
                                             crate::connection::write_resp_err(&mut temp_buf, err);
                                         }
                                     }
-                                } else if aof_ref.is_none()
+                                } else if !has_tracking
+                                    && aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
                                     && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                                     && !crate::block::has_blocked_waiters(cross_shard_router.port)
@@ -1226,7 +1244,8 @@ pub fn run_shard_worker(
                                             crate::connection::write_resp_err(&mut temp_buf, err);
                                         }
                                     }
-                                } else if aof_ref.is_none()
+                                } else if !has_tracking
+                                    && aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
                                     && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                                     && let Command::Lpop { ref key, count } = cmd
@@ -1264,7 +1283,8 @@ pub fn run_shard_worker(
                                             }
                                         }
                                     }
-                                } else if aof_ref.is_none()
+                                } else if !has_tracking
+                                    && aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
                                     && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                                     && let Command::Rpop { ref key, count } = cmd
@@ -1302,7 +1322,9 @@ pub fn run_shard_worker(
                                             }
                                         }
                                     }
-                                } else if let Command::Lrange { ref key, start, stop } = cmd {
+                                } else if !has_tracking
+                                    && let Command::Lrange { ref key, start, stop } = cmd
+                                {
                                     match db.table.lrange_compact_with_hash(key.as_ref(), key_hash, start, stop, &mut temp_buf) {
                                         Ok(resp) => {
                                             responder.write_slot(idx, resp);
@@ -1310,7 +1332,9 @@ pub fn run_shard_worker(
                                         }
                                         Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
                                     }
-                                } else if let Command::Zrange { ref key, ref opts } = cmd {
+                                } else if !has_tracking
+                                    && let Command::Zrange { ref key, ref opts } = cmd
+                                {
                                     match db.table.zrange_compact_with_hash(key.as_ref(), key_hash, opts, is_resp3, &mut temp_buf) {
                                         Ok(resp) => {
                                             responder.write_slot(idx, resp);
@@ -1318,7 +1342,8 @@ pub fn run_shard_worker(
                                         }
                                         Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
                                     }
-                                } else if aof_ref.is_none()
+                                } else if !has_tracking
+                                    && aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
                                     && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                                     && !crate::block::has_blocked_waiters(cross_shard_router.port)
@@ -1416,6 +1441,9 @@ pub fn run_shard_worker(
                                 responder.write_slot(idx, crate::shard::CompactResp::from_slice(&temp_buf));
                             }
                             drop(db);
+                            if has_tracking {
+                                crate::connection::CURRENT_CLIENT_ID.set(prev_cid);
+                            }
                             if has_writes {
                                 cross_shard_router.check_auto_tier_after_write();
                             }
@@ -1884,6 +1912,10 @@ pub fn run_shard_worker(
                     ShardMessage::GetUsedMemory { responder } => {
                         let used = cross_shard_db.borrow().table.used_memory;
                         let _ = responder.send(used);
+                    }
+                    ShardMessage::TryEvictOneKey { policy, responder } => {
+                        let freed = cross_shard_db.borrow_mut().table.try_evict_one_key(&policy);
+                        let _ = responder.send(freed);
                     }
                     ShardMessage::StreamColdRead { key, responder } => {
                         let r = cross_shard_router.clone();

@@ -94,6 +94,9 @@ CORE_SUITES=(
     "unit/obuf-limits"
     "unit/replybufsize"
     "unit/querybuf"
+    "unit/tracking"
+    "unit/acl-v2"
+    "unit/acl"
 )
 
 if [ "$SUITE_ARG" = "all-types" ] || [ "$SUITE_ARG" = "all" ]; then

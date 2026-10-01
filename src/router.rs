@@ -604,6 +604,44 @@ impl Router {
         total
     }
 
+    pub async fn evict_until_under_maxmemory(&self, max_mem: usize, policy: &str) -> bool {
+        let mut total = self.get_total_used_memory().await;
+        if total <= max_mem {
+            return true;
+        }
+        let mut attempts = 0;
+        while total > max_mem && attempts < 256 {
+            attempts += 1;
+            let mut freed_any = false;
+            if let Some(freed) = self.local_db.borrow_mut().table.try_evict_one_key(policy) {
+                total = total.saturating_sub(freed);
+                freed_any = true;
+            }
+            if total <= max_mem {
+                break;
+            }
+            for s in 0..self.num_shards {
+                if s != self.shard_id && total > max_mem {
+                    let (tx, rx) = flume::bounded(1);
+                    let msg = ShardMessage::TryEvictOneKey {
+                        policy: policy.to_string(),
+                        responder: tx,
+                    };
+                    if self.senders[s].send(msg).is_ok()
+                        && let Some(freed) = rx.recv_async().await.unwrap_or(None)
+                    {
+                        total = total.saturating_sub(freed);
+                        freed_any = true;
+                    }
+                }
+            }
+            if !freed_any {
+                break;
+            }
+        }
+        total <= max_mem
+    }
+
     #[inline(always)]
     pub fn is_memory_constrained(&self) -> bool {
         let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed);

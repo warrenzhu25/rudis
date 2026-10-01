@@ -62,6 +62,7 @@ pub fn format_memory_info(
         used_memory_rss_human:{}\r\n\
         maxmemory:{}\r\n\
         maxmemory_human:{}\r\n\
+        mem_not_counted_for_evict:0\r\n\
         mem_fragmentation_ratio:{:.2}\r\n\
         mem_allocator:libc\r\n\
         allocator_allocated:{}\r\n\
