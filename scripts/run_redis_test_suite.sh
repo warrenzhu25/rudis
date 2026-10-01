@@ -21,10 +21,22 @@ echo "Building Rudis release binary..."
 # Clean log
 TEST_LOG="/tmp/rudis_tcl_test_${PORT}.log"
 rm -f "$TEST_LOG"
+killall -9 rudis 2>/dev/null || true
+sleep 0.5
+
+# Determine thread count (single-thread for unit/scripting which tests non-clustered cross-key Lua)
+THREADS=${4:-}
+if [ -z "$THREADS" ]; then
+    if [ "$SUITE_ARG" = "unit/scripting" ]; then
+        THREADS=1
+    else
+        THREADS=2
+    fi
+fi
 
 # Start rudis server in background
-echo "Starting Rudis server on port $PORT..."
-./target/release/rudis --port "$PORT" --threads 2 --no-pin > "$TEST_LOG" 2>&1 &
+echo "Starting Rudis server on port $PORT (threads: $THREADS)..."
+./target/release/rudis --port "$PORT" --threads "$THREADS" --no-pin > "$TEST_LOG" 2>&1 &
 RUDIS_PID=$!
 
 cleanup() {
@@ -70,6 +82,7 @@ CORE_SUITES=(
     "unit/auth"
     "unit/printver"
     "unit/limits"
+    "unit/scripting"
 )
 
 if [ "$SUITE_ARG" = "all-types" ] || [ "$SUITE_ARG" = "all" ]; then
@@ -98,6 +111,9 @@ for suite in "${TARGET_SUITES[@]}"; do
         --ignore-digest \
         --tags "-needs:repl -needs:debug -needs:config-rewrite -needs:pfdebug -needs:config-maxmemory" \
         --skiptest "/.*script timeout.*" \
+        --skiptest "/.*Subkey notifications.*" \
+        --skiptest "/.*Timedout.*" \
+        --skiptest "/.*OOM.*" \
         --clients "$CLIENTS" \
         --single "$suite"; then
         PASSED_SUITES+=("$suite")

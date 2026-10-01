@@ -38,6 +38,7 @@ pub struct ClientInfo {
     pub raw_fd: std::os::unix::io::RawFd,
     pub omem: usize,
     pub reply_mode: crate::resp::ClientReplyMode,
+    pub is_monitor: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -248,7 +249,7 @@ pub fn notify_stream_or_defer(db: &mut ShardDb, key: &Bytes) {
     if hub.is_paused() {
         hub.add_pending_notify(key.clone());
     } else {
-        hub.notify_stream(key);
+        hub.notify_stream(db, key);
     }
 }
 
@@ -449,10 +450,10 @@ pub async fn wait_for_blocked_result<T>(
 }
 
 pub async fn wait_for_stream_result(
-    rx: &flume::Receiver<()>,
+    rx: &flume::Receiver<crate::block::BlockedStreamResult>,
     timeout_ms: u64,
     raw_fd: Option<std::os::unix::io::RawFd>,
-) -> (bool, bool) {
+) -> (Option<crate::block::BlockedStreamResult>, bool) {
     let has_timeout = timeout_ms > 0;
     let deadline = if has_timeout {
         Some(Instant::now() + std::time::Duration::from_millis(timeout_ms))
@@ -465,7 +466,7 @@ pub async fn wait_for_stream_result(
             Some(dl) => {
                 let now = Instant::now();
                 if now >= dl {
-                    return (false, false);
+                    return (None, false);
                 }
                 let rem = dl - now;
                 rem.min(std::time::Duration::from_millis(20))
@@ -474,18 +475,18 @@ pub async fn wait_for_stream_result(
         };
 
         match monoio::time::timeout(check_dur, rx.recv_async()).await {
-            Ok(Ok(_)) => return (true, false),
-            Ok(Err(_)) => return (false, false),
+            Ok(Ok(res)) => return (Some(res), false),
+            Ok(Err(_)) => return (None, false),
             Err(_) => {
                 if let Some(fd) = raw_fd
                     && is_fd_closed(fd)
                 {
-                    return (false, true);
+                    return (None, true);
                 }
                 if let Some(dl) = deadline
                     && Instant::now() >= dl
                 {
-                    return (false, false);
+                    return (None, false);
                 }
             }
         }
@@ -502,10 +503,12 @@ static CLIENT_WATCH_TAINTED: std::sync::LazyLock<
 
 pub static CMD_STATS: std::sync::LazyLock<std::sync::RwLock<hashbrown::HashMap<String, u64>>> =
     std::sync::LazyLock::new(|| std::sync::RwLock::new(hashbrown::HashMap::new()));
+pub static MIN_REPLICAS_TO_WRITE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 thread_local! {
     static LOCAL_CMD_STATS: RefCell<hashbrown::HashMap<&'static str, u64>> = RefCell::new(hashbrown::HashMap::new());
     static LOCAL_CMD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static CURRENT_AUTH_USER: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 #[inline]
@@ -550,6 +553,20 @@ pub static ERROR_STATS: std::sync::LazyLock<std::sync::RwLock<hashbrown::HashMap
     std::sync::LazyLock::new(|| std::sync::RwLock::new(hashbrown::HashMap::new()));
 pub static FAILED_CMD_STATS: std::sync::LazyLock<std::sync::RwLock<hashbrown::HashMap<String, u64>>> =
     std::sync::LazyLock::new(|| std::sync::RwLock::new(hashbrown::HashMap::new()));
+pub static REJECTED_CMD_STATS: std::sync::LazyLock<std::sync::RwLock<hashbrown::HashMap<String, u64>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(hashbrown::HashMap::new()));
+
+pub fn record_rejected_stat(cmd_name: &str) {
+    if let Ok(mut map) = REJECTED_CMD_STATS.write() {
+        *map.entry(cmd_name.to_lowercase()).or_insert(0) += 1;
+    }
+}
+
+pub fn record_failed_stat(cmd_name: &str) {
+    if let Ok(mut map) = FAILED_CMD_STATS.write() {
+        *map.entry(cmd_name.to_lowercase()).or_insert(0) += 1;
+    }
+}
 
 pub fn record_error_stat(prefix: &str, cmd_name: Option<&str>) {
     TOTAL_ERROR_REPLIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -569,6 +586,9 @@ pub fn reset_error_stats() {
         map.clear();
     }
     if let Ok(mut map) = FAILED_CMD_STATS.write() {
+        map.clear();
+    }
+    if let Ok(mut map) = REJECTED_CMD_STATS.write() {
         map.clear();
     }
 }
@@ -982,23 +1002,27 @@ pub fn write_resp_array_header_bytesmut(out: &mut BytesMut, len: usize) {
 #[inline]
 pub fn write_resp_err(out: &mut Vec<u8>, err: impl AsRef<str>) {
     let err = err.as_ref();
-    if err.starts_with("WRONGTYPE")
-        || err.starts_with("CROSSSLOT")
-        || err.starts_with("MOVED")
-        || err.starts_with("ASK")
-        || err.starts_with("NOSCRIPT")
-        || err.starts_with("EXECABORT")
-        || err.starts_with("BUSYGROUP")
-        || err.starts_with("NOGROUP")
-        || err.starts_with("INVALIDOBJ")
-        || err.starts_with("ERR")
+    let err_single_line = err.lines().next().unwrap_or(err);
+    if err_single_line.starts_with("WRONGTYPE")
+        || err_single_line.starts_with("CROSSSLOT")
+        || err_single_line.starts_with("MOVED")
+        || err_single_line.starts_with("ASK")
+        || err_single_line.starts_with("NOSCRIPT")
+        || err_single_line.starts_with("EXECABORT")
+        || err_single_line.starts_with("BUSYGROUP")
+        || err_single_line.starts_with("NOGROUP")
+        || err_single_line.starts_with("INVALIDOBJ")
+        || err_single_line.starts_with("NOREPLICAS")
+        || err_single_line.starts_with("OOM")
+        || err_single_line.starts_with("READONLY")
+        || err_single_line.starts_with("ERR")
     {
         out.extend_from_slice(b"-");
-        out.extend_from_slice(err.as_bytes());
+        out.extend_from_slice(err_single_line.as_bytes());
         out.extend_from_slice(b"\r\n");
     } else {
         out.extend_from_slice(b"-ERR ");
-        out.extend_from_slice(err.as_bytes());
+        out.extend_from_slice(err_single_line.as_bytes());
         out.extend_from_slice(b"\r\n");
     }
 }
@@ -1053,6 +1077,12 @@ pub const NOTIFY_ZSET: u32 = 1 << 7; // z
 pub const NOTIFY_EXPIRED: u32 = 1 << 8; // x
 pub const NOTIFY_EVICTED: u32 = 1 << 9; // e
 pub const NOTIFY_STREAM: u32 = 1 << 10; // t
+pub const NOTIFY_KEY_MISS: u32 = 1 << 11; // m
+pub const NOTIFY_MODULE: u32 = 1 << 12; // d
+pub const NOTIFY_NEW: u32 = 1 << 13; // n
+pub const NOTIFY_OVERWRITTEN: u32 = 1 << 14; // o
+pub const NOTIFY_TYPE_CHANGED: u32 = 1 << 15; // c
+
 pub const NOTIFY_ALL: u32 = NOTIFY_GENERIC
     | NOTIFY_STRING
     | NOTIFY_LIST
@@ -1061,11 +1091,37 @@ pub const NOTIFY_ALL: u32 = NOTIFY_GENERIC
     | NOTIFY_ZSET
     | NOTIFY_EXPIRED
     | NOTIFY_EVICTED
-    | NOTIFY_STREAM; // A
+    | NOTIFY_STREAM
+    | NOTIFY_MODULE; // A
 
 pub static NOTIFY_KEYSPACE_FLAGS: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 pub static NOTIFY_KEYSPACE_STR: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+
+pub fn notify_keyspace_flags_to_string(flags: u32) -> String {
+    let mut res = String::new();
+    if (flags & NOTIFY_ALL) == NOTIFY_ALL {
+        res.push('A');
+    } else {
+        if flags & NOTIFY_GENERIC != 0 { res.push('g'); }
+        if flags & NOTIFY_STRING != 0 { res.push('$'); }
+        if flags & NOTIFY_LIST != 0 { res.push('l'); }
+        if flags & NOTIFY_SET != 0 { res.push('s'); }
+        if flags & NOTIFY_HASH != 0 { res.push('h'); }
+        if flags & NOTIFY_ZSET != 0 { res.push('z'); }
+        if flags & NOTIFY_EXPIRED != 0 { res.push('x'); }
+        if flags & NOTIFY_EVICTED != 0 { res.push('e'); }
+        if flags & NOTIFY_STREAM != 0 { res.push('t'); }
+        if flags & NOTIFY_MODULE != 0 { res.push('d'); }
+        if flags & NOTIFY_NEW != 0 { res.push('n'); }
+    }
+    if flags & NOTIFY_OVERWRITTEN != 0 { res.push('o'); }
+    if flags & NOTIFY_TYPE_CHANGED != 0 { res.push('c'); }
+    if flags & NOTIFY_KEYSPACE != 0 { res.push('K'); }
+    if flags & NOTIFY_KEYEVENT != 0 { res.push('E'); }
+    if flags & NOTIFY_KEY_MISS != 0 { res.push('m'); }
+    res
+}
 
 pub fn get_notify_keyspace_events_str() -> String {
     if let Ok(lock) = NOTIFY_KEYSPACE_STR.read() {
@@ -1090,13 +1146,18 @@ pub fn set_notify_keyspace_events_str(s: &str) {
             'x' => flags |= NOTIFY_EXPIRED,
             'e' => flags |= NOTIFY_EVICTED,
             't' => flags |= NOTIFY_STREAM,
+            'm' => flags |= NOTIFY_KEY_MISS,
+            'd' => flags |= NOTIFY_MODULE,
+            'n' => flags |= NOTIFY_NEW,
+            'o' => flags |= NOTIFY_OVERWRITTEN,
+            'c' => flags |= NOTIFY_TYPE_CHANGED,
             'A' => flags |= NOTIFY_ALL,
             _ => {}
         }
     }
     NOTIFY_KEYSPACE_FLAGS.store(flags, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut lock) = NOTIFY_KEYSPACE_STR.write() {
-        *lock = s.to_string();
+        *lock = notify_keyspace_flags_to_string(flags);
     }
 }
 
@@ -1106,24 +1167,6 @@ pub fn notify_keyspace_event_sync(router: &Router, event_type: u32, event: &str,
         return;
     }
     let db_id = 0;
-    if flags & NOTIFY_KEYEVENT != 0 {
-        let channel = format!("__keyevent@{}__:{}", db_id, event);
-        let _ = router.pubsub.borrow().publish(channel.as_bytes(), key);
-        for (sid, sender) in router.senders.iter().enumerate() {
-            if sid != router.shard_id
-                && router
-                    .presence_table
-                    .is_shard_interested(sid, channel.as_bytes())
-            {
-                let (tx, _rx) = flume::bounded(1);
-                let _ = sender.send(ShardMessage::Publish {
-                    channel: Bytes::from(channel.clone().into_bytes()),
-                    message: Bytes::copy_from_slice(key),
-                    responder: tx,
-                });
-            }
-        }
-    }
     if flags & NOTIFY_KEYSPACE != 0 {
         let channel = format!("__keyspace@{}__:{}", db_id, String::from_utf8_lossy(key));
         let _ = router
@@ -1145,6 +1188,95 @@ pub fn notify_keyspace_event_sync(router: &Router, event_type: u32, event: &str,
             }
         }
     }
+    if flags & NOTIFY_KEYEVENT != 0 {
+        let channel = format!("__keyevent@{}__:{}", db_id, event);
+        let _ = router.pubsub.borrow().publish(channel.as_bytes(), key);
+        for (sid, sender) in router.senders.iter().enumerate() {
+            if sid != router.shard_id
+                && router
+                    .presence_table
+                    .is_shard_interested(sid, channel.as_bytes())
+            {
+                let (tx, _rx) = flume::bounded(1);
+                let _ = sender.send(ShardMessage::Publish {
+                    channel: Bytes::from(channel.clone().into_bytes()),
+                    message: Bytes::copy_from_slice(key),
+                    responder: tx,
+                });
+            }
+        }
+    }
+}
+
+pub fn notify_set_key_events(router: &Router, prev_kind: &str, new_kind: &str, key: &[u8]) {
+    if prev_kind == "none" {
+        notify_keyspace_event_sync(router, NOTIFY_NEW, "new", key);
+    } else {
+        notify_keyspace_event_sync(router, NOTIFY_OVERWRITTEN, "overwritten", key);
+        if prev_kind != new_kind {
+            notify_keyspace_event_sync(router, NOTIFY_TYPE_CHANGED, "type_changed", key);
+        }
+    }
+}
+
+pub fn notify_set_key_events_local(prev_kind: &str, new_kind: &str, key: &[u8]) {
+    if prev_kind == "none" {
+        notify_keyspace_event(NOTIFY_NEW, "new", key);
+    } else {
+        notify_keyspace_event(NOTIFY_OVERWRITTEN, "overwritten", key);
+        if prev_kind != new_kind {
+            notify_keyspace_event(NOTIFY_TYPE_CHANGED, "type_changed", key);
+        }
+    }
+}
+
+pub fn publish_sync(channel: &[u8], message: &[u8]) -> usize {
+    CURRENT_ROUTER.with(|cr| {
+        if let Some(router) = cr.borrow().as_ref() {
+            let mut count = router.pubsub.borrow().publish(channel, message);
+            for (sid, sender) in router.senders.iter().enumerate() {
+                if sid != router.shard_id
+                    && router
+                        .presence_table
+                        .is_shard_interested(sid, channel)
+                {
+                    let (tx, rx) = flume::bounded(1);
+                    let _ = sender.send(ShardMessage::Publish {
+                        channel: Bytes::copy_from_slice(channel),
+                        message: Bytes::copy_from_slice(message),
+                        responder: tx,
+                    });
+                    if let Ok(c) = rx.recv() {
+                        count += c;
+                    }
+                }
+            }
+            count
+        } else {
+            0
+        }
+    })
+}
+
+pub fn spublish_sync(channel: &[u8], message: &[u8]) -> usize {
+    CURRENT_ROUTER.with(|cr| {
+        if let Some(router) = cr.borrow().as_ref() {
+            let target_shard = router.target_shard(channel);
+            if target_shard == router.shard_id {
+                router.pubsub.borrow().spublish(channel, message)
+            } else {
+                let (tx, rx) = flume::bounded(1);
+                let _ = router.senders[target_shard].send(ShardMessage::Spublish {
+                    channel: Bytes::copy_from_slice(channel),
+                    message: Bytes::copy_from_slice(message),
+                    responder: tx,
+                });
+                rx.recv().unwrap_or(0)
+            }
+        } else {
+            0
+        }
+    })
 }
 
 pub static ISOLATED_PANICS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1194,6 +1326,7 @@ pub async fn handle_tls_connection(
             raw_fd,
             omem: 0,
             reply_mode: crate::resp::ClientReplyMode::On,
+            is_monitor: false,
         },
     );
 
@@ -1353,6 +1486,23 @@ async fn execute_tx_step(
                     .lock()
                     .unwrap()
                     .clear_pending_notifies();
+                if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                    c.name = None;
+                    c.is_resp3 = false;
+                    c.is_monitor = false;
+                }
+                reset_client_pubsub(router, client_id);
+
+                let acl = crate::acl::get_acl_for_port(router.port);
+                let default_requires_auth = acl
+                    .read()
+                    .unwrap()
+                    .get_user("default")
+                    .map(|u| !u.passwords.is_empty())
+                    .unwrap_or(false);
+                *authenticated = !default_requires_auth;
+                *auth_user = "default".to_string();
+
                 out_buf.extend_from_slice(b"+RESET\r\n");
                 false
             }
@@ -1455,7 +1605,7 @@ async fn execute_tx_step(
                         if shard_id == router.shard_id {
                             let mut local_db = router.local_db.borrow_mut();
                             let mut hub = hub_arc.lock().unwrap();
-                            hub.notify_stream(&k);
+                            hub.notify_stream(&mut local_db, &k);
                             hub.notify_list(&mut local_db.table, &k);
                             hub.notify_zset(&mut local_db.table, &k);
                         } else {
@@ -1567,6 +1717,7 @@ pub async fn handle_connection(
             raw_fd,
             omem: 0,
             reply_mode: crate::resp::ClientReplyMode::On,
+            is_monitor: false,
         },
     );
 
@@ -1717,9 +1868,60 @@ pub async fn handle_connection(
                             break;
                         }
                         Err(err) => {
-                            write_resp_err(&mut out_buf, &err);
+                            if err.starts_with("Protocol error:") {
+                                write_resp_err(&mut out_buf, &err);
+                                let write_chunk = std::mem::take(&mut out_buf);
+                                let _ = stream.write_all(write_chunk).await.0;
+                                return;
+                            }
                             if in_multi {
+                                for cmd in commands.drain(..) {
+                                    if execute_tx_step(
+                                        cmd,
+                                        &router,
+                                        client_id,
+                                        &client_registry,
+                                        &mut out_buf,
+                                        &mut asking,
+                                        &mut authenticated,
+                                        &mut auth_user,
+                                        &mut in_multi,
+                                        &mut tx_queue,
+                                        &mut tx_has_error,
+                                    )
+                                    .await
+                                    {
+                                        should_quit = true;
+                                        break;
+                                    }
+                                }
                                 tx_has_error = true;
+                            } else {
+                                for cmd in commands.drain(..) {
+                                    if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                                        c.last_active = Instant::now();
+                                        c.last_cmd = get_cmd_name(&cmd);
+                                    }
+                                    let quit = execute_command(
+                                        cmd,
+                                        &router,
+                                        client_id,
+                                        &client_registry,
+                                        &mut out_buf,
+                                        &mut asking,
+                                        &mut authenticated,
+                                        &mut auth_user,
+                                    )
+                                    .await;
+                                    if quit {
+                                        should_quit = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            write_resp_err(&mut out_buf, &err);
+                            if should_quit {
+                                break;
                             }
                         }
                     }
@@ -1752,6 +1954,7 @@ pub async fn handle_connection(
                         let _ = stream.write_all(write_chunk).await.0;
                     }
                     let initial_sub = commands.remove(0);
+                    std::mem::forget(_cleanup);
                     run_pubsub_loop(
                         stream,
                         client_id,
@@ -2175,6 +2378,20 @@ fn recycle_conn_scratch(mut s: ConnScratch) {
     });
 }
 
+pub fn reset_client_pubsub(router: &Router, client_id: u64) {
+    router.pubsub.borrow_mut().remove_client_with_presence(
+        client_id,
+        Some((router.shard_id, &router.presence_table)),
+    );
+    for (sid, sender) in router.senders.iter().enumerate() {
+        if sid != router.shard_id {
+            let _ = sender.send(crate::shard::ShardMessage::RemoveClientPubSub {
+                client_id,
+            });
+        }
+    }
+}
+
 async fn run_pubsub_loop(
     stream: TcpStream,
     client_id: u64,
@@ -2184,6 +2401,35 @@ async fn run_pubsub_loop(
     pending_cmds: Vec<Command>,
     mut buf: BytesMut,
 ) {
+    struct PubsubCleanup {
+        client_id: u64,
+        client_registry: Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
+        router: Rc<Router>,
+    }
+    impl Drop for PubsubCleanup {
+        fn drop(&mut self) {
+            ACTIVE_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            flush_local_cmd_stats();
+            self.client_registry.borrow_mut().remove(&self.client_id);
+            self.router.pubsub.borrow_mut().remove_client_with_presence(
+                self.client_id,
+                Some((self.router.shard_id, &self.router.presence_table)),
+            );
+            for (sid, sender) in self.router.senders.iter().enumerate() {
+                if sid != self.router.shard_id {
+                    let _ = sender.send(crate::shard::ShardMessage::RemoveClientPubSub {
+                        client_id: self.client_id,
+                    });
+                }
+            }
+        }
+    }
+    let _ps_cleanup = PubsubCleanup {
+        client_id,
+        client_registry: client_registry.clone(),
+        router: router.clone(),
+    };
+
     let (mut reader, mut writer) = stream.into_split();
     let (write_tx, write_rx) = flume::bounded::<Bytes>(4096);
 
@@ -2226,6 +2472,11 @@ async fn run_pubsub_loop(
     });
 
     let mut read_buf = vec![0u8; READ_BUFFER_SIZE];
+    let mut in_multi = false;
+    let mut tx_queue: Vec<Command> = Vec::new();
+    let mut asking = false;
+    let mut authenticated = true;
+    let mut auth_user = "default".to_string();
 
     async fn handle_pubsub_cmd(
         cmd: Command,
@@ -2233,8 +2484,198 @@ async fn run_pubsub_loop(
         client_id: u64,
         client_registry: &Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
         write_tx: &flume::Sender<Bytes>,
+        in_multi: &mut bool,
+        tx_queue: &mut Vec<Command>,
         out: &mut Vec<u8>,
+        asking: &mut bool,
+        authenticated: &mut bool,
+        auth_user: &mut String,
     ) -> bool {
+        let is_resp3 = client_registry
+            .borrow()
+            .get(&client_id)
+            .map(|c| c.is_resp3)
+            .unwrap_or(false);
+
+        if *in_multi {
+            match cmd {
+                Command::Multi => {
+                    out.extend_from_slice(b"-ERR MULTI calls can not be nested\r\n");
+                    return false;
+                }
+                Command::Discard => {
+                    *in_multi = false;
+                    tx_queue.clear();
+                    out.extend_from_slice(b"+OK\r\n");
+                    return false;
+                }
+                Command::Reset => {
+                    *in_multi = false;
+                    tx_queue.clear();
+                    if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                        c.name = None;
+                        c.is_resp3 = false;
+                        c.is_monitor = false;
+                    }
+                    reset_client_pubsub(router, client_id);
+
+                    let acl = crate::acl::get_acl_for_port(router.port);
+                    let default_requires_auth = acl
+                        .read()
+                        .unwrap()
+                        .get_user("default")
+                        .map(|u| !u.passwords.is_empty())
+                        .unwrap_or(false);
+                    *authenticated = !default_requires_auth;
+                    *auth_user = "default".to_string();
+
+                    out.extend_from_slice(b"+RESET\r\n");
+                    return false;
+                }
+                Command::Exec => {
+                    *in_multi = false;
+                    let queue = std::mem::take(tx_queue);
+                    let mut exec_results = Vec::new();
+                    for qcmd in queue {
+                        let mut item_out = Vec::new();
+                        match qcmd {
+                            Command::Subscribe(channels) => {
+                                let mut hub = router.pubsub.borrow_mut();
+                                let presence_info = Some((router.shard_id, &*router.presence_table));
+                                for ch in channels {
+                                    let count = hub.subscribe_with_presence(
+                                        client_id,
+                                        ch.clone(),
+                                        write_tx.clone(),
+                                        is_resp3,
+                                        presence_info,
+                                    );
+                                    let mut sub_resp = Vec::new();
+                                    sub_resp.extend_from_slice(b"*3\r\n$9\r\nsubscribe\r\n$");
+                                    sub_resp.extend_from_slice(ch.len().to_string().as_bytes());
+                                    sub_resp.extend_from_slice(b"\r\n");
+                                    sub_resp.extend_from_slice(&ch);
+                                    sub_resp.extend_from_slice(b"\r\n:");
+                                    sub_resp.extend_from_slice(count.to_string().as_bytes());
+                                    sub_resp.extend_from_slice(b"\r\n");
+                                    exec_results.push(sub_resp);
+                                }
+                            }
+                            Command::Unsubscribe(channels) => {
+                                let mut hub = router.pubsub.borrow_mut();
+                                let presence_info = Some((router.shard_id, &*router.presence_table));
+                                if channels.is_empty() {
+                                    let unsubs = hub.unsubscribe_all_with_presence(client_id, presence_info);
+                                    if unsubs.is_empty() {
+                                        let total = hub.total_subscriptions(client_id);
+                                        exec_results.push(format!("*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:{}\r\n", total).into_bytes());
+                                    } else {
+                                        for (ch, rem) in unsubs {
+                                            exec_results.push(format!("*3\r\n$11\r\nunsubscribe\r\n${}\r\n{}\r\n:{}\r\n", ch.len(), String::from_utf8_lossy(&ch), rem).into_bytes());
+                                        }
+                                    }
+                                } else {
+                                    for ch in channels {
+                                        let rem = hub.unsubscribe_with_presence(client_id, &ch, presence_info);
+                                        let mut un_resp = Vec::new();
+                                        un_resp.extend_from_slice(b"*3\r\n$11\r\nunsubscribe\r\n$");
+                                        un_resp.extend_from_slice(ch.len().to_string().as_bytes());
+                                        un_resp.extend_from_slice(b"\r\n");
+                                        un_resp.extend_from_slice(&ch);
+                                        un_resp.extend_from_slice(b"\r\n:");
+                                        un_resp.extend_from_slice(rem.to_string().as_bytes());
+                                        un_resp.extend_from_slice(b"\r\n");
+                                        exec_results.push(un_resp);
+                                    }
+                                }
+                            }
+                            Command::Psubscribe(patterns) => {
+                                let mut hub = router.pubsub.borrow_mut();
+                                let presence_info = Some((router.shard_id, &*router.presence_table));
+                                for pat in patterns {
+                                    let count = hub.psubscribe_with_presence(
+                                        client_id,
+                                        pat.clone(),
+                                        write_tx.clone(),
+                                        is_resp3,
+                                        presence_info,
+                                    );
+                                    let mut psub_resp = Vec::new();
+                                    psub_resp.extend_from_slice(b"*3\r\n$10\r\npsubscribe\r\n$");
+                                    psub_resp.extend_from_slice(pat.len().to_string().as_bytes());
+                                    psub_resp.extend_from_slice(b"\r\n");
+                                    psub_resp.extend_from_slice(&pat);
+                                    psub_resp.extend_from_slice(b"\r\n:");
+                                    psub_resp.extend_from_slice(count.to_string().as_bytes());
+                                    psub_resp.extend_from_slice(b"\r\n");
+                                    exec_results.push(psub_resp);
+                                }
+                            }
+                            Command::Punsubscribe(patterns) => {
+                                let mut hub = router.pubsub.borrow_mut();
+                                let presence_info = Some((router.shard_id, &*router.presence_table));
+                                if patterns.is_empty() {
+                                    let unsubs = hub.punsubscribe_all_with_presence(client_id, presence_info);
+                                    if unsubs.is_empty() {
+                                        let total = hub.total_subscriptions(client_id);
+                                        exec_results.push(format!("*3\r\n$12\r\npunsubscribe\r\n$-1\r\n:{}\r\n", total).into_bytes());
+                                    } else {
+                                        for (pat, rem) in unsubs {
+                                            exec_results.push(format!("*3\r\n$12\r\npunsubscribe\r\n${}\r\n{}\r\n:{}\r\n", pat.len(), String::from_utf8_lossy(&pat), rem).into_bytes());
+                                        }
+                                    }
+                                } else {
+                                    for pat in patterns {
+                                        let rem = hub.punsubscribe_with_presence(client_id, &pat, presence_info);
+                                        let mut un_resp = Vec::new();
+                                        un_resp.extend_from_slice(b"*3\r\n$12\r\npunsubscribe\r\n$");
+                                        un_resp.extend_from_slice(pat.len().to_string().as_bytes());
+                                        un_resp.extend_from_slice(b"\r\n");
+                                        un_resp.extend_from_slice(&pat);
+                                        un_resp.extend_from_slice(b"\r\n:");
+                                        un_resp.extend_from_slice(rem.to_string().as_bytes());
+                                        un_resp.extend_from_slice(b"\r\n");
+                                        exec_results.push(un_resp);
+                                    }
+                                }
+                            }
+                            _ => {
+                                execute_command(
+                                    qcmd,
+                                    router,
+                                    client_id,
+                                    client_registry,
+                                    &mut item_out,
+                                    asking,
+                                    authenticated,
+                                    auth_user,
+                                )
+                                .await;
+                                exec_results.push(item_out);
+                            }
+                        }
+                    }
+                    out.extend_from_slice(format!("*{}\r\n", exec_results.len()).as_bytes());
+                    for res in exec_results {
+                        out.extend_from_slice(&res);
+                    }
+                    return false;
+                }
+                _ => {
+                    tx_queue.push(cmd);
+                    out.extend_from_slice(b"+QUEUED\r\n");
+                    return false;
+                }
+            }
+        }
+
+        if matches!(cmd, Command::Multi) {
+            *in_multi = true;
+            tx_queue.clear();
+            out.extend_from_slice(b"+OK\r\n");
+            return false;
+        }
+
         let cmd_name = match &cmd {
             Command::Subscribe(_) => "SUBSCRIBE",
             Command::Unsubscribe(_) => "UNSUBSCRIBE",
@@ -2246,11 +2687,6 @@ async fn run_pubsub_loop(
             Command::Quit => "QUIT",
             _ => "OTHER",
         };
-        let is_resp3 = client_registry
-            .borrow()
-            .get(&client_id)
-            .map(|c| c.is_resp3)
-            .unwrap_or(false);
         if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
             c.last_active = Instant::now();
             c.last_cmd = cmd_name;
@@ -2432,7 +2868,8 @@ async fn run_pubsub_loop(
                 false
             }
             Command::Ping(msg) => {
-                if is_resp3 {
+                let total_subs = router.pubsub.borrow().total_subscriptions(client_id);
+                if is_resp3 || total_subs == 0 {
                     match msg {
                         Some(m) => {
                             write_resp_bulk(out, &m);
@@ -2470,34 +2907,81 @@ async fn run_pubsub_loop(
                 out.extend_from_slice(b"+OK\r\n");
                 true
             }
-            other => {
-                let name = match &other {
-                    Command::Publish { .. } => "PUBLISH",
-                    Command::Spublish { .. } => "SPUBLISH",
-                    Command::Get(_) => "GET",
-                    Command::Set { .. } => "SET",
-                    _ => "UNKNOWN",
-                };
-                out.extend_from_slice(
-                    format!("-ERR Can't execute '{}' in subscribed mode\r\n", name).as_bytes(),
-                );
+            Command::Reset => {
+                *in_multi = false;
+                tx_queue.clear();
+                if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                    c.name = None;
+                    c.is_resp3 = false;
+                    c.is_monitor = false;
+                }
+                reset_client_pubsub(router, client_id);
+
+                let acl = crate::acl::get_acl_for_port(router.port);
+                let default_requires_auth = acl
+                    .read()
+                    .unwrap()
+                    .get_user("default")
+                    .map(|u| !u.passwords.is_empty())
+                    .unwrap_or(false);
+                *authenticated = !default_requires_auth;
+                *auth_user = "default".to_string();
+
+                out.extend_from_slice(b"+RESET\r\n");
                 false
+            }
+            other => {
+                let total_subs = router.pubsub.borrow().total_subscriptions(client_id);
+                if is_resp3 || total_subs == 0 {
+                    execute_command(
+                        other,
+                        router,
+                        client_id,
+                        client_registry,
+                        out,
+                        asking,
+                        authenticated,
+                        auth_user,
+                    )
+                    .await
+                } else {
+                    let name = get_cmd_name(&other);
+                    out.extend_from_slice(
+                        format!(
+                            "-ERR Can't execute '{}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context\r\n",
+                            name
+                        )
+                        .as_bytes(),
+                    );
+                    false
+                }
             }
         }
     }
 
     let mut out = Vec::new();
+    crate::pubsub::CURRENT_COMMAND_CLIENT_ID.set(Some(client_id));
     let q = handle_pubsub_cmd(
         initial_sub,
         &router,
         client_id,
         &client_registry,
         &write_tx,
+        &mut in_multi,
+        &mut tx_queue,
         &mut out,
+        &mut asking,
+        &mut authenticated,
+        &mut auth_user,
     )
     .await;
+    crate::pubsub::CURRENT_COMMAND_CLIENT_ID.set(None);
     if !out.is_empty() {
         let _ = write_tx.send(Bytes::from(out));
+    }
+    let deferred = crate::pubsub::DEFERRED_SELF_PUBSUB.with(|d| std::mem::take(&mut *d.borrow_mut()));
+    for msg in deferred {
+        let _ = write_tx.send(msg);
     }
     if q {
         return;
@@ -2505,17 +2989,28 @@ async fn run_pubsub_loop(
 
     for cmd in pending_cmds {
         let mut out = Vec::new();
+        crate::pubsub::CURRENT_COMMAND_CLIENT_ID.set(Some(client_id));
         let q = handle_pubsub_cmd(
             cmd,
             &router,
             client_id,
             &client_registry,
             &write_tx,
+            &mut in_multi,
+            &mut tx_queue,
             &mut out,
+            &mut asking,
+            &mut authenticated,
+            &mut auth_user,
         )
         .await;
+        crate::pubsub::CURRENT_COMMAND_CLIENT_ID.set(None);
         if !out.is_empty() {
             let _ = write_tx.send(Bytes::from(out));
+        }
+        let deferred = crate::pubsub::DEFERRED_SELF_PUBSUB.with(|d| std::mem::take(&mut *d.borrow_mut()));
+        for msg in deferred {
+            let _ = write_tx.send(msg);
         }
         if q {
             return;
@@ -2526,17 +3021,28 @@ async fn run_pubsub_loop(
         match parse_command(&mut buf) {
             Ok(Some(cmd)) => {
                 let mut out = Vec::new();
+                crate::pubsub::CURRENT_COMMAND_CLIENT_ID.set(Some(client_id));
                 let q = handle_pubsub_cmd(
                     cmd,
                     &router,
                     client_id,
                     &client_registry,
                     &write_tx,
+                    &mut in_multi,
+                    &mut tx_queue,
                     &mut out,
+                    &mut asking,
+                    &mut authenticated,
+                    &mut auth_user,
                 )
                 .await;
+                crate::pubsub::CURRENT_COMMAND_CLIENT_ID.set(None);
                 if !out.is_empty() {
                     let _ = write_tx.send(Bytes::from(out));
+                }
+                let deferred = crate::pubsub::DEFERRED_SELF_PUBSUB.with(|d| std::mem::take(&mut *d.borrow_mut()));
+                for msg in deferred {
+                    let _ = write_tx.send(msg);
                 }
                 if q {
                     return;
@@ -2547,7 +3053,9 @@ async fn run_pubsub_loop(
                 let mut out = Vec::new();
                 write_resp_err(&mut out, &e);
                 let _ = write_tx.send(Bytes::from(out));
-                return;
+                if e.starts_with("Protocol error:") {
+                    return;
+                }
             }
         }
     }
@@ -2563,17 +3071,28 @@ async fn run_pubsub_loop(
                     match parse_command(&mut buf) {
                         Ok(Some(cmd)) => {
                             let mut out = Vec::new();
+                            crate::pubsub::CURRENT_COMMAND_CLIENT_ID.set(Some(client_id));
                             let q = handle_pubsub_cmd(
                                 cmd,
                                 &router,
                                 client_id,
                                 &client_registry,
                                 &write_tx,
+                                &mut in_multi,
+                                &mut tx_queue,
                                 &mut out,
+                                &mut asking,
+                                &mut authenticated,
+                                &mut auth_user,
                             )
                             .await;
+                            crate::pubsub::CURRENT_COMMAND_CLIENT_ID.set(None);
                             if !out.is_empty() {
                                 let _ = write_tx.send(Bytes::from(out));
+                            }
+                            let deferred = crate::pubsub::DEFERRED_SELF_PUBSUB.with(|d| std::mem::take(&mut *d.borrow_mut()));
+                            for msg in deferred {
+                                let _ = write_tx.send(msg);
                             }
                             if q {
                                 return;
@@ -2584,7 +3103,9 @@ async fn run_pubsub_loop(
                             let mut out = Vec::new();
                             write_resp_err(&mut out, &e);
                             let _ = write_tx.send(Bytes::from(out));
-                            return;
+                            if e.starts_with("Protocol error:") {
+                                return;
+                            }
                         }
                     }
                 }
@@ -4118,6 +4639,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Bgrewriteaof => "BGREWRITEAOF",
         Command::Lastsave => "LASTSAVE",
         Command::Ping(_) => "PING",
+        Command::Monitor => "MONITOR",
         Command::CommandDocs => "COMMAND",
         Command::Info(_) => "INFO",
         Command::Replicaof { .. } => "REPLICAOF",
@@ -4195,8 +4717,8 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Xreadgroup { .. } => "XREADGROUP",
         Command::Xack { .. } => "XACK",
         Command::Xpending { .. } => "XPENDING",
-        Command::Eval { .. } => "EVAL",
-        Command::Evalsha { .. } => "EVALSHA",
+        Command::Eval { read_only, .. } => if *read_only { "EVAL_RO" } else { "EVAL" },
+        Command::Evalsha { read_only, .. } => if *read_only { "EVALSHA_RO" } else { "EVALSHA" },
         Command::ScriptLoad(_) | Command::ScriptExists(_) | Command::ScriptFlush => "SCRIPT",
         Command::Vadd { .. } => "VADD",
         Command::Vquery { .. } => "VQUERY",
@@ -4245,8 +4767,10 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         | Command::FunctionDelete(_)
         | Command::FunctionFlush
         | Command::FunctionStats
+        | Command::FunctionDump
+        | Command::FunctionRestore { .. }
         | Command::FunctionKill => "FUNCTION",
-        Command::Fcall { .. } => "FCALL",
+        Command::Fcall { read_only, .. } => if *read_only { "FCALL_RO" } else { "FCALL" },
         Command::JsonSet { .. }
         | Command::JsonGet { .. }
         | Command::JsonDel { .. }
@@ -4263,14 +4787,14 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         | Command::JsonToggle { .. }
         | Command::JsonClear { .. }
         | Command::JsonMget { .. } => "JSON",
-        Command::Geoadd { .. }
-        | Command::Geodist { .. }
-        | Command::Geopos { .. }
-        | Command::Geohash { .. }
-        | Command::Georadius { .. }
-        | Command::Georadiusbymember { .. }
-        | Command::Geosearch { .. }
-        | Command::Geosearchstore { .. } => "GEO",
+        Command::Geoadd { .. } => "GEOADD",
+        Command::Geodist { .. } => "GEODIST",
+        Command::Geopos { .. } => "GEOPOS",
+        Command::Geohash { .. } => "GEOHASH",
+        Command::Georadius { .. } => "GEORADIUS",
+        Command::Georadiusbymember { .. } => "GEORADIUSBYMEMBER",
+        Command::Geosearch { .. } => "GEOSEARCH",
+        Command::Geosearchstore { .. } => "GEOSEARCHSTORE",
         Command::BfReserve { .. }
         | Command::BfAdd { .. }
         | Command::BfMadd { .. }
@@ -4578,6 +5102,23 @@ async fn fetch_remote_set(
         }
     }
     Ok(set)
+}
+
+async fn fetch_key_type(router: &Router, key: &Bytes) -> String {
+    let target = router.target_shard(key);
+    let type_cmd = Command::Type(key.clone());
+    let t_raw = if target == router.shard_id {
+        let mut tmp = Vec::new();
+        execute_local_command(&type_cmd, &mut router.local_db.borrow_mut(), &mut tmp, None);
+        tmp
+    } else {
+        router.execute_remote(target, type_cmd).await
+    };
+    if t_raw.starts_with(b"+") {
+        String::from_utf8_lossy(&t_raw[1..t_raw.len().saturating_sub(2)]).to_string()
+    } else {
+        "none".to_string()
+    }
 }
 
 async fn fetch_remote_zset(
@@ -4975,7 +5516,20 @@ async fn execute_command(
                         .position(|&b| b == b' ' || b == b'\r' || b == b'\n')
                         .unwrap_or(err_line.len());
                     if let Ok(prefix) = std::str::from_utf8(&err_line[..end_idx]) {
-                        record_error_stat(prefix, Some(self.cmd_name));
+                        let is_script_cmd = self.cmd_name == "EVAL"
+                            || self.cmd_name == "EVALSHA"
+                            || self.cmd_name == "EVAL_RO"
+                            || self.cmd_name == "EVALSHA_RO"
+                            || self.cmd_name == "FCALL"
+                            || self.cmd_name == "FCALL_RO";
+                        if is_script_cmd {
+                            record_failed_stat(self.cmd_name);
+                            if !crate::scripting::SCRIPT_RECORDED_ERROR.get() {
+                                record_error_stat(prefix, None);
+                            }
+                        } else {
+                            record_error_stat(prefix, Some(self.cmd_name));
+                        }
                     }
                 }
             }
@@ -4986,6 +5540,13 @@ async fn execute_command(
         out,
         cmd_name,
     };
+
+    CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = auth_user.clone());
+
+    if MIN_REPLICAS_TO_WRITE.load(std::sync::atomic::Ordering::Relaxed) > 0 && cmd.is_write_command() {
+        out.extend_from_slice(b"-NOREPLICAS Not enough good replicas to write.\r\n");
+        return false;
+    }
 
     if !*authenticated
         && !matches!(
@@ -5115,15 +5676,15 @@ async fn execute_command(
     }
 
     // Enforce maxmemory with noeviction: return OOM if memory limit is exceeded
-    if crate::aof::command_to_resp(&cmd).is_some() {
+    if cmd.is_write_command() && !cmd.allows_oom() {
         let max_mem = crate::tiering::get_max_memory(router.port);
-        if max_mem > 0
-            && get_max_memory_policy() == "noeviction"
-            && router.local_db.borrow().tier_manager.is_none()
-        {
+        if max_mem > 0 && get_max_memory_policy() == "noeviction" {
             let used = router.local_db.borrow().table.used_memory;
             let shard_max = (max_mem / router.num_shards.max(1) as u64) as usize;
             if used > shard_max {
+                let c_name = get_cmd_name(&cmd);
+                record_rejected_stat(c_name);
+                record_error_stat("OOM", Some(c_name));
                 out.extend_from_slice(
                     b"-OOM command not allowed when used memory > 'maxmemory'.\r\n",
                 );
@@ -5203,12 +5764,17 @@ async fn execute_command(
                     && !past_expired
                     && router.aof.is_none()
                     && !crate::replication::has_connected_replicas(router.port)
+                    && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                 {
                     notify_key_invalidation(router.port, key.as_ref(), client_id);
                     {
                         let mut db = router.local_db.borrow_mut();
                         db.set_extended(key.clone(), value, expire_in, false);
                         notify_stream_or_defer(&mut db, &key);
+                    }
+                    notify_keyspace_event_sync(router, NOTIFY_STRING, "set", key.as_ref());
+                    if expire_in.is_some() {
+                        notify_keyspace_event_sync(router, NOTIFY_GENERIC, "expire", key.as_ref());
                     }
                     router.check_auto_tier_after_write();
                     out.extend_from_slice(b"+OK\r\n");
@@ -5321,6 +5887,7 @@ async fn execute_command(
                 }
 
                 notify_key_invalidation(router.port, key.as_ref(), client_id);
+                let prev_kind = db.type_of(key.as_ref());
                 db.set_extended(key.clone(), value.clone(), expire_in, keepttl);
                 notify_stream_or_defer(&mut db, &key);
                 if let Some(aof) = &router.aof
@@ -5359,6 +5926,7 @@ async fn execute_command(
                 } else {
                     out.extend_from_slice(b"+OK\r\n");
                 }
+                notify_set_key_events(router, prev_kind, "string", key.as_ref());
                 notify_keyspace_event_sync(router, NOTIFY_STRING, "set", key.as_ref());
                 if expire_in.is_some() {
                     notify_keyspace_event_sync(router, NOTIFY_GENERIC, "expire", key.as_ref());
@@ -5372,6 +5940,7 @@ async fn execute_command(
                     && !past_expired
                     && router.aof.is_none()
                     && !crate::replication::has_connected_replicas(router.port)
+                    && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                 {
                     router.set(key.clone(), value, expire_in).await;
                     out.extend_from_slice(b"+OK\r\n");
@@ -5736,6 +6305,13 @@ async fn execute_command(
             }
             false
         }
+        Command::Monitor => {
+            if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                c.is_monitor = true;
+            }
+            out.extend_from_slice(b"+OK\r\n");
+            false
+        }
         Command::CommandDocs => {
             out.extend_from_slice(b"*0\r\n");
             false
@@ -5979,22 +6555,38 @@ async fn execute_command(
             let cmdstat_str = {
                 router.flush_all_command_stats().await;
                 let mut s = String::from("# Commandstats\r\n");
+                let mut all_cmds = hashbrown::HashSet::new();
                 if let Ok(map) = CMD_STATS.read() {
-                    let mut entries: Vec<_> = map.iter().collect();
-                    entries.sort_by_key(|(k, _)| *k);
-                    for (cmd, calls) in entries {
-                        let failed = FAILED_CMD_STATS.read().ok().and_then(|m| m.get(cmd).copied()).unwrap_or(0);
-                        if let Some(slow) = crate::slowlog::get_cmd_slow_stat(cmd) {
-                            s.push_str(&format!(
-                                "cmdstat_{}:calls={},usec=100,usec_per_call=100.00,rejected_calls=0,failed_calls={},slowlog_count={},slowlog_time_ms_sum={:.2},slowlog_time_ms_max={:.2}\r\n",
-                                cmd, calls, failed, slow.count, slow.time_ms_sum, slow.time_ms_max
-                            ));
-                        } else {
-                            s.push_str(&format!(
-                                "cmdstat_{}:calls={},usec=100,usec_per_call=100.00,rejected_calls=0,failed_calls={}\r\n",
-                                cmd, calls, failed
-                            ));
-                        }
+                    for k in map.keys() {
+                        all_cmds.insert(k.clone());
+                    }
+                }
+                if let Ok(map) = FAILED_CMD_STATS.read() {
+                    for k in map.keys() {
+                        all_cmds.insert(k.clone());
+                    }
+                }
+                if let Ok(map) = REJECTED_CMD_STATS.read() {
+                    for k in map.keys() {
+                        all_cmds.insert(k.clone());
+                    }
+                }
+                let mut entries: Vec<_> = all_cmds.into_iter().collect();
+                entries.sort();
+                for cmd in entries {
+                    let calls = CMD_STATS.read().ok().and_then(|m| m.get(&cmd).copied()).unwrap_or(0);
+                    let failed = FAILED_CMD_STATS.read().ok().and_then(|m| m.get(&cmd).copied()).unwrap_or(0);
+                    let rejected = REJECTED_CMD_STATS.read().ok().and_then(|m| m.get(&cmd).copied()).unwrap_or(0);
+                    if let Some(slow) = crate::slowlog::get_cmd_slow_stat(&cmd) {
+                        s.push_str(&format!(
+                            "cmdstat_{}:calls={},usec=100,usec_per_call=100.00,rejected_calls={},failed_calls={},slowlog_count={},slowlog_time_ms_sum={:.2},slowlog_time_ms_max={:.2}\r\n",
+                            cmd, calls, rejected, failed, slow.count, slow.time_ms_sum, slow.time_ms_max
+                        ));
+                    } else {
+                        s.push_str(&format!(
+                            "cmdstat_{}:calls={},usec=100,usec_per_call=100.00,rejected_calls={},failed_calls={}\r\n",
+                            cmd, calls, rejected, failed
+                        ));
                     }
                 }
                 s
@@ -6614,6 +7206,13 @@ async fn execute_command(
                         b"-ERR stream-idmp-maxsize must be between 1 and 10000\r\n",
                     );
                 }
+            } else if p_str == "min-replicas-to-write" {
+                if let Ok(n) = val_str.parse::<usize>() {
+                    MIN_REPLICAS_TO_WRITE.store(n, std::sync::atomic::Ordering::Relaxed);
+                    out.extend_from_slice(b"+OK\r\n");
+                } else {
+                    out.extend_from_slice(b"-ERR Invalid argument for CONFIG SET min-replicas-to-write\r\n");
+                }
             } else if p_str == "slowlog-log-slower-than" {
                 if let Ok(v) = val_str.parse::<i64>() {
                     crate::slowlog::SLOWLOG_LOG_SLOWER_THAN
@@ -7087,7 +7686,7 @@ async fn execute_command(
                             .lock()
                             .unwrap()
                             .is_blocked(c.id);
-                        let flags = if is_blocked { "b" } else { "N" };
+                        let flags = if c.is_monitor { "O" } else if is_blocked { "b" } else { "N" };
                         let info = format!(
                             "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=20448 argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name={} lib-ver={} io-thread=0 tot-net-in=0 tot-net-out=0 tot-cmds=0 read-events=0 avg-pipeline-len-sum=0 avg-pipeline-len-cnt=0\n",
                             c.id,
@@ -7569,12 +8168,6 @@ async fn execute_command(
                     };
                     let resolved_ids = resolve_stream_last_ids(router, keys, ids).await;
                     let (tx, rx) = flume::bounded(1);
-                    let start_wait = std::time::Instant::now();
-                    let deadline = if wait_ms > 0 {
-                        Some(start_wait + std::time::Duration::from_millis(wait_ms))
-                    } else {
-                        None
-                    };
 
                     let mut unblocked_cmd = cmd.clone();
                     match &mut unblocked_cmd {
@@ -7594,34 +8187,44 @@ async fn execute_command(
                         _ => {}
                     }
 
-                    loop {
-                        {
-                            let hub_arc = crate::block::get_block_hub_for_port(router.port);
-                            let mut hub = hub_arc.lock().unwrap();
-                            for k in keys {
-                                hub.register_stream_waiter(client_id, k.clone(), tx.clone());
-                            }
+                    {
+                        let hub_arc = crate::block::get_block_hub_for_port(router.port);
+                        let mut hub = hub_arc.lock().unwrap();
+                        for k in keys {
+                            hub.register_stream_waiter(
+                                client_id,
+                                k.clone(),
+                                unblocked_cmd.clone(),
+                                CURRENT_CLIENT_RESP3.get(),
+                                false,
+                                tx.clone(),
+                            );
                         }
+                    }
 
-                        let remaining_ms = match deadline {
-                            Some(dl) => {
-                                let now = std::time::Instant::now();
-                                if now >= dl {
-                                    0
-                                } else {
-                                    (dl - now).as_millis() as u64
-                                }
-                            }
-                            None => 0,
+                    let raw_fd = client_registry.borrow().get(&client_id).map(|c| c.raw_fd);
+                    if let Command::Xreadgroup { claim: Some(min_idle), ref group, .. } = cmd {
+                        let deadline = if wait_ms > 0 {
+                            Some(std::time::Instant::now() + std::time::Duration::from_millis(wait_ms))
+                        } else {
+                            None
                         };
-
-                        if deadline.is_some() && remaining_ms == 0 {
-                            out.extend_from_slice(b"$-1\r\n");
-                            return false;
-                        }
-
-                        let mut wait_timeout_ms = remaining_ms;
-                        if let Command::Xreadgroup { ref group, claim: Some(min_idle), .. } = cmd {
+                        loop {
+                            let remaining_ms = match deadline {
+                                Some(dl) => {
+                                    let now = std::time::Instant::now();
+                                    if now >= dl {
+                                        0
+                                    } else {
+                                        (dl - now).as_millis() as u64
+                                    }
+                                }
+                                None => 0,
+                            };
+                            if deadline.is_some() && remaining_ms == 0 {
+                                out.extend_from_slice(b"$-1\r\n");
+                                return false;
+                            }
                             let mut earliest_pel_wait: Option<u64> = None;
                             if first_target == router.shard_id {
                                 let mut db = router.local_db.borrow_mut();
@@ -7632,43 +8235,95 @@ async fn execute_command(
                                 }
                             }
                             let target_wait = earliest_pel_wait.map_or(50, |w| w.clamp(1, 50));
-                            if deadline.is_some() {
-                                wait_timeout_ms = remaining_ms.min(target_wait);
+                            let wait_timeout_ms = if deadline.is_some() {
+                                remaining_ms.min(target_wait)
                             } else {
-                                wait_timeout_ms = target_wait;
+                                target_wait
+                            };
+
+                            let (wait_res, client_disconnected) =
+                                wait_for_stream_result(&rx, wait_timeout_ms, raw_fd).await;
+                            if client_disconnected {
+                                return true;
+                            }
+                            match wait_res {
+                                Some(crate::block::BlockedStreamResult::Data(data)) => {
+                                    out.extend_from_slice(&data);
+                                    return false;
+                                }
+                                Some(crate::block::BlockedStreamResult::Error(err)) => {
+                                    out.extend_from_slice(&err);
+                                    return false;
+                                }
+                                Some(crate::block::BlockedStreamResult::Unblocked(unblock_type)) => {
+                                    match unblock_type {
+                                        crate::block::ClientUnblockType::Timeout => {
+                                            out.extend_from_slice(b"$-1\r\n")
+                                        }
+                                        crate::block::ClientUnblockType::Error => {
+                                            out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n")
+                                        }
+                                        crate::block::ClientUnblockType::WrongType => {
+                                            out.extend_from_slice(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+                                        }
+                                    }
+                                    return false;
+                                }
+                                _ => {
+                                    let read_start = out.len();
+                                    if first_target == router.shard_id {
+                                        execute_local_command(
+                                            &unblocked_cmd,
+                                            &mut router.local_db.borrow_mut(),
+                                            out,
+                                            router.aof.as_deref(),
+                                        );
+                                    } else {
+                                        let res = router.execute_remote(first_target, unblocked_cmd.clone()).await;
+                                        out.extend_from_slice(&res);
+                                    }
+                                    let unblocked_produced_empty = &out[read_start..] == b"$-1\r\n"
+                                        || &out[read_start..] == b"*0\r\n";
+                                    if !unblocked_produced_empty {
+                                        return false;
+                                    }
+                                    out.truncate(read_start);
+                                }
                             }
                         }
-
-                        let raw_fd = client_registry.borrow().get(&client_id).map(|c| c.raw_fd);
+                    } else {
                         let (wait_res, client_disconnected) =
-                            wait_for_stream_result(&rx, wait_timeout_ms, raw_fd).await;
+                            wait_for_stream_result(&rx, wait_ms, raw_fd).await;
                         if client_disconnected {
                             return true;
                         }
-                        if wait_res || deadline.is_none() || (deadline.is_some() && std::time::Instant::now() < deadline.unwrap()) {
-                            let read_start = out.len();
-                            if first_target == router.shard_id {
-                                execute_local_command(
-                                    &unblocked_cmd,
-                                    &mut router.local_db.borrow_mut(),
-                                    out,
-                                    router.aof.as_deref(),
-                                );
-                            } else {
-                                let res = router.execute_remote(first_target, unblocked_cmd.clone()).await;
-                                out.extend_from_slice(&res);
-                            }
-                            let is_xread = matches!(unblocked_cmd, Command::Xread { .. });
-                            let unblocked_produced_empty = &out[read_start..] == b"$-1\r\n"
-                                || &out[read_start..] == b"*0\r\n"
-                                || (is_xread && out[read_start..].starts_with(b"-WRONGTYPE"));
-                            if !unblocked_produced_empty {
+                        match wait_res {
+                            Some(crate::block::BlockedStreamResult::Data(data)) => {
+                                out.extend_from_slice(&data);
                                 return false;
                             }
-                            out.truncate(read_start);
-                        } else {
-                            out.extend_from_slice(b"$-1\r\n");
-                            return false;
+                            Some(crate::block::BlockedStreamResult::Error(err)) => {
+                                out.extend_from_slice(&err);
+                                return false;
+                            }
+                            Some(crate::block::BlockedStreamResult::Unblocked(unblock_type)) => {
+                                match unblock_type {
+                                    crate::block::ClientUnblockType::Timeout => {
+                                        out.extend_from_slice(b"$-1\r\n")
+                                    }
+                                    crate::block::ClientUnblockType::Error => {
+                                        out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n")
+                                    }
+                                    crate::block::ClientUnblockType::WrongType => {
+                                        out.extend_from_slice(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+                                    }
+                                }
+                                return false;
+                            }
+                            _ => {
+                                out.extend_from_slice(b"$-1\r\n");
+                                return false;
+                            }
                         }
                     }
                 }
@@ -7734,7 +8389,14 @@ async fn execute_command(
                                 let hub_arc = crate::block::get_block_hub_for_port(router.port);
                                 let mut hub = hub_arc.lock().unwrap();
                                 for k in keys {
-                                    hub.register_stream_waiter(client_id, k.clone(), tx.clone());
+                                    hub.register_stream_waiter(
+                                        client_id,
+                                        k.clone(),
+                                        unblocked_cmd.clone(),
+                                        CURRENT_CLIENT_RESP3.get(),
+                                        true,
+                                        tx.clone(),
+                                    );
                                 }
                             }
 
@@ -7755,35 +8417,51 @@ async fn execute_command(
                                 return false;
                             }
 
-                            let mut wait_timeout_ms = remaining_ms;
-                            if let Command::Xreadgroup { claim: Some(_), .. } = cmd {
-                                if deadline.is_some() {
-                                    wait_timeout_ms = remaining_ms.min(50);
-                                } else {
-                                    wait_timeout_ms = 50;
-                                }
-                            }
-
                             let raw_fd = client_registry.borrow().get(&client_id).map(|c| c.raw_fd);
                             let (wait_res, client_disconnected) =
-                                wait_for_stream_result(&rx, wait_timeout_ms, raw_fd).await;
+                                wait_for_stream_result(&rx, remaining_ms, raw_fd).await;
                             if client_disconnected {
                                 return true;
                             }
-                            if wait_res || deadline.is_none() || (deadline.is_some() && std::time::Instant::now() < deadline.unwrap()) {
-                                match query_cross_shard_streams(router, &unblocked_cmd).await {
-                                    Ok(unblocked_blocks) if !unblocked_blocks.is_empty() => {
-                                        write_resp_array_header(out, unblocked_blocks.len());
-                                        for b in unblocked_blocks {
-                                            out.extend_from_slice(&b);
-                                        }
-                                        return false;
-                                    }
-                                    _ => {}
+                            match wait_res {
+                                Some(crate::block::BlockedStreamResult::Data(data)) => {
+                                    out.extend_from_slice(&data);
+                                    return false;
                                 }
-                            } else {
-                                out.extend_from_slice(b"$-1\r\n");
-                                return false;
+                                Some(crate::block::BlockedStreamResult::Error(err)) => {
+                                    out.extend_from_slice(&err);
+                                    return false;
+                                }
+                                Some(crate::block::BlockedStreamResult::Unblocked(unblock_type)) => {
+                                    match unblock_type {
+                                        crate::block::ClientUnblockType::Timeout => {
+                                            out.extend_from_slice(b"$-1\r\n")
+                                        }
+                                        crate::block::ClientUnblockType::Error => {
+                                            out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n")
+                                        }
+                                        crate::block::ClientUnblockType::WrongType => {
+                                            out.extend_from_slice(b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n")
+                                        }
+                                    }
+                                    return false;
+                                }
+                                Some(crate::block::BlockedStreamResult::CrossShard) => {
+                                    match query_cross_shard_streams(router, &unblocked_cmd).await {
+                                        Ok(unblocked_blocks) if !unblocked_blocks.is_empty() => {
+                                            write_resp_array_header(out, unblocked_blocks.len());
+                                            for b in unblocked_blocks {
+                                                out.extend_from_slice(&b);
+                                            }
+                                            return false;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                None => {
+                                    out.extend_from_slice(b"$-1\r\n");
+                                    return false;
+                                }
                             }
                         }
                     } else {
@@ -8263,7 +8941,7 @@ async fn execute_command(
                 None => false,
             };
 
-            if dontsort && key_type == "set" && store.is_some() {
+            if dontsort && key_type == "set" {
                 dontsort = false;
                 sort_alpha = true;
                 by_pattern = None;
@@ -8395,8 +9073,12 @@ async fn execute_command(
 
             // 7. STORE or deliver to client
             if let Some(dest) = store {
+                let prev_kind = fetch_key_type(router, dest).await;
                 if results.is_empty() {
                     router.del(dest.clone()).await;
+                    if prev_kind != "none" {
+                        notify_keyspace_event_sync(router, NOTIFY_GENERIC, "del", dest.as_ref());
+                    }
                     out.extend_from_slice(b":0\r\n");
                 } else {
                     let count = results.len();
@@ -8406,6 +9088,7 @@ async fn execute_command(
                         .collect();
                     router.del(dest.clone()).await;
                     router.rpush(dest.clone(), list_items).await;
+                    notify_set_key_events(router, &prev_kind, "list", dest.as_ref());
                     out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
                 }
             } else {
@@ -9406,10 +10089,12 @@ async fn execute_command(
             if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                 c.name = None;
                 c.is_resp3 = false;
+                c.is_monitor = false;
             }
             CURRENT_CLIENT_RESP3.set(false);
             unregister_client_tracking(router.port, client_id);
             *asking = false;
+            reset_client_pubsub(router, client_id);
 
             let acl = crate::acl::get_acl_for_port(router.port);
             let default_requires_auth = acl
@@ -10202,8 +10887,12 @@ async fn execute_command(
             out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
             false
         }
-        Command::Select(_) => {
-            out.extend_from_slice(b"+OK\r\n");
+        Command::Select(idx) => {
+            if idx >= 16 {
+                out.extend_from_slice(b"-ERR DB index is out of range\r\n");
+            } else {
+                out.extend_from_slice(b"+OK\r\n");
+            }
             false
         }
         Command::Slowlog(args) => {
@@ -11143,12 +11832,33 @@ async fn execute_command(
             out.extend_from_slice(b"+OK\r\n");
             false
         }
-        Command::Eval { script, keys, args } => {
+        Command::Eval {
+            script,
+            keys,
+            args,
+            read_only,
+            auth_user: cmd_auth_user,
+        } => {
+            let effective_user = if !cmd_auth_user.is_empty() {
+                cmd_auth_user
+            } else {
+                auth_user.clone()
+            };
+            CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = effective_user.clone());
             if let Some(first_key) = keys.first() {
                 let target = router.target_shard(first_key);
                 if target != router.shard_id {
                     let res = router
-                        .execute_remote(target, Command::Eval { script, keys, args })
+                        .execute_remote(
+                            target,
+                            Command::Eval {
+                                script,
+                                keys,
+                                args,
+                                read_only,
+                                auth_user: effective_user,
+                            },
+                        )
                         .await;
                     out.extend_from_slice(&res);
                     return false;
@@ -11162,21 +11872,42 @@ async fn execute_command(
                 &args,
                 &router.local_db,
                 router.aof.as_deref(),
+                read_only,
             ) {
                 Ok(resp) => out.extend_from_slice(&resp),
                 Err(e) => {
-                    let err_resp = format!("-{}\r\n", e);
-                    out.extend_from_slice(err_resp.as_bytes());
+                    write_resp_err(out, e);
                 }
             }
             false
         }
-        Command::Evalsha { sha, keys, args } => {
+        Command::Evalsha {
+            sha,
+            keys,
+            args,
+            read_only,
+            auth_user: cmd_auth_user,
+        } => {
+            let effective_user = if !cmd_auth_user.is_empty() {
+                cmd_auth_user
+            } else {
+                auth_user.clone()
+            };
+            CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = effective_user.clone());
             if let Some(first_key) = keys.first() {
                 let target = router.target_shard(first_key);
                 if target != router.shard_id {
                     let res = router
-                        .execute_remote(target, Command::Evalsha { sha, keys, args })
+                        .execute_remote(
+                            target,
+                            Command::Evalsha {
+                                sha,
+                                keys,
+                                args,
+                                read_only,
+                                auth_user: effective_user,
+                            },
+                        )
                         .await;
                     out.extend_from_slice(&res);
                     return false;
@@ -11190,11 +11921,11 @@ async fn execute_command(
                     &args,
                     &router.local_db,
                     router.aof.as_deref(),
+                    read_only,
                 ) {
                     Ok(resp) => out.extend_from_slice(&resp),
                     Err(e) => {
-                        let err_resp = format!("-{}\r\n", e);
-                        out.extend_from_slice(err_resp.as_bytes());
+                        write_resp_err(out, e);
                     }
                 }
             } else {
@@ -11307,13 +12038,41 @@ async fn execute_command(
             function,
             keys,
             args,
+            read_only,
+            auth_user: cmd_auth_user,
         } => {
+            let effective_user = if !cmd_auth_user.is_empty() {
+                cmd_auth_user
+            } else {
+                auth_user.clone()
+            };
+            CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = effective_user.clone());
+            if let Some(first_key) = keys.first() {
+                let target = router.target_shard(first_key);
+                if target != router.shard_id {
+                    let res = router
+                        .execute_remote(
+                            target,
+                            Command::Fcall {
+                                function,
+                                keys,
+                                args,
+                                read_only,
+                                auth_user: effective_user,
+                            },
+                        )
+                        .await;
+                    out.extend_from_slice(&res);
+                    return false;
+                }
+            }
             match crate::scripting::call_function(
                 &function,
                 &keys,
                 &args,
                 &router.local_db,
                 router.aof.as_deref(),
+                read_only,
             ) {
                 Ok(res) => {
                     for k in &keys {
@@ -11331,7 +12090,7 @@ async fn execute_command(
             let libs = crate::scripting::list_functions();
             out.extend_from_slice(format!("*{}\r\n", libs.len()).as_bytes());
             for lib in libs {
-                out.extend_from_slice(b"*8\r\n");
+                out.extend_from_slice(b"*6\r\n");
                 write_resp_bulk(out, b"library_name");
                 write_resp_bulk(out, lib.name.as_bytes());
                 write_resp_bulk(out, b"engine");
@@ -11339,10 +12098,17 @@ async fn execute_command(
                 write_resp_bulk(out, b"functions");
                 out.extend_from_slice(format!("*{}\r\n", lib.functions.len()).as_bytes());
                 for f in &lib.functions {
-                    write_resp_bulk(out, f.as_bytes());
+                    out.extend_from_slice(b"*6\r\n");
+                    write_resp_bulk(out, b"name");
+                    write_resp_bulk(out, f.name.as_bytes());
+                    write_resp_bulk(out, b"description");
+                    write_resp_bulk(out, f.description.as_bytes());
+                    write_resp_bulk(out, b"flags");
+                    out.extend_from_slice(format!("*{}\r\n", f.flags.len()).as_bytes());
+                    for flag in &f.flags {
+                        write_resp_bulk(out, flag.as_bytes());
+                    }
                 }
-                write_resp_bulk(out, b"raw_code");
-                write_resp_bulk(out, lib.raw_code.as_bytes());
             }
             false
         }
@@ -11350,13 +12116,29 @@ async fn execute_command(
             if crate::scripting::delete_function(&lib) {
                 out.extend_from_slice(b"+OK\r\n");
             } else {
-                out.extend_from_slice(format!("-ERR Library not found: {}\r\n", lib).as_bytes());
+                write_resp_err(out, format!("ERR Library not found"));
+            }
+            false
+        }
+        Command::FunctionDump => {
+            let dump = crate::scripting::dump_functions();
+            write_resp_bulk(out, &dump);
+            false
+        }
+        Command::FunctionRestore { payload, policy } => {
+            match crate::scripting::restore_functions(&payload, &policy) {
+                Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                Err(e) => write_resp_err(out, e),
             }
             false
         }
         Command::FunctionFlush => {
             crate::scripting::flush_functions();
             out.extend_from_slice(b"+OK\r\n");
+            false
+        }
+        Command::FunctionKill => {
+            out.extend_from_slice(b"-NOTBUSY No scripts in execution.\r\n");
             false
         }
         Command::FunctionStats => {
@@ -11386,10 +12168,6 @@ async fn execute_command(
             write_resp_integer(out, lib_count as i64);
             write_resp_bulk(out, b"functions_count");
             write_resp_integer(out, func_count as i64);
-            false
-        }
-        Command::FunctionKill => {
-            out.extend_from_slice(b"+OK\r\n");
             false
         }
         Command::FtCreate {
@@ -12909,8 +13687,10 @@ pub fn execute_local_command(
                 return false;
             }
 
+            let prev_kind = db.type_of(key.as_ref());
             db.set_extended(key.clone(), value.clone(), *expire_in, *keepttl);
             record_change!(cmd);
+            notify_set_key_events_local(prev_kind, "string", key);
             notify_keyspace_event(NOTIFY_STRING, "set", key);
             notify_stream_or_defer(db, key);
             if expire_in.is_some() {
@@ -13194,6 +13974,7 @@ pub fn execute_local_command(
             match db.hset_slice_fast(key, fields) {
                 Ok(count) => {
                     record_change!(cmd);
+                    notify_keyspace_event(NOTIFY_HASH, "hset", key);
                     if db.has_search_indices() || crate::search::has_active_search_indices() {
                         reindex_hash_for_search(db, key);
                     }
@@ -13278,6 +14059,10 @@ pub fn execute_local_command(
                 Ok(count) => {
                     if count > 0 {
                         record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_HASH, "hdel", key);
+                        if !db.exists(key) {
+                            notify_keyspace_event(NOTIFY_GENERIC, "del", key);
+                        }
                     }
                     out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
                 }
@@ -13406,6 +14191,7 @@ pub fn execute_local_command(
             match db.lpush_slice(key.as_ref(), values) {
                 Ok(len) => {
                     record_change!(cmd);
+                    notify_keyspace_event(NOTIFY_LIST, "lpush", key);
                     notify_list_or_defer(db, key);
                     write_resp_integer(out, len as i64);
                 }
@@ -13419,6 +14205,7 @@ pub fn execute_local_command(
             match db.rpush_slice_fast(key, values) {
                 Ok(len) => {
                     record_change!(cmd);
+                    notify_keyspace_event(NOTIFY_LIST, "rpush", key);
                     notify_list_or_defer(db, key);
                     write_resp_integer(out, len as i64);
                 }
@@ -13463,6 +14250,10 @@ pub fn execute_local_command(
                 match db.lpop_one(key.as_ref()) {
                     Ok(Some(v)) => {
                         record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_LIST, "lpop", key);
+                        if !db.exists(key) {
+                            notify_keyspace_event(NOTIFY_GENERIC, "del", key);
+                        }
                         write_resp_bulk(out, &v);
                     }
                     Ok(None) => {
@@ -13479,6 +14270,10 @@ pub fn execute_local_command(
                 Ok(popped) => {
                     if !popped.is_empty() {
                         record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_LIST, "lpop", key);
+                        if !db.exists(key) {
+                            notify_keyspace_event(NOTIFY_GENERIC, "del", key);
+                        }
                     }
                     if !popped.is_empty() {
                         out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
@@ -13502,6 +14297,10 @@ pub fn execute_local_command(
                 match db.rpop_one(key.as_ref()) {
                     Ok(Some(v)) => {
                         record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_LIST, "rpop", key);
+                        if !db.exists(key) {
+                            notify_keyspace_event(NOTIFY_GENERIC, "del", key);
+                        }
                         write_resp_bulk(out, &v);
                     }
                     Ok(None) => {
@@ -13518,6 +14317,10 @@ pub fn execute_local_command(
                 Ok(popped) => {
                     if !popped.is_empty() {
                         record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_LIST, "rpop", key);
+                        if !db.exists(key) {
+                            notify_keyspace_event(NOTIFY_GENERIC, "del", key);
+                        }
                     }
                     if !popped.is_empty() {
                         out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
@@ -13624,6 +14427,7 @@ pub fn execute_local_command(
                 Ok(added) => {
                     if added > 0 {
                         record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_SET, "sadd", key);
                     }
                     out.extend_from_slice(format!(":{}\r\n", added).as_bytes());
                 }
@@ -13638,6 +14442,10 @@ pub fn execute_local_command(
                 Ok(count) => {
                     if count > 0 {
                         record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_SET, "srem", key);
+                        if !db.exists(key) {
+                            notify_keyspace_event(NOTIFY_GENERIC, "del", key);
+                        }
                     }
                     out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
                 }
@@ -13770,9 +14578,15 @@ pub fn execute_local_command(
             false
         }
         Command::Sinterstore { destination, keys } => {
+            let prev_kind = db.type_of(destination.as_ref());
             match db.sinterstore(destination.clone(), keys) {
                 Ok(count) => {
                     record_change!(cmd);
+                    if count > 0 {
+                        notify_set_key_events_local(prev_kind, "set", destination.as_ref());
+                    } else if prev_kind != "none" {
+                        notify_keyspace_event(NOTIFY_GENERIC, "del", destination.as_ref());
+                    }
                     write_resp_integer(out, count as i64);
                 }
                 Err(err) => {
@@ -13782,9 +14596,15 @@ pub fn execute_local_command(
             false
         }
         Command::Sunionstore { destination, keys } => {
+            let prev_kind = db.type_of(destination.as_ref());
             match db.sunionstore(destination.clone(), keys) {
                 Ok(count) => {
                     record_change!(cmd);
+                    if count > 0 {
+                        notify_set_key_events_local(prev_kind, "set", destination.as_ref());
+                    } else if prev_kind != "none" {
+                        notify_keyspace_event(NOTIFY_GENERIC, "del", destination.as_ref());
+                    }
                     write_resp_integer(out, count as i64);
                 }
                 Err(err) => {
@@ -13794,9 +14614,15 @@ pub fn execute_local_command(
             false
         }
         Command::Sdiffstore { destination, keys } => {
+            let prev_kind = db.type_of(destination.as_ref());
             match db.sdiffstore(destination.clone(), keys) {
                 Ok(count) => {
                     record_change!(cmd);
+                    if count > 0 {
+                        notify_set_key_events_local(prev_kind, "set", destination.as_ref());
+                    } else if prev_kind != "none" {
+                        notify_keyspace_event(NOTIFY_GENERIC, "del", destination.as_ref());
+                    }
                     write_resp_integer(out, count as i64);
                 }
                 Err(err) => {
@@ -13838,10 +14664,12 @@ pub fn execute_local_command(
                         if incr_score.is_some() {
                             record_change!(cmd);
                             notify_zset_or_defer(db, key);
+                            notify_keyspace_event(NOTIFY_ZSET, "zadd", key);
                         }
                     } else if count > 0 {
                         record_change!(cmd);
                         notify_zset_or_defer(db, key);
+                        notify_keyspace_event(NOTIFY_ZSET, "zadd", key);
                     }
                     if flags.incr {
                         if let Some(score) = incr_score {
@@ -13865,6 +14693,10 @@ pub fn execute_local_command(
                 Ok(count) => {
                     if count > 0 {
                         record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_ZSET, "zrem", key);
+                        if !db.exists(key) {
+                            notify_keyspace_event(NOTIFY_GENERIC, "del", key);
+                        }
                     }
                     out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
                 }
@@ -13997,9 +14829,15 @@ pub fn execute_local_command(
             false
         }
         Command::Zrangestore { dst, src, opts } => {
+            let prev_kind = db.type_of(dst.as_ref());
             match db.zrangestore(dst, src, opts) {
                 Ok(count) => {
                     record_change!(cmd);
+                    if count > 0 {
+                        notify_set_key_events_local(prev_kind, "zset", dst.as_ref());
+                    } else if prev_kind != "none" {
+                        notify_keyspace_event(NOTIFY_GENERIC, "del", dst.as_ref());
+                    }
                     write_resp_integer(out, count as i64);
                 }
                 Err(err) => {
@@ -14143,9 +14981,15 @@ pub fn execute_local_command(
             weights,
             aggregate,
         } => {
+            let prev_kind = db.type_of(destination.as_ref());
             match db.zunionstore(destination.clone(), keys, weights, *aggregate) {
                 Ok(count) => {
                     record_change!(cmd);
+                    if count > 0 {
+                        notify_set_key_events_local(prev_kind, "zset", destination.as_ref());
+                    } else if prev_kind != "none" {
+                        notify_keyspace_event(NOTIFY_GENERIC, "del", destination.as_ref());
+                    }
                     write_resp_integer(out, count as i64);
                 }
                 Err(err) => {
@@ -14160,9 +15004,15 @@ pub fn execute_local_command(
             weights,
             aggregate,
         } => {
+            let prev_kind = db.type_of(destination.as_ref());
             match db.zinterstore(destination.clone(), keys, weights, *aggregate) {
                 Ok(count) => {
                     record_change!(cmd);
+                    if count > 0 {
+                        notify_set_key_events_local(prev_kind, "zset", destination.as_ref());
+                    } else if prev_kind != "none" {
+                        notify_keyspace_event(NOTIFY_GENERIC, "del", destination.as_ref());
+                    }
                     write_resp_integer(out, count as i64);
                 }
                 Err(err) => {
@@ -14172,9 +15022,15 @@ pub fn execute_local_command(
             false
         }
         Command::Zdiffstore { destination, keys } => {
+            let prev_kind = db.type_of(destination.as_ref());
             match db.zdiffstore(destination.clone(), keys) {
                 Ok(count) => {
                     record_change!(cmd);
+                    if count > 0 {
+                        notify_set_key_events_local(prev_kind, "zset", destination.as_ref());
+                    } else if prev_kind != "none" {
+                        notify_keyspace_event(NOTIFY_GENERIC, "del", destination.as_ref());
+                    }
                     write_resp_integer(out, count as i64);
                 }
                 Err(err) => {
@@ -14713,8 +15569,12 @@ pub fn execute_local_command(
             out.extend_from_slice(format!(":{}\r\n", n).as_bytes());
             false
         }
-        Command::Select(_) => {
-            out.extend_from_slice(b"+OK\r\n");
+        Command::Select(idx) => {
+            if *idx >= 16 {
+                out.extend_from_slice(b"-ERR DB index is out of range\r\n");
+            } else {
+                out.extend_from_slice(b"+OK\r\n");
+            }
             false
         }
         Command::Slowlog(args) => {
@@ -14784,7 +15644,7 @@ pub fn execute_local_command(
             }
             db.flushdb();
             record_change!(cmd);
-            crate::block::get_block_hub_for_port(db.port).lock().unwrap().notify_all_streams();
+            crate::block::get_block_hub_for_port(db.port).lock().unwrap().notify_all_streams(db);
             out.extend_from_slice(b"+OK\r\n");
             false
         }
@@ -14794,6 +15654,8 @@ pub fn execute_local_command(
             false
         }
         Command::Rename { key, newkey, nx } => {
+            let prev_kind = db.type_of(newkey.as_ref());
+            let src_kind = db.type_of(key.as_ref());
             match db.rename(key, newkey.clone(), *nx) {
                 Ok(success) => {
                     if success {
@@ -14803,6 +15665,11 @@ pub fn execute_local_command(
                         if db.type_of(newkey) == "list" {
                             notify_list_or_defer(db, newkey);
                         }
+                        if prev_kind != "none" {
+                            notify_set_key_events_local(prev_kind, src_kind, newkey.as_ref());
+                        }
+                        notify_keyspace_event(NOTIFY_GENERIC, "rename_from", key.as_ref());
+                        notify_keyspace_event(NOTIFY_GENERIC, "rename_to", newkey.as_ref());
                         if *nx {
                             out.extend_from_slice(b":1\r\n");
                         } else {
@@ -14824,6 +15691,8 @@ pub fn execute_local_command(
             replace,
             ..
         } => {
+            let prev_kind = db.type_of(destination.as_ref());
+            let src_kind = db.type_of(source.as_ref());
             match db.copy(source, destination.clone(), *replace) {
                 Ok(success) => {
                     if success {
@@ -14834,6 +15703,10 @@ pub fn execute_local_command(
                             "stream" => notify_stream_or_defer(db, destination),
                             _ => touch_watched_key(db.port, destination.as_ref()),
                         }
+                        if prev_kind != "none" {
+                            notify_set_key_events_local(prev_kind, src_kind, destination.as_ref());
+                        }
+                        notify_keyspace_event(NOTIFY_GENERIC, "copy_to", destination.as_ref());
                         out.extend_from_slice(b":1\r\n");
                     } else {
                         out.extend_from_slice(b":0\r\n");
@@ -14943,6 +15816,10 @@ pub fn execute_local_command(
                     out.extend_from_slice(b"+PONG\r\n");
                 }
             }
+            false
+        }
+        Command::Monitor => {
+            out.extend_from_slice(b"+OK\r\n");
             false
         }
         Command::CommandDocs => {
@@ -15129,9 +16006,16 @@ pub fn execute_local_command(
             destkey,
             srckeys,
         } => {
+            let prev_kind = db.type_of(destkey.as_ref());
             match db.bitop(op, destkey.clone(), srckeys) {
                 Ok(len) => {
                     record_change!(cmd);
+                    if len > 0 {
+                        notify_set_key_events_local(prev_kind, "string", destkey.as_ref());
+                        notify_keyspace_event(NOTIFY_STRING, "set", destkey);
+                    } else if prev_kind != "none" {
+                        notify_keyspace_event(NOTIFY_GENERIC, "del", destkey.as_ref());
+                    }
                     out.extend_from_slice(format!(":{}\r\n", len).as_bytes());
                 }
                 Err(err) => {
@@ -15248,9 +16132,24 @@ pub fn execute_local_command(
             replace,
             absttl,
         } => {
+            let prev_type = if *replace {
+                Some(db.type_of(key.as_ref()))
+            } else {
+                None
+            };
             match db.restore(key.clone(), *ttl_ms, serialized, *replace, *absttl) {
                 Ok(()) => {
                     record_change!(cmd);
+                    notify_keyspace_event(NOTIFY_GENERIC, "restore", key);
+                    if let Some(prev) = prev_type {
+                        if prev != "none" {
+                            notify_keyspace_event(NOTIFY_OVERWRITTEN, "overwritten", key);
+                            let new_type = db.type_of(key.as_ref());
+                            if prev != new_type {
+                                notify_keyspace_event(NOTIFY_TYPE_CHANGED, "type_changed", key);
+                            }
+                        }
+                    }
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 Err(err) => {
@@ -15303,6 +16202,7 @@ pub fn execute_local_command(
                     record_change!(&explicit_cmd);
                     let s = generated_id.to_string();
                     notify_stream_or_defer(db, key);
+                    notify_keyspace_event(NOTIFY_STREAM, "xadd", key);
                     out.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
                 }
                 Ok(crate::table::StreamAddResult::Duplicate(existing_id)) => {
@@ -15459,6 +16359,7 @@ pub fn execute_local_command(
                 Ok(count) => {
                     if count > 0 {
                         record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_STREAM, "xdel", key);
                     }
                     out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
                 }
@@ -15480,6 +16381,7 @@ pub fn execute_local_command(
                 Ok(count) => {
                     if count > 0 {
                         record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_STREAM, "xtrim", key);
                     }
                     out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
                 }
@@ -15573,6 +16475,7 @@ pub fn execute_local_command(
             match db.xgroup_create(key.clone(), group.clone(), id, *mkstream, *entries_read) {
                 Ok(()) => {
                     record_change!(cmd);
+                    notify_keyspace_event(NOTIFY_STREAM, "xgroup-create", key);
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 Err(err) => {
@@ -15590,6 +16493,7 @@ pub fn execute_local_command(
                 Ok(destroyed) => {
                     if destroyed {
                         record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_STREAM, "xgroup-destroy", key);
                         notify_stream_or_defer(db, key);
                         out.extend_from_slice(b":1\r\n");
                     } else {
@@ -15614,6 +16518,7 @@ pub fn execute_local_command(
             match db.xgroup_createconsumer(key, group, consumer.clone()) {
                 Ok(created) => {
                     if created {
+                        notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", key);
                         out.extend_from_slice(b":1\r\n");
                     } else {
                         out.extend_from_slice(b":0\r\n");
@@ -15635,8 +16540,13 @@ pub fn execute_local_command(
             consumer,
         } => {
             match db.xgroup_delconsumer(key, group, consumer) {
-                Ok(pending_count) => {
+                Ok(Some(pending_count)) => {
+                    record_change!(cmd);
+                    notify_keyspace_event(NOTIFY_STREAM, "xgroup-delconsumer", key);
                     out.extend_from_slice(format!(":{}\r\n", pending_count).as_bytes());
+                }
+                Ok(None) => {
+                    out.extend_from_slice(b":0\r\n");
                 }
                 Err(err) => {
                     if err.starts_with("ERR") || err.starts_with("NOGROUP") {
@@ -15657,6 +16567,7 @@ pub fn execute_local_command(
             match db.xgroup_setid(key, group, id, *entries_read) {
                 Ok(()) => {
                     record_change!(cmd);
+                    notify_keyspace_event(NOTIFY_STREAM, "xgroup-setid", key);
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 Err(err) => {
@@ -15710,6 +16621,7 @@ pub fn execute_local_command(
                     Ok((entries, modified)) => {
                         if modified {
                             any_modified = true;
+                            notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", k);
                         }
                         if !entries.is_empty() {
                             all_results.push((k.clone(), entries));
@@ -16443,7 +17355,7 @@ pub fn execute_local_command(
                 None => false,
             };
 
-            if dontsort && t == "set" && store.is_some() {
+            if dontsort && t == "set" {
                 dontsort = false;
                 sort_alpha = true;
                 by_pattern = None;
@@ -16572,8 +17484,12 @@ pub fn execute_local_command(
 
             if let Some(dest) = store {
                 record_change!(cmd);
+                let prev_kind = db.type_of(dest);
                 if results.is_empty() {
                     db.del(dest);
+                    if prev_kind != "none" {
+                        notify_keyspace_event(NOTIFY_GENERIC, "del", dest.as_ref());
+                    }
                     out.extend_from_slice(b":0\r\n");
                 } else {
                     let count = results.len();
@@ -16584,6 +17500,7 @@ pub fn execute_local_command(
                     db.del(dest);
                     let _ = db.rpush(dest.clone(), list_items);
                     notify_list_or_defer(db, dest);
+                    notify_set_key_events_local(prev_kind, "list", dest.as_ref());
                     out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
                 }
             } else {
@@ -17141,8 +18058,12 @@ pub fn execute_local_command(
             );
             let has_options = *withcoord || *withdist || *withhash;
             if let Some(store_dest) = storekey {
+                let prev_kind = db.type_of(store_dest.as_ref());
                 if results.is_empty() {
                     db.del(store_dest);
+                    if prev_kind != "none" {
+                        notify_keyspace_event(NOTIFY_GENERIC, "del", store_dest.as_ref());
+                    }
                     write_resp_integer(out, 0);
                 } else {
                     db.del(store_dest);
@@ -17156,6 +18077,7 @@ pub fn execute_local_command(
                         zset_elements.push((sc, item.member.clone()));
                     }
                     let _ = db.zadd(store_dest.clone(), zset_elements, crate::table::ZAddFlags::default());
+                    notify_set_key_events_local(prev_kind, "zset", store_dest.as_ref());
                     write_resp_integer(out, results.len() as i64);
                 }
                 record_change!(cmd);
@@ -17209,8 +18131,12 @@ pub fn execute_local_command(
             );
             let has_options = *withcoord || *withdist || *withhash;
             if let Some(store_dest) = storekey {
+                let prev_kind = db.type_of(store_dest.as_ref());
                 if results.is_empty() {
                     db.del(store_dest);
+                    if prev_kind != "none" {
+                        notify_keyspace_event(NOTIFY_GENERIC, "del", store_dest.as_ref());
+                    }
                     write_resp_integer(out, 0);
                 } else {
                     db.del(store_dest);
@@ -17224,6 +18150,7 @@ pub fn execute_local_command(
                         zset_elements.push((sc, item.member.clone()));
                     }
                     let _ = db.zadd(store_dest.clone(), zset_elements, crate::table::ZAddFlags::default());
+                    notify_set_key_events_local(prev_kind, "zset", store_dest.as_ref());
                     write_resp_integer(out, results.len() as i64);
                 }
                 record_change!(cmd);
@@ -17364,8 +18291,12 @@ pub fn execute_local_command(
                 db, key, center_lon, center_lat, shape, unit, false, false, false,
                 *count, *any, *asc,
             );
+            let prev_kind = db.type_of(dest.as_ref());
             if results.is_empty() {
                 db.del(dest);
+                if prev_kind != "none" {
+                    notify_keyspace_event(NOTIFY_GENERIC, "del", dest.as_ref());
+                }
                 write_resp_integer(out, 0);
             } else {
                 db.del(dest);
@@ -17379,6 +18310,7 @@ pub fn execute_local_command(
                     zset_elements.push((sc, item.member.clone()));
                 }
                 let _ = db.zadd(dest.clone(), zset_elements, crate::table::ZAddFlags::default());
+                notify_set_key_events_local(prev_kind, "zset", dest.as_ref());
                 write_resp_integer(out, results.len() as i64);
             }
             record_change!(cmd);
@@ -18963,7 +19895,10 @@ pub fn execute_local_command(
                 *force,
                 *justid,
             ) {
-                Ok(claimed) => {
+                Ok((claimed, consumer_created)) => {
+                    if consumer_created {
+                        notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", key);
+                    }
                     write_resp_array_header(out, claimed.len());
                     for (sid, fields) in claimed {
                         let sid_str = sid.to_string();
@@ -19002,7 +19937,10 @@ pub fn execute_local_command(
                 *count,
                 *justid,
             ) {
-                Ok((next_cursor, claimed, deleted_ids)) => {
+                Ok((next_cursor, claimed, deleted_ids, consumer_created)) => {
+                    if consumer_created {
+                        notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", key);
+                    }
                     write_resp_array_header(out, 3);
                     write_resp_bulk(out, next_cursor.as_bytes());
                     write_resp_array_header(out, claimed.len());
@@ -19032,6 +19970,29 @@ pub fn execute_local_command(
         }
         Command::FunctionKill => {
             out.extend_from_slice(b"+OK\r\n");
+            false
+        }
+        Command::Publish { channel, message } => {
+            let count = publish_sync(channel.as_ref(), message.as_ref());
+            write_resp_integer(out, count as i64);
+            false
+        }
+        Command::Spublish { channel, message } => {
+            let count = spublish_sync(channel.as_ref(), message.as_ref());
+            write_resp_integer(out, count as i64);
+            false
+        }
+        Command::Unknown(cmd_name) => {
+            let resp = format!("-ERR unknown command '{}'\r\n", cmd_name);
+            out.extend_from_slice(resp.as_bytes());
+            false
+        }
+        Command::Wait { .. } => {
+            out.extend_from_slice(b":0\r\n");
+            false
+        }
+        Command::WaitAof { .. } => {
+            out.extend_from_slice(b"*2\r\n:0\r\n:0\r\n");
             false
         }
         Command::Quit => {
@@ -19117,7 +20078,8 @@ async fn execute_commands_squashed(
             c.last_cmd = get_cmd_name(last_cmd);
         }
     }
-    let mut can_squash = *authenticated;
+    let mut can_squash = *authenticated
+        && NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0;
     if can_squash {
         let acl = if crate::acl::HAS_CUSTOM_ACL.load(std::sync::atomic::Ordering::Relaxed)
             || auth_user != "default"

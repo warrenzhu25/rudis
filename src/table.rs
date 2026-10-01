@@ -2768,6 +2768,7 @@ impl RudisTable {
             if crate::connection::HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                 crate::connection::touch_watched_key_any_port(removed.key.as_ref());
             }
+            crate::connection::notify_keyspace_event(crate::connection::NOTIFY_EXPIRED, "expired", &removed.key);
         }
     }
 
@@ -2850,6 +2851,7 @@ impl RudisTable {
             let freed = removed.key.len() + removed.val.approx_bytes() + 64;
             self.used_memory = self.used_memory.saturating_sub(freed);
             inc_evicted_keys();
+            crate::connection::notify_keyspace_event(crate::connection::NOTIFY_EVICTED, "evicted", &removed.key);
             return Some(freed);
         }
 
@@ -5534,7 +5536,7 @@ impl RudisTable {
         retrycount: Option<usize>,
         force: bool,
         justid: bool,
-    ) -> Result<Vec<(StreamId, Vec<(Bytes, Bytes)>)>, String> {
+    ) -> Result<(Vec<(StreamId, Vec<(Bytes, Bytes)>)>, bool), String> {
         let h = hash_key(key);
         let Some(idx) = self.table.find(key, h) else {
             return Err("NOGROUP No such key or consumer group".to_string());
@@ -5566,6 +5568,7 @@ impl RudisTable {
             now_ms
         };
 
+        let consumer_created = !grp.consumers.contains_key(&consumer);
         grp.consumers
             .entry(consumer.clone())
             .and_modify(|c| c.seen_time_ms = now_ms)
@@ -5637,7 +5640,7 @@ impl RudisTable {
             new_c.active_time_ms = Some(now_ms);
         }
 
-        Ok(claimed)
+        Ok((claimed, consumer_created))
     }
 
     #[allow(clippy::type_complexity)]
@@ -5650,7 +5653,7 @@ impl RudisTable {
         start: &[u8],
         count: usize,
         justid: bool,
-    ) -> Result<(String, Vec<(StreamId, Vec<(Bytes, Bytes)>)>, Vec<StreamId>), String> {
+    ) -> Result<(String, Vec<(StreamId, Vec<(Bytes, Bytes)>)>, Vec<StreamId>, bool), String> {
         let start_s = std::str::from_utf8(start)
             .map_err(|_| "Invalid stream ID specified as stream command argument")?;
         let start_id = if start_s == "-" || start_s == "0" || start_s == "0-0" {
@@ -5683,6 +5686,7 @@ impl RudisTable {
             .unwrap_or_default()
             .as_millis() as u64;
 
+        let consumer_created = !grp.consumers.contains_key(&consumer);
         grp.consumers
             .entry(consumer.clone())
             .and_modify(|c| c.seen_time_ms = now_ms)
@@ -5744,7 +5748,7 @@ impl RudisTable {
             new_c.active_time_ms = Some(now_ms);
         }
 
-        Ok((next_cursor, claimed, deleted_ids))
+        Ok((next_cursor, claimed, deleted_ids, consumer_created))
     }
 
     pub fn hget(&mut self, key: &[u8], field: &[u8]) -> Result<Option<Bytes>, &'static str> {
@@ -13515,7 +13519,7 @@ impl RudisTable {
         key: &[u8],
         group: &[u8],
         consumer: &[u8],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<Option<usize>, &'static str> {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
             if self.check_expired_slot(idx) {
@@ -13533,9 +13537,9 @@ impl RudisTable {
                             for id in cons.pel.keys() {
                                 grp.pel.remove(id);
                             }
-                            Ok(pending)
+                            Ok(Some(pending))
                         } else {
-                            Ok(0)
+                            Ok(None)
                         }
                     }
                     _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),

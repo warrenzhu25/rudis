@@ -1,5 +1,10 @@
 use bytes::Bytes;
 
+thread_local! {
+    pub static CURRENT_COMMAND_CLIENT_ID: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    pub static DEFERRED_SELF_PUBSUB: std::cell::RefCell<Vec<Bytes>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 pub fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
     let mut skip_longer_matches = false;
     stringmatchlen_impl(pattern, text, false, &mut skip_longer_matches, 0)
@@ -586,7 +591,11 @@ impl PubSubHub {
                         build_pubsub_frame(b"message", channel, message, false)
                     })
                 };
-                if let Some(tx) = self.clients.get(client_id)
+                let is_self = CURRENT_COMMAND_CLIENT_ID.get() == Some(*client_id);
+                if is_self {
+                    DEFERRED_SELF_PUBSUB.with(|d| d.borrow_mut().push(frame.clone()));
+                    count += 1;
+                } else if let Some(tx) = self.clients.get(client_id)
                     && tx.try_send(frame.clone()).is_ok()
                 {
                     count += 1;
@@ -611,7 +620,11 @@ impl PubSubHub {
                             build_pubsub_pframe(pattern, channel, message, false)
                         })
                     };
-                    if let Some(tx) = self.clients.get(client_id)
+                    let is_self = CURRENT_COMMAND_CLIENT_ID.get() == Some(*client_id);
+                    if is_self {
+                        DEFERRED_SELF_PUBSUB.with(|d| d.borrow_mut().push(frame.clone()));
+                        count += 1;
+                    } else if let Some(tx) = self.clients.get(client_id)
                         && tx.try_send(frame.clone()).is_ok()
                     {
                         count += 1;
@@ -706,7 +719,11 @@ impl PubSubHub {
                         build_pubsub_frame(b"smessage", channel, message, false)
                     })
                 };
-                if let Some(tx) = self.clients.get(client_id)
+                let is_self = CURRENT_COMMAND_CLIENT_ID.get() == Some(*client_id);
+                if is_self {
+                    DEFERRED_SELF_PUBSUB.with(|d| d.borrow_mut().push(frame.clone()));
+                    count += 1;
+                } else if let Some(tx) = self.clients.get(client_id)
                     && tx.try_send(frame.clone()).is_ok()
                 {
                     count += 1;

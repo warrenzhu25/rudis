@@ -598,7 +598,7 @@ pub fn run_shard_worker(
                             let age = now.duration_since(client.connected_at).as_secs();
                             let idle = now.duration_since(client.last_active).as_secs();
                             let is_blocked = crate::block::get_block_hub_for_port(port).lock().unwrap().is_blocked(client.id);
-                            let flags = if is_blocked { "b" } else { "N" };
+                            let flags = if client.is_monitor { "O" } else if is_blocked { "b" } else { "N" };
                             out.push_str(&format!(
                                 "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=20448 argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name={} lib-ver={} io-thread=0 tot-net-in=0 tot-net-out=0 tot-cmds=0 read-events=0 avg-pipeline-len-sum=0 avg-pipeline-len-cnt=0\n",
                                 client.id,
@@ -950,6 +950,56 @@ pub fn run_shard_worker(
                                                 crate::connection::write_resp_err(&mut temp_buf, err);
                                             }
                                         }
+                                    } else if let Command::Eval { script, keys, args, read_only, auth_user } = &cmd {
+                                        crate::connection::CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = auth_user.clone());
+                                        let script_str = String::from_utf8_lossy(script);
+                                        crate::scripting::load_script(script);
+                                        match crate::scripting::eval_script(
+                                            &script_str,
+                                            keys,
+                                            args,
+                                            &r.local_db,
+                                            aof_ref.as_deref(),
+                                            *read_only,
+                                        ) {
+                                            Ok(resp) => temp_buf.extend_from_slice(&resp),
+                                            Err(e) => {
+                                                crate::connection::write_resp_err(&mut temp_buf, e);
+                                            }
+                                        }
+                                    } else if let Command::Evalsha { sha, keys, args, read_only, auth_user } = &cmd {
+                                        crate::connection::CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = auth_user.clone());
+                                        let sha_str = String::from_utf8_lossy(sha);
+                                        if let Some(script) = crate::scripting::get_script(&sha_str) {
+                                            match crate::scripting::eval_script(
+                                                &script,
+                                                keys,
+                                                args,
+                                                &r.local_db,
+                                                aof_ref.as_deref(),
+                                                *read_only,
+                                            ) {
+                                                Ok(resp) => temp_buf.extend_from_slice(&resp),
+                                                Err(e) => {
+                                                    crate::connection::write_resp_err(&mut temp_buf, e);
+                                                }
+                                            }
+                                        } else {
+                                            temp_buf.extend_from_slice(b"-NOSCRIPT No matching script. Please use EVAL.\r\n");
+                                        }
+                                    } else if let Command::Fcall { function, keys, args, read_only, auth_user } = &cmd {
+                                        crate::connection::CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = auth_user.clone());
+                                        match crate::scripting::call_function(
+                                            function,
+                                            keys,
+                                            args,
+                                            &r.local_db,
+                                            aof_ref.as_deref(),
+                                            *read_only,
+                                        ) {
+                                            Ok(res) => temp_buf.extend_from_slice(&res),
+                                            Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
+                                        }
                                     } else {
                                         if matches!(cmd, Command::Set { .. } | Command::Del(_) | Command::IncrBy { .. }) {
                                             has_writes = true;
@@ -1027,6 +1077,7 @@ pub fn run_shard_worker(
                                     continue;
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
+                                    && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                                     && let Command::IncrBy(ref key, delta) = cmd
                                 {
                                     has_writes = true;
@@ -1054,6 +1105,7 @@ pub fn run_shard_worker(
                                     continue;
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
+                                    && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                                     && !crate::search::has_active_search_indices()
                                     && let Command::Del(ref keys) = cmd && keys.len() == 1
                                 {
@@ -1080,6 +1132,7 @@ pub fn run_shard_worker(
                                     }
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
+                                    && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                                     && !crate::search::has_active_search_indices()
                                     && let Command::Hset { ref key, ref fields } = cmd
                                 {
@@ -1118,6 +1171,7 @@ pub fn run_shard_worker(
                                     }
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
+                                    && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                                     && let Command::Sadd { ref key, ref members } = cmd
                                 {
                                     has_writes = true;
@@ -1146,6 +1200,7 @@ pub fn run_shard_worker(
                                     }
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
+                                    && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                                     && !crate::block::has_blocked_waiters(cross_shard_router.port)
                                     && let Command::Lpush { ref key, ref values } = cmd
                                 {
@@ -1170,6 +1225,7 @@ pub fn run_shard_worker(
                                     }
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
+                                    && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                                     && let Command::Lpop { ref key, count } = cmd
                                 {
                                     if count.is_none() {
@@ -1207,6 +1263,7 @@ pub fn run_shard_worker(
                                     }
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
+                                    && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                                     && let Command::Rpop { ref key, count } = cmd
                                 {
                                     if count.is_none() {
@@ -1260,6 +1317,7 @@ pub fn run_shard_worker(
                                     }
                                 } else if aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
+                                    && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
                                     && !crate::block::has_blocked_waiters(cross_shard_router.port)
                                     && let Command::Zadd { ref key, ref elements, flags } = cmd
                                 {
@@ -1290,6 +1348,62 @@ pub fn run_shard_worker(
                                             crate::connection::write_resp_err(&mut temp_buf, err);
                                         }
                                     }
+                                } else if let Command::Eval { script, keys, args, read_only, auth_user } = &cmd {
+                                    crate::connection::CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = auth_user.clone());
+                                    drop(db);
+                                    let script_str = String::from_utf8_lossy(script);
+                                    crate::scripting::load_script(script);
+                                    match crate::scripting::eval_script(
+                                        &script_str,
+                                        keys,
+                                        args,
+                                        &cross_shard_db,
+                                        cross_shard_aof.as_deref(),
+                                        *read_only,
+                                    ) {
+                                        Ok(resp) => temp_buf.extend_from_slice(&resp),
+                                        Err(e) => {
+                                            crate::connection::write_resp_err(&mut temp_buf, e);
+                                        }
+                                    }
+                                    db = cross_shard_db.borrow_mut();
+                                } else if let Command::Evalsha { sha, keys, args, read_only, auth_user } = &cmd {
+                                    crate::connection::CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = auth_user.clone());
+                                    drop(db);
+                                    let sha_str = String::from_utf8_lossy(sha);
+                                    if let Some(script) = crate::scripting::get_script(&sha_str) {
+                                        match crate::scripting::eval_script(
+                                            &script,
+                                            keys,
+                                            args,
+                                            &cross_shard_db,
+                                            cross_shard_aof.as_deref(),
+                                            *read_only,
+                                        ) {
+                                            Ok(resp) => temp_buf.extend_from_slice(&resp),
+                                            Err(e) => {
+                                                crate::connection::write_resp_err(&mut temp_buf, e);
+                                            }
+                                        }
+                                    } else {
+                                        temp_buf.extend_from_slice(b"-NOSCRIPT No matching script. Please use EVAL.\r\n");
+                                    }
+                                    db = cross_shard_db.borrow_mut();
+                                } else if let Command::Fcall { function, keys, args, read_only, auth_user } = &cmd {
+                                    crate::connection::CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = auth_user.clone());
+                                    drop(db);
+                                    match crate::scripting::call_function(
+                                        function,
+                                        keys,
+                                        args,
+                                        &cross_shard_db,
+                                        cross_shard_aof.as_deref(),
+                                        *read_only,
+                                    ) {
+                                        Ok(res) => temp_buf.extend_from_slice(&res),
+                                        Err(err) => crate::connection::write_resp_err(&mut temp_buf, err),
+                                    }
+                                    db = cross_shard_db.borrow_mut();
                                 } else {
                                     if matches!(cmd, Command::Set { .. } | Command::Del(_) | Command::IncrBy { .. }) {
                                         has_writes = true;
@@ -1625,8 +1739,8 @@ pub fn run_shard_worker(
                         let _ = responder.send(counts);
                     }
                     ShardMessage::PubsubNumpat { responder } => {
-                        let cnt = cross_shard_pubsub.borrow().numpat();
-                        let _ = responder.send(cnt);
+                        let pats = cross_shard_pubsub.borrow().patterns.keys().cloned().collect();
+                        let _ = responder.send(pats);
                     }
                     ShardMessage::RemoveClientPubSub { client_id } => {
                         cross_shard_pubsub
@@ -1727,7 +1841,7 @@ pub fn run_shard_worker(
                         let hub_arc = crate::block::get_block_hub_for_port(db.port);
                         let mut hub = hub_arc.lock().unwrap();
                         for k in keys {
-                            hub.notify_stream(&k);
+                            hub.notify_stream(&mut db, &k);
                             hub.notify_list(&mut db.table, &k);
                             hub.notify_zset(&mut db.table, &k);
                         }

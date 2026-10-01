@@ -632,8 +632,11 @@ pub fn write_slowlog_entries_resp(entries: &[SlowlogEntry], out: &mut Vec<u8>) {
 mod tests {
     use super::*;
 
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_slowlog_crud_and_ring_buffer() {
+        let _guard = TEST_LOCK.lock().unwrap();
         slowlog_reset();
         assert_eq!(slowlog_len(), 0);
 
@@ -669,6 +672,7 @@ mod tests {
 
     #[test]
     fn test_slowlog_truncation_rules() {
+        let _guard = TEST_LOCK.lock().unwrap();
         slowlog_reset();
         SLOWLOG_LOG_SLOWER_THAN.store(0, Ordering::Relaxed);
         SLOWLOG_ENTRY_MAX_ARGC.store(3, Ordering::Relaxed);

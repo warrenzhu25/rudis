@@ -486,7 +486,7 @@ pub enum ShardMessage {
         responder: flume::Sender<Vec<(Bytes, usize)>>,
     },
     PubsubNumpat {
-        responder: flume::Sender<usize>,
+        responder: flume::Sender<Vec<Bytes>>,
     },
     RemoveClientPubSub {
         client_id: u64,
@@ -3306,7 +3306,7 @@ impl ShardDb {
         key: &[u8],
         group: &[u8],
         consumer: &[u8],
-    ) -> Result<usize, &'static str> {
+    ) -> Result<Option<usize>, &'static str> {
         self.table.xgroup_delconsumer(key, group, consumer)
     }
 

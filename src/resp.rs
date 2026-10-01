@@ -757,6 +757,7 @@ pub enum Command {
     Bgrewriteaof,
     Lastsave,
     Ping(Option<Bytes>),
+    Monitor,
     CommandDocs,
     Info(Option<Bytes>),
     Replicaof {
@@ -775,11 +776,15 @@ pub enum Command {
         script: Bytes,
         keys: Vec<Bytes>,
         args: Vec<Bytes>,
+        read_only: bool,
+        auth_user: String,
     },
     Evalsha {
         sha: Bytes,
         keys: Vec<Bytes>,
         args: Vec<Bytes>,
+        read_only: bool,
+        auth_user: String,
     },
     ScriptLoad(Bytes),
     ScriptExists(Vec<Bytes>),
@@ -1429,10 +1434,17 @@ pub enum Command {
         function: String,
         keys: Vec<Bytes>,
         args: Vec<Bytes>,
+        read_only: bool,
+        auth_user: String,
     },
     FunctionList,
     FunctionDelete(String),
     FunctionFlush,
+    FunctionDump,
+    FunctionRestore {
+        payload: Bytes,
+        policy: String,
+    },
     // REDISJSON COMMANDS
     JsonSet {
         key: Bytes,
@@ -1783,6 +1795,94 @@ pub enum Command {
     Unknown(String),
 }
 
+impl Command {
+    pub fn allows_oom(&self) -> bool {
+        match self {
+            Command::Eval { script, .. } => {
+                let s = script.as_ref();
+                if s.starts_with(b"#!") {
+                    let s_str = String::from_utf8_lossy(s);
+                    let first_line = s_str.lines().next().unwrap_or("");
+                    first_line.contains("allow-oom")
+                } else {
+                    false
+                }
+            }
+            Command::Evalsha { sha, .. } => {
+                let sha_str = String::from_utf8_lossy(sha);
+                if let Some(cached) = crate::scripting::get_script(&sha_str) {
+                    if cached.starts_with("#!") {
+                        let first_line = cached.lines().next().unwrap_or("");
+                        first_line.contains("allow-oom")
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    pub fn is_write_command(&self) -> bool {
+        match self {
+            Command::Eval { script, read_only, .. } => {
+                if *read_only {
+                    return false;
+                }
+                let s = script.as_ref();
+                if s.starts_with(b"#!") {
+                    let s_str = String::from_utf8_lossy(s);
+                    let first_line = s_str.lines().next().unwrap_or("");
+                    !first_line.contains("no-writes")
+                } else {
+                    false
+                }
+            }
+            Command::Evalsha { sha, read_only, .. } => {
+                if *read_only {
+                    return false;
+                }
+                let sha_str = String::from_utf8_lossy(sha);
+                if let Some(cached) = crate::scripting::get_script(&sha_str) {
+                    if cached.starts_with("#!") {
+                        let first_line = cached.lines().next().unwrap_or("");
+                        !first_line.contains("no-writes")
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            Command::Fcall { function, read_only, .. } => {
+                if *read_only {
+                    return false;
+                }
+                !crate::scripting::is_function_read_only(function)
+            }
+            _ => {
+                match crate::connection::get_cmd_name(self) {
+                    "SET" | "SETEX" | "PSETEX" | "SETNX" | "MSET" | "MSETNX" | "MSETEX"
+                    | "GETSET" | "GETDEL" | "APPEND" | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "INCRBYFLOAT"
+                    | "DEL" | "UNLINK" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "PERSIST"
+                    | "HEXPIRE" | "HEXPIREAT" | "HPEXPIRE" | "HPEXPIREAT" | "HPERSIST" | "HSETEX"
+                    | "HSET" | "HSETNX" | "HMSET" | "HDEL" | "HINCRBY" | "HINCRBYFLOAT"
+                    | "LPUSH" | "RPUSH" | "LPUSHX" | "RPUSHX" | "LPOP" | "RPOP" | "LSET" | "LTRIM" | "LREM" | "LMOVE"
+                    | "BLMOVE" | "BLPOP" | "BRPOP" | "BRPOPLPUSH" | "LMPOP" | "BLMPOP"
+                    | "SADD" | "SREM" | "SPOP" | "SMOVE"
+                    | "ZADD" | "ZINCRBY" | "ZREM" | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "ZREMRANGEBYLEX"
+                    | "ZPOPMAX" | "ZPOPMIN" | "BZPOPMAX" | "BZPOPMIN" | "ZMPOP" | "BZMPOP"
+                    | "XADD" | "XDEL" | "XTRIM" | "XGROUP" | "XACK" | "XCLAIM" | "XAUTOCLAIM"
+                    | "FLUSHDB" | "FLUSHALL" => true,
+                    _ => false,
+                }
+            }
+        }
+    }
+}
+
 fn parse_memcached_storage_command(buf: &mut BytesMut) -> Result<Option<Option<Command>>, String> {
     let newline_pos = match find_crlf(buf) {
         Some(pos) => pos,
@@ -1957,19 +2057,37 @@ pub fn set_proto_max_bulk_len(val: usize) {
 }
 
 fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
-    let newline_pos = match find_crlf(buf) {
-        Some(pos) => pos,
-        None => return Ok(None),
+    let (newline_pos, advance_len) = match find_newline(buf) {
+        Some(res) => res,
+        None => {
+            if buf.len() > 64 * 1024 {
+                return Err("Protocol error: too big mbulk count string".to_string());
+            }
+            return Ok(None);
+        }
     };
 
     let line = &buf[1..newline_pos];
+    if line.starts_with(b"-") {
+        buf.advance(advance_len);
+        return Ok(None);
+    }
     let num_args: usize = match parse_decimal_bytes(line) {
-        Some(n) => n,
-        None => return Err("Invalid array length in RESP frame".to_string()),
+        Some(n) => {
+            if n > 1024 * 1024 {
+                return Err("Protocol error: invalid multibulk length".to_string());
+            }
+            n
+        }
+        None => return Err("Protocol error: invalid multibulk length".to_string()),
     };
+    if num_args == 0 {
+        buf.advance(advance_len);
+        return Ok(None);
+    }
 
     // First check if the full frame is present before consuming any bytes from buf
-    let mut scan_cursor = newline_pos + 2;
+    let mut scan_cursor = advance_len;
     let mut offsets = [(0usize, 0usize); 16];
     let is_small = num_args <= 16;
 
@@ -1979,25 +2097,33 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
             return Ok(None);
         }
         if buf[scan_cursor] != b'$' {
-            return Err("Expected bulk string in command array".to_string());
+            return Err(format!("Protocol error: expected '$', got '{}'", buf[scan_cursor] as char));
         }
 
-        let next_crlf = match find_crlf_at(buf, scan_cursor) {
-            Some(pos) => pos,
-            None => return Ok(None),
+        let (next_crlf, next_advance) = match find_newline_at(buf, scan_cursor) {
+            Some(res) => res,
+            None => {
+                if buf.len() - scan_cursor > 64 * 1024 {
+                    return Err("Protocol error: too big bulk count string".to_string());
+                }
+                return Ok(None);
+            }
         };
 
         let len_str = &buf[scan_cursor + 1..next_crlf];
+        if len_str.starts_with(b"-") {
+            return Err("Protocol error: invalid bulk length".to_string());
+        }
         let arg_len: usize = match parse_decimal_bytes(len_str) {
             Some(len) => len,
-            None => return Err("Invalid bulk string length".to_string()),
+            None => return Err("Protocol error: invalid bulk length".to_string()),
         };
 
         if arg_len > get_proto_max_bulk_len() {
             return Err("Protocol error: excessive bulk string length".to_string());
         }
 
-        let data_start = next_crlf + 2;
+        let data_start = scan_cursor + next_advance;
         let data_end = data_start + arg_len;
 
         if data_end + 2 > buf.len() {
@@ -2005,7 +2131,7 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
         }
 
         if &buf[data_end..data_end + 2] != b"\r\n" {
-            return Err("Expected CRLF after bulk string data".to_string());
+            return Err("Protocol error: invalid CRLF in request".to_string());
         }
 
         if is_small {
@@ -2241,17 +2367,14 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
         }
         build_command(args)
     } else {
-        buf.advance(newline_pos + 2); // Consume "*N\r\n"
+        buf.advance(advance_len); // Consume "*N\r\n"
         let mut args = Vec::with_capacity(num_args);
 
         for _ in 0..num_args {
-            let header_crlf = find_crlf(buf).unwrap();
-            let arg_len: usize = match parse_decimal_bytes(&buf[1..header_crlf]) {
-                Some(len) => len,
-                None => return Err("Invalid bulk string length".to_string()),
-            };
+            let (header_crlf, next_advance) = find_newline(buf).unwrap();
+            let arg_len: usize = parse_decimal_bytes(&buf[1..header_crlf]).unwrap_or(0);
 
-            buf.advance(header_crlf + 2); // Consume "$len\r\n"
+            buf.advance(next_advance); // Consume "$len\r\n"
             let data = buf.split_to(arg_len).freeze(); // Zero-copy slice!
             buf.advance(2); // Consume "\r\n"
             args.push(data);
@@ -2261,20 +2384,94 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
     }
 }
 
+fn split_inline_args(line: &[u8]) -> Result<Vec<Bytes>, String> {
+    let mut args = Vec::new();
+    let mut p = line;
+    while !p.is_empty() {
+        while !p.is_empty() && (p[0] == b' ' || p[0] == b'\t' || p[0] == b'\r' || p[0] == b'\n') {
+            p = &p[1..];
+        }
+        if p.is_empty() {
+            break;
+        }
+        let in_quote = p[0] == b'"' || p[0] == b'\'';
+        if in_quote {
+            let quote_char = p[0];
+            p = &p[1..];
+            let mut arg = Vec::new();
+            let mut closed = false;
+            while !p.is_empty() {
+                if p[0] == b'\\' {
+                    if p.len() > 1 {
+                        if quote_char == b'"' {
+                            match p[1] {
+                                b'n' => arg.push(b'\n'),
+                                b'r' => arg.push(b'\r'),
+                                b't' => arg.push(b'\t'),
+                                b'b' => arg.push(b'\x08'),
+                                b'a' => arg.push(b'\x07'),
+                                b'x' if p.len() > 3 => {
+                                    if let Ok(b) = u8::from_str_radix(std::str::from_utf8(&p[2..4]).unwrap_or(""), 16) {
+                                        arg.push(b);
+                                        p = &p[4..];
+                                        continue;
+                                    }
+                                }
+                                other => arg.push(other),
+                            }
+                        } else {
+                            arg.push(p[1]);
+                        }
+                        p = &p[2..];
+                        continue;
+                    } else {
+                        return Err("Protocol error: unbalanced quotes in request".to_string());
+                    }
+                } else if p[0] == quote_char {
+                    p = &p[1..];
+                    closed = true;
+                    break;
+                } else {
+                    arg.push(p[0]);
+                    p = &p[1..];
+                }
+            }
+            if !closed {
+                return Err("Protocol error: unbalanced quotes in request".to_string());
+            }
+            if !p.is_empty() && p[0] != b' ' && p[0] != b'\t' && p[0] != b'\r' && p[0] != b'\n' {
+                return Err("Protocol error: unbalanced quotes in request".to_string());
+            }
+            args.push(Bytes::from(arg));
+        } else {
+            let mut arg = Vec::new();
+            while !p.is_empty() && p[0] != b' ' && p[0] != b'\t' && p[0] != b'\r' && p[0] != b'\n' {
+                if p[0] == b'"' || p[0] == b'\'' {
+                    return Err("Protocol error: unbalanced quotes in request".to_string());
+                }
+                arg.push(p[0]);
+                p = &p[1..];
+            }
+            args.push(Bytes::from(arg));
+        }
+    }
+    Ok(args)
+}
+
 fn parse_inline_command(buf: &mut BytesMut) -> Result<Option<Command>, String> {
-    let newline_pos = match find_crlf(buf) {
-        Some(pos) => pos,
-        None => return Ok(None),
+    let (line_end, advance_len) = match find_newline(buf) {
+        Some(res) => res,
+        None => {
+            if buf.len() > 64 * 1024 {
+                return Err("Protocol error: too big inline request".to_string());
+            }
+            return Ok(None);
+        }
     };
 
-    let line = &buf[..newline_pos];
-    let parts: Vec<Bytes> = line
-        .split(|&b| b == b' ' || b == b'\t')
-        .filter(|part| !part.is_empty())
-        .map(Bytes::copy_from_slice)
-        .collect();
-
-    buf.advance(newline_pos + 2);
+    let line = &buf[..line_end];
+    let parts = split_inline_args(line)?;
+    buf.advance(advance_len);
 
     if parts.is_empty() {
         return Ok(None);
@@ -2392,16 +2589,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
         }
         "GET" => {
-            if args.len() < 2 {
+            if args.len() != 2 {
                 return Err("wrong number of arguments for 'get' command".to_string());
             }
-            if args.len() == 2 {
-                Ok(Some(Command::Get(args[1].clone())))
-            } else {
-                Ok(Some(Command::MemcachedGet {
-                    keys: args[1..].to_vec(),
-                }))
-            }
+            Ok(Some(Command::Get(args[1].clone())))
         }
         "GETEX" => {
             if args.len() < 2 {
@@ -3149,7 +3340,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::Ttl(args[1].clone(), true)))
         }
         "PING" => {
-            let msg = if args.len() > 1 {
+            if args.len() > 2 {
+                return Err("wrong number of arguments for 'ping' command".to_string());
+            }
+            let msg = if args.len() == 2 {
                 Some(args[1].clone())
             } else {
                 None
@@ -5323,6 +5517,26 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
         }
         "DEFRAG" | "ACTIVE-DEFRAG" => Ok(Some(Command::Memory(MemorySubcommand::Defrag))),
+        "MODULE" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'module' command".to_string());
+            }
+            let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
+            Ok(Some(Command::Unknown(format!("MODULE {}", sub))))
+        }
+        "HOTKEYS" => {
+            if args.len() < 2 {
+                return Err("wrong number of arguments for 'hotkeys' command".to_string());
+            }
+            let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
+            Ok(Some(Command::Unknown(format!("HOTKEYS {}", sub))))
+        }
+        "MONITOR" => {
+            if args.len() != 1 {
+                return Err("wrong number of arguments for 'monitor' command".to_string());
+            }
+            Ok(Some(Command::Monitor))
+        }
         "EXPIREAT" => {
             if args.len() < 3 {
                 return Err("wrong number of arguments for 'expireat' command".to_string());
@@ -5655,16 +5869,19 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
         }
         "ROLE" => Ok(Some(Command::Role)),
         "EVAL" | "EVAL_RO" => {
+            let cmd_name = String::from_utf8_lossy(&args[0]).to_uppercase();
+            let read_only = cmd_name == "EVAL_RO";
             if args.len() < 3 {
-                return Err("wrong number of arguments for 'eval' command".to_string());
+                return Err(format!("wrong number of arguments for '{}' command", cmd_name.to_lowercase()));
             }
             let script = args[1].clone();
-            let numkeys: usize = match std::str::from_utf8(&args[2])
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-            {
-                Some(n) => n,
-                None => return Err("ERR value is not an integer or out of range".to_string()),
+            let numkeys_str = std::str::from_utf8(&args[2]).unwrap_or("");
+            if numkeys_str.starts_with('-') {
+                return Err("ERR Number of keys can't be negative".to_string());
+            }
+            let numkeys: usize = match numkeys_str.parse::<usize>() {
+                Ok(n) => n,
+                Err(_) => return Err("ERR value is not an integer or out of range".to_string()),
             };
             if 3 + numkeys > args.len() {
                 return Err("ERR Number of keys can't be greater than number of args".to_string());
@@ -5675,19 +5892,24 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 script,
                 keys,
                 args: script_args,
+                read_only,
+                auth_user: String::new(),
             }))
         }
         "EVALSHA" | "EVALSHA_RO" => {
+            let cmd_name = String::from_utf8_lossy(&args[0]).to_uppercase();
+            let read_only = cmd_name == "EVALSHA_RO";
             if args.len() < 3 {
-                return Err("wrong number of arguments for 'evalsha' command".to_string());
+                return Err(format!("wrong number of arguments for '{}' command", cmd_name.to_lowercase()));
             }
             let sha = args[1].clone();
-            let numkeys: usize = match std::str::from_utf8(&args[2])
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-            {
-                Some(n) => n,
-                None => return Err("ERR value is not an integer or out of range".to_string()),
+            let numkeys_str = std::str::from_utf8(&args[2]).unwrap_or("");
+            if numkeys_str.starts_with('-') {
+                return Err("ERR Number of keys can't be negative".to_string());
+            }
+            let numkeys: usize = match numkeys_str.parse::<usize>() {
+                Ok(n) => n,
+                Err(_) => return Err("ERR value is not an integer or out of range".to_string()),
             };
             if 3 + numkeys > args.len() {
                 return Err("ERR Number of keys can't be greater than number of args".to_string());
@@ -5698,6 +5920,8 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 sha,
                 keys,
                 args: script_args,
+                read_only,
+                auth_user: String::new(),
             }))
         }
         "SCRIPT" => {
@@ -10160,19 +10384,44 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "LOAD" => {
                     if args.len() < 3 {
                         return Err(
-                            "wrong number of arguments for 'function load' command".to_string()
+                            "wrong number of arguments for 'function load' command".to_string(),
                         );
                     }
-                    let mut replace = false;
-                    let mut code_idx = 2;
-                    if args.len() >= 4
-                        && String::from_utf8_lossy(&args[2]).to_uppercase() == "REPLACE"
-                    {
-                        replace = true;
-                        code_idx = 3;
-                    }
-                    let code = args[code_idx].clone();
+                    let (replace, code) = if args.len() == 3 {
+                        (false, args[2].clone())
+                    } else if args.len() == 4 {
+                        let opt = String::from_utf8_lossy(&args[2]).to_uppercase();
+                        if opt == "REPLACE" {
+                            (true, args[3].clone())
+                        } else {
+                            return Err(format!("ERR Unknown option given: '{}'", String::from_utf8_lossy(&args[2])));
+                        }
+                    } else {
+                        return Err(format!("ERR Unknown option given: '{}'", String::from_utf8_lossy(&args[2])));
+                    };
                     Ok(Some(Command::FunctionLoad { replace, code }))
+                }
+                "DUMP" => {
+                    if args.len() != 2 {
+                        return Err("wrong number of arguments for 'function dump' command".to_string());
+                    }
+                    Ok(Some(Command::FunctionDump))
+                }
+                "RESTORE" => {
+                    if args.len() < 3 || args.len() > 4 {
+                        return Err("ERR unknown subcommand or wrong number of arguments for 'restore'. Try FUNCTION HELP.".to_string());
+                    }
+                    let payload = args[2].clone();
+                    let policy = if args.len() == 4 {
+                        let p = String::from_utf8_lossy(&args[3]).to_uppercase();
+                        if p != "FLUSH" && p != "APPEND" && p != "REPLACE" {
+                            return Err("ERR unknown subcommand or wrong number of arguments for 'restore'. Try FUNCTION HELP.".to_string());
+                        }
+                        p
+                    } else {
+                        "APPEND".to_string()
+                    };
+                    Ok(Some(Command::FunctionRestore { payload, policy }))
                 }
                 "LIST" => Ok(Some(Command::FunctionList)),
                 "FLUSH" => Ok(Some(Command::FunctionFlush)),
@@ -10181,26 +10430,34 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "DELETE" => {
                     if args.len() != 3 {
                         return Err(
-                            "wrong number of arguments for 'function delete' command".to_string()
+                            "wrong number of arguments for 'function delete' command".to_string(),
                         );
                     }
                     let lib = String::from_utf8_lossy(&args[2]).to_string();
                     Ok(Some(Command::FunctionDelete(lib)))
                 }
-                _ => Ok(Some(Command::Unknown(format!("FUNCTION {}", sub)))),
+                _ => Err("ERR unknown subcommand or wrong number of arguments for 'function' command".to_string()),
             }
         }
         "FCALL" | "FCALL_RO" => {
+            let cmd_name = String::from_utf8_lossy(&args[0]).to_uppercase();
+            let read_only = cmd_name == "FCALL_RO";
             if args.len() < 3 {
-                return Err("wrong number of arguments for 'fcall' command".to_string());
+                return Err(format!("wrong number of arguments for '{}' command", cmd_name.to_lowercase()));
             }
             let function = String::from_utf8_lossy(&args[1]).to_string();
-            let numkeys: usize = std::str::from_utf8(&args[2])
-                .map_err(|_| "value is not an integer or out of range")?
-                .parse()
-                .map_err(|_| "value is not an integer or out of range")?;
-            if args.len() < 3 + numkeys {
-                return Err("Number of keys can't be greater than number of args".to_string());
+            let numkeys_str = std::str::from_utf8(&args[2]).unwrap_or("");
+            if numkeys_str.starts_with('-') {
+                return Err("ERR Number of keys can't be negative".to_string());
+            }
+            let numkeys: usize = match numkeys_str.parse::<usize>() {
+                Ok(n) => n,
+                Err(_) => {
+                    return Err("ERR Bad number of keys provided, please give a non negative number".to_string());
+                }
+            };
+            if 3 + numkeys > args.len() {
+                return Err("ERR Number of keys can't be greater than number of args".to_string());
             }
             let keys = args[3..3 + numkeys].to_vec();
             let func_args = args[3 + numkeys..].to_vec();
@@ -10208,6 +10465,8 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 function,
                 keys,
                 args: func_args,
+                read_only,
+                auth_user: String::new(),
             }))
         }
         "JSON.SET" => {
@@ -13105,6 +13364,28 @@ fn find_crlf_at(buf: &[u8], start: usize) -> Option<usize> {
         .windows(2)
         .position(|w| w == b"\r\n")
         .map(|pos| start + pos)
+}
+
+fn find_newline(buf: &[u8]) -> Option<(usize, usize)> {
+    find_newline_at(buf, 0)
+}
+
+fn find_newline_at(buf: &[u8], start: usize) -> Option<(usize, usize)> {
+    if buf.len() <= start {
+        return None;
+    }
+    if let Some(pos) = buf[start..].iter().position(|&b| b == b'\n') {
+        let abs_pos = start + pos;
+        let line_end = if abs_pos > start && buf[abs_pos - 1] == b'\r' {
+            abs_pos - 1
+        } else {
+            abs_pos
+        };
+        let advance_len = abs_pos + 1 - start;
+        Some((line_end, advance_len))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

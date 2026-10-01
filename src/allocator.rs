@@ -70,7 +70,8 @@ pub fn format_memory_info(
         allocator_metadata:{}\r\n\
         allocator_mapped:{}\r\n\
         cooled_keys:{}\r\n\
-        tiered_keys:{}\r\n",
+        tiered_keys:{}\r\n\
+        number_of_cached_scripts:{}\r\n",
         used_mem,
         crate::tiering::format_bytes_human(used_mem as u64),
         rss,
@@ -85,6 +86,7 @@ pub fn format_memory_info(
         stats.mapped,
         cooled_keys,
         tiered_keys,
+        crate::scripting::cached_scripts_count(),
     )
 }
 

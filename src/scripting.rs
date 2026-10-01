@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use crate::resp::Command;
 use mlua::{Lua, MultiValue, Value};
 use sha1::{Digest, Sha1};
 use std::cell::RefCell;
@@ -50,14 +51,531 @@ pub fn flush_scripts() {
     SCRIPT_CACHE.write().unwrap().clear();
 }
 
+pub fn cached_scripts_count() -> usize {
+    SCRIPT_CACHE.read().unwrap().len()
+}
+
+/// A registered Redis 7 Function definition
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct FunctionDef {
+    pub name: String,
+    pub description: String,
+    pub flags: Vec<String>,
+}
+
+/// A registered Redis 7 Function Library
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct FunctionLib {
+    pub name: String,
+    pub engine: String,
+    pub raw_code: String,
+    pub functions: Vec<FunctionDef>,
+}
+
+static FUNCTION_LIBS: LazyLock<RwLock<HashMap<String, FunctionLib>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+pub fn is_function_read_only(name: &str) -> bool {
+    let cache = FUNCTION_LIBS.read().unwrap();
+    for l in cache.values() {
+        for f in &l.functions {
+            if f.name == name {
+                return f.flags.iter().any(|flag| flag == "no-writes");
+            }
+        }
+    }
+    false
+}
+
+thread_local! {
+    pub static SCRIPT_RECORDED_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Load a Redis 7 Function Library
+pub fn load_function(code: &str, replace: bool) -> Result<String, String> {
+    let mut lib_name = String::new();
+    let mut engine = "LUA".to_string();
+    let mut default_flags = Vec::new();
+
+    for line in code.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("#!") {
+            let after = trimmed[2..].trim();
+            let mut parts = after.split_whitespace();
+            if let Some(eng) = parts.next() {
+                engine = eng.to_uppercase();
+            }
+            for part in parts {
+                if let Some(pos) = part.find('=') {
+                    let key = &part[..pos];
+                    let val = part[pos + 1..].trim_matches('"');
+                    if key == "name" {
+                        lib_name = val.to_string();
+                    } else if key == "flags" {
+                        for f in val.split(',') {
+                            let f_trim = f.trim();
+                            if !f_trim.is_empty() {
+                                default_flags.push(f_trim.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    if engine != "LUA" {
+        return Err(format!("ERR Engine '{}' not found", engine));
+    }
+
+    if lib_name.is_empty()
+        || !lib_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err("ERR Library names can only contain letters, numbers, or underscores(_) and must be at least one character".to_string());
+    }
+
+    {
+        let cache = FUNCTION_LIBS.read().unwrap();
+        if cache.keys().any(|k| k.eq_ignore_ascii_case(&lib_name)) && !replace {
+            return Err(format!("ERR Library '{}' already exists", lib_name));
+        }
+    }
+
+    // Execute with mock redis.register_function to collect function names & flags
+    let lua = Lua::new();
+    let func_defs = Rc::new(RefCell::new(Vec::new()));
+    let func_defs_clone = func_defs.clone();
+    let default_flags_clone = default_flags.clone();
+
+    let redis_tbl = lua.create_table().map_err(|e| e.to_string())?;
+    let reg_fn = lua
+        .create_function(move |_, args: MultiValue| {
+            let mut name_opt = None;
+            let mut desc_opt = None;
+            let mut flags_opt = None;
+            if let Some(first) = args.iter().next() {
+                match first {
+                    Value::String(s) => {
+                        if let Ok(name_str) = s.to_str() {
+                            name_opt = Some(name_str.to_string());
+                        }
+                    }
+                    Value::Table(t) => {
+                        if let Ok(name_str) = t
+                            .raw_get::<String>("function_name")
+                            .or_else(|_| t.raw_get::<String>("name"))
+                        {
+                            name_opt = Some(name_str);
+                        }
+                        if let Ok(desc_str) = t.raw_get::<String>("description") {
+                            desc_opt = Some(desc_str);
+                        }
+                        if let Ok(flags_tbl) = t.raw_get::<mlua::Table>("flags") {
+                            let mut flags = Vec::new();
+                            for i in 1..=flags_tbl.raw_len() {
+                                if let Ok(flag_str) = flags_tbl.raw_get::<String>(i) {
+                                    flags.push(flag_str);
+                                }
+                            }
+                            flags_opt = Some(flags);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(name) = name_opt {
+                let flags = flags_opt.unwrap_or_else(|| default_flags_clone.clone());
+                func_defs_clone.borrow_mut().push(FunctionDef {
+                    name,
+                    description: desc_opt.unwrap_or_default(),
+                    flags,
+                });
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+    redis_tbl
+        .set("register_function", reg_fn)
+        .map_err(|e| e.to_string())?;
+    lua.globals()
+        .set("redis", redis_tbl)
+        .map_err(|e| e.to_string())?;
+
+    let lua_code: String = code
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("#!") {
+                format!("--{}", line)
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    lua.load(&lua_code).exec().map_err(|e| {
+        let s = e.to_string();
+        let first = s.lines().next().unwrap_or(&s);
+        format!("ERR Error compiling function: {}", first)
+    })?;
+
+    let registered = func_defs.borrow().clone();
+    let lib = FunctionLib {
+        name: lib_name.clone(),
+        engine,
+        raw_code: lua_code,
+        functions: registered,
+    };
+
+    FUNCTION_LIBS.write().unwrap().insert(lib_name.clone(), lib);
+    Ok(lib_name)
+}
+
+/// Returns list of registered libraries and functions
+pub fn list_functions() -> Vec<FunctionLib> {
+    let cache = FUNCTION_LIBS.read().unwrap();
+    cache.values().cloned().collect()
+}
+
+/// Delete a registered function library
+pub fn delete_function(lib_name: &str) -> bool {
+    let mut cache = FUNCTION_LIBS.write().unwrap();
+    if let Some(k) = cache
+        .keys()
+        .find(|k| k.eq_ignore_ascii_case(lib_name))
+        .cloned()
+    {
+        cache.remove(&k).is_some()
+    } else {
+        false
+    }
+}
+
+/// Flush all registered function libraries
+pub fn flush_functions() {
+    FUNCTION_LIBS.write().unwrap().clear();
+}
+
+pub fn dump_functions() -> Vec<u8> {
+    let cache = FUNCTION_LIBS.read().unwrap();
+    let libs: Vec<FunctionLib> = cache.values().cloned().collect();
+    let json = serde_json::to_vec(&libs).unwrap_or_default();
+    let mut out = Vec::with_capacity(16 + json.len());
+    out.extend_from_slice(b"RUDFUNCv1\x00");
+    let crc = crc16::State::<crc16::XMODEM>::calculate(&json);
+    out.extend_from_slice(&crc.to_be_bytes());
+    out.extend_from_slice(&json);
+    out
+}
+
+pub fn restore_functions(payload: &[u8], policy: &str) -> Result<(), String> {
+    if payload.len() < 12 || !payload.starts_with(b"RUDFUNCv1\x00") {
+        return Err("ERR DUMP payload version or checksum are wrong".to_string());
+    }
+    let crc_expected = u16::from_be_bytes([payload[10], payload[11]]);
+    let json = &payload[12..];
+    let crc_actual = crc16::State::<crc16::XMODEM>::calculate(json);
+    if crc_expected != crc_actual {
+        return Err("ERR DUMP payload version or checksum are wrong".to_string());
+    }
+    let libs: Vec<FunctionLib> = serde_json::from_slice(json)
+        .map_err(|_| "ERR DUMP payload version or checksum are wrong".to_string())?;
+
+    let mut cache = FUNCTION_LIBS.write().unwrap();
+    if policy == "FLUSH" {
+        cache.clear();
+        for lib in libs {
+            cache.insert(lib.name.clone(), lib);
+        }
+    } else if policy == "APPEND" {
+        for lib in &libs {
+            if cache.keys().any(|k| k.eq_ignore_ascii_case(&lib.name)) {
+                return Err(format!("ERR Library '{}' already exists", lib.name));
+            }
+        }
+        for lib in libs {
+            cache.insert(lib.name.clone(), lib);
+        }
+    } else if policy == "REPLACE" {
+        for lib in libs {
+            cache.insert(lib.name.clone(), lib);
+        }
+    }
+    Ok(())
+}
+
+fn format_lua_error(s: &str) -> String {
+    let first = s.lines().next().unwrap_or(s);
+    if let Some(pos) = first.find("ERR ") {
+        return first[pos..].to_string();
+    }
+    if let Some(pos) = first.find("NOSCRIPT ") {
+        return first[pos..].to_string();
+    }
+    if let Some(pos) = first.find("WRONGTYPE ") {
+        return first[pos..].to_string();
+    }
+    if let Some(pos) = first.find("attempt to call a nil value (field '") {
+        let after = &first[pos + 36..];
+        let field_name = after.split('\'').next().unwrap_or("");
+        return format!("ERR attempt to call field '{}' (a nil value)", field_name);
+    }
+    if let Some(pos) = first.find("attempt to call a nil value (global '") {
+        let after = &first[pos + 37..];
+        let global_name = after.split('\'').next().unwrap_or("");
+        return format!("ERR attempt to call global '{}' (a nil value)", global_name);
+    }
+    if first.contains("attempt to index a nil value") {
+        return "ERR user_script:1: attempt to index a nil value script".to_string();
+    }
+    if first.starts_with("ERR ") {
+        first.to_string()
+    } else {
+        format!("ERR {}", first)
+    }
+}
+
+fn format_eval_error(err: &str, sha: &str) -> String {
+    let mut msg = err.trim_start();
+    if let Some(pos) = msg.find("runtime error: ") {
+        msg = &msg[pos + 15..];
+    }
+    if let Some(stripped) = msg.strip_prefix('@') {
+        msg = stripped;
+    }
+    if let Some(pos) = msg.find("NOREPLICAS ") {
+        return msg[pos..].to_string();
+    }
+    if let Some(pos) = msg.find("OOM ") {
+        return msg[pos..].to_string();
+    }
+    if let Some(pos) = msg.find("attempt to call a nil value (field '") {
+        let after = &msg[pos + 36..];
+        let field_name = after.split('\'').next().unwrap_or("");
+        return format!(
+            "ERR attempt to call field '{}' (a nil value) script: {}, on @user_script:1.",
+            field_name, sha
+        );
+    }
+    if let Some(pos) = msg.find("attempt to call a nil value (global '") {
+        let after = &msg[pos + 37..];
+        let global_name = after.split('\'').next().unwrap_or("");
+        return format!(
+            "ERR attempt to call global '{}' (a nil value) script: {}, on @user_script:1.",
+            global_name, sha
+        );
+    }
+    let final_prefix = if msg.starts_with("ERR ")
+        || msg.starts_with("NOSCRIPT ")
+        || msg.starts_with("WRONGTYPE ")
+    {
+        msg.to_string()
+    } else {
+        format!("ERR {}", msg)
+    };
+    format!("{} script: {}, on @user_script:1.", final_prefix, sha)
+}
+
+/// Execute a registered Redis 7 Function via FCALL
+pub fn call_function(
+    func_name: &str,
+    keys: &[Bytes],
+    args: &[Bytes],
+    db: &Rc<RefCell<crate::shard::ShardDb>>,
+    aof: Option<&RefCell<crate::aof::AofWriter>>,
+    read_only: bool,
+) -> Result<Vec<u8>, String> {
+    SCRIPT_RECORDED_ERROR.set(false);
+    let (lib, func_def) = {
+        let cache = FUNCTION_LIBS.read().unwrap();
+        let mut found = None;
+        for l in cache.values() {
+            if let Some(f) = l
+                .functions
+                .iter()
+                .find(|f| f.name.eq_ignore_ascii_case(func_name))
+            {
+                found = Some((l.clone(), f.clone()));
+                break;
+            }
+        }
+        found.ok_or_else(|| "ERR Function not found".to_string())?
+    };
+
+    let effective_read_only = read_only || func_def.flags.iter().any(|f| f == "no-writes");
+
+    let lua = Lua::new();
+    let aof_raw = aof.map(|a| a as *const _);
+    let script_resp_ver = Rc::new(RefCell::new(2u8));
+    setup_redis_lua_env(
+        &lua,
+        db,
+        aof_raw,
+        effective_read_only,
+        script_resp_ver.clone(),
+    )?;
+
+    // Set KEYS table
+    let keys_tbl = lua.create_table().map_err(|e| e.to_string())?;
+    for (i, k) in keys.iter().enumerate() {
+        let s = lua.create_string(k.as_ref()).map_err(|e| e.to_string())?;
+        keys_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
+    }
+
+    // Set ARGV table
+    let argv_tbl = lua.create_table().map_err(|e| e.to_string())?;
+    for (i, a) in args.iter().enumerate() {
+        let s = lua.create_string(a.as_ref()).map_err(|e| e.to_string())?;
+        argv_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
+    }
+
+    // Capture target function
+    let target_fn = Rc::new(RefCell::new(None));
+    let target_fn_clone = target_fn.clone();
+    let target_name_lower = func_name.to_lowercase();
+
+    let reg_fn = lua
+        .create_function(move |lua, margs: MultiValue| {
+            let mut name_opt = None;
+            let mut func_opt = None;
+            if let Some(first) = margs.iter().next() {
+                match first {
+                    Value::String(s) => {
+                        if let Ok(name_str) = s.to_str() {
+                            name_opt = Some(name_str.to_string());
+                        }
+                        if let Some(Value::Function(f)) = margs.iter().nth(1) {
+                            func_opt = Some(f.clone());
+                        }
+                    }
+                    Value::Table(t) => {
+                        if let Ok(name_str) = t
+                            .raw_get::<String>("function_name")
+                            .or_else(|_| t.raw_get::<String>("name"))
+                        {
+                            name_opt = Some(name_str);
+                        }
+                        if let Ok(f) = t.raw_get::<mlua::Function>("callback") {
+                            func_opt = Some(f);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let (Some(name), Some(f)) = (name_opt, func_opt) {
+                if name.to_lowercase() == target_name_lower {
+                    let key = lua.create_registry_value(f)?;
+                    *target_fn_clone.borrow_mut() = Some(key);
+                }
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+
+    if let Ok(real_redis) = lua.named_registry_value::<mlua::Table>("__real_redis") {
+        real_redis
+            .set("register_function", reg_fn)
+            .map_err(|e| e.to_string())?;
+    }
+
+    // Run library script to define functions
+    lua.load(&lib.raw_code)
+        .exec()
+        .map_err(|e| format!("ERR Failed to compile library: {}", e))?;
+
+    let fn_key = target_fn.borrow_mut().take().ok_or_else(|| {
+        format!(
+            "ERR Function '{}' registered but failed to capture",
+            func_name
+        )
+    })?;
+    let f: mlua::Function = lua.registry_value(&fn_key).map_err(|e| e.to_string())?;
+
+    let res: Value = f
+        .call((keys_tbl, argv_tbl))
+        .map_err(|e| format_lua_error(&e.to_string()))?;
+
+    let mut out = Vec::new();
+    let cur_resp_ver = *script_resp_ver.borrow();
+    lua_val_to_resp_with_depth(&res, &mut out, 0, cur_resp_ver)?;
+    Ok(out)
+}
+
 pub fn eval_script(
     script_content: &str,
     keys: &[Bytes],
     args: &[Bytes],
     db: &Rc<RefCell<crate::shard::ShardDb>>,
     aof: Option<&RefCell<crate::aof::AofWriter>>,
+    read_only: bool,
 ) -> Result<Vec<u8>, String> {
+    SCRIPT_RECORDED_ERROR.set(false);
+    let mut effective_read_only = read_only;
+    let mut processed_script = script_content.to_string();
+
+    let first_line = script_content.lines().next().unwrap_or("");
+    if first_line.trim_start().starts_with("#!") {
+        let trimmed = first_line.trim();
+        let after = trimmed[2..].trim();
+        let mut parts = after.split_whitespace();
+        let engine = parts.next().unwrap_or("");
+        if !engine.eq_ignore_ascii_case("lua") {
+            return Err("ERR Unexpected engine in script shebang".to_string());
+        }
+        for opt in parts {
+            if let Some(pos) = opt.find('=') {
+                let key = &opt[..pos];
+                let val = opt[pos + 1..].trim_matches('"');
+                if key != "flags" {
+                    return Err(format!("ERR Unknown lua shebang option: '{}'", key));
+                }
+                for f in val.split(',') {
+                    let f_trim = f.trim();
+                    if f_trim == "no-writes" {
+                        effective_read_only = true;
+                    } else if f_trim == "allow-oom"
+                        || f_trim == "allow-stale"
+                        || f_trim == "no-cluster"
+                    {
+                        // valid flags
+                    } else {
+                        return Err(format!(
+                            "ERR Unexpected flag in script shebang: '{}'",
+                            f_trim
+                        ));
+                    }
+                }
+            } else {
+                return Err(format!("ERR Unknown lua shebang option: '{}'", opt));
+            }
+        }
+        processed_script = script_content
+            .lines()
+            .enumerate()
+            .map(|(i, line)| {
+                if i == 0 {
+                    format!("--{}", line)
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+
     let lua = Lua::new();
+    let aof_raw = aof.map(|a| a as *const _);
+    let script_resp_ver = Rc::new(RefCell::new(2u8));
+    setup_redis_lua_env(
+        &lua,
+        db,
+        aof_raw,
+        effective_read_only,
+        script_resp_ver.clone(),
+    )?;
 
     // Set KEYS table (1-indexed)
     let keys_tbl = lua.create_table().map_err(|e| e.to_string())?;
@@ -65,9 +583,6 @@ pub fn eval_script(
         let s = lua.create_string(k.as_ref()).map_err(|e| e.to_string())?;
         keys_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
     }
-    lua.globals()
-        .set("KEYS", keys_tbl)
-        .map_err(|e| e.to_string())?;
 
     // Set ARGV table (1-indexed)
     let argv_tbl = lua.create_table().map_err(|e| e.to_string())?;
@@ -75,143 +590,1487 @@ pub fn eval_script(
         let s = lua.create_string(a.as_ref()).map_err(|e| e.to_string())?;
         argv_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
     }
-    lua.globals()
-        .set("ARGV", argv_tbl)
+
+    if let Ok(real_g) = lua.named_registry_value::<mlua::Table>("__real_G") {
+        real_g.set("KEYS", keys_tbl).map_err(|e| e.to_string())?;
+        real_g.set("ARGV", argv_tbl).map_err(|e| e.to_string())?;
+    }
+
+    let chunk_func = lua
+        .load(&processed_script)
+        .set_name("@user_script")
+        .into_function()
+        .map_err(|e| format_lua_error(&e.to_string()))?;
+    let runner: mlua::Function = lua
+        .load(
+            r#"
+        local f = ...
+        return xpcall(f, function(err)
+            if type(err) == "table" then
+                if err.err then
+                    return tostring(err.err)
+                else
+                    return "ERR unknown error"
+                end
+            end
+            return tostring(err)
+        end)
+        "#,
+        )
+        .into_function()
         .map_err(|e| e.to_string())?;
 
-    // Create redis global table
-    let redis = lua.create_table().map_err(|e| e.to_string())?;
+    let (ok, res): (bool, Value) = runner
+        .call(chunk_func)
+        .map_err(|e| format_lua_error(&e.to_string()))?;
 
-    let db_call = db.clone();
-    let aof_call = aof.map(|a| a as *const _);
-    let call_fn = lua
-        .create_function(move |lua, margs: MultiValue| {
-            let mut cmd_args = Vec::with_capacity(margs.len());
-            for v in margs {
-                match v {
-                    Value::String(s) => cmd_args.push(Bytes::copy_from_slice(&s.as_bytes())),
-                    Value::Integer(i) => cmd_args.push(Bytes::from(i.to_string())),
-                    Value::Number(n) => cmd_args.push(Bytes::from(n.to_string())),
-                    Value::Boolean(b) => cmd_args.push(Bytes::from(if b { "1" } else { "0" })),
-                    Value::Nil => cmd_args.push(Bytes::new()),
-                    _ => {}
-                }
-            }
-            let cmd = match crate::resp::build_command(cmd_args) {
-                Ok(Some(c)) => c,
-                Ok(None) => return Err(mlua::Error::RuntimeError("ERR empty command".to_string())),
-                Err(e) => return Err(mlua::Error::RuntimeError(format!("ERR {}", e))),
-            };
-
-            let mut out = Vec::new();
-            let aof_ref = unsafe { aof_call.map(|ptr| &*ptr) };
-            crate::connection::execute_local_command(
-                &cmd,
-                &mut db_call.borrow_mut(),
-                &mut out,
-                aof_ref,
-            );
-
-            resp_bytes_to_lua(lua, &out)
-        })
-        .map_err(|e| e.to_string())?;
-    redis.set("call", call_fn).map_err(|e| e.to_string())?;
-
-    let db_pcall = db.clone();
-    let aof_pcall = aof.map(|a| a as *const _);
-    let pcall_fn = lua
-        .create_function(move |lua, margs: MultiValue| {
-            let mut cmd_args = Vec::with_capacity(margs.len());
-            for v in margs {
-                match v {
-                    Value::String(s) => cmd_args.push(Bytes::copy_from_slice(&s.as_bytes())),
-                    Value::Integer(i) => cmd_args.push(Bytes::from(i.to_string())),
-                    Value::Number(n) => cmd_args.push(Bytes::from(n.to_string())),
-                    Value::Boolean(b) => cmd_args.push(Bytes::from(if b { "1" } else { "0" })),
-                    Value::Nil => cmd_args.push(Bytes::new()),
-                    _ => {}
-                }
-            }
-            let cmd = match crate::resp::build_command(cmd_args) {
-                Ok(Some(c)) => c,
-                Ok(None) => {
-                    let tbl = lua.create_table()?;
-                    tbl.set("err", "ERR empty command")?;
-                    return Ok(Value::Table(tbl));
-                }
-                Err(e) => {
-                    let tbl = lua.create_table()?;
-                    tbl.set("err", format!("ERR {}", e))?;
-                    return Ok(Value::Table(tbl));
-                }
-            };
-
-            let mut out = Vec::new();
-            let aof_ref = unsafe { aof_pcall.map(|ptr| &*ptr) };
-            crate::connection::execute_local_command(
-                &cmd,
-                &mut db_pcall.borrow_mut(),
-                &mut out,
-                aof_ref,
-            );
-
-            if out.starts_with(b"-") {
-                let err_str =
-                    String::from_utf8_lossy(&out[1..out.len().saturating_sub(2)]).to_string();
-                let tbl = lua.create_table()?;
-                tbl.set("err", err_str)?;
-                Ok(Value::Table(tbl))
-            } else {
-                resp_bytes_to_lua(lua, &out)
-            }
-        })
-        .map_err(|e| e.to_string())?;
-    redis.set("pcall", pcall_fn).map_err(|e| e.to_string())?;
-
-    let status_reply = lua
-        .create_function(|lua, msg: String| {
-            let tbl = lua.create_table()?;
-            tbl.set("ok", msg)?;
-            Ok(Value::Table(tbl))
-        })
-        .map_err(|e| e.to_string())?;
-    redis
-        .set("status_reply", status_reply)
-        .map_err(|e| e.to_string())?;
-
-    let error_reply = lua
-        .create_function(|lua, msg: String| {
-            let tbl = lua.create_table()?;
-            tbl.set("err", msg)?;
-            Ok(Value::Table(tbl))
-        })
-        .map_err(|e| e.to_string())?;
-    redis
-        .set("error_reply", error_reply)
-        .map_err(|e| e.to_string())?;
-
-    let sha1hex_fn = lua
-        .create_function(|_lua, s: String| Ok(sha1_hex(s.as_bytes())))
-        .map_err(|e| e.to_string())?;
-    redis
-        .set("sha1hex", sha1hex_fn)
-        .map_err(|e| e.to_string())?;
-
-    lua.globals()
-        .set("redis", redis)
-        .map_err(|e| e.to_string())?;
-
-    let chunk = lua.load(script_content);
-    let val: Value = chunk
-        .eval()
-        .map_err(|e| format!("ERR user_script: {}", e))?;
+    if !ok {
+        let err_msg = match res {
+            Value::String(s) => s.to_str().map(|s| s.to_string()).unwrap_or_default(),
+            _ => format!("{:?}", res),
+        };
+        let sha = load_script(script_content.as_bytes());
+        return Err(format_eval_error(&err_msg, &sha));
+    }
 
     let mut resp = Vec::new();
-    lua_val_to_resp(&val, &mut resp)?;
+    let cur_resp_ver = *script_resp_ver.borrow();
+    lua_val_to_resp_with_depth(&res, &mut resp, 0, cur_resp_ver)?;
     Ok(resp)
 }
 
-fn resp_bytes_to_lua(lua: &Lua, out: &[u8]) -> mlua::Result<Value> {
+fn setup_redis_lua_env(
+    lua: &Lua,
+    db: &Rc<RefCell<crate::shard::ShardDb>>,
+    aof: Option<*const RefCell<crate::aof::AofWriter>>,
+    read_only: bool,
+    script_resp_ver: Rc<RefCell<u8>>,
+) -> Result<(), String> {
+    let real_g = lua.create_table().map_err(|e| e.to_string())?;
+
+    let globals = lua.globals();
+    for pair in globals.clone().pairs::<Value, Value>() {
+        let (k, v) = pair.map_err(|e| e.to_string())?;
+        real_g.set(k, v).map_err(|e| e.to_string())?;
+    }
+
+    static SEED_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let seed = nanos ^ SEED_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _ = lua.load(format!("math.randomseed({})", seed)).exec();
+
+    let table_mod: mlua::Table = real_g.get("table").map_err(|e| e.to_string())?;
+    let unpack_fn: mlua::Function = table_mod.get("unpack").map_err(|e| e.to_string())?;
+    real_g.set("unpack", unpack_fn).map_err(|e| e.to_string())?;
+
+    let loadstring_fn = lua
+        .create_function(|lua, (code, name): (Value, Option<String>)| {
+            let load_fn: mlua::Function = lua.globals().get("load")?;
+            load_fn.call::<Value>((code, name, "t"))
+        })
+        .map_err(|e| e.to_string())?;
+    real_g
+        .set("loadstring", loadstring_fn)
+        .map_err(|e| e.to_string())?;
+
+    let nil = Value::Nil;
+    real_g
+        .set("dofile", nil.clone())
+        .map_err(|e| e.to_string())?;
+    real_g
+        .set("loadfile", nil.clone())
+        .map_err(|e| e.to_string())?;
+    real_g
+        .set("print", nil.clone())
+        .map_err(|e| e.to_string())?;
+
+    if let Ok(os_tbl) = real_g.get::<mlua::Table>("os") {
+        for pair in os_tbl.clone().pairs::<Value, Value>() {
+            if let Ok((k, _)) = pair {
+                if let Value::String(s) = &k {
+                    if s.as_bytes() != b"clock" {
+                        let _ = os_tbl.set(k, Value::Nil);
+                    }
+                }
+            }
+        }
+    }
+
+    register_bit_module(lua, &real_g).map_err(|e| e.to_string())?;
+    register_cjson_module(lua, &real_g).map_err(|e| e.to_string())?;
+    register_cmsgpack_module(lua, &real_g).map_err(|e| e.to_string())?;
+
+    let real_redis = register_redis_module(lua, &real_g, db, aof, read_only, script_resp_ver)
+        .map_err(|e| e.to_string())?;
+    lua.set_named_registry_value("__real_redis", real_redis)
+        .map_err(|e| e.to_string())?;
+
+    lua.set_named_registry_value("__real_G", real_g.clone())
+        .map_err(|e| e.to_string())?;
+
+    let setup_sandbox: mlua::Function = lua
+        .load(
+            r#"
+        local real_g = ...
+        local globals = _G
+        local setmetatable = setmetatable
+        local getmetatable = getmetatable
+        local error = error
+        local pairs = pairs
+        local type = type
+        local tostring = tostring
+
+        local str_proxy = {}
+        local str_proxy_mt = {
+            __index = real_g.string,
+            __newindex = function() error("Attempt to modify a readonly table", 2) end
+        }
+        setmetatable(str_proxy, str_proxy_mt)
+
+        local g_proxy = {}
+        local g_proxy_mt = {
+            __newindex = function() error("Attempt to modify a readonly table", 2) end
+        }
+        setmetatable(g_proxy, g_proxy_mt)
+
+        local orig_getmetatable = real_g.getmetatable
+        local function safe_getmetatable(t)
+            if t == globals then
+                return g_proxy
+            end
+            if type(t) == "string" then
+                return str_proxy
+            end
+            return orig_getmetatable(t)
+        end
+        real_g.getmetatable = safe_getmetatable
+
+        local orig_setmetatable = real_g.setmetatable
+        local function safe_setmetatable(t, mt)
+            if t == globals then
+                error("Attempt to modify a readonly table", 2)
+            end
+            return orig_setmetatable(t, mt)
+        end
+        real_g.setmetatable = safe_setmetatable
+
+        for k in pairs(globals) do
+            globals[k] = nil
+        end
+
+        local g_mt = {
+            __index = function(t, k)
+                if k == "_G" then return globals end
+                local v = real_g[k]
+                if v ~= nil then return v end
+                error(string.format("Script attempted to access nonexistent global variable '%s'", tostring(k)), 2)
+            end,
+            __newindex = function(t, k, v)
+                error("Attempt to modify a readonly table", 2)
+            end
+        }
+        local g_mt_meta = {
+            __newindex = function() error("Attempt to modify a readonly table", 2) end
+        }
+        setmetatable(g_mt, g_mt_meta)
+        setmetatable(globals, g_mt)
+        "#,
+        )
+        .into_function()
+        .map_err(|e| e.to_string())?;
+
+    setup_sandbox
+        .call::<()>(real_g)
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+fn make_table_readonly_proxy(lua: &Lua, tbl: mlua::Table) -> mlua::Result<mlua::Table> {
+    let make_fn: mlua::Function = lua
+        .load(
+            r#"
+        local tbl = ...
+        local proxy = {}
+        local mt = {
+            __index = tbl,
+            __newindex = function() error("Attempt to modify a readonly table", 2) end,
+            __pairs = function() return pairs(tbl) end,
+            __len = function() return #tbl end
+        }
+        local mt_meta = {
+            __newindex = function() error("Attempt to modify a readonly table", 2) end
+        }
+        setmetatable(mt, mt_meta)
+        setmetatable(proxy, mt)
+        return proxy
+        "#,
+        )
+        .into_function()?;
+    make_fn.call(tbl)
+}
+
+fn register_bit_module(lua: &Lua, real_g: &mlua::Table) -> mlua::Result<()> {
+    let bit = lua.create_table()?;
+
+    bit.set(
+        "tobit",
+        lua.create_function(|_lua, x: f64| Ok(x as i64 as i32))?,
+    )?;
+
+    bit.set(
+        "tohex",
+        lua.create_function(|_lua, (val, n): (i64, Option<i64>)| {
+            let n = n.unwrap_or(8);
+            let uval = (val as i32) as u32;
+            let uppercase = n < 0;
+            let abs_n = if n == i64::MIN || n <= -8 {
+                8
+            } else if n < 0 {
+                (-n) as usize
+            } else if n > 8 {
+                8
+            } else if n < 1 {
+                1
+            } else {
+                n as usize
+            };
+            let mask = if abs_n == 8 {
+                0xffff_ffff
+            } else {
+                (1u32 << (abs_n * 4)) - 1
+            };
+            let masked = uval & mask;
+            if uppercase {
+                Ok(format!("{:0width$X}", masked, width = abs_n))
+            } else {
+                Ok(format!("{:0width$x}", masked, width = abs_n))
+            }
+        })?,
+    )?;
+
+    bit.set(
+        "bnot",
+        lua.create_function(|_lua, v: Value| {
+            let n = val_to_i32(&v).unwrap_or(0);
+            Ok(!n)
+        })?,
+    )?;
+
+    bit.set(
+        "band",
+        lua.create_function(|_lua, args: MultiValue| {
+            let mut res = -1i32;
+            for v in args {
+                if let Some(n) = val_to_i32(&v) {
+                    res &= n;
+                }
+            }
+            Ok(res)
+        })?,
+    )?;
+
+    bit.set(
+        "bor",
+        lua.create_function(|_lua, args: MultiValue| {
+            let mut res = 0i32;
+            for v in args {
+                if let Some(n) = val_to_i32(&v) {
+                    res |= n;
+                }
+            }
+            Ok(res)
+        })?,
+    )?;
+
+    bit.set(
+        "bxor",
+        lua.create_function(|_lua, args: MultiValue| {
+            let mut res = 0i32;
+            for v in args {
+                if let Some(n) = val_to_i32(&v) {
+                    res ^= n;
+                }
+            }
+            Ok(res)
+        })?,
+    )?;
+
+    bit.set(
+        "lshift",
+        lua.create_function(|_lua, (a, b): (i64, i64)| {
+            let a = a as i32 as u32;
+            let b = (b as u32) & 31;
+            Ok((a.wrapping_shl(b)) as i32)
+        })?,
+    )?;
+
+    bit.set(
+        "rshift",
+        lua.create_function(|_lua, (a, b): (i64, i64)| {
+            let a = a as i32 as u32;
+            let b = (b as u32) & 31;
+            Ok((a.wrapping_shr(b)) as i32)
+        })?,
+    )?;
+
+    bit.set(
+        "arshift",
+        lua.create_function(|_lua, (a, b): (i64, i64)| {
+            let a = a as i32;
+            let b = (b as u32) & 31;
+            Ok(a.wrapping_shr(b))
+        })?,
+    )?;
+
+    bit.set(
+        "rol",
+        lua.create_function(|_lua, (a, b): (i64, i64)| {
+            let a = a as i32 as u32;
+            let b = (b as u32) & 31;
+            Ok(a.rotate_left(b) as i32)
+        })?,
+    )?;
+
+    bit.set(
+        "ror",
+        lua.create_function(|_lua, (a, b): (i64, i64)| {
+            let a = a as i32 as u32;
+            let b = (b as u32) & 31;
+            Ok(a.rotate_right(b) as i32)
+        })?,
+    )?;
+
+    bit.set(
+        "bswap",
+        lua.create_function(|_lua, a: i64| {
+            let a = (a as i32 as u32).swap_bytes();
+            Ok(a as i32)
+        })?,
+    )?;
+
+    let proxy = make_table_readonly_proxy(lua, bit)?;
+    real_g.set("bit", proxy)?;
+    Ok(())
+}
+
+fn val_to_i32(v: &Value) -> Option<i32> {
+    match v {
+        Value::Integer(i) => Some(*i as i32),
+        Value::Number(n) => Some(*n as i64 as i32),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CJsonConfig {
+    decode_array_with_array_mt: bool,
+    encode_invalid_numbers: bool,
+    encode_max_depth: usize,
+    decode_max_depth: usize,
+}
+
+impl Default for CJsonConfig {
+    fn default() -> Self {
+        Self {
+            decode_array_with_array_mt: false,
+            encode_invalid_numbers: false,
+            encode_max_depth: 1000,
+            decode_max_depth: 1000,
+        }
+    }
+}
+
+fn register_cjson_module(lua: &Lua, real_g: &mlua::Table) -> mlua::Result<()> {
+    let cfg = Rc::new(RefCell::new(CJsonConfig::default()));
+    let cjson = lua.create_table()?;
+
+    // cjson.null
+    let null_val = lua.create_table()?;
+    let null_mt = lua.create_table()?;
+    null_mt.set(
+        "__tostring",
+        lua.create_function(|_lua, ()| Ok("null".to_string()))?,
+    )?;
+    let _ = null_val.set_metatable(Some(null_mt));
+    cjson.set("null", null_val.clone())?;
+
+    // array metatable for decode_array_with_array_mt
+    let array_mt = lua.create_table()?;
+    let array_mt_meta = lua.create_table()?;
+    let array_mt_index = lua.create_table()?;
+    array_mt_index.set("__is_cjson_array", true)?;
+    array_mt_meta.set("__index", array_mt_index)?;
+    let err_fn: mlua::Function = lua
+        .load("error('Attempt to modify a readonly table', 2)")
+        .into_function()?;
+    array_mt_meta.set("__newindex", err_fn)?;
+    let _ = array_mt.set_metatable(Some(array_mt_meta));
+
+    // cjson.decode
+    let cfg_dec = cfg.clone();
+    let null_dec = Value::Table(null_val.clone());
+    let array_mt_dec = array_mt.clone();
+    let decode_fn = lua.create_function(move |lua, json_str: mlua::LuaString| {
+        let s = json_str.to_str()?;
+        let parsed: serde_json::Value = serde_json::from_str(&s).map_err(|e| {
+            mlua::Error::RuntimeError(format!("Expected value but found invalid token: {}", e))
+        })?;
+        json_val_to_lua(
+            lua,
+            parsed,
+            &cfg_dec.borrow(),
+            &null_dec,
+            &array_mt_dec,
+            1,
+        )
+    })?;
+    cjson.set("decode", decode_fn)?;
+
+    // cjson.encode
+    let cfg_enc = cfg.clone();
+    let null_enc = Value::Table(null_val.clone());
+    let encode_fn = lua.create_function(move |_lua, val: Value| {
+        lua_val_to_json_str(&val, &cfg_enc.borrow(), &null_enc, 1)
+            .map_err(mlua::Error::RuntimeError)
+    })?;
+    cjson.set("encode", encode_fn)?;
+
+    // cjson.decode_array_with_array_mt
+    let cfg_mt = cfg.clone();
+    cjson.set(
+        "decode_array_with_array_mt",
+        lua.create_function(move |_lua, enable: Option<bool>| {
+            cfg_mt.borrow_mut().decode_array_with_array_mt = enable.unwrap_or(true);
+            Ok(())
+        })?,
+    )?;
+
+    // cjson.encode_keep_buffer
+    cjson.set(
+        "encode_keep_buffer",
+        lua.create_function(|_lua, _enable: Option<bool>| Ok(()))?,
+    )?;
+
+    // cjson.encode_max_depth
+    let cfg_emd = cfg.clone();
+    cjson.set(
+        "encode_max_depth",
+        lua.create_function(move |_lua, depth: usize| {
+            cfg_emd.borrow_mut().encode_max_depth = depth;
+            Ok(())
+        })?,
+    )?;
+
+    // cjson.decode_max_depth
+    let cfg_dmd = cfg.clone();
+    cjson.set(
+        "decode_max_depth",
+        lua.create_function(move |_lua, depth: usize| {
+            cfg_dmd.borrow_mut().decode_max_depth = depth;
+            Ok(())
+        })?,
+    )?;
+
+    // cjson.encode_invalid_numbers
+    let cfg_ein = cfg.clone();
+    cjson.set(
+        "encode_invalid_numbers",
+        lua.create_function(move |_lua, enable: Option<bool>| {
+            cfg_ein.borrow_mut().encode_invalid_numbers = enable.unwrap_or(true);
+            Ok(())
+        })?,
+    )?;
+
+    let proxy = make_table_readonly_proxy(lua, cjson)?;
+    real_g.set("cjson", proxy)?;
+    Ok(())
+}
+
+fn json_val_to_lua(
+    lua: &Lua,
+    val: serde_json::Value,
+    cfg: &CJsonConfig,
+    null_val: &Value,
+    array_mt: &mlua::Table,
+    depth: usize,
+) -> mlua::Result<Value> {
+    match val {
+        serde_json::Value::Null => Ok(null_val.clone()),
+        serde_json::Value::Bool(b) => Ok(Value::Boolean(b)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Ok(Value::Integer(i))
+            } else if let Some(u) = n.as_u64() {
+                Ok(Value::Integer(u as i64))
+            } else if let Some(f) = n.as_f64() {
+                if f.fract() == 0.0 && f >= (i64::MIN as f64) && f <= (i64::MAX as f64) {
+                    Ok(Value::Integer(f as i64))
+                } else {
+                    Ok(Value::Number(f))
+                }
+            } else {
+                Ok(Value::Nil)
+            }
+        }
+        serde_json::Value::String(s) => {
+            let ls = lua.create_string(&s)?;
+            Ok(Value::String(ls))
+        }
+        serde_json::Value::Array(arr) => {
+            if depth > cfg.decode_max_depth {
+                return Err(mlua::Error::RuntimeError(
+                    "Cannot parse JSON: nesting too deep".to_string(),
+                ));
+            }
+            let tbl = lua.create_table()?;
+            if cfg.decode_array_with_array_mt {
+                let _ = tbl.set_metatable(Some(array_mt.clone()));
+            }
+            for (i, elem) in arr.into_iter().enumerate() {
+                let elem_depth = match &elem {
+                    serde_json::Value::Array(_) | serde_json::Value::Object(_) => depth + 1,
+                    _ => depth,
+                };
+                let lv = json_val_to_lua(lua, elem, cfg, null_val, array_mt, elem_depth)?;
+                tbl.raw_set(i + 1, lv)?;
+            }
+            Ok(Value::Table(tbl))
+        }
+        serde_json::Value::Object(map) => {
+            if depth > cfg.decode_max_depth {
+                return Err(mlua::Error::RuntimeError(
+                    "Cannot parse JSON: nesting too deep".to_string(),
+                ));
+            }
+            let tbl = lua.create_table()?;
+            for (k, v) in map {
+                let val_depth = match &v {
+                    serde_json::Value::Array(_) | serde_json::Value::Object(_) => depth + 1,
+                    _ => depth,
+                };
+                let lv = json_val_to_lua(lua, v, cfg, null_val, array_mt, val_depth)?;
+                tbl.raw_set(k, lv)?;
+            }
+            Ok(Value::Table(tbl))
+        }
+    }
+}
+
+fn lua_val_to_json_str(
+    val: &Value,
+    cfg: &CJsonConfig,
+    null_val: &Value,
+    depth: usize,
+) -> Result<String, String> {
+    match val {
+        Value::Nil => Ok("null".to_string()),
+        Value::Boolean(b) => Ok(if *b {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        }),
+        Value::Integer(i) => Ok(i.to_string()),
+        Value::Number(n) => {
+            if n.is_nan() || n.is_infinite() {
+                if !cfg.encode_invalid_numbers {
+                    return Err("Cannot serialise number: must not be NaN or Inf".to_string());
+                } else {
+                    return Ok("null".to_string());
+                }
+            }
+            if n.fract() == 0.0 && *n >= (i64::MIN as f64) && *n <= (i64::MAX as f64) {
+                Ok((*n as i64).to_string())
+            } else {
+                Ok(n.to_string())
+            }
+        }
+        Value::String(s) => {
+            let s_bytes = s.as_bytes();
+            let s_str = String::from_utf8_lossy(&s_bytes);
+            Ok(serde_json::to_string(&s_str).unwrap())
+        }
+        Value::Table(t) => {
+            if val == null_val {
+                return Ok("null".to_string());
+            }
+            if depth > cfg.encode_max_depth {
+                return Err("Cannot serialise table: nesting too deep".to_string());
+            }
+            let is_array = if let Some(mt) = t.metatable() {
+                mt.get::<bool>("__is_cjson_array").unwrap_or(false)
+            } else {
+                false
+            };
+
+            let mut pairs = Vec::new();
+            for pair in t.clone().pairs::<Value, Value>() {
+                let (k, v) = pair.map_err(|e| e.to_string())?;
+                pairs.push((k, v));
+            }
+
+            if is_array {
+                let mut items = Vec::new();
+                for i in 1..=t.raw_len() {
+                    let elem: Value = t.raw_get(i).unwrap_or(Value::Nil);
+                    let elem_depth = match &elem {
+                        Value::Table(_) => depth + 1,
+                        _ => depth,
+                    };
+                    items.push(lua_val_to_json_str(&elem, cfg, null_val, elem_depth)?);
+                }
+                return Ok(format!("[{}]", items.join(",")));
+            }
+
+            for (k, _) in &pairs {
+                match k {
+                    Value::Integer(_) => {}
+                    Value::Number(n) if n.fract() == 0.0 => {}
+                    Value::String(_) => {}
+                    _ => {
+                        return Err("Cannot serialise table: invalid key type".to_string());
+                    }
+                }
+            }
+
+            let len = t.raw_len();
+            let all_int = pairs.iter().all(|(k, _)| match k {
+                Value::Integer(_) => true,
+                Value::Number(n) if n.fract() == 0.0 => true,
+                _ => false,
+            });
+
+            if len > 0 && all_int && pairs.len() == len {
+                let mut items = Vec::new();
+                for i in 1..=len {
+                    let elem: Value = t.raw_get(i).unwrap_or(Value::Nil);
+                    let elem_depth = match &elem {
+                        Value::Table(_) => depth + 1,
+                        _ => depth,
+                    };
+                    items.push(lua_val_to_json_str(&elem, cfg, null_val, elem_depth)?);
+                }
+                Ok(format!("[{}]", items.join(",")))
+            } else if pairs.is_empty() {
+                Ok("{}".to_string())
+            } else {
+                let mut entries = Vec::new();
+                for (k, v) in pairs {
+                    let key_str = match k {
+                        Value::String(s) => s.to_str().map(|s| s.to_string()).unwrap_or_default(),
+                        Value::Integer(i) => i.to_string(),
+                        Value::Number(n) => (n as i64).to_string(),
+                        _ => return Err("Cannot serialise table: invalid key type".to_string()),
+                    };
+                    let key_json = serde_json::to_string(&key_str).unwrap();
+                    let val_depth = match &v {
+                        Value::Table(_) => depth + 1,
+                        _ => depth,
+                    };
+                    let val_json = lua_val_to_json_str(&v, cfg, null_val, val_depth)?;
+                    entries.push(format!("{}:{}", key_json, val_json));
+                }
+                Ok(format!("{{{}}}", entries.join(",")))
+            }
+        }
+        _ => Ok("null".to_string()),
+    }
+}
+
+fn register_cmsgpack_module(lua: &Lua, real_g: &mlua::Table) -> mlua::Result<()> {
+    let cmsgpack = lua.create_table()?;
+
+    // pack
+    cmsgpack.set(
+        "pack",
+        lua.create_function(|lua, margs: MultiValue| {
+            let mut out = Vec::new();
+            for v in margs {
+                pack_lua_val(&v, &mut out, 1)?;
+            }
+            let s = lua.create_string(&out)?;
+            Ok(Value::String(s))
+        })?,
+    )?;
+
+    // unpack
+    cmsgpack.set(
+        "unpack",
+        lua.create_function(|lua, data: mlua::LuaString| {
+            let bytes = data.as_bytes();
+            let mut off = 0;
+            unpack_msgpack_val(lua, &bytes, &mut off)
+        })?,
+    )?;
+
+    // unpack_one
+    cmsgpack.set(
+        "unpack_one",
+        lua.create_function(|lua, (data, offset): (mlua::LuaString, usize)| {
+            let bytes = data.as_bytes();
+            let mut off = offset;
+            let val = unpack_msgpack_val(lua, &bytes, &mut off)?;
+            let next_off = if off >= bytes.len() { -1 } else { off as i64 };
+            Ok((next_off, val))
+        })?,
+    )?;
+
+    // unpack_limit
+    cmsgpack.set(
+        "unpack_limit",
+        lua.create_function(
+            |lua, (data, limit, offset): (mlua::LuaString, usize, usize)| {
+                let bytes = data.as_bytes();
+                let mut off = offset;
+                let mut results = Vec::new();
+                for _ in 0..limit {
+                    if off >= bytes.len() {
+                        break;
+                    }
+                    let val = unpack_msgpack_val(lua, &bytes, &mut off)?;
+                    results.push(val);
+                }
+                let next_off = if off >= bytes.len() { -1 } else { off as i64 };
+                let mut ret = Vec::with_capacity(results.len() + 1);
+                ret.push(Value::Integer(next_off));
+                ret.extend(results);
+                Ok(MultiValue::from_vec(ret))
+            },
+        )?,
+    )?;
+
+    let proxy = make_table_readonly_proxy(lua, cmsgpack)?;
+    real_g.set("cmsgpack", proxy)?;
+    Ok(())
+}
+
+fn pack_lua_val(val: &Value, out: &mut Vec<u8>, depth: usize) -> mlua::Result<()> {
+    match val {
+        Value::Nil => out.push(0xc0),
+        Value::Boolean(false) => out.push(0xc2),
+        Value::Boolean(true) => out.push(0xc3),
+        Value::Integer(i) => {
+            pack_integer(*i, out);
+        }
+        Value::Number(n) => {
+            if n.fract() == 0.0 && *n >= (i64::MIN as f64) && *n <= (u64::MAX as f64) {
+                if *n >= 0.0 && *n > (i64::MAX as f64) {
+                    out.push(0xcf);
+                    out.extend_from_slice(&(*n as u64).to_be_bytes());
+                } else {
+                    pack_integer(*n as i64, out);
+                }
+            } else {
+                out.push(0xcb);
+                out.extend_from_slice(&n.to_be_bytes());
+            }
+        }
+        Value::String(s) => {
+            let bytes = s.as_bytes();
+            let len = bytes.len();
+            if len < 32 {
+                out.push(0xa0 | (len as u8));
+            } else if len <= 255 {
+                out.push(0xd9);
+                out.push(len as u8);
+            } else if len <= 65535 {
+                out.push(0xda);
+                out.extend_from_slice(&(len as u16).to_be_bytes());
+            } else {
+                out.push(0xdb);
+                out.extend_from_slice(&(len as u32).to_be_bytes());
+            }
+            out.extend_from_slice(&bytes);
+        }
+        Value::Table(t) => {
+            if depth > 16 {
+                out.push(0xc0);
+                return Ok(());
+            }
+            let len = t.raw_len();
+            let mut pairs = Vec::new();
+            for p in t.clone().pairs::<Value, Value>() {
+                pairs.push(p?);
+            }
+            if len > 0
+                && pairs.len() == len
+                && (1..=len)
+                    .all(|i| t.raw_get::<Value>(i).is_ok_and(|v| v != Value::Nil))
+            {
+                if len <= 15 {
+                    out.push(0x90 | (len as u8));
+                } else if len <= 65535 {
+                    out.push(0xdc);
+                    out.extend_from_slice(&(len as u16).to_be_bytes());
+                } else {
+                    out.push(0xdd);
+                    out.extend_from_slice(&(len as u32).to_be_bytes());
+                }
+                for i in 1..=len {
+                    let elem: Value = t.raw_get(i).unwrap_or(Value::Nil);
+                    let elem_depth = match &elem {
+                        Value::Table(_) => depth + 1,
+                        _ => depth,
+                    };
+                    pack_lua_val(&elem, out, elem_depth)?;
+                }
+            } else {
+                let mlen = pairs.len();
+                if mlen <= 15 {
+                    out.push(0x80 | (mlen as u8));
+                } else if mlen <= 65535 {
+                    out.push(0xde);
+                    out.extend_from_slice(&(mlen as u16).to_be_bytes());
+                } else {
+                    out.push(0xdf);
+                    out.extend_from_slice(&(mlen as u32).to_be_bytes());
+                }
+                pairs.sort_by(|(k1, _), (k2, _)| {
+                    let b1 = match k1 {
+                        Value::String(s) => s.as_bytes(),
+                        _ => return std::cmp::Ordering::Equal,
+                    };
+                    let b2 = match k2 {
+                        Value::String(s) => s.as_bytes(),
+                        _ => return std::cmp::Ordering::Equal,
+                    };
+                    b2.as_ref().cmp(b1.as_ref())
+                });
+
+                for (k, v) in pairs {
+                    pack_lua_val(&k, out, depth)?;
+                    let v_depth = match &v {
+                        Value::Table(_) => depth + 1,
+                        _ => depth,
+                    };
+                    pack_lua_val(&v, out, v_depth)?;
+                }
+            }
+        }
+        _ => out.push(0xc0),
+    }
+    Ok(())
+}
+
+fn pack_integer(i: i64, out: &mut Vec<u8>) {
+    if (0..=127).contains(&i) {
+        out.push(i as u8);
+    } else if (-32..0).contains(&i) {
+        out.push(i as i8 as u8);
+    } else if (0..=255).contains(&i) {
+        out.push(0xcc);
+        out.push(i as u8);
+    } else if (-128..0).contains(&i) {
+        out.push(0xd0);
+        out.push(i as i8 as u8);
+    } else if (0..=65535).contains(&i) {
+        out.push(0xcd);
+        out.extend_from_slice(&(i as u16).to_be_bytes());
+    } else if (-32768..0).contains(&i) {
+        out.push(0xd1);
+        out.extend_from_slice(&(i as i16).to_be_bytes());
+    } else if i >= 0 && i <= u32::MAX as i64 {
+        out.push(0xce);
+        out.extend_from_slice(&(i as u32).to_be_bytes());
+    } else if i >= i32::MIN as i64 && i < 0 {
+        out.push(0xd2);
+        out.extend_from_slice(&(i as i32).to_be_bytes());
+    } else if i < 0 {
+        out.push(0xd3);
+        out.extend_from_slice(&i.to_be_bytes());
+    } else {
+        out.push(0xcf);
+        out.extend_from_slice(&(i as u64).to_be_bytes());
+    }
+}
+
+fn read_bytes<'a>(buf: &'a [u8], offset: &mut usize, len: usize) -> mlua::Result<&'a [u8]> {
+    if *offset + len > buf.len() {
+        return Err(mlua::Error::RuntimeError(
+            "unexpected end of msgpack data".to_string(),
+        ));
+    }
+    let slice = &buf[*offset..*offset + len];
+    *offset += len;
+    Ok(slice)
+}
+
+fn read_u8(buf: &[u8], offset: &mut usize) -> mlua::Result<u8> {
+    Ok(read_bytes(buf, offset, 1)?[0])
+}
+
+fn read_u16(buf: &[u8], offset: &mut usize) -> mlua::Result<u16> {
+    let b = read_bytes(buf, offset, 2)?;
+    Ok(u16::from_be_bytes([b[0], b[1]]))
+}
+
+fn read_u32(buf: &[u8], offset: &mut usize) -> mlua::Result<u32> {
+    let b = read_bytes(buf, offset, 4)?;
+    Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+}
+
+fn read_u64(buf: &[u8], offset: &mut usize) -> mlua::Result<u64> {
+    let b = read_bytes(buf, offset, 8)?;
+    Ok(u64::from_be_bytes([
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+    ]))
+}
+
+fn unpack_msgpack_raw(
+    lua: &Lua,
+    buf: &[u8],
+    offset: &mut usize,
+    len: usize,
+) -> mlua::Result<Value> {
+    let slice = read_bytes(buf, offset, len)?;
+    let s = lua.create_string(slice)?;
+    Ok(Value::String(s))
+}
+
+fn unpack_msgpack_array(
+    lua: &Lua,
+    buf: &[u8],
+    offset: &mut usize,
+    len: usize,
+) -> mlua::Result<Value> {
+    let tbl = lua.create_table()?;
+    for i in 1..=len {
+        let v = unpack_msgpack_val(lua, buf, offset)?;
+        tbl.raw_set(i, v)?;
+    }
+    Ok(Value::Table(tbl))
+}
+
+fn unpack_msgpack_map(
+    lua: &Lua,
+    buf: &[u8],
+    offset: &mut usize,
+    len: usize,
+) -> mlua::Result<Value> {
+    let tbl = lua.create_table()?;
+    for _ in 0..len {
+        let k = unpack_msgpack_val(lua, buf, offset)?;
+        let v = unpack_msgpack_val(lua, buf, offset)?;
+        if k != Value::Nil {
+            tbl.raw_set(k, v)?;
+        }
+    }
+    Ok(Value::Table(tbl))
+}
+
+fn unpack_msgpack_val(lua: &Lua, buf: &[u8], offset: &mut usize) -> mlua::Result<Value> {
+    if *offset >= buf.len() {
+        return Err(mlua::Error::RuntimeError(
+            "unexpected end of msgpack data".to_string(),
+        ));
+    }
+    let b = buf[*offset];
+    *offset += 1;
+    match b {
+        0x00..=0x7f => Ok(Value::Integer(b as i64)),
+        0xe0..=0xff => Ok(Value::Integer((b as i8) as i64)),
+        0xc0 => Ok(Value::Nil),
+        0xc2 => Ok(Value::Boolean(false)),
+        0xc3 => Ok(Value::Boolean(true)),
+        0x80..=0x8f => {
+            let len = (b & 0x0f) as usize;
+            unpack_msgpack_map(lua, buf, offset, len)
+        }
+        0x90..=0x9f => {
+            let len = (b & 0x0f) as usize;
+            unpack_msgpack_array(lua, buf, offset, len)
+        }
+        0xa0..=0xbf => {
+            let len = (b & 0x1f) as usize;
+            unpack_msgpack_raw(lua, buf, offset, len)
+        }
+        0xcc => {
+            let val = read_u8(buf, offset)?;
+            Ok(Value::Integer(val as i64))
+        }
+        0xcd => {
+            let val = read_u16(buf, offset)?;
+            Ok(Value::Integer(val as i64))
+        }
+        0xce => {
+            let val = read_u32(buf, offset)?;
+            Ok(Value::Integer(val as i64))
+        }
+        0xcf => {
+            let val = read_u64(buf, offset)?;
+            Ok(Value::Integer(val as i64))
+        }
+        0xd0 => {
+            let val = read_u8(buf, offset)? as i8;
+            Ok(Value::Integer(val as i64))
+        }
+        0xd1 => {
+            let val = read_u16(buf, offset)? as i16;
+            Ok(Value::Integer(val as i64))
+        }
+        0xd2 => {
+            let val = read_u32(buf, offset)? as i32;
+            Ok(Value::Integer(val as i64))
+        }
+        0xd3 => {
+            let val = read_u64(buf, offset)? as i64;
+            Ok(Value::Integer(val))
+        }
+        0xca => {
+            let val = f32::from_be_bytes(read_bytes(buf, offset, 4)?.try_into().unwrap());
+            Ok(Value::Number(val as f64))
+        }
+        0xcb => {
+            let val = f64::from_be_bytes(read_bytes(buf, offset, 8)?.try_into().unwrap());
+            Ok(Value::Number(val))
+        }
+        0xd9 => {
+            let len = read_u8(buf, offset)? as usize;
+            unpack_msgpack_raw(lua, buf, offset, len)
+        }
+        0xda => {
+            let len = read_u16(buf, offset)? as usize;
+            unpack_msgpack_raw(lua, buf, offset, len)
+        }
+        0xdb => {
+            let len = read_u32(buf, offset)? as usize;
+            unpack_msgpack_raw(lua, buf, offset, len)
+        }
+        0xdc => {
+            let len = read_u16(buf, offset)? as usize;
+            unpack_msgpack_array(lua, buf, offset, len)
+        }
+        0xdd => {
+            let len = read_u32(buf, offset)? as usize;
+            unpack_msgpack_array(lua, buf, offset, len)
+        }
+        0xde => {
+            let len = read_u16(buf, offset)? as usize;
+            unpack_msgpack_map(lua, buf, offset, len)
+        }
+        0xdf => {
+            let len = read_u32(buf, offset)? as usize;
+            unpack_msgpack_map(lua, buf, offset, len)
+        }
+        _ => Ok(Value::Nil),
+    }
+}
+
+fn register_redis_module(
+    lua: &Lua,
+    real_g: &mlua::Table,
+    db: &Rc<RefCell<crate::shard::ShardDb>>,
+    aof: Option<*const RefCell<crate::aof::AofWriter>>,
+    read_only: bool,
+    script_resp_ver: Rc<RefCell<u8>>,
+) -> mlua::Result<mlua::Table> {
+    let redis = lua.create_table()?;
+
+    let srv_set = script_resp_ver.clone();
+    redis.set(
+        "setresp",
+        lua.create_function(move |_lua, ver: u8| {
+            *srv_set.borrow_mut() = ver;
+            Ok(())
+        })?,
+    )?;
+
+    let db_call = db.clone();
+    let aof_call = aof;
+    let srv_call = script_resp_ver.clone();
+    let port = db.borrow().port;
+    let call_fn = lua.create_function(move |lua, margs: MultiValue| {
+        let mut cmd_args = Vec::with_capacity(margs.len());
+        for v in margs {
+            match v {
+                Value::String(s) => cmd_args.push(Bytes::copy_from_slice(&s.as_bytes())),
+                Value::Integer(i) => cmd_args.push(Bytes::from(i.to_string())),
+                Value::Number(n) => cmd_args.push(Bytes::from(n.to_string())),
+                _ => {
+                    return Err(mlua::Error::RuntimeError(
+                        "ERR Lua redis lib command arguments must be strings or integers".to_string(),
+                    ));
+                }
+            }
+        }
+        if cmd_args.is_empty() {
+            return Err(mlua::Error::RuntimeError(
+                "ERR Please specify at least one argument for redis.call()".to_string(),
+            ));
+        }
+        let cmd = match crate::resp::build_command(cmd_args) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                return Err(mlua::Error::RuntimeError(
+                    "ERR Please specify at least one argument for redis.call()".to_string(),
+                ));
+            }
+            Err(e) => {
+                if e.contains("wrong number of arguments") {
+                    return Err(mlua::Error::RuntimeError(
+                        "ERR Wrong number of args calling Redis command from script".to_string(),
+                    ));
+                } else {
+                    return Err(mlua::Error::RuntimeError(format!("ERR {}", e)));
+                }
+            }
+        };
+        if let Command::Unknown(_) = &cmd {
+            return Err(mlua::Error::RuntimeError(
+                "Unknown Redis command called from script".to_string(),
+            ));
+        }
+        match &cmd {
+            Command::Cluster(_)
+            | Command::Replicaof { .. }
+            | Command::Shutdown { .. }
+            | Command::Save
+            | Command::Bgsave
+            | Command::Bgrewriteaof => {
+                return Err(mlua::Error::RuntimeError(
+                    "ERR This Redis command is not allowed from script".to_string(),
+                ));
+            }
+            _ => {}
+        }
+        if crate::connection::MIN_REPLICAS_TO_WRITE.load(std::sync::atomic::Ordering::Relaxed) > 0
+            && cmd.is_write_command()
+        {
+            return Err(mlua::Error::RuntimeError(
+                "NOREPLICAS Not enough good replicas to write.".to_string(),
+            ));
+        }
+        let cmd_name = crate::connection::get_cmd_name(&cmd);
+        if read_only && cmd.is_write_command() {
+            crate::connection::record_rejected_stat(cmd_name);
+            crate::connection::record_error_stat("ERR", None);
+            SCRIPT_RECORDED_ERROR.set(true);
+            return Err(mlua::Error::RuntimeError(
+                "ERR Write commands are not allowed from read-only scripts.".to_string(),
+            ));
+        }
+        let max_mem = crate::tiering::get_max_memory(port);
+        if max_mem > 0
+            && crate::connection::get_max_memory_policy() == "noeviction"
+            && cmd.is_write_command()
+            && !cmd.allows_oom()
+        {
+            let used = db_call.borrow().table.used_memory;
+            let shard_max = max_mem as usize;
+            if used > shard_max {
+                crate::connection::record_rejected_stat(cmd_name);
+                crate::connection::record_error_stat("OOM", None);
+                SCRIPT_RECORDED_ERROR.set(true);
+                return Err(mlua::Error::RuntimeError(
+                    "OOM command not allowed when used memory > 'maxmemory'.".to_string(),
+                ));
+            }
+        }
+
+        crate::connection::record_cmd_stat(cmd_name);
+        let mut out = Vec::new();
+        let aof_ref = unsafe { aof_call.map(|ptr| &*ptr) };
+        crate::connection::execute_local_command(
+            &cmd,
+            &mut db_call.borrow_mut(),
+            &mut out,
+            aof_ref,
+        );
+
+        if out.starts_with(b"-") {
+            crate::connection::record_failed_stat(cmd_name);
+            let err_line = String::from_utf8_lossy(&out[1..out.len().saturating_sub(2)]);
+            let end_idx = err_line.find([' ', '\r', '\n']).unwrap_or(err_line.len());
+            let prefix = &err_line[..end_idx];
+            crate::connection::record_error_stat(prefix, None);
+            SCRIPT_RECORDED_ERROR.set(true);
+            if err_line.contains("wrong number of arguments") {
+                return Err(mlua::Error::RuntimeError(
+                    "ERR Wrong number of args calling Redis command from script".to_string(),
+                ));
+            } else {
+                return Err(mlua::Error::RuntimeError(err_line.to_string()));
+            }
+        }
+
+        let is_hgetall = matches!(cmd, Command::Hgetall(_));
+        resp_bytes_to_lua(lua, &out, is_hgetall && *srv_call.borrow() == 3)
+    })?;
+    redis.set("call", call_fn)?;
+
+    let db_pcall = db.clone();
+    let aof_pcall = aof;
+    let srv_pcall = script_resp_ver.clone();
+    let pcall_fn = lua.create_function(move |lua, margs: MultiValue| {
+        let mut cmd_args = Vec::with_capacity(margs.len());
+        for v in margs {
+            match v {
+                Value::String(s) => cmd_args.push(Bytes::copy_from_slice(&s.as_bytes())),
+                Value::Integer(i) => cmd_args.push(Bytes::from(i.to_string())),
+                Value::Number(n) => cmd_args.push(Bytes::from(n.to_string())),
+                _ => {
+                    let tbl = lua.create_table()?;
+                    tbl.set(
+                        "err",
+                        "ERR Lua redis lib command arguments must be strings or integers",
+                    )?;
+                    return Ok(Value::Table(tbl));
+                }
+            }
+        }
+        if cmd_args.is_empty() {
+            let tbl = lua.create_table()?;
+            tbl.set(
+                "err",
+                "ERR Please specify at least one argument for redis.pcall()",
+            )?;
+            return Ok(Value::Table(tbl));
+        }
+        let cmd = match crate::resp::build_command(cmd_args) {
+            Ok(Some(c)) => c,
+            Ok(None) => {
+                let tbl = lua.create_table()?;
+                tbl.set(
+                    "err",
+                    "ERR Please specify at least one argument for redis.pcall()",
+                )?;
+                return Ok(Value::Table(tbl));
+            }
+            Err(e) => {
+                let tbl = lua.create_table()?;
+                if e.contains("wrong number of arguments") {
+                    tbl.set(
+                        "err",
+                        "ERR Wrong number of args calling Redis command from script",
+                    )?;
+                } else {
+                    tbl.set("err", format!("ERR {}", e))?;
+                }
+                return Ok(Value::Table(tbl));
+            }
+        };
+        if let Command::Unknown(_) = &cmd {
+            let tbl = lua.create_table()?;
+            tbl.set("err", "ERR Unknown Redis command called from script")?;
+            return Ok(Value::Table(tbl));
+        }
+        match &cmd {
+            Command::Cluster(_)
+            | Command::Replicaof { .. }
+            | Command::Shutdown { .. }
+            | Command::Save
+            | Command::Bgsave
+            | Command::Bgrewriteaof => {
+                let tbl = lua.create_table()?;
+                tbl.set(
+                    "err",
+                    "ERR This Redis command is not allowed from script",
+                )?;
+                return Ok(Value::Table(tbl));
+            }
+            _ => {}
+        }
+        if crate::connection::MIN_REPLICAS_TO_WRITE.load(std::sync::atomic::Ordering::Relaxed) > 0
+            && cmd.is_write_command()
+        {
+            let tbl = lua.create_table()?;
+            tbl.set("err", "NOREPLICAS Not enough good replicas to write.")?;
+            return Ok(Value::Table(tbl));
+        }
+        let cmd_name = crate::connection::get_cmd_name(&cmd);
+        if read_only && cmd.is_write_command() {
+            crate::connection::record_rejected_stat(cmd_name);
+            crate::connection::record_error_stat("ERR", None);
+            SCRIPT_RECORDED_ERROR.set(true);
+            let tbl = lua.create_table()?;
+            tbl.set(
+                "err",
+                "ERR Write commands are not allowed from read-only scripts.",
+            )?;
+            return Ok(Value::Table(tbl));
+        }
+        let max_mem = crate::tiering::get_max_memory(port);
+        if max_mem > 0
+            && crate::connection::get_max_memory_policy() == "noeviction"
+            && cmd.is_write_command()
+            && !cmd.allows_oom()
+        {
+            let used = db_pcall.borrow().table.used_memory;
+            let shard_max = max_mem as usize;
+            if used > shard_max {
+                crate::connection::record_rejected_stat(cmd_name);
+                crate::connection::record_error_stat("OOM", None);
+                SCRIPT_RECORDED_ERROR.set(true);
+                let tbl = lua.create_table()?;
+                tbl.set(
+                    "err",
+                    "OOM command not allowed when used memory > 'maxmemory'.",
+                )?;
+                return Ok(Value::Table(tbl));
+            }
+        }
+
+        crate::connection::record_cmd_stat(cmd_name);
+        let mut out = Vec::new();
+        let aof_ref = unsafe { aof_pcall.map(|ptr| &*ptr) };
+        crate::connection::execute_local_command(
+            &cmd,
+            &mut db_pcall.borrow_mut(),
+            &mut out,
+            aof_ref,
+        );
+
+        if out.starts_with(b"-") {
+            crate::connection::record_failed_stat(cmd_name);
+            let mut err_str =
+                String::from_utf8_lossy(&out[1..out.len().saturating_sub(2)]).to_string();
+            let end_idx = err_str.find([' ', '\r', '\n']).unwrap_or(err_str.len());
+            let prefix = &err_str[..end_idx];
+            crate::connection::record_error_stat(prefix, None);
+            SCRIPT_RECORDED_ERROR.set(true);
+            if err_str.contains("wrong number of arguments") {
+                err_str = "ERR Wrong number of args calling Redis command from script".to_string();
+            }
+            let tbl = lua.create_table()?;
+            tbl.set("err", err_str)?;
+            Ok(Value::Table(tbl))
+        } else {
+            let is_hgetall = matches!(cmd, Command::Hgetall(_));
+            resp_bytes_to_lua(lua, &out, is_hgetall && *srv_pcall.borrow() == 3)
+        }
+    })?;
+    redis.set("pcall", pcall_fn)?;
+
+    let status_reply = lua.create_function(|lua, msg: String| {
+        let tbl = lua.create_table()?;
+        tbl.set("ok", msg)?;
+        Ok(Value::Table(tbl))
+    })?;
+    redis.set("status_reply", status_reply)?;
+
+    let error_reply = lua.create_function(|lua, msg: String| {
+        let clean = msg.replace("\r\n", "  ").replace('\r', " ").replace('\n', " ");
+        let final_msg = if clean.is_empty() {
+            "ERR".to_string()
+        } else {
+            clean
+        };
+        let tbl = lua.create_table()?;
+        tbl.set("err", final_msg.clone())?;
+        let mt = lua.create_table()?;
+        let err_clone = final_msg;
+        let tostring_fn = lua.create_function(move |_lua, ()| {
+            Ok(err_clone.clone())
+        })?;
+        mt.set("__tostring", tostring_fn)?;
+        let _ = tbl.set_metatable(Some(mt));
+        Ok(Value::Table(tbl))
+    })?;
+    redis.set("error_reply", error_reply)?;
+
+    let sha1hex_fn = lua.create_function(|_lua, margs: MultiValue| {
+        if margs.is_empty() {
+            return Err(mlua::Error::RuntimeError(
+                "ERR wrong number of arguments for redis.sha1hex()".to_string(),
+            ));
+        }
+        match margs.into_iter().next() {
+            Some(Value::String(s)) => Ok(sha1_hex(&s.as_bytes())),
+            _ => Err(mlua::Error::RuntimeError(
+                "ERR wrong number of arguments for redis.sha1hex()".to_string(),
+            )),
+        }
+    })?;
+    redis.set("sha1hex", sha1hex_fn)?;
+
+    let log_fn = lua.create_function(|_lua, (_level, _msg): (i32, String)| Ok(()))?;
+    redis.set("log", log_fn)?;
+    redis.set("LOG_DEBUG", 0)?;
+    redis.set("LOG_VERBOSE", 1)?;
+    redis.set("LOG_NOTICE", 2)?;
+    redis.set("LOG_WARNING", 3)?;
+
+    let port = db.borrow().port;
+    let acl_check_fn = lua.create_function(move |_lua, margs: MultiValue| {
+        let mut cmd_args = Vec::with_capacity(margs.len());
+        for v in margs {
+            match v {
+                Value::String(s) => cmd_args.push(Bytes::copy_from_slice(&s.as_bytes())),
+                Value::Integer(i) => cmd_args.push(Bytes::from(i.to_string())),
+                Value::Number(n) => cmd_args.push(Bytes::from(n.to_string())),
+                _ => {
+                    return Err(mlua::Error::RuntimeError(
+                        "ERR Lua redis lib command arguments must be strings or integers".to_string(),
+                    ));
+                }
+            }
+        }
+        if cmd_args.is_empty() {
+            return Err(mlua::Error::RuntimeError(
+                "ERR Invalid command passed to redis.acl_check_cmd()".to_string(),
+            ));
+        }
+        let cmd = match crate::resp::build_command(cmd_args) {
+            Ok(Some(c)) => c,
+            Err(e) if e.contains("wrong number of arguments") => {
+                return Err(mlua::Error::RuntimeError(
+                    "ERR Wrong number of args calling Redis command from script".to_string(),
+                ));
+            }
+            _ => {
+                return Err(mlua::Error::RuntimeError(
+                    "ERR Invalid command passed to redis.acl_check_cmd()".to_string(),
+                ));
+            }
+        };
+        if let Command::Unknown(_) = &cmd {
+            return Err(mlua::Error::RuntimeError(
+                "ERR Invalid command passed to redis.acl_check_cmd()".to_string(),
+            ));
+        }
+
+        let acl = crate::acl::get_acl_for_port(port);
+        let acl_guard = acl.read().unwrap();
+        let cmd_name = crate::connection::get_cmd_name(&cmd);
+        let mut allowed = true;
+        let auth_user = crate::connection::CURRENT_AUTH_USER.with(|u| u.borrow().clone());
+        let user_opt = if auth_user.is_empty() {
+            acl_guard.get_user("default")
+        } else {
+            acl_guard.get_user(&auth_user)
+        };
+        if let Some(user) = user_opt {
+            if !user.can_execute_command(cmd_name) {
+                allowed = false;
+            }
+            if allowed {
+                let mut keys = Vec::new();
+                crate::connection::for_each_cmd_key(&cmd, |k| keys.push(k));
+                for key in keys {
+                    if !user.can_access_key(key) {
+                        allowed = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if allowed {
+            Ok(Value::Integer(1))
+        } else {
+            Ok(Value::Nil)
+        }
+    })?;
+    redis.set("acl_check_cmd", acl_check_fn)?;
+
+    let proxy = make_table_readonly_proxy(lua, redis.clone())?;
+    real_g.set("redis", proxy)?;
+    Ok(redis)
+}
+
+fn resp_bytes_to_lua(lua: &Lua, out: &[u8], is_hgetall_map: bool) -> mlua::Result<Value> {
     if out.is_empty() {
         return Ok(Value::Nil);
     }
@@ -226,7 +2085,12 @@ fn resp_bytes_to_lua(lua: &Lua, out: &[u8]) -> mlua::Result<Value> {
         b'-' => {
             let end = out.len().saturating_sub(2);
             let s = String::from_utf8_lossy(&out[1..end]);
-            Err(mlua::Error::RuntimeError(s.to_string()))
+            let s = if s.contains("wrong number of arguments") {
+                "ERR Wrong number of args calling Redis command from script".to_string()
+            } else {
+                s.to_string()
+            };
+            Err(mlua::Error::RuntimeError(s))
         }
         b':' => {
             let end = out.len().saturating_sub(2);
@@ -253,8 +2117,100 @@ fn resp_bytes_to_lua(lua: &Lua, out: &[u8]) -> mlua::Result<Value> {
         }
         b'*' => {
             let mut cursor = bytes::BytesMut::from(out);
-            parse_resp_array_to_lua(lua, &mut cursor)
+            if is_hgetall_map {
+                parse_resp_array_to_map_lua(lua, &mut cursor)
+            } else {
+                parse_resp_array_to_lua(lua, &mut cursor)
+            }
         }
+        _ => Ok(Value::Nil),
+    }
+}
+
+fn parse_resp_array_to_map_lua(lua: &Lua, buf: &mut bytes::BytesMut) -> mlua::Result<Value> {
+    use bytes::Buf;
+    if buf.is_empty() || buf[0] != b'*' {
+        return Ok(Value::Nil);
+    }
+    let crlf = match buf.windows(2).position(|w| w == b"\r\n") {
+        Some(pos) => pos,
+        None => return Ok(Value::Nil),
+    };
+    let count: i64 = std::str::from_utf8(&buf[1..crlf])
+        .unwrap_or("-1")
+        .parse()
+        .unwrap_or(-1);
+    buf.advance(crlf + 2);
+    if count < 0 {
+        return Ok(Value::Boolean(false));
+    }
+    let map_tbl = lua.create_table()?;
+    let mt = lua.create_table()?;
+    mt.set("__redis_proto_type", "map")?;
+    let _ = map_tbl.set_metatable(Some(mt));
+
+    let pairs_count = count / 2;
+    for _ in 0..pairs_count {
+        if buf.is_empty() {
+            break;
+        }
+        let k = parse_resp_element(lua, buf)?;
+        let v = parse_resp_element(lua, buf)?;
+        if k != Value::Nil {
+            map_tbl.raw_set(k, v)?;
+        }
+    }
+    Ok(Value::Table(map_tbl))
+}
+
+fn parse_resp_element(lua: &Lua, buf: &mut bytes::BytesMut) -> mlua::Result<Value> {
+    use bytes::Buf;
+    if buf.is_empty() {
+        return Ok(Value::Nil);
+    }
+    match buf[0] {
+        b'+' => {
+            let c = buf.windows(2).position(|w| w == b"\r\n").unwrap_or(buf.len());
+            let s = String::from_utf8_lossy(&buf[1..c]).to_string();
+            buf.advance(c + 2);
+            let st = lua.create_table()?;
+            st.set("ok", s)?;
+            Ok(Value::Table(st))
+        }
+        b'-' => {
+            let c = buf.windows(2).position(|w| w == b"\r\n").unwrap_or(buf.len());
+            let s = String::from_utf8_lossy(&buf[1..c]).to_string();
+            buf.advance(c + 2);
+            let et = lua.create_table()?;
+            et.set("err", s)?;
+            Ok(Value::Table(et))
+        }
+        b':' => {
+            let c = buf.windows(2).position(|w| w == b"\r\n").unwrap_or(buf.len());
+            let n: i64 = std::str::from_utf8(&buf[1..c])
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0);
+            buf.advance(c + 2);
+            Ok(Value::Integer(n))
+        }
+        b'$' => {
+            let c = buf.windows(2).position(|w| w == b"\r\n").unwrap_or(buf.len());
+            let len: i64 = std::str::from_utf8(&buf[1..c])
+                .unwrap_or("-1")
+                .parse()
+                .unwrap_or(-1);
+            buf.advance(c + 2);
+            if len < 0 {
+                Ok(Value::Boolean(false))
+            } else {
+                let ulen = len as usize;
+                let s = lua.create_string(&buf[..ulen])?;
+                buf.advance(ulen + 2);
+                Ok(Value::String(s))
+            }
+        }
+        b'*' => parse_resp_array_to_lua(lua, buf),
         _ => Ok(Value::Nil),
     }
 }
@@ -281,72 +2237,42 @@ fn parse_resp_array_to_lua(lua: &Lua, buf: &mut bytes::BytesMut) -> mlua::Result
         if buf.is_empty() {
             break;
         }
-        match buf[0] {
-            b'$' => {
-                let elem_crlf = match buf.windows(2).position(|w| w == b"\r\n") {
-                    Some(pos) => pos,
-                    None => break,
-                };
-                let len: i64 = std::str::from_utf8(&buf[1..elem_crlf])
-                    .unwrap_or("-1")
-                    .parse()
-                    .unwrap_or(-1);
-                buf.advance(elem_crlf + 2);
-                if len < 0 {
-                    tbl.set(i, Value::Boolean(false))?;
-                } else {
-                    let ulen = len as usize;
-                    if buf.len() >= ulen + 2 {
-                        let data = buf.split_to(ulen);
-                        buf.advance(2);
-                        let s = lua.create_string(&data)?;
-                        tbl.set(i, Value::String(s))?;
-                    }
-                }
-            }
-            b':' => {
-                let elem_crlf = match buf.windows(2).position(|w| w == b"\r\n") {
-                    Some(pos) => pos,
-                    None => break,
-                };
-                let n: i64 = std::str::from_utf8(&buf[1..elem_crlf])
-                    .unwrap_or("0")
-                    .parse()
-                    .unwrap_or(0);
-                buf.advance(elem_crlf + 2);
-                tbl.set(i, Value::Integer(n))?;
-            }
-            b'+' => {
-                let elem_crlf = match buf.windows(2).position(|w| w == b"\r\n") {
-                    Some(pos) => pos,
-                    None => break,
-                };
-                let s = std::str::from_utf8(&buf[1..elem_crlf])
-                    .unwrap_or("")
-                    .to_string();
-                buf.advance(elem_crlf + 2);
-                let ok_tbl = lua.create_table()?;
-                ok_tbl.set("ok", s)?;
-                tbl.set(i, Value::Table(ok_tbl))?;
-            }
-            b'*' => {
-                let nested = parse_resp_array_to_lua(lua, buf)?;
-                tbl.set(i, nested)?;
-            }
-            _ => break,
-        }
+        let val = parse_resp_element(lua, buf)?;
+        tbl.set(i, val)?;
     }
     Ok(Value::Table(tbl))
 }
 
-fn lua_val_to_resp(val: &Value, out: &mut Vec<u8>) -> Result<(), String> {
+pub fn lua_val_to_resp(val: &Value, out: &mut Vec<u8>) -> Result<(), String> {
+    lua_val_to_resp_with_depth(val, out, 0, 2)
+}
+
+fn lua_val_to_resp_with_depth(
+    val: &Value,
+    out: &mut Vec<u8>,
+    depth: usize,
+    script_resp_ver: u8,
+) -> Result<(), String> {
+    if depth > 1000 {
+        return Err("reached lua stack limit".to_string());
+    }
     match val {
         Value::Nil => {
-            out.extend_from_slice(b"$-1\r\n");
+            if crate::connection::CURRENT_CLIENT_RESP3.get() && script_resp_ver == 3 {
+                out.extend_from_slice(b"_\r\n");
+            } else {
+                out.extend_from_slice(b"$-1\r\n");
+            }
             Ok(())
         }
         Value::Boolean(b) => {
-            if *b {
+            if crate::connection::CURRENT_CLIENT_RESP3.get() && script_resp_ver == 3 {
+                if *b {
+                    out.extend_from_slice(b"#t\r\n");
+                } else {
+                    out.extend_from_slice(b"#f\r\n");
+                }
+            } else if *b {
                 out.extend_from_slice(b":1\r\n");
             } else {
                 out.extend_from_slice(b"$-1\r\n");
@@ -354,31 +2280,80 @@ fn lua_val_to_resp(val: &Value, out: &mut Vec<u8>) -> Result<(), String> {
             Ok(())
         }
         Value::Integer(i) => {
-            crate::connection::write_resp_integer(out, *i);
+            out.extend_from_slice(format!(":{}\r\n", i).as_bytes());
             Ok(())
         }
         Value::Number(n) => {
-            crate::connection::write_resp_integer(out, *n as i64);
+            if crate::connection::CURRENT_CLIENT_RESP3.get() && script_resp_ver == 3 {
+                out.extend_from_slice(format!(",{}\r\n", n).as_bytes());
+            } else {
+                out.extend_from_slice(format!(":{}\r\n", *n as i64).as_bytes());
+            }
             Ok(())
         }
         Value::String(s) => {
-            crate::connection::write_resp_bulk(out, &s.as_bytes());
+            let bytes = s.as_bytes();
+            out.extend_from_slice(format!("${}\r\n", bytes.len()).as_bytes());
+            out.extend_from_slice(&bytes);
+            out.extend_from_slice(b"\r\n");
             Ok(())
         }
         Value::Table(t) => {
-            if let Ok(ok_str) = t.get::<String>("ok") {
+            if let Ok(ok_str) = t.raw_get::<String>("ok") {
                 out.extend_from_slice(format!("+{}\r\n", ok_str).as_bytes());
                 return Ok(());
             }
-            if let Ok(err_str) = t.get::<String>("err") {
-                out.extend_from_slice(format!("-{}\r\n", err_str).as_bytes());
+            if let Ok(err_str) = t.raw_get::<String>("err") {
+                let sanitized = err_str.replace("\r\n", "  ").replace('\r', " ").replace('\n', " ");
+                let final_err = if sanitized.is_empty() || sanitized == "ERR" {
+                    "ERR ".to_string()
+                } else {
+                    sanitized
+                };
+                out.extend_from_slice(format!("-{}\r\n", final_err).as_bytes());
                 return Ok(());
             }
+            if let Ok(f) = t.raw_get::<f64>("double") {
+                if crate::connection::CURRENT_CLIENT_RESP3.get() && script_resp_ver == 3 {
+                    out.extend_from_slice(format!(",{}\r\n", f).as_bytes());
+                } else {
+                    crate::connection::write_resp_bulk(out, f.to_string().as_bytes());
+                }
+                return Ok(());
+            }
+
+            let is_resp3_map = if let Some(mt) = t.metatable() {
+                mt.get::<String>("__redis_proto_type").unwrap_or_default() == "map"
+            } else {
+                false
+            };
+
+            if is_resp3_map {
+                let mut pairs = Vec::new();
+                for pair in t.clone().pairs::<Value, Value>() {
+                    pairs.push(pair.map_err(|e| e.to_string())?);
+                }
+                if crate::connection::CURRENT_CLIENT_RESP3.get() && script_resp_ver == 3 {
+                    out.extend_from_slice(format!("%{}\r\n", pairs.len()).as_bytes());
+                    for (k, v) in pairs {
+                        lua_val_to_resp_with_depth(&k, out, depth + 1, script_resp_ver)?;
+                        lua_val_to_resp_with_depth(&v, out, depth + 1, script_resp_ver)?;
+                    }
+                } else {
+                    out.extend_from_slice(format!("*{}\r\n", pairs.len() * 2).as_bytes());
+                    for (k, v) in pairs {
+                        lua_val_to_resp_with_depth(&k, out, depth + 1, script_resp_ver)?;
+                        lua_val_to_resp_with_depth(&v, out, depth + 1, script_resp_ver)?;
+                    }
+                }
+                return Ok(());
+            }
+
             let len = t.raw_len();
             out.extend_from_slice(format!("*{}\r\n", len).as_bytes());
             for i in 1..=len {
-                let elem: Value = t.get(i).unwrap_or(Value::Nil);
-                lua_val_to_resp(&elem, out)?;
+                let elem: Value = t.raw_get(i).unwrap_or(Value::Nil);
+                lua_val_to_resp_with_depth(&elem, out, depth + 1, script_resp_ver)?;
             }
             Ok(())
         }
@@ -387,226 +2362,6 @@ fn lua_val_to_resp(val: &Value, out: &mut Vec<u8>) -> Result<(), String> {
             Ok(())
         }
     }
-}
-
-/// A registered Redis 7 Function Library
-#[derive(Clone, Debug)]
-pub struct FunctionLib {
-    pub name: String,
-    pub engine: String,
-    pub raw_code: String,
-    pub functions: Vec<String>,
-}
-
-static FUNCTION_LIBS: LazyLock<RwLock<HashMap<String, FunctionLib>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
-
-/// Load a Redis 7 Function Library
-pub fn load_function(code: &str, replace: bool) -> Result<String, String> {
-    // Parse library name from shebang or comment, e.g. "#!lua name=mylib"
-    let mut lib_name = "default_lib".to_string();
-    for line in code.lines() {
-        let trimmed = line.trim();
-        if (trimmed.starts_with("#!lua") || trimmed.starts_with("--"))
-            && let Some(pos) = trimmed.find("name=")
-        {
-            let rest = &trimmed[pos + 5..];
-            let name = rest
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .trim_matches('"');
-            if !name.is_empty() {
-                lib_name = name.to_string();
-                break;
-            }
-        }
-    }
-
-    {
-        let cache = FUNCTION_LIBS.read().unwrap();
-        if cache.contains_key(&lib_name) && !replace {
-            return Err(format!("ERR Library '{}' already exists", lib_name));
-        }
-    }
-
-    // Execute with mock redis.register_function to collect function names
-    let lua = Lua::new();
-    let func_names = Rc::new(RefCell::new(Vec::new()));
-    let func_names_clone = func_names.clone();
-
-    let redis_tbl = lua.create_table().map_err(|e| e.to_string())?;
-    let reg_fn = lua
-        .create_function(move |_, (name, _): (String, Value)| {
-            func_names_clone.borrow_mut().push(name);
-            Ok(())
-        })
-        .map_err(|e| e.to_string())?;
-    redis_tbl
-        .set("register_function", reg_fn)
-        .map_err(|e| e.to_string())?;
-    lua.globals()
-        .set("redis", redis_tbl)
-        .map_err(|e| e.to_string())?;
-
-    let lua_code: String = code
-        .lines()
-        .map(|line| {
-            if line.trim_start().starts_with("#!") {
-                format!("--{}", line)
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    lua.load(&lua_code)
-        .exec()
-        .map_err(|e| format!("ERR Error registering function: {}", e))?;
-
-    let registered = func_names.borrow().clone();
-    let lib = FunctionLib {
-        name: lib_name.clone(),
-        engine: "LUA".to_string(),
-        raw_code: lua_code,
-        functions: registered,
-    };
-
-    FUNCTION_LIBS.write().unwrap().insert(lib_name.clone(), lib);
-    Ok(lib_name)
-}
-
-/// Execute a registered Redis 7 Function via FCALL
-pub fn call_function(
-    func_name: &str,
-    keys: &[Bytes],
-    args: &[Bytes],
-    db: &Rc<RefCell<crate::shard::ShardDb>>,
-    aof: Option<&RefCell<crate::aof::AofWriter>>,
-) -> Result<Vec<u8>, String> {
-    // Find which library contains this function
-    let lib = {
-        let cache = FUNCTION_LIBS.read().unwrap();
-        cache
-            .values()
-            .find(|l| l.functions.iter().any(|f| f == func_name))
-            .cloned()
-            .ok_or_else(|| format!("ERR Function '{}' not found", func_name))?
-    };
-
-    let lua = Lua::new();
-
-    // Set KEYS table
-    let keys_tbl = lua.create_table().map_err(|e| e.to_string())?;
-    for (i, k) in keys.iter().enumerate() {
-        let s = lua.create_string(k.as_ref()).map_err(|e| e.to_string())?;
-        keys_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
-    }
-
-    // Set ARGV table
-    let argv_tbl = lua.create_table().map_err(|e| e.to_string())?;
-    for (i, a) in args.iter().enumerate() {
-        let s = lua.create_string(a.as_ref()).map_err(|e| e.to_string())?;
-        argv_tbl.set(i + 1, s).map_err(|e| e.to_string())?;
-    }
-
-    // Capture target function
-    let target_fn = Rc::new(RefCell::new(None));
-    let target_fn_clone = target_fn.clone();
-    let target_name = func_name.to_string();
-
-    let redis_tbl = lua.create_table().map_err(|e| e.to_string())?;
-
-    // Bind redis.call
-    let db_call = db.clone();
-    let aof_call = aof.map(|a| a as *const _);
-    let call_fn = lua
-        .create_function(move |lua, margs: MultiValue| {
-            let mut cmd_args = Vec::with_capacity(margs.len());
-            for v in margs {
-                match v {
-                    Value::String(s) => cmd_args.push(Bytes::copy_from_slice(&s.as_bytes())),
-                    Value::Integer(i) => cmd_args.push(Bytes::from(i.to_string())),
-                    Value::Number(n) => cmd_args.push(Bytes::from(n.to_string())),
-                    Value::Boolean(b) => cmd_args.push(Bytes::from(if b { "1" } else { "0" })),
-                    Value::Nil => cmd_args.push(Bytes::new()),
-                    _ => {}
-                }
-            }
-            let cmd = match crate::resp::build_command(cmd_args) {
-                Ok(Some(c)) => c,
-                Ok(None) => return Err(mlua::Error::RuntimeError("ERR empty command".to_string())),
-                Err(e) => return Err(mlua::Error::RuntimeError(format!("ERR {}", e))),
-            };
-
-            let mut out = Vec::new();
-            let aof_ref = unsafe { aof_call.map(|ptr| &*ptr) };
-            crate::connection::execute_local_command(
-                &cmd,
-                &mut db_call.borrow_mut(),
-                &mut out,
-                aof_ref,
-            );
-
-            resp_bytes_to_lua(lua, &out)
-        })
-        .map_err(|e| e.to_string())?;
-    redis_tbl.set("call", call_fn).map_err(|e| e.to_string())?;
-
-    let reg_fn = lua
-        .create_function(move |lua, (name, f): (String, mlua::Function)| {
-            if name == target_name {
-                let key = lua.create_registry_value(f)?;
-                *target_fn_clone.borrow_mut() = Some(key);
-            }
-            Ok(())
-        })
-        .map_err(|e| e.to_string())?;
-    redis_tbl
-        .set("register_function", reg_fn)
-        .map_err(|e| e.to_string())?;
-
-    lua.globals()
-        .set("redis", redis_tbl)
-        .map_err(|e| e.to_string())?;
-
-    // Run library script to define functions
-    lua.load(&lib.raw_code)
-        .exec()
-        .map_err(|e| format!("ERR Failed to compile library: {}", e))?;
-
-    let fn_key = target_fn.borrow_mut().take().ok_or_else(|| {
-        format!(
-            "ERR Function '{}' registered but failed to capture",
-            func_name
-        )
-    })?;
-    let f: mlua::Function = lua.registry_value(&fn_key).map_err(|e| e.to_string())?;
-
-    let res: Value = f
-        .call((keys_tbl, argv_tbl))
-        .map_err(|e| format!("ERR Error running function '{}': {}", func_name, e))?;
-
-    let mut out = Vec::new();
-    lua_val_to_resp(&res, &mut out)?;
-    Ok(out)
-}
-
-/// Returns list of registered libraries and functions
-pub fn list_functions() -> Vec<FunctionLib> {
-    let cache = FUNCTION_LIBS.read().unwrap();
-    cache.values().cloned().collect()
-}
-
-/// Delete a registered function library
-pub fn delete_function(lib_name: &str) -> bool {
-    FUNCTION_LIBS.write().unwrap().remove(lib_name).is_some()
-}
-
-/// Flush all registered function libraries
-pub fn flush_functions() {
-    FUNCTION_LIBS.write().unwrap().clear();
 }
 
 #[cfg(test)]
@@ -619,41 +2374,35 @@ mod tests {
     fn test_eval_script_basic_types_and_redis_call() {
         let db = Rc::new(RefCell::new(ShardDb::new(6379)));
 
-        // Number return
-        let res = eval_script("return 10 + 20", &[], &[], &db, None).unwrap();
+        let res = eval_script("return 10 + 20", &[], &[], &db, None, false).unwrap();
         assert_eq!(res, b":30\r\n");
 
-        // String return
-        let res = eval_script("return 'rudis_script'", &[], &[], &db, None).unwrap();
+        let res = eval_script("return 'rudis_script'", &[], &[], &db, None, false).unwrap();
         assert_eq!(res, b"$12\r\nrudis_script\r\n");
 
-        // Boolean returns
-        let res_t = eval_script("return true", &[], &[], &db, None).unwrap();
+        let res_t = eval_script("return true", &[], &[], &db, None, false).unwrap();
         assert_eq!(res_t, b":1\r\n");
-        let res_f = eval_script("return false", &[], &[], &db, None).unwrap();
+        let res_f = eval_script("return false", &[], &[], &db, None, false).unwrap();
         assert_eq!(res_f, b"$-1\r\n");
 
-        // Array return
-        let res_arr = eval_script("return {'x', 'y'}", &[], &[], &db, None).unwrap();
+        let res_arr = eval_script("return {'x', 'y'}", &[], &[], &db, None, false).unwrap();
         assert_eq!(res_arr, b"*2\r\n$1\r\nx\r\n$1\r\ny\r\n");
 
-        // redis.call
         let res_call = eval_script(
             "redis.call('SET', KEYS[1], ARGV[1]); return redis.call('GET', KEYS[1]);",
             &[Bytes::from("k_eval")],
             &[Bytes::from("v_eval")],
             &db,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(res_call, b"$6\r\nv_eval\r\n");
 
-        // Syntax error
-        let err_syn = eval_script("this is invalid lua !!!", &[], &[], &db, None);
+        let err_syn = eval_script("this is invalid lua !!!", &[], &[], &db, None, false);
         assert!(err_syn.is_err());
 
-        // Runtime error
-        let err_rt = eval_script("error('custom lua panic')", &[], &[], &db, None);
+        let err_rt = eval_script("error('custom lua panic')", &[], &[], &db, None, false);
         assert!(err_rt.is_err());
     }
 
@@ -663,16 +2412,14 @@ mod tests {
         let script = b"return redis.call('PING')";
         let sha = load_script(script);
 
-        // Check script exists
         assert_eq!(script_exists(&[Bytes::from(sha.clone())]), vec![true]);
         assert_eq!(
             script_exists(&[Bytes::from("0000000000000000000000000000000000000000")]),
             vec![false]
         );
 
-        // Retrieve script and eval
         let cached = get_script(&sha).expect("script should be in cache");
-        let res = eval_script(&cached, &[], &[], &db, None).unwrap();
+        let res = eval_script(&cached, &[], &[], &db, None, false).unwrap();
         assert_eq!(res, b"+PONG\r\n");
 
         flush_scripts();
@@ -685,13 +2432,11 @@ mod tests {
         let funcs = list_functions();
         assert!(funcs.iter().any(|f| f.name == "mylib"));
 
-        // Call registered function
-        let call_res = call_function("greet", &[], &[Bytes::from("world")], &db, None).unwrap();
+        let call_res =
+            call_function("greet", &[], &[Bytes::from("world")], &db, None, false).unwrap();
         assert_eq!(call_res, b"$11\r\nhello world\r\n");
 
-        // Duplicate load without replace fails
         assert!(load_function(code, false).is_err());
-        // With replace succeeds
         assert!(load_function(code, true).is_ok());
 
         assert!(delete_function("mylib"));
@@ -714,6 +2459,7 @@ mod tests {
             &[Bytes::from("test_val")],
             &db,
             Some(&aof),
+            false,
         );
         assert!(res.is_ok());
         assert_eq!(
@@ -723,17 +2469,8 @@ mod tests {
 
         let buf = aof.borrow().buffer().to_vec();
         let aof_str = String::from_utf8_lossy(&buf);
-        assert!(
-            aof_str.contains("SET"),
-            "AOF buffer must contain SET command"
-        );
-        assert!(
-            aof_str.contains("test_key"),
-            "AOF buffer must contain test_key"
-        );
-        assert!(
-            aof_str.contains("test_val"),
-            "AOF buffer must contain test_val"
-        );
+        assert!(aof_str.contains("SET"), "AOF buffer must contain SET command");
+        assert!(aof_str.contains("test_key"), "AOF buffer must contain test_key");
+        assert!(aof_str.contains("test_val"), "AOF buffer must contain test_val");
     }
 }

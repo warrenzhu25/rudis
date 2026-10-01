@@ -976,10 +976,17 @@ impl Router {
             {
                 aof.borrow_mut().append(&bytes);
             }
-            {
+            let prev_kind = {
                 let mut db = self.local_db.borrow_mut();
+                let kind = db.type_of(&key);
                 db.set(key.clone(), value, expire_in);
                 crate::connection::notify_stream_or_defer(&mut db, &key);
+                kind
+            };
+            crate::connection::notify_set_key_events(self, prev_kind, "string", &key);
+            crate::connection::notify_keyspace_event_sync(self, crate::connection::NOTIFY_STRING, "set", &key);
+            if expire_in.is_some() {
+                crate::connection::notify_keyspace_event_sync(self, crate::connection::NOTIFY_GENERIC, "expire", &key);
             }
             let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed);
             if max_mem > 0 {
@@ -2143,7 +2150,7 @@ impl Router {
                 .lock()
                 .unwrap()
                 .is_blocked(client.id);
-            let flags = if is_blocked { "b" } else { "N" };
+            let flags = if client.is_monitor { "O" } else if is_blocked { "b" } else { "N" };
             out.push_str(&format!(
                 "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=20448 argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name={} lib-ver={} io-thread=0 tot-net-in=0 tot-net-out=0 tot-cmds=0 read-events=0 avg-pipeline-len-sum=0 avg-pipeline-len-cnt=0\n",
                 client.id,
@@ -2368,7 +2375,8 @@ impl Router {
     }
 
     pub async fn pubsub_numpat(&self) -> usize {
-        let mut total = self.pubsub.borrow().numpat();
+        let mut unique: hashbrown::HashSet<Bytes> =
+            self.pubsub.borrow().patterns.keys().cloned().collect();
         let mut pending = Vec::new();
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
@@ -2380,11 +2388,13 @@ impl Router {
             }
         }
         for rx in pending {
-            if let Ok(count) = rx.recv_async().await {
-                total += count;
+            if let Ok(pats) = rx.recv_async().await {
+                for p in pats {
+                    unique.insert(p);
+                }
             }
         }
-        total
+        unique.len()
     }
 
     pub async fn spublish(&self, channel: Bytes, message: Bytes) -> usize {

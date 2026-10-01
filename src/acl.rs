@@ -319,10 +319,56 @@ impl AclManager {
                 let full_hash = format!("#{}", h);
                 user.password_hashes
                     .retain(|pass| pass != &full_hash && pass != h);
-            } else if rule == "+@all" || rule == "+all" {
+            } else if let Some(cat) = rule.strip_prefix("+@") {
+                let c = cat.to_lowercase();
+                if c == "all" {
+                    user.all_commands = true;
+                    user.disallowed_commands.clear();
+                } else if c == "scripting" {
+                    for cmd in &[
+                        "eval", "evalsha", "eval_ro", "evalsha_ro", "function", "fcall",
+                        "fcall_ro", "script",
+                    ] {
+                        if user.all_commands {
+                            user.disallowed_commands.remove(*cmd);
+                        } else {
+                            user.allowed_commands.insert(cmd.to_string());
+                        }
+                    }
+                } else if c == "string" {
+                    for cmd in &[
+                        "get", "set", "mget", "mset", "incr", "decr", "incrby", "decrby",
+                        "incrbyfloat", "append", "strlen", "getset", "getdel", "getex",
+                        "setnx", "setex", "psetex", "msetnx",
+                    ] {
+                        if user.all_commands {
+                            user.disallowed_commands.remove(*cmd);
+                        } else {
+                            user.allowed_commands.insert(cmd.to_string());
+                        }
+                    }
+                }
+            } else if let Some(cat) = rule.strip_prefix("-@") {
+                let c = cat.to_lowercase();
+                if c == "all" {
+                    user.all_commands = false;
+                    user.allowed_commands.clear();
+                } else if c == "scripting" {
+                    for cmd in &[
+                        "eval", "evalsha", "eval_ro", "evalsha_ro", "function", "fcall",
+                        "fcall_ro", "script",
+                    ] {
+                        if user.all_commands {
+                            user.disallowed_commands.insert(cmd.to_string());
+                        } else {
+                            user.allowed_commands.remove(*cmd);
+                        }
+                    }
+                }
+            } else if rule == "+all" {
                 user.all_commands = true;
                 user.disallowed_commands.clear();
-            } else if rule == "-@all" || rule == "-all" {
+            } else if rule == "-all" {
                 user.all_commands = false;
                 user.allowed_commands.clear();
             } else if let Some(cmd) = rule.strip_prefix('+') {

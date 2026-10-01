@@ -75,10 +75,21 @@ pub struct ListWaiter {
     pub sender: Sender<BlockedListResult>,
 }
 
+#[derive(Clone, Debug)]
+pub enum BlockedStreamResult {
+    Data(Vec<u8>),
+    Error(Vec<u8>),
+    CrossShard,
+    Unblocked(ClientUnblockType),
+}
+
 pub struct StreamWaiter {
     pub client_id: u64,
     pub key: Bytes,
-    pub sender: Sender<()>,
+    pub cmd: crate::resp::Command,
+    pub is_resp3: bool,
+    pub is_cross_shard: bool,
+    pub sender: Sender<BlockedStreamResult>,
 }
 
 pub struct BlockHub {
@@ -88,7 +99,7 @@ pub struct BlockHub {
     stream_waiters: HashMap<Bytes, Vec<StreamWaiter>>,
     blocked_clients: HashMap<u64, Sender<BlockedListResult>>,
     blocked_zset_clients: HashMap<u64, Sender<BlockedZSetResult>>,
-    blocked_stream_clients: HashMap<u64, Sender<()>>,
+    blocked_stream_clients: HashMap<u64, Sender<BlockedStreamResult>>,
     paused_count: usize,
     pending_notifies: Vec<Bytes>,
 }
@@ -268,7 +279,7 @@ impl BlockHub {
             unblocked = true;
         }
         if let Some(sender) = self.blocked_stream_clients.remove(&client_id) {
-            let _ = sender.try_send(());
+            let _ = sender.try_send(BlockedStreamResult::Unblocked(unblock_type));
             for waiters in self.stream_waiters.values_mut() {
                 waiters.retain(|w| w.client_id != client_id);
             }
@@ -583,38 +594,83 @@ impl BlockHub {
         }
     }
 
-    pub fn register_stream_waiter(&mut self, client_id: u64, key: Bytes, sender: Sender<()>) {
+    pub fn register_stream_waiter(
+        &mut self,
+        client_id: u64,
+        key: Bytes,
+        cmd: crate::resp::Command,
+        is_resp3: bool,
+        is_cross_shard: bool,
+        sender: Sender<BlockedStreamResult>,
+    ) {
         self.blocked_stream_clients.insert(client_id, sender.clone());
         let entry = self.stream_waiters.entry(key.clone()).or_default();
         if !entry.iter().any(|w| w.client_id == client_id) {
-            entry.push(StreamWaiter { client_id, key, sender });
+            entry.push(StreamWaiter {
+                client_id,
+                key,
+                cmd,
+                is_resp3,
+                is_cross_shard,
+                sender,
+            });
         }
         self.sync_atomic_waiters_count();
     }
 
     /// Called when XADD adds an entry to a stream.
-    pub fn notify_stream(&mut self, key: &Bytes) {
-        if let Some(waiters) = self.stream_waiters.remove(key) {
+    pub fn notify_stream(&mut self, db: &mut crate::shard::ShardDb, key: &Bytes) {
+        if let Some(waiters) = self.stream_waiters.get_mut(key) {
+            let mut satisfied = Vec::new();
             for (idx, waiter) in waiters.iter().enumerate() {
-                self.blocked_stream_clients.remove(&waiter.client_id);
-                if idx > 0 {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                if waiter.sender.is_disconnected() {
+                    satisfied.push(idx);
+                    continue;
                 }
-                let _ = waiter.sender.try_send(());
+                if waiter.is_cross_shard {
+                    let _ = waiter.sender.send(BlockedStreamResult::CrossShard);
+                    satisfied.push(idx);
+                    continue;
+                }
+                let mut out = Vec::new();
+                crate::connection::CURRENT_CLIENT_RESP3.set(waiter.is_resp3);
+                crate::connection::execute_local_command(&waiter.cmd, db, &mut out, None);
+                let is_xread = matches!(waiter.cmd, crate::resp::Command::Xread { .. });
+                let empty = out == b"$-1\r\n"
+                    || out == b"*0\r\n"
+                    || (is_xread && out.starts_with(b"-WRONGTYPE"));
+                if !empty {
+                    let res = if out.starts_with(b"-") {
+                        BlockedStreamResult::Error(out)
+                    } else {
+                        BlockedStreamResult::Data(out)
+                    };
+                    let _ = waiter.sender.send(res);
+                    satisfied.push(idx);
+                }
             }
-            for waiter in waiters {
+            let mut removed_cids = Vec::new();
+            for idx in satisfied.into_iter().rev() {
+                let w = waiters.remove(idx);
+                self.blocked_stream_clients.remove(&w.client_id);
+                removed_cids.push(w.client_id);
+            }
+            if waiters.is_empty() {
+                self.stream_waiters.remove(key);
+            }
+            if !removed_cids.is_empty() {
                 for other_waiters in self.stream_waiters.values_mut() {
-                    other_waiters.retain(|w| w.client_id != waiter.client_id);
+                    other_waiters.retain(|ow| !removed_cids.contains(&ow.client_id));
                 }
             }
             self.sync_atomic_waiters_count();
         }
     }
 
-    pub fn notify_all_streams(&mut self) {
+    pub fn notify_all_streams(&mut self, db: &mut crate::shard::ShardDb) {
         let keys: Vec<Bytes> = self.stream_waiters.keys().cloned().collect();
         for k in keys {
-            self.notify_stream(&k);
+            self.notify_stream(db, &k);
         }
     }
 }
@@ -746,10 +802,33 @@ mod tests {
         // Test Stream waiter
         let sk = Bytes::from_static(b"skey");
         let (tx_s, rx_s) = unbounded();
-        hub.register_stream_waiter(1001, sk.clone(), tx_s);
+        let cmd = crate::resp::Command::Xread {
+            count: None,
+            maxcount: None,
+            maxsize: None,
+            block_ms: None,
+            keys: vec![sk.clone()],
+            ids: vec!["0-0".to_string()],
+        };
+        let mut sdb = crate::shard::ShardDb::new(12346);
+        let xadd_cmd = crate::resp::Command::Xadd {
+            key: sk.clone(),
+            nomkstream: false,
+            maxlen: None,
+            minid: None,
+            approx: false,
+            trim_strategy: crate::table::StreamTrimStrategy::KeepRef,
+            idmp: None,
+            id: crate::table::StreamAddId::Explicit(crate::table::StreamId::new(1, 0)),
+            fields: vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))],
+            limit: None,
+        };
+        let mut dummy = Vec::new();
+        crate::connection::execute_local_command(&xadd_cmd, &mut sdb, &mut dummy, None);
+        hub.register_stream_waiter(1001, sk.clone(), cmd, false, false, tx_s);
         assert_eq!(hub.stream_waiters.len(), 1);
 
-        hub.notify_stream(&sk);
+        hub.notify_stream(&mut sdb, &sk);
         assert!(rx_s.try_recv().is_ok());
         assert_eq!(hub.stream_waiters.len(), 0);
 
