@@ -86,6 +86,10 @@ pub fn run_shard_worker(
 
     rt.block_on(async move {
         let base_port = port;
+        if shard_id == 0 {
+            // Startup value of `appendfsync`; CONFIG SET may change it later.
+            crate::aof::set_fsync_every_sec(base_port, aof_config.fsync_every_sec);
+        }
         let shard_port = if cluster_enabled {
             base_port + shard_id as u16
         } else {
@@ -166,7 +170,7 @@ pub fn run_shard_worker(
                 Ok(w) => {
                     let writer = Rc::new(RefCell::new(w));
                     let flush_writer = writer.clone();
-                    let fsync_every_sec = aof_config.fsync_every_sec;
+                    let fsync_every_sec = crate::aof::fsync_every_sec_flag(base_port);
                     monoio::spawn(async move {
                         let mut ticker = 0u64;
                         loop {
@@ -179,7 +183,9 @@ pub fn run_shard_worker(
                                 }
                             }
                             ticker += 1;
-                            if fsync_every_sec && ticker.is_multiple_of(200) {
+                            if ticker.is_multiple_of(200)
+                                && fsync_every_sec.load(std::sync::atomic::Ordering::Relaxed)
+                            {
                                 let file = flush_writer.borrow().get_file();
                                 if let Some(file) = file {
                                     let _ = file.sync_data().await;

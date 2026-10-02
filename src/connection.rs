@@ -9135,7 +9135,7 @@ async fn execute_command(
                     let backup_dir = CONFIG_BACKUPDIRNAME.read().unwrap().clone();
                     let slaveof_cfg = CONFIG_SLAVEOF.read().unwrap().clone();
 
-                    let all_configs: [(&str, String); 42] = [
+                    let all_configs: [(&str, String); 43] = [
                         ("port", port_str),
                         (
                             "protected-mode",
@@ -9179,6 +9179,10 @@ async fn execute_command(
                         ("client-output-buffer-limit", obuf),
                         ("requirepass", pass),
                         ("appendonly", app),
+                        (
+                            "appendfsync",
+                            crate::aof::appendfsync_name(router.base_port).to_string(),
+                        ),
                         (
                             "aof-load-truncated",
                             if crate::aof::aof_load_truncated() {
@@ -9291,6 +9295,35 @@ async fn execute_command(
                             if !matches!(val_str.to_ascii_lowercase().as_str(), "yes" | "no") {
                                 out.extend_from_slice(
                                     b"-ERR CONFIG SET failed (possibly related to argument 'aof-load-truncated') - argument must be 'yes' or 'no'\r\n",
+                                );
+                                return false;
+                            }
+                        } else if p_str == "appendonly" {
+                            // The AOF writers are opened once per shard at startup.
+                            let requested = match val_str.to_ascii_lowercase().as_str() {
+                                "yes" => true,
+                                "no" => false,
+                                _ => {
+                                    out.extend_from_slice(
+                                        b"-ERR CONFIG SET failed (possibly related to argument 'appendonly') - argument must be 'yes' or 'no'\r\n",
+                                    );
+                                    return false;
+                                }
+                            };
+                            if requested != router.aof.is_some() {
+                                out.extend_from_slice(
+                                    b"-ERR CONFIG SET failed (possibly related to argument 'appendonly') - changing appendonly at runtime is not supported; set it in the config file and restart\r\n",
+                                );
+                                return false;
+                            }
+                        } else if p_str == "appendfsync" {
+                            if let Err(e) = crate::aof::parse_appendfsync(&val_str) {
+                                out.extend_from_slice(
+                                    format!(
+                                        "-ERR CONFIG SET failed (possibly related to argument 'appendfsync') - {}\r\n",
+                                        e
+                                    )
+                                    .as_bytes(),
                                 );
                                 return false;
                             }
@@ -9670,6 +9703,11 @@ async fn execute_command(
                             *CONFIG_OOM_SCORE_ADJ.write().unwrap() = val_str.to_string();
                         } else if p_str == "oom-score-adj-values" {
                             *CONFIG_OOM_SCORE_ADJ_VALUES.write().unwrap() = val_str.to_string();
+                        } else if p_str == "appendfsync" {
+                            // Validated in phase 1.
+                            if let Ok(every_sec) = crate::aof::parse_appendfsync(&val_str) {
+                                crate::aof::set_fsync_every_sec(router.base_port, every_sec);
+                            }
                         } else if p_str == "save" {
                             // Validated in phase 1.
                             if let Ok(points) = crate::config::parse_save_points(&val_str) {

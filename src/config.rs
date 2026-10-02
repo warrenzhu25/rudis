@@ -14,6 +14,9 @@ pub struct RudisConfig {
     pub maxmemory_bytes: Option<u64>,
     pub maxmemory_policy: String,
     pub appendonly: bool,
+    /// `appendfsync`: true = everysec (default), false = no. `always` is
+    /// rejected at parse time.
+    pub appendfsync_every_sec: bool,
     pub aof_load_truncated: bool,
     pub dir: PathBuf,
     pub requirepass: Option<String>,
@@ -41,6 +44,7 @@ impl Default for RudisConfig {
             maxmemory_bytes: None,
             maxmemory_policy: "noeviction".to_string(),
             appendonly: false,
+            appendfsync_every_sec: true,
             aof_load_truncated: true,
             dir: PathBuf::from("."),
             requirepass: None,
@@ -166,8 +170,23 @@ impl RudisConfig {
                     config.maxmemory_policy = rest[0].to_lowercase();
                 }
                 "appendonly" => {
-                    config.appendonly =
-                        matches!(rest[0].to_lowercase().as_str(), "yes" | "true" | "1");
+                    config.appendonly = match rest[0].to_lowercase().as_str() {
+                        "yes" => true,
+                        "no" => false,
+                        other => {
+                            return Err(format!(
+                                "Invalid appendonly at line {}: '{}' (expected yes|no)",
+                                line_num + 1,
+                                other
+                            ));
+                        }
+                    };
+                }
+                "appendfsync" => {
+                    config.appendfsync_every_sec =
+                        crate::aof::parse_appendfsync(rest[0]).map_err(|e| {
+                            format!("Invalid appendfsync at line {}: {}", line_num + 1, e)
+                        })?;
                 }
                 "aof-load-truncated" => {
                     config.aof_load_truncated = match rest[0].to_lowercase().as_str() {
@@ -483,6 +502,23 @@ mod tests {
                 .aof_load_truncated
         );
         assert!(RudisConfig::parse_str("aof-load-truncated maybe").is_err());
+    }
+
+    #[test]
+    fn test_parse_appendonly_and_appendfsync() {
+        let cfg = RudisConfig::parse_str("").unwrap();
+        assert!(!cfg.appendonly);
+        assert!(cfg.appendfsync_every_sec);
+        let cfg = RudisConfig::parse_str("appendonly yes\nappendfsync no").unwrap();
+        assert!(cfg.appendonly);
+        assert!(!cfg.appendfsync_every_sec);
+        let cfg = RudisConfig::parse_str("appendfsync EVERYSEC").unwrap();
+        assert!(cfg.appendfsync_every_sec);
+        // `always` can't be honoured, so it must not load as something weaker.
+        let err = RudisConfig::parse_str("appendfsync always").unwrap_err();
+        assert!(err.contains("always is not supported"), "{}", err);
+        assert!(RudisConfig::parse_str("appendfsync sometimes").is_err());
+        assert!(RudisConfig::parse_str("appendonly on").is_err());
     }
 
     #[test]

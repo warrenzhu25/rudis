@@ -108,9 +108,10 @@ a `Rc<RefCell<Self>>`-taking convenience wrapper around the same logic — it ex
 per a full-repo grep, its only callers today are two of `aof.rs`'s own unit tests; the production 5ms flush task
 in `server.rs` (§3.2) calls `take_flush_chunk` directly rather than through `flush_rc`.
 
-**There is still no `appendfsync always`/`everysec`/`no` policy choice.** `AofConfig.fsync_every_sec` remains a
-single boolean, and `main.rs:179` still hardcodes it to `true` unconditionally — there is no `RudisConfig`/
-config-file directive that sets it otherwise (confirmed: `fsync_every_sec` never appears in `config.rs`). AOF
+**`appendfsync everysec`/`no` are supported; `always` is rejected.** The config directive sets
+`RudisConfig.appendfsync_every_sec`, which seeds `AofConfig.fsync_every_sec`; the flusher reads a per-port
+live flag (`aof::fsync_every_sec_flag`) so `CONFIG SET appendfsync` applies at runtime. `always` fails config
+loading and `CONFIG SET` because the background flusher can't fsync before replying. AOF
 durability is therefore still a fixed Redis `everysec`-like policy (background flush every 5ms, `fsync` roughly
 every 1 second, §3.2); per-write synchronous `fsync` ("always") and no periodic `fsync` ("no") remain unreachable
 through configuration.
@@ -612,8 +613,7 @@ periodic `bgsave`. A configured `save 900 1` directive is accepted at startup an
   (§3.6); every flow session receives a fresh full RDB chunk for its shard.
 - **STILL OPEN — `DFLY FLOW` sessions are not reflected in `INFO replication`/`ROLE`** (§3.7).
 - **STILL OPEN — the 1MB `ReplicationBacklog` size and the AOF flush/fsync cadence remain compile-time
-  constants**, and `appendfsync`-style policy choice (`always`/`everysec`/`no`) is still not exposed — `main.rs`
-  still hardcodes `fsync_every_sec: true` (§2.1).
+  constants**; `appendfsync everysec`/`no` are configurable but `always` is rejected (§2.1).
 - **STILL OPEN — `replid` is derived from `fxhash` over port+timestamp**, not a cryptographically-derived run-id
   (§2.2).
 

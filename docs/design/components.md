@@ -614,7 +614,7 @@ fixed-capacity ring-buffer backlog) and a Dragonfly-compatible `DFLY FLOW` per-s
 **Performance characteristics.** AOF write cost is O(1) amortized per command; file size and restart replay
 time both grow unboundedly with lifetime write volume until an explicit `BGREWRITEAOF` compacts — nothing
 compacts automatically. The replication backlog size and AOF fsync cadence are compile-time constants, not
-runtime-configurable (no `appendfsync always/everysec/no` policy choice exists).
+runtime-configurable; `appendfsync everysec`/`no` are configurable, `always` is rejected.
 
 **Verified findings.** **`RudisValue::Tiered` values (keys currently offloaded to NVMe by Component 07) are
 serialized as zero payload bytes during both `SAVE`/`BGSAVE` (RDB) and `BGREWRITEAOF`.** The serialization match

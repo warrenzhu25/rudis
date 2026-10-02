@@ -199,7 +199,7 @@ fn main() {
     let aof_config = rudis::aof::AofConfig {
         enabled: server_config.appendonly,
         dir: server_config.dir.clone(),
-        fsync_every_sec: true,
+        fsync_every_sec: server_config.appendfsync_every_sec,
     };
     if aof_config.enabled {
         match rudis::aof::reshard_aof_dir(&aof_config.dir, num_shards, port) {

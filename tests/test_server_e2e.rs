@@ -15317,3 +15317,87 @@ fn test_scripts_reject_keys_on_several_shards_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child);
 }
+
+#[test]
+fn test_appendonly_and_appendfsync_are_reported_truthfully_e2e() {
+    let port = 16977;
+    let dir = std::env::temp_dir().join(format!("rudis-appendfsync-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let port_s = port.to_string();
+    let conf = dir.join("aof.conf");
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--aof-dir",
+        dir.to_str().unwrap(),
+        "-c",
+        conf.to_str().unwrap(),
+    ];
+
+    // `appendfsync always` can't be honoured: refuse to start rather than
+    // run with weaker durability than configured.
+    std::fs::write(&conf, "appendonly yes\nappendfsync always\n").unwrap();
+    let (status, stderr) = run_rudis_until_exit(&args);
+    assert!(!status.success(), "{stderr}");
+    assert!(
+        stderr.contains("appendfsync always is not supported"),
+        "{stderr}"
+    );
+
+    std::fs::write(&conf, "appendonly yes\nappendfsync no\n").unwrap();
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let get = |c: &mut TcpStream, p: &str| resp_cmd(c, &["CONFIG", "GET", p]);
+    assert_eq!(
+        get(&mut c, "appendfsync"),
+        "*2\r\n$11\r\nappendfsync\r\n$2\r\nno\r\n"
+    );
+    assert_eq!(
+        get(&mut c, "appendonly"),
+        "*2\r\n$10\r\nappendonly\r\n$3\r\nyes\r\n"
+    );
+
+    // appendfsync switches at runtime between the supported policies.
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "appendfsync", "everysec"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        get(&mut c, "appendfsync"),
+        "*2\r\n$11\r\nappendfsync\r\n$8\r\neverysec\r\n"
+    );
+    let r = resp_cmd(&mut c, &["CONFIG", "SET", "appendfsync", "always"]);
+    assert!(r.starts_with("-ERR") && r.contains("not supported"), "{r}");
+    assert_eq!(
+        get(&mut c, "appendfsync"),
+        "*2\r\n$11\r\nappendfsync\r\n$8\r\neverysec\r\n"
+    );
+
+    // appendonly can't be toggled at runtime; a no-op SET is fine.
+    let r = resp_cmd(&mut c, &["CONFIG", "SET", "appendonly", "no"]);
+    assert!(r.starts_with("-ERR") && r.contains("restart"), "{r}");
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "appendonly", "yes"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        get(&mut c, "appendonly"),
+        "*2\r\n$10\r\nappendonly\r\n$3\r\nyes\r\n"
+    );
+
+    // The AOF is still written and replayed.
+    assert_eq!(resp_cmd(&mut c, &["SET", "fsync:k", "v"]), "+OK\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["GET", "fsync:k"]), "$1\r\nv\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}

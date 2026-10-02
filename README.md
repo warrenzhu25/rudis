@@ -422,10 +422,12 @@ docker run -d --name rudis \
 
 Understand what "durable" means here today before relying on it:
 
-- **AOF** (`appendonly yes`): the fsync policy is currently hardcoded to flush roughly every
-  second ([`src/aof.rs`](src/aof.rs)) — there is no config directive yet to select Redis's
-  `appendfsync always` (fsync every write) or `appendfsync no` (OS-decided) policies. Expect to
-  lose at most ~1 second of writes on a hard crash.
+- **AOF** (`appendonly yes`): `appendfsync everysec` (default) fsyncs roughly every second;
+  `appendfsync no` leaves flushing to the OS. Both can be changed with `CONFIG SET`.
+  `appendfsync always` is **not supported** — writes reach the AOF through a background flusher,
+  so a reply can't wait for its fsync — and the server refuses to start (or `CONFIG SET` fails)
+  rather than silently running with weaker durability. `appendonly` can't be toggled at runtime;
+  set it in the config file and restart. Expect to lose up to ~1 second of writes on a hard crash.
 - **RDB autosave**: the classic `save <seconds> <changes>` directive is parsed and stored, but
   **nothing schedules a `BGSAVE` from it today** — drive periodic snapshots externally (e.g. a
   cron job issuing `redis-cli BGSAVE`) if you need them.

@@ -1969,6 +1969,52 @@ pub fn aof_load_truncated() -> bool {
     AOF_LOAD_TRUNCATED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Parses an `appendfsync` value into "fsync every second?".
+///
+/// `always` is rejected rather than silently downgraded: writes reach the AOF
+/// through a background flusher, so a reply can't wait for its fsync.
+pub fn parse_appendfsync(v: &str) -> Result<bool, String> {
+    match v.to_ascii_lowercase().as_str() {
+        "everysec" => Ok(true),
+        "no" => Ok(false),
+        "always" => Err(
+            "appendfsync always is not supported (the AOF is flushed in the background); use everysec or no"
+                .to_string(),
+        ),
+        other => Err(format!(
+            "invalid appendfsync '{}' (expected everysec or no)",
+            other
+        )),
+    }
+}
+
+type FsyncFlags = std::collections::HashMap<u16, std::sync::Arc<std::sync::atomic::AtomicBool>>;
+static FSYNC_EVERY_SEC: std::sync::Mutex<Option<FsyncFlags>> = std::sync::Mutex::new(None);
+
+/// Live `appendfsync` policy for the server on `port` (true = everysec). The
+/// AOF flusher reads it on every tick, so `CONFIG SET appendfsync` applies
+/// without a restart. Defaults to everysec.
+pub fn fsync_every_sec_flag(port: u16) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    let mut map = FSYNC_EVERY_SEC.lock().unwrap_or_else(|e| e.into_inner());
+    map.get_or_insert_with(Default::default)
+        .entry(port)
+        .or_insert_with(|| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)))
+        .clone()
+}
+
+pub fn set_fsync_every_sec(port: u16, every_sec: bool) {
+    fsync_every_sec_flag(port).store(every_sec, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The `appendfsync` value reported by CONFIG GET.
+pub fn appendfsync_name(port: u16) -> &'static str {
+    if fsync_every_sec_flag(port).load(std::sync::atomic::Ordering::Relaxed) {
+        "everysec"
+    } else {
+        "no"
+    }
+}
+
 /// Replays an AOF into `db`, returning the number of commands applied.
 ///
 /// Like Redis: an incomplete final command (e.g. a crash mid-write) is cut
@@ -2890,6 +2936,25 @@ mod tests {
         let p = std::env::temp_dir().join(format!("rudis-aoftail-{}-{}", std::process::id(), name));
         std::fs::write(&p, content).unwrap();
         p
+    }
+
+    #[test]
+    fn test_appendfsync_parse_and_live_policy() {
+        assert_eq!(parse_appendfsync("everysec"), Ok(true));
+        assert_eq!(parse_appendfsync("No"), Ok(false));
+        assert!(parse_appendfsync("always").is_err());
+        assert!(parse_appendfsync("").is_err());
+
+        // Per-port, defaults to everysec, and the flusher's handle sees updates.
+        let port = 59_101;
+        assert_eq!(appendfsync_name(port), "everysec");
+        let flag = fsync_every_sec_flag(port);
+        set_fsync_every_sec(port, false);
+        assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(appendfsync_name(port), "no");
+        assert_eq!(appendfsync_name(59_102), "everysec");
+        set_fsync_every_sec(port, true);
+        assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
     }
 
     const SET_A: &[u8] = b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n";

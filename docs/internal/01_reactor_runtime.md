@@ -125,8 +125,8 @@ pub struct RudisConfig {
 `RudisConfig::merge_cli` takes 11 positional `Option<T>` arguments (port, threads, aof, aof_dir,
 maxmemory, tiered_offload_threshold, tiered_upload_threshold, tls_port, tls_cert_file,
 tls_key_file, cluster_enabled) and overwrites the corresponding field only when `Some`. There is
-still no `appendfsync`-style directive — AOF fsync cadence remains hardcoded (see §3.1 and
-Component 14).
+`appendfsync` (`everysec`/`no`; `always` rejected) is read from the config file, not the CLI (see §3.1
+and Component 14).
 
 ### 2.2 Core-affinity discovery: `get_process_affinity_cores` (main.rs:66-87)
 
