@@ -15194,3 +15194,59 @@ fn test_save_points_trigger_background_saves_and_config_is_truthful_e2e() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_pipeline_keeps_order_across_shards_e2e() {
+    // A write to another shard followed by an unbatched command (MGET,
+    // multi-key EXISTS) in the same pipeline must see the write.
+    let port = 16979;
+    let port_s = port.to_string();
+    let args = ["--port", &port_s, "--threads", "4", "--no-pin"];
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let enc = |args: &[&str]| {
+        let mut b = format!("*{}\r\n", args.len());
+        for a in args {
+            b.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+        }
+        b
+    };
+    let mut req = String::new();
+    let mut want = String::new();
+    for i in 0..200 {
+        let (k, e, v) = (
+            format!("po:k{}", i),
+            format!("po:e{}", i),
+            format!("new{}", i),
+        );
+        req += &enc(&["SET", &k, "old"]);
+        want += "+OK\r\n";
+        req += &enc(&["SET", &k, &v]);
+        want += "+OK\r\n";
+        req += &enc(&["MGET", &k, "po:missing"]);
+        want += &format!("*2\r\n${}\r\n{}\r\n$-1\r\n", v.len(), v);
+        req += &enc(&["SET", &e, "1"]);
+        want += "+OK\r\n";
+        req += &enc(&["EXISTS", &e, "po:missing"]);
+        want += ":1\r\n";
+    }
+    c.write_all(req.as_bytes()).unwrap();
+    let mut got = vec![0u8; want.len()];
+    c.read_exact(&mut got).unwrap();
+    let got = String::from_utf8_lossy(&got);
+    if got != want {
+        let pos = got
+            .bytes()
+            .zip(want.bytes())
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
+        panic!(
+            "pipeline reply diverges at byte {pos}: got {:?}, want {:?}",
+            &got[pos.saturating_sub(40)..(pos + 40).min(got.len())],
+            &want[pos.saturating_sub(40)..(pos + 40).min(want.len())]
+        );
+    }
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}

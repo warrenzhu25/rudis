@@ -23428,6 +23428,17 @@ async fn execute_commands_squashed(
             }
         } else if let Command::Mget(keys) = cmd {
             drop(local_db);
+            if remote_batches.iter().any(|b| !b.is_empty()) {
+                flush_remote_batches(
+                    router,
+                    responders,
+                    remote_batches,
+                    items_pool,
+                    responses,
+                    is_resp3,
+                )
+                .await;
+            }
             if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
                 for key in &keys {
                     record_client_read(router.port, client_id, key.as_ref());
@@ -23441,6 +23452,17 @@ async fn execute_commands_squashed(
             local_db = router.local_db.borrow_mut();
         } else if let Command::Mset(pairs) = cmd {
             drop(local_db);
+            if remote_batches.iter().any(|b| !b.is_empty()) {
+                flush_remote_batches(
+                    router,
+                    responders,
+                    remote_batches,
+                    items_pool,
+                    responses,
+                    is_resp3,
+                )
+                .await;
+            }
             if crate::replication::has_connected_replicas(router.port)
                 && let Some(bytes) = crate::aof::command_to_resp(&Command::Mset(pairs.clone()))
             {
@@ -23469,6 +23491,17 @@ async fn execute_commands_squashed(
                 | Command::FunctionKill
         ) {
             drop(local_db);
+            if remote_batches.iter().any(|b| !b.is_empty()) {
+                flush_remote_batches(
+                    router,
+                    responders,
+                    remote_batches,
+                    items_pool,
+                    responses,
+                    is_resp3,
+                )
+                .await;
+            }
             local_buf.clear();
             if execute_command(
                 cmd,
@@ -23500,61 +23533,24 @@ async fn execute_commands_squashed(
         router.check_auto_tier_after_write();
     }
 
-    // 2. Dispatch batched hops to all remote shards in parallel using pre-allocated channels
+    // 2-3. Dispatch the remaining per-shard batches and wait for them.
     let _ = results_pool;
-    let resp_base_ptr = responses.as_mut_ptr();
-    let mut pending_mask: u64 = 0;
-    for (target_shard, items) in remote_batches.iter_mut().enumerate() {
-        if !items.is_empty() {
-            let responder = &responders[target_shard];
-            responder.prepare(resp_base_ptr);
-            let next_items = items_pool.pop().unwrap_or_else(|| Vec::with_capacity(64));
-            let msg = ShardMessage::Batch {
-                items: std::mem::replace(items, next_items),
-                responder: responder.clone(),
-                is_resp3,
-            };
-            if router.senders[target_shard].send(msg).is_ok() {
-                pending_mask |= 1u64 << target_shard;
-            }
-        }
-    }
-
-    for (cold_idx, cold_key) in local_cold_gets {
+    let cold_gets = std::mem::take(&mut local_cold_gets);
+    flush_remote_batches(
+        router,
+        responders,
+        remote_batches,
+        items_pool,
+        responses,
+        is_resp3,
+    )
+    .await;
+    for (cold_idx, cold_key) in cold_gets {
         if let Some(v) = router.stream_cold_read_local(&cold_key).await {
             responses[cold_idx] = CompactResp::Bulk(v);
         } else {
             responses[cold_idx] = crate::shard::CompactResp::null(is_resp3);
         }
-    }
-
-    // 3. Await parallel responses from all remote shards with lock-free spin-wait before async yield
-    for _spin in 0..256 {
-        if pending_mask == 0 {
-            break;
-        }
-        let mut check_mask = pending_mask;
-        while check_mask != 0 {
-            let target_shard = check_mask.trailing_zeros() as usize;
-            let responder = &responders[target_shard];
-            if let Some(recycled_items) = responder.try_take() {
-                items_pool.push(recycled_items);
-                pending_mask &= !(1u64 << target_shard);
-            }
-            check_mask &= check_mask - 1;
-        }
-        if pending_mask == 0 {
-            break;
-        }
-        std::hint::spin_loop();
-    }
-    while pending_mask != 0 {
-        let target_shard = pending_mask.trailing_zeros() as usize;
-        let responder = &responders[target_shard];
-        if let Some(recycled_items) = responder.wait_take().await {
-            items_pool.push(recycled_items);
-        }
-        pending_mask &= !(1u64 << target_shard);
     }
 
     // 4. Gather the cross-shard MGET/MSET replies that were dispatched in step 1.
@@ -23596,6 +23592,67 @@ async fn execute_commands_squashed(
     }
 
     should_close
+}
+
+/// Sends the per-shard batches built so far and waits until every shard has
+/// written its replies into `responses`. Commands that are not batched must
+/// call this first so they cannot overtake earlier commands of the same
+/// pipeline (e.g. `SET k v` to a remote shard followed by `MGET k x`).
+async fn flush_remote_batches(
+    router: &Router,
+    responders: &[std::sync::Arc<crate::mailbox::BatchResponder>],
+    remote_batches: &mut [Vec<(usize, u64, Command)>],
+    items_pool: &mut Vec<Vec<(usize, u64, Command)>>,
+    responses: &mut [CompactResp],
+    is_resp3: bool,
+) {
+    // Dispatch batched hops to all remote shards in parallel using pre-allocated channels
+    let resp_base_ptr = responses.as_mut_ptr();
+    let mut pending_mask: u64 = 0;
+    for (target_shard, items) in remote_batches.iter_mut().enumerate() {
+        if !items.is_empty() {
+            let responder = &responders[target_shard];
+            responder.prepare(resp_base_ptr);
+            let next_items = items_pool.pop().unwrap_or_else(|| Vec::with_capacity(64));
+            let msg = ShardMessage::Batch {
+                items: std::mem::replace(items, next_items),
+                responder: responder.clone(),
+                is_resp3,
+            };
+            if router.senders[target_shard].send(msg).is_ok() {
+                pending_mask |= 1u64 << target_shard;
+            }
+        }
+    }
+
+    // Await parallel responses from all remote shards with lock-free spin-wait before async yield
+    for _spin in 0..256 {
+        if pending_mask == 0 {
+            break;
+        }
+        let mut check_mask = pending_mask;
+        while check_mask != 0 {
+            let target_shard = check_mask.trailing_zeros() as usize;
+            let responder = &responders[target_shard];
+            if let Some(recycled_items) = responder.try_take() {
+                items_pool.push(recycled_items);
+                pending_mask &= !(1u64 << target_shard);
+            }
+            check_mask &= check_mask - 1;
+        }
+        if pending_mask == 0 {
+            break;
+        }
+        std::hint::spin_loop();
+    }
+    while pending_mask != 0 {
+        let target_shard = pending_mask.trailing_zeros() as usize;
+        let responder = &responders[target_shard];
+        if let Some(recycled_items) = responder.wait_take().await {
+            items_pool.push(recycled_items);
+        }
+        pending_mask &= !(1u64 << target_shard);
+    }
 }
 
 pub(crate) struct RecvBytesMut(pub BytesMut);
@@ -24118,6 +24175,75 @@ mod tests {
         assert_eq!(other.responders.len(), 8);
         assert_eq!(other.remote_batches.len(), 8);
         recycle_conn_scratch(other);
+    }
+
+    #[monoio::test]
+    async fn test_flush_remote_batches_waits_for_owner_replies() {
+        let dir = std::env::temp_dir().join(format!("rudis-flush-batches-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let (senders_mesh, mut receivers) = crate::mailbox::create_shard_mesh(2);
+        let router = Router::new(
+            0,
+            2,
+            6398,
+            std::rc::Rc::new(std::cell::RefCell::new(crate::shard::ShardDb::new(6398))),
+            senders_mesh[0].clone(),
+            None,
+            std::rc::Rc::new(std::cell::RefCell::new(crate::pubsub::PubSubHub::new())),
+            dir,
+        );
+        // Fake owner of shard 1: answers one Batch with an integer per item.
+        let rx1 = receivers.remove(1);
+        let owner = std::thread::spawn(move || {
+            loop {
+                if let Ok(ShardMessage::Batch {
+                    mut items,
+                    responder,
+                    ..
+                }) = rx1.try_recv()
+                {
+                    for (idx, _, _) in items.iter() {
+                        responder.write_slot(*idx, CompactResp::from_integer(*idx as i64 + 100));
+                    }
+                    items.clear();
+                    responder.finish(items);
+                    return;
+                }
+                std::thread::yield_now();
+            }
+        });
+
+        let mut scratch = take_conn_scratch(2);
+        let mut responses = vec![CompactResp::empty(); 3];
+        // Nothing pending: returns at once without touching responses.
+        flush_remote_batches(
+            &router,
+            &scratch.responders,
+            &mut scratch.remote_batches,
+            &mut scratch.items_pool,
+            &mut responses,
+            false,
+        )
+        .await;
+        scratch.remote_batches[1].push((0, 0, Command::Get(Bytes::from("a"))));
+        scratch.remote_batches[1].push((2, 0, Command::Get(Bytes::from("b"))));
+        flush_remote_batches(
+            &router,
+            &scratch.responders,
+            &mut scratch.remote_batches,
+            &mut scratch.items_pool,
+            &mut responses,
+            false,
+        )
+        .await;
+        owner.join().unwrap();
+        // Replies are in place when it returns, and the batch was handed off.
+        let mut out = Vec::new();
+        responses[0].write_to(&mut out);
+        responses[2].write_to(&mut out);
+        assert_eq!(String::from_utf8_lossy(&out), ":100\r\n:102\r\n");
+        assert!(scratch.remote_batches.iter().all(|b| b.is_empty()));
+        recycle_conn_scratch(scratch);
     }
 
     #[monoio::test]
