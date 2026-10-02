@@ -428,9 +428,9 @@ Understand what "durable" means here today before relying on it:
   so a reply can't wait for its fsync — and the server refuses to start (or `CONFIG SET` fails)
   rather than silently running with weaker durability. `appendonly` can't be toggled at runtime;
   set it in the config file and restart. Expect to lose up to ~1 second of writes on a hard crash.
-- **RDB autosave**: the classic `save <seconds> <changes>` directive is parsed and stored, but
-  **nothing schedules a `BGSAVE` from it today** — drive periodic snapshots externally (e.g. a
-  cron job issuing `redis-cli BGSAVE`) if you need them.
+- **RDB autosave**: `save <seconds> <changes>` points schedule `BGSAVE` like Redis. Unlike
+  Redis there are no default save points; with none configured, nothing is saved automatically
+  (and not on shutdown).
 - **A known data-integrity gap**: keys currently offloaded to NVMe tiering
   (`RudisValue::Tiered`) serialize to **zero bytes** in an RDB image — see
   [`docs/rdbsave.md`](docs/rdbsave.md) before combining NVMe tiering with RDB-based backup in
