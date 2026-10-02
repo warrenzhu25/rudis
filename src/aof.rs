@@ -4,6 +4,17 @@ use std::path::{Path, PathBuf};
 use crate::resp::Command;
 use crate::shard::ShardDb;
 
+/// Absolute unix-ms deadline `d` from now. Expiries are written to the AOF as
+/// absolute times (like Redis' PEXPIREAT/PXAT propagation) so that downtime
+/// between write and replay does not extend a key's lifetime.
+fn unix_ms_after(d: std::time::Duration) -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        + d.as_millis()
+}
+
 #[derive(Clone, Debug)]
 pub struct AofConfig {
     pub enabled: bool,
@@ -254,8 +265,8 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             match expiry {
                 crate::resp::MsetexExpiry::KeepTtl => buf.extend_from_slice(b"$7\r\nKEEPTTL\r\n"),
                 crate::resp::MsetexExpiry::ExpireIn(d) => {
-                    buf.extend_from_slice(b"$2\r\nPX\r\n");
-                    let ms_str = d.as_millis().to_string();
+                    buf.extend_from_slice(b"$4\r\nPXAT\r\n");
+                    let ms_str = unix_ms_after(*d).to_string();
                     buf.extend_from_slice(
                         format!("${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
                     );
@@ -290,9 +301,10 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             Some(buf)
         }
         Command::Expire { key, duration, .. } => {
-            let ms = duration.as_millis().max(1);
-            let ms_str = ms.to_string();
-            buf.extend_from_slice(format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", key.len()).as_bytes());
+            let ms_str = unix_ms_after(*duration).to_string();
+            buf.extend_from_slice(
+                format!("*3\r\n$9\r\nPEXPIREAT\r\n${}\r\n", key.len()).as_bytes(),
+            );
             buf.extend_from_slice(key);
             buf.extend_from_slice(format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes());
             Some(buf)
@@ -1358,8 +1370,14 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             condition,
             fields,
         } => {
-            let cmd_name = if *is_at { "HPEXPIREAT" } else { "HPEXPIRE" };
-            let exp_s = expire_ms.to_string();
+            // Always propagate as an absolute deadline (see `unix_ms_after`).
+            let cmd_name = "HPEXPIREAT";
+            let exp_s = if *is_at {
+                expire_ms.to_string()
+            } else {
+                unix_ms_after(std::time::Duration::from_millis((*expire_ms).max(0) as u64))
+                    .to_string()
+            };
             let numfields_s = fields.len().to_string();
             let mut args: Vec<&[u8]> = vec![cmd_name.as_bytes(), key.as_ref(), exp_s.as_bytes()];
             match condition {
@@ -1416,8 +1434,9 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                     args.push(b"PERSIST");
                 }
                 crate::resp::HFieldExpireOpt::ExMs(ms) => {
-                    val_s = ms.to_string();
-                    args.push(b"PX");
+                    val_s = unix_ms_after(std::time::Duration::from_millis((*ms).max(0) as u64))
+                        .to_string();
+                    args.push(b"PXAT");
                     args.push(val_s.as_bytes());
                 }
                 crate::resp::HFieldExpireOpt::ExAtMs(ms) => {
@@ -1458,8 +1477,9 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                 crate::resp::HFieldExpireOpt::None | crate::resp::HFieldExpireOpt::Persist => {}
                 crate::resp::HFieldExpireOpt::KeepTtl => args.push(b"KEEPTTL"),
                 crate::resp::HFieldExpireOpt::ExMs(ms) => {
-                    val_s = ms.to_string();
-                    args.push(b"PX");
+                    val_s = unix_ms_after(std::time::Duration::from_millis((*ms).max(0) as u64))
+                        .to_string();
+                    args.push(b"PXAT");
                     args.push(val_s.as_bytes());
                 }
                 crate::resp::HFieldExpireOpt::ExAtMs(ms) => {
@@ -2081,8 +2101,7 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
         match val_ref {
             crate::table::RudisValue::String(val) => {
                 if let Some(exp) = entry.expire_at {
-                    let rem_ms = exp.duration_since(now).as_millis() as u64;
-                    let rem_ms_str = rem_ms.to_string();
+                    let rem_ms_str = unix_ms_after(exp.saturating_duration_since(now)).to_string();
                     writer.write_all(b"*5\r\n$3\r\nSET\r\n$")?;
                     writer.write_all(k.len().to_string().as_bytes())?;
                     writer.write_all(b"\r\n")?;
@@ -2091,7 +2110,7 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
                     writer.write_all(val.len().to_string().as_bytes())?;
                     writer.write_all(b"\r\n")?;
                     writer.write_all(val.as_ref())?;
-                    writer.write_all(b"\r\n$2\r\nPX\r\n$")?;
+                    writer.write_all(b"\r\n$4\r\nPXAT\r\n$")?;
                     writer.write_all(rem_ms_str.len().to_string().as_bytes())?;
                     writer.write_all(b"\r\n")?;
                     writer.write_all(rem_ms_str.as_bytes())?;
@@ -2352,9 +2371,8 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
         if !matches!(val_ref, crate::table::RudisValue::String(_))
             && let Some(exp) = entry.expire_at
         {
-            let rem_ms = exp.duration_since(now).as_millis() as u64;
-            let rem_ms_str = rem_ms.to_string();
-            writer.write_all(b"*3\r\n$7\r\nPEXPIRE\r\n$")?;
+            let rem_ms_str = unix_ms_after(exp.saturating_duration_since(now)).to_string();
+            writer.write_all(b"*3\r\n$9\r\nPEXPIREAT\r\n$")?;
             writer.write_all(k.len().to_string().as_bytes())?;
             writer.write_all(b"\r\n")?;
             writer.write_all(k)?;
@@ -2676,6 +2694,60 @@ mod tests {
         assert!(replay_aof_with(&p2, &mut db, true).is_err());
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_file(&p2);
+    }
+
+    #[test]
+    fn test_aof_expiries_are_absolute_so_downtime_does_not_extend_ttl() {
+        let dir = std::env::temp_dir().join(format!("rudis-aof-abs-exp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Live AOF: SET, then EXPIRE/PEXPIRE propagated as an absolute deadline.
+        let expire = Command::Expire {
+            key: Bytes::from_static(b"live"),
+            duration: Duration::from_millis(50),
+            opts: Default::default(),
+        };
+        let resp = command_to_resp(&expire).unwrap();
+        assert!(
+            resp.starts_with(b"*3\r\n$9\r\nPEXPIREAT\r\n"),
+            "{:?}",
+            String::from_utf8_lossy(&resp)
+        );
+        let mut live = SET_A.to_vec(); // SET a 1 (no TTL)
+        live.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$4\r\nlive\r\n$1\r\nx\r\n");
+        live.extend_from_slice(&resp);
+        let live_path = dir.join("live.aof");
+        std::fs::write(&live_path, &live).unwrap();
+
+        // Rewrite output for keys with TTLs (string and non-string).
+        let mut src = ShardDb::new(0);
+        src.set(
+            Bytes::from("rw_str"),
+            Bytes::from("v"),
+            Some(Duration::from_millis(50)),
+        );
+        src.rpush(Bytes::from("rw_list"), vec![Bytes::from("e")])
+            .unwrap();
+        src.table
+            .expire(b"rw_list", Duration::from_millis(50), Default::default());
+        rewrite_shard_aof(&mut src, &dir, 0).unwrap();
+
+        // "Downtime" longer than every TTL before replaying.
+        std::thread::sleep(Duration::from_millis(120));
+
+        let mut db = ShardDb::new(0);
+        replay_aof_with(&live_path, &mut db, true).unwrap();
+        assert_eq!(db.table.dbsize(), 1, "only the key without TTL may survive");
+
+        let mut db = ShardDb::new(0);
+        replay_aof_with(&dir.join("appendonly-0.aof"), &mut db, true).unwrap();
+        assert_eq!(
+            db.table.dbsize(),
+            0,
+            "rewritten keys must not outlive their TTL"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

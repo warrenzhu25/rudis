@@ -14811,3 +14811,55 @@ fn test_aof_truncated_tail_is_repaired_and_later_writes_survive_e2e() {
     shutdown_and_wait(port, &mut child);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_aof_ttls_do_not_survive_downtime_e2e() {
+    let port = 16985;
+    let dir = std::env::temp_dir().join(format!("rudis-aofttl-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--aof",
+        "true",
+        "--aof-dir",
+        dir.to_str().unwrap(),
+    ];
+
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["SET", "keep", "1"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SET", "e1", "1"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["PEXPIRE", "e1", "400"]), ":1\r\n");
+    let r = resp_cmd(&mut c, &["MSETEX", "1", "e2", "v", "PX", "400"]);
+    assert!(r == "+OK\r\n" || r == ":1\r\n", "{r}");
+    assert_eq!(
+        resp_cmd(&mut c, &["HSET", "h", "f", "v", "g", "w"]),
+        ":2\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["HPEXPIRE", "h", "400", "FIELDS", "1", "f"]),
+        "*1\r\n:1\r\n"
+    );
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+
+    // Downtime longer than every TTL: nothing may come back with a fresh TTL.
+    thread::sleep(Duration::from_millis(800));
+
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["EXISTS", "keep"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["EXISTS", "e1"]), ":0\r\n");
+    assert_eq!(resp_cmd(&mut c, &["EXISTS", "e2"]), ":0\r\n");
+    assert_eq!(resp_cmd(&mut c, &["HEXISTS", "h", "f"]), ":0\r\n");
+    assert_eq!(resp_cmd(&mut c, &["HEXISTS", "h", "g"]), ":1\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}
