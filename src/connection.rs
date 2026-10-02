@@ -8652,12 +8652,16 @@ async fn execute_command(
                 shard_conns.join(",")
             );
             let snap = crate::snapshot::state(router.base_port);
+            let aof_rw = crate::snapshot::aof_rewrite_state(router.base_port);
             let persistence_str = format!(
-                "# Persistence\r\nloading:0\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\n",
+                "# Persistence\r\nloading:0\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\naof_enabled:{}\r\naof_rewrite_in_progress:{}\r\naof_last_bgrewrite_status:{}\r\n",
                 snap.changes_since_last_save(),
                 u8::from(RDB_BGSAVE_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed)),
                 snap.last_save_unix(),
-                if snap.last_save_ok() { "ok" } else { "err" }
+                if snap.last_save_ok() { "ok" } else { "err" },
+                u8::from(router.aof.is_some()),
+                u8::from(aof_rw.in_progress()),
+                if aof_rw.last_ok() { "ok" } else { "err" }
             );
             let cmdstat_str = {
                 router.flush_all_command_stats().await;

@@ -15493,3 +15493,73 @@ fn test_bgrewriteaof_under_load_neither_loses_nor_duplicates_writes_e2e() {
     shutdown_and_wait(port, &mut child);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_failed_bgrewriteaof_is_reported_and_does_not_block_later_ones_e2e() {
+    let port = 16975;
+    let dir = std::env::temp_dir().join(format!("rudis-rewritefail-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "1",
+        "--no-pin",
+        "--aof",
+        "true",
+        "--aof-dir",
+        dir.to_str().unwrap(),
+    ];
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["SET", "rwf:k", "v"]), "+OK\r\n");
+    assert_eq!(info_field(&mut c, "aof_enabled"), "1");
+    let wait_rewrite = |c: &mut TcpStream| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while info_field(c, "aof_rewrite_in_progress") != "0" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rewrite never finished"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        info_field(c, "aof_last_bgrewrite_status")
+    };
+
+    // The AOF path is now a directory, so publishing the rewrite fails.
+    let aof = dir.join("appendonly-0.aof");
+    std::fs::remove_file(&aof).unwrap();
+    std::fs::create_dir(&aof).unwrap();
+    for _ in 0..2 {
+        let r = resp_cmd(&mut c, &["BGREWRITEAOF"]);
+        assert!(
+            r.starts_with('+'),
+            "a failed rewrite must not block the next: {r}"
+        );
+        assert_eq!(wait_rewrite(&mut c), "err");
+    }
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+
+    std::fs::remove_dir(&aof).unwrap();
+    assert!(resp_cmd(&mut c, &["BGREWRITEAOF"]).starts_with('+'));
+    assert_eq!(wait_rewrite(&mut c), "ok");
+    assert_eq!(resp_cmd(&mut c, &["SET", "rwf:after", "2"]), "+OK\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["GET", "rwf:k"]), "$1\r\nv\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "rwf:after"]), "$1\r\n2\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}

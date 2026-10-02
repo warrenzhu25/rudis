@@ -3232,7 +3232,21 @@ impl Router {
         Ok(())
     }
 
+    /// Rewrites every shard's AOF. Clears `is_saving` (set by
+    /// `bgrewriteaof`) however it ends, and records the outcome for INFO.
     pub async fn perform_rewrite_aof(&self) -> Result<usize, String> {
+        let status = crate::snapshot::aof_rewrite_state(self.base_port);
+        status.begin();
+        let res = self.rewrite_all_shard_aofs().await;
+        if let Err(e) = &res {
+            eprintln!("[Shard {}] BGREWRITEAOF failed: {}", self.shard_id, e);
+        }
+        status.finish(res.is_ok());
+        self.is_saving.store(false, Ordering::SeqCst);
+        res
+    }
+
+    async fn rewrite_all_shard_aofs(&self) -> Result<usize, String> {
         self.sync_aof().await;
         let mut total_rewritten = {
             let mut db = self.local_db.borrow_mut();
@@ -3242,29 +3256,33 @@ impl Router {
                 self.shard_id,
                 self.aof.as_ref(),
             )
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("shard {}: {}", self.shard_id, e))?
         };
 
         // Remote shards rewritten sequentially one-by-one to eliminate concurrent 15-shard I/O and memory spikes
+        let mut errors = Vec::new();
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
                 let (tx, rx) = flume::bounded(1);
-                if sender
+                let sent = sender
                     .send(ShardMessage::RewriteAof {
                         dir: self.db_dir.clone(),
                         shard_id: sid,
                         responder: tx,
                     })
-                    .is_ok()
-                    && let Ok(Ok(count)) = rx.recv_async().await
-                {
-                    total_rewritten += count;
+                    .is_ok();
+                match rx.recv_async().await {
+                    Ok(Ok(count)) if sent => total_rewritten += count,
+                    Ok(Err(e)) => errors.push(format!("shard {}: {}", sid, e)),
+                    _ => errors.push(format!("shard {}: no reply", sid)),
                 }
             }
         }
-
-        self.is_saving.store(false, Ordering::SeqCst);
-        Ok(total_rewritten)
+        if errors.is_empty() {
+            Ok(total_rewritten)
+        } else {
+            Err(errors.join("; "))
+        }
     }
 
     pub async fn generate_full_rdb(&self) -> Vec<u8> {
@@ -3621,6 +3639,40 @@ mod tests {
         std::fs::remove_dir(dir.join("dump.rdb")).unwrap();
         block_on(router.save_rdb()).unwrap();
         assert!(dir.join("dump.rdb").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_failed_rewrite_clears_flag_and_temp_file() {
+        let port = 19871;
+        let (mut router, db) = single_shard_router(port);
+        db.borrow_mut()
+            .set(Bytes::from("k"), Bytes::from("v"), None);
+        let dir = std::env::temp_dir().join(format!("rudis-rewritefail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        router.db_dir = dir.clone();
+        let status = crate::snapshot::aof_rewrite_state(router.base_port);
+        // The target is a directory, so publishing the rewrite fails.
+        std::fs::create_dir_all(dir.join("appendonly-0.aof")).unwrap();
+        for _ in 0..2 {
+            // As BGREWRITEAOF does before spawning the rewrite.
+            router.is_saving.store(true, Ordering::SeqCst);
+            assert!(block_on(router.perform_rewrite_aof()).is_err());
+            assert!(!router.is_saving.load(Ordering::SeqCst), "flag left set");
+            assert!(!status.last_ok());
+            assert!(!status.in_progress());
+        }
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "temp file left"
+        );
+        std::fs::remove_dir(dir.join("appendonly-0.aof")).unwrap();
+        router.is_saving.store(true, Ordering::SeqCst);
+        assert_eq!(block_on(router.perform_rewrite_aof()), Ok(1));
+        assert!(status.last_ok());
+        assert!(dir.join("appendonly-0.aof").is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

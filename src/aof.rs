@@ -2340,6 +2340,29 @@ pub fn reshard_aof_dir(dir: &Path, num_shards: usize, port: u16) -> std::io::Res
 }
 
 pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::io::Result<usize> {
+    static TMP_REWRITE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let tmp_id = TMP_REWRITE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = dir.join(format!(
+        "appendonly-{}.aof.tmp.{}_{}",
+        shard_id,
+        std::process::id(),
+        tmp_id
+    ));
+    let target_path = dir.join(format!("appendonly-{}.aof", shard_id));
+    let res = write_rewritten_aof(db, &tmp_path, &target_path);
+    if res.is_err() {
+        // Don't leave a partial rewrite behind.
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    res
+}
+
+/// Writes `db` as an AOF to `tmp_path`, fsyncs it and renames it to `target_path`.
+fn write_rewritten_aof(
+    db: &mut ShardDb,
+    tmp_path: &Path,
+    target_path: &Path,
+) -> std::io::Result<usize> {
     use std::io::Write;
     let mut count = 0;
     let now = std::time::Instant::now();
@@ -2356,17 +2379,7 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
         }
     }
 
-    static TMP_REWRITE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let tmp_id = TMP_REWRITE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp_path = dir.join(format!(
-        "appendonly-{}.aof.tmp.{}_{}",
-        shard_id,
-        std::process::id(),
-        tmp_id
-    ));
-    let target_path = dir.join(format!("appendonly-{}.aof", shard_id));
-
-    let file = std::fs::File::create(&tmp_path)?;
+    let file = std::fs::File::create(tmp_path)?;
     let mut writer = std::io::BufWriter::with_capacity(65536, file);
 
     // 1. Snapshot all non-expired entries in RudisTable as canonical RESP commands
@@ -2907,8 +2920,8 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
     writer.flush()?;
     let file = writer.into_inner().map_err(|e| e.into_error())?;
     file.sync_all()?;
-    std::fs::rename(&tmp_path, &target_path)?;
-    let _ = sync_parent_dir(&target_path);
+    std::fs::rename(tmp_path, target_path)?;
+    let _ = sync_parent_dir(target_path);
 
     Ok(count)
 }

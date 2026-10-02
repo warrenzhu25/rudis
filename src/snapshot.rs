@@ -132,6 +132,47 @@ pub fn format_save_points(points: &[(u64, u64)]) -> String {
         .join(" ")
 }
 
+/// BGREWRITEAOF status for INFO persistence (`aof_rewrite_in_progress`,
+/// `aof_last_bgrewrite_status`).
+pub struct AofRewriteState {
+    in_progress: AtomicBool,
+    last_ok: AtomicBool,
+}
+
+static AOF_REWRITE_STATES: Mutex<Option<HashMap<u16, Arc<AofRewriteState>>>> = Mutex::new(None);
+
+pub fn aof_rewrite_state(port: u16) -> Arc<AofRewriteState> {
+    let mut map = AOF_REWRITE_STATES.lock().unwrap_or_else(|e| e.into_inner());
+    map.get_or_insert_with(HashMap::new)
+        .entry(port)
+        .or_insert_with(|| {
+            Arc::new(AofRewriteState {
+                in_progress: AtomicBool::new(false),
+                last_ok: AtomicBool::new(true),
+            })
+        })
+        .clone()
+}
+
+impl AofRewriteState {
+    pub fn begin(&self) {
+        self.in_progress.store(true, Ordering::Relaxed);
+    }
+
+    pub fn finish(&self, ok: bool) {
+        self.last_ok.store(ok, Ordering::Relaxed);
+        self.in_progress.store(false, Ordering::Relaxed);
+    }
+
+    pub fn in_progress(&self) -> bool {
+        self.in_progress.load(Ordering::Relaxed)
+    }
+
+    pub fn last_ok(&self) -> bool {
+        self.last_ok.load(Ordering::Relaxed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
