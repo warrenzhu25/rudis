@@ -195,6 +195,7 @@ fn main() {
     }
 
     rudis::aof::set_aof_load_truncated(server_config.aof_load_truncated);
+    rudis::mailbox::set_cross_shard_spin(server_config.cross_shard_spin);
     rudis::config::set_save_points(port, server_config.save_points.clone());
     let aof_config = rudis::aof::AofConfig {
         enabled: server_config.appendonly,

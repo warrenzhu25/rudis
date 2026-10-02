@@ -9139,7 +9139,7 @@ async fn execute_command(
                     let backup_dir = CONFIG_BACKUPDIRNAME.read().unwrap().clone();
                     let slaveof_cfg = CONFIG_SLAVEOF.read().unwrap().clone();
 
-                    let all_configs: [(&str, String); 43] = [
+                    let all_configs: [(&str, String); 44] = [
                         ("port", port_str),
                         (
                             "protected-mode",
@@ -9186,6 +9186,10 @@ async fn execute_command(
                         (
                             "appendfsync",
                             crate::aof::appendfsync_name(router.base_port).to_string(),
+                        ),
+                        (
+                            "cross-shard-spin",
+                            crate::mailbox::cross_shard_spin().to_string(),
                         ),
                         (
                             "aof-load-truncated",
@@ -9317,6 +9321,13 @@ async fn execute_command(
                             if requested != router.aof.is_some() {
                                 out.extend_from_slice(
                                     b"-ERR CONFIG SET failed (possibly related to argument 'appendonly') - changing appendonly at runtime is not supported; set it in the config file and restart\r\n",
+                                );
+                                return false;
+                            }
+                        } else if p_str == "cross-shard-spin" {
+                            if val_str.parse::<usize>().is_err() {
+                                out.extend_from_slice(
+                                    b"-ERR CONFIG SET failed (possibly related to argument 'cross-shard-spin') - argument must be a non-negative integer\r\n",
                                 );
                                 return false;
                             }
@@ -9707,6 +9718,10 @@ async fn execute_command(
                             *CONFIG_OOM_SCORE_ADJ.write().unwrap() = val_str.to_string();
                         } else if p_str == "oom-score-adj-values" {
                             *CONFIG_OOM_SCORE_ADJ_VALUES.write().unwrap() = val_str.to_string();
+                        } else if p_str == "cross-shard-spin" {
+                            if let Ok(n) = val_str.parse::<usize>() {
+                                crate::mailbox::set_cross_shard_spin(n);
+                            }
                         } else if p_str == "appendfsync" {
                             // Validated in phase 1.
                             if let Ok(every_sec) = crate::aof::parse_appendfsync(&val_str) {
@@ -23679,8 +23694,9 @@ async fn flush_remote_batches(
         }
     }
 
-    // Await parallel responses from all remote shards with lock-free spin-wait before async yield
-    for _spin in 0..256 {
+    // Await the replies; optionally poll first (`cross-shard-spin`, default 0)
+    // before parking so the event loop can serve other connections meanwhile.
+    for _spin in 0..crate::mailbox::cross_shard_spin() {
         if pending_mask == 0 {
             break;
         }

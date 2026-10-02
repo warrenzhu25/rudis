@@ -874,7 +874,7 @@ impl Router {
             };
             let res = if self.senders[target].send(msg).is_ok() {
                 if !desc.done.load(Ordering::Acquire) {
-                    for _ in 0..32 {
+                    for _ in 0..crate::mailbox::cross_shard_spin() {
                         std::hint::spin_loop();
                         if desc.done.load(Ordering::Acquire) {
                             break;
@@ -1111,7 +1111,7 @@ impl Router {
                 descriptor: desc.clone(),
             };
             if self.senders[target].send(msg).is_ok() && !desc.done.load(Ordering::Acquire) {
-                for _ in 0..32 {
+                for _ in 0..crate::mailbox::cross_shard_spin() {
                     std::hint::spin_loop();
                     if desc.done.load(Ordering::Acquire) {
                         break;
@@ -1197,12 +1197,8 @@ impl Router {
         let mut chosen = None;
         while let Some(desc) = pool.pop() {
             if desc.results.len() >= total_keys && desc.recycled_keys.len() >= self.num_shards {
-                for _ in 0..128 {
-                    if Arc::strong_count(&desc) == 1 {
-                        break;
-                    }
-                    std::hint::spin_loop();
-                }
+                // Reuse only if the owner shard already dropped its clone;
+                // otherwise keep it pooled rather than spin waiting for it.
                 if Arc::strong_count(&desc) == 1 {
                     chosen = Some(desc);
                     break;
@@ -1240,12 +1236,8 @@ impl Router {
         let mut chosen = None;
         while let Some(desc) = pool.pop() {
             if desc.recycled_pairs.len() >= self.num_shards {
-                for _ in 0..128 {
-                    if Arc::strong_count(&desc) == 1 {
-                        break;
-                    }
-                    std::hint::spin_loop();
-                }
+                // Reuse only if the owner shard already dropped its clone;
+                // otherwise keep it pooled rather than spin waiting for it.
                 if Arc::strong_count(&desc) == 1 {
                     chosen = Some(desc);
                     break;
@@ -1352,7 +1344,9 @@ impl Router {
         }
 
         // Wait for all remote shards to complete their writes
-        descriptor.wait_completed(64, &notify_rx).await;
+        descriptor
+            .wait_completed(crate::mailbox::cross_shard_spin(), &notify_rx)
+            .await;
 
         let recycled = descriptor.take_recycled_keys();
         self.mget_batch_pool.borrow_mut().push(recycled);
@@ -1483,7 +1477,9 @@ impl Router {
         } = inflight;
 
         // Wait for all remote shards to complete their writes
-        descriptor.wait_completed(256, &notify_rx).await;
+        descriptor
+            .wait_completed(crate::mailbox::cross_shard_spin(), &notify_rx)
+            .await;
 
         let recycled = descriptor.take_recycled_keys();
         self.mget_batch_pool.borrow_mut().push(recycled);
@@ -1627,7 +1623,9 @@ impl Router {
             notify_rx,
         } = inflight;
 
-        descriptor.wait_completed(64, &notify_rx).await;
+        descriptor
+            .wait_completed(crate::mailbox::cross_shard_spin(), &notify_rx)
+            .await;
 
         let recycled = descriptor.take_recycled_pairs();
         self.mset_batch_pool.borrow_mut().push(recycled);
@@ -2377,7 +2375,7 @@ impl Router {
         };
         let res = if self.senders[target].send(msg).is_ok() {
             let mut completed = false;
-            for _spin in 0..48 {
+            for _spin in 0..crate::mailbox::cross_shard_spin() {
                 if responder.try_take().is_some() {
                     completed = true;
                     break;

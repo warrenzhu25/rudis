@@ -15563,3 +15563,81 @@ fn test_failed_bgrewriteaof_is_reported_and_does_not_block_later_ones_e2e() {
     shutdown_and_wait(port, &mut child);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_cross_shard_spin_config_and_replies_with_or_without_polling_e2e() {
+    let port = 16974;
+    let dir = std::env::temp_dir().join(format!("rudis-spin-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let conf = dir.join("spin.conf");
+    std::fs::write(&conf, "cross-shard-spin 32\n").unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "4",
+        "--no-pin",
+        "-c",
+        conf.to_str().unwrap(),
+    ];
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let get = |c: &mut TcpStream| resp_cmd(c, &["CONFIG", "GET", "cross-shard-spin"]);
+    assert_eq!(get(&mut c), "*2\r\n$16\r\ncross-shard-spin\r\n$2\r\n32\r\n");
+
+    for spin in ["32", "0"] {
+        assert_eq!(
+            resp_cmd(&mut c, &["CONFIG", "SET", "cross-shard-spin", spin]),
+            "+OK\r\n"
+        );
+        // 40 keys spread over all 4 shards: single-key hops, MSET/MGET
+        // scatter and a pipelined batch must all answer with spin 32 or 0.
+        let keys: Vec<String> = (0..40).map(|i| format!("spin{spin}:k{i}")).collect();
+        for (i, k) in keys.iter().enumerate().take(10) {
+            assert_eq!(resp_cmd(&mut c, &["SET", k, &format!("v{i}")]), "+OK\r\n");
+            assert_eq!(
+                resp_cmd(&mut c, &["GET", k]),
+                format!("${}\r\nv{}\r\n", i.to_string().len() + 1, i)
+            );
+        }
+        let mut mset = vec!["MSET".to_string()];
+        for (i, k) in keys.iter().enumerate() {
+            mset.push(k.clone());
+            mset.push(format!("v{i}"));
+        }
+        let mset: Vec<&str> = mset.iter().map(String::as_str).collect();
+        assert_eq!(resp_cmd(&mut c, &mset), "+OK\r\n");
+        let mut mget = vec!["MGET"];
+        mget.extend(keys.iter().map(String::as_str));
+        let mut expected = format!("*{}\r\n", keys.len());
+        for i in 0..keys.len() {
+            expected.push_str(&format!("${}\r\nv{}\r\n", i.to_string().len() + 1, i));
+        }
+        assert_eq!(resp_cmd(&mut c, &mget), expected);
+
+        let mut pipeline = String::new();
+        let mut expected = String::new();
+        for (i, k) in keys.iter().enumerate() {
+            pipeline.push_str(&format!("*2\r\n$3\r\nGET\r\n${}\r\n{}\r\n", k.len(), k));
+            expected.push_str(&format!("${}\r\nv{}\r\n", i.to_string().len() + 1, i));
+        }
+        c.write_all(pipeline.as_bytes()).unwrap();
+        let mut got = vec![0u8; expected.len()];
+        c.read_exact(&mut got).unwrap();
+        assert_eq!(String::from_utf8_lossy(&got), expected);
+    }
+    assert_eq!(get(&mut c), "*2\r\n$16\r\ncross-shard-spin\r\n$1\r\n0\r\n");
+
+    for bad in ["-1", "lots"] {
+        let r = resp_cmd(&mut c, &["CONFIG", "SET", "cross-shard-spin", bad]);
+        assert!(r.starts_with("-ERR"), "{r}");
+    }
+    assert_eq!(get(&mut c), "*2\r\n$16\r\ncross-shard-spin\r\n$1\r\n0\r\n");
+
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}

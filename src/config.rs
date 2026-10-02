@@ -17,6 +17,8 @@ pub struct RudisConfig {
     /// `appendfsync`: true = everysec (default), false = no. `always` is
     /// rejected at parse time.
     pub appendfsync_every_sec: bool,
+    /// `cross-shard-spin`: polls before parking on a cross-shard reply.
+    pub cross_shard_spin: usize,
     pub aof_load_truncated: bool,
     pub dir: PathBuf,
     pub requirepass: Option<String>,
@@ -45,6 +47,7 @@ impl Default for RudisConfig {
             maxmemory_policy: "noeviction".to_string(),
             appendonly: false,
             appendfsync_every_sec: true,
+            cross_shard_spin: 0,
             aof_load_truncated: true,
             dir: PathBuf::from("."),
             requirepass: None,
@@ -181,6 +184,11 @@ impl RudisConfig {
                             ));
                         }
                     };
+                }
+                "cross-shard-spin" => {
+                    config.cross_shard_spin = rest[0].parse::<usize>().map_err(|e| {
+                        format!("Invalid cross-shard-spin at line {}: {}", line_num + 1, e)
+                    })?;
                 }
                 "appendfsync" => {
                     config.appendfsync_every_sec =
@@ -502,6 +510,19 @@ mod tests {
                 .aof_load_truncated
         );
         assert!(RudisConfig::parse_str("aof-load-truncated maybe").is_err());
+    }
+
+    #[test]
+    fn test_parse_cross_shard_spin() {
+        assert_eq!(RudisConfig::parse_str("").unwrap().cross_shard_spin, 0);
+        assert_eq!(
+            RudisConfig::parse_str("cross-shard-spin 64")
+                .unwrap()
+                .cross_shard_spin,
+            64
+        );
+        assert!(RudisConfig::parse_str("cross-shard-spin -1").is_err());
+        assert!(RudisConfig::parse_str("cross-shard-spin lots").is_err());
     }
 
     #[test]

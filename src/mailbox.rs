@@ -21,6 +21,21 @@ impl<T> std::ops::DerefMut for CachePadded<T> {
     }
 }
 
+/// `cross-shard-spin`: how many times a connection polls for a cross-shard
+/// reply before parking its task. Polling burns the shard's CPU while other
+/// connections on it wait, so the default is 0 (park immediately and let the
+/// event loop serve them); a small value can shave latency on idle servers.
+static CROSS_SHARD_SPIN: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_cross_shard_spin(iters: usize) {
+    CROSS_SHARD_SPIN.store(iters, Ordering::Relaxed);
+}
+
+#[inline(always)]
+pub fn cross_shard_spin() -> usize {
+    CROSS_SHARD_SPIN.load(Ordering::Relaxed)
+}
+
 /// Shared-memory Scatter-Gather Descriptor for multi-shard MGET.
 pub const DESC_RUNNING: u8 = 0;
 pub const DESC_COMPLETED: u8 = 1;
@@ -735,6 +750,15 @@ mod tests {
             64
         );
         assert!(std::mem::size_of::<CachePadded<UnsafeCell<Option<Bytes>>>>() >= 64);
+    }
+
+    #[test]
+    fn test_cross_shard_spin_knob_defaults_to_parking() {
+        assert_eq!(cross_shard_spin(), 0);
+        set_cross_shard_spin(64);
+        assert_eq!(cross_shard_spin(), 64);
+        set_cross_shard_spin(0);
+        assert_eq!(cross_shard_spin(), 0);
     }
 
     #[test]
