@@ -2087,7 +2087,7 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
     let line = &buf[1..newline_pos];
     if line.starts_with(b"-") {
         buf.advance(advance_len);
-        return Ok(None);
+        return parse_command(buf);
     }
     let num_args: usize = match parse_decimal_bytes(line) {
         Some(n) => {
@@ -2100,7 +2100,7 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
     };
     if num_args == 0 {
         buf.advance(advance_len);
-        return Ok(None);
+        return parse_command(buf);
     }
 
     // First check if the full frame is present before consuming any bytes from buf
@@ -2137,7 +2137,7 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
         };
 
         if arg_len > get_proto_max_bulk_len() {
-            return Err("Protocol error: excessive bulk string length".to_string());
+            return Err("Protocol error: invalid bulk length".to_string());
         }
 
         let data_start = scan_cursor + next_advance;
@@ -2491,7 +2491,7 @@ fn parse_inline_command(buf: &mut BytesMut) -> Result<Option<Command>, String> {
     buf.advance(advance_len);
 
     if parts.is_empty() {
-        return Ok(None);
+        return parse_command(buf);
     }
 
     build_command(parts)
@@ -10637,6 +10637,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
                 "STATS" => Ok(Some(Command::FunctionStats)),
                 "KILL" => Ok(Some(Command::FunctionKill)),
+                "HELP" => Ok(Some(Command::Unknown("FUNCTION HELP".to_string()))),
                 "DELETE" => {
                     if args.len() != 3 {
                         return Err(
@@ -14622,7 +14623,7 @@ mod tests {
         set_proto_max_bulk_len(5);
         let mut buf = BytesMut::from("*2\r\n$4\r\nECHO\r\n$6\r\n123456\r\n");
         let err = parse_command(&mut buf).unwrap_err();
-        assert!(err.contains("excessive bulk string length"));
+        assert!(err.contains("invalid bulk length"));
         set_proto_max_bulk_len(old);
 
         // XINFO STREAM

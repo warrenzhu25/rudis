@@ -3618,7 +3618,85 @@ impl RudisTable {
         key_type: Option<&[u8]>,
     ) -> (usize, Vec<Bytes>) {
         let bound = self.table.cursor_bound();
-        if cursor >= bound || bound == 0 {
+        if bound == 0 {
+            return (0, Vec::new());
+        }
+        if self.table.len() <= 8192 {
+            let mut candidates: Vec<(usize, usize)> = Vec::with_capacity(self.table.len());
+            for cur in 0..bound {
+                let idx = self.table.cursor_to_global_idx(cur);
+                if !self.check_expired_slot(idx)
+                    && let Some(entry) = self.table.get_slot(idx)
+                {
+                    let eh = ((xxhash_rust::xxh3::xxh3_64(&entry.key) as u32) | 1) as usize;
+                    if cursor == 0 || eh >= cursor {
+                        candidates.push((eh, idx));
+                    }
+                }
+            }
+            candidates.sort_unstable_by_key(|(eh, _)| *eh);
+            let mut res = Vec::new();
+            let mut next_cursor = 0usize;
+            let mut inspected = 0usize;
+            for (i, &(eh, idx)) in candidates.iter().enumerate() {
+                if let Some(entry) = self.table.get_slot(idx) {
+                    let matches = match pattern {
+                        Some(pat) => crate::pubsub::glob_match(pat, &entry.key),
+                        None => true,
+                    };
+                    let type_matches = match key_type {
+                        Some(t) => {
+                            let actual_type = match &entry.val {
+                                RudisValue::String(_) | RudisValue::Int(_) => "string",
+                                RudisValue::Hash(_) | RudisValue::SmallHash(_) => "hash",
+                                RudisValue::List(_) => "list",
+                                RudisValue::Set(_) => "set",
+                                RudisValue::ZSet(_) => "zset",
+                                RudisValue::HyperLogLog(_) => "string",
+                                RudisValue::Stream(_) => "stream",
+                                RudisValue::Tiered(ptr) => match ptr.value_type {
+                                    0 => "string",
+                                    1 => "list",
+                                    2 => "set",
+                                    3 => "zset",
+                                    4 => "hash",
+                                    5 => "string",
+                                    6 => "stream",
+                                    _ => "none",
+                                },
+                                RudisValue::Cooled { val, .. } => match &**val {
+                                    RudisValue::String(_) | RudisValue::Int(_) => "string",
+                                    RudisValue::Hash(_) | RudisValue::SmallHash(_) => "hash",
+                                    RudisValue::List(_) => "list",
+                                    RudisValue::Set(_) => "set",
+                                    RudisValue::ZSet(_) => "zset",
+                                    RudisValue::HyperLogLog(_) => "string",
+                                    RudisValue::Stream(_) => "stream",
+                                    _ => "none",
+                                },
+                            };
+                            actual_type.as_bytes().eq_ignore_ascii_case(t)
+                        }
+                        None => true,
+                    };
+                    if matches && type_matches {
+                        res.push(entry.key.clone());
+                    }
+                }
+                inspected += 1;
+                if inspected >= count {
+                    for next_cand in &candidates[i + 1..] {
+                        if next_cand.0 > eh {
+                            next_cursor = next_cand.0;
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+            return (next_cursor, res);
+        }
+        if cursor >= bound {
             return (0, Vec::new());
         }
         let mut res = Vec::new();

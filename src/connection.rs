@@ -7215,7 +7215,7 @@ async fn execute_command(
     };
 
     wait_if_client_paused(router.port, client_id, &cmd).await;
-    if has_monitor_clients() && !matches!(cmd, Command::Monitor) {
+    if has_monitor_clients() && !matches!(cmd, Command::Monitor | Command::Reset | Command::Quit) {
         let addr_s = client_registry
             .borrow()
             .get(&client_id)
@@ -22376,6 +22376,18 @@ pub fn execute_local_command(
             false
         }
         Command::Unknown(cmd_name) => {
+            if let Some(cmd_prefix) = cmd_name.strip_suffix(" HELP") {
+                let first_line = format!(
+                    "{} <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+                    cmd_prefix
+                );
+                let help_lines = [first_line.as_str(), "HELP -- Print this help."];
+                write_resp_array_header(out, help_lines.len());
+                for line in help_lines {
+                    write_resp_bulk(out, line.as_bytes());
+                }
+                return false;
+            }
             let resp = format!("-ERR unknown command '{}'\r\n", cmd_name);
             out.extend_from_slice(resp.as_bytes());
             false

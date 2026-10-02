@@ -2323,7 +2323,14 @@ impl Router {
     }
 
     pub async fn flushdb(&self) {
-        self.local_db.borrow_mut().flushdb();
+        {
+            let mut db = self.local_db.borrow_mut();
+            db.flushdb();
+            crate::block::get_block_hub_for_port(self.port)
+                .lock()
+                .unwrap()
+                .notify_all_streams(&mut db);
+        }
         if let Some(aof) = &self.aof
             && let Some(bytes) = crate::aof::command_to_resp(&Command::Flushdb)
         {

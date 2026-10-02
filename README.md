@@ -60,6 +60,7 @@ are called out explicitly rather than left implicit, both here and in the linked
   - [8. Dual-Protocol Engine: Redis + Memcached](#8-dual-protocol-engine-redis--memcached)
   - [9. Agent Memory, LLM Quota, Checkpoints & MCP Server](#9-agent-memory-llm-quota-checkpoints--mcp-server)
 - [Subsystem & Feature Matrix](#subsystem--feature-matrix)
+- [Redis/Valkey TCL Compatibility Suite](#redisvalkey-tcl-compatibility-suite)
 - [Documentation & Contributor Guides](#documentation--contributor-guides)
 
 ---
@@ -650,6 +651,28 @@ links go to the corresponding source-verified subsystem specification.
 | **`SO_ZEROCOPY` send path** | Experimental, not on live path | Correct primitives in `src/zerocopy.rs`; unused by the real connection write path. | [10](docs/design/10_kernel_bypass_xdp.md) |
 | **Kernel TLS (kTLS)** | Attempted, inert | `rustls` handles real TLS; kernel offload is attempted best-effort and its result is currently discarded. | [15](docs/design/15_security_tls.md) |
 | **Jemalloc memory telemetry** | Implemented | Global allocator is `tikv-jemallocator`; live stats via `tikv-jemalloc-ctl` in `INFO memory`. | [15](docs/design/15_security_tls.md) |
+
+---
+
+## Redis/Valkey TCL Compatibility Suite
+
+Rudis is continuously validated against **49 official Redis/Valkey TCL test suites** in `tests/redis-tests` via [`scripts/run_redis_test_suite.sh`](scripts/run_redis_test_suite.sh):
+
+```bash
+# Run all 49 core TCL suites
+./scripts/run_redis_test_suite.sh 16379 all
+
+# Run a specific suite or comma-separated list of suites
+./scripts/run_redis_test_suite.sh 16379 "unit/tracking,unit/acl-v2,unit/acl"
+```
+
+| Category | Passing TCL Suites (49) |
+| :--- | :--- |
+| **Core Data Types** | `unit/type/string`, `unit/type/incr`, `unit/type/increx`, `unit/type/hash`, `unit/type/hash-field-expire`, `unit/type/list`, `unit/type/list-2`, `unit/type/list-3`, `unit/type/list-4`, `unit/type/set`, `unit/type/zset`, `unit/type/stream`, `unit/type/stream-cgroups`, `unit/bitops`, `unit/bitfield`, `unit/hyperloglog`, `unit/geo`, `unit/sort` |
+| **Keyspace & Lifecycle** | `unit/expire`, `unit/keyspace`, `unit/scan`, `unit/dump`, `unit/lazyfree`, `unit/maxmemory`, `unit/gcra` |
+| **Transactions, Scripting & Pub/Sub** | `unit/multi`, `unit/scripting`, `unit/functions`, `unit/pubsub`, `unit/pubsubshard`, `unit/tracking` |
+| **Auth, ACLs & Protocol** | `unit/auth`, `unit/acl`, `unit/acl-v2`, `unit/protocol`, `unit/quit`, `unit/limits`, `unit/obuf-limits`, `unit/replybufsize`, `unit/querybuf` |
+| **Introspection & Telemetry** | `unit/info`, `unit/info-command`, `unit/introspection`, `unit/introspection-2`, `unit/slowlog`, `unit/latency-monitor`, `unit/pause`, `unit/other`, `unit/printver` |
 
 ---
 
