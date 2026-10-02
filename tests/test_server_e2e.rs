@@ -16142,9 +16142,21 @@ fn test_pipelined_commands_counted_in_commandstats_e2e() {
         got.extend_from_slice(&buf[..n]);
     }
 
-    c.write_all(b"*2\r\n$4\r\nINFO\r\n$12\r\ncommandstats\r\n")
-        .unwrap();
+    let info = info_section(&mut c, "commandstats");
+    for (cmd, calls) in [("set", N), ("get", N), ("mget", 1)] {
+        let want = format!("cmdstat_{cmd}:calls={calls},");
+        assert!(info.contains(&want), "missing {want:?} in:\n{info}");
+    }
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}
+
+/// Sends `INFO <section>` and returns the whole bulk reply.
+fn info_section(c: &mut TcpStream, section: &str) -> String {
+    let req = format!("*2\r\n$4\r\nINFO\r\n${}\r\n{}\r\n", section.len(), section);
+    c.write_all(req.as_bytes()).unwrap();
     let mut info = Vec::new();
+    let mut buf = [0u8; 65536];
     loop {
         let n = c.read(&mut buf).unwrap();
         assert!(n > 0, "connection closed");
@@ -16155,14 +16167,73 @@ fn test_pipelined_commands_counted_in_commandstats_e2e() {
                 .parse()
                 .unwrap();
             if info.len() >= hdr_end + 2 + len + 2 {
-                break;
+                return String::from_utf8(info).unwrap();
             }
         }
     }
-    let info = String::from_utf8(info).unwrap();
-    for (cmd, calls) in [("set", N), ("get", N), ("mget", 1)] {
-        let want = format!("cmdstat_{cmd}:calls={calls},");
-        assert!(info.contains(&want), "missing {want:?} in:\n{info}");
+}
+
+/// Returns the `field=` value of `cmdstat_<cmd>` in an INFO commandstats reply.
+fn cmdstat_field(info: &str, cmd: &str, field: &str) -> f64 {
+    let prefix = format!("cmdstat_{cmd}:");
+    let line = info
+        .lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("no {prefix} in:\n{info}"));
+    line.split(',')
+        .find_map(|kv| kv.strip_prefix(&format!("{field}=")))
+        .unwrap_or_else(|| panic!("no {field} in {line}"))
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn test_commandstats_reports_measured_usec_e2e() {
+    let port = 16964;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    assert_eq!(resp_cmd(&mut c, &["DEBUG", "SLEEP", "0.05"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SET", "us:k", "v"]), "+OK\r\n");
+
+    // Pipelined commands take the batched path.
+    let mut pipeline = String::new();
+    for i in 0..2000 {
+        let k = format!("us:{i}");
+        pipeline.push_str(&format!(
+            "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n$1\r\nv\r\n",
+            k.len(),
+            k
+        ));
+        pipeline.push_str(&format!("*2\r\n$3\r\nGET\r\n${}\r\n{}\r\n", k.len(), k));
+    }
+    pipeline.push_str("*1\r\n$4\r\nPING\r\n");
+    c.write_all(pipeline.as_bytes()).unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 65536];
+    while !got.ends_with(b"+PONG\r\n") {
+        let n = c.read(&mut buf).unwrap();
+        assert!(n > 0, "connection closed");
+        got.extend_from_slice(&buf[..n]);
+    }
+
+    let info = info_section(&mut c, "commandstats");
+    let debug_usec = cmdstat_field(&info, "debug", "usec");
+    assert!(
+        debug_usec >= 50_000.0,
+        "DEBUG SLEEP 0.05 took {debug_usec}us:\n{info}"
+    );
+    assert!(
+        cmdstat_field(&info, "debug", "usec_per_call") >= 50_000.0,
+        "{info}"
+    );
+    for cmd in ["set", "get"] {
+        let usec = cmdstat_field(&info, cmd, "usec");
+        let per_call = cmdstat_field(&info, cmd, "usec_per_call");
+        assert!(usec > 0.0, "{cmd} usec {usec}:\n{info}");
+        assert!(per_call < 1000.0, "{cmd} usec_per_call {per_call}:\n{info}");
     }
     drop(c);
     shutdown_and_wait(port, &mut child);

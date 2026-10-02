@@ -611,27 +611,38 @@ static CLIENT_WATCH_TAINTED: std::sync::LazyLock<
     std::sync::RwLock<hashbrown::HashMap<(u16, u64), bool>>,
 > = std::sync::LazyLock::new(|| std::sync::RwLock::new(hashbrown::HashMap::new()));
 
-pub static CMD_STATS: std::sync::LazyLock<std::sync::RwLock<hashbrown::HashMap<String, u64>>> =
+/// Calls and total execution time of one command, as reported by
+/// INFO commandstats.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct CmdStat {
+    pub calls: u64,
+    pub nanos: u64,
+}
+
+pub static CMD_STATS: std::sync::LazyLock<std::sync::RwLock<hashbrown::HashMap<String, CmdStat>>> =
     std::sync::LazyLock::new(|| std::sync::RwLock::new(hashbrown::HashMap::new()));
 pub static MIN_REPLICAS_TO_WRITE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 thread_local! {
-    static LOCAL_CMD_STATS: RefCell<hashbrown::HashMap<&'static str, u64>> = RefCell::new(hashbrown::HashMap::new());
+    static LOCAL_CMD_STATS: RefCell<hashbrown::HashMap<&'static str, CmdStat>> = RefCell::new(hashbrown::HashMap::new());
     static LOCAL_CMD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub static CURRENT_AUTH_USER: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 #[inline]
 pub fn record_cmd_stat(name: &'static str) {
-    record_cmd_stats(name, 1);
+    record_cmd_stats(name, 1, 0);
 }
 
-/// Adds `calls` calls of `name` to this thread's command statistics.
-pub fn record_cmd_stats(name: &'static str, calls: u64) {
+/// Adds `calls` calls of `name` taking `nanos` in total to this thread's
+/// command statistics.
+pub fn record_cmd_stats(name: &'static str, calls: u64, nanos: u64) {
     LOCAL_CMD_STATS.with(|stats| {
         let mut map = stats.borrow_mut();
-        *map.entry(name).or_insert(0) += calls;
+        let stat = map.entry(name).or_default();
+        stat.calls += calls;
+        stat.nanos += nanos;
     });
     LOCAL_CMD_COUNT.with(|count| {
         let c = count.get() + calls as usize;
@@ -644,31 +655,86 @@ pub fn record_cmd_stats(name: &'static str, calls: u64) {
     });
 }
 
-/// Counts consecutive runs of the same command so a pipeline of N identical
-/// commands costs one statistics update instead of N.
-#[derive(Default)]
-struct CmdStatRun {
-    name: &'static str,
-    calls: u64,
+/// Commands whose run time includes waiting for data, replicas or fsync.
+/// Like Redis, the wait is not counted as execution time.
+fn may_block(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Blpop { .. }
+            | Command::Brpop { .. }
+            | Command::Blmpop { .. }
+            | Command::Blmove { .. }
+            | Command::Bzpopmin { .. }
+            | Command::Bzpopmax { .. }
+            | Command::Bzmpop { .. }
+            | Command::Xread { .. }
+            | Command::Xreadgroup { .. }
+            | Command::Wait { .. }
+            | Command::WaitAof { .. }
+    )
 }
 
-impl CmdStatRun {
-    #[inline]
-    fn note(&mut self, name: &'static str) {
-        if std::ptr::eq(name, self.name) {
-            self.calls += 1;
-        } else {
-            self.flush();
-            self.name = name;
-            self.calls = 1;
+/// Records one call of a command run by `execute_command`, timed from
+/// `start` until the guard drops.
+struct CmdStatGuard {
+    name: &'static str,
+    start: Option<std::time::Instant>,
+}
+
+impl Drop for CmdStatGuard {
+    fn drop(&mut self) {
+        let nanos = self.start.map_or(0, |s| s.elapsed().as_nanos() as u64);
+        record_cmd_stats(self.name, 1, nanos);
+    }
+}
+
+/// Command statistics for one batched pipeline. Calls are tallied per
+/// command name; the time of each segment (the stretch between `restart`
+/// and `flush`) is split across the commands counted in it in proportion
+/// to their calls. That costs two clock reads per segment instead of two
+/// per command.
+struct CmdStatBatch {
+    start: std::time::Instant,
+    runs: smallvec::SmallVec<[(&'static str, u64); 8]>,
+}
+
+impl CmdStatBatch {
+    fn new() -> Self {
+        Self {
+            start: std::time::Instant::now(),
+            runs: smallvec::SmallVec::new(),
         }
     }
 
-    fn flush(&mut self) {
-        if self.calls > 0 {
-            record_cmd_stats(self.name, self.calls);
-            self.calls = 0;
+    #[inline]
+    fn note(&mut self, name: &'static str) {
+        if let Some(last) = self.runs.last_mut()
+            && std::ptr::eq(last.0, name)
+        {
+            last.1 += 1;
+        } else if let Some(run) = self.runs.iter_mut().find(|r| std::ptr::eq(r.0, name)) {
+            run.1 += 1;
+        } else {
+            self.runs.push((name, 1));
         }
+    }
+
+    /// Ends the current segment and records its commands.
+    fn flush(&mut self) {
+        if self.runs.is_empty() {
+            return;
+        }
+        let elapsed = self.start.elapsed().as_nanos();
+        let total: u64 = self.runs.iter().map(|r| r.1).sum();
+        for (name, calls) in self.runs.drain(..) {
+            let nanos = elapsed * u128::from(calls) / u128::from(total);
+            record_cmd_stats(name, calls, nanos as u64);
+        }
+    }
+
+    /// Starts a new segment, leaving out the time since the last `flush`.
+    fn restart(&mut self) {
+        self.start = std::time::Instant::now();
     }
 }
 
@@ -679,8 +745,10 @@ pub fn flush_local_cmd_stats() {
             return;
         }
         if let Ok(mut global_map) = CMD_STATS.write() {
-            for (&cmd, &calls) in local_map.iter() {
-                *global_map.entry(cmd.to_lowercase()).or_insert(0) += calls;
+            for (&cmd, stat) in local_map.iter() {
+                let global = global_map.entry(cmd.to_lowercase()).or_default();
+                global.calls += stat.calls;
+                global.nanos += stat.nanos;
             }
         }
         local_map.clear();
@@ -7475,7 +7543,10 @@ async fn execute_command(
         broadcast_monitor(router.port, &addr_s, &monitor_argv);
     }
     let cmd_name = get_cmd_name(&cmd);
-    record_cmd_stat(cmd_name);
+    let _cmd_stat_guard = CmdStatGuard {
+        name: cmd_name,
+        start: (!may_block(&cmd)).then(std::time::Instant::now),
+    };
     if cmd.is_write_command() {
         crate::snapshot::note_write();
     }
@@ -8765,11 +8836,18 @@ async fn execute_command(
                 let mut entries: Vec<_> = all_cmds.into_iter().collect();
                 entries.sort();
                 for cmd in entries {
-                    let calls = CMD_STATS
+                    let stat = CMD_STATS
                         .read()
                         .ok()
                         .and_then(|m| m.get(&cmd).copied())
-                        .unwrap_or(0);
+                        .unwrap_or_default();
+                    let calls = stat.calls;
+                    let usec = stat.nanos / 1000;
+                    let usec_per_call = if calls == 0 {
+                        0.0
+                    } else {
+                        stat.nanos as f64 / 1000.0 / calls as f64
+                    };
                     let failed = FAILED_CMD_STATS
                         .read()
                         .ok()
@@ -8782,13 +8860,13 @@ async fn execute_command(
                         .unwrap_or(0);
                     if let Some(slow) = crate::slowlog::get_cmd_slow_stat(&cmd) {
                         s.push_str(&format!(
-                            "cmdstat_{}:calls={},usec=100,usec_per_call=100.00,rejected_calls={},failed_calls={},slowlog_count={},slowlog_time_ms_sum={:.2},slowlog_time_ms_max={:.2}\r\n",
-                            cmd, calls, rejected, failed, slow.count, slow.time_ms_sum, slow.time_ms_max
+                            "cmdstat_{}:calls={},usec={},usec_per_call={:.2},rejected_calls={},failed_calls={},slowlog_count={},slowlog_time_ms_sum={:.2},slowlog_time_ms_max={:.2}\r\n",
+                            cmd, calls, usec, usec_per_call, rejected, failed, slow.count, slow.time_ms_sum, slow.time_ms_max
                         ));
                     } else {
                         s.push_str(&format!(
-                            "cmdstat_{}:calls={},usec=100,usec_per_call=100.00,rejected_calls={},failed_calls={}\r\n",
-                            cmd, calls, rejected, failed
+                            "cmdstat_{}:calls={},usec={},usec_per_call={:.2},rejected_calls={},failed_calls={}\r\n",
+                            cmd, calls, usec, usec_per_call, rejected, failed
                         ));
                     }
                 }
@@ -23166,8 +23244,9 @@ async fn execute_commands_squashed(
         && !crate::replication::has_connected_replicas(router.port)
         && NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0;
     let mut local_db = router.local_db.borrow_mut();
-    // Commands handed to `execute_command` below record their own stats.
-    let mut stat_run = CmdStatRun::default();
+    // Commands handed to `execute_command` below record their own stats; the
+    // time spent awaiting other shards is left out of the batch segments.
+    let mut stat_run = CmdStatBatch::new();
     for (idx, cmd) in commands.drain(..).enumerate() {
         if cmd.is_write_command() {
             crate::snapshot::note_write();
@@ -23642,9 +23721,9 @@ async fn execute_commands_squashed(
             }
             folded_mgets.push((idx, start, responses.len() - start));
         } else if let Command::Mset(pairs) = cmd {
-            stat_run.note("MSET");
             drop(local_db);
             if remote_batches.iter().any(|b| !b.is_empty()) {
+                stat_run.flush();
                 flush_remote_batches(
                     router,
                     responders,
@@ -23654,7 +23733,9 @@ async fn execute_commands_squashed(
                     is_resp3,
                 )
                 .await;
+                stat_run.restart();
             }
+            stat_run.note("MSET");
             if crate::replication::has_connected_replicas(router.port)
                 && let Some(bytes) = crate::aof::command_to_resp(&Command::Mset(pairs.clone()))
             {
@@ -23683,6 +23764,7 @@ async fn execute_commands_squashed(
                 | Command::FunctionKill
         ) {
             drop(local_db);
+            stat_run.flush();
             if remote_batches.iter().any(|b| !b.is_empty()) {
                 flush_remote_batches(
                     router,
@@ -23711,6 +23793,7 @@ async fn execute_commands_squashed(
             }
             responses[idx] = CompactResp::from_vec(std::mem::take(&mut local_buf));
             local_db = router.local_db.borrow_mut();
+            stat_run.restart();
         } else {
             stat_run.note(get_cmd_name(&cmd));
             local_buf.clear();
@@ -24351,23 +24434,54 @@ mod tests {
         // Flush and verify in global map
         flush_local_cmd_stats();
         let map = CMD_STATS.read().unwrap();
-        assert!(map.get("get").copied().unwrap_or(0) >= 2);
-        assert!(map.get("set").copied().unwrap_or(0) >= 1);
+        assert!(map.get("get").map_or(0, |s| s.calls) >= 2);
+        assert!(map.get("set").map_or(0, |s| s.calls) >= 1);
     }
 
     #[test]
-    fn test_cmd_stat_run_counts_every_command() {
-        let mut run = CmdStatRun::default();
+    fn test_cmd_stat_batch_counts_and_times_every_command() {
+        let pending =
+            |n: &str| LOCAL_CMD_STATS.with(|m| m.borrow().get(n).copied().unwrap_or_default());
+        let mut batch = CmdStatBatch::new();
         for name in ["GET", "GET", "SET", "GET", "GET"] {
-            run.note(name);
+            batch.note(name);
         }
-        // Nothing is lost before the final flush.
-        let pending = |n: &str| LOCAL_CMD_STATS.with(|m| m.borrow().get(n).copied().unwrap_or(0));
-        assert_eq!(pending("GET") + run.calls, 4);
-        run.flush();
-        run.flush();
-        assert_eq!(pending("GET"), 4);
-        assert_eq!(pending("SET"), 1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        batch.flush();
+        let (get, set) = (pending("GET"), pending("SET"));
+        assert_eq!((get.calls, set.calls), (4, 1));
+        // The segment's time is split 4:1 between GET and SET.
+        assert!(set.nanos >= 1_000_000, "SET nanos {}", set.nanos);
+        assert!(
+            get.nanos >= 4 * set.nanos - 4,
+            "GET {} SET {}",
+            get.nanos,
+            set.nanos
+        );
+
+        // Time between flush and restart is not attributed to anything.
+        batch.flush();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        batch.restart();
+        batch.note("GET");
+        batch.flush();
+        let after = pending("GET");
+        assert_eq!(after.calls, 5);
+        assert!(
+            after.nanos - get.nanos < 20_000_000,
+            "{}",
+            after.nanos - get.nanos
+        );
+    }
+
+    #[test]
+    fn test_blocking_commands_are_not_timed() {
+        let blpop = Command::Blpop {
+            keys: vec![Bytes::from("k")],
+            timeout: 0.0,
+        };
+        assert!(may_block(&blpop));
+        assert!(!may_block(&Command::Get(Bytes::from("k"))));
     }
 
     #[test]
