@@ -3236,12 +3236,14 @@ impl Router {
         self.sync_aof().await;
         let mut total_rewritten = {
             let mut db = self.local_db.borrow_mut();
-            crate::aof::rewrite_shard_aof(&mut db, &self.db_dir, self.shard_id)
-                .map_err(|e| e.to_string())?
+            crate::aof::rewrite_and_swap_shard_aof(
+                &mut db,
+                &self.db_dir,
+                self.shard_id,
+                self.aof.as_ref(),
+            )
+            .map_err(|e| e.to_string())?
         };
-        if let Some(aof) = &self.aof {
-            let _ = crate::aof::AofWriter::reopen_after_rewrite(aof).await;
-        }
 
         // Remote shards rewritten sequentially one-by-one to eliminate concurrent 15-shard I/O and memory spikes
         for (sid, sender) in self.senders.iter().enumerate() {

@@ -139,39 +139,41 @@ impl AofWriter {
         Ok(())
     }
 
-    pub async fn reopen_after_rewrite(
-        aof: &std::rc::Rc<std::cell::RefCell<Self>>,
-    ) -> std::io::Result<u64> {
-        let path = aof.borrow().path.clone();
-        if path.as_os_str().is_empty() {
+    /// Points the writer at the freshly rewritten AOF at `self.path`.
+    ///
+    /// Must run synchronously right after the rewrite, with no `.await` in
+    /// between, so no command can run in the gap: anything appended before is
+    /// part of the rewritten snapshot (the pending buffer is dropped rather
+    /// than appended twice) and anything appended after goes to the new file.
+    /// A flush already in flight still targets the old, replaced file, which
+    /// is harmless because its commands are in the snapshot too.
+    pub fn swap_after_rewrite(&mut self) -> std::io::Result<u64> {
+        if self.path.as_os_str().is_empty() {
             return Ok(0);
         }
-        let file = monoio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&path)
-            .await?;
-        let new_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-        let rc_file = std::rc::Rc::new(file);
-        let chunk_and_off = {
-            let mut writer = aof.borrow_mut();
-            writer.file = Some(rc_file.clone());
-            writer.offset = new_size;
-            if !writer.buffer.is_empty() {
-                let chunk = std::mem::replace(&mut writer.buffer, Vec::with_capacity(65536));
-                let off = writer.offset;
-                writer.offset += chunk.len() as u64;
-                Some((chunk, off))
-            } else {
-                None
-            }
-        };
-        if let Some((chunk, off)) = chunk_and_off {
-            let (res, _) = rc_file.write_all_at(chunk, off).await;
-            res?;
-        }
+        // The rewrite just renamed the new file into place.
+        let std_file = std::fs::OpenOptions::new().write(true).open(&self.path)?;
+        let new_size = std_file.metadata()?.len();
+        self.file = Some(std::rc::Rc::new(monoio::fs::File::from_std(std_file)?));
+        self.offset = new_size;
+        self.buffer.clear();
         Ok(new_size)
     }
+}
+
+/// Rewrites shard `shard_id`'s AOF from `db` and, if `aof` is the live
+/// writer, switches it to the new file in the same synchronous step.
+pub fn rewrite_and_swap_shard_aof(
+    db: &mut ShardDb,
+    dir: &Path,
+    shard_id: usize,
+    aof: Option<&std::rc::Rc<std::cell::RefCell<AofWriter>>>,
+) -> std::io::Result<usize> {
+    let count = rewrite_shard_aof(db, dir, shard_id)?;
+    if let Some(aof) = aof {
+        aof.borrow_mut().swap_after_rewrite()?;
+    }
+    Ok(count)
 }
 
 pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
@@ -3279,8 +3281,8 @@ mod tests {
             let count = rewrite_shard_aof(&mut db, &temp_dir, 0).unwrap();
             assert_eq!(count, 1);
 
-            // Reopen writer after rewrite and log k2
-            let new_size = AofWriter::reopen_after_rewrite(&writer).await.unwrap();
+            // Switch the writer to the rewritten file and log k2
+            let new_size = writer.borrow_mut().swap_after_rewrite().unwrap();
             assert!(new_size > 0);
             writer
                 .borrow_mut()
@@ -3295,6 +3297,45 @@ mod tests {
             assert_eq!(new_db.get(b"k2"), Some(Bytes::from("v2")));
         });
 
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_rewrite_swap_neither_duplicates_nor_loses_writes() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("rudis-aof-swap-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let aof_file = temp_dir.join("appendonly-0.aof");
+        const INCR: &[u8] = b"*2\r\n$4\r\nINCR\r\n$1\r\nn\r\n";
+
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let writer = std::rc::Rc::new(std::cell::RefCell::new(
+                AofWriter::open(aof_file.clone()).await.unwrap(),
+            ));
+            let mut db = ShardDb::new(6379);
+            // Two INCRs applied; the second is still only in the AOF buffer
+            // when the rewrite snapshots the db.
+            for flush in [true, false] {
+                db.incr_by(Bytes::from("n"), 1).unwrap();
+                writer.borrow_mut().append(INCR);
+                if flush {
+                    AofWriter::flush_rc(&writer).await.unwrap();
+                }
+            }
+            rewrite_and_swap_shard_aof(&mut db, &temp_dir, 0, Some(&writer)).unwrap();
+            // A write after the swap must land in the new file.
+            db.incr_by(Bytes::from("n"), 1).unwrap();
+            writer.borrow_mut().append(INCR);
+            AofWriter::flush_rc(&writer).await.unwrap();
+
+            let mut replayed = ShardDb::new(6379);
+            replay_aof(&aof_file, &mut replayed).unwrap();
+            assert_eq!(replayed.get(b"n"), Some(Bytes::from("3")));
+        });
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 

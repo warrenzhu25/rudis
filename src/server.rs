@@ -1645,21 +1645,14 @@ pub fn run_shard_worker(
                         responder,
                     } => {
                         let mut db = cross_shard_db.borrow_mut();
-                        let res = crate::aof::rewrite_shard_aof(&mut db, &dir, shard_id)
-                            .map_err(|e| e.to_string());
-                        if let Some(aof) = &cross_shard_aof {
-                            let aof_clone = aof.clone();
-                            monoio::spawn(async move {
-                                if res.is_ok() {
-                                    let _ =
-                                        crate::aof::AofWriter::reopen_after_rewrite(&aof_clone)
-                                            .await;
-                                }
-                                let _ = responder.send(res);
-                            });
-                        } else {
-                            let _ = responder.send(res);
-                        }
+                        let res = crate::aof::rewrite_and_swap_shard_aof(
+                            &mut db,
+                            &dir,
+                            shard_id,
+                            cross_shard_aof.as_ref(),
+                        )
+                        .map_err(|e| e.to_string());
+                        let _ = responder.send(res);
                     }
                     ShardMessage::SetSlotState { slot, state } => {
                         if state == crate::shard::SlotState::Stable {

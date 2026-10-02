@@ -15401,3 +15401,95 @@ fn test_appendonly_and_appendfsync_are_reported_truthfully_e2e() {
     shutdown_and_wait(port, &mut child);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_bgrewriteaof_under_load_neither_loses_nor_duplicates_writes_e2e() {
+    // INCR is not idempotent, so after a restart every counter must equal the
+    // last value the client saw: lower means writes were lost during a
+    // rewrite, higher means some were replayed twice.
+    let port = 16976;
+    let dir = std::env::temp_dir().join(format!("rudis-rewrite-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "4",
+        "--no-pin",
+        "--aof",
+        "true",
+        "--aof-dir",
+        dir.to_str().unwrap(),
+    ];
+    let mut child = spawn_rudis_listening(&args, port);
+    const KEYS: usize = 16;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer = {
+        let stop = stop.clone();
+        thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut batch = String::new();
+            for k in 0..KEYS {
+                let key = format!("rw:{}", k);
+                batch.push_str(&format!(
+                    "*2\r\n$4\r\nINCR\r\n${}\r\n{}\r\n",
+                    key.len(),
+                    key
+                ));
+            }
+            let mut last = vec![0i64; KEYS];
+            let mut buf = Vec::new();
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                c.write_all(batch.as_bytes()).unwrap();
+                buf.clear();
+                let mut chunk = [0u8; 4096];
+                while buf.iter().filter(|&&b| b == b'\n').count() < KEYS {
+                    let n = c.read(&mut chunk).unwrap();
+                    assert!(n > 0, "connection closed");
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                let text = String::from_utf8_lossy(&buf);
+                for (k, line) in text.lines().enumerate() {
+                    last[k] = line.strip_prefix(':').expect(line).parse().unwrap();
+                }
+            }
+            last
+        })
+    };
+    let mut admin = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    admin
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    for _ in 0..25 {
+        thread::sleep(Duration::from_millis(60));
+        let r = resp_cmd(&mut admin, &["BGREWRITEAOF"]);
+        assert!(r.starts_with('+') || r.contains("in progress"), "{r}");
+    }
+    thread::sleep(Duration::from_millis(200));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let last = writer.join().unwrap();
+    assert!(last.iter().all(|&v| v > 0));
+    // Let any in-flight rewrite finish before shutting down.
+    thread::sleep(Duration::from_millis(300));
+    drop(admin);
+    shutdown_and_wait(port, &mut child);
+
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    for (k, want) in last.iter().enumerate() {
+        let got = resp_cmd(&mut c, &["GET", &format!("rw:{}", k)]);
+        let want = want.to_string();
+        assert_eq!(
+            got,
+            format!("${}\r\n{}\r\n", want.len(), want),
+            "counter rw:{} after restart",
+            k
+        );
+    }
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}
