@@ -51,6 +51,17 @@ thread_local! {
 /// depend on the caller exporting `RUST_MIN_STACK`.
 pub const SHARD_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
 
+/// Abort the whole process on an unrecoverable startup error (exit code 1),
+/// like Redis does when it cannot load its data files. Serving an empty
+/// dataset instead would let the next save overwrite the original files.
+fn fatal_startup_error(shard_id: usize, msg: &str) -> ! {
+    eprintln!(
+        "[Shard {}] FATAL: {}. Refusing to start so existing data files are not overwritten.",
+        shard_id, msg
+    );
+    std::process::exit(1);
+}
+
 pub fn run_shard_worker(
     shard_id: usize,
     num_shards: usize,
@@ -123,9 +134,10 @@ pub fn run_shard_worker(
                             println!("[Shard {}/{}] Restored {} keys from {:?}", shard_id, num_shards, n, rdb_path);
                         }
                     }
-                    Err(e) => {
-                        eprintln!("[Shard {}/{}] Failed to restore from RDB: {}", shard_id, num_shards, e);
-                    }
+                    Err(e) => fatal_startup_error(
+                        shard_id,
+                        &format!("failed to load RDB {:?}: {}", rdb_path, e),
+                    ),
                 }
             }
         }
@@ -142,9 +154,10 @@ pub fn run_shard_worker(
                         );
                     }
                 }
-                Err(e) => {
-                    eprintln!("[Shard {}] Failed to replay AOF: {}", shard_id, e);
-                }
+                Err(e) => fatal_startup_error(
+                    shard_id,
+                    &format!("failed to replay AOF {:?}: {}", aof_path, e),
+                ),
             }
         }
 
@@ -176,10 +189,10 @@ pub fn run_shard_worker(
                     });
                     Some(writer)
                 }
-                Err(e) => {
-                    eprintln!("[Shard {}] Failed to open AOF writer: {}", shard_id, e);
-                    None
-                }
+                Err(e) => fatal_startup_error(
+                    shard_id,
+                    &format!("failed to open AOF for appending: {}", e),
+                ),
             }
         } else {
             None

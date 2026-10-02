@@ -14958,8 +14958,14 @@ pub fn load_rdb_bytes(
     shard_id: usize,
     num_shards: usize,
 ) -> std::io::Result<usize> {
-    if data.len() < 18 {
+    if data.is_empty() {
         return Ok(0);
+    }
+    if data.len() < 18 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "RDB file is truncated (shorter than header + EOF + checksum)",
+        ));
     }
     if !data.starts_with(b"REDIS") {
         return Err(std::io::Error::new(
@@ -14984,11 +14990,15 @@ pub fn load_rdb_bytes(
 
     let mut cursor = 9; // Skip REDIS0011
     let mut count = 0;
+    // The writer always terminates with 0xFF; every malformed/unsupported
+    // record below `break`s early, which we turn into an error after the loop.
+    let mut saw_eof = false;
 
     while cursor < content_len {
         let op = data[cursor];
         if op == 0xFF {
             // EOF
+            saw_eof = true;
             break;
         }
         if op == 0xFE {
@@ -15465,6 +15475,22 @@ pub fn load_rdb_bytes(
         }
     }
 
+    if !saw_eof {
+        // 0xFA (AUX) right after the header is how Redis/Valkey RDBs start.
+        let hint = if data.get(9) == Some(&0xFA) {
+            " (looks like a Redis/Valkey RDB, which rudis cannot load yet)"
+        } else {
+            ""
+        };
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "RDB parse error at offset {}: truncated, corrupt or unsupported record{}",
+                cursor, hint
+            ),
+        ));
+    }
+
     Ok(count)
 }
 
@@ -15472,6 +15498,50 @@ pub fn load_rdb_bytes(
 mod tests {
     use super::*;
     use std::thread;
+
+    fn rdb_with_body(body: &[u8]) -> Vec<u8> {
+        let mut v = b"REDIS0011".to_vec();
+        v.extend_from_slice(body);
+        let crc = crc64(&v);
+        v.extend_from_slice(&crc.to_le_bytes());
+        v
+    }
+
+    #[test]
+    fn test_load_rdb_rejects_truncated_corrupt_and_foreign_files() {
+        let mut src = crate::shard::ShardDb::new(0);
+        src.table
+            .set(Bytes::from_static(b"k"), Bytes::from_static(b"v"), None);
+        let mut chunk = Vec::new();
+        src.save_rdb_chunk(&mut chunk);
+
+        // Well-formed file loads.
+        let mut body = vec![0xFE, 0x00];
+        body.extend_from_slice(&chunk);
+        body.push(0xFF);
+        let mut db = crate::shard::ShardDb::new(0);
+        assert_eq!(
+            load_rdb_bytes(&rdb_with_body(&body), &mut db, 0, 1).unwrap(),
+            1
+        );
+
+        // Empty file is an empty dataset.
+        assert_eq!(load_rdb_bytes(&[], &mut db, 0, 1).unwrap(), 0);
+
+        // Short file is truncated, not empty.
+        assert!(load_rdb_bytes(b"REDIS0011\xFE", &mut db, 0, 1).is_err());
+
+        // Record cut short (valid checksum, missing EOF opcode).
+        let mut cut = vec![0xFE, 0x00];
+        cut.extend_from_slice(&chunk[..chunk.len() - 1]);
+        let err = load_rdb_bytes(&rdb_with_body(&cut), &mut db, 0, 1).unwrap_err();
+        assert!(err.to_string().contains("RDB parse error"), "{err}");
+
+        // Redis/Valkey RDB (AUX field first) is reported, not silently empty.
+        let foreign = rdb_with_body(b"\xFA\x09redis-ver\x058.1.0\xFE\x00\xFF");
+        let err = load_rdb_bytes(&foreign, &mut db, 0, 1).unwrap_err();
+        assert!(err.to_string().contains("Redis/Valkey RDB"), "{err}");
+    }
 
     #[test]
     fn test_rudis_entry_size() {

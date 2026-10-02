@@ -14638,3 +14638,89 @@ fn test_script_redis_call_enforces_caller_acl_e2e() {
     assert!(r.starts_with("-NOPERM"), "{}", r);
     assert_eq!(resp_cmd(&mut admin, &["GET", "ok:1"]), "$1\r\nv\r\n");
 }
+
+/// Runs the real binary until it exits (or fails the test after 20s).
+fn run_rudis_until_exit(args: &[&str]) -> (std::process::ExitStatus, String) {
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rudis"))
+        .args(args)
+        .env("MONOIO_FORCE_LEGACY_DRIVER", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rudis");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("rudis kept running despite unloadable data files");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    (status, stderr)
+}
+
+#[test]
+fn test_startup_refuses_unloadable_rdb_and_aof_e2e() {
+    let dir = std::env::temp_dir().join(format!("rudis-badload-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_s = dir.to_str().unwrap();
+
+    // 1. A Redis/Valkey-style RDB (valid checksum) must not load as empty.
+    let mut rdb = b"REDIS0011\xFA\x09redis-ver\x058.1.0\xFE\x00\xFF".to_vec();
+    let crc = rudis::table::crc64(&rdb);
+    rdb.extend_from_slice(&crc.to_le_bytes());
+    let rdb_path = dir.join("dump.rdb");
+    std::fs::write(&rdb_path, &rdb).unwrap();
+    let (status, stderr) = run_rudis_until_exit(&[
+        "--port",
+        "16988",
+        "--threads",
+        "2",
+        "--no-pin",
+        "--aof-dir",
+        dir_s,
+    ]);
+    assert_eq!(status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("FATAL") && stderr.contains("RDB"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&rdb_path).unwrap(),
+        rdb,
+        "dump.rdb must be untouched"
+    );
+
+    // 2. An unreadable AOF (here: a directory) must not start an empty server.
+    std::fs::create_dir_all(dir.join("appendonly-0.aof")).unwrap();
+    let (status, stderr) = run_rudis_until_exit(&[
+        "--port",
+        "16988",
+        "--threads",
+        "2",
+        "--no-pin",
+        "--aof",
+        "true",
+        "--aof-dir",
+        dir_s,
+    ]);
+    assert_eq!(status.code(), Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("FATAL") && stderr.contains("AOF"),
+        "{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
