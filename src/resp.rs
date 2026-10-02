@@ -8595,7 +8595,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         let val = parse_integer(&args[*idx + 1]).map_err(|_| {
                             "ERR value is not an integer or out of range".to_string()
                         })?;
-                        if (opt == "EX" || opt == "PX") && val <= 0 {
+                        // Valkey only rejects negative values; an already-expired
+                        // time (e.g. PX 0) returns the values and deletes the fields.
+                        if val < 0 {
                             return Err("ERR invalid expire time in 'hgetex' command".to_string());
                         }
                         expire = match opt.as_str() {
@@ -13797,6 +13799,24 @@ mod tests {
         let cmd = parse_command(&mut buf).unwrap().unwrap();
         assert_eq!(cmd, Command::Get(Bytes::from_static(b"mykey")));
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn test_hgetex_zero_expire_accepted_negative_rejected() {
+        let mut buf = BytesMut::from("HGETEX h PX 0 FIELDS 1 f\r\n");
+        match parse_command(&mut buf).unwrap().unwrap() {
+            Command::Hgetex { expire, .. } => assert_eq!(expire, HFieldExpireOpt::ExMs(0)),
+            other => panic!("unexpected {:?}", other),
+        }
+        let mut buf = BytesMut::from("HGETEX h EX 0 FIELDS 1 f\r\n");
+        assert!(parse_command(&mut buf).unwrap().is_some());
+        for opt in ["EX", "PX", "EXAT", "PXAT"] {
+            let mut buf = BytesMut::from(format!("HGETEX h {} -1 FIELDS 1 f\r\n", opt).as_str());
+            assert_eq!(
+                parse_command(&mut buf).unwrap_err(),
+                "ERR invalid expire time in 'hgetex' command"
+            );
+        }
     }
 
     #[test]
