@@ -624,12 +624,17 @@ thread_local! {
 
 #[inline]
 pub fn record_cmd_stat(name: &'static str) {
+    record_cmd_stats(name, 1);
+}
+
+/// Adds `calls` calls of `name` to this thread's command statistics.
+pub fn record_cmd_stats(name: &'static str, calls: u64) {
     LOCAL_CMD_STATS.with(|stats| {
         let mut map = stats.borrow_mut();
-        *map.entry(name).or_insert(0) += 1;
+        *map.entry(name).or_insert(0) += calls;
     });
     LOCAL_CMD_COUNT.with(|count| {
-        let c = count.get() + 1;
+        let c = count.get() + calls as usize;
         if c >= 1024 {
             count.set(0);
             flush_local_cmd_stats();
@@ -637,6 +642,34 @@ pub fn record_cmd_stat(name: &'static str) {
             count.set(c);
         }
     });
+}
+
+/// Counts consecutive runs of the same command so a pipeline of N identical
+/// commands costs one statistics update instead of N.
+#[derive(Default)]
+struct CmdStatRun {
+    name: &'static str,
+    calls: u64,
+}
+
+impl CmdStatRun {
+    #[inline]
+    fn note(&mut self, name: &'static str) {
+        if std::ptr::eq(name, self.name) {
+            self.calls += 1;
+        } else {
+            self.flush();
+            self.name = name;
+            self.calls = 1;
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.calls > 0 {
+            record_cmd_stats(self.name, self.calls);
+            self.calls = 0;
+        }
+    }
 }
 
 pub fn flush_local_cmd_stats() {
@@ -23133,11 +23166,14 @@ async fn execute_commands_squashed(
         && !crate::replication::has_connected_replicas(router.port)
         && NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0;
     let mut local_db = router.local_db.borrow_mut();
+    // Commands handed to `execute_command` below record their own stats.
+    let mut stat_run = CmdStatRun::default();
     for (idx, cmd) in commands.drain(..).enumerate() {
         if cmd.is_write_command() {
             crate::snapshot::note_write();
         }
         if let Some((target, key_hash)) = target_shard_and_hash_of_cmd(&cmd, router.num_shards) {
+            stat_run.note(get_cmd_name(&cmd));
             if target == router.shard_id {
                 local_buf.clear();
                 if let Command::Get(ref key) = cmd {
@@ -23574,6 +23610,7 @@ async fn execute_commands_squashed(
                 remote_batches[target].push((idx, key_hash, cmd));
             }
         } else if let Command::Mget(keys) = cmd {
+            stat_run.note("MGET");
             // Fold into the per-shard batches as one GET per key, each with its
             // own slot after the pipeline's slots; the array is assembled once
             // every batch has replied. Per-shard FIFO keeps earlier writes of
@@ -23605,6 +23642,7 @@ async fn execute_commands_squashed(
             }
             folded_mgets.push((idx, start, responses.len() - start));
         } else if let Command::Mset(pairs) = cmd {
+            stat_run.note("MSET");
             drop(local_db);
             if remote_batches.iter().any(|b| !b.is_empty()) {
                 flush_remote_batches(
@@ -23674,6 +23712,7 @@ async fn execute_commands_squashed(
             responses[idx] = CompactResp::from_vec(std::mem::take(&mut local_buf));
             local_db = router.local_db.borrow_mut();
         } else {
+            stat_run.note(get_cmd_name(&cmd));
             local_buf.clear();
             if execute_local_command(&cmd, &mut local_db, &mut local_buf, None) {
                 should_close = true;
@@ -23682,6 +23721,7 @@ async fn execute_commands_squashed(
         }
     }
     drop(local_db);
+    stat_run.flush();
 
     if has_local_writes {
         router.check_auto_tier_after_write();
@@ -24313,6 +24353,21 @@ mod tests {
         let map = CMD_STATS.read().unwrap();
         assert!(map.get("get").copied().unwrap_or(0) >= 2);
         assert!(map.get("set").copied().unwrap_or(0) >= 1);
+    }
+
+    #[test]
+    fn test_cmd_stat_run_counts_every_command() {
+        let mut run = CmdStatRun::default();
+        for name in ["GET", "GET", "SET", "GET", "GET"] {
+            run.note(name);
+        }
+        // Nothing is lost before the final flush.
+        let pending = |n: &str| LOCAL_CMD_STATS.with(|m| m.borrow().get(n).copied().unwrap_or(0));
+        assert_eq!(pending("GET") + run.calls, 4);
+        run.flush();
+        run.flush();
+        assert_eq!(pending("GET"), 4);
+        assert_eq!(pending("SET"), 1);
     }
 
     #[test]

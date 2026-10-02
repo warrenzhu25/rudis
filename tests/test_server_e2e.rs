@@ -16108,3 +16108,62 @@ fn test_getex_ttl_change_reaches_aof_e2e() {
     shutdown_and_wait(port, &mut child);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_pipelined_commands_counted_in_commandstats_e2e() {
+    let port = 16965;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // One write so every command runs through the pipeline batching path.
+    const N: usize = 3000;
+    let mut pipeline = String::new();
+    let mut push = |args: &[&str]| {
+        pipeline.push_str(&format!("*{}\r\n", args.len()));
+        for a in args {
+            pipeline.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+        }
+    };
+    for i in 0..N {
+        let k = format!("cs:{i}");
+        push(&["SET", &k, "v"]);
+        push(&["GET", &k]);
+    }
+    push(&["MGET", "cs:0", "cs:1", "cs:2"]);
+    push(&["PING"]);
+    c.write_all(pipeline.as_bytes()).unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 65536];
+    while !got.ends_with(b"+PONG\r\n") {
+        let n = c.read(&mut buf).unwrap();
+        assert!(n > 0, "connection closed");
+        got.extend_from_slice(&buf[..n]);
+    }
+
+    c.write_all(b"*2\r\n$4\r\nINFO\r\n$12\r\ncommandstats\r\n")
+        .unwrap();
+    let mut info = Vec::new();
+    loop {
+        let n = c.read(&mut buf).unwrap();
+        assert!(n > 0, "connection closed");
+        info.extend_from_slice(&buf[..n]);
+        if let Some(hdr_end) = info.windows(2).position(|w| w == b"\r\n") {
+            let len: usize = std::str::from_utf8(&info[1..hdr_end])
+                .unwrap()
+                .parse()
+                .unwrap();
+            if info.len() >= hdr_end + 2 + len + 2 {
+                break;
+            }
+        }
+    }
+    let info = String::from_utf8(info).unwrap();
+    for (cmd, calls) in [("set", N), ("get", N), ("mget", 1)] {
+        let want = format!("cmdstat_{cmd}:calls={calls},");
+        assert!(info.contains(&want), "missing {want:?} in:\n{info}");
+    }
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}
