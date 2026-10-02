@@ -15775,3 +15775,88 @@ fn test_pipelined_mget_folds_across_shards_in_order_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child);
 }
+
+#[test]
+fn test_keyspace_events_match_when_pipeline_is_batched_e2e() {
+    let port = 16970;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "4", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "notify-keyspace-events", "KEA"]),
+        "+OK\r\n"
+    );
+    let mut sub = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sub.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let r = resp_cmd(&mut sub, &["PSUBSCRIBE", "__keyevent@0__:*"]);
+    assert!(r.contains("psubscribe"), "{r}");
+
+    let enc = |args: &[&str]| {
+        let mut s = format!("*{}\r\n", args.len());
+        for a in args {
+            s.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+        }
+        s
+    };
+    // Keys on every shard; one pipeline of batched writes and reads.
+    let keys: Vec<String> = (0..8).map(|i| format!("ev:{i}")).collect();
+    let mut pipeline = String::new();
+    let mut expected_replies = String::new();
+    let mut expected_events: Vec<(String, String)> = Vec::new();
+    for k in &keys {
+        pipeline.push_str(&enc(&["SET", k, "v"]));
+        expected_replies.push_str("+OK\r\n");
+        expected_events.push(("set".into(), k.clone()));
+        pipeline.push_str(&enc(&["GET", k]));
+        expected_replies.push_str("$1\r\nv\r\n");
+        pipeline.push_str(&enc(&["EXPIRE", k, "100"]));
+        expected_replies.push_str(":1\r\n");
+        expected_events.push(("expire".into(), k.clone()));
+        pipeline.push_str(&enc(&["DEL", k]));
+        expected_replies.push_str(":1\r\n");
+        expected_events.push(("del".into(), k.clone()));
+        pipeline.push_str(&enc(&["LPUSH", k, "a"]));
+        expected_replies.push_str(":1\r\n");
+        expected_events.push(("lpush".into(), k.clone()));
+    }
+    c.write_all(pipeline.as_bytes()).unwrap();
+    let mut got = vec![0u8; expected_replies.len()];
+    c.read_exact(&mut got).unwrap();
+    assert_eq!(String::from_utf8_lossy(&got), expected_replies);
+
+    // Collect pmessage frames: event name from the channel, key as payload.
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 65536];
+    while let Ok(n) = sub.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        raw.extend_from_slice(&buf[..n]);
+    }
+    let text = String::from_utf8_lossy(&raw).to_string();
+    let parts: Vec<&str> = text.split("\r\n").collect();
+    let mut events = Vec::new();
+    let mut i = 0;
+    while i + 8 < parts.len() {
+        if parts[i] == "*4" && parts[i + 2] == "pmessage" {
+            let event = parts[i + 6].trim_start_matches("__keyevent@0__:");
+            events.push((event.to_string(), parts[i + 8].to_string()));
+            i += 9;
+        } else {
+            i += 1;
+        }
+    }
+    // Same events, and in command order for each key.
+    for k in &keys {
+        let want: Vec<_> = expected_events.iter().filter(|(_, key)| key == k).collect();
+        let have: Vec<_> = events.iter().filter(|(_, key)| key == k).collect();
+        assert_eq!(have, want, "events for {k}: {text}");
+    }
+    assert_eq!(events.len(), expected_events.len(), "{text}");
+
+    drop(sub);
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}

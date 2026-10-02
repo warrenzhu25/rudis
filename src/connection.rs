@@ -22873,8 +22873,12 @@ async fn execute_commands_squashed(
             c.last_cmd = get_cmd_name(last_cmd);
         }
     }
-    let mut can_squash =
-        *authenticated && NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0;
+    let mut can_squash = *authenticated;
+    // With keyspace notifications on, a pipeline is batched only if every
+    // command emits its events the same way when batched.
+    if can_squash && NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+        can_squash = commands.iter().all(notifies_same_when_batched);
+    }
     if can_squash {
         let acl = if crate::acl::HAS_CUSTOM_ACL.load(std::sync::atomic::Ordering::Relaxed)
             || auth_user != "default"
@@ -23020,6 +23024,11 @@ async fn execute_commands_squashed(
     // 1. Process local shard commands immediately in-place; bucket remote commands by shard
     let mut has_local_writes = false;
     let is_resp3 = CURRENT_CLIENT_RESP3.get();
+    // Write fast paths skip AOF, replication and keyspace notifications; when
+    // any of those is needed, writes go through `execute_local_command`.
+    let write_fast_path = router.aof.is_none()
+        && !crate::replication::has_connected_replicas(router.port)
+        && NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0;
     let mut local_db = router.local_db.borrow_mut();
     for (idx, cmd) in commands.drain(..).enumerate() {
         if cmd.is_write_command() {
@@ -23049,9 +23058,7 @@ async fn execute_commands_squashed(
                             write_resp_err(&mut local_buf, err);
                         }
                     }
-                } else if router.aof.is_none()
-                    && !crate::replication::has_connected_replicas(router.port)
-                    && NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
+                } else if write_fast_path
                     && let Command::Set {
                         key,
                         value,
@@ -23078,10 +23085,7 @@ async fn execute_commands_squashed(
                     }
                     responses[idx] = crate::shard::CompactResp::OK;
                     continue;
-                } else if router.aof.is_none()
-                    && !crate::replication::has_connected_replicas(router.port)
-                    && let Command::IncrBy(ref key, delta) = cmd
-                {
+                } else if write_fast_path && let Command::IncrBy(ref key, delta) = cmd {
                     has_local_writes = true;
                     match local_db.table.incr_by_slice_with_hash(key, key_hash, delta) {
                         Ok(val) => {
@@ -23114,8 +23118,7 @@ async fn execute_commands_squashed(
                         crate::shard::CompactResp::INT_0
                     };
                     continue;
-                } else if router.aof.is_none()
-                    && !crate::replication::has_connected_replicas(router.port)
+                } else if write_fast_path
                     && !crate::search::has_active_search_indices()
                     && let Command::Del(ref keys) = cmd
                     && keys.len() == 1
@@ -23148,8 +23151,7 @@ async fn execute_commands_squashed(
                             write_resp_err(&mut local_buf, err);
                         }
                     }
-                } else if router.aof.is_none()
-                    && !crate::replication::has_connected_replicas(router.port)
+                } else if write_fast_path
                     && !crate::search::has_active_search_indices()
                     && let Command::Hset {
                         ref key,
@@ -23205,8 +23207,7 @@ async fn execute_commands_squashed(
                             write_resp_err(&mut local_buf, err);
                         }
                     }
-                } else if router.aof.is_none()
-                    && !crate::replication::has_connected_replicas(router.port)
+                } else if write_fast_path
                     && let Command::Sadd {
                         ref key,
                         ref members,
@@ -23242,8 +23243,7 @@ async fn execute_commands_squashed(
                             write_resp_err(&mut local_buf, err);
                         }
                     }
-                } else if router.aof.is_none()
-                    && !crate::replication::has_connected_replicas(router.port)
+                } else if write_fast_path
                     && !crate::block::has_blocked_waiters(router.port)
                     && let Command::Zadd {
                         ref key,
@@ -23285,8 +23285,7 @@ async fn execute_commands_squashed(
                             write_resp_err(&mut local_buf, err);
                         }
                     }
-                } else if router.aof.is_none()
-                    && !crate::replication::has_connected_replicas(router.port)
+                } else if write_fast_path
                     && !crate::block::has_blocked_waiters(router.port)
                     && let Command::Lpush {
                         ref key,
@@ -23316,10 +23315,7 @@ async fn execute_commands_squashed(
                             write_resp_err(&mut local_buf, err);
                         }
                     }
-                } else if router.aof.is_none()
-                    && !crate::replication::has_connected_replicas(router.port)
-                    && let Command::Lpop { ref key, count } = cmd
-                {
+                } else if write_fast_path && let Command::Lpop { ref key, count } = cmd {
                     if count.is_none() {
                         match local_db.table.lpop_one_with_hash(key.as_ref(), key_hash) {
                             Ok(Some(v)) => {
@@ -23403,30 +23399,7 @@ async fn execute_commands_squashed(
                         }
                         Err(err) => write_resp_err(&mut local_buf, err),
                     }
-                } else if router.aof.is_none()
-                    && !crate::replication::has_connected_replicas(router.port)
-                    && let Command::IncrBy(ref key, delta) = cmd
-                {
-                    match local_db.table.incr_by_slice_with_hash(key, key_hash, delta) {
-                        Ok(val) => {
-                            has_local_writes = true;
-                            if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
-                                touch_watched_key(router.port, key.as_ref());
-                            }
-                            if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
-                                notify_key_invalidation(router.port, key.as_ref(), client_id);
-                            }
-                            responses[idx] = CompactResp::from_integer(val);
-                            continue;
-                        }
-                        Err(err) => {
-                            write_resp_err(&mut local_buf, err);
-                        }
-                    }
-                } else if router.aof.is_none()
-                    && !crate::replication::has_connected_replicas(router.port)
-                    && let Command::Rpop { ref key, count } = cmd
-                {
+                } else if write_fast_path && let Command::Rpop { ref key, count } = cmd {
                     if count.is_none() {
                         match local_db.table.rpop_one_with_hash(key.as_ref(), key_hash) {
                             Ok(Some(v)) => {
@@ -23661,6 +23634,54 @@ async fn execute_commands_squashed(
     }
 
     should_close
+}
+
+/// True when a command emits the same keyspace notifications inside a batched
+/// pipeline as when run on its own. Reads emit none; the listed writes were
+/// checked event for event against unbatched execution (per-key order
+/// included). Other writes keep the whole pipeline unbatched.
+fn notifies_same_when_batched(cmd: &Command) -> bool {
+    !cmd.is_write_command()
+        || matches!(
+            cmd,
+            Command::Set { .. }
+                | Command::Setnx { .. }
+                | Command::Getset { .. }
+                | Command::Getdel(_)
+                | Command::Getex { .. }
+                | Command::Append { .. }
+                | Command::IncrBy(..)
+                | Command::Incrbyfloat { .. }
+                | Command::Setrange { .. }
+                | Command::Setbit { .. }
+                | Command::Del(_)
+                | Command::Unlink(_)
+                | Command::Expire { .. }
+                | Command::Persist(_)
+                | Command::Hset { .. }
+                | Command::Hsetnx { .. }
+                | Command::Hdel { .. }
+                | Command::Hincrby { .. }
+                | Command::Hincrbyfloat { .. }
+                | Command::Lpush { .. }
+                | Command::Rpush { .. }
+                | Command::Lpop { .. }
+                | Command::Rpop { .. }
+                | Command::Lset { .. }
+                | Command::Lrem { .. }
+                | Command::Linsert { .. }
+                | Command::Ltrim { .. }
+                | Command::Sadd { .. }
+                | Command::Srem { .. }
+                | Command::Spop { .. }
+                | Command::Zadd { .. }
+                | Command::Zincrby { .. }
+                | Command::Zrem { .. }
+                | Command::Zpopmin { .. }
+                | Command::Zpopmax { .. }
+                | Command::Xadd { .. }
+                | Command::Pfadd { .. }
+        )
 }
 
 /// Builds an MGET array from per-key GET replies. MGET answers nil for a key
@@ -24344,6 +24365,26 @@ mod tests {
         let resp3 = assemble_mget_reply(&resp3_items, true).into_vec();
         assert_eq!(resp3, b"*2\r\n_\r\n_\r\n");
         assert_eq!(assemble_mget_reply(&[], false).into_vec(), b"*0\r\n");
+    }
+
+    #[test]
+    fn test_notifies_same_when_batched_allows_reads_and_checked_writes() {
+        assert!(notifies_same_when_batched(&Command::Get(Bytes::from("k"))));
+        assert!(notifies_same_when_batched(&Command::Mget(vec![
+            Bytes::from("k")
+        ])));
+        assert!(notifies_same_when_batched(&Command::Del(smallvec![
+            Bytes::from("k")
+        ])));
+        assert!(notifies_same_when_batched(&Command::IncrBy(
+            Bytes::from("k"),
+            1
+        )));
+        // MSET is a write that was not checked: it keeps the pipeline unbatched.
+        assert!(!notifies_same_when_batched(&Command::Mset(vec![(
+            Bytes::from("k"),
+            Bytes::from("v")
+        )])));
     }
 
     #[test]
