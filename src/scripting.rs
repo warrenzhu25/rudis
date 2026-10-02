@@ -2446,8 +2446,9 @@ fn register_redis_module(
             if allowed {
                 let mut keys = Vec::new();
                 crate::connection::for_each_cmd_key(&cmd, |k| keys.push(k));
+                let need = crate::connection::acl_key_perm(&cmd);
                 for key in keys {
-                    if !user.can_access_key(key) {
+                    if !user.can_access_key(key, need) {
                         allowed = false;
                         break;
                     }

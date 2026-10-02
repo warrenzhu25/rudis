@@ -14509,3 +14509,52 @@ fn test_acl_channel_permissions_e2e() {
     let r = resp_cmd(&mut c, &["PSUBSCRIBE", "news.*"]);
     assert!(r.contains("psubscribe"), "{}", r);
 }
+
+#[test]
+fn test_acl_read_write_key_permissions_e2e() {
+    let port = 16999;
+    start_test_server(port, 2);
+    let mut admin = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    admin
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    for (k, v) in [("r:1", "a"), ("w:1", "b"), ("x1", "c")] {
+        assert_eq!(resp_cmd(&mut admin, &["SET", k, v]), "+OK\r\n");
+    }
+    assert_eq!(
+        resp_cmd(
+            &mut admin,
+            &[
+                "ACL", "SETUSER", "rw", "on", ">p", "+@all", "%R~r:*", "%W~w:*", "~x?"
+            ]
+        ),
+        "+OK\r\n"
+    );
+    let getuser = resp_cmd(&mut admin, &["ACL", "GETUSER", "rw"]);
+    assert!(getuser.contains("%R~r:* %W~w:* ~x?"), "{}", getuser);
+
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["AUTH", "rw", "p"]), "+OK\r\n");
+    const DENIED: &str =
+        "-NOPERM this user has no permissions to access one of the keys used as arguments\r\n";
+    // Read-only pattern: reads OK, writes denied.
+    assert_eq!(resp_cmd(&mut c, &["GET", "r:1"]), "$1\r\na\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SET", "r:1", "z"]), DENIED);
+    assert_eq!(resp_cmd(&mut c, &["DEL", "r:1"]), DENIED);
+    // Write-only pattern: blind writes OK, anything returning the value denied.
+    assert_eq!(resp_cmd(&mut c, &["SET", "w:1", "z"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["LPUSH", "w:list", "z"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "w:1"]), DENIED);
+    assert_eq!(resp_cmd(&mut c, &["SET", "w:1", "y", "GET"]), DENIED);
+    assert_eq!(resp_cmd(&mut c, &["GETDEL", "w:1"]), DENIED);
+    // EXISTS needs neither read nor write, just a matching pattern.
+    assert_eq!(resp_cmd(&mut c, &["EXISTS", "w:1"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["EXISTS", "other"]), DENIED);
+    // Full glob syntax in key patterns.
+    assert_eq!(resp_cmd(&mut c, &["GET", "x1"]), "$1\r\nc\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "x12"]), DENIED);
+    // Pipelined (squashable) commands get the same checks.
+    let r = send_and_read(&mut c, b"GET r:1\r\nGET w:1\r\nGET x1\r\n");
+    assert_eq!(r, format!("$1\r\na\r\n{}$1\r\nc\r\n", DENIED));
+}

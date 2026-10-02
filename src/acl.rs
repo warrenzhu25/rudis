@@ -123,6 +123,43 @@ impl CommandSet {
     }
 }
 
+/// Key permission bits (Redis ACL_READ_PERMISSION / ACL_WRITE_PERMISSION).
+pub const KEY_READ: u8 = 1;
+pub const KEY_WRITE: u8 = 2;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyPattern {
+    pub pattern: String,
+    pub perm: u8,
+}
+
+/// Parses `~pat` (read+write) or `%<R|W|RW>~pat`.
+fn parse_key_rule(rule: &str) -> Result<(u8, &str), String> {
+    if let Some(pat) = rule.strip_prefix('~') {
+        return Ok((KEY_READ | KEY_WRITE, pat));
+    }
+    let body = &rule[1..];
+    let (flags, pat) = body
+        .split_once('~')
+        .ok_or_else(|| setuser_err(rule, "Syntax error"))?;
+    let mut perm = 0;
+    for c in flags.chars() {
+        let bit = match c.to_ascii_uppercase() {
+            'R' => KEY_READ,
+            'W' => KEY_WRITE,
+            _ => return Err(setuser_err(rule, "Syntax error")),
+        };
+        if perm & bit != 0 {
+            return Err(setuser_err(rule, "Syntax error"));
+        }
+        perm |= bit;
+    }
+    if perm == 0 {
+        return Err(setuser_err(rule, "Syntax error"));
+    }
+    Ok((perm, pat))
+}
+
 fn setuser_err(rule: &str, msg: &str) -> String {
     format!("Error in ACL SETUSER modifier '{}': {}", rule, msg)
 }
@@ -139,7 +176,8 @@ pub struct AclUser {
     pub all_commands: bool,
     commands: CommandSet,
     pub all_keys: bool,
-    pub allowed_key_patterns: Vec<String>,
+    /// `~pat` / `%R~pat` / `%W~pat` key patterns.
+    pub key_patterns: Vec<KeyPattern>,
     /// `&*` / `allchannels`.
     pub all_channels: bool,
     /// `&<glob>` Pub/Sub channel patterns.
@@ -156,7 +194,7 @@ impl AclUser {
             all_commands: true,
             commands: CommandSet::full(),
             all_keys: true,
-            allowed_key_patterns: Vec::new(),
+            key_patterns: Vec::new(),
             all_channels: true,
             channel_patterns: Vec::new(),
         }
@@ -173,7 +211,7 @@ impl AclUser {
             all_commands: false,
             commands: CommandSet::empty(),
             all_keys: false,
-            allowed_key_patterns: Vec::new(),
+            key_patterns: Vec::new(),
             all_channels: false,
             channel_patterns: Vec::new(),
         }
@@ -238,11 +276,11 @@ impl AclUser {
             }
             "allkeys" | "~*" => {
                 self.all_keys = true;
-                self.allowed_key_patterns.clear();
+                self.key_patterns.clear();
             }
             "resetkeys" => {
                 self.all_keys = false;
-                self.allowed_key_patterns.clear();
+                self.key_patterns.clear();
             }
             "allcommands" | "+@all" => {
                 self.commands = CommandSet::full();
@@ -291,15 +329,21 @@ impl AclUser {
         } else if let Some(h) = rule.strip_prefix('!') {
             let full_hash = parse_password_hash(h)?;
             self.password_hashes.retain(|x| *x != full_hash);
-        } else if let Some(pat) = rule.strip_prefix('~') {
+        } else if rule.starts_with('~') || rule.starts_with('%') {
+            let (perm, pat) = parse_key_rule(rule)?;
             if self.all_keys {
                 return Err(setuser_err(
                     rule,
                     "Adding a pattern after the * pattern (or the 'allkeys' flag) is not valid and does not have any effect. Try 'resetkeys' to start with an empty list of patterns",
                 ));
             }
-            if !self.allowed_key_patterns.iter().any(|p| p == pat) {
-                self.allowed_key_patterns.push(pat.to_string());
+            // Same pattern again widens its permissions, as in Redis.
+            match self.key_patterns.iter_mut().find(|p| p.pattern == pat) {
+                Some(p) => p.perm |= perm,
+                None => self.key_patterns.push(KeyPattern {
+                    pattern: pat.to_string(),
+                    perm,
+                }),
             }
         } else if let Some(pat) = rule.strip_prefix('&') {
             if self.all_channels {
@@ -311,11 +355,6 @@ impl AclUser {
             if !self.channel_patterns.iter().any(|p| p == pat) {
                 self.channel_patterns.push(pat.to_string());
             }
-        } else if rule.starts_with('%') {
-            return Err(setuser_err(
-                rule,
-                "Read/write key permissions are not supported yet",
-            ));
         } else if rule.starts_with('(') {
             return Err(setuser_err(rule, "Selectors are not supported"));
         } else if let Some(rest) = rule.strip_prefix('+').or_else(|| rule.strip_prefix('-')) {
@@ -362,9 +401,13 @@ impl AclUser {
         if self.all_keys {
             "~*".to_string()
         } else {
-            self.allowed_key_patterns
+            self.key_patterns
                 .iter()
-                .map(|p| format!("~{}", p))
+                .map(|p| match p.perm {
+                    KEY_READ => format!("%R~{}", p.pattern),
+                    KEY_WRITE => format!("%W~{}", p.pattern),
+                    _ => format!("~{}", p.pattern),
+                })
                 .collect::<Vec<_>>()
                 .join(" ")
         }
@@ -398,24 +441,14 @@ impl AclUser {
             })
     }
 
-    pub fn can_access_key(&self, key: &[u8]) -> bool {
-        if self.all_keys {
-            return true;
-        }
-        let key_str = String::from_utf8_lossy(key);
-        for pat in &self.allowed_key_patterns {
-            if pat == "*" {
-                return true;
-            }
-            if let Some(prefix) = pat.strip_suffix('*') {
-                if key_str.starts_with(prefix) {
-                    return true;
-                }
-            } else if key_str == *pat {
-                return true;
-            }
-        }
-        false
+    /// Redis ACLSelectorCheckKey: some single pattern must glob-match `key`
+    /// and grant every permission in `need` ([`KEY_READ`] | [`KEY_WRITE`]; 0
+    /// for commands that neither read nor modify the value, e.g. EXISTS).
+    pub fn can_access_key(&self, key: &[u8], need: u8) -> bool {
+        self.all_keys
+            || self.key_patterns.iter().any(|p| {
+                p.perm & need == need && crate::pubsub::glob_match(p.pattern.as_bytes(), key)
+            })
     }
 
     pub fn flags(&self) -> Vec<String> {
@@ -715,10 +748,12 @@ mod tests {
         assert!(!user.can_execute_command("set"));
         assert!(!user.can_execute_command("del"));
 
-        assert!(user.can_access_key(b"user:12345"));
-        assert!(user.can_access_key(b"user:profile"));
-        assert!(!user.can_access_key(b"cache:12345"));
-        assert!(!user.can_access_key(b"admin:root"));
+        for need in [0, KEY_READ, KEY_WRITE, KEY_READ | KEY_WRITE] {
+            assert!(user.can_access_key(b"user:12345", need));
+            assert!(user.can_access_key(b"user:profile", need));
+            assert!(!user.can_access_key(b"cache:12345", need));
+            assert!(!user.can_access_key(b"admin:root", need));
+        }
     }
 
     fn user_with(rules: &[&str]) -> Result<AclUser, String> {
@@ -807,7 +842,10 @@ mod tests {
             ("bogus", "Syntax error"),
             ("-nopass", "Unknown command or category name in ACL"),
             ("(+get ~x)", "Selectors are not supported"),
-            ("%R~x", "not supported yet"),
+            ("%X~x", "Syntax error"),
+            ("%RR~x", "Syntax error"),
+            ("%~x", "Syntax error"),
+            ("%Rx", "Syntax error"),
         ] {
             let err = mgr
                 .set_user("u", &["on".to_string(), rule.to_string()])
@@ -863,6 +901,31 @@ mod tests {
     }
 
     #[test]
+    fn test_acl_read_write_key_permissions() {
+        let u = user_with(&["%R~r:*", "%W~w:*", "~rw:[ab]?"]).unwrap();
+        assert!(u.can_access_key(b"r:1", KEY_READ));
+        assert!(!u.can_access_key(b"r:1", KEY_WRITE));
+        assert!(!u.can_access_key(b"r:1", KEY_READ | KEY_WRITE));
+        assert!(u.can_access_key(b"w:1", KEY_WRITE));
+        assert!(!u.can_access_key(b"w:1", KEY_READ));
+        // Commands needing no permission bits (EXISTS) only need a match.
+        assert!(u.can_access_key(b"w:1", 0));
+        assert!(!u.can_access_key(b"z", 0));
+        // Full glob syntax, not just trailing '*'.
+        assert!(u.can_access_key(b"rw:a1", KEY_READ | KEY_WRITE));
+        assert!(!u.can_access_key(b"rw:c1", KEY_READ));
+        assert!(!u.can_access_key(b"rw:a12", KEY_READ));
+        // Repeating a pattern widens it.
+        let u = user_with(&["%R~k", "%W~k"]).unwrap();
+        assert_eq!(u.key_patterns.len(), 1);
+        assert!(u.can_access_key(b"k", KEY_READ | KEY_WRITE));
+        assert_eq!(u.keys_rule_string(), "~k");
+        let u = user_with(&["%W~k", "%r~j"]).unwrap();
+        assert_eq!(u.keys_rule_string(), "%W~k %R~j");
+        assert!(user_with(&["allkeys", "%R~x"]).is_err());
+    }
+
+    #[test]
     fn test_acl_list_line_round_trips() {
         for rules in [
             vec!["on", "nopass", "+@all", "~*"],
@@ -877,6 +940,9 @@ mod tests {
             ],
             vec!["off", "-@all", "+@read", "-memory|usage", "+client|setname"],
             vec!["on", "nopass", "+@all", "&news.*", "&alerts"],
+            vec![
+                "on", "nopass", "+@all", "%R~r:*", "%W~w:*", "%RW~rw", "~x", "%W~r:*",
+            ],
         ] {
             let u = user_with(&rules).unwrap();
             let line = u.to_acl_list_line();
@@ -884,7 +950,7 @@ mod tests {
             let u2 = user_with(&replay).unwrap();
             assert_eq!(u.commands, u2.commands, "{line}");
             assert_eq!(u.all_commands, u2.all_commands, "{line}");
-            assert_eq!(u.allowed_key_patterns, u2.allowed_key_patterns, "{line}");
+            assert_eq!(u.key_patterns, u2.key_patterns, "{line}");
             assert_eq!(u.password_hashes, u2.password_hashes, "{line}");
             assert_eq!(u.enabled, u2.enabled, "{line}");
             assert_eq!(u.all_channels, u2.all_channels, "{line}");

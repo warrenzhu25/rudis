@@ -77,6 +77,22 @@ EXTRA = {
 }
 
 
+def key_flags(v):
+    """ACL key permissions the command needs (Valkey ACLSelectorCheckKey):
+    bit 0 = read (ACCESS), bit 1 = write (INSERT/DELETE/UPDATE), unioned
+    over all key specs since rudis does not map keys to specs."""
+    f = 0
+    for spec in v.get("key_specs", []):
+        flags = set(spec.get("flags", []))
+        if "NOT_KEY" in flags:
+            continue
+        if "ACCESS" in flags:
+            f |= 1
+        if flags & {"INSERT", "DELETE", "UPDATE"}:
+            f |= 2
+    return f
+
+
 def implicit(v):
     cats = {c.lower() for c in v.get("acl_categories", [])}
     flags = set(v.get("command_flags", []))
@@ -106,12 +122,14 @@ def main():
                 full = name.lower()
                 if "container" in v:
                     full = v["container"].lower() + "|" + full
-                entries[full] = implicit(v)
+                entries[full] = implicit(v) + (key_flags(v),)
     if not entries:
         sys.exit(f"no command json found under {src}/src/commands")
     for name, cats in EXTRA.items():
         assert name not in entries, f"{name} is now in the Valkey table"
-        entries[name] = (set(cats), False)
+        # Coarse families: reads need R; anything else needs R and W.
+        kf = 1 if "read" in cats and "write" not in cats else 3
+        entries[name] = (set(cats), False, kf)
 
     names = sorted(entries)
     index = {n: i for i, n in enumerate(names)}
@@ -130,6 +148,8 @@ def main():
     w("    /// Lowercase name; subcommands are `parent|sub`.")
     w("    pub name: &'static str,")
     w("    pub cats: u32,")
+    w("    /// Key permissions needed: bit 0 = read (%R), bit 1 = write (%W).")
+    w("    pub key_flags: u8,")
     w("    /// Command carries the NO_AUTH flag (exempt from command ACLs).")
     w("    pub no_auth: bool,")
     w("    /// Index of the container command, for subcommands.")
@@ -144,7 +164,7 @@ def main():
     w("/// Sorted by `name`.")
     w("pub static COMMANDS: [CmdInfo; NUM_COMMANDS] = [")
     for n in names:
-        cats, no_auth = entries[n]
+        cats, no_auth, kf = entries[n]
         mask = 0
         for c in cats:
             mask |= 1 << CATEGORIES.index(c)
@@ -155,8 +175,12 @@ def main():
         subs = (min(sub_idx), max(sub_idx) + 1) if sub_idx else (0, 0)
         if sub_idx:
             assert sub_idx == list(range(subs[0], subs[1])), n
+            # A bare container name (subcommand unknown) needs what any
+            # subcommand might need.
+            for i in sub_idx:
+                kf |= entries[names[i]][2]
         w(
-            f'    CmdInfo {{ name: "{n}", cats: {mask:#x}, no_auth: {str(no_auth).lower()}, '
+            f'    CmdInfo {{ name: "{n}", cats: {mask:#x}, key_flags: {kf}, no_auth: {str(no_auth).lower()}, '
             f"parent: {parent}, subs: ({subs[0]}, {subs[1]}) }},"
         )
     w("];")

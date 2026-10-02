@@ -1695,8 +1695,9 @@ fn can_tracker_read_key(
     let acl = crate::acl::get_acl_for_port(port);
     let guard = acl.read().unwrap();
     guard
-        .get_user(user_name)
-        .map(|u| u.can_access_key(key))
+        .users
+        .get(user_name)
+        .map(|u| u.can_access_key(key, crate::acl::KEY_READ))
         .unwrap_or(true)
 }
 
@@ -6290,6 +6291,19 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
     }
 }
 
+/// Key permissions (`crate::acl::KEY_READ` / `KEY_WRITE`) `cmd` needs on each
+/// of its keys, from the command table's key specs. SET without GET only
+/// overwrites (Redis setGetKeys). Unknown commands need both.
+pub fn acl_key_perm(cmd: &Command) -> u8 {
+    use crate::acl::{KEY_READ, KEY_WRITE};
+    if let Command::Set { get: false, .. } = cmd {
+        return KEY_WRITE;
+    }
+    crate::acl::command_index(acl_cmd_name(cmd))
+        .map(|i| crate::acl_categories::COMMANDS[i].key_flags)
+        .unwrap_or(KEY_READ | KEY_WRITE)
+}
+
 /// Name used for ACL checks: like [`get_cmd_name`], but resolves the
 /// subcommand (`container|sub`) for containers whose subcommands have
 /// different ACL categories. Unresolved containers return the bare container
@@ -7546,8 +7560,9 @@ async fn execute_command(
                 );
                 return false;
             }
+            let need = acl_key_perm(&cmd);
             for key in cmd_keys(&cmd) {
-                if !user.can_access_key(key) {
+                if !user.can_access_key(key, need) {
                     out.extend_from_slice(
                         b"-NOPERM this user has no permissions to access one of the keys used as arguments\r\n",
                     );
@@ -22788,8 +22803,9 @@ async fn execute_commands_squashed(
                         break;
                     }
                     let mut forbidden = false;
+                    let need = acl_key_perm(cmd);
                     for_each_cmd_key(cmd, |k| {
-                        if !user.can_access_key(k) {
+                        if !user.can_access_key(k, need) {
                             forbidden = true;
                         }
                     });
