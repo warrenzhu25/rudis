@@ -3040,7 +3040,7 @@ impl RudisTable {
                 RudisValue::String(b) => Ok(Some(crate::shard::CompactResp::from_bulk(b))),
                 RudisValue::Int(n) => {
                     let formatted = Self::format_i64(*n);
-                    Ok(Some(crate::shard::CompactResp::from_slice(&formatted)))
+                    Ok(Some(crate::shard::CompactResp::from_bulk(&formatted)))
                 }
                 RudisValue::HyperLogLog(regs) => Ok(Some(crate::shard::CompactResp::from_bulk(
                     &Bytes::copy_from_slice(&regs[..]),
@@ -17513,5 +17513,22 @@ mod tests {
             });
         }
         assert_eq!(table.len(), total_inserted);
+    }
+
+    #[test]
+    fn test_get_compact_frames_integer_values_as_bulk_strings() {
+        let mut table = RudisTable::new();
+        for v in ["7", "12345", "-3", "9223372036854775807"] {
+            table.set(Bytes::from_static(b"k"), Bytes::from(v), None);
+            assert!(matches!(
+                table.get_entry(b"k").unwrap().0,
+                RudisValue::Int(_)
+            ));
+            let got = table.get_compact(b"k").unwrap().unwrap();
+            assert_eq!(
+                got.as_slice(),
+                format!("${}\r\n{}\r\n", v.len(), v).as_bytes()
+            );
+        }
     }
 }

@@ -15641,3 +15641,39 @@ fn test_cross_shard_spin_config_and_replies_with_or_without_polling_e2e() {
     shutdown_and_wait(port, &mut child);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_pipelined_get_of_integer_values_is_bulk_framed_e2e() {
+    let port = 16973;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "4", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // Integer-looking values are stored integer-encoded; a pipelined GET of
+    // them used to come back as bare digits without the `$len` header.
+    let vals = ["7", "12345", "-3", "9223372036854775807", "plain"];
+    let keys: Vec<String> = (0..20).map(|i| format!("intget:{i}")).collect();
+    for (i, k) in keys.iter().enumerate() {
+        assert_eq!(
+            resp_cmd(&mut c, &["SET", k, vals[i % vals.len()]]),
+            "+OK\r\n"
+        );
+    }
+    let mut pipeline = String::new();
+    let mut expected = String::new();
+    for (i, k) in keys.iter().enumerate() {
+        pipeline.push_str(&format!("*2\r\n$3\r\nGET\r\n${}\r\n{}\r\n", k.len(), k));
+        let v = vals[i % vals.len()];
+        expected.push_str(&format!("${}\r\n{}\r\n", v.len(), v));
+    }
+    pipeline.push_str("*2\r\n$4\r\nINCR\r\n$8\r\nintget:0\r\n");
+    expected.push_str(":8\r\n");
+    c.write_all(pipeline.as_bytes()).unwrap();
+    let mut got = vec![0u8; expected.len()];
+    c.read_exact(&mut got).unwrap();
+    assert_eq!(String::from_utf8_lossy(&got), expected);
+    assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n");
+
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}
