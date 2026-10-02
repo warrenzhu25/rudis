@@ -734,13 +734,15 @@ fn format_eval_error(err: &str, sha: &str) -> String {
             global_name, sha
         );
     }
-    let final_prefix =
-        if msg.starts_with("ERR ") || msg.starts_with("NOSCRIPT ") || msg.starts_with("WRONGTYPE ")
-        {
-            msg.to_string()
-        } else {
-            format!("ERR {}", msg)
-        };
+    let final_prefix = if msg.starts_with("ERR ")
+        || msg.starts_with("NOSCRIPT ")
+        || msg.starts_with("WRONGTYPE ")
+        || msg.starts_with("NOPERM ")
+    {
+        msg.to_string()
+    } else {
+        format!("ERR {}", msg)
+    };
     format!("{} script: {}, on @user_script:1.", final_prefix, sha)
 }
 
@@ -2100,6 +2102,12 @@ fn register_redis_module(
                 "Unknown Redis command called from script".to_string(),
             ));
         }
+        if let Some(err) = script_acl_denied(port, &cmd) {
+            crate::connection::record_rejected_stat(crate::connection::get_cmd_name(&cmd));
+            crate::connection::record_error_stat("NOPERM", None);
+            SCRIPT_RECORDED_ERROR.set(true);
+            return Err(mlua::Error::RuntimeError(err));
+        }
         match &cmd {
             Command::Cluster(_)
             | Command::Replicaof { .. }
@@ -2243,6 +2251,14 @@ fn register_redis_module(
         if let Command::Unknown(_) = &cmd {
             let tbl = lua.create_table()?;
             tbl.set("err", "ERR Unknown Redis command called from script")?;
+            return Ok(Value::Table(tbl));
+        }
+        if let Some(err) = script_acl_denied(port, &cmd) {
+            crate::connection::record_rejected_stat(crate::connection::get_cmd_name(&cmd));
+            crate::connection::record_error_stat("NOPERM", None);
+            SCRIPT_RECORDED_ERROR.set(true);
+            let tbl = lua.create_table()?;
+            tbl.set("err", err)?;
             return Ok(Value::Table(tbl));
         }
         match &cmd {
@@ -2429,33 +2445,7 @@ fn register_redis_module(
             ));
         }
 
-        let acl = crate::acl::get_acl_for_port(port);
-        let acl_guard = acl.read().unwrap();
-        let cmd_name = crate::connection::acl_cmd_name(&cmd);
-        let mut allowed = true;
-        let auth_user = crate::connection::CURRENT_AUTH_USER.with(|u| u.borrow().clone());
-        let user_opt = if auth_user.is_empty() {
-            acl_guard.get_user("default")
-        } else {
-            acl_guard.get_user(&auth_user)
-        };
-        if let Some(user) = user_opt {
-            if !user.can_execute_command(cmd_name) {
-                allowed = false;
-            }
-            if allowed {
-                let mut keys = Vec::new();
-                crate::connection::for_each_cmd_key(&cmd, |k| keys.push(k));
-                let need = crate::connection::acl_key_perm(&cmd);
-                for key in keys {
-                    if !user.can_access_key(key, need) {
-                        allowed = false;
-                        break;
-                    }
-                }
-            }
-        }
-        if allowed {
+        if script_acl_denied(port, &cmd).is_none() {
             Ok(Value::Integer(1))
         } else {
             Ok(Value::Nil)
@@ -2466,6 +2456,49 @@ fn register_redis_module(
     let proxy = make_table_readonly_proxy(lua, redis.clone())?;
     real_g.set("redis", proxy)?;
     Ok(redis)
+}
+
+/// ACL check for commands issued by a script (Redis scriptVerifyACL): they
+/// run with the calling user's command, key and channel permissions. Returns
+/// the NOPERM error if denied.
+fn script_acl_denied(port: u16, cmd: &Command) -> Option<String> {
+    let auth_user = crate::connection::CURRENT_AUTH_USER.with(|u| u.borrow().clone());
+    let user_name = if auth_user.is_empty() {
+        "default"
+    } else {
+        auth_user.as_str()
+    };
+    if !crate::acl::HAS_CUSTOM_ACL.load(std::sync::atomic::Ordering::Relaxed)
+        && user_name == "default"
+    {
+        return None;
+    }
+    let acl = crate::acl::get_acl_for_port(port);
+    let guard = acl.read().unwrap();
+    let user = guard.users.get(user_name)?;
+    let name = crate::connection::acl_cmd_name(cmd);
+    if !user.can_execute_command(name) {
+        return Some(format!(
+            "NOPERM this user has no permissions to run the '{}' command",
+            name.to_lowercase()
+        ));
+    }
+    let need = crate::connection::acl_key_perm(cmd);
+    let mut key_denied = false;
+    crate::connection::for_each_cmd_key(cmd, |k| key_denied |= !user.can_access_key(k, need));
+    if key_denied {
+        return Some(
+            "NOPERM this user has no permissions to access one of the keys used as arguments"
+                .to_string(),
+        );
+    }
+    if crate::connection::acl_channels_denied(user, cmd) {
+        return Some(
+            "NOPERM this user has no permissions to access one of the channels used as arguments"
+                .to_string(),
+        );
+    }
+    None
 }
 
 fn resp_bytes_to_lua(lua: &Lua, out: &[u8], is_hgetall_map: bool) -> mlua::Result<Value> {
@@ -2779,6 +2812,46 @@ mod tests {
     use super::*;
     use crate::aof::AofWriter;
     use crate::shard::ShardDb;
+
+    #[test]
+    fn test_script_commands_are_subject_to_caller_acl() {
+        let port = 65041;
+        crate::acl::get_acl_for_port(port)
+            .write()
+            .unwrap()
+            .set_user(
+                "lua",
+                &["on", "nopass", "-@all", "+eval", "+get", "~ok:*", "&news"].map(String::from),
+            )
+            .unwrap();
+        let cmd = |args: &[&str]| {
+            crate::resp::build_command(
+                args.iter()
+                    .map(|a| Bytes::copy_from_slice(a.as_bytes()))
+                    .collect(),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        crate::connection::CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = "lua".to_string());
+        assert_eq!(script_acl_denied(port, &cmd(&["GET", "ok:1"])), None);
+        let e = script_acl_denied(port, &cmd(&["GET", "secret"])).unwrap();
+        assert!(e.starts_with("NOPERM") && e.contains("keys"), "{e}");
+        let e = script_acl_denied(port, &cmd(&["SET", "ok:1", "v"])).unwrap();
+        assert!(
+            e.starts_with("NOPERM") && e.contains("'set' command"),
+            "{e}"
+        );
+        // An unrestricted caller is unaffected.
+        crate::connection::CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = "default".to_string());
+        assert_eq!(script_acl_denied(port, &cmd(&["SET", "secret", "v"])), None);
+        crate::connection::CURRENT_AUTH_USER.with(|u| u.borrow_mut().clear());
+        // Surfaced to the client as NOPERM (not wrapped in ERR), like Redis.
+        assert_eq!(
+            format_eval_error("runtime error: NOPERM denied", "abc"),
+            "NOPERM denied script: abc, on @user_script:1."
+        );
+    }
 
     #[test]
     fn test_eval_script_basic_types_and_redis_call() {

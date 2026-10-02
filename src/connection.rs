@@ -2120,6 +2120,7 @@ pub fn write_resp_err(out: &mut Vec<u8>, err: impl AsRef<str>) {
         || err_single_line.starts_with("NOREPLICAS")
         || err_single_line.starts_with("OOM")
         || err_single_line.starts_with("READONLY")
+        || err_single_line.starts_with("NOPERM")
         || err_single_line.starts_with("ERR")
     {
         out.extend_from_slice(b"-");
@@ -7287,7 +7288,7 @@ const NOPERM_CHANNEL: &[u8] =
 
 /// True if `cmd` names a Pub/Sub channel (or PSUBSCRIBE pattern) the user's
 /// `&` permissions do not cover.
-fn acl_channels_denied(user: &crate::acl::AclUser, cmd: &Command) -> bool {
+pub fn acl_channels_denied(user: &crate::acl::AclUser, cmd: &Command) -> bool {
     if user.all_channels {
         return false;
     }

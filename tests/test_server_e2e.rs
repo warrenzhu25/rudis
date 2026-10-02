@@ -14558,3 +14558,59 @@ fn test_acl_read_write_key_permissions_e2e() {
     let r = send_and_read(&mut c, b"GET r:1\r\nGET w:1\r\nGET x1\r\n");
     assert_eq!(r, format!("$1\r\na\r\n{}$1\r\nc\r\n", DENIED));
 }
+
+#[test]
+fn test_script_redis_call_enforces_caller_acl_e2e() {
+    let port = 16989;
+    start_test_server(port, 1);
+    let mut admin = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    admin
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    assert_eq!(resp_cmd(&mut admin, &["SET", "secret", "s"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut admin, &["SET", "ok:1", "v"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(
+            &mut admin,
+            &[
+                "ACL", "SETUSER", "lua", "on", ">p", "-@all", "+eval", "+get", "~ok:*"
+            ]
+        ),
+        "+OK\r\n"
+    );
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["AUTH", "lua", "p"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &["EVAL", "return redis.call('get', KEYS[1])", "1", "ok:1"]
+        ),
+        "$1\r\nv\r\n"
+    );
+    // A key outside the user's patterns, smuggled in as a script argument.
+    let r = resp_cmd(&mut c, &["EVAL", "return redis.call('get','secret')", "0"]);
+    assert!(r.starts_with("-NOPERM") && !r.contains("$1\r\ns"), "{}", r);
+    let r = resp_cmd(&mut c, &["EVAL", "return redis.pcall('get','secret')", "0"]);
+    assert!(r.starts_with("-NOPERM"), "{}", r);
+    // A command the user lacks.
+    let r = resp_cmd(
+        &mut c,
+        &["EVAL", "return redis.call('set','ok:1','x')", "0"],
+    );
+    assert!(
+        r.starts_with("-NOPERM") && r.contains("'set' command"),
+        "{}",
+        r
+    );
+    let r = resp_cmd(
+        &mut c,
+        &[
+            "EVAL",
+            "return redis.call('config','set','maxclients','5')",
+            "0",
+        ],
+    );
+    assert!(r.starts_with("-NOPERM"), "{}", r);
+    assert_eq!(resp_cmd(&mut admin, &["GET", "ok:1"]), "$1\r\nv\r\n");
+}
