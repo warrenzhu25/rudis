@@ -14,6 +14,24 @@ pub fn get_acl_for_port(port: u16) -> Arc<RwLock<AclManager>> {
         .clone()
 }
 
+/// Makes `port` resolve to the same ACL table as `base_port`.
+///
+/// In cluster mode every shard listens on `base_port + shard_id`, but users,
+/// `requirepass` and ACL SETUSER are server-wide in Redis. Without aliasing,
+/// connections to any shard port other than the base one would see a fresh,
+/// unauthenticated `default nopass` user.
+pub fn share_acl_with_port(port: u16, base_port: u16) {
+    if port == base_port {
+        return;
+    }
+    let mut map = PORT_ACLS.lock().unwrap();
+    let base = map
+        .entry(base_port)
+        .or_insert_with(|| Arc::new(RwLock::new(AclManager::new())))
+        .clone();
+    map.insert(port, base);
+}
+
 /// Redis ACL password hash: `#` + lowercase hex SHA-256 of the password.
 pub fn hash_password_sha256(password: &str) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, password.as_bytes());
@@ -477,6 +495,34 @@ mod tests {
         // '<' removes a password.
         mgr.set_user("alice", &[format!("<{}", pass)]).unwrap();
         assert!(mgr.check_auth(Some("alice"), pass).is_err());
+    }
+
+    #[test]
+    fn test_cluster_shard_ports_share_one_acl_table() {
+        let (base, shard1) = (65031u16, 65032u16);
+        // A stale per-shard table created before aliasing must be replaced.
+        let _ = get_acl_for_port(shard1);
+        share_acl_with_port(shard1, base);
+        share_acl_with_port(base, base); // no-op
+        get_acl_for_port(base)
+            .write()
+            .unwrap()
+            .set_requirepass("pw");
+        let shard_acl = get_acl_for_port(shard1);
+        assert!(Arc::ptr_eq(&shard_acl, &get_acl_for_port(base)));
+        assert!(shard_acl.read().unwrap().is_auth_required_for_default());
+        shard_acl
+            .write()
+            .unwrap()
+            .set_user("zed", &["on".to_string(), ">z".to_string()])
+            .unwrap();
+        assert!(
+            get_acl_for_port(base)
+                .read()
+                .unwrap()
+                .get_user("zed")
+                .is_some()
+        );
     }
 
     #[test]

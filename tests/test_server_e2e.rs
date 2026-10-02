@@ -14321,3 +14321,38 @@ fn test_acl_passwords_never_stored_or_shown_in_plaintext_e2e() {
     assert!(resp_cmd(&mut anon2, &["AUTH", "rootpw"]).starts_with("-WRONGPASS"));
     assert_eq!(resp_cmd(&mut anon2, &["AUTH", "rootpw2"]), "+OK\r\n");
 }
+
+#[test]
+fn test_cluster_shard_ports_share_requirepass_and_users_e2e() {
+    let base = 16995;
+    start_test_server_cluster(base, 2);
+    let shard1 = base + 1;
+
+    let mut admin = TcpStream::connect(("127.0.0.1", base)).unwrap();
+    admin
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    assert_eq!(
+        resp_cmd(&mut admin, &["CONFIG", "SET", "requirepass", "clusterpw"]),
+        "+OK\r\n"
+    );
+
+    // Every shard port enforces the server-wide password.
+    let mut c = TcpStream::connect(("127.0.0.1", shard1)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    assert!(resp_cmd(&mut c, &["GET", "k"]).starts_with("-NOAUTH"));
+    assert!(resp_cmd(&mut c, &["SUBSCRIBE", "ch"]).starts_with("-NOAUTH"));
+    assert_eq!(resp_cmd(&mut c, &["AUTH", "clusterpw"]), "+OK\r\n");
+
+    // Users created via one shard port can log in on another.
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &["ACL", "SETUSER", "op", "on", ">oppw", "+@all", "~*"]
+        ),
+        "+OK\r\n"
+    );
+    let mut c0 = TcpStream::connect(("127.0.0.1", base)).unwrap();
+    c0.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    assert_eq!(resp_cmd(&mut c0, &["AUTH", "op", "oppw"]), "+OK\r\n");
+}
