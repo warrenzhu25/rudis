@@ -15677,3 +15677,40 @@ fn test_pipelined_get_of_integer_values_is_bulk_framed_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child);
 }
+
+#[test]
+fn test_unlink_exists_touch_count_keys_across_all_shards_e2e() {
+    let port = 16972;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "4", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // 40 keys spread over all 4 shards, sent as one request per command.
+    let keys: Vec<String> = (0..40).map(|i| format!("ux:{i}")).collect();
+    for k in &keys {
+        assert_eq!(resp_cmd(&mut c, &["SET", k, "v"]), "+OK\r\n");
+    }
+    let with = |cmd: &str, extra: &[&str]| {
+        let mut args = vec![cmd];
+        args.extend(keys.iter().map(String::as_str));
+        args.extend_from_slice(extra);
+        args.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+    };
+    let run = |c: &mut TcpStream, args: Vec<String>| {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        resp_cmd(c, &args)
+    };
+    // Duplicates are counted per occurrence, missing keys are not.
+    assert_eq!(
+        run(&mut c, with("EXISTS", &["ux:0", "ux:39", "nope"])),
+        ":42\r\n"
+    );
+    assert_eq!(run(&mut c, with("TOUCH", &["nope"])), ":40\r\n");
+    assert_eq!(run(&mut c, with("UNLINK", &["nope"])), ":40\r\n");
+    assert_eq!(run(&mut c, with("EXISTS", &[])), ":0\r\n");
+    assert_eq!(run(&mut c, with("UNLINK", &[])), ":0\r\n");
+    assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), ":0\r\n");
+
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}

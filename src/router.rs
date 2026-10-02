@@ -2393,6 +2393,82 @@ impl Router {
         res
     }
 
+    /// Like [`Self::execute_remote`] for several `(shard, command)` pairs, but
+    /// sends them all before waiting, so K remote shards cost one round trip
+    /// instead of K. Replies are returned in input order.
+    pub async fn execute_remote_many(&self, cmds: Vec<(usize, Command)>) -> Vec<Vec<u8>> {
+        let is_resp3 = crate::connection::CURRENT_CLIENT_RESP3.get();
+        // Remote shards write into these slots through raw pointers: the
+        // boxed slice is never resized and outlives every wait below.
+        let mut slots: Box<[crate::shard::CompactResp]> = (0..cmds.len())
+            .map(|_| crate::shard::CompactResp::empty())
+            .collect();
+        let mut pending = Vec::with_capacity(cmds.len());
+        for (i, (target, cmd)) in cmds.into_iter().enumerate() {
+            let responder = self
+                .remote_responder_pool
+                .borrow_mut()
+                .pop()
+                .unwrap_or_else(|| std::sync::Arc::new(crate::mailbox::BatchResponder::new()));
+            responder.prepare(&mut slots[i] as *mut _);
+            let h = crate::connection::cmd_primary_key(&cmd)
+                .map(|k| crate::table::hash_key(k))
+                .unwrap_or(0);
+            let msg = ShardMessage::Batch {
+                items: vec![(0, h, cmd)],
+                responder: responder.clone(),
+                is_resp3,
+            };
+            let sent = self.senders[target].send(msg).is_ok();
+            pending.push((responder, sent));
+        }
+        for (responder, sent) in &pending {
+            if *sent {
+                let _ = responder.wait_take().await;
+            }
+        }
+        let out = slots
+            .into_vec()
+            .into_iter()
+            .zip(&pending)
+            .map(|(slot, (_, sent))| {
+                if *sent {
+                    slot.into_vec()
+                } else {
+                    b"-ERR internal shard routing error\r\n".to_vec()
+                }
+            })
+            .collect();
+        let mut pool = self.remote_responder_pool.borrow_mut();
+        for (responder, sent) in pending {
+            if sent {
+                pool.push(responder);
+            }
+        }
+        out
+    }
+
+    /// Splits `keys` into the ones this shard owns and one batch per other
+    /// shard, keeping duplicates (EXISTS counts them).
+    pub fn group_keys_by_shard(&self, keys: &[Bytes]) -> (Vec<Bytes>, Vec<(usize, Vec<Bytes>)>) {
+        let mut local = Vec::new();
+        let mut remote: Vec<Vec<Bytes>> = (0..self.num_shards).map(|_| Vec::new()).collect();
+        for key in keys {
+            let target = self.target_shard(key);
+            if target == self.shard_id {
+                local.push(key.clone());
+            } else {
+                remote[target].push(key.clone());
+            }
+        }
+        let remote = remote
+            .into_iter()
+            .enumerate()
+            .filter(|(_, ks)| !ks.is_empty())
+            .collect();
+        (local, remote)
+    }
+
     pub async fn dbsize(&self) -> usize {
         let mut total = self.local_db.borrow_mut().dbsize();
         for sid in 0..self.num_shards {
@@ -4821,5 +4897,100 @@ mod tests {
         assert!(!presence.is_shard_interested(101, b"news"));
         presence.remove_subscriber(100, b"news");
         assert!(!presence.is_shard_interested(100, b"news"));
+    }
+
+    #[test]
+    fn test_group_keys_by_shard_keeps_duplicates_and_owner() {
+        let (mut senders_mesh, _receivers) = crate::mailbox::create_shard_mesh(3);
+        let router = Router::new(
+            0,
+            3,
+            9986,
+            Rc::new(RefCell::new(ShardDb::new(9986))),
+            senders_mesh.remove(0),
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+        let mut keys: Vec<Bytes> = (0..30).map(|i| Bytes::from(format!("g{i}"))).collect();
+        keys.push(keys[0].clone());
+        let (local, remote) = router.group_keys_by_shard(&keys);
+        assert!(local.iter().all(|k| router.target_shard(k) == 0));
+        for (shard, ks) in &remote {
+            assert_ne!(*shard, 0);
+            assert!(!ks.is_empty());
+            assert!(ks.iter().all(|k| router.target_shard(k) == *shard));
+        }
+        let total = local.len() + remote.iter().map(|(_, ks)| ks.len()).sum::<usize>();
+        assert_eq!(total, keys.len());
+    }
+
+    #[test]
+    fn test_execute_remote_many_sends_to_all_shards_before_waiting() {
+        let (mut senders_mesh, mut receivers) = crate::mailbox::create_shard_mesh(3);
+        let senders = senders_mesh.remove(0);
+        drop(senders_mesh);
+        let rx2 = receivers.remove(2);
+        let rx1 = receivers.remove(1);
+        let shard2_got_msg = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Fake shards reply with an integer. Shard 1 only answers 1 if shard 2
+        // already holds its request, i.e. both were sent before any wait.
+        let seen = shard2_got_msg.clone();
+        let t1 = std::thread::spawn(move || {
+            if let Ok(ShardMessage::Batch {
+                items, responder, ..
+            }) = rx1.recv()
+            {
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                while !seen.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                let n = if seen.load(Ordering::Acquire) { 1 } else { 0 };
+                responder.write_slot(
+                    0,
+                    crate::shard::CompactResp::from_slice(format!(":{n}\r\n").as_bytes()),
+                );
+                responder.finish(items);
+            }
+        });
+        let seen = shard2_got_msg.clone();
+        let t2 = std::thread::spawn(move || {
+            if let Ok(ShardMessage::Batch {
+                items, responder, ..
+            }) = rx2.recv()
+            {
+                seen.store(true, Ordering::Release);
+                responder.write_slot(0, crate::shard::CompactResp::from_slice(b":7\r\n"));
+                responder.finish(items);
+            }
+        });
+
+        let router = Router::new(
+            0,
+            3,
+            9985,
+            Rc::new(RefCell::new(ShardDb::new(9985))),
+            senders,
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        let replies = rt.block_on(async {
+            router
+                .execute_remote_many(vec![
+                    (1, Command::Exists(smallvec![Bytes::from("a")])),
+                    (2, Command::Exists(smallvec![Bytes::from("b")])),
+                ])
+                .await
+        });
+        assert_eq!(replies, vec![b":1\r\n".to_vec(), b":7\r\n".to_vec()]);
+        assert_eq!(router.remote_responder_pool.borrow().len(), 2);
+        t1.join().unwrap();
+        t2.join().unwrap();
     }
 }

@@ -8255,26 +8255,22 @@ async fn execute_command(
             for key in &keys {
                 notify_key_invalidation(router.port, key.as_ref(), client_id);
             }
+            let (local, remote) = router.group_keys_by_shard(&keys);
             let mut count = 0usize;
-            for key in &keys {
-                let target = router.target_shard(key);
-                if target == router.shard_id {
-                    let lazy = router.local_db.borrow().table.is_lazyfree_worthy(key);
-                    if router.del(key.clone()).await {
-                        count += 1;
-                        if lazy {
-                            crate::table::add_lazyfreed_objects(1);
-                        }
-                    }
-                } else {
-                    let resp = router
-                        .execute_remote(target, Command::Unlink(smallvec![key.clone()]))
-                        .await;
-                    if resp == b":1\r\n" {
-                        count += 1;
+            for key in &local {
+                let lazy = router.local_db.borrow().table.is_lazyfree_worthy(key);
+                if router.del(key.clone()).await {
+                    count += 1;
+                    if lazy {
+                        crate::table::add_lazyfreed_objects(1);
                     }
                 }
             }
+            let remote = remote
+                .into_iter()
+                .map(|(shard, ks)| (shard, Command::Unlink(smallvec::SmallVec::from_vec(ks))))
+                .collect();
+            count += sum_remote_counts(router, remote).await;
             if count > 0 {
                 for key in &keys {
                     crate::search::delete_document_hook(&String::from_utf8_lossy(key));
@@ -8304,11 +8300,17 @@ async fn execute_command(
                 write_resp_integer(out, if exists { 1 } else { 0 });
                 return false;
             }
-            let mut count = 0usize;
-            for key in keys {
-                if router.exists(key.clone()).await {
-                    count += 1;
-                }
+            let (local, remote) = router.group_keys_by_shard(&keys);
+            let mut count = {
+                let mut db = router.local_db.borrow_mut();
+                local.iter().filter(|k| db.exists(k.as_ref())).count()
+            };
+            let remote = remote
+                .into_iter()
+                .map(|(shard, ks)| (shard, Command::Exists(smallvec::SmallVec::from_vec(ks))))
+                .collect();
+            count += sum_remote_counts(router, remote).await;
+            for key in &keys {
                 record_client_read(router.port, client_id, key.as_ref());
             }
             write_resp_integer(out, count as i64);
@@ -13762,18 +13764,17 @@ async fn execute_command(
             false
         }
         Command::Touch(keys) => {
-            let mut count = 0usize;
-            for k in keys {
-                let target = router.target_shard(&k);
-                if target == router.shard_id {
-                    count += router.local_db.borrow_mut().touch(&[k]);
-                } else {
-                    let res = router.execute_remote(target, Command::Touch(vec![k])).await;
-                    if res == b":1\r\n" {
-                        count += 1;
-                    }
-                }
-            }
+            let (local, remote) = router.group_keys_by_shard(&keys);
+            let mut count = if local.is_empty() {
+                0
+            } else {
+                router.local_db.borrow_mut().touch(&local)
+            };
+            let remote = remote
+                .into_iter()
+                .map(|(shard, ks)| (shard, Command::Touch(ks)))
+                .collect();
+            count += sum_remote_counts(router, remote).await;
             out.extend_from_slice(format!(":{}\r\n", count).as_bytes());
             false
         }
@@ -23742,6 +23743,29 @@ fn keys_span_shards(keys: &[Bytes], shard_of: impl Fn(&[u8]) -> usize) -> bool {
     }
 }
 
+/// Value of a `:N\r\n` integer reply; 0 for errors or any other reply.
+fn resp_integer_or_zero(resp: &[u8]) -> usize {
+    resp.strip_prefix(b":")
+        .and_then(|r| r.strip_suffix(b"\r\n"))
+        .and_then(|n| std::str::from_utf8(n).ok())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Runs one command per remote shard concurrently (see
+/// `Router::execute_remote_many`) and sums their integer replies.
+async fn sum_remote_counts(router: &Router, cmds: Vec<(usize, Command)>) -> usize {
+    if cmds.is_empty() {
+        return 0;
+    }
+    router
+        .execute_remote_many(cmds)
+        .await
+        .iter()
+        .map(|r| resp_integer_or_zero(r))
+        .sum()
+}
+
 pub(crate) struct RecvBytesMut(pub BytesMut);
 
 unsafe impl monoio::buf::IoBufMut for RecvBytesMut {
@@ -24283,6 +24307,16 @@ mod tests {
             &[Bytes::from("x"), Bytes::from("y")],
             |k| k[0] as usize
         ));
+    }
+
+    #[test]
+    fn test_resp_integer_or_zero() {
+        assert_eq!(resp_integer_or_zero(b":0\r\n"), 0);
+        assert_eq!(resp_integer_or_zero(b":42\r\n"), 42);
+        assert_eq!(resp_integer_or_zero(b"-ERR boom\r\n"), 0);
+        assert_eq!(resp_integer_or_zero(b"$1\r\n5\r\n"), 0);
+        assert_eq!(resp_integer_or_zero(b":-1\r\n"), 0);
+        assert_eq!(resp_integer_or_zero(b""), 0);
     }
 
     #[monoio::test]
