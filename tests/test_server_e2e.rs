@@ -14863,3 +14863,85 @@ fn test_aof_ttls_do_not_survive_downtime_e2e() {
     shutdown_and_wait(port, &mut child);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_aof_survives_thread_count_changes_e2e() {
+    let port = 16984;
+    let dir = std::env::temp_dir().join(format!("rudis-aofreshard-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let port_s = port.to_string();
+    let dir_s = dir.to_str().unwrap().to_string();
+    let args = |threads: &'static str| {
+        vec![
+            "--port".to_string(),
+            port_s.clone(),
+            "--threads".to_string(),
+            threads.to_string(),
+            "--no-pin".to_string(),
+            "--aof".to_string(),
+            "true".to_string(),
+            "--aof-dir".to_string(),
+            dir_s.clone(),
+        ]
+    };
+    let start = |threads: &'static str| {
+        let a = args(threads);
+        let a: Vec<&str> = a.iter().map(String::as_str).collect();
+        spawn_rudis_listening(&a, port)
+    };
+    let check_all = |c: &mut TcpStream, n: usize| {
+        assert_eq!(resp_cmd(c, &["DBSIZE"]), format!(":{}\r\n", n + 2));
+        for k in 0..n {
+            let key = format!("key:{}", k);
+            let want = format!("v{}", k);
+            assert_eq!(
+                resp_cmd(c, &["GET", &key]),
+                format!("${}\r\n{}\r\n", want.len(), want),
+                "{key}"
+            );
+        }
+        assert_eq!(resp_cmd(c, &["LLEN", "list"]), ":3\r\n");
+        assert_eq!(resp_cmd(c, &["HGET", "hash", "f"]), "$1\r\nv\r\n");
+    };
+
+    let mut child = start("4");
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    for k in 0..200 {
+        let (key, val) = (format!("key:{}", k), format!("v{}", k));
+        assert_eq!(resp_cmd(&mut c, &["SET", &key, &val]), "+OK\r\n");
+    }
+    assert_eq!(
+        resp_cmd(&mut c, &["RPUSH", "list", "a", "b", "c"]),
+        ":3\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["HSET", "hash", "f", "v"]), ":1\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+
+    // Fewer threads: keys from the dropped shard files must not vanish.
+    let mut child = start("2");
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    check_all(&mut c, 200);
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+
+    // More threads: keys must be found in their new owning shards.
+    let mut child = start("8");
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    check_all(&mut c, 200);
+    for k in 200..250 {
+        let (key, val) = (format!("key:{}", k), format!("v{}", k));
+        assert_eq!(resp_cmd(&mut c, &["SET", &key, &val]), "+OK\r\n");
+    }
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+
+    // Same count again: plain replay, including writes made after the reshard.
+    let mut child = start("8");
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    check_all(&mut c, 250);
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}

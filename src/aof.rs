@@ -2045,6 +2045,252 @@ pub fn replay_aof_with(
     Ok(count)
 }
 
+/// Records how many shards wrote the `appendonly-{i}.aof` files in a dir.
+pub const AOF_SHARDS_MANIFEST: &str = "appendonly.shards";
+/// Present only while [`reshard_aof_dir`] is swapping files in; if it is
+/// found at startup the swap was interrupted and needs a human.
+pub const AOF_RESHARD_MARKER: &str = "appendonly.reshard-in-progress";
+const AOF_RESHARD_STAGING: &str = ".aof-reshard-staging";
+
+fn aof_shard_file_index(name: &str) -> Option<usize> {
+    name.strip_prefix("appendonly-")?
+        .strip_suffix(".aof")?
+        .parse()
+        .ok()
+}
+
+fn write_file_synced(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(data)?;
+    f.sync_all()
+}
+
+/// How keys were spread over the per-shard AOF files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AofLayout {
+    shards: usize,
+    /// Cluster mode routes by CRC16 slot, standalone by key hash.
+    cluster_slots: bool,
+}
+
+impl AofLayout {
+    fn current(shards: usize) -> Self {
+        Self {
+            shards,
+            cluster_slots: crate::cluster::HAS_ACTIVE_CLUSTER
+                .load(std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    fn routing_name(&self) -> &'static str {
+        if self.cluster_slots { "slots" } else { "hash" }
+    }
+}
+
+fn write_aof_shards_manifest(dir: &Path, layout: AofLayout) -> std::io::Result<()> {
+    let tmp = dir.join(format!("{}.tmp", AOF_SHARDS_MANIFEST));
+    let text = format!(
+        "shards {}\nrouting {}\n",
+        layout.shards,
+        layout.routing_name()
+    );
+    write_file_synced(&tmp, text.as_bytes())?;
+    let target = dir.join(AOF_SHARDS_MANIFEST);
+    std::fs::rename(&tmp, &target)?;
+    sync_parent_dir(&target)
+}
+
+fn read_aof_shards_manifest(dir: &Path) -> std::io::Result<Option<AofLayout>> {
+    let path = dir.join(AOF_SHARDS_MANIFEST);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut shards = None;
+    let mut cluster_slots = None;
+    for line in text.lines() {
+        match line.trim().split_once(' ') {
+            Some(("shards", n)) => shards = n.trim().parse::<usize>().ok().filter(|n| *n > 0),
+            Some(("routing", "hash")) => cluster_slots = Some(false),
+            Some(("routing", "slots")) => cluster_slots = Some(true),
+            _ => {}
+        }
+    }
+    match (shards, cluster_slots) {
+        (Some(shards), Some(cluster_slots)) => Ok(Some(AofLayout {
+            shards,
+            cluster_slots,
+        })),
+        _ => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("bad AOF shard manifest {:?}: {:?}", path, text),
+        )),
+    }
+}
+
+/// Returns argument `idx` of a raw RESP array command.
+fn raw_resp_arg(raw: &[u8], idx: usize) -> Option<&[u8]> {
+    fn line(buf: &[u8], pos: usize) -> Option<(&[u8], usize)> {
+        let end = pos + buf.get(pos..)?.windows(2).position(|w| w == b"\r\n")?;
+        Some((&buf[pos..end], end + 2))
+    }
+    let (hdr, mut pos) = line(raw, 0)?;
+    let argc: usize = std::str::from_utf8(hdr.strip_prefix(b"*")?)
+        .ok()?
+        .parse()
+        .ok()?;
+    if idx >= argc {
+        return None;
+    }
+    for i in 0..=idx {
+        let (len_line, next) = line(raw, pos)?;
+        let len: usize = std::str::from_utf8(len_line.strip_prefix(b"$")?)
+            .ok()?
+            .parse()
+            .ok()?;
+        let arg = raw.get(next..next + len)?;
+        if i == idx {
+            return Some(arg);
+        }
+        pos = next + len + 2;
+    }
+    None
+}
+
+/// Makes the per-shard AOF files in `dir` match `num_shards`.
+///
+/// Each shard replays only `appendonly-{shard}.aof`, and keys are owned by
+/// `hash(key) % num_shards`, so restarting with a different `--threads` would
+/// load keys into shards that never look them up (or drop whole files). When
+/// the count changed, this replays every old file into one in-memory db,
+/// rewrites it, and splits the rewrite by key owner into new per-shard files.
+/// The old files are kept in a backup dir. The shard count and routing scheme
+/// (key hash, or cluster slots) are recorded in [`AOF_SHARDS_MANIFEST`]; dirs
+/// from before the manifest existed are assumed to have one file per shard
+/// (the writer creates every shard's file) and the current routing scheme.
+///
+/// Returns the old shard count if a reshard happened.
+pub fn reshard_aof_dir(dir: &Path, num_shards: usize, port: u16) -> std::io::Result<Option<usize>> {
+    let invalid = |msg: String| std::io::Error::new(std::io::ErrorKind::InvalidData, msg);
+    let marker = dir.join(AOF_RESHARD_MARKER);
+    if marker.exists() {
+        let backup = std::fs::read_to_string(&marker).unwrap_or_default();
+        return Err(invalid(format!(
+            "a previous AOF reshard in {:?} was interrupted. The original AOF files are in {:?}. \
+             Restore them into {:?} (removing any appendonly-*.aof there), delete {:?}, and restart",
+            dir,
+            backup.trim(),
+            dir,
+            marker
+        )));
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut max_index: Option<usize> = None;
+    for entry in entries {
+        let name = entry?.file_name();
+        if let Some(i) = name.to_str().and_then(aof_shard_file_index) {
+            max_index = Some(max_index.map_or(i, |m| m.max(i)));
+        }
+    }
+    // Leftovers from a reshard that crashed before touching the real files.
+    let staging = dir.join(AOF_RESHARD_STAGING);
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)?;
+    }
+
+    let new_layout = AofLayout::current(num_shards);
+    let old_layout = match (read_aof_shards_manifest(dir)?, max_index) {
+        (Some(l), Some(i)) if i >= l.shards => {
+            return Err(invalid(format!(
+                "{:?} says {} shards but appendonly-{}.aof exists",
+                dir.join(AOF_SHARDS_MANIFEST),
+                l.shards,
+                i
+            )));
+        }
+        (Some(l), _) => l,
+        (None, Some(i)) => AofLayout {
+            shards: i + 1,
+            ..new_layout
+        },
+        (None, None) => new_layout,
+    };
+    let old_shards = old_layout.shards;
+    if old_layout == new_layout {
+        if !dir.join(AOF_SHARDS_MANIFEST).exists() {
+            write_aof_shards_manifest(dir, new_layout)?;
+        }
+        return Ok(None);
+    }
+
+    // 1. Load everything. Each key only ever lived in one file, so its
+    //    history replays in order.
+    let mut combined = ShardDb::new(port);
+    for i in 0..old_shards {
+        replay_aof(&dir.join(format!("appendonly-{}.aof", i)), &mut combined)?;
+    }
+
+    // 2. Rewrite to canonical per-key commands and split them by owner.
+    std::fs::create_dir_all(&staging)?;
+    rewrite_shard_aof(&mut combined, &staging, 0)?;
+    drop(combined);
+    let rewritten = std::fs::read(staging.join("appendonly-0.aof"))?;
+    let mut outputs: Vec<Vec<u8>> = vec![Vec::new(); num_shards];
+    let mut buf = BytesMut::from(&rewritten[..]);
+    while !buf.is_empty() {
+        let start = rewritten.len() - buf.len();
+        let cmd = match crate::resp::parse_command(&mut buf) {
+            Ok(Some(cmd)) => cmd,
+            _ => return Err(invalid(format!("bad rewritten AOF at offset {}", start))),
+        };
+        let raw = &rewritten[start..rewritten.len() - buf.len()];
+        let shard = crate::connection::target_shard_of_cmd(&cmd, num_shards)
+            .or_else(|| raw_resp_arg(raw, 1).map(|k| crate::router::target_shard(k, num_shards)))
+            .unwrap_or(0);
+        outputs[shard].extend_from_slice(raw);
+    }
+    for (i, out) in outputs.iter().enumerate() {
+        write_file_synced(&staging.join(format!("appendonly-{}.aof", i)), out)?;
+    }
+    sync_parent_dir(&staging.join("appendonly-0.aof"))?;
+
+    // 3. Swap: old files to a backup dir, new files in, manifest last.
+    let unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let backup = dir.join(format!(
+        "aof-reshard-backup-{}to{}-{}",
+        old_shards, num_shards, unix_ms
+    ));
+    write_file_synced(&marker, backup.to_string_lossy().as_bytes())?;
+    sync_parent_dir(&marker)?;
+    std::fs::create_dir_all(&backup)?;
+    for i in 0..old_shards {
+        let name = format!("appendonly-{}.aof", i);
+        let old = dir.join(&name);
+        if old.exists() {
+            std::fs::rename(&old, backup.join(&name))?;
+        }
+    }
+    sync_parent_dir(&backup.join("x"))?;
+    for i in 0..num_shards {
+        let name = format!("appendonly-{}.aof", i);
+        std::fs::rename(staging.join(&name), dir.join(&name))?;
+    }
+    write_aof_shards_manifest(dir, new_layout)?;
+    std::fs::remove_file(&marker)?;
+    sync_parent_dir(&marker)?;
+    let _ = std::fs::remove_dir_all(&staging);
+    Ok(Some(old_shards))
+}
+
 pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::io::Result<usize> {
     use std::io::Write;
     let mut count = 0;
@@ -2647,6 +2893,119 @@ mod tests {
     }
 
     const SET_A: &[u8] = b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n";
+
+    /// Replays each `appendonly-{i}.aof` and checks every key sits in the
+    /// shard that owns it. Returns the total key count.
+    fn assert_aof_keys_owned(dir: &Path, num_shards: usize) -> usize {
+        let mut total = 0;
+        for i in 0..num_shards {
+            let mut db = ShardDb::new(0);
+            replay_aof(&dir.join(format!("appendonly-{}.aof", i)), &mut db).unwrap();
+            for e in db.table.entries() {
+                assert_eq!(
+                    crate::router::target_shard(&e.key, num_shards),
+                    i,
+                    "key {:?} in wrong shard file",
+                    e.key
+                );
+            }
+            total += db.table.dbsize();
+        }
+        assert!(!dir.join(format!("appendonly-{}.aof", num_shards)).exists());
+        total
+    }
+
+    #[test]
+    fn test_reshard_aof_dir_moves_keys_to_owning_shards() {
+        let dir = std::env::temp_dir().join(format!("rudis-aof-reshard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Legacy layout (no manifest), written by 4 shards.
+        let mut dbs: Vec<ShardDb> = (0..4).map(|_| ShardDb::new(0)).collect();
+        for k in 0..100 {
+            let key = Bytes::from(format!("k{}", k));
+            let ttl = (k % 10 == 0).then(|| Duration::from_secs(1000));
+            dbs[crate::router::target_shard(&key, 4)].set(key, Bytes::from("v"), ttl);
+        }
+        for (i, db) in dbs.iter_mut().enumerate() {
+            rewrite_shard_aof(db, &dir, i).unwrap();
+        }
+
+        assert_eq!(reshard_aof_dir(&dir, 2, 0).unwrap(), Some(4));
+        assert_eq!(assert_aof_keys_owned(&dir, 2), 100);
+        assert_eq!(
+            read_aof_shards_manifest(&dir).unwrap(),
+            Some(AofLayout::current(2))
+        );
+        assert!(!dir.join(AOF_RESHARD_MARKER).exists());
+        assert!(!dir.join(AOF_RESHARD_STAGING).exists());
+        let backups: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("aof-reshard-backup-4to2-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read_dir(backups[0].path()).unwrap().count(), 4);
+
+        // Same layout again: nothing to do.
+        assert_eq!(reshard_aof_dir(&dir, 2, 0).unwrap(), None);
+        // Grow, and TTLs survive the round trips.
+        assert_eq!(reshard_aof_dir(&dir, 8, 0).unwrap(), Some(2));
+        assert_eq!(assert_aof_keys_owned(&dir, 8), 100);
+        let key = Bytes::from("k10");
+        let mut db = ShardDb::new(0);
+        let owner = crate::router::target_shard(&key, 8);
+        replay_aof(&dir.join(format!("appendonly-{}.aof", owner)), &mut db).unwrap();
+        assert!(
+            db.table
+                .entries()
+                .any(|e| e.key == key && e.expire_at.is_some())
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_reshard_aof_dir_refuses_after_interrupted_swap_or_bad_manifest() {
+        let dir =
+            std::env::temp_dir().join(format!("rudis-aof-reshard-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("appendonly-0.aof"), SET_A).unwrap();
+
+        std::fs::write(dir.join(AOF_RESHARD_MARKER), "/backup/here").unwrap();
+        let err = reshard_aof_dir(&dir, 1, 0).unwrap_err();
+        assert!(err.to_string().contains("/backup/here"), "{err}");
+        std::fs::remove_file(dir.join(AOF_RESHARD_MARKER)).unwrap();
+
+        // Manifest says 1 shard but a second shard file exists.
+        std::fs::write(dir.join(AOF_SHARDS_MANIFEST), "shards 1\nrouting hash\n").unwrap();
+        std::fs::write(dir.join("appendonly-1.aof"), b"").unwrap();
+        assert!(reshard_aof_dir(&dir, 2, 0).is_err());
+        std::fs::remove_file(dir.join("appendonly-1.aof")).unwrap();
+
+        // Staging leftovers from a crash before the swap are discarded.
+        std::fs::create_dir_all(dir.join(AOF_RESHARD_STAGING)).unwrap();
+        assert_eq!(reshard_aof_dir(&dir, 1, 0).unwrap(), None);
+        assert!(!dir.join(AOF_RESHARD_STAGING).exists());
+
+        std::fs::write(dir.join(AOF_SHARDS_MANIFEST), "garbage").unwrap();
+        assert!(reshard_aof_dir(&dir, 1, 0).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_raw_resp_arg() {
+        assert_eq!(raw_resp_arg(SET_A, 0), Some(&b"SET"[..]));
+        assert_eq!(raw_resp_arg(SET_A, 1), Some(&b"a"[..]));
+        assert_eq!(raw_resp_arg(SET_A, 2), Some(&b"1"[..]));
+        assert_eq!(raw_resp_arg(SET_A, 3), None);
+        assert_eq!(raw_resp_arg(b"*2\r\n$3\r\nGET", 1), None);
+    }
 
     #[test]
     fn test_replay_aof_truncated_tail_is_cut_when_allowed() {

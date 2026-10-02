@@ -200,6 +200,23 @@ fn main() {
         dir: server_config.dir.clone(),
         fsync_every_sec: true,
     };
+    if aof_config.enabled {
+        match rudis::aof::reshard_aof_dir(&aof_config.dir, num_shards, port) {
+            Ok(Some(old)) => println!(
+                "AOF files in {:?} were written with a different shard layout ({} shards); \
+                 resharded them for {} shards (originals kept in an aof-reshard-backup-* dir)",
+                aof_config.dir, old, num_shards
+            ),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!(
+                    "FATAL: cannot reshard the AOF files in {:?}: {}",
+                    aof_config.dir, e
+                );
+                std::process::exit(1);
+            }
+        }
+    }
 
     let tls_config = if let Some(tls_port) = server_config.tls_port {
         let server_config_tls = match (&server_config.tls_cert_file, &server_config.tls_key_file) {
