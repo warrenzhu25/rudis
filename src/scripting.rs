@@ -2160,6 +2160,11 @@ fn register_redis_module(
         }
 
         crate::connection::record_cmd_stat(cmd_name);
+        crate::connection::inc_active_client_tot_cmds();
+        if crate::connection::has_monitor_clients() {
+            let monitor_argv = crate::slowlog::command_to_monitor_argv(&cmd);
+            crate::connection::broadcast_monitor(port, "lua", &monitor_argv);
+        }
         let mut out = Vec::new();
         let aof_ref = unsafe { aof_call.map(|ptr| &*ptr) };
         crate::connection::execute_local_command(
@@ -2309,6 +2314,11 @@ fn register_redis_module(
         }
 
         crate::connection::record_cmd_stat(cmd_name);
+        crate::connection::inc_active_client_tot_cmds();
+        if crate::connection::has_monitor_clients() {
+            let monitor_argv = crate::slowlog::command_to_monitor_argv(&cmd);
+            crate::connection::broadcast_monitor(port, "lua", &monitor_argv);
+        }
         let mut out = Vec::new();
         let aof_ref = unsafe { aof_pcall.map(|ptr| &*ptr) };
         crate::connection::execute_local_command(

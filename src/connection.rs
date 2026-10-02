@@ -23,6 +23,35 @@ pub type ResponderChannel = (
     flume::Receiver<(Vec<(usize, Command)>, Vec<(usize, CompactResp)>)>,
 );
 
+#[derive(Debug)]
+pub struct ClientStats {
+    pub connected_at: Instant,
+    pub addr: SocketAddr,
+    pub tot_net_in: std::sync::atomic::AtomicU64,
+    pub tot_net_out: std::sync::atomic::AtomicU64,
+    pub tot_cmds: std::sync::atomic::AtomicU64,
+    pub read_events: std::sync::atomic::AtomicU64,
+    pub pipeline_len_sum: std::sync::atomic::AtomicU64,
+    pub pipeline_len_cnt: std::sync::atomic::AtomicU64,
+    pub killed: std::sync::atomic::AtomicBool,
+}
+
+impl ClientStats {
+    pub fn new(connected_at: Instant, addr: SocketAddr) -> Self {
+        Self {
+            connected_at,
+            addr,
+            tot_net_in: std::sync::atomic::AtomicU64::new(0),
+            tot_net_out: std::sync::atomic::AtomicU64::new(0),
+            tot_cmds: std::sync::atomic::AtomicU64::new(0),
+            read_events: std::sync::atomic::AtomicU64::new(0),
+            pipeline_len_sum: std::sync::atomic::AtomicU64::new(0),
+            pipeline_len_cnt: std::sync::atomic::AtomicU64::new(0),
+            killed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ClientInfo {
     pub id: u64,
@@ -41,6 +70,7 @@ pub struct ClientInfo {
     pub qbuf_cap: usize,
     pub reply_mode: crate::resp::ClientReplyMode,
     pub is_monitor: bool,
+    pub stats: std::sync::Arc<ClientStats>,
 }
 
 impl ClientInfo {
@@ -224,6 +254,7 @@ pub struct GlobalClientEntry {
     pub is_resp3: bool,
     pub auth_user: String,
     pub is_pubsub: bool,
+    pub stats: std::sync::Arc<ClientStats>,
 }
 
 #[derive(Clone, Debug)]
@@ -631,8 +662,11 @@ pub fn record_latency_histogram_cmd(cmd: &Command) {
     }
     let name = match cmd {
         Command::ConfigGet(_) => "config|get".to_string(),
-        Command::ConfigSet(p, _) => {
-            let p_lower = String::from_utf8_lossy(p).to_lowercase();
+        Command::ConfigSet(pairs) => {
+            let p_lower = pairs
+                .first()
+                .map(|(p, _)| String::from_utf8_lossy(p).to_lowercase())
+                .unwrap_or_default();
             if p_lower == "resetstat" {
                 "config|resetstat".to_string()
             } else if p_lower == "rewrite" {
@@ -1120,6 +1154,104 @@ static GLOBAL_CLIENTS: std::sync::LazyLock<
     std::sync::RwLock<hashbrown::HashMap<(u16, u64), GlobalClientEntry>>,
 > = std::sync::LazyLock::new(|| std::sync::RwLock::new(hashbrown::HashMap::new()));
 
+pub static ACTIVE_COMMAND_PORT: std::sync::atomic::AtomicU16 =
+    std::sync::atomic::AtomicU16::new(0);
+
+pub fn inc_active_client_tot_cmds() {
+    let port = ACTIVE_COMMAND_PORT.load(std::sync::atomic::Ordering::Relaxed);
+    let cid = ACTIVE_COMMAND_CLIENT_ID.load(std::sync::atomic::Ordering::Relaxed);
+    if cid > 0
+        && let Some(entry) = GLOBAL_CLIENTS.read().unwrap().get(&(port, cid))
+    {
+        entry
+            .stats
+            .tot_cmds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+pub static HAS_MONITOR_CLIENTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+static MONITOR_CLIENTS: std::sync::LazyLock<
+    std::sync::RwLock<Vec<(u16, u64, std::os::unix::io::RawFd)>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(Vec::new()));
+
+#[inline(always)]
+pub fn has_monitor_clients() -> bool {
+    HAS_MONITOR_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn register_monitor_client(port: u16, client_id: u64, raw_fd: std::os::unix::io::RawFd) {
+    let mut list = MONITOR_CLIENTS.write().unwrap();
+    if !list.iter().any(|&(p, id, _)| p == port && id == client_id) {
+        list.push((port, client_id, raw_fd));
+    }
+    HAS_MONITOR_CLIENTS.store(!list.is_empty(), std::sync::atomic::Ordering::Release);
+}
+
+pub fn unregister_monitor_client(port: u16, client_id: u64) {
+    if !has_monitor_clients() {
+        return;
+    }
+    let mut list = MONITOR_CLIENTS.write().unwrap();
+    let prev_len = list.len();
+    list.retain(|&(p, id, _)| !(p == port && id == client_id));
+    if list.len() != prev_len {
+        HAS_MONITOR_CLIENTS.store(!list.is_empty(), std::sync::atomic::Ordering::Release);
+    }
+}
+
+pub fn broadcast_monitor(port: u16, source_addr: &str, argv: &[Bytes]) {
+    if !has_monitor_clients() || argv.is_empty() {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let mut line = format!(
+        "+{}.{:06} [0 {}]",
+        now.as_secs(),
+        now.subsec_micros(),
+        source_addr
+    );
+    for arg in argv {
+        line.push_str(" \"");
+        for &b in arg.iter() {
+            match b {
+                b'\\' => line.push_str("\\\\"),
+                b'"' => line.push_str("\\\""),
+                b'\n' => line.push_str("\\n"),
+                b'\r' => line.push_str("\\r"),
+                b'\t' => line.push_str("\\t"),
+                0x20..=0x7e => line.push(b as char),
+                _ => line.push_str(&format!("\\x{:02x}", b)),
+            }
+        }
+        line.push('"');
+    }
+    line.push_str("\r\n");
+    let bytes = line.as_bytes();
+    let list = MONITOR_CLIENTS.read().unwrap();
+    for &(p, _, fd) in list.iter() {
+        if p == port {
+            unsafe {
+                libc::send(
+                    fd,
+                    bytes.as_ptr() as *const libc::c_void,
+                    bytes.len(),
+                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                );
+            }
+        }
+    }
+}
+
+pub static RDB_KEY_SAVE_DELAY: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static RDB_BGSAVE_IN_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub fn register_global_client(
     port: u16,
     client_id: u64,
@@ -1128,6 +1260,7 @@ pub fn register_global_client(
     is_resp3: bool,
     auth_user: String,
     is_pubsub: bool,
+    stats: std::sync::Arc<ClientStats>,
 ) {
     GLOBAL_CLIENTS.write().unwrap().insert(
         (port, client_id),
@@ -1137,6 +1270,7 @@ pub fn register_global_client(
             is_resp3,
             auth_user,
             is_pubsub,
+            stats,
         },
     );
 }
@@ -1278,7 +1412,11 @@ pub fn unregister_client_tracking(port: u16, client_id: u64) {
     }
 }
 
-pub fn set_client_caching(port: u16, client_id: u64, yes: bool) -> Result<(), &'static str> {
+pub fn set_client_caching(
+    port: u16,
+    client_id: u64,
+    yes_opt: Option<bool>,
+) -> Result<(), &'static str> {
     if !HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
         return Err(
             "CLIENT CACHING can be called only when the client is in tracking mode with OPTIN or OPTOUT mode enabled",
@@ -1295,6 +1433,9 @@ pub fn set_client_caching(port: u16, client_id: u64, yes: bool) -> Result<(), &'
             "CLIENT CACHING can be called only when the client is in tracking mode with OPTIN or OPTOUT mode enabled",
         );
     }
+    let Some(yes) = yes_opt else {
+        return Err("syntax error");
+    };
     if yes && !tracker.optin {
         return Err("CLIENT CACHING YES is only valid when OPTIN is enabled");
     }
@@ -2291,6 +2432,7 @@ pub async fn handle_tls_connection(
             qbuf_cap: 0,
             reply_mode: crate::resp::ClientReplyMode::On,
             is_monitor: false,
+            stats: std::sync::Arc::new(ClientStats::new(now, client_addr)),
         },
     );
 
@@ -2421,6 +2563,9 @@ async fn execute_tx_step(
                 record_cmd_stat("MULTI");
                 record_failed_stat("MULTI");
                 record_error_stat("ERR", None);
+                if let Some(c) = client_registry.borrow().get(&client_id) {
+                    c.stats.tot_cmds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 out_buf.extend_from_slice(b"-ERR MULTI calls can not be nested\r\n");
                 false
             }
@@ -2428,16 +2573,25 @@ async fn execute_tx_step(
                 record_cmd_stat("WATCH");
                 record_failed_stat("WATCH");
                 record_error_stat("ERR", None);
+                if let Some(c) = client_registry.borrow().get(&client_id) {
+                    c.stats.tot_cmds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 out_buf.extend_from_slice(b"-ERR WATCH inside MULTI is not allowed\r\n");
                 false
             }
             Command::Unwatch => {
                 record_cmd_stat("UNWATCH");
+                if let Some(c) = client_registry.borrow().get(&client_id) {
+                    c.stats.tot_cmds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 out_buf.extend_from_slice(b"+OK\r\n");
                 false
             }
             Command::Discard => {
                 record_cmd_stat("DISCARD");
+                if let Some(c) = client_registry.borrow().get(&client_id) {
+                    c.stats.tot_cmds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 *in_multi = false;
                 tx_queue.clear();
                 *tx_has_error = false;
@@ -2463,10 +2617,12 @@ async fn execute_tx_step(
                     c.name = None;
                     c.is_resp3 = false;
                     c.is_monitor = false;
+                    c.stats.tot_cmds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 update_global_client_resp3(router.port, client_id, false);
                 update_global_client_auth(router.port, client_id, "default");
                 unregister_client_tracking(router.port, client_id);
+                unregister_monitor_client(router.port, client_id);
                 reset_client_pubsub(router, client_id);
 
                 let acl = crate::acl::get_acl_for_port(router.port);
@@ -2484,8 +2640,33 @@ async fn execute_tx_step(
             }
             Command::Exec => {
                 record_cmd_stat("EXEC");
+                let monitor_addr = if has_monitor_clients() {
+                    let addr_s = client_registry
+                        .borrow()
+                        .get(&client_id)
+                        .map(|c| c.addr.to_string())
+                        .unwrap_or_default();
+                    broadcast_monitor(
+                        router.port,
+                        &addr_s,
+                        &[Bytes::from_static(b"multi")],
+                    );
+                    Some(addr_s)
+                } else {
+                    None
+                };
+                if let Some(c) = client_registry.borrow().get(&client_id) {
+                    c.stats.tot_cmds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 *in_multi = false;
                 if *tx_has_error {
+                    if let Some(ref addr_s) = monitor_addr {
+                        broadcast_monitor(
+                            router.port,
+                            addr_s,
+                            &[Bytes::from_static(b"exec")],
+                        );
+                    }
                     record_failed_stat("EXEC");
                     record_error_stat("EXECABORT", None);
                     tx_queue.clear();
@@ -2500,6 +2681,13 @@ async fn execute_tx_step(
                     );
                     false
                 } else if router.cluster_enabled && tx_has_cross_slot(tx_queue) {
+                    if let Some(ref addr_s) = monitor_addr {
+                        broadcast_monitor(
+                            router.port,
+                            addr_s,
+                            &[Bytes::from_static(b"exec")],
+                        );
+                    }
                     record_failed_stat("EXEC");
                     record_error_stat("CROSSSLOT", None);
                     tx_queue.clear();
@@ -2514,6 +2702,13 @@ async fn execute_tx_step(
                     );
                     false
                 } else if is_watch_tainted(router.port, client_id) {
+                    if let Some(ref addr_s) = monitor_addr {
+                        broadcast_monitor(
+                            router.port,
+                            addr_s,
+                            &[Bytes::from_static(b"exec")],
+                        );
+                    }
                     tx_queue.clear();
                     *tx_has_error = false;
                     unwatch_keys(router.port, client_id);
@@ -2557,6 +2752,7 @@ async fn execute_tx_step(
                     DEFER_BCAST_FLUSH.set(true);
                     DEFER_BCAST_FLUSH_GLOBAL.store(true, std::sync::atomic::Ordering::Relaxed);
                     EXECUTING_CLIENT_ID.set(client_id);
+                    ACTIVE_COMMAND_PORT.store(router.port, std::sync::atomic::Ordering::Relaxed);
                     ACTIVE_COMMAND_CLIENT_ID.store(client_id, std::sync::atomic::Ordering::Relaxed);
                     for q_cmd in queued {
                         let quit = execute_command(
@@ -2574,6 +2770,13 @@ async fn execute_tx_step(
                             should_quit = true;
                             break;
                         }
+                    }
+                    if let Some(ref addr_s) = monitor_addr {
+                        broadcast_monitor(
+                            router.port,
+                            addr_s,
+                            &[Bytes::from_static(b"exec")],
+                        );
                     }
                     DEFER_BCAST_FLUSH.set(false);
                     DEFER_BCAST_FLUSH_GLOBAL.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -2636,6 +2839,9 @@ async fn execute_tx_step(
         match cmd {
             Command::Multi => {
                 record_cmd_stat("MULTI");
+                if let Some(c) = client_registry.borrow().get(&client_id) {
+                    c.stats.tot_cmds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 *in_multi = true;
                 tx_queue.clear();
                 *tx_has_error = false;
@@ -2646,6 +2852,9 @@ async fn execute_tx_step(
                 record_cmd_stat("DISCARD");
                 record_failed_stat("DISCARD");
                 record_error_stat("ERR", None);
+                if let Some(c) = client_registry.borrow().get(&client_id) {
+                    c.stats.tot_cmds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 out_buf.extend_from_slice(b"-ERR DISCARD without MULTI\r\n");
                 false
             }
@@ -2653,17 +2862,26 @@ async fn execute_tx_step(
                 record_cmd_stat("EXEC");
                 record_failed_stat("EXEC");
                 record_error_stat("ERR", None);
+                if let Some(c) = client_registry.borrow().get(&client_id) {
+                    c.stats.tot_cmds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 out_buf.extend_from_slice(b"-ERR EXEC without MULTI\r\n");
                 false
             }
             Command::Watch(keys) => {
                 record_cmd_stat("WATCH");
+                if let Some(c) = client_registry.borrow().get(&client_id) {
+                    c.stats.tot_cmds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 watch_keys(router.port, client_id, &keys);
                 out_buf.extend_from_slice(b"+OK\r\n");
                 false
             }
             Command::Unwatch => {
                 record_cmd_stat("UNWATCH");
+                if let Some(c) = client_registry.borrow().get(&client_id) {
+                    c.stats.tot_cmds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 unwatch_keys(router.port, client_id);
                 out_buf.extend_from_slice(b"+OK\r\n");
                 false
@@ -2703,6 +2921,7 @@ pub async fn handle_connection(
 
     let raw_fd = stream.as_raw_fd();
     let now = Instant::now();
+    let stats = std::sync::Arc::new(ClientStats::new(now, client_addr));
     let (track_tx, track_rx) = flume::unbounded::<Vec<u8>>();
     register_global_client(
         router.port,
@@ -2712,6 +2931,7 @@ pub async fn handle_connection(
         false,
         "default".to_string(),
         false,
+        stats.clone(),
     );
     client_registry.borrow_mut().insert(
         client_id,
@@ -2732,6 +2952,7 @@ pub async fn handle_connection(
             qbuf_cap: 0,
             reply_mode: crate::resp::ClientReplyMode::On,
             is_monitor: false,
+            stats: stats.clone(),
         },
     );
 
@@ -2740,13 +2961,17 @@ pub async fn handle_connection(
         client_id: u64,
         registry: Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
         router: Rc<Router>,
+        stats: std::sync::Arc<ClientStats>,
     }
     impl Drop for ClientCleanup {
         fn drop(&mut self) {
-            ACTIVE_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            if !self.stats.killed.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                ACTIVE_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
             flush_local_cmd_stats();
             self.registry.borrow_mut().remove(&self.client_id);
             unregister_global_client(self.port, self.client_id);
+            unregister_monitor_client(self.port, self.client_id);
             if !self.router.pubsub.borrow().clients.is_empty() {
                 self.router.pubsub.borrow_mut().remove_client_with_presence(
                     self.client_id,
@@ -2773,6 +2998,7 @@ pub async fn handle_connection(
         client_id,
         registry: client_registry.clone(),
         router: router.clone(),
+        stats: stats.clone(),
     };
 
     let ConnScratch {
@@ -2814,6 +3040,12 @@ pub async fn handle_connection(
                 break;
             }
             Ok(n) => {
+                stats
+                    .read_events
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                stats
+                    .tot_net_in
+                    .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                 // Drain any additional bytes waiting in kernel TCP socket buffer if spare capacity was completely filled
                 if n == avail_before {
                     loop {
@@ -2831,6 +3063,9 @@ pub async fn handle_connection(
                             )
                         };
                         if drain_n > 0 {
+                            stats
+                                .tot_net_in
+                                .fetch_add(drain_n as u64, std::sync::atomic::Ordering::Relaxed);
                             unsafe {
                                 buf.set_len(buf.len() + drain_n as usize);
                             }
@@ -2893,6 +3128,9 @@ pub async fn handle_connection(
                                 )
                             };
                             if drain_n > 0 {
+                                stats
+                                    .tot_net_in
+                                    .fetch_add(drain_n as u64, std::sync::atomic::Ordering::Relaxed);
                                 unsafe {
                                     buf.set_len(buf.len() + drain_n as usize);
                                 }
@@ -2908,6 +3146,9 @@ pub async fn handle_connection(
                         Err(err) => {
                             if err.starts_with("Protocol error:") {
                                 write_resp_err(&mut out_buf, &err);
+                                stats
+                                    .tot_net_out
+                                    .fetch_add(out_buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
                                 let write_chunk = std::mem::take(&mut out_buf);
                                 let _ = stream.write_all(write_chunk).await.0;
                                 return;
@@ -2965,6 +3206,15 @@ pub async fn handle_connection(
                     }
                 }
 
+                if !commands.is_empty() {
+                    stats
+                        .pipeline_len_sum
+                        .fetch_add(commands.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                    stats
+                        .pipeline_len_cnt
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+
                 // 2. Transition to Pub/Sub mode if SUBSCRIBE, PSUBSCRIBE, or SSUBSCRIBE is received
                 if has_special
                     && let Some(sub_idx) = commands.iter().position(|c| {
@@ -2988,6 +3238,9 @@ pub async fn handle_connection(
                         .await;
                     }
                     if !out_buf.is_empty() {
+                        stats
+                            .tot_net_out
+                            .fetch_add(out_buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
                         let write_chunk = std::mem::take(&mut out_buf);
                         let _ = stream.write_all(write_chunk).await.0;
                     }
@@ -3027,6 +3280,9 @@ pub async fn handle_connection(
                         .await;
                     }
                     if !out_buf.is_empty() {
+                        stats
+                            .tot_net_out
+                            .fetch_add(out_buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
                         let write_chunk = std::mem::take(&mut out_buf);
                         let _ = stream.write_all(write_chunk).await.0;
                     }
@@ -3062,6 +3318,9 @@ pub async fn handle_connection(
                         .await;
                     }
                     if !out_buf.is_empty() {
+                        stats
+                            .tot_net_out
+                            .fetch_add(out_buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
                         let write_chunk = std::mem::take(&mut out_buf);
                         let _ = stream.write_all(write_chunk).await.0;
                     }
@@ -3115,6 +3374,8 @@ pub async fn handle_connection(
                         }
                     } else if is_client_paused().is_some()
                         || HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
+                        || has_monitor_clients()
+                        || crate::block::has_blocked_waiters(router.port)
                         || client_registry
                             .borrow()
                             .get(&client_id)
@@ -3167,6 +3428,9 @@ pub async fn handle_connection(
                                 ))
                                 && !out_buf.is_empty()
                             {
+                                stats
+                                    .tot_net_out
+                                    .fetch_add(out_buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
                                 let write_chunk = std::mem::take(&mut out_buf);
                                 let (res, returned_buf) = stream.write_all(write_chunk).await;
                                 out_buf = returned_buf;
@@ -3222,6 +3486,7 @@ pub async fn handle_connection(
                             should_quit = true;
                         }
                     } else {
+                        let cmd_cnt = commands.len() as u64;
                         let quit = execute_commands_squashed(
                             &mut commands,
                             has_special,
@@ -3239,6 +3504,9 @@ pub async fn handle_connection(
                             &mut auth_user,
                         )
                         .await;
+                        stats
+                            .tot_cmds
+                            .fetch_add(cmd_cnt, std::sync::atomic::Ordering::Relaxed);
                         if quit {
                             should_quit = true;
                         }
@@ -3290,6 +3558,9 @@ pub async fn handle_connection(
 
                 if !out_buf.is_empty() {
                     let len = out_buf.len();
+                    stats
+                        .tot_net_out
+                        .fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
                     let send_ret = unsafe {
                         libc::send(
                             raw_fd,
@@ -3472,10 +3743,19 @@ async fn run_pubsub_loop(
     }
     impl Drop for PubsubCleanup {
         fn drop(&mut self) {
-            ACTIVE_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            let already_killed = self
+                .client_registry
+                .borrow()
+                .get(&self.client_id)
+                .map(|c| c.stats.killed.swap(true, std::sync::atomic::Ordering::Relaxed))
+                .unwrap_or(false);
+            if !already_killed {
+                ACTIVE_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
             flush_local_cmd_stats();
             self.client_registry.borrow_mut().remove(&self.client_id);
             unregister_global_client(self.router.port, self.client_id);
+            unregister_monitor_client(self.router.port, self.client_id);
             unregister_client_tracking(self.router.port, self.client_id);
             self.router.pubsub.borrow_mut().remove_client_with_presence(
                 self.client_id,
@@ -5604,6 +5884,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
             ClientSubcommand::Pause(_, _) => "client|pause",
             ClientSubcommand::Unpause => "client|unpause",
             ClientSubcommand::NoTouch(_) => "client|no-touch",
+            ClientSubcommand::NoEvict(_) => "client|no-evict",
             ClientSubcommand::SetInfo { .. } => "client|setinfo",
             ClientSubcommand::Reply(_) => "client|reply",
         },
@@ -5716,7 +5997,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Replconf(_) => "REPLCONF",
         Command::Role => "ROLE",
         Command::Tier(_) => "TIER",
-        Command::ConfigGet(_) | Command::ConfigSet(_, _) => "CONFIG",
+        Command::ConfigGet(_) | Command::ConfigSet(_) => "CONFIG",
         Command::Shutdown { .. } => "SHUTDOWN",
         Command::Quit => "QUIT",
         Command::Subscribe(_) => "SUBSCRIBE",
@@ -6867,32 +7148,45 @@ async fn execute_command(
     auth_user: &mut String,
 ) -> bool {
     let mut initial_reply_mode = crate::resp::ClientReplyMode::On;
+    let mut client_stats = None;
     if let Some(client) = client_registry.borrow().get(&client_id) {
         CURRENT_CLIENT_RESP3.set(client.is_resp3);
         initial_reply_mode = client.reply_mode;
+        client_stats = Some(client.stats.clone());
     }
     struct ExecutingClientGuard {
         prev_local: u64,
         prev_exec: u64,
-        has_tracking: bool,
+        has_active_global: bool,
+        stats: Option<std::sync::Arc<ClientStats>>,
     }
     impl Drop for ExecutingClientGuard {
         fn drop(&mut self) {
             CURRENT_CLIENT_ID.set(self.prev_local);
             EXECUTING_CLIENT_ID.set(self.prev_exec);
-            if self.has_tracking {
+            if self.has_active_global {
                 ACTIVE_COMMAND_CLIENT_ID
                     .store(self.prev_exec, std::sync::atomic::Ordering::Relaxed);
             }
+            if let Some(ref st) = self.stats {
+                st.tot_cmds
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
-    let has_tracking = HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed);
+    let has_active_global = HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
+        || matches!(
+            cmd,
+            Command::Eval { .. } | Command::Evalsha { .. } | Command::Fcall { .. }
+        );
     let _exec_client_guard = ExecutingClientGuard {
         prev_local: CURRENT_CLIENT_ID.replace(client_id),
         prev_exec: EXECUTING_CLIENT_ID.replace(client_id),
-        has_tracking,
+        has_active_global,
+        stats: client_stats,
     };
-    if has_tracking {
+    if has_active_global {
+        ACTIVE_COMMAND_PORT.store(router.port, std::sync::atomic::Ordering::Relaxed);
         ACTIVE_COMMAND_CLIENT_ID.store(client_id, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -6921,6 +7215,15 @@ async fn execute_command(
     };
 
     wait_if_client_paused(router.port, client_id, &cmd).await;
+    if has_monitor_clients() && !matches!(cmd, Command::Monitor) {
+        let addr_s = client_registry
+            .borrow()
+            .get(&client_id)
+            .map(|c| c.addr.to_string())
+            .unwrap_or_default();
+        let monitor_argv = crate::slowlog::command_to_monitor_argv(&cmd);
+        broadcast_monitor(router.port, &addr_s, &monitor_argv);
+    }
     let cmd_name = get_cmd_name(&cmd);
     record_cmd_stat(cmd_name);
     record_latency_histogram_cmd(&cmd);
@@ -7869,6 +8172,7 @@ async fn execute_command(
         Command::Monitor => {
             if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                 c.is_monitor = true;
+                register_monitor_client(router.port, client_id, c.raw_fd);
             }
             out.extend_from_slice(b"+OK\r\n");
             false
@@ -8124,8 +8428,9 @@ async fn execute_command(
                 shard_conns.join(",")
             );
             let persistence_str = format!(
-                "# Persistence\r\nloading:0\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:0\r\nrdb_last_save_time:0\r\nrdb_last_bgsave_status:ok\r\n",
-                DIRTY_CHANGES.load(std::sync::atomic::Ordering::Relaxed)
+                "# Persistence\r\nloading:0\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:0\r\nrdb_last_bgsave_status:ok\r\n",
+                DIRTY_CHANGES.load(std::sync::atomic::Ordering::Relaxed),
+                u8::from(RDB_BGSAVE_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed))
             );
             let cmdstat_str = {
                 router.flush_all_command_stats().await;
@@ -8480,511 +8785,631 @@ async fn execute_command(
             }
             false
         }
-        Command::ConfigGet(param) => {
-            let p_str = String::from_utf8_lossy(&param).to_lowercase();
-            if p_str == "maxmemory" {
-                let max_mem = crate::tiering::get_max_memory(router.port).to_string();
-                let resp = format!(
-                    "*2\r\n$9\r\nmaxmemory\r\n${}\r\n{}\r\n",
-                    max_mem.len(),
-                    max_mem
-                );
-                out.extend_from_slice(resp.as_bytes());
-            } else if p_str == "tiered-offload-threshold" {
-                let val = crate::tiering::get_offload_threshold_pct(router.port).to_string();
-                let resp = format!(
-                    "*2\r\n$24\r\ntiered-offload-threshold\r\n${}\r\n{}\r\n",
-                    val.len(),
-                    val
-                );
-                out.extend_from_slice(resp.as_bytes());
-            } else if p_str == "tiered-upload-threshold" {
-                let val = crate::tiering::get_upload_threshold_pct(router.port).to_string();
-                let resp = format!(
-                    "*2\r\n$23\r\ntiered-upload-threshold\r\n${}\r\n{}\r\n",
-                    val.len(),
-                    val
-                );
-                out.extend_from_slice(resp.as_bytes());
-            } else if p_str == "hash-max-listpack-entries" || p_str == "hash-max-ziplist-entries" {
-                let val = HASH_MAX_ENTRIES
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .to_string();
-                let resp = format!(
-                    "*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-                    p_str.len(),
-                    p_str,
-                    val.len(),
-                    val
-                );
-                out.extend_from_slice(resp.as_bytes());
-            } else if p_str == "hash-max-listpack-value" || p_str == "hash-max-ziplist-value" {
-                let val = HASH_MAX_VALUE
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .to_string();
-                let resp = format!(
-                    "*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-                    p_str.len(),
-                    p_str,
-                    val.len(),
-                    val
-                );
-                out.extend_from_slice(resp.as_bytes());
-            } else if p_str == "stream-node-max-entries" {
-                let val = crate::table::STREAM_NODE_MAX_ENTRIES
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .to_string();
-                let resp = format!(
-                    "*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-                    p_str.len(),
-                    p_str,
-                    val.len(),
-                    val
-                );
-                out.extend_from_slice(resp.as_bytes());
-            } else if p_str == "stream-idmp-duration" {
-                let val = crate::table::STREAM_IDMP_DURATION
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .to_string();
-                let resp = format!(
-                    "*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-                    p_str.len(),
-                    p_str,
-                    val.len(),
-                    val
-                );
-                out.extend_from_slice(resp.as_bytes());
-            } else if p_str == "stream-idmp-maxsize" {
-                let val = crate::table::STREAM_IDMP_MAXSIZE
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .to_string();
-                let resp = format!(
-                    "*2\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-                    p_str.len(),
-                    p_str,
-                    val.len(),
-                    val
-                );
-                out.extend_from_slice(resp.as_bytes());
-            } else if p_str == "maxclients" {
-                let val = get_max_clients().to_string();
-                let resp = format!("*2\r\n$10\r\nmaxclients\r\n${}\r\n{}\r\n", val.len(), val);
-                out.extend_from_slice(resp.as_bytes());
-            } else if p_str == "maxmemory-policy" {
-                let val = get_max_memory_policy();
-                let resp = format!(
-                    "*2\r\n$16\r\nmaxmemory-policy\r\n${}\r\n{}\r\n",
-                    val.len(),
-                    val
-                );
-                out.extend_from_slice(resp.as_bytes());
-            } else if p_str == "slowlog-log-slower-than" {
-                let val = crate::slowlog::SLOWLOG_LOG_SLOWER_THAN
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .to_string();
-                let resp = format!(
-                    "*2\r\n$23\r\nslowlog-log-slower-than\r\n${}\r\n{}\r\n",
-                    val.len(),
-                    val
-                );
-                out.extend_from_slice(resp.as_bytes());
-            } else if p_str == "slowlog-max-len" {
-                let val = crate::slowlog::SLOWLOG_MAX_LEN
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .to_string();
-                let resp = format!(
-                    "*2\r\n$15\r\nslowlog-max-len\r\n${}\r\n{}\r\n",
-                    val.len(),
-                    val
-                );
-                out.extend_from_slice(resp.as_bytes());
-            } else if p_str == "slowlog-entry-max-argc" {
-                let val = crate::slowlog::SLOWLOG_ENTRY_MAX_ARGC
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .to_string();
-                let resp = format!(
-                    "*2\r\n$22\r\nslowlog-entry-max-argc\r\n${}\r\n{}\r\n",
-                    val.len(),
-                    val
-                );
-                out.extend_from_slice(resp.as_bytes());
-            } else if p_str == "slowlog-entry-max-string-len" {
-                let val = crate::slowlog::SLOWLOG_ENTRY_MAX_STRING_LEN
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .to_string();
-                let resp = format!(
-                    "*2\r\n$28\r\nslowlog-entry-max-string-len\r\n${}\r\n{}\r\n",
-                    val.len(),
-                    val
-                );
-                out.extend_from_slice(resp.as_bytes());
-            } else if p_str == "client-output-buffer-limit" {
-                let val = format_client_output_buffer_limit_config();
-                let resp = format!(
-                    "*2\r\n$26\r\nclient-output-buffer-limit\r\n${}\r\n{}\r\n",
-                    val.len(),
-                    val
-                );
-                out.extend_from_slice(resp.as_bytes());
-            } else if p_str == "requirepass" {
-                let acl = crate::acl::get_acl_for_port(router.port);
-                let pass = acl
-                    .read()
-                    .unwrap()
-                    .get_user("default")
-                    .and_then(|u| u.passwords.first().cloned())
-                    .unwrap_or_default();
-                let resp = format!(
-                    "*2\r\n$11\r\nrequirepass\r\n${}\r\n{}\r\n",
-                    pass.len(),
-                    pass
-                );
-                out.extend_from_slice(resp.as_bytes());
-            } else if p_str == "appendonly" {
-                let val = if router.aof.is_some() { "yes" } else { "no" };
-                let resp = format!("*2\r\n$10\r\nappendonly\r\n${}\r\n{}\r\n", val.len(), val);
-                out.extend_from_slice(resp.as_bytes());
-            } else if p_str == "proto-max-bulk-len" {
-                let val = crate::resp::get_proto_max_bulk_len().to_string();
-                let resp = format!(
-                    "*2\r\n$18\r\nproto-max-bulk-len\r\n${}\r\n{}\r\n",
-                    val.len(),
-                    val
-                );
-                out.extend_from_slice(resp.as_bytes());
-            } else if p_str == "notify-keyspace-events" {
-                let val = get_notify_keyspace_events_str();
-                let resp = format!(
-                    "*2\r\n$22\r\nnotify-keyspace-events\r\n${}\r\n{}\r\n",
-                    val.len(),
-                    val
-                );
-                out.extend_from_slice(resp.as_bytes());
-            } else if p_str == "lazyfree-lazy-expire" {
-                let val = if crate::table::is_lazyfree_lazy_expire() {
-                    "yes"
-                } else {
-                    "no"
-                };
-                let resp = format!(
-                    "*2\r\n$20\r\nlazyfree-lazy-expire\r\n${}\r\n{}\r\n",
-                    val.len(),
-                    val
-                );
-                out.extend_from_slice(resp.as_bytes());
-            } else if p_str == "latency-monitor-threshold" {
-                let val = LATENCY_MONITOR_THRESHOLD
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .to_string();
-                let resp = format!(
-                    "*2\r\n$25\r\nlatency-monitor-threshold\r\n${}\r\n{}\r\n",
-                    val.len(),
-                    val
-                );
-                out.extend_from_slice(resp.as_bytes());
-            } else if p_str == "tracking-table-max-keys" {
-                let val = TRACKING_TABLE_MAX_KEYS
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .to_string();
-                let resp = format!(
-                    "*2\r\n$23\r\ntracking-table-max-keys\r\n${}\r\n{}\r\n",
-                    val.len(),
-                    val
-                );
-                out.extend_from_slice(resp.as_bytes());
-            } else if p_str == "*" {
-                let max_mem = crate::tiering::get_max_memory(router.port).to_string();
-                let offload = crate::tiering::get_offload_threshold_pct(router.port).to_string();
-                let upload = crate::tiering::get_upload_threshold_pct(router.port).to_string();
-                let max_c = get_max_clients().to_string();
-                let policy = get_max_memory_policy();
-                let slow_than = crate::slowlog::SLOWLOG_LOG_SLOWER_THAN
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .to_string();
-                let slow_len = crate::slowlog::SLOWLOG_MAX_LEN
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .to_string();
-                let slow_argc = crate::slowlog::SLOWLOG_ENTRY_MAX_ARGC
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .to_string();
-                let slow_str = crate::slowlog::SLOWLOG_ENTRY_MAX_STRING_LEN
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .to_string();
-                let obuf = format_client_output_buffer_limit_config();
-                let acl = crate::acl::get_acl_for_port(router.port);
-                let pass = acl
-                    .read()
-                    .unwrap()
-                    .get_user("default")
-                    .and_then(|u| u.passwords.first().cloned())
-                    .unwrap_or_default();
-                let app = if router.aof.is_some() {
-                    "yes".to_string()
-                } else {
-                    "no".to_string()
-                };
-                let proto_bulk = crate::resp::get_proto_max_bulk_len().to_string();
-                let notify_ev = get_notify_keyspace_events_str();
+        Command::ConfigGet(_) | Command::ConfigSet(_) => {
+            static CONFIG_REPL_BACKLOG_SIZE: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(1048576);
+            static CONFIG_BACKUP_SEALED_TTL: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(86400);
+            static CONFIG_MAXMEMORY_SAMPLES: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(5);
+            static CONFIG_CLIENT_QUERY_BUFFER_LIMIT: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(1073741824);
+            static CONFIG_KEY_LOAD_DELAY: std::sync::atomic::AtomicI64 =
+                std::sync::atomic::AtomicI64::new(0);
+            static CONFIG_LUA_TIME_LIMIT: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(5000);
+            static CONFIG_OOM_SCORE_ADJ: std::sync::LazyLock<std::sync::RwLock<String>> =
+                std::sync::LazyLock::new(|| std::sync::RwLock::new("no".to_string()));
+            static CONFIG_OOM_SCORE_ADJ_VALUES: std::sync::LazyLock<std::sync::RwLock<String>> =
+                std::sync::LazyLock::new(|| std::sync::RwLock::new("0 200 800".to_string()));
+            static CONFIG_SAVE: std::sync::LazyLock<std::sync::RwLock<String>> =
+                std::sync::LazyLock::new(|| {
+                    std::sync::RwLock::new("3600 1 300 100 60 10000".to_string())
+                });
+            static CONFIG_MAXMEMORY_CLIENTS: std::sync::LazyLock<std::sync::RwLock<String>> =
+                std::sync::LazyLock::new(|| std::sync::RwLock::new("0".to_string()));
+            static CONFIG_BIND: std::sync::LazyLock<std::sync::RwLock<String>> =
+                std::sync::LazyLock::new(|| std::sync::RwLock::new("127.0.0.1".to_string()));
+            static CONFIG_BACKUPDIRNAME: std::sync::LazyLock<std::sync::RwLock<String>> =
+                std::sync::LazyLock::new(|| std::sync::RwLock::new("backup".to_string()));
+            static CONFIG_SLAVEOF: std::sync::LazyLock<std::sync::RwLock<String>> =
+                std::sync::LazyLock::new(|| std::sync::RwLock::new(String::new()));
 
-                let pairs = [
-                    ("maxmemory", max_mem),
-                    ("tiered-offload-threshold", offload),
-                    ("tiered-upload-threshold", upload),
-                    ("maxclients", max_c),
-                    ("maxmemory-policy", policy),
-                    ("slowlog-log-slower-than", slow_than),
-                    ("slowlog-max-len", slow_len),
-                    ("slowlog-entry-max-argc", slow_argc),
-                    ("slowlog-entry-max-string-len", slow_str),
-                    ("client-output-buffer-limit", obuf),
-                    ("requirepass", pass),
-                    ("appendonly", app),
-                    ("proto-max-bulk-len", proto_bulk),
-                    ("notify-keyspace-events", notify_ev),
-                ];
-                out.extend_from_slice(format!("*{}\r\n", pairs.len() * 2).as_bytes());
-                for (k, v) in pairs {
-                    out.extend_from_slice(format!("${}\r\n{}\r\n", k.len(), k).as_bytes());
-                    out.extend_from_slice(format!("${}\r\n{}\r\n", v.len(), v).as_bytes());
+            match cmd {
+                Command::ConfigGet(patterns) => {
+                    let max_mem = crate::tiering::get_max_memory(router.port).to_string();
+                    let offload =
+                        crate::tiering::get_offload_threshold_pct(router.port).to_string();
+                    let upload =
+                        crate::tiering::get_upload_threshold_pct(router.port).to_string();
+                    let hash_entries = HASH_MAX_ENTRIES
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string();
+                    let hash_value = HASH_MAX_VALUE
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string();
+                    let stream_entries = crate::table::STREAM_NODE_MAX_ENTRIES
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string();
+                    let stream_idmp_dur = crate::table::STREAM_IDMP_DURATION
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string();
+                    let stream_idmp_max = crate::table::STREAM_IDMP_MAXSIZE
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string();
+                    let max_c = get_max_clients().to_string();
+                    let policy = get_max_memory_policy();
+                    let slow_than = crate::slowlog::SLOWLOG_LOG_SLOWER_THAN
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string();
+                    let slow_len = crate::slowlog::SLOWLOG_MAX_LEN
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string();
+                    let slow_argc = crate::slowlog::SLOWLOG_ENTRY_MAX_ARGC
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string();
+                    let slow_str = crate::slowlog::SLOWLOG_ENTRY_MAX_STRING_LEN
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string();
+                    let obuf = format_client_output_buffer_limit_config();
+                    let acl = crate::acl::get_acl_for_port(router.port);
+                    let pass = acl
+                        .read()
+                        .unwrap()
+                        .get_user("default")
+                        .and_then(|u| u.passwords.first().cloned())
+                        .unwrap_or_default();
+                    let app = if router.aof.is_some() {
+                        "yes".to_string()
+                    } else {
+                        "no".to_string()
+                    };
+                    let proto_bulk = crate::resp::get_proto_max_bulk_len().to_string();
+                    let notify_ev = get_notify_keyspace_events_str();
+                    let lazy_exp = if crate::table::is_lazyfree_lazy_expire() {
+                        "yes".to_string()
+                    } else {
+                        "no".to_string()
+                    };
+                    let latency_thresh = LATENCY_MONITOR_THRESHOLD
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string();
+                    let tracking_max = TRACKING_TABLE_MAX_KEYS
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string();
+                    let port_str = router.port.to_string();
+                    let repl_backlog = CONFIG_REPL_BACKLOG_SIZE
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string();
+                    let backup_ttl = CONFIG_BACKUP_SEALED_TTL
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string();
+                    let maxmem_samples = CONFIG_MAXMEMORY_SAMPLES
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string();
+                    let qbuf_limit = CONFIG_CLIENT_QUERY_BUFFER_LIMIT
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string();
+                    let key_load_delay = CONFIG_KEY_LOAD_DELAY
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string();
+                    let rdb_save_delay = RDB_KEY_SAVE_DELAY
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string();
+                    let lua_time_limit = CONFIG_LUA_TIME_LIMIT
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        .to_string();
+                    let oom_adj = CONFIG_OOM_SCORE_ADJ.read().unwrap().clone();
+                    let oom_adj_vals = CONFIG_OOM_SCORE_ADJ_VALUES.read().unwrap().clone();
+                    let save_cfg = CONFIG_SAVE.read().unwrap().clone();
+                    let maxmem_clients = CONFIG_MAXMEMORY_CLIENTS.read().unwrap().clone();
+                    let bind_cfg = CONFIG_BIND.read().unwrap().clone();
+                    let backup_dir = CONFIG_BACKUPDIRNAME.read().unwrap().clone();
+                    let slaveof_cfg = CONFIG_SLAVEOF.read().unwrap().clone();
+
+                    let all_configs: [(&str, String); 40] = [
+                        ("port", port_str),
+                        ("daemonize", "no".to_string()),
+                        ("maxmemory", max_mem),
+                        ("maxmemory-samples", maxmem_samples),
+                        ("maxmemory-clients", maxmem_clients),
+                        ("maxmemory-policy", policy),
+                        ("client-query-buffer-limit", qbuf_limit),
+                        ("repl-backlog-size", repl_backlog),
+                        ("save", save_cfg),
+                        ("backup-sealed-ttl", backup_ttl),
+                        ("backupdirname", backup_dir),
+                        ("bind", bind_cfg),
+                        ("slaveof", slaveof_cfg.clone()),
+                        ("replicaof", slaveof_cfg),
+                        ("oom-score-adj", oom_adj),
+                        ("oom-score-adj-values", oom_adj_vals),
+                        ("busy-reply-threshold", lua_time_limit.clone()),
+                        ("lua-time-limit", lua_time_limit),
+                        ("tiered-offload-threshold", offload),
+                        ("tiered-upload-threshold", upload),
+                        ("hash-max-listpack-entries", hash_entries.clone()),
+                        ("hash-max-ziplist-entries", hash_entries),
+                        ("hash-max-listpack-value", hash_value.clone()),
+                        ("hash-max-ziplist-value", hash_value),
+                        ("stream-node-max-entries", stream_entries),
+                        ("stream-idmp-duration", stream_idmp_dur),
+                        ("stream-idmp-maxsize", stream_idmp_max),
+                        ("maxclients", max_c),
+                        ("slowlog-log-slower-than", slow_than),
+                        ("slowlog-max-len", slow_len),
+                        ("slowlog-entry-max-argc", slow_argc),
+                        ("slowlog-entry-max-string-len", slow_str),
+                        ("client-output-buffer-limit", obuf),
+                        ("requirepass", pass),
+                        ("appendonly", app),
+                        ("proto-max-bulk-len", proto_bulk),
+                        ("notify-keyspace-events", notify_ev),
+                        ("lazyfree-lazy-expire", lazy_exp),
+                        ("latency-monitor-threshold", latency_thresh),
+                        ("tracking-table-max-keys", tracking_max),
+                    ];
+                    let hidden_configs: [(&str, String); 2] = [
+                        ("key-load-delay", key_load_delay),
+                        ("rdb-key-save-delay", rdb_save_delay),
+                    ];
+
+                    let mut matched: Vec<(&str, &str)> = Vec::new();
+                    let mut seen: std::collections::HashSet<&str> =
+                        std::collections::HashSet::new();
+
+                    for pat in &patterns {
+                        let pat_str = String::from_utf8_lossy(pat).to_lowercase();
+                        let is_exact = !pat_str.contains('*')
+                            && !pat_str.contains('?')
+                            && !pat_str.contains('[');
+                        for (name, val) in &all_configs {
+                            if (is_exact && pat_str == *name)
+                                || (!is_exact
+                                    && crate::pubsub::glob_match(
+                                        pat_str.as_bytes(),
+                                        name.as_bytes(),
+                                    ))
+                            {
+                                if seen.insert(*name) {
+                                    matched.push((*name, val.as_str()));
+                                }
+                            }
+                        }
+                        if is_exact {
+                            for (name, val) in &hidden_configs {
+                                if pat_str == *name && seen.insert(*name) {
+                                    matched.push((*name, val.as_str()));
+                                }
+                            }
+                        }
+                    }
+
+                    out.extend_from_slice(format!("*{}\r\n", matched.len() * 2).as_bytes());
+                    for (k, v) in matched {
+                        out.extend_from_slice(format!("${}\r\n{}\r\n", k.len(), k).as_bytes());
+                        out.extend_from_slice(format!("${}\r\n{}\r\n", v.len(), v).as_bytes());
+                    }
+                    false
                 }
-            } else {
-                out.extend_from_slice(b"*0\r\n");
+                Command::ConfigSet(pairs) => {
+                    if pairs.len() == 1 {
+                        let p0 = String::from_utf8_lossy(&pairs[0].0).to_lowercase();
+                        if p0 == "resetstat" {
+                            router.reset_command_stats().await;
+                            reset_error_stats();
+                            reset_latency_histogram();
+                            crate::slowlog::reset_slowlog_stats();
+                            crate::table::reset_expired_keys();
+                            out.extend_from_slice(b"+OK\r\n");
+                            return false;
+                        } else if p0 == "rewrite" {
+                            match crate::config::rewrite_config_file(router.port) {
+                                Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                                Err(e) => {
+                                    out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes())
+                                }
+                            }
+                            return false;
+                        }
+                    }
+
+                    // Phase 1: Validate all pairs and check for duplicates before applying any change
+                    let mut seen_canonical: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for (param, val) in &pairs {
+                        let p_str = String::from_utf8_lossy(param).to_lowercase();
+                        let val_str = String::from_utf8_lossy(val);
+                        let canonical = match p_str.as_str() {
+                            "busy-reply-threshold" | "lua-time-limit" => "lua-time-limit",
+                            "slaveof" | "replicaof" => "replicaof",
+                            "hash-max-ziplist-entries" | "hash-max-listpack-entries" => {
+                                "hash-max-listpack-entries"
+                            }
+                            "hash-max-ziplist-value" | "hash-max-listpack-value" => {
+                                "hash-max-listpack-value"
+                            }
+                            other => other,
+                        };
+                        if !seen_canonical.insert(canonical.to_string()) {
+                            out.extend_from_slice(
+                                b"-ERR Cannot set duplicate config parameters in a single CONFIG SET call\r\n",
+                            );
+                            return false;
+                        }
+
+                        if p_str == "daemonize" {
+                            out.extend_from_slice(
+                                b"-ERR CONFIG SET failed (possibly related to argument 'daemonize') - can't set immutable config\r\n",
+                            );
+                            return false;
+                        } else if p_str == "maxmemory-clients" {
+                            if let Some(pct_str) = val_str.strip_suffix('%') {
+                                match pct_str.parse::<i64>() {
+                                    Ok(pct) if (0..=100).contains(&pct) => {}
+                                    _ => {
+                                        out.extend_from_slice(
+                                            b"-ERR CONFIG SET failed (possibly related to argument 'maxmemory-clients') - percentage argument must be less or equal to 100\r\n",
+                                        );
+                                        return false;
+                                    }
+                                }
+                            } else if crate::tiering::parse_memory_bytes(&val_str).is_none() {
+                                out.extend_from_slice(
+                                    b"-ERR CONFIG SET failed (possibly related to argument 'maxmemory-clients') - invalid maxmemory-clients\r\n",
+                                );
+                                return false;
+                            }
+                        } else if p_str == "client-query-buffer-limit" {
+                            if crate::tiering::parse_memory_bytes(&val_str).is_none() {
+                                out.extend_from_slice(
+                                    b"-ERR CONFIG SET failed (possibly related to argument 'client-query-buffer-limit') - invalid client-query-buffer-limit\r\n",
+                                );
+                                return false;
+                            }
+                        } else if p_str == "port" {
+                            match val_str.parse::<u16>() {
+                                Ok(new_port) => {
+                                    if new_port != 0 && new_port != router.port {
+                                        if let Err(e) =
+                                            std::net::TcpListener::bind(("127.0.0.1", new_port))
+                                        {
+                                            out.extend_from_slice(
+                                                format!(
+                                                    "-ERR CONFIG SET failed (possibly related to argument 'port') - Unable to listen on this port: {}\r\n",
+                                                    e
+                                                )
+                                                .as_bytes(),
+                                            );
+                                            return false;
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    out.extend_from_slice(
+                                        b"-ERR CONFIG SET failed (possibly related to argument 'port') - Invalid argument\r\n",
+                                    );
+                                    return false;
+                                }
+                            }
+                        } else if p_str == "proto-max-bulk-len" {
+                            if val_str.parse::<usize>().is_err() {
+                                out.extend_from_slice(
+                                    b"-ERR Invalid argument for CONFIG SET proto-max-bulk-len\r\n",
+                                );
+                                return false;
+                            }
+                        } else if p_str == "maxmemory" {
+                            if crate::tiering::parse_memory_bytes(&val_str).is_none() {
+                                out.extend_from_slice(
+                                    b"-ERR CONFIG SET failed (Invalid argument for 'maxmemory')\r\n",
+                                );
+                                return false;
+                            }
+                        } else if p_str == "tiered-offload-threshold" {
+                            if val_str.parse::<u64>().is_err() {
+                                out.extend_from_slice(
+                                    b"-ERR Invalid argument for CONFIG SET tiered-offload-threshold\r\n",
+                                );
+                                return false;
+                            }
+                        } else if p_str == "tiered-upload-threshold" {
+                            if val_str.parse::<u64>().is_err() {
+                                out.extend_from_slice(
+                                    b"-ERR Invalid argument for CONFIG SET tiered-upload-threshold\r\n",
+                                );
+                                return false;
+                            }
+                        } else if p_str == "hash-max-listpack-entries"
+                            || p_str == "hash-max-ziplist-entries"
+                            || p_str == "hash-max-listpack-value"
+                            || p_str == "hash-max-ziplist-value"
+                        {
+                            if val_str.parse::<usize>().is_err() {
+                                out.extend_from_slice(b"-ERR Invalid argument for CONFIG SET\r\n");
+                                return false;
+                            }
+                        } else if p_str == "stream-node-max-entries" {
+                            match val_str.parse::<usize>() {
+                                Ok(n) if n > 0 => {}
+                                Ok(_) => {
+                                    out.extend_from_slice(
+                                        b"-ERR stream-node-max-entries must be a positive integer\r\n",
+                                    );
+                                    return false;
+                                }
+                                Err(_) => {
+                                    out.extend_from_slice(
+                                        b"-ERR Invalid argument for CONFIG SET\r\n",
+                                    );
+                                    return false;
+                                }
+                            }
+                        } else if p_str == "stream-idmp-duration" {
+                            match val_str.parse::<i64>() {
+                                Ok(n) if (1..=86400).contains(&n) => {}
+                                _ => {
+                                    out.extend_from_slice(
+                                        b"-ERR stream-idmp-duration must be between 1 and 86400\r\n",
+                                    );
+                                    return false;
+                                }
+                            }
+                        } else if p_str == "stream-idmp-maxsize" {
+                            match val_str.parse::<i64>() {
+                                Ok(n) if (1..=10000).contains(&n) => {}
+                                _ => {
+                                    out.extend_from_slice(
+                                        b"-ERR stream-idmp-maxsize must be between 1 and 10000\r\n",
+                                    );
+                                    return false;
+                                }
+                            }
+                        } else if p_str == "min-replicas-to-write" {
+                            if val_str.parse::<usize>().is_err() {
+                                out.extend_from_slice(
+                                    b"-ERR Invalid argument for CONFIG SET min-replicas-to-write\r\n",
+                                );
+                                return false;
+                            }
+                        } else if p_str == "slowlog-log-slower-than" {
+                            if val_str.parse::<i64>().is_err() {
+                                out.extend_from_slice(
+                                    b"-ERR Invalid argument for CONFIG SET slowlog-log-slower-than\r\n",
+                                );
+                                return false;
+                            }
+                        } else if p_str == "slowlog-max-len" {
+                            if val_str.parse::<usize>().is_err() {
+                                out.extend_from_slice(
+                                    b"-ERR Invalid argument for CONFIG SET slowlog-max-len\r\n",
+                                );
+                                return false;
+                            }
+                        } else if p_str == "slowlog-entry-max-argc" {
+                            match val_str.parse::<usize>() {
+                                Ok(v) if v >= 2 => {}
+                                _ => {
+                                    out.extend_from_slice(
+                                        b"-ERR argument must be between 2 and 2147483647\r\n",
+                                    );
+                                    return false;
+                                }
+                            }
+                        } else if p_str == "slowlog-entry-max-string-len" {
+                            match val_str.parse::<usize>() {
+                                Ok(v) if v >= 1 => {}
+                                _ => {
+                                    out.extend_from_slice(
+                                        b"-ERR argument must be between 1 and 2147483647\r\n",
+                                    );
+                                    return false;
+                                }
+                            }
+                        } else if p_str == "client-output-buffer-limit" {
+                            if let Err(err) = set_client_output_buffer_limit_str(&val_str) {
+                                out.extend_from_slice(err.as_bytes());
+                                return false;
+                            }
+                        } else if p_str == "latency-monitor-threshold" {
+                            if val_str.parse::<i64>().is_err() {
+                                out.extend_from_slice(
+                                    b"-ERR Invalid argument for CONFIG SET latency-monitor-threshold\r\n",
+                                );
+                                return false;
+                            }
+                        } else if p_str == "maxclients" {
+                            if val_str.parse::<usize>().is_err() {
+                                out.extend_from_slice(
+                                    b"-ERR Invalid argument for CONFIG SET maxclients\r\n",
+                                );
+                                return false;
+                            }
+                        } else if p_str == "tracking-table-max-keys" {
+                            if val_str.parse::<usize>().is_err() {
+                                out.extend_from_slice(
+                                    b"-ERR Invalid argument for CONFIG SET tracking-table-max-keys\r\n",
+                                );
+                                return false;
+                            }
+                        }
+                    }
+
+                    // Phase 2: Apply all validated config parameters
+                    for (param, val) in &pairs {
+                        let p_str = String::from_utf8_lossy(param).to_lowercase();
+                        let val_str = String::from_utf8_lossy(val);
+                        if p_str == "proto-max-bulk-len" {
+                            if let Ok(n) = val_str.parse::<usize>() {
+                                crate::resp::set_proto_max_bulk_len(n);
+                            }
+                        } else if p_str == "maxmemory" {
+                            if let Some(bytes) = crate::tiering::parse_memory_bytes(&val_str) {
+                                crate::tiering::set_max_memory(router.port, bytes);
+                            }
+                        } else if p_str == "tiered-offload-threshold" {
+                            if let Ok(pct) = val_str.parse::<u64>() {
+                                crate::tiering::set_offload_threshold_pct(router.port, pct);
+                            }
+                        } else if p_str == "tiered-upload-threshold" {
+                            if let Ok(pct) = val_str.parse::<u64>() {
+                                crate::tiering::set_upload_threshold_pct(router.port, pct);
+                            }
+                        } else if p_str == "hash-max-listpack-entries"
+                            || p_str == "hash-max-ziplist-entries"
+                        {
+                            if let Ok(n) = val_str.parse::<usize>() {
+                                HASH_MAX_ENTRIES.store(n, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        } else if p_str == "hash-max-listpack-value"
+                            || p_str == "hash-max-ziplist-value"
+                        {
+                            if let Ok(n) = val_str.parse::<usize>() {
+                                HASH_MAX_VALUE.store(n, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        } else if p_str == "stream-node-max-entries" {
+                            if let Ok(n) = val_str.parse::<usize>() {
+                                crate::table::STREAM_NODE_MAX_ENTRIES
+                                    .store(n, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        } else if p_str == "stream-idmp-duration" {
+                            if let Ok(n) = val_str.parse::<i64>() {
+                                crate::table::STREAM_IDMP_DURATION
+                                    .store(n as u64, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        } else if p_str == "stream-idmp-maxsize" {
+                            if let Ok(n) = val_str.parse::<i64>() {
+                                crate::table::STREAM_IDMP_MAXSIZE
+                                    .store(n as usize, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        } else if p_str == "min-replicas-to-write" {
+                            if let Ok(n) = val_str.parse::<usize>() {
+                                MIN_REPLICAS_TO_WRITE
+                                    .store(n, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        } else if p_str == "slowlog-log-slower-than" {
+                            if let Ok(v) = val_str.parse::<i64>() {
+                                crate::slowlog::SLOWLOG_LOG_SLOWER_THAN
+                                    .store(v, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        } else if p_str == "slowlog-max-len" {
+                            if let Ok(v) = val_str.parse::<usize>() {
+                                crate::slowlog::SLOWLOG_MAX_LEN
+                                    .store(v, std::sync::atomic::Ordering::Relaxed);
+                                crate::slowlog::trim_slowlog_buffer();
+                            }
+                        } else if p_str == "slowlog-entry-max-argc" {
+                            if let Ok(v) = val_str.parse::<usize>() {
+                                crate::slowlog::SLOWLOG_ENTRY_MAX_ARGC
+                                    .store(v, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        } else if p_str == "slowlog-entry-max-string-len" {
+                            if let Ok(v) = val_str.parse::<usize>() {
+                                crate::slowlog::SLOWLOG_ENTRY_MAX_STRING_LEN
+                                    .store(v, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        } else if p_str == "client-output-buffer-limit" {
+                            let _ = set_client_output_buffer_limit_str(&val_str);
+                        } else if p_str == "latency-monitor-threshold" {
+                            if let Ok(v) = val_str.parse::<i64>() {
+                                LATENCY_MONITOR_THRESHOLD
+                                    .store(v, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        } else if p_str == "maxclients" {
+                            if let Ok(n) = val_str.parse::<usize>() {
+                                set_max_clients(n);
+                            }
+                        } else if p_str == "maxmemory-policy" {
+                            set_max_memory_policy(&val_str);
+                        } else if p_str == "requirepass" {
+                            let acl = crate::acl::get_acl_for_port(router.port);
+                            let mut acl_guard = acl.write().unwrap();
+                            if let Some(user) = acl_guard.get_user_mut("default") {
+                                user.passwords.clear();
+                                user.password_hashes.clear();
+                                if !val_str.is_empty() {
+                                    user.passwords.push(val_str.to_string());
+                                    let h = crate::acl::hash_password_sha256(&val_str);
+                                    user.password_hashes.push(h);
+                                    user.nopass = false;
+                                    crate::acl::HAS_CUSTOM_ACL
+                                        .store(true, std::sync::atomic::Ordering::Release);
+                                } else {
+                                    user.nopass = true;
+                                }
+                            }
+                        } else if p_str == "notify-keyspace-events" {
+                            set_notify_keyspace_events_str(&val_str);
+                        } else if p_str == "lazyfree-lazy-expire" {
+                            let v = val_str.eq_ignore_ascii_case("yes");
+                            crate::table::set_lazyfree_lazy_expire(v);
+                        } else if p_str == "tracking-table-max-keys" {
+                            if let Ok(n) = val_str.parse::<usize>() {
+                                TRACKING_TABLE_MAX_KEYS
+                                    .store(n, std::sync::atomic::Ordering::Relaxed);
+                                if !PAUSE_CRON.load(std::sync::atomic::Ordering::Relaxed) {
+                                    enforce_tracking_max_keys(router.port);
+                                }
+                            }
+                        } else if p_str == "rdb-key-save-delay" {
+                            if let Ok(v) = val_str.parse::<u64>() {
+                                RDB_KEY_SAVE_DELAY.store(v, std::sync::atomic::Ordering::Relaxed);
+                                if v == 0 {
+                                    RDB_BGSAVE_IN_PROGRESS
+                                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
+                        } else if p_str == "repl-backlog-size" {
+                            if let Some(bytes) = crate::tiering::parse_memory_bytes(&val_str) {
+                                CONFIG_REPL_BACKLOG_SIZE
+                                    .store(bytes, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        } else if p_str == "backup-sealed-ttl" {
+                            if let Ok(v) = val_str.parse::<u64>() {
+                                CONFIG_BACKUP_SEALED_TTL
+                                    .store(v, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        } else if p_str == "maxmemory-samples" {
+                            if let Ok(v) = val_str.parse::<u64>() {
+                                CONFIG_MAXMEMORY_SAMPLES
+                                    .store(v, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        } else if p_str == "client-query-buffer-limit" {
+                            if let Some(bytes) = crate::tiering::parse_memory_bytes(&val_str) {
+                                CONFIG_CLIENT_QUERY_BUFFER_LIMIT
+                                    .store(bytes, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        } else if p_str == "key-load-delay" {
+                            if let Ok(v) = val_str.parse::<i64>() {
+                                CONFIG_KEY_LOAD_DELAY
+                                    .store(v, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        } else if p_str == "lua-time-limit" || p_str == "busy-reply-threshold" {
+                            if let Ok(v) = val_str.parse::<u64>() {
+                                CONFIG_LUA_TIME_LIMIT
+                                    .store(v, std::sync::atomic::Ordering::Relaxed);
+                            }
+                        } else if p_str == "oom-score-adj" {
+                            *CONFIG_OOM_SCORE_ADJ.write().unwrap() = val_str.to_string();
+                        } else if p_str == "oom-score-adj-values" {
+                            *CONFIG_OOM_SCORE_ADJ_VALUES.write().unwrap() = val_str.to_string();
+                        } else if p_str == "save" {
+                            *CONFIG_SAVE.write().unwrap() = val_str.to_string();
+                        } else if p_str == "maxmemory-clients" {
+                            *CONFIG_MAXMEMORY_CLIENTS.write().unwrap() = val_str.to_string();
+                        } else if p_str == "bind" {
+                            *CONFIG_BIND.write().unwrap() = val_str.to_string();
+                        } else if p_str == "backupdirname" {
+                            *CONFIG_BACKUPDIRNAME.write().unwrap() = val_str.to_string();
+                        } else if p_str == "slaveof" || p_str == "replicaof" {
+                            *CONFIG_SLAVEOF.write().unwrap() = val_str.to_string();
+                        }
+                    }
+                    out.extend_from_slice(b"+OK\r\n");
+                    false
+                }
+                _ => unreachable!(),
             }
-            false
-        }
-        Command::ConfigSet(param, val) => {
-            let p_str = String::from_utf8_lossy(&param).to_lowercase();
-            let val_str = String::from_utf8_lossy(&val);
-            if p_str == "proto-max-bulk-len" {
-                if let Ok(n) = val_str.parse::<usize>() {
-                    crate::resp::set_proto_max_bulk_len(n);
-                    out.extend_from_slice(b"+OK\r\n");
-                } else {
-                    out.extend_from_slice(
-                        b"-ERR Invalid argument for CONFIG SET proto-max-bulk-len\r\n",
-                    );
-                }
-            } else if p_str == "maxmemory" {
-                if let Some(bytes) = crate::tiering::parse_memory_bytes(&val_str) {
-                    crate::tiering::set_max_memory(router.port, bytes);
-                    out.extend_from_slice(b"+OK\r\n");
-                } else {
-                    out.extend_from_slice(
-                        b"-ERR CONFIG SET failed (Invalid argument for 'maxmemory')\r\n",
-                    );
-                }
-            } else if p_str == "tiered-offload-threshold" {
-                if let Ok(pct) = val_str.parse::<u64>() {
-                    crate::tiering::set_offload_threshold_pct(router.port, pct);
-                    out.extend_from_slice(b"+OK\r\n");
-                } else {
-                    out.extend_from_slice(
-                        b"-ERR Invalid argument for CONFIG SET tiered-offload-threshold\r\n",
-                    );
-                }
-            } else if p_str == "tiered-upload-threshold" {
-                if let Ok(pct) = val_str.parse::<u64>() {
-                    crate::tiering::set_upload_threshold_pct(router.port, pct);
-                    out.extend_from_slice(b"+OK\r\n");
-                } else {
-                    out.extend_from_slice(
-                        b"-ERR Invalid argument for CONFIG SET tiered-upload-threshold\r\n",
-                    );
-                }
-            } else if p_str == "hash-max-listpack-entries" || p_str == "hash-max-ziplist-entries" {
-                if let Ok(n) = val_str.parse::<usize>() {
-                    HASH_MAX_ENTRIES.store(n, std::sync::atomic::Ordering::Relaxed);
-                    out.extend_from_slice(b"+OK\r\n");
-                } else {
-                    out.extend_from_slice(b"-ERR Invalid argument for CONFIG SET\r\n");
-                }
-            } else if p_str == "hash-max-listpack-value" || p_str == "hash-max-ziplist-value" {
-                if let Ok(n) = val_str.parse::<usize>() {
-                    HASH_MAX_VALUE.store(n, std::sync::atomic::Ordering::Relaxed);
-                    out.extend_from_slice(b"+OK\r\n");
-                } else {
-                    out.extend_from_slice(b"-ERR Invalid argument for CONFIG SET\r\n");
-                }
-            } else if p_str == "stream-node-max-entries" {
-                if let Ok(n) = val_str.parse::<usize>() {
-                    if n > 0 {
-                        crate::table::STREAM_NODE_MAX_ENTRIES
-                            .store(n, std::sync::atomic::Ordering::Relaxed);
-                        out.extend_from_slice(b"+OK\r\n");
-                    } else {
-                        out.extend_from_slice(
-                            b"-ERR stream-node-max-entries must be a positive integer\r\n",
-                        );
-                    }
-                } else {
-                    out.extend_from_slice(b"-ERR Invalid argument for CONFIG SET\r\n");
-                }
-            } else if p_str == "stream-idmp-duration" {
-                if let Ok(n) = val_str.parse::<i64>() {
-                    if n >= 1 && n <= 86400 {
-                        crate::table::STREAM_IDMP_DURATION
-                            .store(n as u64, std::sync::atomic::Ordering::Relaxed);
-                        out.extend_from_slice(b"+OK\r\n");
-                    } else {
-                        out.extend_from_slice(
-                            b"-ERR stream-idmp-duration must be between 1 and 86400\r\n",
-                        );
-                    }
-                } else {
-                    out.extend_from_slice(
-                        b"-ERR stream-idmp-duration must be between 1 and 86400\r\n",
-                    );
-                }
-            } else if p_str == "stream-idmp-maxsize" {
-                if let Ok(n) = val_str.parse::<i64>() {
-                    if n >= 1 && n <= 10000 {
-                        crate::table::STREAM_IDMP_MAXSIZE
-                            .store(n as usize, std::sync::atomic::Ordering::Relaxed);
-                        out.extend_from_slice(b"+OK\r\n");
-                    } else {
-                        out.extend_from_slice(
-                            b"-ERR stream-idmp-maxsize must be between 1 and 10000\r\n",
-                        );
-                    }
-                } else {
-                    out.extend_from_slice(
-                        b"-ERR stream-idmp-maxsize must be between 1 and 10000\r\n",
-                    );
-                }
-            } else if p_str == "min-replicas-to-write" {
-                if let Ok(n) = val_str.parse::<usize>() {
-                    MIN_REPLICAS_TO_WRITE.store(n, std::sync::atomic::Ordering::Relaxed);
-                    out.extend_from_slice(b"+OK\r\n");
-                } else {
-                    out.extend_from_slice(b"-ERR Invalid argument for CONFIG SET min-replicas-to-write\r\n");
-                }
-            } else if p_str == "slowlog-log-slower-than" {
-                if let Ok(v) = val_str.parse::<i64>() {
-                    crate::slowlog::SLOWLOG_LOG_SLOWER_THAN
-                        .store(v, std::sync::atomic::Ordering::Relaxed);
-                    out.extend_from_slice(b"+OK\r\n");
-                } else {
-                    out.extend_from_slice(
-                        b"-ERR Invalid argument for CONFIG SET slowlog-log-slower-than\r\n",
-                    );
-                }
-            } else if p_str == "slowlog-max-len" {
-                if let Ok(v) = val_str.parse::<usize>() {
-                    crate::slowlog::SLOWLOG_MAX_LEN.store(v, std::sync::atomic::Ordering::Relaxed);
-                    crate::slowlog::trim_slowlog_buffer();
-                    out.extend_from_slice(b"+OK\r\n");
-                } else {
-                    out.extend_from_slice(
-                        b"-ERR Invalid argument for CONFIG SET slowlog-max-len\r\n",
-                    );
-                }
-            } else if p_str == "slowlog-entry-max-argc" {
-                if let Ok(v) = val_str.parse::<usize>() {
-                    if v < 2 {
-                        out.extend_from_slice(
-                            b"-ERR argument must be between 2 and 2147483647\r\n",
-                        );
-                    } else {
-                        crate::slowlog::SLOWLOG_ENTRY_MAX_ARGC
-                            .store(v, std::sync::atomic::Ordering::Relaxed);
-                        out.extend_from_slice(b"+OK\r\n");
-                    }
-                } else {
-                    out.extend_from_slice(b"-ERR argument must be between 2 and 2147483647\r\n");
-                }
-            } else if p_str == "slowlog-entry-max-string-len" {
-                if let Ok(v) = val_str.parse::<usize>() {
-                    if v < 1 {
-                        out.extend_from_slice(
-                            b"-ERR argument must be between 1 and 2147483647\r\n",
-                        );
-                    } else {
-                        crate::slowlog::SLOWLOG_ENTRY_MAX_STRING_LEN
-                            .store(v, std::sync::atomic::Ordering::Relaxed);
-                        out.extend_from_slice(b"+OK\r\n");
-                    }
-                } else {
-                    out.extend_from_slice(b"-ERR argument must be between 1 and 2147483647\r\n");
-                }
-            } else if p_str == "client-output-buffer-limit" {
-                match set_client_output_buffer_limit_str(&val_str) {
-                    Ok(()) => out.extend_from_slice(b"+OK\r\n"),
-                    Err(err) => out.extend_from_slice(err.as_bytes()),
-                }
-            } else if p_str == "resetstat" {
-                router.reset_command_stats().await;
-                reset_error_stats();
-                reset_latency_histogram();
-                crate::slowlog::reset_slowlog_stats();
-                crate::table::reset_expired_keys();
-                out.extend_from_slice(b"+OK\r\n");
-            } else if p_str == "latency-monitor-threshold" {
-                if let Ok(v) = val_str.parse::<i64>() {
-                    LATENCY_MONITOR_THRESHOLD.store(v, std::sync::atomic::Ordering::Relaxed);
-                    out.extend_from_slice(b"+OK\r\n");
-                } else {
-                    out.extend_from_slice(
-                        b"-ERR Invalid argument for CONFIG SET latency-monitor-threshold\r\n",
-                    );
-                }
-            } else if p_str == "maxclients" {
-                if let Ok(n) = val_str.parse::<usize>() {
-                    set_max_clients(n);
-                    out.extend_from_slice(b"+OK\r\n");
-                } else {
-                    out.extend_from_slice(b"-ERR Invalid argument for CONFIG SET maxclients\r\n");
-                }
-            } else if p_str == "maxmemory-policy" {
-                set_max_memory_policy(&val_str);
-                out.extend_from_slice(b"+OK\r\n");
-            } else if p_str == "requirepass" {
-                let acl = crate::acl::get_acl_for_port(router.port);
-                let mut acl_guard = acl.write().unwrap();
-                if let Some(user) = acl_guard.get_user_mut("default") {
-                    user.passwords.clear();
-                    user.password_hashes.clear();
-                    if !val_str.is_empty() {
-                        user.passwords.push(val_str.to_string());
-                        let h = crate::acl::hash_password_sha256(&val_str);
-                        user.password_hashes.push(h);
-                        user.nopass = false;
-                        crate::acl::HAS_CUSTOM_ACL
-                            .store(true, std::sync::atomic::Ordering::Release);
-                    } else {
-                        user.nopass = true;
-                    }
-                }
-                out.extend_from_slice(b"+OK\r\n");
-            } else if p_str == "appendonly" {
-                out.extend_from_slice(b"+OK\r\n");
-            } else if p_str == "notify-keyspace-events" {
-                set_notify_keyspace_events_str(&val_str);
-                out.extend_from_slice(b"+OK\r\n");
-            } else if p_str == "lazyfree-lazy-expire" {
-                let v = val_str.eq_ignore_ascii_case("yes");
-                crate::table::set_lazyfree_lazy_expire(v);
-                out.extend_from_slice(b"+OK\r\n");
-            } else if p_str == "tracking-table-max-keys" {
-                if let Ok(n) = val_str.parse::<usize>() {
-                    TRACKING_TABLE_MAX_KEYS.store(n, std::sync::atomic::Ordering::Relaxed);
-                    if !PAUSE_CRON.load(std::sync::atomic::Ordering::Relaxed) {
-                        enforce_tracking_max_keys(router.port);
-                    }
-                    out.extend_from_slice(b"+OK\r\n");
-                } else {
-                    out.extend_from_slice(
-                        b"-ERR Invalid argument for CONFIG SET tracking-table-max-keys\r\n",
-                    );
-                }
-            } else if p_str == "rewrite" {
-                match crate::config::rewrite_config_file(router.port) {
-                    Ok(()) => out.extend_from_slice(b"+OK\r\n"),
-                    Err(e) => out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes()),
-                }
-            } else {
-                out.extend_from_slice(b"+OK\r\n");
-            }
-            false
         }
         Command::Cluster(sub) => {
             match sub {
@@ -9336,6 +9761,7 @@ async fn execute_command(
             false
         }
         Command::Client(sub) => {
+            let mut close_conn = false;
             match sub {
                 ClientSubcommand::List(ref filter_ids) => {
                     let list = router.client_list(client_registry, filter_ids).await;
@@ -9353,10 +9779,37 @@ async fn execute_command(
                             .lock()
                             .unwrap()
                             .is_blocked(c.id);
-                        let flags = if c.is_monitor { "O" } else if is_blocked { "b" } else { "N" };
+                        let flags = if c.is_monitor {
+                            "O"
+                        } else if is_blocked {
+                            "b"
+                        } else {
+                            "N"
+                        };
                         let (qbuf, qbuf_free) = c.effective_qbuf(idle);
+                        let tot_net_in = c
+                            .stats
+                            .tot_net_in
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let tot_net_out = c
+                            .stats
+                            .tot_net_out
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let tot_cmds = c.stats.tot_cmds.load(std::sync::atomic::Ordering::Relaxed);
+                        let read_events = c
+                            .stats
+                            .read_events
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let pipe_sum = c
+                            .stats
+                            .pipeline_len_sum
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let pipe_cnt = c
+                            .stats
+                            .pipeline_len_cnt
+                            .load(std::sync::atomic::Ordering::Relaxed);
                         let info = format!(
-                            "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf={} qbuf-free={} argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name={} lib-ver={} io-thread=0 tot-net-in=0 tot-net-out=0 tot-cmds=0 read-events=0 avg-pipeline-len-sum=0 avg-pipeline-len-cnt=0\n",
+                            "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf={} qbuf-free={} argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name={} lib-ver={} io-thread=0 tot-net-in={} tot-net-out={} tot-cmds={} read-events={} avg-pipeline-len-sum={} avg-pipeline-len-cnt={}\n",
                             c.id,
                             c.addr,
                             router.port,
@@ -9370,6 +9823,12 @@ async fn execute_command(
                             c.last_cmd.to_lowercase(),
                             c.lib_name.as_deref().unwrap_or(""),
                             c.lib_ver.as_deref().unwrap_or(""),
+                            tot_net_in,
+                            tot_net_out,
+                            tot_cmds,
+                            read_events,
+                            pipe_sum,
+                            pipe_cnt,
                         );
                         out.extend_from_slice(format!("${}\r\n", info.len()).as_bytes());
                         out.extend_from_slice(info.as_bytes());
@@ -9379,20 +9838,42 @@ async fn execute_command(
                     }
                 }
                 ClientSubcommand::SetName(name) => {
-                    if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
-                        c.name = Some(name);
+                    if name.bytes().any(|b| !(b'!'..=b'~').contains(&b)) {
+                        out.extend_from_slice(
+                            b"-ERR Client names cannot contain spaces, newlines or special characters.\r\n",
+                        );
+                    } else {
+                        if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                            c.name = if name.is_empty() { None } else { Some(name) };
+                        }
+                        out.extend_from_slice(b"+OK\r\n");
                     }
-                    out.extend_from_slice(b"+OK\r\n");
                 }
                 ClientSubcommand::SetInfo { attr, val } => {
-                    if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
-                        if attr.eq_ignore_ascii_case("lib-name") {
-                            c.lib_name = Some(val);
-                        } else if attr.eq_ignore_ascii_case("lib-ver") {
-                            c.lib_ver = Some(val);
+                    if !attr.eq_ignore_ascii_case("lib-name")
+                        && !attr.eq_ignore_ascii_case("lib-ver")
+                    {
+                        let msg = format!(
+                            "-ERR Unrecognized option '{}' for CLIENT SETINFO\r\n",
+                            attr
+                        );
+                        out.extend_from_slice(msg.as_bytes());
+                    } else if val.bytes().any(|b| !(b'!'..=b'~').contains(&b)) {
+                        let msg = format!(
+                            "-ERR {} cannot contain spaces, newlines or special characters.\r\n",
+                            attr.to_lowercase()
+                        );
+                        out.extend_from_slice(msg.as_bytes());
+                    } else {
+                        if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                            if attr.eq_ignore_ascii_case("lib-name") {
+                                c.lib_name = if val.is_empty() { None } else { Some(val) };
+                            } else if attr.eq_ignore_ascii_case("lib-ver") {
+                                c.lib_ver = if val.is_empty() { None } else { Some(val) };
+                            }
                         }
+                        out.extend_from_slice(b"+OK\r\n");
                     }
-                    out.extend_from_slice(b"+OK\r\n");
                 }
                 ClientSubcommand::GetName => {
                     let name = client_registry
@@ -9460,8 +9941,253 @@ async fn execute_command(
                         .unwrap_or(false);
                     write_client_tracking_info(router.port, client_id, is_resp3, out);
                 }
-                ClientSubcommand::Kill(_) => {
-                    out.extend_from_slice(b"+OK\r\n");
+                ClientSubcommand::Kill(ref args) => {
+                    if args.is_empty() {
+                        out.extend_from_slice(
+                            b"-ERR wrong number of arguments for 'client|kill' command\r\n",
+                        );
+                    } else if args.len() == 1 {
+                        let target_addr = String::from_utf8_lossy(&args[0]);
+                        let list = router.client_list(client_registry, &[]).await;
+                        let mut killed_cids = Vec::new();
+                        for line in list.lines() {
+                            let mut cid_opt = None;
+                            let mut addr_opt = None;
+                            for tok in line.split_whitespace() {
+                                if let Some(v) = tok.strip_prefix("id=") {
+                                    cid_opt = v.parse::<u64>().ok();
+                                } else if let Some(v) = tok.strip_prefix("addr=") {
+                                    addr_opt = Some(v);
+                                }
+                            }
+                            if let (Some(cid), Some(addr)) = (cid_opt, addr_opt)
+                                && addr == target_addr
+                            {
+                                killed_cids.push(cid);
+                            }
+                        }
+                        if killed_cids.is_empty() {
+                            out.extend_from_slice(b"-ERR No such client\r\n");
+                        } else {
+                            let map = GLOBAL_CLIENTS.read().unwrap();
+                            for cid in killed_cids {
+                                if cid == client_id {
+                                    close_conn = true;
+                                } else if let Some(entry) = map.get(&(router.port, cid)) {
+                                    if entry
+                                        .stats
+                                        .killed
+                                        .compare_exchange(
+                                            false,
+                                            true,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        )
+                                        .is_ok()
+                                    {
+                                        ACTIVE_CLIENTS
+                                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    unsafe {
+                                        libc::shutdown(entry.raw_fd, libc::SHUT_RDWR);
+                                    }
+                                    crate::block::get_block_hub_for_port(router.port)
+                                        .lock()
+                                        .unwrap()
+                                        .remove_waiters_for_client(cid);
+                                }
+                            }
+                            out.extend_from_slice(b"+OK\r\n");
+                        }
+                    } else if args.len() % 2 != 0 {
+                        out.extend_from_slice(b"-ERR syntax error\r\n");
+                    } else {
+                        let mut filter_ids: Vec<u64> = Vec::new();
+                        let mut filter_type: Option<String> = None;
+                        let mut filter_user: Option<String> = None;
+                        let mut filter_addr: Option<String> = None;
+                        let mut filter_laddr: Option<String> = None;
+                        let mut skipme = true;
+                        let mut maxage: Option<u64> = None;
+                        let mut err_msg: Option<String> = None;
+
+                        let mut i = 0;
+                        while i < args.len() {
+                            let k = String::from_utf8_lossy(&args[i]).to_uppercase();
+                            let v = String::from_utf8_lossy(&args[i + 1]);
+                            match k.as_str() {
+                                "ID" => match v.parse::<i64>() {
+                                    Ok(id) if id > 0 => filter_ids.push(id as u64),
+                                    _ => {
+                                        err_msg = Some(
+                                            "-ERR client-id should be greater than 0\r\n"
+                                                .to_string(),
+                                        );
+                                        break;
+                                    }
+                                },
+                                "TYPE" => {
+                                    let t = v.to_lowercase();
+                                    if matches!(
+                                        t.as_str(),
+                                        "normal" | "master" | "slave" | "replica" | "pubsub"
+                                    ) {
+                                        filter_type = Some(t);
+                                    } else {
+                                        err_msg =
+                                            Some(format!("-ERR Unknown client type '{}'\r\n", v));
+                                        break;
+                                    }
+                                }
+                                "USER" => {
+                                    let acl = crate::acl::get_acl_for_port(router.port);
+                                    if acl.read().unwrap().get_user(&v).is_none() {
+                                        err_msg =
+                                            Some(format!("-ERR No such user '{}'\r\n", v));
+                                        break;
+                                    }
+                                    filter_user = Some(v.to_string());
+                                }
+                                "ADDR" => {
+                                    filter_addr = Some(v.to_string());
+                                }
+                                "LADDR" => {
+                                    filter_laddr = Some(v.to_string());
+                                }
+                                "SKIPME" => {
+                                    if v.eq_ignore_ascii_case("yes") {
+                                        skipme = true;
+                                    } else if v.eq_ignore_ascii_case("no") {
+                                        skipme = false;
+                                    } else {
+                                        err_msg = Some("-ERR syntax error\r\n".to_string());
+                                        break;
+                                    }
+                                }
+                                "MAXAGE" => match v.parse::<i64>() {
+                                    Ok(a) if a >= 0 => maxage = Some(a as u64),
+                                    Ok(_) => {
+                                        err_msg = Some(
+                                            "-ERR maxage should be greater than 0\r\n"
+                                                .to_string(),
+                                        );
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        err_msg = Some(
+                                            "-ERR maxage is not an integer or out of range\r\n"
+                                                .to_string(),
+                                        );
+                                        break;
+                                    }
+                                },
+                                _ => {
+                                    err_msg = Some("-ERR syntax error\r\n".to_string());
+                                    break;
+                                }
+                            }
+                            i += 2;
+                        }
+
+                        if let Some(err) = err_msg {
+                            out.extend_from_slice(err.as_bytes());
+                        } else {
+                            let list = router.client_list(client_registry, &[]).await;
+                            let map = GLOBAL_CLIENTS.read().unwrap();
+                            let mut killed_cids = Vec::new();
+                            for line in list.lines() {
+                                let mut cid_opt = None;
+                                let mut addr_opt = None;
+                                let mut laddr_opt = None;
+                                let mut age_opt = None;
+                                for tok in line.split_whitespace() {
+                                    if let Some(v) = tok.strip_prefix("id=") {
+                                        cid_opt = v.parse::<u64>().ok();
+                                    } else if let Some(v) = tok.strip_prefix("addr=") {
+                                        addr_opt = Some(v);
+                                    } else if let Some(v) = tok.strip_prefix("laddr=") {
+                                        laddr_opt = Some(v);
+                                    } else if let Some(v) = tok.strip_prefix("age=") {
+                                        age_opt = v.parse::<u64>().ok();
+                                    }
+                                }
+                                let Some(cid) = cid_opt else { continue };
+                                if skipme && cid == client_id {
+                                    continue;
+                                }
+                                if !filter_ids.is_empty() && !filter_ids.contains(&cid) {
+                                    continue;
+                                }
+                                if let Some(ref f_addr) = filter_addr
+                                    && addr_opt != Some(f_addr.as_str())
+                                {
+                                    continue;
+                                }
+                                if let Some(ref f_laddr) = filter_laddr
+                                    && laddr_opt != Some(f_laddr.as_str())
+                                {
+                                    continue;
+                                }
+                                if let Some(ma) = maxage
+                                    && age_opt.unwrap_or(0) <= ma
+                                {
+                                    continue;
+                                }
+                                let entry_opt = map.get(&(router.port, cid));
+                                if let Some(ref f_user) = filter_user {
+                                    let u = entry_opt
+                                        .map(|e| e.auth_user.as_str())
+                                        .unwrap_or("default");
+                                    if u != f_user {
+                                        continue;
+                                    }
+                                }
+                                if let Some(ref f_type) = filter_type {
+                                    let is_ps =
+                                        entry_opt.map(|e| e.is_pubsub).unwrap_or(false);
+                                    let matches_type = match f_type.as_str() {
+                                        "pubsub" => is_ps,
+                                        "normal" => !is_ps,
+                                        _ => false,
+                                    };
+                                    if !matches_type {
+                                        continue;
+                                    }
+                                }
+                                killed_cids.push(cid);
+                            }
+
+                            let killed_count = killed_cids.len();
+                            for cid in killed_cids {
+                                if cid == client_id {
+                                    close_conn = true;
+                                } else if let Some(entry) = map.get(&(router.port, cid)) {
+                                    if entry
+                                        .stats
+                                        .killed
+                                        .compare_exchange(
+                                            false,
+                                            true,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                            std::sync::atomic::Ordering::Relaxed,
+                                        )
+                                        .is_ok()
+                                    {
+                                        ACTIVE_CLIENTS
+                                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    unsafe {
+                                        libc::shutdown(entry.raw_fd, libc::SHUT_RDWR);
+                                    }
+                                    crate::block::get_block_hub_for_port(router.port)
+                                        .lock()
+                                        .unwrap()
+                                        .remove_waiters_for_client(cid);
+                                }
+                            }
+                            out.extend_from_slice(format!(":{}\r\n", killed_count).as_bytes());
+                        }
+                    }
                 }
                 ClientSubcommand::Unblock {
                     client_id: target_id,
@@ -9491,6 +10217,9 @@ async fn execute_command(
                     CLIENT_NO_TOUCH.store(enabled, std::sync::atomic::Ordering::Relaxed);
                     out.extend_from_slice(b"+OK\r\n");
                 }
+                ClientSubcommand::NoEvict(_) => {
+                    out.extend_from_slice(b"+OK\r\n");
+                }
                 ClientSubcommand::Reply(mode) => {
                     if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                         c.reply_mode = mode;
@@ -9500,7 +10229,7 @@ async fn execute_command(
                     }
                 }
             }
-            false
+            close_conn
         }
         Command::Hset { .. }
         | Command::Hsetnx { .. }
@@ -9693,6 +10422,7 @@ async fn execute_command(
         | Command::Xinfo(crate::resp::XinfoSubcommand::StreamFull { .. })
         | Command::Xinfo(crate::resp::XinfoSubcommand::Groups(_))
         | Command::Xinfo(crate::resp::XinfoSubcommand::Consumers { .. }) => {
+            let had_waiters = crate::block::has_blocked_waiters(router.port);
             if let Some(target) = target_shard_of_cmd(&cmd, router.num_shards) {
                 if target == router.shard_id {
                     execute_local_command(
@@ -9705,6 +10435,9 @@ async fn execute_command(
                     let res = router.execute_remote(target, cmd).await;
                     out.extend_from_slice(&res);
                 }
+            }
+            if had_waiters && !IN_TX.get() {
+                monoio::time::sleep(std::time::Duration::from_millis(2)).await;
             }
             false
         }
@@ -11819,6 +12552,7 @@ async fn execute_command(
             update_global_client_resp3(router.port, client_id, false);
             update_global_client_auth(router.port, client_id, "default");
             unregister_client_tracking(router.port, client_id);
+            unregister_monitor_client(router.port, client_id);
             *asking = false;
             reset_client_pubsub(router, client_id);
 
@@ -12693,6 +13427,9 @@ async fn execute_command(
                 }
             }
             router.flushdb().await;
+            if RDB_KEY_SAVE_DELAY.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                RDB_BGSAVE_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
             notify_flush_invalidation(router.port, client_id);
             out.extend_from_slice(b"+OK\r\n");
             false
@@ -12985,6 +13722,9 @@ async fn execute_command(
             false
         }
         Command::Bgsave => {
+            if RDB_KEY_SAVE_DELAY.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                RDB_BGSAVE_IN_PROGRESS.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             match router.bgsave().await {
                 Ok(_) => {
                     out.extend_from_slice(b"+Background saving started\r\n");
@@ -21685,7 +22425,7 @@ fn is_special_pipeline_cmd(cmd: &Command) -> bool {
             | Command::Acl(_)
             | Command::Tier(_)
             | Command::ConfigGet(_)
-            | Command::ConfigSet(_, _)
+            | Command::ConfigSet(_)
             | Command::Xread {
                 block_ms: Some(_),
                 ..

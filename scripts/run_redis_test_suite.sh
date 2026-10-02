@@ -97,6 +97,10 @@ CORE_SUITES=(
     "unit/tracking"
     "unit/acl-v2"
     "unit/acl"
+    "unit/info"
+    "unit/introspection"
+    "unit/maxmemory"
+    "unit/gcra"
 )
 
 if [ "$SUITE_ARG" = "all-types" ] || [ "$SUITE_ARG" = "all" ]; then

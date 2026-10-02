@@ -170,7 +170,7 @@ pub enum ClientSubcommand {
         optout: bool,
         noloop: bool,
     },
-    Caching(bool),
+    Caching(Option<bool>),
     GetRedir,
     TrackingInfo,
     Unblock {
@@ -180,6 +180,7 @@ pub enum ClientSubcommand {
     Pause(u64, bool),
     Unpause,
     NoTouch(bool),
+    NoEvict(bool),
     SetInfo {
         attr: String,
         val: String,
@@ -805,8 +806,8 @@ pub enum Command {
     // TIERED STORAGE COMMANDS
     Tier(TierSubcommand),
     // CONFIG COMMANDS
-    ConfigGet(Bytes),
-    ConfigSet(Bytes, Bytes),
+    ConfigGet(Vec<Bytes>),
+    ConfigSet(Vec<(Bytes, Bytes)>),
     Shutdown {
         save: Option<bool>,
     },
@@ -3804,18 +3805,18 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
                 "INFO" => Ok(Some(Command::Client(ClientSubcommand::Info))),
                 "SETNAME" => {
-                    if args.len() < 3 {
+                    if args.len() != 3 {
                         return Err(
-                            "wrong number of arguments for 'client setname' command".to_string()
+                            "wrong number of arguments for 'client|setname' command".to_string()
                         );
                     }
                     let name = String::from_utf8_lossy(&args[2]).to_string();
                     Ok(Some(Command::Client(ClientSubcommand::SetName(name))))
                 }
                 "SETINFO" => {
-                    if args.len() < 4 {
+                    if args.len() != 4 {
                         return Err(
-                            "wrong number of arguments for 'client setinfo' command".to_string()
+                            "wrong number of arguments for 'client|setinfo' command".to_string()
                         );
                     }
                     let attr = String::from_utf8_lossy(&args[2]).to_string();
@@ -3915,9 +3916,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     }
                     let state = String::from_utf8_lossy(&args[2]).to_uppercase();
                     let flag = match state.as_str() {
-                        "YES" => true,
-                        "NO" => false,
-                        _ => return Err("syntax error".to_string()),
+                        "YES" => Some(true),
+                        "NO" => Some(false),
+                        _ => None,
                     };
                     Ok(Some(Command::Client(ClientSubcommand::Caching(flag))))
                 }
@@ -3969,10 +3970,14 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             "wrong number of arguments for 'client|pause' command".to_string()
                         );
                     }
-                    let timeout: u64 = std::str::from_utf8(&args[2])
+                    let timeout_i64: i64 = std::str::from_utf8(&args[2])
                         .map_err(|_| "timeout is not an integer or out of range".to_string())?
                         .parse()
                         .map_err(|_| "timeout is not an integer or out of range".to_string())?;
+                    if timeout_i64 < 0 {
+                        return Err("timeout is negative".to_string());
+                    }
+                    let timeout = timeout_i64 as u64;
                     let write_only = if args.len() == 4 {
                         let mode = String::from_utf8_lossy(&args[3]).to_uppercase();
                         if mode == "WRITE" {
@@ -3991,14 +3996,32 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
                 "UNPAUSE" => Ok(Some(Command::Client(ClientSubcommand::Unpause))),
                 "NO-TOUCH" => {
-                    if args.len() < 3 {
+                    if args.len() != 3 {
                         return Err(
-                            "wrong number of arguments for 'client no-touch' command".to_string()
+                            "wrong number of arguments for 'client|no-touch' command".to_string()
                         );
                     }
                     let opt = String::from_utf8_lossy(&args[2]).to_uppercase();
-                    let enabled = opt == "ON" || opt == "YES" || opt == "1";
+                    let enabled = match opt.as_str() {
+                        "ON" | "YES" | "1" => true,
+                        "OFF" | "NO" | "0" => false,
+                        _ => return Err("syntax error".to_string()),
+                    };
                     Ok(Some(Command::Client(ClientSubcommand::NoTouch(enabled))))
+                }
+                "NO-EVICT" => {
+                    if args.len() != 3 {
+                        return Err(
+                            "wrong number of arguments for 'client|no-evict' command".to_string()
+                        );
+                    }
+                    let opt = String::from_utf8_lossy(&args[2]).to_uppercase();
+                    let enabled = match opt.as_str() {
+                        "ON" => true,
+                        "OFF" => false,
+                        _ => return Err("syntax error".to_string()),
+                    };
+                    Ok(Some(Command::Client(ClientSubcommand::NoEvict(enabled))))
                 }
                 "REPLY" => {
                     if args.len() < 3 {
@@ -6376,52 +6399,42 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
             match sub.as_str() {
                 "GET" => {
-                    if args.len() != 3 {
+                    if args.len() < 3 {
                         return Err(
-                            "wrong number of arguments for 'config get' command".to_string()
+                            "wrong number of arguments for 'config|get' command".to_string()
                         );
                     }
-                    Ok(Some(Command::ConfigGet(args[2].clone())))
+                    Ok(Some(Command::ConfigGet(args[2..].to_vec())))
                 }
                 "SET" => {
-                    if args.len() < 4 {
+                    if args.len() < 4 || !(args.len() - 2).is_multiple_of(2) {
                         return Err(
-                            "wrong number of arguments for 'config set' command".to_string()
+                            "wrong number of arguments for 'config|set' command".to_string()
                         );
                     }
-                    let val = if args.len() == 4 {
-                        let mut v = args[3].clone();
-                        if (v.starts_with(b"\"") && v.ends_with(b"\""))
-                            || (v.starts_with(b"'") && v.ends_with(b"'"))
+                    let mut pairs = Vec::with_capacity((args.len() - 2) / 2);
+                    let mut i = 2;
+                    while i < args.len() {
+                        let mut v = args[i + 1].clone();
+                        if v.len() >= 2
+                            && ((v.starts_with(b"\"") && v.ends_with(b"\""))
+                                || (v.starts_with(b"'") && v.ends_with(b"'")))
                         {
                             v = v.slice(1..v.len() - 1);
                         }
-                        v
-                    } else {
-                        let mut combined = Vec::new();
-                        for (i, a) in args[3..].iter().enumerate() {
-                            if i > 0 {
-                                combined.push(b' ');
-                            }
-                            combined.extend_from_slice(a);
-                        }
-                        if (combined.starts_with(b"\"") && combined.ends_with(b"\""))
-                            || (combined.starts_with(b"'") && combined.ends_with(b"'"))
-                        {
-                            combined = combined[1..combined.len() - 1].to_vec();
-                        }
-                        Bytes::from(combined)
-                    };
-                    Ok(Some(Command::ConfigSet(args[2].clone(), val)))
+                        pairs.push((args[i].clone(), v));
+                        i += 2;
+                    }
+                    Ok(Some(Command::ConfigSet(pairs)))
                 }
-                "RESETSTAT" => Ok(Some(Command::ConfigSet(
+                "RESETSTAT" => Ok(Some(Command::ConfigSet(vec![(
                     Bytes::from_static(b"resetstat"),
                     Bytes::new(),
-                ))),
-                "REWRITE" => Ok(Some(Command::ConfigSet(
+                )]))),
+                "REWRITE" => Ok(Some(Command::ConfigSet(vec![(
                     Bytes::from_static(b"rewrite"),
                     Bytes::new(),
-                ))),
+                )]))),
                 "HELP" => Ok(Some(Command::Unknown("CONFIG HELP".to_string()))),
                 _ => Err(format!("ERR unknown subcommand '{}' for CONFIG", sub)),
             }

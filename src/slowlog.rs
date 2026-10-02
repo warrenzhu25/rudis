@@ -380,37 +380,37 @@ pub fn command_to_slowlog_argv(cmd: &Command) -> (Vec<Bytes>, usize) {
             let len = res.len();
             (res, len)
         }
-        Command::ConfigGet(param) => (
-            vec![
-                Bytes::from_static(b"config"),
-                Bytes::from_static(b"get"),
-                param.clone(),
-            ],
-            3,
-        ),
-        Command::ConfigSet(param, val) => {
-            let p_lower = String::from_utf8_lossy(param).to_lowercase();
-            let val_bytes = if matches!(
-                p_lower.as_str(),
-                "masteruser"
-                    | "masterauth"
-                    | "requirepass"
-                    | "tls-key-file-pass"
-                    | "tls-client-key-file-pass"
-            ) {
-                Bytes::from_static(b"(redacted)")
-            } else {
-                val.clone()
-            };
-            (
-                vec![
-                    Bytes::from_static(b"config"),
-                    Bytes::from_static(b"set"),
-                    Bytes::from(p_lower),
-                    val_bytes,
-                ],
-                4,
-            )
+        Command::ConfigGet(params) => {
+            let mut v = Vec::with_capacity(2 + params.len());
+            v.push(Bytes::from_static(b"config"));
+            v.push(Bytes::from_static(b"get"));
+            v.extend(params.iter().cloned());
+            let len = v.len();
+            (v, len)
+        }
+        Command::ConfigSet(pairs) => {
+            let mut v = Vec::with_capacity(2 + pairs.len() * 2);
+            v.push(Bytes::from_static(b"config"));
+            v.push(Bytes::from_static(b"set"));
+            for (param, val) in pairs {
+                let p_lower = String::from_utf8_lossy(param).to_lowercase();
+                let val_bytes = if matches!(
+                    p_lower.as_str(),
+                    "masteruser"
+                        | "masterauth"
+                        | "requirepass"
+                        | "tls-key-file-pass"
+                        | "tls-client-key-file-pass"
+                ) {
+                    Bytes::from_static(b"(redacted)")
+                } else {
+                    val.clone()
+                };
+                v.push(Bytes::from(p_lower));
+                v.push(val_bytes);
+            }
+            let len = v.len();
+            (v, len)
         }
         Command::Acl(sub) => match sub {
             crate::resp::AclSubcommand::GetUser(_) => (
@@ -637,6 +637,94 @@ pub fn command_to_slowlog_argv(cmd: &Command) -> (Vec<Bytes>, usize) {
     }
 }
 
+pub fn command_to_monitor_argv(cmd: &Command) -> Vec<Bytes> {
+    match cmd {
+        Command::Blpop { keys, timeout } => {
+            let mut args = Vec::with_capacity(keys.len() + 2);
+            args.push(Bytes::from_static(b"blpop"));
+            args.extend(keys.iter().cloned());
+            let t_str = if timeout.fract() == 0.0 {
+                (*timeout as i64).to_string()
+            } else {
+                timeout.to_string()
+            };
+            args.push(Bytes::from(t_str));
+            args
+        }
+        Command::Info(section) => {
+            if let Some(sec) = section {
+                vec![Bytes::from_static(b"info"), sec.clone()]
+            } else {
+                vec![Bytes::from_static(b"info")]
+            }
+        }
+        Command::Eval {
+            script,
+            keys,
+            args,
+            read_only,
+            ..
+        } => {
+            let mut v = Vec::with_capacity(3 + keys.len() + args.len());
+            v.push(if *read_only {
+                Bytes::from_static(b"eval_ro")
+            } else {
+                Bytes::from_static(b"eval")
+            });
+            v.push(script.clone());
+            v.push(Bytes::from(keys.len().to_string()));
+            v.extend(keys.iter().cloned());
+            v.extend(args.iter().cloned());
+            v
+        }
+        Command::Evalsha {
+            sha,
+            keys,
+            args,
+            read_only,
+            ..
+        } => {
+            let mut v = Vec::with_capacity(3 + keys.len() + args.len());
+            v.push(if *read_only {
+                Bytes::from_static(b"evalsha_ro")
+            } else {
+                Bytes::from_static(b"evalsha")
+            });
+            v.push(sha.clone());
+            v.push(Bytes::from(keys.len().to_string()));
+            v.extend(keys.iter().cloned());
+            v.extend(args.iter().cloned());
+            v
+        }
+        Command::Fcall {
+            function,
+            keys,
+            args,
+            read_only,
+            ..
+        } => {
+            let mut v = Vec::with_capacity(3 + keys.len() + args.len());
+            v.push(if *read_only {
+                Bytes::from_static(b"fcall_ro")
+            } else {
+                Bytes::from_static(b"fcall")
+            });
+            v.push(Bytes::from(function.clone()));
+            v.push(Bytes::from(keys.len().to_string()));
+            v.extend(keys.iter().cloned());
+            v.extend(args.iter().cloned());
+            v
+        }
+        _ => {
+            let (mut argv, _) = command_to_slowlog_argv(cmd);
+            if let Some(first) = argv.first_mut() {
+                *first = Bytes::from(String::from_utf8_lossy(first).to_lowercase());
+            }
+            argv
+        }
+    }
+}
+
 /// Serialize Slowlog entries into RESP2 format
 pub fn write_slowlog_entries_resp(entries: &[SlowlogEntry], out: &mut Vec<u8>) {
     out.extend_from_slice(format!("*{}\r\n", entries.len()).as_bytes());
@@ -745,10 +833,10 @@ mod tests {
 
     #[test]
     fn test_slowlog_sensitive_redaction() {
-        let cmd = Command::ConfigSet(
+        let cmd = Command::ConfigSet(vec![(
             Bytes::from_static(b"requirepass"),
             Bytes::from_static(b"supersecret"),
-        );
+        )]);
         let (argv, _) = command_to_slowlog_argv(&cmd);
         assert_eq!(&argv[3][..], b"(redacted)");
     }

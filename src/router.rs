@@ -2179,6 +2179,9 @@ impl Router {
         let mut out = String::new();
         let now = std::time::Instant::now();
         for client in local_registry.borrow().values() {
+            if client.stats.killed.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
             if !filter_ids.is_empty() && !filter_ids.contains(&client.id) {
                 continue;
             }
@@ -2190,8 +2193,14 @@ impl Router {
                 .is_blocked(client.id);
             let flags = if client.is_monitor { "O" } else if is_blocked { "b" } else { "N" };
             let (qbuf, qbuf_free) = client.effective_qbuf(idle);
+            let tot_net_in = client.stats.tot_net_in.load(std::sync::atomic::Ordering::Relaxed);
+            let tot_net_out = client.stats.tot_net_out.load(std::sync::atomic::Ordering::Relaxed);
+            let tot_cmds = client.stats.tot_cmds.load(std::sync::atomic::Ordering::Relaxed);
+            let read_events = client.stats.read_events.load(std::sync::atomic::Ordering::Relaxed);
+            let pipe_sum = client.stats.pipeline_len_sum.load(std::sync::atomic::Ordering::Relaxed);
+            let pipe_cnt = client.stats.pipeline_len_cnt.load(std::sync::atomic::Ordering::Relaxed);
             out.push_str(&format!(
-                "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf={} qbuf-free={} argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name={} lib-ver={} io-thread=0 tot-net-in=0 tot-net-out=0 tot-cmds=0 read-events=0 avg-pipeline-len-sum=0 avg-pipeline-len-cnt=0\n",
+                "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf={} qbuf-free={} argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name={} lib-ver={} io-thread=0 tot-net-in={} tot-net-out={} tot-cmds={} read-events={} avg-pipeline-len-sum={} avg-pipeline-len-cnt={}\n",
                 client.id,
                 client.addr,
                 self.port,
@@ -2205,6 +2214,12 @@ impl Router {
                 client.last_cmd.to_lowercase(),
                 client.lib_name.as_deref().unwrap_or(""),
                 client.lib_ver.as_deref().unwrap_or(""),
+                tot_net_in,
+                tot_net_out,
+                tot_cmds,
+                read_events,
+                pipe_sum,
+                pipe_cnt,
             ));
         }
 
