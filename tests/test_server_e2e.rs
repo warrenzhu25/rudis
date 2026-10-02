@@ -12287,7 +12287,8 @@ fn test_distributed_multi_exec_and_stream_observability_e2e() {
 
     let ginfo_initial = send_and_read(&mut stream, b"XINFO GROUPS obs_s\r\n");
     assert!(
-        ginfo_initial.contains("entries-read\r\n:0\r\n") && ginfo_initial.contains("lag\r\n:3\r\n"),
+        ginfo_initial.contains("entries-read\r\n$-1\r\n")
+            && ginfo_initial.contains("lag\r\n:3\r\n"),
         "unexpected initial XINFO GROUPS: {}",
         ginfo_initial
     );
