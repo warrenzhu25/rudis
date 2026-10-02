@@ -454,22 +454,52 @@ impl<T> SpscQueue<T> {
         }
     }
 
+    /// Pushes from the single producer. Only the producer ever writes `tail`
+    /// and the ring slots behind it, so the ring stays a true SPSC queue.
     #[inline(always)]
     pub fn push(&self, item: T) {
         let tail = self.tail.load(Ordering::Relaxed);
         let head = self.head.load(Ordering::Acquire);
+        // `has_overflow` is only set by this thread and only cleared once the
+        // overflow is empty, so `false` means every earlier item is in the
+        // ring and appending to it keeps FIFO order.
         if !self.has_overflow.load(Ordering::Acquire) && tail.wrapping_sub(head) < self.capacity {
             unsafe {
                 *self.buffer[tail & self.mask].get() = Some(item);
             }
             self.tail.store(tail.wrapping_add(1), Ordering::Release);
         } else {
-            let mut q = self.overflow.lock().unwrap();
-            q.push_back(item);
-            self.has_overflow.store(true, Ordering::Release);
+            self.push_slow(item);
         }
     }
 
+    #[cold]
+    fn push_slow(&self, item: T) {
+        let mut q = self.overflow.lock().unwrap();
+        // Move older overflow entries into the ring first, oldest first, so
+        // the overflow only ever holds items newer than everything in the ring.
+        let mut tail = self.tail.load(Ordering::Relaxed);
+        while !q.is_empty() && tail.wrapping_sub(self.head.load(Ordering::Acquire)) < self.capacity
+        {
+            let next = q.pop_front();
+            unsafe {
+                *self.buffer[tail & self.mask].get() = next;
+            }
+            tail = tail.wrapping_add(1);
+            self.tail.store(tail, Ordering::Release);
+        }
+        if q.is_empty() && tail.wrapping_sub(self.head.load(Ordering::Acquire)) < self.capacity {
+            unsafe {
+                *self.buffer[tail & self.mask].get() = Some(item);
+            }
+            self.tail.store(tail.wrapping_add(1), Ordering::Release);
+        } else {
+            q.push_back(item);
+        }
+        self.has_overflow.store(!q.is_empty(), Ordering::Release);
+    }
+
+    /// Pops from the single consumer. The consumer only writes `head`.
     #[inline(always)]
     pub fn pop(&self) -> Option<T> {
         let head = self.head.load(Ordering::Relaxed);
@@ -477,30 +507,30 @@ impl<T> SpscQueue<T> {
         if head != tail {
             let item = unsafe { (*self.buffer[head & self.mask].get()).take() };
             self.head.store(head.wrapping_add(1), Ordering::Release);
-            if self.has_overflow.load(Ordering::Acquire) {
-                let mut q = self.overflow.lock().unwrap();
-                if let Some(next_item) = q.pop_front() {
-                    let t = self.tail.load(Ordering::Relaxed);
-                    unsafe {
-                        *self.buffer[t & self.mask].get() = Some(next_item);
-                    }
-                    self.tail.store(t.wrapping_add(1), Ordering::Release);
-                }
-                if q.is_empty() {
-                    self.has_overflow.store(false, Ordering::Release);
-                }
-            }
             item
         } else if self.has_overflow.load(Ordering::Acquire) {
-            let mut q = self.overflow.lock().unwrap();
-            let item = q.pop_front();
-            if q.is_empty() {
-                self.has_overflow.store(false, Ordering::Release);
-            }
-            item
+            self.pop_overflow(head)
         } else {
             None
         }
+    }
+
+    #[cold]
+    fn pop_overflow(&self, head: usize) -> Option<T> {
+        let mut q = self.overflow.lock().unwrap();
+        // The producer may have moved overflow entries into the ring before we
+        // took the lock; those are older than the overflow front.
+        if self.tail.load(Ordering::Acquire) != head {
+            drop(q);
+            let item = unsafe { (*self.buffer[head & self.mask].get()).take() };
+            self.head.store(head.wrapping_add(1), Ordering::Release);
+            return item;
+        }
+        let item = q.pop_front();
+        if q.is_empty() {
+            self.has_overflow.store(false, Ordering::Release);
+        }
+        item
     }
 
     #[inline(always)]
@@ -901,6 +931,55 @@ mod tests {
         assert_eq!(queue.pop(), Some(3));
         assert_eq!(queue.pop(), Some(4));
         assert_eq!(queue.pop(), Some(5));
+        assert_eq!(queue.pop(), None);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn test_spsc_queue_concurrent_overflow_keeps_order() {
+        // Bursts slightly larger than the ring make the overflow fill and
+        // empty on nearly every burst while the producer is still pushing,
+        // which is where the consumer used to move overflow items into the
+        // ring concurrently with the producer writing the same slot.
+        const CAP: u64 = 4;
+        const BURSTS: u64 = 200_000;
+        let queue = Arc::new(SpscQueue::new(CAP as usize));
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let producer = {
+            let (queue, consumed) = (queue.clone(), consumed.clone());
+            thread::spawn(move || {
+                let mut next = 0u64;
+                for b in 0..BURSTS {
+                    for _ in 0..CAP + 1 + b % 3 {
+                        queue.push(next);
+                        next += 1;
+                    }
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                    while consumed.load(Ordering::Acquire) as u64 != next {
+                        assert!(std::time::Instant::now() < deadline, "consumer stuck");
+                        std::hint::spin_loop();
+                    }
+                }
+                next
+            })
+        };
+        let total = BURSTS * (CAP + 1) + (0..BURSTS).map(|b| b % 3).sum::<u64>();
+        let mut expected = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while expected < total {
+            match queue.pop() {
+                Some(v) => {
+                    assert_eq!(v, expected, "item lost or reordered");
+                    expected += 1;
+                    consumed.store(expected as usize, Ordering::Release);
+                }
+                None => {
+                    assert!(std::time::Instant::now() < deadline, "stuck at {expected}");
+                    std::hint::spin_loop();
+                }
+            }
+        }
+        assert_eq!(producer.join().unwrap(), total);
         assert_eq!(queue.pop(), None);
         assert!(queue.is_empty());
     }
