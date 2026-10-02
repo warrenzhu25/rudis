@@ -6290,6 +6290,55 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
     }
 }
 
+/// Name used for ACL checks: like [`get_cmd_name`], but resolves the
+/// subcommand (`container|sub`) for containers whose subcommands have
+/// different ACL categories. Unresolved containers return the bare container
+/// name, which the ACL layer only permits if every subcommand is permitted.
+pub fn acl_cmd_name(cmd: &Command) -> &'static str {
+    use crate::resp::{AclSubcommand as A, ClusterSubcommand as C, MemorySubcommand as M};
+    match cmd {
+        Command::Acl(sub) => match sub {
+            A::List => "acl|list",
+            A::Users => "acl|users",
+            A::GetUser(_) => "acl|getuser",
+            A::SetUser { .. } => "acl|setuser",
+            A::DelUser(_) => "acl|deluser",
+            A::WhoAmI => "acl|whoami",
+            A::Cat => "acl|cat",
+        },
+        Command::Cluster(sub) => match sub {
+            C::KeySlot(_) => "cluster|keyslot",
+            C::CountKeysInSlot(_) => "cluster|countkeysinslot",
+            C::GetKeysInSlot(..) => "cluster|getkeysinslot",
+            C::Slots => "cluster|slots",
+            C::Shards => "cluster|shards",
+            C::Links => "cluster|links",
+            C::Nodes => "cluster|nodes",
+            C::Info => "cluster|info",
+            C::MyId => "cluster|myid",
+            _ => "cluster",
+        },
+        Command::ConfigGet(_) => "config|get",
+        Command::ConfigSet(_) => "config|set",
+        Command::FunctionLoad { .. } => "function|load",
+        Command::FunctionDump => "function|dump",
+        Command::FunctionRestore { .. } => "function|restore",
+        Command::FunctionList { .. } => "function|list",
+        Command::FunctionFlush => "function|flush",
+        Command::FunctionStats => "function|stats",
+        Command::FunctionKill => "function|kill",
+        Command::FunctionDelete(_) => "function|delete",
+        Command::Memory(sub) => match sub {
+            M::Usage { .. } => "memory|usage",
+            M::Stats => "memory|stats",
+            M::Purge => "memory|purge",
+            M::Doctor => "memory|doctor",
+            M::Defrag => "memory",
+        },
+        _ => get_cmd_name(cmd),
+    }
+}
+
 pub fn write_command_list(out: &mut Vec<u8>, filter: Option<(&str, &str)>) {
     const ALL_CMD_NAMES: &[&str] = &[
         "get",
@@ -7241,8 +7290,8 @@ fn mode_switch_denied(
     }
     let acl = crate::acl::get_acl_for_port(port);
     let guard = acl.read().unwrap();
-    let user = guard.get_user(auth_user)?;
-    let name = get_cmd_name(cmd);
+    let user = guard.users.get(auth_user)?;
+    let name = acl_cmd_name(cmd);
     if user.can_execute_command(name) {
         None
     } else {
@@ -7463,12 +7512,13 @@ async fn execute_command(
     {
         let acl = crate::acl::get_acl_for_port(router.port);
         let acl_guard = acl.read().unwrap();
-        if let Some(user) = acl_guard.get_user(auth_user) {
-            if !user.can_execute_command(cmd_name) {
+        if let Some(user) = acl_guard.users.get(auth_user) {
+            let acl_name = acl_cmd_name(&cmd);
+            if !user.can_execute_command(acl_name) {
                 out.extend_from_slice(
                     format!(
                         "-NOPERM this user has no permissions to run the '{}' command\r\n",
-                        cmd_name.to_lowercase()
+                        acl_name.to_lowercase()
                     )
                     .as_bytes(),
                 );
@@ -11133,12 +11183,12 @@ async fn execute_command(
                             out.extend_from_slice(format!("${}\r\n{}\r\n", p.len(), p).as_bytes());
                         }
                         out.extend_from_slice(b"$8\r\ncommands\r\n");
-                        let cmd_str = if user.all_commands { "+@all" } else { "-@all" };
+                        let cmd_str = user.commands_rule_string();
                         out.extend_from_slice(
                             format!("${}\r\n{}\r\n", cmd_str.len(), cmd_str).as_bytes(),
                         );
                         out.extend_from_slice(b"$4\r\nkeys\r\n");
-                        let key_str = if user.all_keys { "~*" } else { "" };
+                        let key_str = user.keys_rule_string();
                         out.extend_from_slice(
                             format!("${}\r\n{}\r\n", key_str.len(), key_str).as_bytes(),
                         );
@@ -11158,29 +11208,7 @@ async fn execute_command(
                     write_resp_integer(out, count as i64);
                 }
                 crate::resp::AclSubcommand::Cat => {
-                    let cats = [
-                        "keyspace",
-                        "read",
-                        "write",
-                        "set",
-                        "sortedset",
-                        "list",
-                        "hash",
-                        "string",
-                        "bitmap",
-                        "hyperloglog",
-                        "geo",
-                        "stream",
-                        "pubsub",
-                        "admin",
-                        "fast",
-                        "slow",
-                        "blocking",
-                        "dangerous",
-                        "connection",
-                        "transaction",
-                        "scripting",
-                    ];
+                    let cats = crate::acl_categories::CATEGORIES;
                     out.extend_from_slice(format!("*{}\r\n", cats.len()).as_bytes());
                     for cat in cats {
                         out.extend_from_slice(format!("${}\r\n{}\r\n", cat.len(), cat).as_bytes());
@@ -22702,7 +22730,7 @@ async fn execute_commands_squashed(
             None
         };
         let acl_guard = acl.as_ref().map(|a| a.read().unwrap());
-        let user = acl_guard.as_ref().and_then(|g| g.get_user(auth_user));
+        let user = acl_guard.as_ref().and_then(|g| g.users.get(auth_user));
 
         let hub = if crate::cluster::HAS_ACTIVE_CLUSTER.load(std::sync::atomic::Ordering::Relaxed) {
             let h = crate::cluster::get_cluster_hub(router.port);
@@ -22723,7 +22751,7 @@ async fn execute_commands_squashed(
                     break;
                 }
                 if let Some(user) = &user {
-                    let cmd_name = get_cmd_name(cmd);
+                    let cmd_name = acl_cmd_name(cmd);
                     if !user.can_execute_command(cmd_name) {
                         can_squash = false;
                         break;

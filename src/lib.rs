@@ -1,6 +1,8 @@
 #![allow(clippy::type_complexity, clippy::too_many_arguments)]
 
 pub mod acl;
+#[rustfmt::skip]
+pub mod acl_categories;
 pub mod agent;
 pub mod allocator;
 pub mod aof;

@@ -2779,7 +2779,7 @@ fn test_auth_and_acl_e2e() {
 
     // 5. Enforce password on default user and verify NOAUTH
     assert_eq!(
-        send_and_read(&mut client, b"ACL SETUSER default >defpass -nopass\r\n"),
+        send_and_read(&mut client, b"ACL SETUSER default >defpass\r\n"),
         "+OK\r\n"
     );
 
@@ -14355,4 +14355,88 @@ fn test_cluster_shard_ports_share_requirepass_and_users_e2e() {
     let mut c0 = TcpStream::connect(("127.0.0.1", base)).unwrap();
     c0.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     assert_eq!(resp_cmd(&mut c0, &["AUTH", "op", "oppw"]), "+OK\r\n");
+}
+
+#[test]
+fn test_acl_categories_and_unknown_rules_e2e() {
+    let port = 16997;
+    start_test_server(port, 2);
+    let mut admin = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    admin
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    assert_eq!(
+        resp_cmd(
+            &mut admin,
+            &[
+                "ACL",
+                "SETUSER",
+                "app",
+                "on",
+                ">apppw",
+                "+@all",
+                "-@dangerous",
+                "~*"
+            ]
+        ),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(
+            &mut admin,
+            &["ACL", "SETUSER", "ro", "on", ">ropw", "+@read", "~*"]
+        ),
+        "+OK\r\n"
+    );
+
+    let mut app = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    app.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    assert_eq!(resp_cmd(&mut app, &["AUTH", "app", "apppw"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut app, &["SET", "k", "v"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut app, &["CLIENT", "SETNAME", "x"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut app, &["ACL", "WHOAMI"]), "$3\r\napp\r\n");
+    for (cmd, name) in [
+        (&["FLUSHALL"][..], "flushall"),
+        (&["KEYS", "*"][..], "keys"),
+        (&["CONFIG", "SET", "maxclients", "10"][..], "config|set"),
+        (&["CONFIG", "GET", "maxclients"][..], "config|get"),
+        (&["ACL", "SETUSER", "app", "+@all"][..], "acl|setuser"),
+        (&["CLIENT", "KILL", "ID", "999999"][..], "client|kill"),
+    ] {
+        let r = resp_cmd(&mut app, cmd);
+        assert_eq!(
+            r,
+            format!(
+                "-NOPERM this user has no permissions to run the '{}' command\r\n",
+                name
+            ),
+            "{:?}",
+            cmd
+        );
+    }
+    assert_eq!(resp_cmd(&mut app, &["GET", "k"]), "$1\r\nv\r\n");
+
+    let mut ro = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    ro.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    assert_eq!(resp_cmd(&mut ro, &["AUTH", "ro", "ropw"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut ro, &["GET", "k"]), "$1\r\nv\r\n");
+    assert!(resp_cmd(&mut ro, &["SET", "k", "w"]).starts_with("-NOPERM"));
+    assert!(resp_cmd(&mut ro, &["DEL", "k"]).starts_with("-NOPERM"));
+
+    // Unknown rules are errors, not silently ignored, and change nothing.
+    let r = resp_cmd(&mut admin, &["ACL", "SETUSER", "ro", "+set", "+nosuchcmd"]);
+    assert_eq!(
+        r,
+        "-ERR Error in ACL SETUSER modifier '+nosuchcmd': Unknown command or category name in ACL\r\n"
+    );
+    assert!(resp_cmd(&mut ro, &["SET", "k", "w"]).starts_with("-NOPERM"));
+    assert!(resp_cmd(&mut admin, &["ACL", "SETUSER", "ro", "+@bogus"]).starts_with("-ERR"));
+    assert!(resp_cmd(&mut admin, &["ACL", "SETUSER", "ro", "whatever"]).starts_with("-ERR"));
+
+    // ACL GETUSER describes the effective command set in replayable form.
+    let getuser = resp_cmd(&mut admin, &["ACL", "GETUSER", "app"]);
+    assert!(getuser.contains("+@all"), "{}", getuser);
+    assert!(getuser.contains("-flushall"), "{}", getuser);
+    assert!(getuser.contains("-config|set"), "{}", getuser);
+    assert!(!getuser.contains("-get "), "{}", getuser);
 }

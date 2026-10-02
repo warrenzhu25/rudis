@@ -2431,7 +2431,7 @@ fn register_redis_module(
 
         let acl = crate::acl::get_acl_for_port(port);
         let acl_guard = acl.read().unwrap();
-        let cmd_name = crate::connection::get_cmd_name(&cmd);
+        let cmd_name = crate::connection::acl_cmd_name(&cmd);
         let mut allowed = true;
         let auth_user = crate::connection::CURRENT_AUTH_USER.with(|u| u.borrow().clone());
         let user_opt = if auth_user.is_empty() {

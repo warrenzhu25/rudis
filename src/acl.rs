@@ -1,3 +1,4 @@
+use crate::acl_categories::{CATEGORIES, COMMANDS, NUM_COMMANDS, WORDS};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
@@ -61,6 +62,71 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
+/// Index of a command (`name` or `container|sub`, case-insensitive) in
+/// [`COMMANDS`].
+pub fn command_index(name: &str) -> Option<usize> {
+    COMMANDS
+        .binary_search_by(|c| {
+            c.name
+                .bytes()
+                .cmp(name.bytes().map(|b| b.to_ascii_lowercase()))
+        })
+        .ok()
+}
+
+fn category_bit(name: &str) -> Option<u32> {
+    CATEGORIES
+        .iter()
+        .position(|c| c.eq_ignore_ascii_case(name))
+        .map(|i| 1u32 << i)
+}
+
+/// Commands in `category` (for `ACL CAT <category>`), or None if unknown.
+pub fn commands_in_category(category: &str) -> Option<Vec<&'static str>> {
+    let bit = category_bit(category)?;
+    Some(
+        COMMANDS
+            .iter()
+            .filter(|c| c.cats & bit != 0)
+            .map(|c| c.name)
+            .collect(),
+    )
+}
+
+/// One bit per entry of [`COMMANDS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandSet([u64; WORDS]);
+
+impl CommandSet {
+    const fn empty() -> Self {
+        Self([0; WORDS])
+    }
+
+    fn full() -> Self {
+        let mut s = Self::empty();
+        for i in 0..NUM_COMMANDS {
+            s.set(i, true);
+        }
+        s
+    }
+
+    fn get(&self, i: usize) -> bool {
+        (self.0[i / 64] >> (i % 64)) & 1 == 1
+    }
+
+    fn set(&mut self, i: usize, on: bool) {
+        if on {
+            self.0[i / 64] |= 1 << (i % 64);
+        } else {
+            self.0[i / 64] &= !(1 << (i % 64));
+        }
+    }
+}
+
+fn setuser_err(rule: &str, msg: &str) -> String {
+    format!("Error in ACL SETUSER modifier '{}': {}", rule, msg)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AclUser {
     pub name: String,
@@ -68,9 +134,10 @@ pub struct AclUser {
     /// `#<sha256 hex>` entries only; plaintext passwords are never stored.
     pub password_hashes: Vec<String>,
     pub nopass: bool,
+    /// Redis `allcommands`: set by `+@all`, cleared by any later removal. Also
+    /// grants commands that are not in the category table.
     pub all_commands: bool,
-    pub allowed_commands: hashbrown::HashSet<String>,
-    pub disallowed_commands: hashbrown::HashSet<String>,
+    commands: CommandSet,
     pub all_keys: bool,
     pub allowed_key_patterns: Vec<String>,
 }
@@ -83,23 +150,203 @@ impl AclUser {
             password_hashes: Vec::new(),
             nopass: true,
             all_commands: true,
-            allowed_commands: hashbrown::HashSet::new(),
-            disallowed_commands: hashbrown::HashSet::new(),
+            commands: CommandSet::full(),
             all_keys: true,
             allowed_key_patterns: Vec::new(),
         }
     }
 
+    /// A newly created user: Redis starts with `off resetpass resetkeys -@all`.
+    fn new_empty(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            enabled: false,
+            password_hashes: Vec::new(),
+            nopass: false,
+            all_commands: false,
+            commands: CommandSet::empty(),
+            all_keys: false,
+            allowed_key_patterns: Vec::new(),
+        }
+    }
+
+    /// `cmd_name` is a command name or `container|sub` (any case). A bare
+    /// container name (subcommand unknown to the caller) is permitted only if
+    /// every non-help subcommand is.
     pub fn can_execute_command(&self, cmd_name: &str) -> bool {
-        let name = cmd_name.to_lowercase();
-        if name == "ping" || name == "reset" || name == "quit" || name == "auth" || name == "hello"
-        {
+        let Some(i) = command_index(cmd_name) else {
+            return self.all_commands;
+        };
+        let c = &COMMANDS[i];
+        if c.no_auth || self.all_commands {
             return true;
         }
-        if self.all_commands {
-            !self.disallowed_commands.contains(&name)
+        if c.subs.0 == c.subs.1 {
+            return self.commands.get(i);
+        }
+        (c.subs.0..c.subs.1).all(|j| {
+            let j = j as usize;
+            self.commands.get(j) || COMMANDS[j].name.ends_with("|help")
+        })
+    }
+
+    /// Redis ACLChangeSelectorPerm: a container rule also covers its
+    /// subcommands.
+    fn change_perm(&mut self, i: usize, allow: bool) {
+        self.commands.set(i, allow);
+        let (a, b) = COMMANDS[i].subs;
+        for j in a..b {
+            self.commands.set(j as usize, allow);
+        }
+        if !allow {
+            self.all_commands = false;
+        }
+    }
+
+    fn change_category(&mut self, bit: u32, allow: bool) {
+        for (i, c) in COMMANDS.iter().enumerate() {
+            if c.cats & bit != 0 {
+                self.change_perm(i, allow);
+            }
+        }
+        if !allow {
+            self.all_commands = false;
+        }
+    }
+
+    fn apply_rule(&mut self, rule: &str) -> Result<(), String> {
+        let lower = rule.to_ascii_lowercase();
+        match lower.as_str() {
+            "on" => self.enabled = true,
+            "off" => self.enabled = false,
+            "nopass" => {
+                self.nopass = true;
+                self.password_hashes.clear();
+            }
+            "resetpass" => {
+                self.nopass = false;
+                self.password_hashes.clear();
+            }
+            "allkeys" | "~*" => {
+                self.all_keys = true;
+                self.allowed_key_patterns.clear();
+            }
+            "resetkeys" => {
+                self.all_keys = false;
+                self.allowed_key_patterns.clear();
+            }
+            "allcommands" | "+@all" => {
+                self.commands = CommandSet::full();
+                self.all_commands = true;
+            }
+            "nocommands" | "-@all" => {
+                self.commands = CommandSet::empty();
+                self.all_commands = false;
+            }
+            // Every channel is currently permitted, which is exactly `&*`.
+            "allchannels" | "&*" => {}
+            // No selectors exist, so there is nothing to clear.
+            "clearselectors" => {}
+            "reset" => {
+                let name = std::mem::take(&mut self.name);
+                *self = Self::new_empty(&name);
+            }
+            _ => return self.apply_prefixed_rule(rule),
+        }
+        Ok(())
+    }
+
+    fn apply_prefixed_rule(&mut self, rule: &str) -> Result<(), String> {
+        const UNKNOWN: &str = "Unknown command or category name in ACL";
+        if let Some(p) = rule.strip_prefix('>') {
+            self.nopass = false;
+            let h = hash_password_sha256(p);
+            if !self.password_hashes.contains(&h) {
+                self.password_hashes.push(h);
+            }
+        } else if let Some(h) = rule.strip_prefix('#') {
+            let full_hash = parse_password_hash(h)?;
+            self.nopass = false;
+            if !self.password_hashes.contains(&full_hash) {
+                self.password_hashes.push(full_hash);
+            }
+        } else if let Some(p) = rule.strip_prefix('<') {
+            let h = hash_password_sha256(p);
+            self.password_hashes.retain(|x| *x != h);
+        } else if let Some(h) = rule.strip_prefix('!') {
+            let full_hash = parse_password_hash(h)?;
+            self.password_hashes.retain(|x| *x != full_hash);
+        } else if let Some(pat) = rule.strip_prefix('~') {
+            if self.all_keys {
+                return Err(setuser_err(
+                    rule,
+                    "Adding a pattern after the * pattern (or the 'allkeys' flag) is not valid and does not have any effect. Try 'resetkeys' to start with an empty list of patterns",
+                ));
+            }
+            if !self.allowed_key_patterns.iter().any(|p| p == pat) {
+                self.allowed_key_patterns.push(pat.to_string());
+            }
+        } else if rule.starts_with('&') || rule.eq_ignore_ascii_case("resetchannels") {
+            return Err(setuser_err(
+                rule,
+                "Pub/Sub channel restrictions are not supported yet",
+            ));
+        } else if rule.starts_with('%') {
+            return Err(setuser_err(
+                rule,
+                "Read/write key permissions are not supported yet",
+            ));
+        } else if rule.starts_with('(') {
+            return Err(setuser_err(rule, "Selectors are not supported"));
+        } else if let Some(rest) = rule.strip_prefix('+').or_else(|| rule.strip_prefix('-')) {
+            let allow = rule.starts_with('+');
+            if let Some(cat) = rest.strip_prefix('@') {
+                let bit = category_bit(cat).ok_or_else(|| setuser_err(rule, UNKNOWN))?;
+                self.change_category(bit, allow);
+            } else {
+                let i = command_index(rest).ok_or_else(|| setuser_err(rule, UNKNOWN))?;
+                self.change_perm(i, allow);
+            }
         } else {
-            self.allowed_commands.contains(&name)
+            return Err(setuser_err(rule, "Syntax error"));
+        }
+        Ok(())
+    }
+
+    /// The command part of `ACL LIST` / `ACL GETUSER`, replayable through
+    /// `ACL SETUSER`.
+    pub fn commands_rule_string(&self) -> String {
+        let allowed = (0..NUM_COMMANDS).filter(|&i| self.commands.get(i)).count();
+        let base_all = self.all_commands || allowed * 2 > NUM_COMMANDS;
+        let mut parts = vec![if base_all { "+@all" } else { "-@all" }.to_string()];
+        let sign = |on: bool| if on { '+' } else { '-' };
+        for (i, c) in COMMANDS.iter().enumerate() {
+            if c.parent.is_some() {
+                continue;
+            }
+            let on = self.commands.get(i);
+            if on != base_all {
+                parts.push(format!("{}{}", sign(on), c.name));
+            }
+            for j in c.subs.0..c.subs.1 {
+                let s = self.commands.get(j as usize);
+                if s != on {
+                    parts.push(format!("{}{}", sign(s), COMMANDS[j as usize].name));
+                }
+            }
+        }
+        parts.join(" ")
+    }
+
+    pub fn keys_rule_string(&self) -> String {
+        if self.all_keys {
+            "~*".to_string()
+        } else {
+            self.allowed_key_patterns
+                .iter()
+                .map(|p| format!("~{}", p))
+                .collect::<Vec<_>>()
+                .join(" ")
         }
     }
 
@@ -156,25 +403,14 @@ impl AclUser {
                 parts.push(h.clone());
             }
         }
-        if self.all_commands {
-            parts.push("+@all".to_string());
-            for d in &self.disallowed_commands {
-                parts.push(format!("-{}", d));
-            }
+        let keys = self.keys_rule_string();
+        if keys.is_empty() {
+            parts.push("resetkeys".to_string());
         } else {
-            parts.push("-@all".to_string());
-            for a in &self.allowed_commands {
-                parts.push(format!("+{}", a));
-            }
-        }
-        if self.all_keys {
-            parts.push("~*".to_string());
-        } else {
-            for pat in &self.allowed_key_patterns {
-                parts.push(format!("~{}", pat));
-            }
+            parts.push(keys);
         }
         parts.push("&*".to_string());
+        parts.push(self.commands_rule_string());
         parts.join(" ")
     }
 }
@@ -284,160 +520,19 @@ impl AclManager {
         self.users.get_mut(username)
     }
 
+    /// Applies `rules` atomically: on error the user is left unchanged (or not
+    /// created), as in Redis.
     pub fn set_user(&mut self, username: &str, rules: &[String]) -> Result<(), String> {
-        HAS_CUSTOM_ACL.store(true, Ordering::Release);
-        let user = self
+        let mut user = self
             .users
-            .entry(username.to_string())
-            .or_insert_with(|| AclUser {
-                name: username.to_string(),
-                enabled: false,
-                password_hashes: Vec::new(),
-                nopass: false,
-                all_commands: false,
-                allowed_commands: hashbrown::HashSet::new(),
-                disallowed_commands: hashbrown::HashSet::new(),
-                all_keys: false,
-                allowed_key_patterns: Vec::new(),
-            });
-
+            .get(username)
+            .cloned()
+            .unwrap_or_else(|| AclUser::new_empty(username));
         for rule in rules {
-            if rule == "on" {
-                user.enabled = true;
-            } else if rule == "off" {
-                user.enabled = false;
-            } else if rule == "nopass" {
-                user.nopass = true;
-                user.password_hashes.clear();
-            } else if rule == "-nopass" {
-                user.nopass = false;
-            } else if rule == "resetpass" {
-                user.nopass = false;
-                user.password_hashes.clear();
-            } else if let Some(p) = rule.strip_prefix('>') {
-                user.nopass = false;
-                let h = hash_password_sha256(p);
-                if !user.password_hashes.contains(&h) {
-                    user.password_hashes.push(h);
-                }
-            } else if let Some(h) = rule.strip_prefix('#') {
-                let full_hash = parse_password_hash(h)?;
-                user.nopass = false;
-                if !user.password_hashes.contains(&full_hash) {
-                    user.password_hashes.push(full_hash);
-                }
-            } else if let Some(p) = rule.strip_prefix('<') {
-                let h = hash_password_sha256(p);
-                user.password_hashes.retain(|x| *x != h);
-            } else if let Some(h) = rule.strip_prefix('!') {
-                let full_hash = parse_password_hash(h)?;
-                user.password_hashes.retain(|x| *x != full_hash);
-            } else if let Some(cat) = rule.strip_prefix("+@") {
-                let c = cat.to_lowercase();
-                if c == "all" {
-                    user.all_commands = true;
-                    user.disallowed_commands.clear();
-                } else if c == "scripting" {
-                    for cmd in &[
-                        "eval",
-                        "evalsha",
-                        "eval_ro",
-                        "evalsha_ro",
-                        "function",
-                        "fcall",
-                        "fcall_ro",
-                        "script",
-                    ] {
-                        if user.all_commands {
-                            user.disallowed_commands.remove(*cmd);
-                        } else {
-                            user.allowed_commands.insert(cmd.to_string());
-                        }
-                    }
-                } else if c == "string" {
-                    for cmd in &[
-                        "get",
-                        "set",
-                        "mget",
-                        "mset",
-                        "incr",
-                        "decr",
-                        "incrby",
-                        "decrby",
-                        "incrbyfloat",
-                        "append",
-                        "strlen",
-                        "getset",
-                        "getdel",
-                        "getex",
-                        "setnx",
-                        "setex",
-                        "psetex",
-                        "msetnx",
-                    ] {
-                        if user.all_commands {
-                            user.disallowed_commands.remove(*cmd);
-                        } else {
-                            user.allowed_commands.insert(cmd.to_string());
-                        }
-                    }
-                }
-            } else if let Some(cat) = rule.strip_prefix("-@") {
-                let c = cat.to_lowercase();
-                if c == "all" {
-                    user.all_commands = false;
-                    user.allowed_commands.clear();
-                } else if c == "scripting" {
-                    for cmd in &[
-                        "eval",
-                        "evalsha",
-                        "eval_ro",
-                        "evalsha_ro",
-                        "function",
-                        "fcall",
-                        "fcall_ro",
-                        "script",
-                    ] {
-                        if user.all_commands {
-                            user.disallowed_commands.insert(cmd.to_string());
-                        } else {
-                            user.allowed_commands.remove(*cmd);
-                        }
-                    }
-                }
-            } else if rule == "+all" {
-                user.all_commands = true;
-                user.disallowed_commands.clear();
-            } else if rule == "-all" {
-                user.all_commands = false;
-                user.allowed_commands.clear();
-            } else if let Some(cmd) = rule.strip_prefix('+') {
-                let c = cmd.to_lowercase();
-                if user.all_commands {
-                    user.disallowed_commands.remove(&c);
-                } else {
-                    user.allowed_commands.insert(c);
-                }
-            } else if let Some(cmd) = rule.strip_prefix('-') {
-                let c = cmd.to_lowercase();
-                if user.all_commands {
-                    user.disallowed_commands.insert(c);
-                } else {
-                    user.allowed_commands.remove(&c);
-                }
-            } else if rule == "~*" || rule == "allkeys" {
-                user.all_keys = true;
-                user.allowed_key_patterns.clear();
-            } else if rule == "resetkeys" {
-                user.all_keys = false;
-                user.allowed_key_patterns.clear();
-            } else if let Some(pat) = rule.strip_prefix('~') {
-                user.all_keys = false;
-                if !user.allowed_key_patterns.contains(&pat.to_string()) {
-                    user.allowed_key_patterns.push(pat.to_string());
-                }
-            }
+            user.apply_rule(rule)?;
         }
+        HAS_CUSTOM_ACL.store(true, Ordering::Release);
+        self.users.insert(username.to_string(), user);
         Ok(())
     }
 
@@ -564,7 +659,11 @@ mod tests {
 
         let user = mgr.get_user("restricted").unwrap();
         assert!(user.can_execute_command("get"));
-        assert!(user.can_execute_command("ping")); // Builtin allowed
+        assert!(user.can_execute_command("GET"));
+        // Only NO_AUTH commands bypass command ACLs (as in Redis); PING does not.
+        assert!(user.can_execute_command("auth"));
+        assert!(user.can_execute_command("hello"));
+        assert!(!user.can_execute_command("ping"));
         assert!(!user.can_execute_command("set"));
         assert!(!user.can_execute_command("del"));
 
@@ -572,5 +671,146 @@ mod tests {
         assert!(user.can_access_key(b"user:profile"));
         assert!(!user.can_access_key(b"cache:12345"));
         assert!(!user.can_access_key(b"admin:root"));
+    }
+
+    fn user_with(rules: &[&str]) -> Result<AclUser, String> {
+        let mut mgr = AclManager::new();
+        mgr.set_user(
+            "u",
+            &rules.iter().map(|r| r.to_string()).collect::<Vec<_>>(),
+        )?;
+        Ok(mgr.get_user("u").unwrap())
+    }
+
+    #[test]
+    fn test_acl_categories_follow_redis_command_table() {
+        // +@all -@dangerous: data commands OK, admin/dangerous ones denied.
+        let u = user_with(&["+@all", "-@dangerous"]).unwrap();
+        for ok in [
+            "get",
+            "set",
+            "ping",
+            "client|setname",
+            "acl|whoami",
+            "config|help",
+        ] {
+            assert!(u.can_execute_command(ok), "{ok}");
+        }
+        for denied in [
+            "flushall",
+            "flushdb",
+            "keys",
+            "config|set",
+            "config|get",
+            "client|kill",
+            "acl|setuser",
+            "debug",
+            "shutdown",
+            "mcp",
+            "xdp",
+        ] {
+            assert!(!u.can_execute_command(denied), "{denied}");
+        }
+        // Bare container with a dangerous subcommand is not fully permitted.
+        assert!(!u.can_execute_command("config"));
+        assert!(!u.all_commands);
+
+        // +@read grants reads only.
+        let u = user_with(&["+@read"]).unwrap();
+        assert!(u.can_execute_command("get"));
+        assert!(u.can_execute_command("zrange"));
+        assert!(u.can_execute_command("memory|usage"));
+        assert!(!u.can_execute_command("set"));
+        assert!(!u.can_execute_command("json")); // mixed read/write family is @write
+        assert!(!u.can_execute_command("memory|stats"));
+
+        // Container rules cascade; subcommand rules are precise.
+        let u = user_with(&["+config", "-config|set"]).unwrap();
+        assert!(u.can_execute_command("config|get"));
+        assert!(!u.can_execute_command("config|set"));
+        let u = user_with(&["-@all", "+client|setname"]).unwrap();
+        assert!(u.can_execute_command("client|setname"));
+        assert!(!u.can_execute_command("client|kill"));
+
+        // Commands outside the table are covered only by allcommands.
+        assert!(
+            user_with(&["+@all"])
+                .unwrap()
+                .can_execute_command("not-a-command")
+        );
+        assert!(
+            !user_with(&["+@read"])
+                .unwrap()
+                .can_execute_command("not-a-command")
+        );
+
+        // reset == off resetpass resetkeys -@all
+        let u = user_with(&["on", "nopass", "+@all", "~*", "reset"]).unwrap();
+        assert!(!u.enabled && !u.nopass && !u.all_keys);
+        assert!(!u.can_execute_command("get"));
+    }
+
+    #[test]
+    fn test_acl_setuser_rejects_unknown_rules_atomically() {
+        let mut mgr = AclManager::new();
+        for (rule, msg) in [
+            ("+notacommand", "Unknown command or category name in ACL"),
+            ("+@notacategory", "Unknown command or category name in ACL"),
+            ("bogus", "Syntax error"),
+            ("-nopass", "Unknown command or category name in ACL"),
+            ("(+get ~x)", "Selectors are not supported"),
+            ("%R~x", "not supported yet"),
+            ("resetchannels", "not supported yet"),
+        ] {
+            let err = mgr
+                .set_user("u", &["on".to_string(), rule.to_string()])
+                .unwrap_err();
+            assert!(
+                err.starts_with(&format!("Error in ACL SETUSER modifier '{}': ", rule))
+                    && err.contains(msg),
+                "{rule}: {err}"
+            );
+        }
+        // A failed SETUSER neither creates nor partially modifies the user.
+        assert!(mgr.get_user("u").is_none());
+        mgr.set_user("u", &["on".to_string(), "+get".to_string()])
+            .unwrap();
+        assert!(
+            mgr.set_user("u", &["+set".to_string(), "+nope".to_string()])
+                .is_err()
+        );
+        assert!(!mgr.get_user("u").unwrap().can_execute_command("set"));
+        // A key pattern after allkeys is rejected like in Redis.
+        assert!(
+            mgr.set_user("u", &["~*".to_string(), "~foo".to_string()])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_acl_list_line_round_trips() {
+        for rules in [
+            vec!["on", "nopass", "+@all", "~*"],
+            vec![
+                "on",
+                ">pw",
+                "+@all",
+                "-@dangerous",
+                "+config|get",
+                "~a:*",
+                "~b",
+            ],
+            vec!["off", "-@all", "+@read", "-memory|usage", "+client|setname"],
+        ] {
+            let u = user_with(&rules).unwrap();
+            let line = u.to_acl_list_line();
+            let replay: Vec<&str> = line.split(' ').skip(2).collect();
+            let u2 = user_with(&replay).unwrap();
+            assert_eq!(u.commands, u2.commands, "{line}");
+            assert_eq!(u.all_commands, u2.all_commands, "{line}");
+            assert_eq!(u.allowed_key_patterns, u2.allowed_key_patterns, "{line}");
+            assert_eq!(u.password_hashes, u2.password_hashes, "{line}");
+            assert_eq!(u.enabled, u2.enabled, "{line}");
+        }
     }
 }
