@@ -194,6 +194,7 @@ fn main() {
             .store(num_shards, std::sync::atomic::Ordering::Release);
     }
 
+    rudis::aof::set_aof_load_truncated(server_config.aof_load_truncated);
     let aof_config = rudis::aof::AofConfig {
         enabled: server_config.appendonly,
         dir: server_config.dir.clone(),

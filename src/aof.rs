@@ -1937,7 +1937,34 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
     }
 }
 
+static AOF_LOAD_TRUNCATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// `aof-load-truncated`: when true (Redis default), an AOF whose last command
+/// is incomplete is truncated to the last complete command and loaded.
+pub fn set_aof_load_truncated(v: bool) {
+    AOF_LOAD_TRUNCATED.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn aof_load_truncated() -> bool {
+    AOF_LOAD_TRUNCATED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Replays an AOF into `db`, returning the number of commands applied.
+///
+/// Like Redis: an incomplete final command (e.g. a crash mid-write) is cut
+/// off and the file truncated to the last complete command when
+/// `aof-load-truncated` is on, otherwise it is an error. Any malformed
+/// command before the end of the file is always an error, so the caller can
+/// refuse to start rather than silently dropping everything after it.
 pub fn replay_aof(path: &Path, db: &mut ShardDb) -> std::io::Result<usize> {
+    replay_aof_with(path, db, aof_load_truncated())
+}
+
+pub fn replay_aof_with(
+    path: &Path,
+    db: &mut ShardDb,
+    load_truncated: bool,
+) -> std::io::Result<usize> {
     if !path.exists() {
         return Ok(0);
     }
@@ -1945,18 +1972,54 @@ pub fn replay_aof(path: &Path, db: &mut ShardDb) -> std::io::Result<usize> {
     if data.is_empty() {
         return Ok(0);
     }
+    let bad = |offset: usize, why: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "bad AOF format at offset {} of {}: {}",
+                offset,
+                data.len(),
+                why
+            ),
+        )
+    };
     let mut buf = BytesMut::from(&data[..]);
     let mut count = 0;
     let mut dummy_out = Vec::new();
     while !buf.is_empty() {
+        let offset = data.len() - buf.len();
+        // rudis only ever appends RESP arrays; anything else is corruption
+        // (the inline parser would otherwise accept garbage as a command).
+        if buf[0] != b'*' {
+            return Err(bad(offset, "expected a RESP array"));
+        }
         match crate::resp::parse_command(&mut buf) {
             Ok(Some(cmd)) => {
                 crate::connection::execute_local_command(&cmd, db, &mut dummy_out, None);
                 dummy_out.clear();
                 count += 1;
             }
-            Ok(None) => break,
-            Err(_) => break,
+            Ok(None) if buf.is_empty() => break,
+            Ok(None) => {
+                if !load_truncated {
+                    return Err(bad(
+                        offset,
+                        "truncated final command (set aof-load-truncated yes to load anyway)",
+                    ));
+                }
+                eprintln!(
+                    "!!! Warning: short read while loading the AOF file {:?}: truncating it from {} to {} bytes (last complete command).",
+                    path,
+                    data.len(),
+                    offset
+                );
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)?
+                    .set_len(offset as u64)?;
+                break;
+            }
+            Err(e) => return Err(bad(offset, &e)),
         }
     }
     Ok(count)
@@ -2558,6 +2621,62 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use std::time::Duration;
+
+    fn aof_tmp(name: &str, content: &[u8]) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("rudis-aoftail-{}-{}", std::process::id(), name));
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+
+    const SET_A: &[u8] = b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n";
+
+    #[test]
+    fn test_replay_aof_truncated_tail_is_cut_when_allowed() {
+        let mut content = SET_A.to_vec();
+        content.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1"); // crash mid-write
+        let p = aof_tmp("trunc-yes", &content);
+        let mut db = ShardDb::new(0);
+        assert_eq!(replay_aof_with(&p, &mut db, true).unwrap(), 1);
+        assert_eq!(db.table.dbsize(), 1);
+        // File now ends at the last complete command, so new appends are readable.
+        assert_eq!(std::fs::read(&p).unwrap(), SET_A);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_replay_aof_truncated_tail_is_fatal_when_disallowed() {
+        let mut content = SET_A.to_vec();
+        content.extend_from_slice(b"*3\r\n$3\r\nSET");
+        let p = aof_tmp("trunc-no", &content);
+        let mut db = ShardDb::new(0);
+        let err = replay_aof_with(&p, &mut db, false).unwrap_err();
+        assert!(err.to_string().contains("aof-load-truncated"), "{err}");
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            content,
+            "file must be untouched"
+        );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_replay_aof_mid_file_corruption_is_fatal() {
+        let mut content = SET_A.to_vec();
+        content.extend_from_slice(b"garbage\r\n");
+        content.extend_from_slice(SET_A);
+        let p = aof_tmp("corrupt", &content);
+        let mut db = ShardDb::new(0);
+        let err = replay_aof_with(&p, &mut db, true).unwrap_err();
+        assert!(
+            err.to_string().contains(&format!("offset {}", SET_A.len())),
+            "{err}"
+        );
+        // Bad multibulk header is corruption too, even with aof-load-truncated.
+        let p2 = aof_tmp("corrupt2", b"*x\r\n");
+        assert!(replay_aof_with(&p2, &mut db, true).is_err());
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&p2);
+    }
 
     #[test]
     fn test_aof_compaction_and_rewrite() {

@@ -14,6 +14,7 @@ pub struct RudisConfig {
     pub maxmemory_bytes: Option<u64>,
     pub maxmemory_policy: String,
     pub appendonly: bool,
+    pub aof_load_truncated: bool,
     pub dir: PathBuf,
     pub requirepass: Option<String>,
     pub tls_port: Option<u16>,
@@ -37,6 +38,7 @@ impl Default for RudisConfig {
             maxmemory_bytes: None,
             maxmemory_policy: "noeviction".to_string(),
             appendonly: false,
+            aof_load_truncated: true,
             dir: PathBuf::from("."),
             requirepass: None,
             tls_port: None,
@@ -122,6 +124,19 @@ impl RudisConfig {
                 "appendonly" => {
                     config.appendonly =
                         matches!(rest[0].to_lowercase().as_str(), "yes" | "true" | "1");
+                }
+                "aof-load-truncated" => {
+                    config.aof_load_truncated = match rest[0].to_lowercase().as_str() {
+                        "yes" => true,
+                        "no" => false,
+                        other => {
+                            return Err(format!(
+                                "Invalid aof-load-truncated at line {}: '{}' (expected yes|no)",
+                                line_num + 1,
+                                other
+                            ));
+                        }
+                    };
                 }
                 "dir" => {
                     // Strip quotes if present
@@ -398,6 +413,22 @@ mod tests {
         assert_eq!(cfg.port, 6379);
         assert_eq!(cfg.maxclients, 10000);
         assert!(!cfg.appendonly);
+    }
+
+    #[test]
+    fn test_parse_aof_load_truncated() {
+        assert!(RudisConfig::parse_str("").unwrap().aof_load_truncated);
+        assert!(
+            !RudisConfig::parse_str("aof-load-truncated no")
+                .unwrap()
+                .aof_load_truncated
+        );
+        assert!(
+            RudisConfig::parse_str("aof-load-truncated YES")
+                .unwrap()
+                .aof_load_truncated
+        );
+        assert!(RudisConfig::parse_str("aof-load-truncated maybe").is_err());
     }
 
     #[test]

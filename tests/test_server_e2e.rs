@@ -14724,3 +14724,90 @@ fn test_startup_refuses_unloadable_rdb_and_aof_e2e() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Starts the real binary and waits until it accepts connections.
+fn spawn_rudis_listening(args: &[&str], port: u16) -> std::process::Child {
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rudis"))
+        .args(args)
+        .env("MONOIO_FORCE_LEGACY_DRIVER", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn rudis");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        if let Some(s) = child.try_wait().unwrap() {
+            panic!("rudis exited early: {s}");
+        }
+        assert!(std::time::Instant::now() < deadline, "rudis did not start");
+        thread::sleep(Duration::from_millis(50));
+    }
+    child
+}
+
+fn shutdown_and_wait(port: u16, child: &mut std::process::Child) {
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let _ = c.write_all(b"*1\r\n$8\r\nSHUTDOWN\r\n");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("rudis did not shut down");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn test_aof_truncated_tail_is_repaired_and_later_writes_survive_e2e() {
+    let port = 16986;
+    let dir = std::env::temp_dir().join(format!("rudis-aoftail-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_s = dir.to_str().unwrap();
+    let aof = dir.join("appendonly-0.aof");
+    // A complete SET followed by a command cut off by a crash.
+    let mut content = b"*3\r\n$3\r\nSET\r\n$6\r\nbefore\r\n$1\r\n1\r\n".to_vec();
+    content.extend_from_slice(b"*3\r\n$3\r\nSET\r\n$4\r\nlost");
+    std::fs::write(&aof, &content).unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "1",
+        "--no-pin",
+        "--aof",
+        "true",
+        "--aof-dir",
+        dir_s,
+    ];
+
+    // aof-load-truncated no: refuse to start and leave the file alone.
+    let conf = dir.join("strict.conf");
+    std::fs::write(&conf, "aof-load-truncated no\n").unwrap();
+    let mut strict = args.to_vec();
+    strict.extend_from_slice(&["-c", conf.to_str().unwrap()]);
+    let (status, stderr) = run_rudis_until_exit(&strict);
+    assert_eq!(status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("aof-load-truncated"), "{stderr}");
+    assert_eq!(std::fs::read(&aof).unwrap(), content);
+
+    // Default (yes): load, cut the tail, and keep appending readable commands.
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["GET", "before"]), "$1\r\n1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SET", "after", "2"]), "+OK\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["GET", "before"]), "$1\r\n1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "after"]), "$1\r\n2\r\n");
+    assert_eq!(resp_cmd(&mut c, &["EXISTS", "lost"]), ":0\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}

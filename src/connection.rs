@@ -9131,7 +9131,7 @@ async fn execute_command(
                     let backup_dir = CONFIG_BACKUPDIRNAME.read().unwrap().clone();
                     let slaveof_cfg = CONFIG_SLAVEOF.read().unwrap().clone();
 
-                    let all_configs: [(&str, String); 41] = [
+                    let all_configs: [(&str, String); 42] = [
                         ("port", port_str),
                         (
                             "protected-mode",
@@ -9175,6 +9175,15 @@ async fn execute_command(
                         ("client-output-buffer-limit", obuf),
                         ("requirepass", pass),
                         ("appendonly", app),
+                        (
+                            "aof-load-truncated",
+                            if crate::aof::aof_load_truncated() {
+                                "yes"
+                            } else {
+                                "no"
+                            }
+                            .to_string(),
+                        ),
                         ("proto-max-bulk-len", proto_bulk),
                         ("notify-keyspace-events", notify_ev),
                         ("lazyfree-lazy-expire", lazy_exp),
@@ -9274,6 +9283,13 @@ async fn execute_command(
                                 b"-ERR CONFIG SET failed (possibly related to argument 'daemonize') - can't set immutable config\r\n",
                             );
                             return false;
+                        } else if p_str == "aof-load-truncated" {
+                            if !matches!(val_str.to_ascii_lowercase().as_str(), "yes" | "no") {
+                                out.extend_from_slice(
+                                    b"-ERR CONFIG SET failed (possibly related to argument 'aof-load-truncated') - argument must be 'yes' or 'no'\r\n",
+                                );
+                                return false;
+                            }
                         } else if p_str == "protected-mode" {
                             if !matches!(val_str.to_ascii_lowercase().as_str(), "yes" | "no") {
                                 out.extend_from_slice(
@@ -9588,6 +9604,8 @@ async fn execute_command(
                             acl.write().unwrap().set_requirepass(&val_str);
                         } else if p_str == "notify-keyspace-events" {
                             set_notify_keyspace_events_str(&val_str);
+                        } else if p_str == "aof-load-truncated" {
+                            crate::aof::set_aof_load_truncated(val_str.eq_ignore_ascii_case("yes"));
                         } else if p_str == "lazyfree-lazy-expire" {
                             let v = val_str.eq_ignore_ascii_case("yes");
                             crate::table::set_lazyfree_lazy_expire(v);
