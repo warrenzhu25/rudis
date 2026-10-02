@@ -32,6 +32,7 @@ fn start_test_server(port: u16, num_shards: usize) {
         let shard_aof_config = aof_config.clone();
         thread::Builder::new()
             .name(format!("test-resilience-shard-{}", shard_id))
+            .stack_size(rudis::server::SHARD_THREAD_STACK_SIZE)
             .spawn(move || {
                 run_shard_worker(
                     shard_id,

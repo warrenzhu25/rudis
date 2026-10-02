@@ -29,6 +29,7 @@ fn start_test_server_with_aof(port: u16, num_shards: usize, aof_config: rudis::a
         let shard_aof_config = aof_config.clone();
         thread::Builder::new()
             .name(format!("test-shard-{}", shard_id))
+            .stack_size(rudis::server::SHARD_THREAD_STACK_SIZE)
             .spawn(move || {
                 run_shard_worker(
                     shard_id,
@@ -78,6 +79,7 @@ fn start_test_server_cluster(port: u16, num_shards: usize) {
         let shard_aof_config = aof_config.clone();
         thread::Builder::new()
             .name(format!("test-cluster-shard-{}", shard_id))
+            .stack_size(rudis::server::SHARD_THREAD_STACK_SIZE)
             .spawn(move || {
                 run_shard_worker(
                     shard_id,
@@ -135,6 +137,7 @@ fn start_test_server_with_tls(port: u16, tls_port: u16, num_shards: usize) -> (V
         let shard_tls_config = Some(tls_config.clone());
         thread::Builder::new()
             .name(format!("test-tls-shard-{}", shard_id))
+            .stack_size(rudis::server::SHARD_THREAD_STACK_SIZE)
             .spawn(move || {
                 run_shard_worker(
                     shard_id,
@@ -7141,19 +7144,22 @@ fn test_graceful_shutdown_command_and_worker_exit_e2e() {
 
     for (shard_id, rx) in receivers.into_iter().enumerate() {
         let shard_senders = senders_mesh[shard_id].clone();
-        let handle = thread::spawn(move || {
-            run_shard_worker(
-                shard_id,
-                2,
-                port,
-                shard_senders,
-                rx,
-                None,
-                rudis::aof::AofConfig::default(),
-                None,
-                false,
-            );
-        });
+        let handle = thread::Builder::new()
+            .stack_size(rudis::server::SHARD_THREAD_STACK_SIZE)
+            .spawn(move || {
+                run_shard_worker(
+                    shard_id,
+                    2,
+                    port,
+                    shard_senders,
+                    rx,
+                    None,
+                    rudis::aof::AofConfig::default(),
+                    None,
+                    false,
+                );
+            })
+            .expect("Failed to spawn test shard");
         handles.push(handle);
     }
 

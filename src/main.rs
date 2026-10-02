@@ -277,6 +277,7 @@ fn main() {
 
         let handle = thread::Builder::new()
             .name(format!("rudis-shard-{}", shard_id))
+            .stack_size(rudis::server::SHARD_THREAD_STACK_SIZE)
             .spawn(move || {
                 run_shard_worker(
                     shard_id,

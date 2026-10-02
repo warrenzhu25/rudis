@@ -43,6 +43,14 @@ thread_local! {
     static ADOPTED_CLIENT_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+/// Stack size for shard worker threads.
+///
+/// Shard threads run deeply nested async state machines plus the embedded Lua
+/// VM; unoptimised (debug/coverage) builds overflow the 2 MiB std default.
+/// Every spawner of `run_shard_worker` must use this so correctness does not
+/// depend on the caller exporting `RUST_MIN_STACK`.
+pub const SHARD_THREAD_STACK_SIZE: usize = 32 * 1024 * 1024;
+
 pub fn run_shard_worker(
     shard_id: usize,
     num_shards: usize,
@@ -2251,6 +2259,20 @@ async fn accept_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_shard_thread_stack_size_supports_deep_frames() {
+        const { assert!(SHARD_THREAD_STACK_SIZE >= 16 * 1024 * 1024) };
+        // A frame far larger than the 2 MiB std default must fit.
+        let h = std::thread::Builder::new()
+            .stack_size(SHARD_THREAD_STACK_SIZE)
+            .spawn(|| {
+                let buf = [7u8; 8 * 1024 * 1024];
+                std::hint::black_box(&buf)[buf.len() - 1]
+            })
+            .expect("spawn");
+        assert_eq!(h.join().unwrap(), 7);
+    }
 
     #[monoio::test]
     async fn test_catch_unwind_async_catches_panic() {
