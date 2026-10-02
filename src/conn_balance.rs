@@ -52,9 +52,18 @@ pub fn unregister_conn(shard_id: usize) {
     if shard_id < MAX_TRACKED_SHARDS {
         // Saturating: a double-unregister must not wrap to usize::MAX and make
         // this shard look permanently idle.
-        let _ = CONN_COUNTS[shard_id].fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
-            Some(c.saturating_sub(1))
-        });
+        // Explicit CAS loop: `fetch_update` is deprecated since Rust 1.99 and
+        // its replacement `try_update` is unavailable on older toolchains.
+        let counter = &CONN_COUNTS[shard_id];
+        let mut cur = counter.load(Ordering::Relaxed);
+        while let Err(actual) = counter.compare_exchange_weak(
+            cur,
+            cur.saturating_sub(1),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            cur = actual;
+        }
     }
 }
 
