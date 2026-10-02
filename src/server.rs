@@ -488,6 +488,7 @@ pub fn run_shard_worker(
                                 if db.del(&k) {
                                     count += 1;
                                     db.delete_document_local(&String::from_utf8_lossy(&k));
+                                    crate::connection::notify_keyspace_event_sync(&cross_shard_router, crate::connection::NOTIFY_GENERIC, "del", &k);
                                     deleted_keys.push(k);
                                 }
                             }

@@ -1767,6 +1767,12 @@ impl Router {
                 for k in keys {
                     if db.del(&k) {
                         count += 1;
+                        crate::connection::notify_keyspace_event_sync(
+                            self,
+                            crate::connection::NOTIFY_GENERIC,
+                            "del",
+                            &k,
+                        );
                         crate::connection::notify_stream_or_defer(&mut db, &k);
                         deleted_keys.push(k);
                     }
@@ -1806,6 +1812,12 @@ impl Router {
                 for k in local_keys {
                     if db.del(&k) {
                         total_deleted += 1;
+                        crate::connection::notify_keyspace_event_sync(
+                            self,
+                            crate::connection::NOTIFY_GENERIC,
+                            "del",
+                            &k,
+                        );
                         crate::connection::notify_stream_or_defer(&mut db, &k);
                         deleted_local.push(k);
                     }
@@ -4749,6 +4761,56 @@ mod tests {
             assert!(!router.exists(k0).await);
             assert!(!router.exists(k1).await);
         });
+    }
+
+    #[test]
+    fn test_router_del_keys_publishes_del_events() {
+        let _flags = crate::connection::NOTIFY_FLAGS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (mut senders_mesh, _receivers) = crate::mailbox::create_shard_mesh(1);
+        let db0 = Rc::new(RefCell::new(ShardDb::new(9996)));
+        let pubsub = Rc::new(RefCell::new(crate::pubsub::PubSubHub::new()));
+        let router = Router::new(
+            0,
+            1,
+            9996,
+            db0.clone(),
+            senders_mesh.remove(0),
+            None,
+            pubsub.clone(),
+            std::env::temp_dir(),
+        );
+        let (tx, rx) = flume::unbounded();
+        pubsub
+            .borrow_mut()
+            .psubscribe(1, Bytes::from_static(b"__keyevent@0__:del"), tx, false);
+        db0.borrow_mut()
+            .set(Bytes::from("d1"), Bytes::from("v"), None);
+        db0.borrow_mut()
+            .set(Bytes::from("d2"), Bytes::from("v"), None);
+        let prev = crate::connection::get_notify_keyspace_events_str();
+        crate::connection::set_notify_keyspace_events_str("KEA");
+
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        let deleted = rt.block_on(router.del_keys(vec![
+            Bytes::from("d1"),
+            Bytes::from("missing"),
+            Bytes::from("d2"),
+        ]));
+        crate::connection::set_notify_keyspace_events_str(&prev);
+
+        assert_eq!(deleted, 2);
+        let frames: Vec<String> = rx
+            .try_iter()
+            .map(|f| String::from_utf8_lossy(&f).to_string())
+            .collect();
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        assert!(frames[0].ends_with("\r\nd1\r\n"), "{frames:?}");
+        assert!(frames[1].ends_with("\r\nd2\r\n"), "{frames:?}");
     }
 
     #[test]

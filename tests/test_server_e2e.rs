@@ -15972,3 +15972,20 @@ fn test_string_commands_emit_keyspace_events_e2e() {
     assert_eq!(got, want);
     shutdown_and_wait(port, &mut child);
 }
+
+#[test]
+fn test_multi_key_del_emits_del_per_key_e2e() {
+    let port = 16968;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "4", "--no-pin"], port);
+    let keys: Vec<String> = (0..8).map(|i| format!("mdel:{i}")).collect();
+    let setup: Vec<Vec<&str>> = keys.iter().map(|k| vec!["SET", k.as_str(), "v"]).collect();
+    let setup_refs: Vec<&[&str]> = setup.iter().map(|c| c.as_slice()).collect();
+    let mut del = vec!["DEL"];
+    del.extend(keys.iter().map(|k| k.as_str()));
+    del.push("mdel:missing");
+    let got = keyevents_for(port, &setup_refs, &[&del]);
+    let want: Vec<(&str, &str)> = keys.iter().map(|k| ("del", k.as_str())).collect();
+    assert_eq!(got, sorted_events(&want));
+    shutdown_and_wait(port, &mut child);
+}
