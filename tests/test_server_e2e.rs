@@ -4498,8 +4498,8 @@ fn test_geospatial_engine_e2e() {
     // 4. GEOHASH
     let hash_resp = send_and_read(&mut stream, b"GEOHASH sicily Palermo Catania\r\n");
     assert!(hash_resp.starts_with("*2\r\n"));
-    assert!(hash_resp.contains("$11\r\ntc1q585vb58"));
-    assert!(hash_resp.contains("$11\r\ntc26yj70z7h"));
+    assert!(hash_resp.contains("$11\r\nsqc8b49rny0"));
+    assert!(hash_resp.contains("$11\r\nsqdtr74hyu0"));
 
     // 5. GEORADIUS with WITHDIST and WITHCOORD
     let rad_resp = send_and_read(
