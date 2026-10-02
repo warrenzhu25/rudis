@@ -18,6 +18,10 @@ struct Args {
     #[arg(short, long)]
     port: Option<u16>,
 
+    /// Interfaces to listen on, Redis `bind` syntax (e.g. "127.0.0.1 -::1"; default "* -::*")
+    #[arg(long)]
+    bind: Option<String>,
+
     /// Number of worker threads / shards (defaults to number of CPU cores)
     #[arg(short, long)]
     threads: Option<usize>,
@@ -125,7 +129,17 @@ fn main() {
         cluster_opt,
     );
 
+    if let Some(b) = args.bind {
+        server_config.bind = b;
+    }
+
     let port = server_config.port;
+    let bind_addrs = rudis::netsec::parse_bind_spec(&server_config.bind).unwrap_or_else(|e| {
+        eprintln!("FATAL CONFIG: {}", e);
+        std::process::exit(1);
+    });
+    let bind_display = rudis::netsec::format_bind_spec(&bind_addrs);
+    rudis::netsec::set_bind_addrs(port, bind_addrs);
     if let Some(bytes) = server_config.maxmemory_bytes {
         rudis::tiering::set_max_memory(port, bytes);
     }
@@ -207,9 +221,12 @@ fn main() {
     println!("  rudis v0.1.0 (Redis in Rust)");
     println!("  Architecture: Multi-threaded Shared-Nothing (Thread-per-Core)");
     println!("  I/O Backend:  Linux io_uring (Monoio)");
-    println!("  Listening:    0.0.0.0:{}", port);
+    println!("  Listening:    port {} (bind {})", port, bind_display);
     if let Some(ref tls_cfg) = tls_config {
-        println!("  TLS Port:     0.0.0.0:{}", tls_cfg.tls_port);
+        println!(
+            "  TLS Port:     {} (bind {})",
+            tls_cfg.tls_port, bind_display
+        );
     }
     println!(
         "  Shards:       {} worker threads (pinned to CPU cores)",

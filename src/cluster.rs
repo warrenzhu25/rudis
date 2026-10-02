@@ -1536,37 +1536,25 @@ pub fn start_cluster_bus(port: u16) {
     std::thread::Builder::new()
         .name(format!("cluster-bus-{}", cport))
         .spawn(move || {
-            let socket = match socket2::Socket::new(
-                socket2::Domain::IPV4,
-                socket2::Type::STREAM,
-                Some(socket2::Protocol::TCP),
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("[ClusterBus {}] Socket create error: {}", cport, e);
-                    return;
-                }
-            };
-            let _ = socket.set_reuse_address(true);
-            let _ = socket.set_reuse_port(true);
-            let _ = socket.set_nonblocking(true);
-            let bind_addr: SocketAddr = format!("0.0.0.0:{}", cport).parse().unwrap();
-            if let Err(e) = socket.bind(&bind_addr.into()) {
-                eprintln!("[ClusterBus {}] Socket bind error: {}", cport, e);
-                return;
-            }
-            if let Err(e) = socket.listen(128) {
-                eprintln!("[ClusterBus {}] Socket listen error: {}", cport, e);
-                return;
-            }
-            let listener: TcpListener = socket.into();
+            // Same interfaces as the client port (`bind`), never a blanket 0.0.0.0.
+            let listeners: Vec<TcpListener> =
+                match crate::netsec::bind_all(&crate::netsec::bind_addrs(port), cport, 128) {
+                    Ok(v) => v.into_iter().map(|(_, l)| l).collect(),
+                    Err(e) => {
+                        eprintln!("[ClusterBus {}] {}", cport, e);
+                        return;
+                    }
+                };
 
             let mut last_tick = std::time::Instant::now();
 
             while cancel_rx.is_empty() {
                 // 1. Accept new cluster bus connections
-                match listener.accept() {
-                    Ok((stream, _)) => {
+                let mut accepted_any = false;
+                for listener in &listeners {
+                    if let Ok((stream, _)) = listener.accept() {
+                        accepted_any = true;
+                        let _ = stream.set_nonblocking(false);
                         let hub_for_conn = hub_clone.clone();
                         std::thread::spawn(move || {
                             let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
@@ -1574,12 +1562,9 @@ pub fn start_cluster_bus(port: u16) {
                             handle_cluster_bus_conn(stream, &hub_for_conn);
                         });
                     }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                    Err(_) => {
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
+                }
+                if !accepted_any {
+                    std::thread::sleep(Duration::from_millis(20));
                 }
 
                 // 2. Heartbeat tick every 500ms

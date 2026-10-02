@@ -16,6 +16,7 @@ pub mod hll;
 pub mod json;
 pub mod mailbox;
 pub mod mcp;
+pub mod netsec;
 pub mod probabilistic;
 pub mod pubsub;
 pub mod replication;

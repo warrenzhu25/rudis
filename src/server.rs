@@ -1,5 +1,4 @@
 use smallvec::{SmallVec, smallvec};
-use socket2::{Domain, Protocol, Socket, Type};
 use std::cell::RefCell;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -74,56 +73,30 @@ pub fn run_shard_worker(
             base_port
         };
 
-        // 1. Configure socket with SO_REUSEPORT and SO_REUSEADDR
-        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-            .expect("Failed to create socket");
-        socket
-            .set_reuse_port(true)
-            .expect("Failed to set SO_REUSEPORT");
-        socket
-            .set_reuse_address(true)
-            .expect("Failed to set SO_REUSEADDR");
-        socket
-            .set_nonblocking(true)
-            .expect("Failed to set non-blocking");
-        let _ = socket.set_recv_buffer_size(512 * 1024);
-        let _ = socket.set_send_buffer_size(512 * 1024);
+        // 1. One SO_REUSEPORT listener per configured `bind` address.
+        let bind_addrs = crate::netsec::bind_addrs(base_port);
+        let bound = crate::netsec::bind_all(&bind_addrs, shard_port, 4096)
+            .unwrap_or_else(|e| panic!("[Shard {}] {}", shard_id, e));
+        let listen_addrs: Vec<SocketAddr> = bound.iter().map(|(a, _)| *a).collect();
+        let listeners: Vec<monoio::net::TcpListener> = bound
+            .into_iter()
+            .map(|(_, l)| {
+                monoio::net::TcpListener::from_std(l)
+                    .expect("Failed to convert socket into Monoio TcpListener")
+            })
+            .collect();
 
-        let addr: SocketAddr = format!("0.0.0.0:{}", shard_port)
-            .parse()
-            .expect("Invalid address");
-        socket.bind(&addr.into()).expect("Failed to bind socket");
-        socket.listen(4096).expect("Failed to listen on socket");
-
-        let listener = monoio::net::TcpListener::from_std(socket.into())
-            .expect("Failed to convert socket into Monoio TcpListener");
-
-        let tls_listener = if let Some(ref tls_cfg) = tls_config {
-            let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-                .expect("Failed to create TLS socket");
-            socket
-                .set_reuse_port(true)
-                .expect("Failed to set SO_REUSEPORT on TLS socket");
-            socket
-                .set_reuse_address(true)
-                .expect("Failed to set SO_REUSEADDR on TLS socket");
-            socket
-                .set_nonblocking(true)
-                .expect("Failed to set non-blocking on TLS socket");
-            let _ = socket.set_recv_buffer_size(512 * 1024);
-            let _ = socket.set_send_buffer_size(512 * 1024);
-
-            let addr: SocketAddr = format!("0.0.0.0:{}", tls_cfg.tls_port)
-                .parse()
-                .expect("Invalid TLS address");
-            socket.bind(&addr.into()).expect("Failed to bind TLS socket");
-            socket.listen(4096).expect("Failed to listen on TLS socket");
-
-            let listener = monoio::net::TcpListener::from_std(socket.into())
-                .expect("Failed to convert TLS socket into Monoio TcpListener");
-            Some(listener)
+        let tls_listeners: Vec<monoio::net::TcpListener> = if let Some(ref tls_cfg) = tls_config {
+            crate::netsec::bind_all(&bind_addrs, tls_cfg.tls_port, 4096)
+                .unwrap_or_else(|e| panic!("[Shard {}] TLS: {}", shard_id, e))
+                .into_iter()
+                .map(|(_, l)| {
+                    monoio::net::TcpListener::from_std(l)
+                        .expect("Failed to convert TLS socket into Monoio TcpListener")
+                })
+                .collect()
         } else {
-            None
+            Vec::new()
         };
 
         // 2. Pure thread-local Shard DB (no Mutex, no Arc)
@@ -202,8 +175,8 @@ pub fn run_shard_worker(
             None
         };
 
-        // 4. Background Cluster Bus & Gossip Engine (on Shard 0)
-        if shard_id == 0 {
+        // 4. Background Cluster Bus & Gossip Engine (on Shard 0), cluster mode only.
+        if shard_id == 0 && cluster_enabled {
             crate::cluster::start_cluster_bus(port);
         }
 
@@ -2019,17 +1992,28 @@ pub fn run_shard_worker(
 
         println!(
             "[Shard {}/{}] Worker started and listening on {} via io_uring",
-            shard_id, num_shards, addr
+            shard_id,
+            num_shards,
+            listen_addrs
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
 
         // 4.9 Spawn TLS Accept loop if enabled
-        if let Some(tls_listener) = tls_listener
+        if !tls_listeners.is_empty()
             && let Some(tls_cfg) = tls_config
         {
+            let next_tls_client_id = Rc::new(std::cell::Cell::new(
+                ((shard_id as u64) << 48) | 0x8000_0000_0000,
+            ));
+            for tls_listener in tls_listeners {
             let r = router.clone();
             let reg = client_registry.clone();
+            let tls_cfg = tls_cfg.clone();
+            let next_tls_client_id = next_tls_client_id.clone();
             monoio::spawn(async move {
-                let mut next_tls_client_id: u64 = ((shard_id as u64) << 48) | 0x8000_0000_0000;
                 loop {
                     if crate::shutdown::is_shutting_down() {
                         break;
@@ -2046,8 +2030,8 @@ pub fn run_shard_worker(
                     match accept_res {
                         Ok((mut stream, client_addr)) => {
                             let _ = stream.set_nodelay(true);
-                            let client_id = next_tls_client_id;
-                            next_tls_client_id += 1;
+                            let client_id = next_tls_client_id.get();
+                            next_tls_client_id.set(client_id + 1);
                             let router_clone = r.clone();
                             let reg_clone = reg.clone();
                             let s_cfg = tls_cfg.server_config.clone();
@@ -2087,108 +2071,34 @@ pub fn run_shard_worker(
                     }
                 }
             });
-        }
-
-        // 5. Accept loop
-        let mut next_client_id: u64 = ((shard_id as u64) << 48) + 1;
-        loop {
-            if crate::shutdown::is_shutting_down() {
-                break;
-            }
-            let accept_res = match monoio::time::timeout(
-                std::time::Duration::from_millis(200),
-                listener.accept(),
-            )
-            .await
-            {
-                Ok(res) => res,
-                Err(_) => continue,
-            };
-            match accept_res {
-                Ok((stream, client_addr)) => {
-                    let _ = stream.set_nodelay(true);
-                    let raw_fd = std::os::unix::io::AsRawFd::as_raw_fd(&stream);
-                    unsafe {
-                        let yes: libc::c_int = 1;
-                        libc::setsockopt(
-                            raw_fd,
-                            libc::IPPROTO_TCP,
-                            libc::TCP_NODELAY,
-                            &yes as *const _ as *const libc::c_void,
-                            std::mem::size_of_val(&yes) as libc::socklen_t,
-                        );
-                        libc::setsockopt(
-                            raw_fd,
-                            libc::IPPROTO_TCP,
-                            libc::TCP_QUICKACK,
-                            &yes as *const _ as *const libc::c_void,
-                            std::mem::size_of_val(&yes) as libc::socklen_t,
-                        );
-                    }
-                    let r = router.clone();
-                    let client_id = next_client_id;
-                    next_client_id += 1;
-                    let reg = client_registry.clone();
-
-                    // SO_REUSEPORT picked this shard by hashing the 4-tuple,
-                    // which is badly uneven (see crate::conn_balance). If we
-                    // already hold more connections than the least loaded
-                    // shard, hand this one over instead of compounding the
-                    // imbalance.
-                    //
-                    // Cluster mode is exempt: there each shard binds its own
-                    // port (base_port + shard_id) and the client picks the
-                    // shard on purpose to reach the slots it owns. Moving the
-                    // connection elsewhere would answer from the wrong shard
-                    // and break MOVED redirection. It also has nothing to fix,
-                    // since the distribution is client-chosen, not hashed.
-                    let owner = if cluster_enabled {
-                        crate::conn_balance::register_conn(shard_id);
-                        shard_id
-                    } else {
-                        crate::conn_balance::claim_owner(shard_id, num_shards)
-                    };
-                    if owner != shard_id {
-                        // claim_owner already reserved the target's slot, so
-                        // the target must not register again on arrival; it
-                        // only unregisters when the connection ends.
-                        //
-                        // Release the fd without closing it; the target shard
-                        // adopts it. into_raw_fd consumes the stream so no Drop
-                        // runs and the fd stays valid.
-                        let fd = std::os::unix::io::IntoRawFd::into_raw_fd(stream);
-                        let handed = router.senders[owner]
-                            .send(ShardMessage::AdoptConnection {
-                                fd,
-                                peer: client_addr,
-                            })
-                            .is_ok();
-                        if !handed {
-                            // Target mailbox is gone; we still own the fd, so
-                            // close it rather than leak it, and give back the
-                            // slot that was reserved for it.
-                            crate::conn_balance::unregister_conn(owner);
-                            unsafe { libc::close(fd) };
-                        }
-                    } else {
-                        monoio::spawn(async move {
-                            let res = catch_unwind_async(async move {
-                                handle_connection(stream, client_addr, client_id, reg, r).await;
-                            })
-                            .await;
-                            crate::conn_balance::unregister_conn(shard_id);
-                            if let Err(e) = res {
-                                crate::connection::inc_isolated_panics();
-                                tracing::error!(client_id = client_id, "Panic isolated in client connection: {:?}", e);
-                            }
-                        });
-                    }
-                }
-                Err(e) => {
-                    eprintln!("[Shard {}] Accept error: {}", shard_id, e);
-                }
             }
         }
+
+        // 5. Accept loops: one per bound address, sharing the client id sequence.
+        let next_client_id = Rc::new(std::cell::Cell::new(((shard_id as u64) << 48) + 1));
+        let mut listeners = listeners.into_iter();
+        let primary = listeners.next().expect("bind_all returns at least one listener");
+        for extra in listeners {
+            monoio::spawn(accept_loop(
+                extra,
+                next_client_id.clone(),
+                router.clone(),
+                client_registry.clone(),
+                shard_id,
+                num_shards,
+                cluster_enabled,
+            ));
+        }
+        accept_loop(
+            primary,
+            next_client_id,
+            router.clone(),
+            client_registry.clone(),
+            shard_id,
+            num_shards,
+            cluster_enabled,
+        )
+        .await;
 
         // 6. Graceful shutdown cleanup: sync AOF and notify
         if let Some(aof) = aof_writer {
@@ -2209,6 +2119,118 @@ pub fn run_shard_worker(
             }
         }
     });
+}
+
+/// Accepts plain-TCP clients on one listener until shutdown.
+async fn accept_loop(
+    listener: monoio::net::TcpListener,
+    next_client_id: Rc<std::cell::Cell<u64>>,
+    router: Rc<Router>,
+    client_registry: Rc<RefCell<hashbrown::HashMap<u64, crate::connection::ClientInfo>>>,
+    shard_id: usize,
+    num_shards: usize,
+    cluster_enabled: bool,
+) {
+    loop {
+        if crate::shutdown::is_shutting_down() {
+            break;
+        }
+        let accept_res =
+            match monoio::time::timeout(std::time::Duration::from_millis(200), listener.accept())
+                .await
+            {
+                Ok(res) => res,
+                Err(_) => continue,
+            };
+        match accept_res {
+            Ok((stream, client_addr)) => {
+                let _ = stream.set_nodelay(true);
+                let raw_fd = std::os::unix::io::AsRawFd::as_raw_fd(&stream);
+                unsafe {
+                    let yes: libc::c_int = 1;
+                    libc::setsockopt(
+                        raw_fd,
+                        libc::IPPROTO_TCP,
+                        libc::TCP_NODELAY,
+                        &yes as *const _ as *const libc::c_void,
+                        std::mem::size_of_val(&yes) as libc::socklen_t,
+                    );
+                    libc::setsockopt(
+                        raw_fd,
+                        libc::IPPROTO_TCP,
+                        libc::TCP_QUICKACK,
+                        &yes as *const _ as *const libc::c_void,
+                        std::mem::size_of_val(&yes) as libc::socklen_t,
+                    );
+                }
+                let r = router.clone();
+                let client_id = next_client_id.get();
+                next_client_id.set(client_id + 1);
+                let reg = client_registry.clone();
+
+                // SO_REUSEPORT picked this shard by hashing the 4-tuple,
+                // which is badly uneven (see crate::conn_balance). If we
+                // already hold more connections than the least loaded
+                // shard, hand this one over instead of compounding the
+                // imbalance.
+                //
+                // Cluster mode is exempt: there each shard binds its own
+                // port (base_port + shard_id) and the client picks the
+                // shard on purpose to reach the slots it owns. Moving the
+                // connection elsewhere would answer from the wrong shard
+                // and break MOVED redirection. It also has nothing to fix,
+                // since the distribution is client-chosen, not hashed.
+                let owner = if cluster_enabled {
+                    crate::conn_balance::register_conn(shard_id);
+                    shard_id
+                } else {
+                    crate::conn_balance::claim_owner(shard_id, num_shards)
+                };
+                if owner != shard_id {
+                    // claim_owner already reserved the target's slot, so
+                    // the target must not register again on arrival; it
+                    // only unregisters when the connection ends.
+                    //
+                    // Release the fd without closing it; the target shard
+                    // adopts it. into_raw_fd consumes the stream so no Drop
+                    // runs and the fd stays valid.
+                    let fd = std::os::unix::io::IntoRawFd::into_raw_fd(stream);
+                    let handed = router.senders[owner]
+                        .send(ShardMessage::AdoptConnection {
+                            fd,
+                            peer: client_addr,
+                        })
+                        .is_ok();
+                    if !handed {
+                        // Target mailbox is gone; we still own the fd, so
+                        // close it rather than leak it, and give back the
+                        // slot that was reserved for it.
+                        crate::conn_balance::unregister_conn(owner);
+                        unsafe { libc::close(fd) };
+                    }
+                } else {
+                    monoio::spawn(async move {
+                        let res = catch_unwind_async(async move {
+                            handle_connection(stream, client_addr, client_id, reg, r).await;
+                        })
+                        .await;
+                        crate::conn_balance::unregister_conn(shard_id);
+                        if let Err(e) = res {
+                            crate::connection::inc_isolated_panics();
+                            tracing::error!(
+                                client_id = client_id,
+                                "Panic isolated in client connection: {:?}",
+                                e
+                            );
+                        }
+                    });
+                }
+            }
+            Err(e) => {
+                eprintln!("[Shard {}] Accept error: {}", shard_id, e);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

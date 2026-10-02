@@ -219,7 +219,7 @@ The binary is `rudis`. Its real command-line flags (from `src/main.rs`, via `cla
 ```
 
 > Only the flags listed in [Configuration](#configuration) below actually exist. There is
-> **no** `--bind`, `--dbfilename`, `--requirepass`, `--maxmemory`-as-a-plain-flag beyond what
+> **no** `--dbfilename`, `--requirepass`, `--maxmemory`-as-a-plain-flag beyond what
 > is listed, `--cache_mode`, `--tiered_prefix`, or `--memcached_port` flag — those either do
 > not exist in the source at all, or are config-file-only directives (see below).
 
@@ -265,7 +265,7 @@ lists only directives and flags verified against [`src/config.rs`](src/config.rs
 
 | Directive | Meaning | Default |
 | :--- | :--- | :--- |
-| `bind <ip>` | Bind address | `127.0.0.1` |
+| `bind <addr> [<addr> ...]` | Interfaces to listen on, Redis syntax: IPv4/IPv6 addresses, `*` = all IPv4, `::*` = all IPv6, a leading `-` makes an address optional. Also applies to the TLS port and the cluster bus. Not changeable at runtime. | `* -::*` (same as Redis) |
 | `port <n>` | TCP port | `6379` |
 | `threads <n>` (alias `io-threads`) | Worker/shard count | `min(available_cores, 8)` |
 | `maxclients <n>` | Maximum concurrent client connections | `10000` |
@@ -292,9 +292,9 @@ there is no code path that reads it to schedule an automatic `BGSAVE`; only expl
 `--aof-dir <path>` (sets the *data directory*, reused for RDB too), `--maxmemory <size>`,
 `--tiered-offload-threshold <pct>`, `--tiered-upload-threshold <pct>`, `--no-pin` (disable
 core-affinity pinning), `--tls-port <n>`, `--tls-cert-file <path>`, `--tls-key-file <path>`,
-`--cluster-enabled <yes|no|true|1>`.
+`--cluster-enabled <yes|no|true|1>`, `--bind <addrs>`.
 
-There is no CLI equivalent for `bind` or `requirepass` — set those in the config file.
+There is no CLI equivalent for `requirepass` — set it in the config file.
 
 ### Example: `rudis.conf` (shipped in the repository root)
 

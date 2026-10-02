@@ -8939,8 +8939,6 @@ async fn execute_command(
                 });
             static CONFIG_MAXMEMORY_CLIENTS: std::sync::LazyLock<std::sync::RwLock<String>> =
                 std::sync::LazyLock::new(|| std::sync::RwLock::new("0".to_string()));
-            static CONFIG_BIND: std::sync::LazyLock<std::sync::RwLock<String>> =
-                std::sync::LazyLock::new(|| std::sync::RwLock::new("127.0.0.1".to_string()));
             static CONFIG_BACKUPDIRNAME: std::sync::LazyLock<std::sync::RwLock<String>> =
                 std::sync::LazyLock::new(|| std::sync::RwLock::new("backup".to_string()));
             static CONFIG_SLAVEOF: std::sync::LazyLock<std::sync::RwLock<String>> =
@@ -9033,7 +9031,9 @@ async fn execute_command(
                     let oom_adj_vals = CONFIG_OOM_SCORE_ADJ_VALUES.read().unwrap().clone();
                     let save_cfg = CONFIG_SAVE.read().unwrap().clone();
                     let maxmem_clients = CONFIG_MAXMEMORY_CLIENTS.read().unwrap().clone();
-                    let bind_cfg = CONFIG_BIND.read().unwrap().clone();
+                    let bind_cfg = crate::netsec::format_bind_spec(&crate::netsec::bind_addrs(
+                        router.base_port,
+                    ));
                     let backup_dir = CONFIG_BACKUPDIRNAME.read().unwrap().clone();
                     let slaveof_cfg = CONFIG_SLAVEOF.read().unwrap().clone();
 
@@ -9172,6 +9172,25 @@ async fn execute_command(
                                 b"-ERR CONFIG SET failed (possibly related to argument 'daemonize') - can't set immutable config\r\n",
                             );
                             return false;
+                        } else if p_str == "bind" {
+                            // Listeners are created once per shard at startup; a
+                            // no-op SET is fine, anything else must not claim success.
+                            let current = crate::netsec::bind_addrs(router.base_port);
+                            match crate::netsec::parse_bind_spec(&val_str) {
+                                Ok(requested) if requested == current => {}
+                                Ok(_) => {
+                                    out.extend_from_slice(
+                                        b"-ERR CONFIG SET failed (possibly related to argument 'bind') - changing bind at runtime is not supported; set it in the config file and restart\r\n",
+                                    );
+                                    return false;
+                                }
+                                Err(_) => {
+                                    out.extend_from_slice(
+                                        b"-ERR CONFIG SET failed (possibly related to argument 'bind') - Failed to bind to specified addresses.\r\n",
+                                    );
+                                    return false;
+                                }
+                            }
                         } else if p_str == "maxmemory-clients" {
                             if let Some(pct_str) = val_str.strip_suffix('%') {
                                 match pct_str.parse::<i64>() {
@@ -9526,8 +9545,6 @@ async fn execute_command(
                             *CONFIG_SAVE.write().unwrap() = val_str.to_string();
                         } else if p_str == "maxmemory-clients" {
                             *CONFIG_MAXMEMORY_CLIENTS.write().unwrap() = val_str.to_string();
-                        } else if p_str == "bind" {
-                            *CONFIG_BIND.write().unwrap() = val_str.to_string();
                         } else if p_str == "backupdirname" {
                             *CONFIG_BACKUPDIRNAME.write().unwrap() = val_str.to_string();
                         } else if p_str == "slaveof" || p_str == "replicaof" {

@@ -27,7 +27,7 @@ pub struct RudisConfig {
 impl Default for RudisConfig {
     fn default() -> Self {
         Self {
-            bind: "127.0.0.1".to_string(),
+            bind: crate::netsec::DEFAULT_BIND.to_string(),
             port: 6379,
             threads: None,
             maxclients: 10000,
@@ -74,7 +74,10 @@ impl RudisConfig {
 
             match directive.as_str() {
                 "bind" => {
-                    config.bind = rest.join(" ");
+                    let spec = rest.join(" ");
+                    crate::netsec::parse_bind_spec(&spec)
+                        .map_err(|e| format!("Invalid bind at line {}: {}", line_num + 1, e))?;
+                    config.bind = spec;
                 }
                 "port" => {
                     config.port = rest[0]
@@ -425,6 +428,14 @@ mod tests {
             cfg.extra_directives.get("save").map(|s| s.as_str()),
             Some("900 1")
         );
+    }
+
+    #[test]
+    fn test_bind_default_and_validation() {
+        assert_eq!(RudisConfig::default().bind, "* -::*");
+        let cfg = RudisConfig::parse_str("bind 127.0.0.1 -::1\n").unwrap();
+        assert_eq!(cfg.bind, "127.0.0.1 -::1");
+        assert!(RudisConfig::parse_str("bind 999.1.1.1\n").is_err());
     }
 
     #[test]

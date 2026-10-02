@@ -2373,7 +2373,9 @@ fn test_cluster_gossip_and_meet_e2e() {
     let port1 = 16399;
     let port2 = 16400;
     start_test_server(port1, 2);
+    rudis::cluster::start_cluster_bus(port1);
     start_test_server(port2, 2);
+    rudis::cluster::start_cluster_bus(port2);
 
     let mut client1 = TcpStream::connect(("127.0.0.1", port1)).unwrap();
     let mut client2 = TcpStream::connect(("127.0.0.1", port2)).unwrap();
@@ -3413,8 +3415,12 @@ fn test_cluster_bus_gossip_failover_e2e() {
     let port3 = 16442;
 
     start_test_server(port1, 2);
+
+    rudis::cluster::start_cluster_bus(port1);
     start_test_server(port2, 2);
+    rudis::cluster::start_cluster_bus(port2);
     start_test_server(port3, 2);
+    rudis::cluster::start_cluster_bus(port3);
 
     let mut c1 = TcpStream::connect(format!("127.0.0.1:{}", port1)).unwrap();
     let mut c2 = TcpStream::connect(format!("127.0.0.1:{}", port2)).unwrap();
@@ -4682,8 +4688,12 @@ fn test_cluster_bus_shards_and_automated_failover_e2e() {
     let port3 = 16612;
 
     start_test_server(port1, 2);
+
+    rudis::cluster::start_cluster_bus(port1);
     start_test_server(port2, 2);
+    rudis::cluster::start_cluster_bus(port2);
     start_test_server(port3, 2);
+    rudis::cluster::start_cluster_bus(port3);
 
     let mut c1 = TcpStream::connect(format!("127.0.0.1:{}", port1)).unwrap();
     let mut c2 = TcpStream::connect(format!("127.0.0.1:{}", port2)).unwrap();
@@ -5769,7 +5779,10 @@ fn test_cluster_pipelined_squashed_moved_redirect_e2e() {
     let port2 = 16661;
 
     start_test_server(port1, 2);
+
+    rudis::cluster::start_cluster_bus(port1);
     start_test_server(port2, 2);
+    rudis::cluster::start_cluster_bus(port2);
 
     let mut c1 = TcpStream::connect(format!("127.0.0.1:{}", port1)).unwrap();
     let mut c2 = TcpStream::connect(format!("127.0.0.1:{}", port2)).unwrap();
@@ -7688,8 +7701,12 @@ fn test_cluster_quorum_failure_detection_and_gossip_e2e() {
     let port3 = 16764;
 
     start_test_server(port1, 2);
+
+    rudis::cluster::start_cluster_bus(port1);
     start_test_server(port2, 2);
+    rudis::cluster::start_cluster_bus(port2);
     start_test_server(port3, 2);
+    rudis::cluster::start_cluster_bus(port3);
 
     let mut c1 = TcpStream::connect(format!("127.0.0.1:{}", port1)).unwrap();
     let mut c2 = TcpStream::connect(format!("127.0.0.1:{}", port2)).unwrap();
@@ -8109,7 +8126,9 @@ fn test_cluster_setslot_live_migration_and_ask_redirection_e2e() {
     let port1 = 16771;
     let port2 = 16772;
     start_test_server(port1, 2);
+    rudis::cluster::start_cluster_bus(port1);
     start_test_server(port2, 2);
+    rudis::cluster::start_cluster_bus(port2);
 
     let mut c1 = TcpStream::connect(format!("127.0.0.1:{}", port1)).unwrap();
     let mut c2 = TcpStream::connect(format!("127.0.0.1:{}", port2)).unwrap();
@@ -8630,7 +8649,9 @@ fn test_cluster_check_and_rebalance_live_migration_e2e() {
     let port1 = 16776;
     let port2 = 16777;
     start_test_server(port1, 2);
+    rudis::cluster::start_cluster_bus(port1);
     start_test_server(port2, 2);
+    rudis::cluster::start_cluster_bus(port2);
 
     let mut c1 = TcpStream::connect(format!("127.0.0.1:{}", port1)).unwrap();
     let mut c2 = TcpStream::connect(format!("127.0.0.1:{}", port2)).unwrap();
@@ -14029,4 +14050,45 @@ fn test_bzmpop_bzpopmin_zmpop_sort_unwatch_zrangebylex_e2e() {
 
     let bzmpop_empty = send_and_read(&mut client, b"BZMPOP 0.02 1 {empty_bzmpop} MIN COUNT 1\r\n");
     assert_eq!(bzmpop_empty, "*-1\r\n");
+}
+
+/// Sends one RESP-encoded command and returns the raw reply.
+fn resp_cmd(stream: &mut TcpStream, args: &[&str]) -> String {
+    let mut out = format!("*{}\r\n", args.len());
+    for a in args {
+        out.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+    }
+    send_and_read(stream, out.as_bytes())
+}
+
+#[test]
+fn test_bind_restricts_interfaces_and_standalone_has_no_cluster_bus_e2e() {
+    let port = 16991;
+    rudis::netsec::set_bind_addrs(port, rudis::netsec::parse_bind_spec("127.0.0.1").unwrap());
+    start_test_server(port, 2);
+
+    let mut c = TcpStream::connect(("127.0.0.1", port)).expect("bound address reachable");
+    let bind = resp_cmd(&mut c, &["CONFIG", "GET", "bind"]);
+    assert!(bind.contains("127.0.0.1"), "CONFIG GET bind: {}", bind);
+
+    // 127.0.0.2 routes to loopback on Linux but is not a bound address.
+    assert!(
+        TcpStream::connect(("127.0.0.2", port)).is_err(),
+        "server must not listen beyond its bind addresses"
+    );
+    // Standalone mode must not open the cluster bus.
+    assert!(
+        TcpStream::connect(("127.0.0.1", port + 10000)).is_err(),
+        "cluster bus must stay closed when cluster mode is disabled"
+    );
+
+    // Runtime rebinding is refused rather than silently accepted.
+    let r = resp_cmd(&mut c, &["CONFIG", "SET", "bind", "0.0.0.0"]);
+    assert!(r.starts_with("-ERR CONFIG SET failed"), "{}", r);
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "bind", "127.0.0.1"]),
+        "+OK\r\n"
+    );
+    let r = resp_cmd(&mut c, &["CONFIG", "SET", "bind", "999.1.1.1"]);
+    assert!(r.contains("Failed to bind"), "{}", r);
 }
