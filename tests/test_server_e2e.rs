@@ -3832,8 +3832,10 @@ fn test_auto_tiering_memory_pressure_e2e() {
         .parse()
         .unwrap();
 
-    // Set maxmemory just slightly above current used memory (+500 bytes)
-    let limit = cur_used + 500;
+    // Set maxmemory a little above current usage. Tiered keys still keep their
+    // key and pointer in RAM, so leave room for that metadata while the values
+    // (10 x 1000 bytes) far exceed the headroom and must be spilled to NVMe.
+    let limit = cur_used + 4096;
     assert_eq!(
         send_and_read(
             &mut client,
@@ -3844,7 +3846,7 @@ fn test_auto_tiering_memory_pressure_e2e() {
 
     // Insert multiple keys that will exceed the threshold
     for i in 0..10 {
-        let val = "Z".repeat(200);
+        let val = "Z".repeat(1000);
         let resp = send_and_read(
             &mut client,
             format!("SET autotier:{} {}\r\n", i, val).as_bytes(),
@@ -3860,7 +3862,7 @@ fn test_auto_tiering_memory_pressure_e2e() {
 
     // Verify all keys remain accessible and return correct data
     for i in 0..10 {
-        let expected = "Z".repeat(200);
+        let expected = "Z".repeat(1000);
         let resp = send_and_read(&mut client, format!("GET autotier:{}\r\n", i).as_bytes());
         assert_eq!(resp, format!("${}\r\n{}\r\n", expected.len(), expected));
     }

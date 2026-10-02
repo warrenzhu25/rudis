@@ -7702,7 +7702,9 @@ async fn execute_command(
         } else if cmd.is_write_command() && !cmd.allows_oom() {
             let used = router.local_db.borrow().table.used_memory;
             let shard_max = (max_mem / router.num_shards.max(1) as u64) as usize;
-            if used > shard_max {
+            // noeviction never deletes data, but values may still be offloaded
+            // to the NVMe tier; only reject if that cannot make room.
+            if used > shard_max && !router.check_auto_tier().await {
                 let c_name = get_cmd_name(&cmd);
                 record_rejected_stat(c_name);
                 record_error_stat("OOM", Some(c_name));

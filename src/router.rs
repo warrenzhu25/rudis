@@ -657,39 +657,39 @@ impl Router {
         used_mem >= (shard_threshold * offload_pct as usize) / 100
     }
 
-    pub async fn check_auto_tier(&self) {
-        if self.is_auto_tiering.get() {
-            return;
+    /// Decommit cooled keys, then spill hot keys to NVMe until this shard is
+    /// back under its share of `maxmemory`. Returns whether the shard ended
+    /// under its share (also `true` when no limit is set).
+    pub async fn check_auto_tier(&self) -> bool {
+        let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed);
+        if max_mem == 0 {
+            return true;
+        }
+        let shard_max_mem = (max_mem / self.num_shards.max(1) as u64).max(1) as usize;
+        let under = || self.local_db.borrow().table.used_memory <= shard_max_mem;
+        if self.is_auto_tiering.get() || under() {
+            return under();
         }
         self.is_auto_tiering.set(true);
 
-        let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed);
-        if max_mem == 0 {
-            self.is_auto_tiering.set(false);
-            return;
-        }
-        let shard_max_mem = (max_mem / self.num_shards.max(1) as u64).max(1) as usize;
-
-        let used = self.local_db.borrow().table.used_memory;
-        if used <= shard_max_mem {
-            self.is_auto_tiering.set(false);
-            return;
-        }
-
         // Phase 1: Instant Zero-I/O Decommit of all Cooled keys
         let decommitted = self.decommit_local(None);
-        if decommitted > 0 {
-            let used_after = self.local_db.borrow().table.used_memory;
-            if used_after <= shard_max_mem {
-                self.is_auto_tiering.set(false);
-                return;
-            }
+        if decommitted > 0 && under() {
+            self.is_auto_tiering.set(false);
+            return true;
         }
 
-        // Phase 2: Spill Hot keys to NVMe disk in 64-key slices until under target_mem
+        // Phase 2: Spill Hot keys to NVMe disk in 64-key slices until under target_mem.
+        // Stop once a full pass over the table spills nothing, otherwise a shard
+        // whose keys cannot be spilled would spin here forever.
         let target_mem = shard_max_mem.saturating_sub((shard_max_mem / 20).max(128 * 1024));
+        let mut fruitless = 0usize;
         loop {
             if self.local_db.borrow().table.used_memory <= target_mem {
+                break;
+            }
+            let pass_len = self.local_db.borrow_mut().table.dbsize().max(1);
+            if fruitless >= pass_len {
                 break;
             }
             let hot_keys = self.local_db.borrow_mut().table.get_hot_keys_for_spill(64);
@@ -697,7 +697,11 @@ impl Router {
                 break;
             }
             for k in hot_keys {
-                let _ = self.spill_local_internal(&k, false).await;
+                if self.spill_local_internal(&k, false).await {
+                    fruitless = 0;
+                } else {
+                    fruitless += 1;
+                }
                 if self.local_db.borrow().table.used_memory <= target_mem {
                     break;
                 }
@@ -710,6 +714,7 @@ impl Router {
         }
 
         self.is_auto_tiering.set(false);
+        under()
     }
 
     pub async fn spill_key(&self, key: &[u8]) -> bool {
@@ -3516,6 +3521,84 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn single_shard_router(port: u16) -> (Router, Rc<RefCell<ShardDb>>) {
+        let db = Rc::new(RefCell::new(ShardDb::new(port)));
+        let (senders_mesh, _rx) = crate::mailbox::create_shard_mesh(1);
+        let router = Router::new(
+            0,
+            1,
+            port,
+            db.clone(),
+            senders_mesh[0].clone(),
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+        (router, db)
+    }
+
+    fn fill_and_limit(router: &Router, db: &Rc<RefCell<ShardDb>>, port: u16) -> usize {
+        let pairs = (0..64)
+            .map(|i| {
+                (
+                    Bytes::from(format!("tier_k{}", i)),
+                    Bytes::from(vec![b'v'; 4096]),
+                )
+            })
+            .collect();
+        monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(router.mset(pairs));
+        let used = db.borrow().table.used_memory;
+        // Limit below current usage but above what remains once values are offloaded.
+        let limit = used - 64 * 2048;
+        crate::tiering::set_max_memory(port, limit as u64);
+        limit
+    }
+
+    #[test]
+    fn test_check_auto_tier_terminates_when_nothing_can_spill() {
+        let port = 19871;
+        let (router, db) = single_shard_router(port);
+        fill_and_limit(&router, &db, port);
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        // No tier manager: every spill fails, so this must give up, not spin.
+        assert!(!rt.block_on(router.check_auto_tier()));
+        assert!(!router.is_auto_tiering.get());
+        crate::tiering::set_max_memory(port, 0);
+    }
+
+    #[test]
+    fn test_check_auto_tier_spills_under_limit() {
+        let port = 19872;
+        let (router, db) = single_shard_router(port);
+        let limit = fill_and_limit(&router, &db, port);
+        let dir = std::env::temp_dir().join(format!("rudis-autotier-{}", std::process::id()));
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let tm = crate::tiering::ShardTierManager::open(0, port, &dir)
+                .await
+                .unwrap();
+            db.borrow_mut().tier_manager = Some(Rc::new(tm));
+            assert!(router.check_auto_tier().await);
+            assert!(db.borrow().table.used_memory <= limit);
+            assert_eq!(
+                router.get(Bytes::from_static(b"tier_k0")).await,
+                Some(Bytes::from(vec![b'v'; 4096]))
+            );
+        });
+        crate::tiering::set_max_memory(port, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_router_mget_mset_fanout() {
