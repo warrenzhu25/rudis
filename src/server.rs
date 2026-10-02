@@ -2144,8 +2144,21 @@ async fn accept_loop(
             };
         match accept_res {
             Ok((stream, client_addr)) => {
-                let _ = stream.set_nodelay(true);
                 let raw_fd = std::os::unix::io::AsRawFd::as_raw_fd(&stream);
+                if crate::netsec::protected_mode_denies(router.base_port, client_addr.ip()) {
+                    let msg = crate::netsec::PROTECTED_MODE_DENIED;
+                    unsafe {
+                        libc::send(
+                            raw_fd,
+                            msg.as_ptr() as *const libc::c_void,
+                            msg.len(),
+                            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                        );
+                    }
+                    drop(stream);
+                    continue;
+                }
+                let _ = stream.set_nodelay(true);
                 unsafe {
                     let yes: libc::c_int = 1;
                     libc::setsockopt(

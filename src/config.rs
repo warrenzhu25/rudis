@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RudisConfig {
     pub bind: String,
+    pub protected_mode: bool,
     pub port: u16,
     pub threads: Option<usize>,
     pub maxclients: usize,
@@ -28,6 +29,7 @@ impl Default for RudisConfig {
     fn default() -> Self {
         Self {
             bind: crate::netsec::DEFAULT_BIND.to_string(),
+            protected_mode: true,
             port: 6379,
             threads: None,
             maxclients: 10000,
@@ -78,6 +80,19 @@ impl RudisConfig {
                     crate::netsec::parse_bind_spec(&spec)
                         .map_err(|e| format!("Invalid bind at line {}: {}", line_num + 1, e))?;
                     config.bind = spec;
+                }
+                "protected-mode" => {
+                    config.protected_mode = match rest[0].to_lowercase().as_str() {
+                        "yes" => true,
+                        "no" => false,
+                        other => {
+                            return Err(format!(
+                                "Invalid protected-mode at line {}: '{}' (expected yes|no)",
+                                line_num + 1,
+                                other
+                            ));
+                        }
+                    };
                 }
                 "port" => {
                     config.port = rest[0]
@@ -436,6 +451,22 @@ mod tests {
         let cfg = RudisConfig::parse_str("bind 127.0.0.1 -::1\n").unwrap();
         assert_eq!(cfg.bind, "127.0.0.1 -::1");
         assert!(RudisConfig::parse_str("bind 999.1.1.1\n").is_err());
+    }
+
+    #[test]
+    fn test_protected_mode_directive() {
+        assert!(RudisConfig::default().protected_mode);
+        assert!(
+            !RudisConfig::parse_str("protected-mode no\n")
+                .unwrap()
+                .protected_mode
+        );
+        assert!(
+            RudisConfig::parse_str("protected-mode yes\n")
+                .unwrap()
+                .protected_mode
+        );
+        assert!(RudisConfig::parse_str("protected-mode maybe\n").is_err());
     }
 
     #[test]

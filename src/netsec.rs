@@ -84,6 +84,49 @@ pub fn bind_addrs(port: u16) -> Vec<BindAddr> {
     parse_bind_spec(DEFAULT_BIND).expect("default bind spec is valid")
 }
 
+static PROTECTED_MODE: LazyLock<RwLock<HashMap<u16, bool>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Enables/disables protected mode for the server on base port `port`.
+pub fn set_protected_mode(port: u16, enabled: bool) {
+    PROTECTED_MODE.write().unwrap().insert(port, enabled);
+}
+
+/// Protected mode for base port `port` (Redis default: enabled).
+pub fn protected_mode(port: u16) -> bool {
+    PROTECTED_MODE
+        .read()
+        .unwrap()
+        .get(&port)
+        .copied()
+        .unwrap_or(true)
+}
+
+fn is_loopback_peer(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
+/// Redis protected mode: while enabled and the default user has no password,
+/// only loopback clients may connect.
+pub fn protected_mode_denies(port: u16, peer: IpAddr) -> bool {
+    if !protected_mode(port) || is_loopback_peer(peer) {
+        return false;
+    }
+    crate::acl::get_acl_for_port(port)
+        .read()
+        .unwrap()
+        .get_user("default")
+        .is_some_and(|u| u.nopass)
+}
+
+/// Reply sent (then the connection is closed) when protected mode refuses a client.
+pub const PROTECTED_MODE_DENIED: &[u8] = b"-DENIED Running in protected mode because protected mode is enabled and no password is set for the default user. In this mode connections are only accepted from the loopback interface. If you want to connect from external computers you may adopt one of the following solutions: 1) Just disable protected mode sending the command 'CONFIG SET protected-mode no' from the loopback interface by connecting from the same host the server is running, however MAKE SURE the server is not publicly accessible from internet if you do so. Use CONFIG REWRITE to make this change permanent. 2) Alternatively you can just disable the protected mode by editing the configuration file, and setting the protected mode option to 'no', and then restarting the server. 3) If you started the server manually just for testing, restart it with the '--protected-mode no' option. 4) Set up an authentication password for the default user. NOTE: You only need to do one of the above things in order for the server to start accepting connections from the outside.\r\n";
+
 /// Creates one non-blocking `SO_REUSEPORT` listener on `ip:port`.
 pub fn bind_reuseport_listener(
     ip: IpAddr,
@@ -185,6 +228,38 @@ mod tests {
         assert_eq!(bind_all(&opt, 0, 16).unwrap().len(), 1);
         let req = parse_bind_spec("192.0.2.123").unwrap();
         assert!(bind_all(&req, 0, 16).is_err());
+    }
+
+    #[test]
+    fn test_protected_mode_decision() {
+        let port = 65012;
+        let ext: IpAddr = "10.1.2.3".parse().unwrap();
+        // Default: protected, default user nopass -> external denied, loopback allowed.
+        assert!(protected_mode(port));
+        assert!(protected_mode_denies(port, ext));
+        assert!(!protected_mode_denies(port, "127.0.0.1".parse().unwrap()));
+        assert!(!protected_mode_denies(port, "::1".parse().unwrap()));
+        assert!(!protected_mode_denies(
+            port,
+            "::ffff:127.0.0.1".parse().unwrap()
+        ));
+        assert!(protected_mode_denies(
+            port,
+            "::ffff:10.1.2.3".parse().unwrap()
+        ));
+
+        // A default-user password lifts the restriction.
+        {
+            let acl = crate::acl::get_acl_for_port(port);
+            let mut g = acl.write().unwrap();
+            g.set_user("default", &[">s3cret".to_string()]).unwrap();
+        }
+        assert!(!protected_mode_denies(port, ext));
+
+        // So does disabling protected mode.
+        let port2 = 65013;
+        set_protected_mode(port2, false);
+        assert!(!protected_mode_denies(port2, ext));
     }
 
     #[test]

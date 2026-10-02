@@ -2435,6 +2435,12 @@ pub async fn handle_tls_connection(
     client_registry: Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
     router: Rc<Router>,
 ) {
+    if crate::netsec::protected_mode_denies(router.base_port, client_addr.ip()) {
+        let _ = session
+            .write_plaintext(&mut stream, crate::netsec::PROTECTED_MODE_DENIED)
+            .await;
+        return;
+    }
     let current_clients = ACTIVE_CLIENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let max_c = MAX_CLIENTS.load(std::sync::atomic::Ordering::Relaxed);
     if max_c > 0 && current_clients > max_c {
@@ -9037,8 +9043,16 @@ async fn execute_command(
                     let backup_dir = CONFIG_BACKUPDIRNAME.read().unwrap().clone();
                     let slaveof_cfg = CONFIG_SLAVEOF.read().unwrap().clone();
 
-                    let all_configs: [(&str, String); 40] = [
+                    let all_configs: [(&str, String); 41] = [
                         ("port", port_str),
+                        (
+                            "protected-mode",
+                            if crate::netsec::protected_mode(router.base_port) {
+                                "yes".to_string()
+                            } else {
+                                "no".to_string()
+                            },
+                        ),
                         ("daemonize", "no".to_string()),
                         ("maxmemory", max_mem),
                         ("maxmemory-samples", maxmem_samples),
@@ -9172,6 +9186,13 @@ async fn execute_command(
                                 b"-ERR CONFIG SET failed (possibly related to argument 'daemonize') - can't set immutable config\r\n",
                             );
                             return false;
+                        } else if p_str == "protected-mode" {
+                            if !matches!(val_str.to_ascii_lowercase().as_str(), "yes" | "no") {
+                                out.extend_from_slice(
+                                    b"-ERR CONFIG SET failed (possibly related to argument 'protected-mode') - argument must be 'yes' or 'no'\r\n",
+                                );
+                                return false;
+                            }
                         } else if p_str == "bind" {
                             // Listeners are created once per shard at startup; a
                             // no-op SET is fine, anything else must not claim success.
@@ -9467,6 +9488,11 @@ async fn execute_command(
                             if let Ok(n) = val_str.parse::<usize>() {
                                 set_max_clients(n);
                             }
+                        } else if p_str == "protected-mode" {
+                            crate::netsec::set_protected_mode(
+                                router.base_port,
+                                val_str.eq_ignore_ascii_case("yes"),
+                            );
                         } else if p_str == "maxmemory-policy" {
                             set_max_memory_policy(&val_str);
                         } else if p_str == "requirepass" {

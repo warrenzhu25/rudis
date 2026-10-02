@@ -266,6 +266,7 @@ lists only directives and flags verified against [`src/config.rs`](src/config.rs
 | Directive | Meaning | Default |
 | :--- | :--- | :--- |
 | `bind <addr> [<addr> ...]` | Interfaces to listen on, Redis syntax: IPv4/IPv6 addresses, `*` = all IPv4, `::*` = all IPv6, a leading `-` makes an address optional. Also applies to the TLS port and the cluster bus. Not changeable at runtime. | `* -::*` (same as Redis) |
+| `protected-mode <yes\|no>` | While the default user has no password, refuse non-loopback clients with `-DENIED` (Redis semantics). Also `--protected-mode`, `CONFIG SET protected-mode`. | `yes` |
 | `port <n>` | TCP port | `6379` |
 | `threads <n>` (alias `io-threads`) | Worker/shard count | `min(available_cores, 8)` |
 | `maxclients <n>` | Maximum concurrent client connections | `10000` |
@@ -292,7 +293,7 @@ there is no code path that reads it to schedule an automatic `BGSAVE`; only expl
 `--aof-dir <path>` (sets the *data directory*, reused for RDB too), `--maxmemory <size>`,
 `--tiered-offload-threshold <pct>`, `--tiered-upload-threshold <pct>`, `--no-pin` (disable
 core-affinity pinning), `--tls-port <n>`, `--tls-cert-file <path>`, `--tls-key-file <path>`,
-`--cluster-enabled <yes|no|true|1>`, `--bind <addrs>`.
+`--cluster-enabled <yes|no|true|1>`, `--bind <addrs>`, `--protected-mode <yes|no>`.
 
 There is no CLI equivalent for `requirepass` — set it in the config file.
 

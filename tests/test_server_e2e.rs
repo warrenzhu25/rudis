@@ -14092,3 +14092,82 @@ fn test_bind_restricts_interfaces_and_standalone_has_no_cluster_bus_e2e() {
     let r = resp_cmd(&mut c, &["CONFIG", "SET", "bind", "999.1.1.1"]);
     assert!(r.contains("Failed to bind"), "{}", r);
 }
+
+/// A local, non-loopback source address (no packets are sent), if the host has one.
+fn local_non_loopback_ip() -> Option<std::net::IpAddr> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("192.0.2.1:9").ok()?;
+    let ip = s.local_addr().ok()?.ip();
+    if ip.is_loopback() || ip.is_unspecified() {
+        None
+    } else {
+        Some(ip)
+    }
+}
+
+/// Connects from a non-loopback address, sends PING, returns everything read until EOF/timeout.
+fn external_ping(ip: std::net::IpAddr, port: u16) -> String {
+    let mut s = TcpStream::connect((ip, port)).expect("connect via external interface");
+    s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let _ = s.write_all(b"PING\r\n");
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match s.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                out.extend_from_slice(&buf[..n]);
+                if out.ends_with(b"\r\n") && !out.starts_with(b"-DENIED") {
+                    break;
+                }
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+#[test]
+fn test_protected_mode_denies_external_clients_without_password_e2e() {
+    let Some(ext_ip) = local_non_loopback_ip() else {
+        eprintln!("skipping: host has no non-loopback interface");
+        return;
+    };
+    let port = 16992;
+    start_test_server(port, 2);
+    let mut lo = TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+    // Default: protected mode on, default user has no password.
+    assert!(resp_cmd(&mut lo, &["CONFIG", "GET", "protected-mode"]).contains("yes"));
+    assert_eq!(resp_cmd(&mut lo, &["PING"]), "+PONG\r\n");
+    let r = external_ping(ext_ip, port);
+    assert!(
+        r.starts_with("-DENIED"),
+        "external client must be refused: {}",
+        r
+    );
+
+    // A default-user password lifts the restriction (client must then AUTH).
+    assert_eq!(
+        resp_cmd(&mut lo, &["CONFIG", "SET", "requirepass", "pw"]),
+        "+OK\r\n"
+    );
+    let r = external_ping(ext_ip, port);
+    assert!(r.starts_with("-NOAUTH"), "{}", r);
+
+    // Removing it re-arms protected mode.
+    assert_eq!(resp_cmd(&mut lo, &["AUTH", "pw"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut lo, &["CONFIG", "SET", "requirepass", ""]),
+        "+OK\r\n"
+    );
+    assert!(external_ping(ext_ip, port).starts_with("-DENIED"));
+
+    // Explicitly disabling protected mode admits external clients.
+    assert_eq!(
+        resp_cmd(&mut lo, &["CONFIG", "SET", "protected-mode", "no"]),
+        "+OK\r\n"
+    );
+    assert!(resp_cmd(&mut lo, &["CONFIG", "GET", "protected-mode"]).contains("no"));
+    assert_eq!(external_ping(ext_ip, port), "+PONG\r\n");
+    assert!(resp_cmd(&mut lo, &["CONFIG", "SET", "protected-mode", "maybe"]).starts_with("-ERR"));
+}

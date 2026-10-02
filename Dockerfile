@@ -49,4 +49,7 @@ USER rudis
 EXPOSE 6379 6380
 
 ENTRYPOINT ["/usr/local/bin/rudis"]
-CMD ["--port", "6379", "--aof", "true", "--aof-dir", "/var/lib/rudis"]
+# Like the official redis image: protected mode would refuse every client
+# arriving over the container network, so it is disabled here. Set a password
+# (requirepass) before publishing the port beyond a trusted network.
+CMD ["--port", "6379", "--aof", "true", "--aof-dir", "/var/lib/rudis", "--protected-mode", "no"]

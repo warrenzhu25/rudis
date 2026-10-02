@@ -22,6 +22,10 @@ struct Args {
     #[arg(long)]
     bind: Option<String>,
 
+    /// Protected mode: with no default-user password, only accept loopback clients (yes|no, default yes)
+    #[arg(long)]
+    protected_mode: Option<String>,
+
     /// Number of worker threads / shards (defaults to number of CPU cores)
     #[arg(short, long)]
     threads: Option<usize>,
@@ -140,6 +144,20 @@ fn main() {
     });
     let bind_display = rudis::netsec::format_bind_spec(&bind_addrs);
     rudis::netsec::set_bind_addrs(port, bind_addrs);
+    if let Some(pm) = args.protected_mode {
+        server_config.protected_mode = match pm.to_lowercase().as_str() {
+            "yes" => true,
+            "no" => false,
+            other => {
+                eprintln!(
+                    "FATAL CONFIG: --protected-mode expects yes|no, got '{}'",
+                    other
+                );
+                std::process::exit(1);
+            }
+        };
+    }
+    rudis::netsec::set_protected_mode(port, server_config.protected_mode);
     if let Some(bytes) = server_config.maxmemory_bytes {
         rudis::tiering::set_max_memory(port, bytes);
     }
