@@ -6274,10 +6274,13 @@ fn test_client_tracking_atomic_bypass_and_invalidation_e2e() {
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     // 5. Client 1 receives push invalidation message
+    // The push is already queued, so a single read() may return it without
+    // the PONG; drain until the PING reply arrives so later replies align.
     let mut next_resp = send_and_read(&mut client1, b"PING\r\n");
-    if !next_resp.contains("invalidate") {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        next_resp.push_str(&send_and_read(&mut client1, b"PING\r\n"));
+    while !next_resp.contains("PONG") {
+        let mut buf = [0u8; 4096];
+        let n = client1.read(&mut buf).unwrap();
+        next_resp.push_str(&String::from_utf8_lossy(&buf[..n]));
     }
     assert!(next_resp.contains("invalidate") && next_resp.contains("tracked_k1"));
 
