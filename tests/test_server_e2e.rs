@@ -14200,7 +14200,8 @@ fn test_mode_switch_commands_require_auth_and_acl_e2e() {
                 "-@all",
                 "+subscribe",
                 "+auth",
-                "~*"
+                "~*",
+                "&*"
             ]
         ),
         "+OK\r\n"
@@ -14439,4 +14440,72 @@ fn test_acl_categories_and_unknown_rules_e2e() {
     assert!(getuser.contains("-flushall"), "{}", getuser);
     assert!(getuser.contains("-config|set"), "{}", getuser);
     assert!(!getuser.contains("-get "), "{}", getuser);
+}
+
+#[test]
+fn test_acl_channel_permissions_e2e() {
+    let port = 16998;
+    start_test_server(port, 2);
+    let mut admin = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    admin
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    assert_eq!(
+        resp_cmd(
+            &mut admin,
+            &[
+                "ACL", "SETUSER", "news", "on", ">np", "+@all", "~*", "&news.*"
+            ]
+        ),
+        "+OK\r\n"
+    );
+    // Redis 7 default: new users get no channels unless granted.
+    assert_eq!(
+        resp_cmd(
+            &mut admin,
+            &["ACL", "SETUSER", "nochan", "on", ">cp", "+@all", "~*"]
+        ),
+        "+OK\r\n"
+    );
+    let getuser = resp_cmd(&mut admin, &["ACL", "GETUSER", "news"]);
+    assert!(
+        getuser.contains("$8\r\nchannels\r\n$7\r\n&news.*\r\n"),
+        "{}",
+        getuser
+    );
+    let list = resp_cmd(&mut admin, &["ACL", "LIST"]);
+    assert!(list.contains("user nochan on"), "{}", list);
+    assert!(list.contains("resetchannels"), "{}", list);
+    const DENIED: &str =
+        "-NOPERM this user has no permissions to access one of the channels used as arguments\r\n";
+
+    let mut nochan = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    nochan
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    assert_eq!(resp_cmd(&mut nochan, &["AUTH", "nochan", "cp"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut nochan, &["PUBLISH", "news.a", "m"]), DENIED);
+    assert_eq!(resp_cmd(&mut nochan, &["SUBSCRIBE", "news.a"]), DENIED);
+
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["AUTH", "news", "np"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["PUBLISH", "news.a", "m"]), ":0\r\n");
+    assert_eq!(resp_cmd(&mut c, &["PUBLISH", "sports", "m"]), DENIED);
+    assert_eq!(resp_cmd(&mut c, &["SPUBLISH", "sports", "m"]), DENIED);
+    // Pipelined (squashable) PUBLISH is checked too.
+    let r = send_and_read(
+        &mut c,
+        b"PUBLISH news.b m\r\nPUBLISH sports m\r\nPUBLISH news.c m\r\n",
+    );
+    assert_eq!(r, format!(":0\r\n{}:0\r\n", DENIED));
+    // PSUBSCRIBE needs a literal pattern match.
+    assert_eq!(resp_cmd(&mut c, &["PSUBSCRIBE", "*"]), DENIED);
+    assert_eq!(resp_cmd(&mut c, &["SUBSCRIBE", "news.a", "sports"]), DENIED);
+    let r = resp_cmd(&mut c, &["SUBSCRIBE", "news.a"]);
+    assert!(r.contains("subscribe") && r.contains("news.a"), "{}", r);
+    // Inside pub/sub mode the same rules apply.
+    assert_eq!(resp_cmd(&mut c, &["SUBSCRIBE", "sports"]), DENIED);
+    let r = resp_cmd(&mut c, &["PSUBSCRIBE", "news.*"]);
+    assert!(r.contains("psubscribe"), "{}", r);
 }

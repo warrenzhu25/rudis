@@ -140,6 +140,10 @@ pub struct AclUser {
     commands: CommandSet,
     pub all_keys: bool,
     pub allowed_key_patterns: Vec<String>,
+    /// `&*` / `allchannels`.
+    pub all_channels: bool,
+    /// `&<glob>` Pub/Sub channel patterns.
+    pub channel_patterns: Vec<String>,
 }
 
 impl AclUser {
@@ -153,10 +157,13 @@ impl AclUser {
             commands: CommandSet::full(),
             all_keys: true,
             allowed_key_patterns: Vec::new(),
+            all_channels: true,
+            channel_patterns: Vec::new(),
         }
     }
 
-    /// A newly created user: Redis starts with `off resetpass resetkeys -@all`.
+    /// A newly created user. Like Redis 7 (`acl-pubsub-default resetchannels`)
+    /// it starts as `off resetpass resetkeys resetchannels -@all`.
     fn new_empty(name: &str) -> Self {
         Self {
             name: name.to_string(),
@@ -167,6 +174,8 @@ impl AclUser {
             commands: CommandSet::empty(),
             all_keys: false,
             allowed_key_patterns: Vec::new(),
+            all_channels: false,
+            channel_patterns: Vec::new(),
         }
     }
 
@@ -243,8 +252,14 @@ impl AclUser {
                 self.commands = CommandSet::empty();
                 self.all_commands = false;
             }
-            // Every channel is currently permitted, which is exactly `&*`.
-            "allchannels" | "&*" => {}
+            "allchannels" | "&*" => {
+                self.all_channels = true;
+                self.channel_patterns.clear();
+            }
+            "resetchannels" => {
+                self.all_channels = false;
+                self.channel_patterns.clear();
+            }
             // No selectors exist, so there is nothing to clear.
             "clearselectors" => {}
             "reset" => {
@@ -286,11 +301,16 @@ impl AclUser {
             if !self.allowed_key_patterns.iter().any(|p| p == pat) {
                 self.allowed_key_patterns.push(pat.to_string());
             }
-        } else if rule.starts_with('&') || rule.eq_ignore_ascii_case("resetchannels") {
-            return Err(setuser_err(
-                rule,
-                "Pub/Sub channel restrictions are not supported yet",
-            ));
+        } else if let Some(pat) = rule.strip_prefix('&') {
+            if self.all_channels {
+                return Err(setuser_err(
+                    rule,
+                    "Adding a pattern after the * pattern (or the 'allchannels' flag) is not valid and does not have any effect. Try 'resetchannels' to start with an empty list of channels",
+                ));
+            }
+            if !self.channel_patterns.iter().any(|p| p == pat) {
+                self.channel_patterns.push(pat.to_string());
+            }
         } else if rule.starts_with('%') {
             return Err(setuser_err(
                 rule,
@@ -348,6 +368,34 @@ impl AclUser {
                 .collect::<Vec<_>>()
                 .join(" ")
         }
+    }
+
+    pub fn channels_rule_string(&self) -> String {
+        if self.all_channels {
+            "&*".to_string()
+        } else if self.channel_patterns.is_empty() {
+            "resetchannels".to_string()
+        } else {
+            self.channel_patterns
+                .iter()
+                .map(|p| format!("&{}", p))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    }
+
+    /// Redis ACLCheckChannelAgainstList: channels (PUBLISH/SUBSCRIBE) are glob
+    /// matched against the user's patterns; a PSUBSCRIBE pattern must equal
+    /// one of them literally.
+    pub fn can_access_channel(&self, channel: &[u8], is_pattern: bool) -> bool {
+        self.all_channels
+            || self.channel_patterns.iter().any(|p| {
+                if is_pattern {
+                    p.as_bytes() == channel
+                } else {
+                    crate::pubsub::glob_match(p.as_bytes(), channel)
+                }
+            })
     }
 
     pub fn can_access_key(&self, key: &[u8]) -> bool {
@@ -409,7 +457,7 @@ impl AclUser {
         } else {
             parts.push(keys);
         }
-        parts.push("&*".to_string());
+        parts.push(self.channels_rule_string());
         parts.push(self.commands_rule_string());
         parts.join(" ")
     }
@@ -760,7 +808,6 @@ mod tests {
             ("-nopass", "Unknown command or category name in ACL"),
             ("(+get ~x)", "Selectors are not supported"),
             ("%R~x", "not supported yet"),
-            ("resetchannels", "not supported yet"),
         ] {
             let err = mgr
                 .set_user("u", &["on".to_string(), rule.to_string()])
@@ -788,6 +835,34 @@ mod tests {
     }
 
     #[test]
+    fn test_acl_channel_permissions() {
+        // New users have no channel access (Redis 7 resetchannels default);
+        // the default user keeps &*.
+        let u = user_with(&["on"]).unwrap();
+        assert!(!u.can_access_channel(b"news", false));
+        assert!(AclUser::new_default().can_access_channel(b"anything", false));
+
+        let u = user_with(&["&news.*", "&alerts"]).unwrap();
+        assert!(u.can_access_channel(b"news.sport", false));
+        assert!(u.can_access_channel(b"alerts", false));
+        assert!(!u.can_access_channel(b"alerts2", false));
+        // PSUBSCRIBE patterns must match a user pattern literally.
+        assert!(u.can_access_channel(b"news.*", true));
+        assert!(!u.can_access_channel(b"news.s*", true));
+        assert!(!u.can_access_channel(b"*", true));
+        assert_eq!(u.channels_rule_string(), "&news.* &alerts");
+
+        let u = user_with(&["&a", "allchannels"]).unwrap();
+        assert!(u.all_channels && u.channel_patterns.is_empty());
+        let err = user_with(&["&*", "&x"]).unwrap_err();
+        assert!(err.contains("allchannels"), "{err}");
+        let u = user_with(&["&*", "resetchannels"]).unwrap();
+        assert_eq!(u.channels_rule_string(), "resetchannels");
+        let u = user_with(&["&*", "reset"]).unwrap();
+        assert!(!u.all_channels);
+    }
+
+    #[test]
     fn test_acl_list_line_round_trips() {
         for rules in [
             vec!["on", "nopass", "+@all", "~*"],
@@ -801,6 +876,7 @@ mod tests {
                 "~b",
             ],
             vec!["off", "-@all", "+@read", "-memory|usage", "+client|setname"],
+            vec!["on", "nopass", "+@all", "&news.*", "&alerts"],
         ] {
             let u = user_with(&rules).unwrap();
             let line = u.to_acl_list_line();
@@ -811,6 +887,8 @@ mod tests {
             assert_eq!(u.allowed_key_patterns, u2.allowed_key_patterns, "{line}");
             assert_eq!(u.password_hashes, u2.password_hashes, "{line}");
             assert_eq!(u.enabled, u2.enabled, "{line}");
+            assert_eq!(u.all_channels, u2.all_channels, "{line}");
+            assert_eq!(u.channel_patterns, u2.channel_patterns, "{line}");
         }
     }
 }

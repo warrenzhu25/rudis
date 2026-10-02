@@ -7268,6 +7268,28 @@ fn is_mode_switch_cmd(cmd: &Command) -> bool {
     )
 }
 
+const NOPERM_CHANNEL: &[u8] =
+    b"-NOPERM this user has no permissions to access one of the channels used as arguments\r\n";
+
+/// True if `cmd` names a Pub/Sub channel (or PSUBSCRIBE pattern) the user's
+/// `&` permissions do not cover.
+fn acl_channels_denied(user: &crate::acl::AclUser, cmd: &Command) -> bool {
+    if user.all_channels {
+        return false;
+    }
+    let (channels, is_pattern): (&[Bytes], bool) = match cmd {
+        Command::Subscribe(c) | Command::Ssubscribe(c) => (c, false),
+        Command::Psubscribe(p) => (p, true),
+        Command::Publish { channel, .. } | Command::Spublish { channel, .. } => {
+            (std::slice::from_ref(channel), false)
+        }
+        _ => return false,
+    };
+    channels
+        .iter()
+        .any(|c| !user.can_access_channel(c, is_pattern))
+}
+
 /// AUTH/ACL gate for mode-switching commands, which bypass execute_command.
 /// Returns the error reply if the client may not run `cmd`; `None` otherwise
 /// (and always `None` for commands that are not mode switches).
@@ -7293,7 +7315,7 @@ fn mode_switch_denied(
     let user = guard.users.get(auth_user)?;
     let name = acl_cmd_name(cmd);
     if user.can_execute_command(name) {
-        None
+        acl_channels_denied(user, cmd).then(|| NOPERM_CHANNEL.to_vec())
     } else {
         Some(
             format!(
@@ -7531,6 +7553,10 @@ async fn execute_command(
                     );
                     return false;
                 }
+            }
+            if acl_channels_denied(user, &cmd) {
+                out.extend_from_slice(NOPERM_CHANNEL);
+                return false;
             }
         }
     }
@@ -11166,7 +11192,7 @@ async fn execute_command(
                 }
                 crate::resp::AclSubcommand::GetUser(username) => {
                     if let Some(user) = acl.read().unwrap().get_user(&username) {
-                        out.extend_from_slice(b"*8\r\n");
+                        out.extend_from_slice(b"*10\r\n");
                         out.extend_from_slice(b"$5\r\nflags\r\n");
                         let flags = user.flags();
                         out.extend_from_slice(format!("*{}\r\n", flags.len()).as_bytes());
@@ -11191,6 +11217,11 @@ async fn execute_command(
                         let key_str = user.keys_rule_string();
                         out.extend_from_slice(
                             format!("${}\r\n{}\r\n", key_str.len(), key_str).as_bytes(),
+                        );
+                        out.extend_from_slice(b"$8\r\nchannels\r\n");
+                        let chan_str = user.channels_rule_string();
+                        out.extend_from_slice(
+                            format!("${}\r\n{}\r\n", chan_str.len(), chan_str).as_bytes(),
                         );
                     } else {
                         out.extend_from_slice(b"$-1\r\n");
@@ -22752,7 +22783,7 @@ async fn execute_commands_squashed(
                 }
                 if let Some(user) = &user {
                     let cmd_name = acl_cmd_name(cmd);
-                    if !user.can_execute_command(cmd_name) {
+                    if !user.can_execute_command(cmd_name) || acl_channels_denied(user, cmd) {
                         can_squash = false;
                         break;
                     }
@@ -23673,12 +23704,16 @@ mod tests {
             .unwrap()
             .set_user(
                 "limited",
-                &["on", "nopass", "-@all", "+get", "+subscribe"].map(String::from),
+                &["on", "nopass", "-@all", "+get", "+subscribe", "&ch"].map(String::from),
             )
             .unwrap();
         let e = mode_switch_denied(&psync, port, true, "limited").unwrap();
         assert!(e.starts_with(b"-NOPERM"));
         assert!(mode_switch_denied(&sub, port, true, "limited").is_none());
+        // Allowed command, but a channel outside the user's & patterns.
+        let other = Command::Subscribe(vec![Bytes::from_static(b"ch"), Bytes::from_static(b"x")]);
+        let e = mode_switch_denied(&other, port, true, "limited").unwrap();
+        assert!(e.starts_with(b"-NOPERM") && e.windows(8).any(|w| w == b"channels"));
     }
 
     #[test]
