@@ -23004,10 +23004,11 @@ async fn execute_commands_squashed(
     responses.resize(n, CompactResp::empty());
     let mut local_buf = Vec::new();
     let mut should_close = false;
-    // Cross-shard MGET/MSET are dispatched without awaiting so that every command in
+    // Cross-shard MSETs are dispatched without awaiting so that every command in
     // the pipeline is in flight before we pay a single round-trip stall. These hold
     // the handles until the gather phase below.
-    let mut inflight_mgets: Vec<(usize, crate::router::MgetInFlight)> = Vec::new();
+    // MGETs are folded into the per-shard batches: (pipeline idx, first slot, keys).
+    let mut folded_mgets: Vec<(usize, usize, usize)> = Vec::new();
     let mut inflight_msets: Vec<(usize, crate::router::MsetInFlight)> = Vec::new();
     let mut local_cold_gets: smallvec::SmallVec<[(usize, bytes::Bytes); 8]> =
         smallvec::SmallVec::new();
@@ -23497,29 +23498,36 @@ async fn execute_commands_squashed(
                 remote_batches[target].push((idx, key_hash, cmd));
             }
         } else if let Command::Mget(keys) = cmd {
-            drop(local_db);
-            if remote_batches.iter().any(|b| !b.is_empty()) {
-                flush_remote_batches(
-                    router,
-                    responders,
-                    remote_batches,
-                    items_pool,
-                    responses,
-                    is_resp3,
-                )
-                .await;
-            }
+            // Fold into the per-shard batches as one GET per key, each with its
+            // own slot after the pipeline's slots; the array is assembled once
+            // every batch has replied. Per-shard FIFO keeps earlier writes of
+            // this pipeline visible, so no flush is needed first.
             if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
                 for key in &keys {
                     record_client_read(router.port, client_id, key.as_ref());
                 }
             }
-            local_buf.clear();
-            match router.begin_mget_resp(keys, &mut local_buf).await {
-                Some(inflight) => inflight_mgets.push((idx, inflight)),
-                None => responses[idx] = CompactResp::from_vec(std::mem::take(&mut local_buf)),
+            let start = responses.len();
+            for key in keys {
+                let slot = responses.len();
+                responses.push(CompactResp::empty());
+                let (target, key_hash) = router.target_shard_and_hash(key.as_ref());
+                if target == router.shard_id {
+                    match local_db.table.get_compact_with_hash(key.as_ref(), key_hash) {
+                        Ok(Some(resp)) => responses[slot] = resp,
+                        Ok(None)
+                            if local_db.tier_manager.is_some()
+                                && local_db.table.is_tiered(&key).is_some() =>
+                        {
+                            local_cold_gets.push((slot, key));
+                        }
+                        _ => responses[slot] = CompactResp::null(is_resp3),
+                    }
+                } else {
+                    remote_batches[target].push((slot, key_hash, Command::Get(key)));
+                }
             }
-            local_db = router.local_db.borrow_mut();
+            folded_mgets.push((idx, start, responses.len() - start));
         } else if let Command::Mset(pairs) = cmd {
             drop(local_db);
             if remote_batches.iter().any(|b| !b.is_empty()) {
@@ -23623,22 +23631,13 @@ async fn execute_commands_squashed(
         }
     }
 
-    // 4. Gather the cross-shard MGET/MSET replies that were dispatched in step 1.
-    //    They ran concurrently with each other and with the shard batch hops above.
-    let batch_len = responses.len();
-    if inflight_mgets.len() == batch_len {
-        for (_idx, inflight) in inflight_mgets.drain(..) {
-            router.finish_mget_resp(inflight, out).await;
-        }
-        return should_close;
+    // 4. Assemble folded MGET arrays from their per-key slots, then gather the
+    //    cross-shard MSETs dispatched in step 1.
+    for (idx, start, len) in folded_mgets.drain(..) {
+        responses[idx] = assemble_mget_reply(&responses[start..start + len], is_resp3);
     }
-    if !inflight_mgets.is_empty() {
-        for (idx, inflight) in inflight_mgets.drain(..) {
-            local_buf.clear();
-            router.finish_mget_resp(inflight, &mut local_buf).await;
-            responses[idx] = CompactResp::from_vec(std::mem::take(&mut local_buf));
-        }
-    }
+    responses.truncate(n);
+    let batch_len = n;
     if inflight_msets.len() == batch_len {
         out.reserve(batch_len * 5);
         for (_idx, inflight) in inflight_msets.drain(..) {
@@ -23662,6 +23661,25 @@ async fn execute_commands_squashed(
     }
 
     should_close
+}
+
+/// Builds an MGET array from per-key GET replies. MGET answers nil for a key
+/// holding a non-string value, where GET answers WRONGTYPE.
+fn assemble_mget_reply(items: &[CompactResp], is_resp3: bool) -> CompactResp {
+    let mut buf = Vec::with_capacity(16 + items.iter().map(|r| r.estimated_len()).sum::<usize>());
+    write_resp_array_header(&mut buf, items.len());
+    for item in items {
+        let is_error = matches!(
+            item,
+            CompactResp::Small { .. } | CompactResp::Big(_) | CompactResp::RawBytes(_)
+        ) && item.as_slice().first() == Some(&b'-');
+        if is_error {
+            CompactResp::null(is_resp3).write_to(&mut buf);
+        } else {
+            item.write_to(&mut buf);
+        }
+    }
+    CompactResp::from_vec(buf)
 }
 
 /// Sends the per-shard batches built so far and waits until every shard has
@@ -24307,6 +24325,25 @@ mod tests {
             &[Bytes::from("x"), Bytes::from("y")],
             |k| k[0] as usize
         ));
+    }
+
+    #[test]
+    fn test_assemble_mget_reply_maps_errors_to_nil() {
+        let items = [
+            CompactResp::from_bulk(&Bytes::from("v1")),
+            CompactResp::null(false),
+            CompactResp::from_slice(b"-WRONGTYPE Operation against a key\r\n"),
+            CompactResp::Bulk(Bytes::from(vec![b'x'; 40])),
+        ];
+        let got = assemble_mget_reply(&items, false).into_vec();
+        let mut want = b"*4\r\n$2\r\nv1\r\n$-1\r\n$-1\r\n$40\r\n".to_vec();
+        want.extend_from_slice(&[b'x'; 40]);
+        want.extend_from_slice(b"\r\n");
+        assert_eq!(got, want);
+        let resp3_items = [CompactResp::null(true), items[2].clone()];
+        let resp3 = assemble_mget_reply(&resp3_items, true).into_vec();
+        assert_eq!(resp3, b"*2\r\n_\r\n_\r\n");
+        assert_eq!(assemble_mget_reply(&[], false).into_vec(), b"*0\r\n");
     }
 
     #[test]

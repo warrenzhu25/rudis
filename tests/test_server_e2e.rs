@@ -15714,3 +15714,64 @@ fn test_unlink_exists_touch_count_keys_across_all_shards_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child);
 }
+
+#[test]
+fn test_pipelined_mget_folds_across_shards_in_order_e2e() {
+    let port = 16971;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "4", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let enc = |args: &[&str]| {
+        let mut s = format!("*{}\r\n", args.len());
+        for a in args {
+            s.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+        }
+        s
+    };
+    let bulk = |v: &str| format!("${}\r\n{}\r\n", v.len(), v);
+    let keys: Vec<String> = (0..12).map(|i| format!("pm:{i}")).collect();
+    let k: Vec<&str> = keys.iter().map(String::as_str).collect();
+    assert_eq!(resp_cmd(&mut c, &["HSET", "pm:hash", "f", "v"]), ":1\r\n");
+
+    // Writes earlier in the pipeline must be visible to a later MGET on every
+    // shard, a later write must not be, a hash reads as nil, and replies stay
+    // in pipeline order around single-key commands.
+    let mut pipeline = String::new();
+    let mut expected = String::new();
+    for (i, key) in k.iter().enumerate() {
+        pipeline.push_str(&enc(&["SET", key, &format!("a{i}")]));
+        expected.push_str("+OK\r\n");
+    }
+    let mut mget = vec!["MGET"];
+    mget.extend(&k);
+    mget.extend(["pm:missing", "pm:hash"]);
+    pipeline.push_str(&enc(&mget));
+    expected.push_str(&format!("*{}\r\n", k.len() + 2));
+    for i in 0..k.len() {
+        expected.push_str(&bulk(&format!("a{i}")));
+    }
+    expected.push_str("$-1\r\n$-1\r\n");
+    pipeline.push_str(&enc(&["SET", k[3], "b3"]));
+    expected.push_str("+OK\r\n");
+    pipeline.push_str(&enc(&["GET", k[3]]));
+    expected.push_str(&bulk("b3"));
+    pipeline.push_str(&enc(&["MGET", k[3], k[7]]));
+    expected.push_str(&format!("*2\r\n{}{}", bulk("b3"), bulk("a7")));
+    pipeline.push_str(&enc(&["DEL", k[7], k[8]]));
+    expected.push_str(":2\r\n");
+    pipeline.push_str(&enc(&["MGET", k[7], k[8], k[9]]));
+    expected.push_str(&format!("*3\r\n$-1\r\n$-1\r\n{}", bulk("a9")));
+    for _ in 0..5 {
+        pipeline.push_str(&enc(&["MGET", k[0], k[1], k[2]]));
+        expected.push_str(&format!("*3\r\n{}{}{}", bulk("a0"), bulk("a1"), bulk("a2")));
+    }
+    c.write_all(pipeline.as_bytes()).unwrap();
+    let mut got = vec![0u8; expected.len()];
+    c.read_exact(&mut got).unwrap();
+    assert_eq!(String::from_utf8_lossy(&got), expected);
+    assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n");
+
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}
