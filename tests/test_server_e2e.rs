@@ -16037,3 +16037,74 @@ fn test_collection_commands_emit_keyspace_events_e2e() {
     assert_eq!(got, want);
     shutdown_and_wait(port, &mut child);
 }
+
+#[test]
+fn test_getex_ttl_change_reaches_aof_e2e() {
+    let port = 16966;
+    let dir = std::env::temp_dir().join(format!("rudis-getex-aof-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--aof",
+        "true",
+        "--aof-dir",
+        dir.to_str().unwrap(),
+    ];
+    let expiring: Vec<String> = (0..6).map(|i| format!("gx:e{i}")).collect();
+    let persisting: Vec<String> = (0..6).map(|i| format!("gx:p{i}")).collect();
+
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    for k in &expiring {
+        assert_eq!(resp_cmd(&mut c, &["SET", k, "v"]), "+OK\r\n");
+    }
+    for k in &persisting {
+        assert_eq!(resp_cmd(&mut c, &["SET", k, "v", "EX", "1000"]), "+OK\r\n");
+    }
+    // One write so the GETEXs run through the pipeline batching path.
+    let mut pipeline = String::new();
+    let mut push = |args: &[&str]| {
+        pipeline.push_str(&format!("*{}\r\n", args.len()));
+        for a in args {
+            pipeline.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+        }
+    };
+    for k in &expiring {
+        push(&["GETEX", k, "EX", "1000"]);
+    }
+    for k in &persisting {
+        push(&["GETEX", k, "PERSIST"]);
+    }
+    push(&["PING"]);
+    c.write_all(pipeline.as_bytes()).unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !got.ends_with(b"+PONG\r\n") {
+        let n = c.read(&mut buf).unwrap();
+        assert!(n > 0, "connection closed");
+        got.extend_from_slice(&buf[..n]);
+    }
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    for k in &expiring {
+        let ttl = resp_cmd(&mut c, &["TTL", k]);
+        let secs: i64 = ttl.trim_start_matches(':').trim().parse().unwrap();
+        assert!(secs > 900, "{k}: TTL {ttl:?}");
+    }
+    for k in &persisting {
+        assert_eq!(resp_cmd(&mut c, &["TTL", k]), ":-1\r\n", "{k}");
+    }
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}

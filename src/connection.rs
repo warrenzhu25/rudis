@@ -7802,21 +7802,35 @@ async fn execute_command(
             let val = router.get(key.clone()).await;
             match val {
                 Some(v) => {
-                    if persist {
-                        if router.persist(key.clone()).await {
-                            notify_keyspace_event_sync(
-                                router,
-                                NOTIFY_GENERIC,
-                                "persist",
-                                key.as_ref(),
-                            );
-                        }
-                    } else if let Some(exp) = expire_in
-                        && router
-                            .expire(key.clone(), exp, crate::resp::ExpireOptions::default())
+                    let ttl_change = if persist {
+                        router
+                            .persist(key.clone())
                             .await
-                    {
-                        notify_keyspace_event_sync(router, NOTIFY_GENERIC, "expire", key.as_ref());
+                            .then(|| ("persist", Command::Persist(key.clone())))
+                    } else if let Some(exp) = expire_in {
+                        let opts = crate::resp::ExpireOptions::default();
+                        router.expire(key.clone(), exp, opts).await.then(|| {
+                            let cmd = Command::Expire {
+                                key: key.clone(),
+                                duration: exp,
+                                opts,
+                            };
+                            ("expire", cmd)
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some((event, change)) = ttl_change {
+                        if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                            touch_watched_key(router.port, key.as_ref());
+                        }
+                        if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                            notify_key_invalidation(router.port, key.as_ref(), client_id);
+                        }
+                        notify_keyspace_event_sync(router, NOTIFY_GENERIC, event, key.as_ref());
+                        if let Some(bytes) = crate::aof::command_to_resp(&change) {
+                            crate::replication::propagate_bytes(router.port, &bytes);
+                        }
                     }
                     write_resp_bulk(out, &v);
                 }
@@ -16421,14 +16435,31 @@ pub fn execute_local_command(
             let val = db.get(key.as_ref());
             match val {
                 Some(v) => {
-                    if *persist {
-                        if db.persist(key.as_ref()) {
-                            notify_keyspace_event(NOTIFY_GENERIC, "persist", key);
+                    let ttl_change = if *persist {
+                        db.persist(key.as_ref())
+                            .then(|| ("persist", Command::Persist(key.clone())))
+                    } else if let Some(exp) = expire_in {
+                        let opts = crate::resp::ExpireOptions::default();
+                        db.expire(key.as_ref(), *exp, opts).then(|| {
+                            let cmd = Command::Expire {
+                                key: key.clone(),
+                                duration: *exp,
+                                opts,
+                            };
+                            ("expire", cmd)
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some((event, change)) = ttl_change {
+                        record_change!(&change);
+                        if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
+                            touch_watched_key(db.port, key.as_ref());
                         }
-                    } else if let Some(exp) = expire_in
-                        && db.expire(key.as_ref(), *exp, crate::resp::ExpireOptions::default())
-                    {
-                        notify_keyspace_event(NOTIFY_GENERIC, "expire", key);
+                        if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+                            notify_key_invalidation(db.port, key.as_ref(), 0);
+                        }
+                        notify_keyspace_event(NOTIFY_GENERIC, event, key);
                     }
                     write_resp_bulk(out, &v);
                 }
@@ -24580,6 +24611,38 @@ mod tests {
             (&["RPUSH", "t", "a"], &["rpush"]),
             (&["LTRIM", "t", "1", "0"], &["ltrim", "del"]),
         ]);
+    }
+
+    #[test]
+    fn test_getex_records_ttl_change_in_aof() {
+        let mut db = crate::shard::ShardDb::new(6396);
+        let aof = RefCell::new(crate::aof::AofWriter::new_in_memory());
+        let mut out = Vec::new();
+        db.set(Bytes::from("k"), Bytes::from("v"), None);
+        let getex = |expire_in, persist| Command::Getex {
+            key: Bytes::from("k"),
+            expire_in,
+            persist,
+        };
+
+        // A plain GETEX changes nothing and logs nothing.
+        execute_local_command(&getex(None, false), &mut db, &mut out, Some(&aof));
+        assert!(aof.borrow().buffer().is_empty());
+
+        execute_local_command(
+            &getex(Some(std::time::Duration::from_secs(100)), false),
+            &mut db,
+            &mut out,
+            Some(&aof),
+        );
+        let logged = String::from_utf8_lossy(aof.borrow().buffer()).to_uppercase();
+        assert!(logged.contains("EXPIRE"), "{logged:?}");
+
+        let before = aof.borrow().buffer().len();
+        execute_local_command(&getex(None, true), &mut db, &mut out, Some(&aof));
+        let logged = String::from_utf8_lossy(&aof.borrow().buffer()[before..]).to_uppercase();
+        assert!(logged.contains("PERSIST"), "{logged:?}");
+        assert_eq!(out, b"$1\r\nv\r\n$1\r\nv\r\n$1\r\nv\r\n");
     }
 
     #[test]
