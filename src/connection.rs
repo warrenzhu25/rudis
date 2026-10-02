@@ -23418,8 +23418,8 @@ mod tests {
     fn test_tracking_clients_atomic_fast_path() {
         let port = 65432;
         let cid = 999999;
-        let (tx, _rx) = flume::unbounded();
-        register_client_tracking(port, cid, false, Vec::new(), tx, false);
+        register_client_tracking(port, cid, None, false, Vec::new(), false, false, false)
+            .unwrap();
         assert!(HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed));
 
         record_client_read(port, cid, b"test_key");
@@ -24262,20 +24262,36 @@ mod tests {
     #[test]
     fn test_client_tracking_invalidation_and_watch_flow() {
         let port = 21001;
-        let (tx, rx) = flume::bounded::<Vec<u8>>(10);
-        register_client_tracking(port, 100, false, vec![], tx, false);
+        let (tx, _rx) = flume::bounded::<Vec<u8>>(10);
+        let (mut peer, ours) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        register_global_client(
+            port,
+            100,
+            std::os::unix::io::AsRawFd::as_raw_fd(&ours),
+            tx,
+            true,
+            "default".to_string(),
+            false,
+            std::sync::Arc::new(ClientStats::new(Instant::now(), addr)),
+        );
+        register_client_tracking(port, 100, None, false, vec![], false, false, false).unwrap();
         record_client_read(port, 100, b"my_tracked_key");
 
         // Invalidate from another client
         notify_key_invalidation(port, b"my_tracked_key", 101);
-        let msg = rx.try_recv().expect("should receive invalidation");
+        let mut msg = [0u8; 256];
+        let n = std::io::Read::read(&mut peer, &mut msg).expect("should receive invalidation");
         assert!(
-            std::str::from_utf8(&msg)
+            std::str::from_utf8(&msg[..n])
                 .unwrap()
                 .contains("my_tracked_key")
         );
 
         unregister_client_tracking(port, 100);
+        unregister_global_client(port, 100);
 
         // Watch keys test
         let watch_port = 21002;
