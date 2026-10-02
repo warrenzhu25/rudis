@@ -2097,6 +2097,32 @@ pub fn run_shard_worker(
             }
         }
 
+        // 4.8 `save <secs> <changes>` schedule (Redis serverCron).
+        if shard_id == 0 {
+            let r = router.clone();
+            // Counts start now: data loaded at startup is not "changes".
+            crate::snapshot::state(r.base_port);
+            monoio::spawn(async move {
+                while !crate::shutdown::is_shutting_down() {
+                    monoio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let points = crate::config::save_points(r.base_port);
+                    if points.is_empty() || r.is_saving.load(std::sync::atomic::Ordering::SeqCst) {
+                        continue;
+                    }
+                    let snap = crate::snapshot::state(r.base_port);
+                    let now = crate::snapshot::unix_now();
+                    if snap.save_due(&points, now) {
+                        println!(
+                            "{} changes in {} seconds. Saving...",
+                            snap.changes_since_last_save(),
+                            now.saturating_sub(snap.last_save_unix())
+                        );
+                        let _ = r.bgsave().await;
+                    }
+                }
+            });
+        }
+
         // 4.9 SIGTERM/SIGINT: save like a plain SHUTDOWN, and stay up if that
         // fails (Redis logs "can't exit" and keeps serving).
         if shard_id == 0 {

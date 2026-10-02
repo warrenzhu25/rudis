@@ -168,7 +168,6 @@ pub struct Router {
     pub tx_lock: Rc<RefCell<Option<u64>>>,
     pub tx_waiters: Rc<RefCell<std::collections::VecDeque<(u64, flume::Sender<()>)>>>,
     pub is_saving: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    pub last_save_time: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pub db_dir: std::path::PathBuf,
     pub is_auto_tiering: Rc<Cell<bool>>,
     pub notify_channel_pool: Rc<RefCell<Vec<(flume::Sender<()>, flume::Receiver<()>)>>>,
@@ -213,7 +212,6 @@ impl Router {
             tx_lock: Rc::new(RefCell::new(None)),
             tx_waiters: Rc::new(RefCell::new(std::collections::VecDeque::new())),
             is_saving: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_save_time: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             db_dir,
             is_auto_tiering: Rc::new(Cell::new(false)),
             notify_channel_pool: Rc::new(RefCell::new(Vec::new())),
@@ -3168,20 +3166,9 @@ impl Router {
         }
     }
 
+    /// Unix time of the last successful save, shared by all shards.
     pub fn lastsave(&self) -> u64 {
-        let ts = self.last_save_time.load(Ordering::Relaxed);
-        if ts == 0 {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let _ =
-                self.last_save_time
-                    .compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed);
-            self.last_save_time.load(Ordering::Relaxed)
-        } else {
-            ts
-        }
+        crate::snapshot::state(self.base_port).last_save_unix()
     }
 
     pub async fn save_rdb(&self) -> Result<(), String> {
@@ -3406,7 +3393,10 @@ impl Router {
         let tmp_filename =
             self.db_dir
                 .join(format!("dump.rdb.tmp.{}_{}", std::process::id(), tmp_id));
+        let snap = crate::snapshot::state(self.base_port);
+        let dirty_before = snap.begin();
         let res = self.write_rdb_file(&tmp_filename).await;
+        snap.finish(dirty_before, res.is_ok());
         if let Err(ref e) = res {
             eprintln!("Error saving DB on disk: {}", e);
             let _ = std::fs::remove_file(&tmp_filename);
@@ -3463,12 +3453,6 @@ impl Router {
         file.sync_all().map_err(|e| e.to_string())?;
         std::fs::rename(tmp_filename, &filename).map_err(|e| e.to_string())?;
         let _ = crate::aof::sync_parent_dir(std::path::Path::new(&filename));
-
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        self.last_save_time.store(now_unix, Ordering::Relaxed);
         Ok(())
     }
 

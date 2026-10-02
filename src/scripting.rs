@@ -2162,6 +2162,9 @@ fn register_redis_module(
         }
 
         crate::connection::record_cmd_stat(cmd_name);
+        if cmd.is_write_command() {
+            crate::snapshot::note_write();
+        }
         crate::connection::inc_active_client_tot_cmds();
         if crate::connection::has_monitor_clients() {
             let monitor_argv = crate::slowlog::command_to_monitor_argv(&cmd);
@@ -2321,6 +2324,9 @@ fn register_redis_module(
         }
 
         crate::connection::record_cmd_stat(cmd_name);
+        if cmd.is_write_command() {
+            crate::snapshot::note_write();
+        }
         crate::connection::inc_active_client_tot_cmds();
         if crate::connection::has_monitor_clients() {
             let monitor_argv = crate::slowlog::command_to_monitor_argv(&cmd);

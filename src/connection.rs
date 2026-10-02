@@ -7431,6 +7431,9 @@ async fn execute_command(
     }
     let cmd_name = get_cmd_name(&cmd);
     record_cmd_stat(cmd_name);
+    if cmd.is_write_command() {
+        crate::snapshot::note_write();
+    }
     record_latency_histogram_cmd(&cmd);
 
     let slow_threshold =
@@ -8648,10 +8651,13 @@ async fn execute_command(
                 get_isolated_panics(),
                 shard_conns.join(",")
             );
+            let snap = crate::snapshot::state(router.base_port);
             let persistence_str = format!(
-                "# Persistence\r\nloading:0\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:0\r\nrdb_last_bgsave_status:ok\r\n",
-                DIRTY_CHANGES.load(std::sync::atomic::Ordering::Relaxed),
-                u8::from(RDB_BGSAVE_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed))
+                "# Persistence\r\nloading:0\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\n",
+                snap.changes_since_last_save(),
+                u8::from(RDB_BGSAVE_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed)),
+                snap.last_save_unix(),
+                if snap.last_save_ok() { "ok" } else { "err" }
             );
             let cmdstat_str = {
                 router.flush_all_command_stats().await;
@@ -9032,10 +9038,6 @@ async fn execute_command(
                 std::sync::LazyLock::new(|| std::sync::RwLock::new("no".to_string()));
             static CONFIG_OOM_SCORE_ADJ_VALUES: std::sync::LazyLock<std::sync::RwLock<String>> =
                 std::sync::LazyLock::new(|| std::sync::RwLock::new("0 200 800".to_string()));
-            static CONFIG_SAVE: std::sync::LazyLock<std::sync::RwLock<String>> =
-                std::sync::LazyLock::new(|| {
-                    std::sync::RwLock::new("3600 1 300 100 60 10000".to_string())
-                });
             static CONFIG_MAXMEMORY_CLIENTS: std::sync::LazyLock<std::sync::RwLock<String>> =
                 std::sync::LazyLock::new(|| std::sync::RwLock::new("0".to_string()));
             static CONFIG_BACKUPDIRNAME: std::sync::LazyLock<std::sync::RwLock<String>> =
@@ -9123,7 +9125,9 @@ async fn execute_command(
                         .to_string();
                     let oom_adj = CONFIG_OOM_SCORE_ADJ.read().unwrap().clone();
                     let oom_adj_vals = CONFIG_OOM_SCORE_ADJ_VALUES.read().unwrap().clone();
-                    let save_cfg = CONFIG_SAVE.read().unwrap().clone();
+                    let save_cfg = crate::snapshot::format_save_points(
+                        &crate::config::save_points(router.base_port),
+                    );
                     let maxmem_clients = CONFIG_MAXMEMORY_CLIENTS.read().unwrap().clone();
                     let bind_cfg = crate::netsec::format_bind_spec(&crate::netsec::bind_addrs(
                         router.base_port,
@@ -9287,6 +9291,13 @@ async fn execute_command(
                             if !matches!(val_str.to_ascii_lowercase().as_str(), "yes" | "no") {
                                 out.extend_from_slice(
                                     b"-ERR CONFIG SET failed (possibly related to argument 'aof-load-truncated') - argument must be 'yes' or 'no'\r\n",
+                                );
+                                return false;
+                            }
+                        } else if p_str == "save" {
+                            if crate::config::parse_save_points(&val_str).is_err() {
+                                out.extend_from_slice(
+                                    b"-ERR CONFIG SET failed (possibly related to argument 'save') - Invalid save parameters\r\n",
                                 );
                                 return false;
                             }
@@ -9660,7 +9671,10 @@ async fn execute_command(
                         } else if p_str == "oom-score-adj-values" {
                             *CONFIG_OOM_SCORE_ADJ_VALUES.write().unwrap() = val_str.to_string();
                         } else if p_str == "save" {
-                            *CONFIG_SAVE.write().unwrap() = val_str.to_string();
+                            // Validated in phase 1.
+                            if let Ok(points) = crate::config::parse_save_points(&val_str) {
+                                crate::config::set_save_points(router.base_port, points);
+                            }
                         } else if p_str == "maxmemory-clients" {
                             *CONFIG_MAXMEMORY_CLIENTS.write().unwrap() = val_str.to_string();
                         } else if p_str == "backupdirname" {
@@ -22937,6 +22951,9 @@ async fn execute_commands_squashed(
     let is_resp3 = CURRENT_CLIENT_RESP3.get();
     let mut local_db = router.local_db.borrow_mut();
     for (idx, cmd) in commands.drain(..).enumerate() {
+        if cmd.is_write_command() {
+            crate::snapshot::note_write();
+        }
         if let Some((target, key_hash)) = target_shard_and_hash_of_cmd(&cmd, router.num_shards) {
             if target == router.shard_id {
                 local_buf.clear();

@@ -30,6 +30,7 @@ pub mod server;
 pub mod shard;
 pub mod shutdown;
 pub mod slowlog;
+pub mod snapshot;
 pub mod syscheck;
 pub mod table;
 pub mod telemetry;
