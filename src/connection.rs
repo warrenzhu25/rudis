@@ -2206,6 +2206,9 @@ pub const NOTIFY_ALL: u32 = NOTIFY_GENERIC
 pub static NOTIFY_KEYSPACE_FLAGS: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(0);
 pub static NOTIFY_KEYSPACE_STR: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+/// Held by unit tests that change the process-wide notification flags.
+#[cfg(test)]
+pub(crate) static NOTIFY_FLAGS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn notify_keyspace_flags_to_string(flags: u32) -> String {
     let mut res = String::new();
@@ -7791,11 +7794,20 @@ async fn execute_command(
             match val {
                 Some(v) => {
                     if persist {
-                        let _ = router.persist(key).await;
-                    } else if let Some(exp) = expire_in {
-                        let _ = router
-                            .expire(key, exp, crate::resp::ExpireOptions::default())
-                            .await;
+                        if router.persist(key.clone()).await {
+                            notify_keyspace_event_sync(
+                                router,
+                                NOTIFY_GENERIC,
+                                "persist",
+                                key.as_ref(),
+                            );
+                        }
+                    } else if let Some(exp) = expire_in
+                        && router
+                            .expire(key.clone(), exp, crate::resp::ExpireOptions::default())
+                            .await
+                    {
+                        notify_keyspace_event_sync(router, NOTIFY_GENERIC, "expire", key.as_ref());
                     }
                     write_resp_bulk(out, &v);
                 }
@@ -8055,7 +8067,16 @@ async fn execute_command(
                     flush_pending_bcast(router.port);
                 }
             }
+            let keys: Vec<Bytes> =
+                if NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                    pairs.iter().map(|(k, _)| k.clone()).collect()
+                } else {
+                    Vec::new()
+                };
             router.mset(pairs).await;
+            for key in &keys {
+                notify_keyspace_event_sync(router, NOTIFY_STRING, "set", key);
+            }
             out.extend_from_slice(b"+OK\r\n");
             false
         }
@@ -8320,6 +8341,7 @@ async fn execute_command(
             match router.incr_by(key.clone(), delta).await {
                 Ok(val) => {
                     notify_key_invalidation(router.port, key.as_ref(), client_id);
+                    notify_keyspace_event_sync(router, NOTIFY_STRING, "incrby", key.as_ref());
                     if let Some(bytes) = crate::aof::command_to_resp(&Command::IncrBy(key, delta)) {
                         crate::replication::propagate_bytes(router.port, &bytes);
                     }
@@ -16391,9 +16413,13 @@ pub fn execute_local_command(
             match val {
                 Some(v) => {
                     if *persist {
-                        db.persist(key.as_ref());
-                    } else if let Some(exp) = expire_in {
-                        db.expire(key.as_ref(), *exp, crate::resp::ExpireOptions::default());
+                        if db.persist(key.as_ref()) {
+                            notify_keyspace_event(NOTIFY_GENERIC, "persist", key);
+                        }
+                    } else if let Some(exp) = expire_in
+                        && db.expire(key.as_ref(), *exp, crate::resp::ExpireOptions::default())
+                    {
+                        notify_keyspace_event(NOTIFY_GENERIC, "expire", key);
                     }
                     write_resp_bulk(out, &v);
                 }
@@ -16548,6 +16574,9 @@ pub fn execute_local_command(
                 db.set(k.clone(), v.clone(), None);
             }
             record_change!(cmd);
+            for (k, _) in pairs {
+                notify_keyspace_event(NOTIFY_STRING, "set", k);
+            }
             out.extend_from_slice(b"+OK\r\n");
             false
         }
@@ -16761,6 +16790,7 @@ pub fn execute_local_command(
             match db.incr_by_slice(key.as_ref(), *delta) {
                 Ok(val) => {
                     record_change!(cmd);
+                    notify_keyspace_event(NOTIFY_STRING, "incrby", key);
                     write_resp_integer(out, val);
                 }
                 Err(err) => {
@@ -18514,6 +18544,7 @@ pub fn execute_local_command(
             let set = db.setnx(key.clone(), value.clone());
             if set {
                 record_change!(cmd);
+                notify_keyspace_event(NOTIFY_STRING, "set", key);
                 out.extend_from_slice(b":1\r\n");
             } else {
                 out.extend_from_slice(b":0\r\n");
@@ -18524,6 +18555,7 @@ pub fn execute_local_command(
             match db.getset(key.clone(), value.clone()) {
                 Ok(old) => {
                     record_change!(cmd);
+                    notify_keyspace_event(NOTIFY_STRING, "set", key);
                     match old {
                         Some(v) => {
                             out.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
@@ -18544,6 +18576,7 @@ pub fn execute_local_command(
                 Ok(old) => {
                     if old.is_some() {
                         record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_GENERIC, "del", key);
                     }
                     match old {
                         Some(v) => {
@@ -18564,6 +18597,7 @@ pub fn execute_local_command(
             match db.append(key.clone(), value) {
                 Ok(new_len) => {
                     record_change!(cmd);
+                    notify_keyspace_event(NOTIFY_STRING, "append", key);
                     out.extend_from_slice(format!(":{}\r\n", new_len).as_bytes());
                 }
                 Err(err) => {
@@ -18592,6 +18626,9 @@ pub fn execute_local_command(
                     db.set(k.clone(), v.clone(), None);
                 }
                 record_change!(cmd);
+                for (k, _) in pairs {
+                    notify_keyspace_event(NOTIFY_STRING, "set", k);
+                }
                 out.extend_from_slice(b":1\r\n");
             }
             false
@@ -18695,6 +18732,7 @@ pub fn execute_local_command(
                     if changed {
                         record_change!(cmd);
                     }
+                    notify_keyspace_event(NOTIFY_STRING, "setbit", key);
                     out.extend_from_slice(format!(":{}\r\n", old).as_bytes());
                 }
                 Err(err) => {
@@ -18820,6 +18858,7 @@ pub fn execute_local_command(
                 Ok(updated) => {
                     if updated {
                         record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_STRING, "pfadd", key);
                         out.extend_from_slice(b":1\r\n");
                     } else {
                         out.extend_from_slice(b":0\r\n");
@@ -20379,6 +20418,7 @@ pub fn execute_local_command(
             match db.incrbyfloat(key.clone(), *increment) {
                 Ok(val) => {
                     record_change!(cmd);
+                    notify_keyspace_event(NOTIFY_STRING, "incrbyfloat", key);
                     write_resp_bulk(out, val.to_string().as_bytes());
                 }
                 Err(err) => {
@@ -20451,6 +20491,9 @@ pub fn execute_local_command(
             match db.setrange(key.clone(), *offset, value) {
                 Ok(len) => {
                     record_change!(cmd);
+                    if !value.is_empty() {
+                        notify_keyspace_event(NOTIFY_STRING, "setrange", key);
+                    }
                     write_resp_integer(out, len as i64);
                 }
                 Err(err) => {
@@ -24395,6 +24438,105 @@ mod tests {
         assert_eq!(resp_integer_or_zero(b"$1\r\n5\r\n"), 0);
         assert_eq!(resp_integer_or_zero(b":-1\r\n"), 0);
         assert_eq!(resp_integer_or_zero(b""), 0);
+    }
+
+    #[test]
+    fn test_string_writes_publish_keyspace_events() {
+        let _flags = NOTIFY_FLAGS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // execute_command's future is too deep for the default test stack in debug builds.
+        std::thread::Builder::new()
+            .stack_size(256 << 20)
+            .spawn(|| {
+                monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(string_writes_publish_keyspace_events())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn string_writes_publish_keyspace_events() {
+        let dir = std::env::temp_dir().join(format!("rudis-str-notify-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let (senders_mesh, _receivers) = crate::mailbox::create_shard_mesh(1);
+        let pubsub = std::rc::Rc::new(std::cell::RefCell::new(crate::pubsub::PubSubHub::new()));
+        let router = std::rc::Rc::new(Router::new(
+            0,
+            1,
+            6397,
+            std::rc::Rc::new(std::cell::RefCell::new(crate::shard::ShardDb::new(6397))),
+            senders_mesh[0].clone(),
+            None,
+            pubsub.clone(),
+            dir,
+        ));
+        set_current_router(router.clone());
+        let (tx, rx) = flume::unbounded();
+        pubsub
+            .borrow_mut()
+            .psubscribe(1, Bytes::from_static(b"__keyevent@0__:*"), tx, false);
+        let prev_flags = get_notify_keyspace_events_str();
+        set_notify_keyspace_events_str("KEA");
+
+        let client_registry = std::cell::RefCell::new(hashbrown::HashMap::new());
+        let (mut asking, mut authenticated) = (false, true);
+        let mut auth_user = String::from("default");
+        let b = |s: &str| Bytes::copy_from_slice(s.as_bytes());
+        let cases: Vec<(Vec<Bytes>, &str)> = vec![
+            (vec![b("INCR"), b("n")], "incrby"),
+            (vec![b("INCRBYFLOAT"), b("f"), b("1.5")], "incrbyfloat"),
+            (vec![b("APPEND"), b("a"), b("x")], "append"),
+            (vec![b("SETNX"), b("nx"), b("v")], "set"),
+            (vec![b("GETSET"), b("a"), b("y")], "set"),
+            (vec![b("GETEX"), b("a"), b("EX"), b("100")], "expire"),
+            (vec![b("GETEX"), b("a"), b("PERSIST")], "persist"),
+            (vec![b("SETRANGE"), b("r"), b("1"), b("z")], "setrange"),
+            (vec![b("SETBIT"), b("bit"), b("3"), b("1")], "setbit"),
+            (vec![b("PFADD"), b("h"), b("e")], "pfadd"),
+            (vec![b("GETDEL"), b("a")], "del"),
+            (vec![b("MSETNX"), b("m1"), b("1")], "set"),
+        ];
+        for (args, event) in cases {
+            let mut wire = bytes::BytesMut::from(format!("*{}\r\n", args.len()).as_bytes());
+            for a in &args {
+                wire.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+                wire.extend_from_slice(a);
+                wire.extend_from_slice(b"\r\n");
+            }
+            let cmd = crate::resp::parse_command(&mut wire).unwrap().unwrap();
+            let mut out = Vec::new();
+            execute_command(
+                cmd,
+                &router,
+                1,
+                &client_registry,
+                &mut out,
+                &mut asking,
+                &mut authenticated,
+                &mut auth_user,
+            )
+            .await;
+            assert!(
+                !out.starts_with(b"-"),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out)
+            );
+            let frames: Vec<String> = rx
+                .try_iter()
+                .map(|f| String::from_utf8_lossy(&f).to_string())
+                .collect();
+            let want = format!("__keyevent@0__:{event}\r\n");
+            assert!(
+                frames.iter().any(|f| f.contains(&want)),
+                "{args:?} should publish {event}, got {frames:?}"
+            );
+        }
+        set_notify_keyspace_events_str(&prev_flags);
     }
 
     #[monoio::test]

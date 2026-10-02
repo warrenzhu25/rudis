@@ -15860,3 +15860,115 @@ fn test_keyspace_events_match_when_pipeline_is_batched_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child);
 }
+
+/// Subscribes to every keyevent channel, runs `cmds` one at a time and
+/// returns the (event, key) pairs published for them.
+fn keyevents_for(port: u16, setup: &[&[&str]], cmds: &[&[&str]]) -> Vec<(String, String)> {
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "notify-keyspace-events", "KEA"]),
+        "+OK\r\n"
+    );
+    resp_cmd(&mut c, &["FLUSHALL"]);
+    for cmd in setup {
+        resp_cmd(&mut c, cmd);
+    }
+    let mut sub = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    sub.set_read_timeout(Some(Duration::from_millis(400)))
+        .unwrap();
+    let r = resp_cmd(&mut sub, &["PSUBSCRIBE", "__keyevent@0__:*"]);
+    assert!(r.contains("psubscribe"), "{r}");
+    for cmd in cmds {
+        let r = resp_cmd(&mut c, cmd);
+        assert!(!r.starts_with('-'), "{cmd:?}: {r}");
+    }
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 65536];
+    while let Ok(n) = sub.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        raw.extend_from_slice(&buf[..n]);
+    }
+    let text = String::from_utf8_lossy(&raw).to_string();
+    let parts: Vec<&str> = text.split("\r\n").collect();
+    let mut events = Vec::new();
+    let mut i = 0;
+    while i + 8 < parts.len() {
+        if parts[i] == "*4" && parts[i + 2] == "pmessage" {
+            let event = parts[i + 6].trim_start_matches("__keyevent@0__:");
+            events.push((event.to_string(), parts[i + 8].to_string()));
+            i += 9;
+        } else {
+            i += 1;
+        }
+    }
+    events.sort();
+    events
+}
+
+fn sorted_events(list: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut v: Vec<(String, String)> = list
+        .iter()
+        .map(|(e, k)| (e.to_string(), k.to_string()))
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn test_string_commands_emit_keyspace_events_e2e() {
+    let port = 16969;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "4", "--no-pin"], port);
+    let got = keyevents_for(
+        port,
+        &[
+            &["SET", "s:getset", "v"],
+            &["SET", "s:getdel", "v"],
+            &["SET", "s:getex", "v"],
+        ],
+        &[
+            &["INCR", "s:incr"],
+            &["DECRBY", "s:incr", "3"],
+            &["INCRBYFLOAT", "s:float", "1.5"],
+            &["APPEND", "s:append", "x"],
+            &["SETNX", "s:nx", "v"],
+            &["SETNX", "s:nx", "w"],
+            &["GETSET", "s:getset", "w"],
+            &["GETDEL", "s:getdel"],
+            &["GETDEL", "s:missing"],
+            &["GETEX", "s:getex", "EX", "100"],
+            &["GETEX", "s:getex", "PERSIST"],
+            &["SETRANGE", "s:range", "2", "xy"],
+            &["SETRANGE", "s:range", "0", ""],
+            &["SETBIT", "s:bit", "7", "1"],
+            &["PFADD", "s:hll", "a"],
+            &["PFADD", "s:hll", "a"],
+            &["MSET", "s:m1", "1", "s:m2", "2", "s:m3", "3"],
+            &["MSETNX", "{s}n1", "1", "{s}n2", "2"],
+        ],
+    );
+    let want = sorted_events(&[
+        ("incrby", "s:incr"),
+        ("incrby", "s:incr"),
+        ("incrbyfloat", "s:float"),
+        ("append", "s:append"),
+        ("set", "s:nx"),
+        ("set", "s:getset"),
+        ("del", "s:getdel"),
+        ("expire", "s:getex"),
+        ("persist", "s:getex"),
+        ("setrange", "s:range"),
+        ("setbit", "s:bit"),
+        ("pfadd", "s:hll"),
+        ("set", "s:m1"),
+        ("set", "s:m2"),
+        ("set", "s:m3"),
+        ("set", "{s}n1"),
+        ("set", "{s}n2"),
+    ]);
+    assert_eq!(got, want);
+    shutdown_and_wait(port, &mut child);
+}
