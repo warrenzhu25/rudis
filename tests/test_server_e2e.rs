@@ -15989,3 +15989,51 @@ fn test_multi_key_del_emits_del_per_key_e2e() {
     assert_eq!(got, sorted_events(&want));
     shutdown_and_wait(port, &mut child);
 }
+
+#[test]
+fn test_collection_commands_emit_keyspace_events_e2e() {
+    let port = 16967;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "4", "--no-pin"], port);
+    let got = keyevents_for(
+        port,
+        &[
+            &["RPUSH", "c:list", "a", "b", "c", "b"],
+            &["RPUSH", "c:trim", "a"],
+            &["SADD", "c:set", "a"],
+            &["ZADD", "c:zset", "1", "a", "2", "b"],
+        ],
+        &[
+            &["HSETNX", "c:hash", "f", "1"],
+            &["HSETNX", "c:hash", "f", "2"],
+            &["HMSET", "c:hash", "g", "1"],
+            &["HINCRBY", "c:hash", "f", "2"],
+            &["HINCRBYFLOAT", "c:hash", "g", "0.5"],
+            &["LSET", "c:list", "0", "z"],
+            &["LINSERT", "c:list", "BEFORE", "c", "y"],
+            &["LREM", "c:list", "0", "b"],
+            &["LTRIM", "c:trim", "1", "0"],
+            &["SPOP", "c:set"],
+            &["ZPOPMIN", "c:zset"],
+            &["ZPOPMAX", "c:zset"],
+        ],
+    );
+    let want = sorted_events(&[
+        ("hset", "c:hash"),
+        ("hset", "c:hash"),
+        ("hincrby", "c:hash"),
+        ("hincrbyfloat", "c:hash"),
+        ("lset", "c:list"),
+        ("linsert", "c:list"),
+        ("lrem", "c:list"),
+        ("ltrim", "c:trim"),
+        ("del", "c:trim"),
+        ("spop", "c:set"),
+        ("del", "c:set"),
+        ("zpopmin", "c:zset"),
+        ("zpopmax", "c:zset"),
+        ("del", "c:zset"),
+    ]);
+    assert_eq!(got, want);
+    shutdown_and_wait(port, &mut child);
+}

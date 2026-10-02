@@ -301,6 +301,15 @@ pub fn set_current_router(router: std::rc::Rc<Router>) {
     });
 }
 
+/// Publishes `del` when a write removed the last element of `key`. The
+/// existence check only runs when notifications are enabled.
+#[inline]
+fn notify_del_if_emptied(db: &mut ShardDb, key: &[u8]) {
+    if NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) != 0 && !db.exists(key) {
+        notify_keyspace_event(NOTIFY_GENERIC, "del", key);
+    }
+}
+
 pub fn notify_keyspace_event(event_type: u32, event: &str, key: &[u8]) {
     CURRENT_ROUTER.with(|cr| {
         if let Some(router) = cr.borrow().as_ref() {
@@ -16863,6 +16872,7 @@ pub fn execute_local_command(
                 Ok(count) => {
                     if count > 0 {
                         record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_HASH, "hset", key);
                     }
                     write_resp_integer(out, count as i64);
                 }
@@ -16876,6 +16886,7 @@ pub fn execute_local_command(
             match db.hset_slice_fast(key, fields) {
                 Ok(_) => {
                     record_change!(cmd);
+                    notify_keyspace_event(NOTIFY_HASH, "hset", key);
                     if db.has_search_indices() || crate::search::has_active_search_indices() {
                         reindex_hash_for_search(db, key);
                     }
@@ -17379,6 +17390,8 @@ pub fn execute_local_command(
                             members: popped.clone(),
                         };
                         record_change!(&srem_cmd);
+                        notify_keyspace_event(NOTIFY_SET, "spop", key);
+                        notify_del_if_emptied(db, key);
                     }
                     if count.is_some() {
                         out.extend_from_slice(format!("*{}\r\n", popped.len()).as_bytes());
@@ -17728,6 +17741,8 @@ pub fn execute_local_command(
                             members: popped.iter().map(|(m, _)| m.clone()).collect(),
                         };
                         record_change!(&zrem_cmd);
+                        notify_keyspace_event(NOTIFY_ZSET, "zpopmin", key);
+                        notify_del_if_emptied(db, key);
                     }
                     if count.is_none() {
                         if popped.is_empty() {
@@ -17769,6 +17784,8 @@ pub fn execute_local_command(
                             members: popped.iter().map(|(m, _)| m.clone()).collect(),
                         };
                         record_change!(&zrem_cmd);
+                        notify_keyspace_event(NOTIFY_ZSET, "zpopmax", key);
+                        notify_del_if_emptied(db, key);
                     }
                     if count.is_none() {
                         if popped.is_empty() {
@@ -19669,6 +19686,7 @@ pub fn execute_local_command(
             match db.hincrby(key.clone(), field.clone(), *increment) {
                 Ok(val) => {
                     record_change!(cmd);
+                    notify_keyspace_event(NOTIFY_HASH, "hincrby", key);
                     write_resp_integer(out, val);
                 }
                 Err(err) => {
@@ -19689,6 +19707,7 @@ pub fn execute_local_command(
             match db.hincrbyfloat(key.clone(), field.clone(), *increment) {
                 Ok(val) => {
                     record_change!(cmd);
+                    notify_keyspace_event(NOTIFY_HASH, "hincrbyfloat", key);
                     write_resp_bulk(out, val.to_string().as_bytes());
                 }
                 Err(err) => {
@@ -20051,9 +20070,15 @@ pub fn execute_local_command(
             false
         }
         Command::Ltrim { key, start, stop } => {
+            let existed = NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) != 0
+                && db.exists(key);
             match db.ltrim(key, *start, *stop) {
                 Ok(()) => {
                     record_change!(cmd);
+                    if existed {
+                        notify_keyspace_event(NOTIFY_LIST, "ltrim", key);
+                        notify_del_if_emptied(db, key);
+                    }
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 Err(err) => {
@@ -20074,6 +20099,7 @@ pub fn execute_local_command(
             match db.lset(key, *index, element.clone()) {
                 Ok(()) => {
                     record_change!(cmd);
+                    notify_keyspace_event(NOTIFY_LIST, "lset", key);
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 Err(err) => {
@@ -20095,6 +20121,8 @@ pub fn execute_local_command(
                 Ok(removed) => {
                     if removed > 0 {
                         record_change!(cmd);
+                        notify_keyspace_event(NOTIFY_LIST, "lrem", key);
+                        notify_del_if_emptied(db, key);
                     }
                     write_resp_integer(out, removed as i64);
                 }
@@ -20151,6 +20179,7 @@ pub fn execute_local_command(
                     if len > 0 {
                         record_change!(cmd);
                         notify_list_or_defer(db, key);
+                        notify_keyspace_event(NOTIFY_LIST, "linsert", key);
                     }
                     write_resp_integer(out, len);
                 }
@@ -24440,28 +24469,31 @@ mod tests {
         assert_eq!(resp_integer_or_zero(b""), 0);
     }
 
-    #[test]
-    fn test_string_writes_publish_keyspace_events() {
+    /// Runs each command on a one-shard server and checks the exact keyevent
+    /// names it publishes, in order.
+    fn assert_commands_publish(
+        cases: &'static [(&'static [&'static str], &'static [&'static str])],
+    ) {
         let _flags = NOTIFY_FLAGS_TEST_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         // execute_command's future is too deep for the default test stack in debug builds.
         std::thread::Builder::new()
             .stack_size(256 << 20)
-            .spawn(|| {
+            .spawn(move || {
                 monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
                     .enable_all()
                     .build()
                     .unwrap()
-                    .block_on(string_writes_publish_keyspace_events())
+                    .block_on(commands_publish(cases))
             })
             .unwrap()
             .join()
             .unwrap();
     }
 
-    async fn string_writes_publish_keyspace_events() {
-        let dir = std::env::temp_dir().join(format!("rudis-str-notify-{}", std::process::id()));
+    async fn commands_publish(cases: &[(&[&str], &[&str])]) {
+        let dir = std::env::temp_dir().join(format!("rudis-notify-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let (senders_mesh, _receivers) = crate::mailbox::create_shard_mesh(1);
         let pubsub = std::rc::Rc::new(std::cell::RefCell::new(crate::pubsub::PubSubHub::new()));
@@ -24486,27 +24518,10 @@ mod tests {
         let client_registry = std::cell::RefCell::new(hashbrown::HashMap::new());
         let (mut asking, mut authenticated) = (false, true);
         let mut auth_user = String::from("default");
-        let b = |s: &str| Bytes::copy_from_slice(s.as_bytes());
-        let cases: Vec<(Vec<Bytes>, &str)> = vec![
-            (vec![b("INCR"), b("n")], "incrby"),
-            (vec![b("INCRBYFLOAT"), b("f"), b("1.5")], "incrbyfloat"),
-            (vec![b("APPEND"), b("a"), b("x")], "append"),
-            (vec![b("SETNX"), b("nx"), b("v")], "set"),
-            (vec![b("GETSET"), b("a"), b("y")], "set"),
-            (vec![b("GETEX"), b("a"), b("EX"), b("100")], "expire"),
-            (vec![b("GETEX"), b("a"), b("PERSIST")], "persist"),
-            (vec![b("SETRANGE"), b("r"), b("1"), b("z")], "setrange"),
-            (vec![b("SETBIT"), b("bit"), b("3"), b("1")], "setbit"),
-            (vec![b("PFADD"), b("h"), b("e")], "pfadd"),
-            (vec![b("GETDEL"), b("a")], "del"),
-            (vec![b("MSETNX"), b("m1"), b("1")], "set"),
-        ];
-        for (args, event) in cases {
+        for (args, events) in cases {
             let mut wire = bytes::BytesMut::from(format!("*{}\r\n", args.len()).as_bytes());
-            for a in &args {
-                wire.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
-                wire.extend_from_slice(a);
-                wire.extend_from_slice(b"\r\n");
+            for a in args.iter() {
+                wire.extend_from_slice(format!("${}\r\n{a}\r\n", a.len()).as_bytes());
             }
             let cmd = crate::resp::parse_command(&mut wire).unwrap().unwrap();
             let mut out = Vec::new();
@@ -24526,17 +24541,65 @@ mod tests {
                 "{args:?}: {}",
                 String::from_utf8_lossy(&out)
             );
-            let frames: Vec<String> = rx
+            let got: Vec<String> = rx
                 .try_iter()
-                .map(|f| String::from_utf8_lossy(&f).to_string())
+                .map(|f| {
+                    let f = String::from_utf8_lossy(&f).to_string();
+                    let event = f.split("__keyevent@0__:").nth(2).unwrap_or("");
+                    event.split("\r\n").next().unwrap_or("").to_string()
+                })
                 .collect();
-            let want = format!("__keyevent@0__:{event}\r\n");
-            assert!(
-                frames.iter().any(|f| f.contains(&want)),
-                "{args:?} should publish {event}, got {frames:?}"
-            );
+            assert_eq!(got, *events, "{args:?}");
         }
         set_notify_keyspace_events_str(&prev_flags);
+    }
+
+    #[test]
+    fn test_collection_writes_publish_keyspace_events() {
+        assert_commands_publish(&[
+            (&["HSETNX", "h", "f", "1"], &["hset"]),
+            (&["HSETNX", "h", "f", "2"], &[]),
+            (&["HMSET", "h", "g", "1"], &["hset"]),
+            (&["HINCRBY", "h", "f", "2"], &["hincrby"]),
+            (&["HINCRBYFLOAT", "h", "g", "0.5"], &["hincrbyfloat"]),
+            (&["RPUSH", "l", "a", "b", "c", "b"], &["rpush"]),
+            (&["LSET", "l", "0", "z"], &["lset"]),
+            (&["LINSERT", "l", "BEFORE", "c", "y"], &["linsert"]),
+            (&["LINSERT", "l", "BEFORE", "nope", "y"], &[]),
+            (&["LREM", "l", "0", "b"], &["lrem"]),
+            (&["LREM", "l", "0", "b"], &[]),
+            (&["LTRIM", "l", "0", "0"], &["ltrim"]),
+            (&["LTRIM", "missing", "0", "0"], &[]),
+            (&["LREM", "l", "0", "z"], &["lrem", "del"]),
+            (&["SADD", "s", "a"], &["sadd"]),
+            (&["SPOP", "s"], &["spop", "del"]),
+            (&["SPOP", "s"], &[]),
+            (&["ZADD", "z", "1", "a", "2", "b"], &["zadd"]),
+            (&["ZPOPMIN", "z"], &["zpopmin"]),
+            (&["ZPOPMAX", "z"], &["zpopmax", "del"]),
+            (&["RPUSH", "t", "a"], &["rpush"]),
+            (&["LTRIM", "t", "1", "0"], &["ltrim", "del"]),
+        ]);
+    }
+
+    #[test]
+    fn test_string_writes_publish_keyspace_events() {
+        assert_commands_publish(&[
+            (&["INCR", "n"], &["incrby"]),
+            (&["INCRBYFLOAT", "f", "1.5"], &["incrbyfloat"]),
+            (&["APPEND", "a", "x"], &["append"]),
+            (&["SETNX", "nx", "v"], &["set"]),
+            (&["SETNX", "nx", "w"], &[]),
+            (&["GETSET", "a", "y"], &["set"]),
+            (&["GETEX", "a", "EX", "100"], &["expire"]),
+            (&["GETEX", "a", "PERSIST"], &["persist"]),
+            (&["SETRANGE", "r", "1", "z"], &["setrange"]),
+            (&["SETBIT", "bit", "3", "1"], &["setbit"]),
+            (&["PFADD", "h", "e"], &["pfadd"]),
+            (&["GETDEL", "a"], &["del"]),
+            (&["GETDEL", "a"], &[]),
+            (&["MSETNX", "m1", "1"], &["set"]),
+        ]);
     }
 
     #[monoio::test]
