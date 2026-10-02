@@ -478,6 +478,13 @@ Understand what "durable" means here today before relying on it:
   a `rudis` system user.
 - Bind to a private interface (`bind <ip>`) rather than `0.0.0.0` unless the port is otherwise
   firewalled — command access control is governed by the Redis ACL model, not a network ACL.
+- ACL users follow the Redis 7 model: command categories come from the Valkey command table
+  (`+@read`, `-@dangerous`, `+config|get`), keys support `~pat` / `%R~pat` / `%W~pat` globs, and
+  channels `&pat`. New users start with no channel access (`resetchannels`, the Redis 7 default),
+  and commands run from Lua scripts are checked against the calling user. Selectors and
+  `acl-pubsub-default` are not supported; unsupported or unknown rules are rejected rather than
+  ignored. After updating the command table, regenerate `src/acl_categories.rs` with
+  `scripts/gen_acl_categories.py ~/valkey > src/acl_categories.rs`.
 
 ---
 
