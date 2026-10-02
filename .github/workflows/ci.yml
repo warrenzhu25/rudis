@@ -19,8 +19,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Keep in sync with rust-toolchain.toml.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: clippy, rustfmt
 
@@ -33,7 +34,7 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 

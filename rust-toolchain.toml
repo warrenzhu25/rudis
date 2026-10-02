@@ -1,0 +1,6 @@
+# Pin the toolchain so new stable lints cannot break CI unannounced.
+# Bump deliberately (and fix any new clippy findings in the same change).
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

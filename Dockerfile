@@ -1,6 +1,7 @@
 # Multi-stage Dockerfile for high-performance io_uring Redis replacement (rudis)
 # Stage 1: Build
-FROM rust:1.85-bookworm AS builder
+# Keep in sync with rust-toolchain.toml.
+FROM rust:1.99-bookworm AS builder
 
 WORKDIR /usr/src/rudis
 
