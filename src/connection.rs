@@ -14863,7 +14863,7 @@ async fn execute_command(
             false
         }
         Command::FunctionKill => {
-            out.extend_from_slice(b"-NOTBUSY No scripts in execution.\r\n");
+            out.extend_from_slice(b"-NOTBUSY No scripts in execution right now.\r\n");
             false
         }
         Command::FunctionStats => {

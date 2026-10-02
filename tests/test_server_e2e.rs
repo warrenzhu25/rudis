@@ -11596,7 +11596,11 @@ fn test_client_setinfo_latency_pubsub_function_e2e() {
     let func_stats = send_and_read(&mut stream, b"FUNCTION STATS\r\n");
     assert!(func_stats.contains("running_script"));
     assert!(func_stats.contains("libraries_count"));
-    assert_eq!(send_and_read(&mut stream, b"FUNCTION KILL\r\n"), "+OK\r\n");
+    // Nothing is running, so Valkey replies NOTBUSY.
+    assert_eq!(
+        send_and_read(&mut stream, b"FUNCTION KILL\r\n"),
+        "-NOTBUSY No scripts in execution right now.\r\n"
+    );
 }
 
 #[test]
