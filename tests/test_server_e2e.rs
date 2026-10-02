@@ -14171,3 +14171,63 @@ fn test_protected_mode_denies_external_clients_without_password_e2e() {
     assert_eq!(external_ping(ext_ip, port), "+PONG\r\n");
     assert!(resp_cmd(&mut lo, &["CONFIG", "SET", "protected-mode", "maybe"]).starts_with("-ERR"));
 }
+
+#[test]
+fn test_mode_switch_commands_require_auth_and_acl_e2e() {
+    let port = 16993;
+    start_test_server(port, 2);
+    let mut admin = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert_eq!(
+        resp_cmd(&mut admin, &["CONFIG", "SET", "requirepass", "pw"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut admin, &["AUTH", "pw"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(
+            &mut admin,
+            &[
+                "ACL",
+                "SETUSER",
+                "sub",
+                "on",
+                ">p",
+                "-@all",
+                "+subscribe",
+                "+auth",
+                "~*"
+            ]
+        ),
+        "+OK\r\n"
+    );
+
+    // Unauthenticated: PSYNC/SYNC/SUBSCRIBE are refused and must not stream data.
+    admin.write_all(b"SET secret v\r\n").unwrap();
+    let _ = admin.read(&mut [0u8; 64]);
+    let mut anon = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    anon.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    for cmd in [
+        &["PSYNC", "?", "-1"][..],
+        &["SYNC"][..],
+        &["SUBSCRIBE", "ch"][..],
+    ] {
+        let r = resp_cmd(&mut anon, cmd);
+        assert!(r.starts_with("-NOAUTH"), "{:?} -> {}", cmd, r);
+    }
+    // Still a normal connection afterwards.
+    assert!(resp_cmd(&mut anon, &["GET", "secret"]).starts_with("-NOAUTH"));
+
+    // Authenticated but not permitted: NOPERM, no replication stream.
+    let mut limited = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    limited
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    assert_eq!(resp_cmd(&mut limited, &["AUTH", "sub", "p"]), "+OK\r\n");
+    let r = resp_cmd(&mut limited, &["PSYNC", "?", "-1"]);
+    assert!(r.starts_with("-NOPERM"), "{}", r);
+
+    // Allowed SUBSCRIBE enters pub/sub mode with the same user, so ACLs still apply there.
+    let r = resp_cmd(&mut limited, &["SUBSCRIBE", "ch"]);
+    assert!(r.contains("subscribe"), "{}", r);
+    let r = resp_cmd(&mut limited, &["PSUBSCRIBE", "p*"]);
+    assert!(r.starts_with("-NOPERM"), "{}", r);
+}

@@ -3263,16 +3263,11 @@ pub async fn handle_connection(
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
 
-                // 2. Transition to Pub/Sub mode if SUBSCRIBE, PSUBSCRIBE, or SSUBSCRIBE is received
-                if has_special
-                    && let Some(sub_idx) = commands.iter().position(|c| {
-                        matches!(
-                            c,
-                            Command::Subscribe(_) | Command::Psubscribe(_) | Command::Ssubscribe(_)
-                        )
-                    })
-                {
-                    for c in commands.drain(..sub_idx) {
+                // 2. Commands that hand the connection to a dedicated loop (pub/sub,
+                // replica stream, DFLY flow) never reach execute_command, so AUTH and
+                // ACL must be enforced here before switching modes.
+                while has_special && let Some(idx) = commands.iter().position(is_mode_switch_cmd) {
+                    for c in commands.drain(..idx) {
                         let _ = execute_command(
                             c,
                             &router,
@@ -3285,47 +3280,12 @@ pub async fn handle_connection(
                         )
                         .await;
                     }
-                    if !out_buf.is_empty() {
-                        stats
-                            .tot_net_out
-                            .fetch_add(out_buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                        let write_chunk = std::mem::take(&mut out_buf);
-                        let _ = stream.write_all(write_chunk).await.0;
-                    }
-                    let initial_sub = commands.remove(0);
-                    update_global_client_pubsub(router.port, client_id, true);
-                    std::mem::forget(_cleanup);
-                    run_pubsub_loop(
-                        stream,
-                        client_id,
-                        client_registry,
-                        router,
-                        initial_sub,
-                        commands,
-                        buf,
-                    )
-                    .await;
-                    return;
-                }
-
-                // 2.5 Transition to Replica Stream mode if PSYNC is received
-                if has_special
-                    && let Some(psync_idx) = commands
-                        .iter()
-                        .position(|c| matches!(c, Command::Psync { .. } | Command::Sync))
-                {
-                    for c in commands.drain(..psync_idx) {
-                        let _ = execute_command(
-                            c,
-                            &router,
-                            client_id,
-                            &client_registry,
-                            &mut out_buf,
-                            &mut asking,
-                            &mut authenticated,
-                            &mut auth_user,
-                        )
-                        .await;
+                    if let Some(err) =
+                        mode_switch_denied(&commands[0], router.port, authenticated, &auth_user)
+                    {
+                        commands.remove(0);
+                        out_buf.extend_from_slice(&err);
+                        continue;
                     }
                     if !out_buf.is_empty() {
                         stats
@@ -3334,47 +3294,37 @@ pub async fn handle_connection(
                         let write_chunk = std::mem::take(&mut out_buf);
                         let _ = stream.write_all(write_chunk).await.0;
                     }
-                    let psync_cmd = commands.remove(0);
-                    run_master_replica_stream(
-                        stream,
-                        client_id,
-                        client_registry,
-                        router,
-                        psync_cmd,
-                    )
-                    .await;
-                    return;
-                }
-
-                // 2.6 Transition to Shard Replication Flow mode if DFLY FLOW is received
-                if has_special
-                    && let Some(flow_idx) = commands
-                        .iter()
-                        .position(|c| matches!(c, Command::DflyFlow { .. }))
-                {
-                    for c in commands.drain(..flow_idx) {
-                        let _ = execute_command(
-                            c,
-                            &router,
-                            client_id,
-                            &client_registry,
-                            &mut out_buf,
-                            &mut asking,
-                            &mut authenticated,
-                            &mut auth_user,
-                        )
-                        .await;
-                    }
-                    if !out_buf.is_empty() {
-                        stats
-                            .tot_net_out
-                            .fetch_add(out_buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                        let write_chunk = std::mem::take(&mut out_buf);
-                        let _ = stream.write_all(write_chunk).await.0;
-                    }
-                    let flow_cmd = commands.remove(0);
-                    if let Command::DflyFlow { shard_id, lsn, .. } = flow_cmd {
-                        run_shard_replication_flow(stream, client_id, router, shard_id, lsn).await;
+                    let switch_cmd = commands.remove(0);
+                    match switch_cmd {
+                        Command::Psync { .. } | Command::Sync => {
+                            run_master_replica_stream(
+                                stream,
+                                client_id,
+                                client_registry,
+                                router,
+                                switch_cmd,
+                            )
+                            .await;
+                        }
+                        Command::DflyFlow { shard_id, lsn, .. } => {
+                            run_shard_replication_flow(stream, client_id, router, shard_id, lsn)
+                                .await;
+                        }
+                        initial_sub => {
+                            update_global_client_pubsub(router.port, client_id, true);
+                            std::mem::forget(_cleanup);
+                            run_pubsub_loop(
+                                stream,
+                                client_id,
+                                client_registry,
+                                router,
+                                initial_sub,
+                                commands,
+                                buf,
+                                auth_user,
+                            )
+                            .await;
+                        }
                     }
                     return;
                 }
@@ -3782,6 +3732,7 @@ async fn run_pubsub_loop(
     initial_sub: Command,
     pending_cmds: Vec<Command>,
     mut buf: BytesMut,
+    auth_user: String,
 ) {
     struct PubsubCleanup {
         client_id: u64,
@@ -3872,8 +3823,10 @@ async fn run_pubsub_loop(
     let mut in_multi = false;
     let mut tx_queue: Vec<Command> = Vec::new();
     let mut asking = false;
+    // Only reachable after mode_switch_denied() passed, i.e. already authenticated;
+    // keep the real user so ACLs keep applying inside pub/sub mode.
     let mut authenticated = true;
-    let mut auth_user = "default".to_string();
+    let mut auth_user = auth_user;
 
     async fn handle_pubsub_cmd(
         cmd: Command,
@@ -3935,6 +3888,12 @@ async fn run_pubsub_loop(
                     let mut exec_results = Vec::new();
                     for qcmd in queue {
                         let mut item_out = Vec::new();
+                        if let Some(err) =
+                            mode_switch_denied(&qcmd, router.port, *authenticated, auth_user)
+                        {
+                            exec_results.push(err);
+                            continue;
+                        }
                         match qcmd {
                             Command::Subscribe(channels) => {
                                 let mut hub = router.pubsub.borrow_mut();
@@ -4097,6 +4056,11 @@ async fn run_pubsub_loop(
             *in_multi = true;
             tx_queue.clear();
             out.extend_from_slice(b"+OK\r\n");
+            return false;
+        }
+
+        if let Some(err) = mode_switch_denied(&cmd, router.port, *authenticated, auth_user) {
+            out.extend_from_slice(&err);
             return false;
         }
 
@@ -7255,6 +7219,56 @@ async fn resolve_stream_last_ids(router: &Router, keys: &[Bytes], ids: &[String]
         resolved.push(last_id.unwrap_or_else(|| "0-0".to_string()));
     }
     resolved
+}
+
+/// Commands that move a connection out of the normal request loop.
+fn is_mode_switch_cmd(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Subscribe(_)
+            | Command::Psubscribe(_)
+            | Command::Ssubscribe(_)
+            | Command::Psync { .. }
+            | Command::Sync
+            | Command::DflyFlow { .. }
+    )
+}
+
+/// AUTH/ACL gate for mode-switching commands, which bypass execute_command.
+/// Returns the error reply if the client may not run `cmd`; `None` otherwise
+/// (and always `None` for commands that are not mode switches).
+fn mode_switch_denied(
+    cmd: &Command,
+    port: u16,
+    authenticated: bool,
+    auth_user: &str,
+) -> Option<Vec<u8>> {
+    if !is_mode_switch_cmd(cmd) {
+        return None;
+    }
+    if !authenticated {
+        return Some(b"-NOAUTH Authentication required.\r\n".to_vec());
+    }
+    if !crate::acl::HAS_CUSTOM_ACL.load(std::sync::atomic::Ordering::Relaxed)
+        && auth_user == "default"
+    {
+        return None;
+    }
+    let acl = crate::acl::get_acl_for_port(port);
+    let guard = acl.read().unwrap();
+    let user = guard.get_user(auth_user)?;
+    let name = get_cmd_name(cmd);
+    if user.can_execute_command(name) {
+        None
+    } else {
+        Some(
+            format!(
+                "-NOPERM this user has no permissions to run the '{}' command\r\n",
+                name.to_lowercase()
+            )
+            .into_bytes(),
+        )
+    }
 }
 
 async fn execute_command(
@@ -23641,6 +23655,37 @@ mod tests {
         buf.clear();
         write_resp_array_header(&mut buf, 1024);
         assert_eq!(buf, b"*1024\r\n");
+    }
+
+    #[test]
+    fn test_mode_switch_denied_enforces_auth_and_acl() {
+        let port = 65021;
+        let psync = Command::Psync {
+            replid: Bytes::from_static(b"?"),
+            offset: -1,
+        };
+        let sub = Command::Subscribe(vec![Bytes::from_static(b"ch")]);
+        // Not a mode switch: never gated here.
+        assert!(mode_switch_denied(&Command::Ping(None), port, false, "default").is_none());
+        // Unauthenticated clients may not switch modes.
+        for c in [&psync, &Command::Sync, &sub] {
+            let e = mode_switch_denied(c, port, false, "default").unwrap();
+            assert!(e.starts_with(b"-NOAUTH"));
+        }
+        // Authenticated default user with no custom ACL: allowed.
+        assert!(mode_switch_denied(&psync, port, true, "default").is_none());
+        // Restricted user lacks the command.
+        crate::acl::get_acl_for_port(port)
+            .write()
+            .unwrap()
+            .set_user(
+                "limited",
+                &["on", "nopass", "-@all", "+get", "+subscribe"].map(String::from),
+            )
+            .unwrap();
+        let e = mode_switch_denied(&psync, port, true, "limited").unwrap();
+        assert!(e.starts_with(b"-NOPERM"));
+        assert!(mode_switch_denied(&sub, port, true, "limited").is_none());
     }
 
     #[test]
