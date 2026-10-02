@@ -7825,7 +7825,10 @@ fn test_aof_bgrewriteaof_compaction_e2e() {
         ":2\r\n"
     );
     assert_eq!(
-        send_and_read(&mut client1, b"JSON.SET doc1 $ '{\"val\":\"compacted\"}'\r\n"),
+        send_and_read(
+            &mut client1,
+            b"JSON.SET doc1 $ '{\"val\":\"compacted\"}'\r\n"
+        ),
         "+OK\r\n"
     );
 
@@ -10699,7 +10702,10 @@ fn test_sharded_pubsub_slot_bound_e2e() {
 
     // 6. Subscribed mode restrictions: sub1 cannot execute GET or SET
     let err_resp = send_and_read(&mut sub1, b"GET key\r\n");
-    assert!(err_resp.contains("ERR Can't execute 'GET' in subscribed mode"));
+    assert!(
+        err_resp.contains("only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context"),
+        "unexpected: {err_resp}"
+    );
 
     let pong_resp = send_and_read(&mut sub1, b"PING\r\n");
     assert_eq!(pong_resp, "*2\r\n$4\r\npong\r\n$0\r\n\r\n");
