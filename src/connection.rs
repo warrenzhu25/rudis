@@ -2675,12 +2675,7 @@ async fn execute_tx_step(
                 reset_client_pubsub(router, client_id);
 
                 let acl = crate::acl::get_acl_for_port(router.port);
-                let default_requires_auth = acl
-                    .read()
-                    .unwrap()
-                    .get_user("default")
-                    .map(|u| !u.passwords.is_empty())
-                    .unwrap_or(false);
+                let default_requires_auth = acl.read().unwrap().is_auth_required_for_default();
                 *authenticated = !default_requires_auth;
                 *auth_user = "default".to_string();
 
@@ -3870,12 +3865,7 @@ async fn run_pubsub_loop(
                     reset_client_pubsub(router, client_id);
 
                     let acl = crate::acl::get_acl_for_port(router.port);
-                    let default_requires_auth = acl
-                        .read()
-                        .unwrap()
-                        .get_user("default")
-                        .map(|u| !u.passwords.is_empty())
-                        .unwrap_or(false);
+                    let default_requires_auth = acl.read().unwrap().is_auth_required_for_default();
                     *authenticated = !default_requires_auth;
                     *auth_user = "default".to_string();
 
@@ -4306,12 +4296,7 @@ async fn run_pubsub_loop(
                 reset_client_pubsub(router, client_id);
 
                 let acl = crate::acl::get_acl_for_port(router.port);
-                let default_requires_auth = acl
-                    .read()
-                    .unwrap()
-                    .get_user("default")
-                    .map(|u| !u.passwords.is_empty())
-                    .unwrap_or(false);
+                let default_requires_auth = acl.read().unwrap().is_auth_required_for_default();
                 *authenticated = !default_requires_auth;
                 *auth_user = "default".to_string();
 
@@ -9001,12 +8986,7 @@ async fn execute_command(
                         .to_string();
                     let obuf = format_client_output_buffer_limit_config();
                     let acl = crate::acl::get_acl_for_port(router.port);
-                    let pass = acl
-                        .read()
-                        .unwrap()
-                        .get_user("default")
-                        .and_then(|u| u.passwords.first().cloned())
-                        .unwrap_or_default();
+                    let pass = acl.read().unwrap().requirepass.clone().unwrap_or_default();
                     let app = if router.aof.is_some() {
                         "yes".to_string()
                     } else {
@@ -9511,21 +9491,7 @@ async fn execute_command(
                             set_max_memory_policy(&val_str);
                         } else if p_str == "requirepass" {
                             let acl = crate::acl::get_acl_for_port(router.port);
-                            let mut acl_guard = acl.write().unwrap();
-                            if let Some(user) = acl_guard.get_user_mut("default") {
-                                user.passwords.clear();
-                                user.password_hashes.clear();
-                                if !val_str.is_empty() {
-                                    user.passwords.push(val_str.to_string());
-                                    let h = crate::acl::hash_password_sha256(&val_str);
-                                    user.password_hashes.push(h);
-                                    user.nopass = false;
-                                    crate::acl::HAS_CUSTOM_ACL
-                                        .store(true, std::sync::atomic::Ordering::Release);
-                                } else {
-                                    user.nopass = true;
-                                }
-                            }
+                            acl.write().unwrap().set_requirepass(&val_str);
                         } else if p_str == "notify-keyspace-events" {
                             set_notify_keyspace_events_str(&val_str);
                         } else if p_str == "lazyfree-lazy-expire" {
@@ -11158,8 +11124,12 @@ async fn execute_command(
                             out.extend_from_slice(format!("${}\r\n{}\r\n", f.len(), f).as_bytes());
                         }
                         out.extend_from_slice(b"$9\r\npasswords\r\n");
-                        out.extend_from_slice(format!("*{}\r\n", user.passwords.len()).as_bytes());
-                        for p in &user.passwords {
+                        // Redis reports SHA-256 hex digests, never plaintext.
+                        out.extend_from_slice(
+                            format!("*{}\r\n", user.password_hashes.len()).as_bytes(),
+                        );
+                        for h in &user.password_hashes {
+                            let p = h.strip_prefix('#').unwrap_or(h);
                             out.extend_from_slice(format!("${}\r\n{}\r\n", p.len(), p).as_bytes());
                         }
                         out.extend_from_slice(b"$8\r\ncommands\r\n");
@@ -12753,12 +12723,7 @@ async fn execute_command(
             reset_client_pubsub(router, client_id);
 
             let acl = crate::acl::get_acl_for_port(router.port);
-            let default_requires_auth = acl
-                .read()
-                .unwrap()
-                .get_user("default")
-                .map(|u| !u.passwords.is_empty())
-                .unwrap_or(false);
+            let default_requires_auth = acl.read().unwrap().is_auth_required_for_default();
             *authenticated = !default_requires_auth;
             *auth_user = "default".to_string();
             out.extend_from_slice(b"+RESET\r\n");

@@ -2746,7 +2746,13 @@ fn test_auth_and_acl_e2e() {
     );
 
     let getuser = send_and_read(&mut client, b"ACL GETUSER alice\r\n");
-    assert!(getuser.contains("$9\r\nsecret123\r\n"));
+    let hex = rudis::acl::hash_password_sha256("secret123")[1..].to_string();
+    assert!(
+        getuser.contains(&format!("$64\r\n{}\r\n", hex)),
+        "{}",
+        getuser
+    );
+    assert!(!getuser.contains("secret123"), "{}", getuser);
 
     // 3. Authenticate as alice
     assert_eq!(
@@ -5887,7 +5893,7 @@ fn test_acl_permissions_and_hashed_passwords_e2e() {
 
     // 1. Create user 'carol' with restricted commands (-@all +get +ping) and restricted keys (~user:*)
     let pass = "carol_secure_pass";
-    let hash = rudis::acl::hash_password(pass);
+    let hash = rudis::acl::hash_password_sha256(pass);
     let setuser_cmd = format!("ACL SETUSER carol on {} -@all +get +acl ~user:*\r\n", hash);
     assert_eq!(
         send_and_read(&mut client, setuser_cmd.as_bytes()),
@@ -14230,4 +14236,88 @@ fn test_mode_switch_commands_require_auth_and_acl_e2e() {
     assert!(r.contains("subscribe"), "{}", r);
     let r = resp_cmd(&mut limited, &["PSUBSCRIBE", "p*"]);
     assert!(r.starts_with("-NOPERM"), "{}", r);
+}
+
+#[test]
+fn test_acl_passwords_never_stored_or_shown_in_plaintext_e2e() {
+    let port = 16994;
+    start_test_server(port, 2);
+    let mut admin = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    admin
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+
+    let pass = "dave_plaintext_pw";
+    let hash = rudis::acl::hash_password_sha256(pass); // "#<sha256 hex>"
+    let hex = &hash[1..];
+    assert_eq!(
+        resp_cmd(
+            &mut admin,
+            &[
+                "ACL",
+                "SETUSER",
+                "dave",
+                "on",
+                &format!(">{}", pass),
+                "+@all",
+                "~*"
+            ]
+        ),
+        "+OK\r\n"
+    );
+
+    // ACL LIST / GETUSER expose only the SHA-256 digest, as Redis does.
+    let list = resp_cmd(&mut admin, &["ACL", "LIST"]);
+    assert!(!list.contains(pass), "{}", list);
+    assert!(list.contains(&hash), "{}", list);
+    let getuser = resp_cmd(&mut admin, &["ACL", "GETUSER", "dave"]);
+    assert!(!getuser.contains(pass), "{}", getuser);
+    assert!(
+        getuser.contains(&format!("${}\r\n{}\r\n", hex.len(), hex)),
+        "{}",
+        getuser
+    );
+
+    // Knowing the stored hash is not enough to log in.
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    assert!(resp_cmd(&mut c, &["AUTH", "dave", &hash]).starts_with("-WRONGPASS"));
+    assert!(resp_cmd(&mut c, &["AUTH", "dave", hex]).starts_with("-WRONGPASS"));
+    assert_eq!(resp_cmd(&mut c, &["AUTH", "dave", pass]), "+OK\r\n");
+
+    // Malformed '#' rules are rejected instead of silently stored.
+    assert!(resp_cmd(&mut admin, &["ACL", "SETUSER", "eve", "#nothex"]).starts_with("-ERR"));
+
+    // A default user configured with only a '#<hash>' password requires AUTH.
+    let root_hash = rudis::acl::hash_password_sha256("rootpw");
+    assert_eq!(
+        resp_cmd(
+            &mut admin,
+            &["ACL", "SETUSER", "default", "resetpass", &root_hash]
+        ),
+        "+OK\r\n"
+    );
+    let mut anon = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    anon.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    assert!(resp_cmd(&mut anon, &["GET", "k"]).starts_with("-NOAUTH"));
+    assert_eq!(resp_cmd(&mut anon, &["AUTH", "rootpw"]), "+OK\r\n");
+
+    // requirepass round-trips through CONFIG GET without being kept in the user record.
+    assert_eq!(
+        resp_cmd(&mut admin, &["CONFIG", "SET", "requirepass", "rootpw2"]),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut admin, &["CONFIG", "GET", "requirepass"]),
+        "*2\r\n$11\r\nrequirepass\r\n$7\r\nrootpw2\r\n"
+    );
+    let list = resp_cmd(&mut admin, &["ACL", "LIST"]);
+    assert!(!list.contains("rootpw2"), "{}", list);
+    let mut anon2 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    anon2
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    assert!(resp_cmd(&mut anon2, &["PING"]).starts_with("-NOAUTH"));
+    assert!(resp_cmd(&mut anon2, &["AUTH", "rootpw"]).starts_with("-WRONGPASS"));
+    assert_eq!(resp_cmd(&mut anon2, &["AUTH", "rootpw2"]), "+OK\r\n");
 }

@@ -324,10 +324,8 @@ pub fn rewrite_config_file(port: u16) -> Result<(), String> {
 
     // If requirepass is set
     let acl = crate::acl::get_acl_for_port(port);
-    if let Some(user) = acl.read().unwrap().get_user("default")
-        && let Some(pass) = user.passwords.first()
-    {
-        directives.insert("requirepass".to_string(), pass.clone());
+    if let Some(pass) = acl.read().unwrap().requirepass.clone() {
+        directives.insert("requirepass".to_string(), pass);
     }
 
     // 3. Update existing lines or track which ones were updated

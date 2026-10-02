@@ -14,22 +14,7 @@ pub fn get_acl_for_port(port: u16) -> Arc<RwLock<AclManager>> {
         .clone()
 }
 
-pub fn hash_password(password: &str) -> String {
-    use sha1::{Digest, Sha1};
-    let mut hasher = Sha1::new();
-    hasher.update(b"rudis_acl_salt_v1:");
-    hasher.update(password.as_bytes());
-    let res = hasher.finalize();
-    let mut s = String::with_capacity(res.len() * 2 + 1);
-    s.push('#');
-    for b in res {
-        use std::fmt::Write;
-        let _ = write!(&mut s, "{:02x}", b);
-    }
-    s
-}
-
-/// Standard Redis SHA-256 hash (#<64-hex>)
+/// Redis ACL password hash: `#` + lowercase hex SHA-256 of the password.
 pub fn hash_password_sha256(password: &str) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, password.as_bytes());
     let mut s = String::with_capacity(65);
@@ -41,27 +26,28 @@ pub fn hash_password_sha256(password: &str) -> String {
     s
 }
 
-/// Modern per-user salted SHA-256 password hash
-pub fn hash_password_salted(username: &str, password: &str) -> String {
-    let mut input = Vec::with_capacity(username.len() + 1 + password.len());
-    input.extend_from_slice(username.as_bytes());
-    input.push(b':');
-    input.extend_from_slice(password.as_bytes());
-    let digest = ring::digest::digest(&ring::digest::SHA256, &input);
-    let mut s = String::with_capacity(65);
-    s.push('#');
-    for b in digest.as_ref() {
-        use std::fmt::Write;
-        let _ = write!(&mut s, "{:02x}", b);
+/// Validates and normalizes a `#<hash>` ACL rule body (64 hex chars).
+fn parse_password_hash(hex: &str) -> Result<String, String> {
+    if hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(format!("#{}", hex.to_ascii_lowercase()))
+    } else {
+        Err(format!(
+            "Error in ACL SETUSER modifier '#{}': The password hash must be exactly 64 characters and contain only lowercase hexadecimal characters",
+            hex
+        ))
     }
-    s
+}
+
+/// Constant-time equality so hash comparison timing doesn't leak a prefix match.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AclUser {
     pub name: String,
     pub enabled: bool,
-    pub passwords: Vec<String>,
+    /// `#<sha256 hex>` entries only; plaintext passwords are never stored.
     pub password_hashes: Vec<String>,
     pub nopass: bool,
     pub all_commands: bool,
@@ -76,7 +62,6 @@ impl AclUser {
         Self {
             name: "default".to_string(),
             enabled: true,
-            passwords: Vec::new(),
             password_hashes: Vec::new(),
             nopass: true,
             all_commands: true,
@@ -149,13 +134,8 @@ impl AclUser {
         if self.nopass {
             parts.push("nopass".to_string());
         } else {
-            for p in &self.passwords {
-                parts.push(format!(">{}", p));
-            }
             for h in &self.password_hashes {
-                if !self.passwords.iter().any(|p| p == h) {
-                    parts.push(h.clone());
-                }
+                parts.push(h.clone());
             }
         }
         if self.all_commands {
@@ -183,6 +163,9 @@ impl AclUser {
 
 pub struct AclManager {
     pub users: HashMap<String, AclUser>,
+    /// Value of the `requirepass` config, kept only so CONFIG GET/REWRITE can
+    /// report it like Redis does. ACL commands never expose it.
+    pub requirepass: Option<String>,
 }
 
 impl Default for AclManager {
@@ -195,7 +178,10 @@ impl AclManager {
     pub fn new() -> Self {
         let mut users = HashMap::new();
         users.insert("default".to_string(), AclUser::new_default());
-        Self { users }
+        Self {
+            users,
+            requirepass: None,
+        }
     }
 
     pub fn check_auth(
@@ -203,41 +189,58 @@ impl AclManager {
         username: Option<&str>,
         password: &str,
     ) -> Result<String, &'static str> {
+        const WRONGPASS: &str = "WRONGPASS invalid username-password pair or user is disabled.";
         let user_name = username.unwrap_or("default");
-        if let Some(user) = self.users.get(user_name) {
-            if !user.enabled {
-                return Err("WRONGPASS User is disabled");
-            }
-            if user.nopass {
-                return Ok(user_name.to_string());
-            }
-            let legacy_sha1 = hash_password(password);
-            let sha256 = hash_password_sha256(password);
-            let salted = hash_password_salted(user_name, password);
-            if user.passwords.iter().any(|p| p == password)
-                || user.password_hashes.iter().any(|h| {
-                    h == &sha256
-                        || h == &salted
-                        || h == &legacy_sha1
-                        || (h.starts_with('#') && h[1..] == sha256[1..])
-                        || h == password
-                })
-            {
-                Ok(user_name.to_string())
-            } else {
-                Err("WRONGPASS invalid username-password pair or user is disabled.")
-            }
+        let Some(user) = self.users.get(user_name) else {
+            return Err(WRONGPASS);
+        };
+        if !user.enabled {
+            return Err(WRONGPASS);
+        }
+        if user.nopass {
+            return Ok(user_name.to_string());
+        }
+        // Only the SHA-256 of the supplied password is compared; a stored hash
+        // is never accepted as a password itself.
+        let candidate = hash_password_sha256(password);
+        if user
+            .password_hashes
+            .iter()
+            .any(|h| ct_eq(h.as_bytes(), candidate.as_bytes()))
+        {
+            Ok(user_name.to_string())
         } else {
-            Err("WRONGPASS invalid username-password pair or user is disabled.")
+            Err(WRONGPASS)
         }
     }
 
+    /// Redis `authRequired()`: new connections start unauthenticated unless the
+    /// default user is enabled and `nopass`.
     pub fn is_auth_required_for_default(&self) -> bool {
-        if let Some(user) = self.users.get("default") {
-            !user.nopass && (!user.passwords.is_empty() || !user.password_hashes.is_empty())
-        } else {
-            false
+        match self.users.get("default") {
+            Some(user) => !(user.nopass && user.enabled),
+            None => true,
         }
+    }
+
+    /// Applies `requirepass`: the default user gets exactly this password
+    /// (empty string = nopass), as Redis does.
+    pub fn set_requirepass(&mut self, pass: &str) {
+        if let Some(user) = self.users.get_mut("default") {
+            user.password_hashes.clear();
+            if pass.is_empty() {
+                user.nopass = true;
+            } else {
+                user.password_hashes.push(hash_password_sha256(pass));
+                user.nopass = false;
+                HAS_CUSTOM_ACL.store(true, Ordering::Release);
+            }
+        }
+        self.requirepass = if pass.is_empty() {
+            None
+        } else {
+            Some(pass.to_string())
+        };
     }
 
     pub fn list(&self) -> Vec<String> {
@@ -271,7 +274,6 @@ impl AclManager {
             .or_insert_with(|| AclUser {
                 name: username.to_string(),
                 enabled: false,
-                passwords: Vec::new(),
                 password_hashes: Vec::new(),
                 nopass: false,
                 all_commands: false,
@@ -288,37 +290,30 @@ impl AclManager {
                 user.enabled = false;
             } else if rule == "nopass" {
                 user.nopass = true;
-                user.passwords.clear();
                 user.password_hashes.clear();
             } else if rule == "-nopass" {
                 user.nopass = false;
+            } else if rule == "resetpass" {
+                user.nopass = false;
+                user.password_hashes.clear();
             } else if let Some(p) = rule.strip_prefix('>') {
                 user.nopass = false;
-                if !user.passwords.contains(&p.to_string()) {
-                    user.passwords.push(p.to_string());
-                }
-                let h256 = hash_password_sha256(p);
-                if !user.password_hashes.contains(&h256) {
-                    user.password_hashes.push(h256);
-                }
-                let h = hash_password(p);
+                let h = hash_password_sha256(p);
                 if !user.password_hashes.contains(&h) {
                     user.password_hashes.push(h);
                 }
             } else if let Some(h) = rule.strip_prefix('#') {
+                let full_hash = parse_password_hash(h)?;
                 user.nopass = false;
-                let full_hash = format!("#{}", h);
                 if !user.password_hashes.contains(&full_hash) {
                     user.password_hashes.push(full_hash);
                 }
             } else if let Some(p) = rule.strip_prefix('<') {
-                user.passwords.retain(|pass| pass != p);
-                let h = hash_password(p);
-                user.password_hashes.retain(|pass| pass != &h && pass != p);
+                let h = hash_password_sha256(p);
+                user.password_hashes.retain(|x| *x != h);
             } else if let Some(h) = rule.strip_prefix('!') {
-                let full_hash = format!("#{}", h);
-                user.password_hashes
-                    .retain(|pass| pass != &full_hash && pass != h);
+                let full_hash = parse_password_hash(h)?;
+                user.password_hashes.retain(|x| *x != full_hash);
             } else if let Some(cat) = rule.strip_prefix("+@") {
                 let c = cat.to_lowercase();
                 if c == "all" {
@@ -445,45 +440,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_acl_salted_password_hashing() {
+    fn test_acl_passwords_stored_hashed_and_hash_not_accepted() {
         let mut mgr = AclManager::new();
         let pass = "super_secret_pw";
-        let expected_hash = hash_password(pass);
-        assert!(expected_hash.starts_with('#'));
+        let expected_hash = hash_password_sha256(pass);
+        assert_eq!(expected_hash.len(), 65);
 
-        // Set user with plaintext password: should auto-hash
         mgr.set_user(
             "alice",
-            &[
-                "on".to_string(),
-                format!(">{}", pass),
-                "+@all".to_string(),
-                "~*".to_string(),
-            ],
+            &["on", &format!(">{}", pass), "+@all", "~*"].map(String::from),
         )
         .unwrap();
-
         let alice = mgr.get_user("alice").unwrap();
-        assert!(alice.password_hashes.contains(&expected_hash));
+        assert_eq!(alice.password_hashes, vec![expected_hash.clone()]);
+        // Plaintext never appears in ACL LIST.
+        let line = alice.to_acl_list_line();
+        assert!(!line.contains(pass), "{}", line);
+        assert!(line.contains(&expected_hash));
 
-        // Authenticate with plaintext password
         assert_eq!(mgr.check_auth(Some("alice"), pass), Ok("alice".to_string()));
         assert!(mgr.check_auth(Some("alice"), "wrong_pw").is_err());
+        // The stored hash (with or without '#') must not work as a password.
+        assert!(mgr.check_auth(Some("alice"), &expected_hash).is_err());
+        assert!(mgr.check_auth(Some("alice"), &expected_hash[1..]).is_err());
 
-        // Set user directly with precomputed hash
+        // Precomputed '#<sha256>' rule (Redis format) authenticates the plaintext.
         mgr.set_user(
             "bob",
-            &[
-                "on".to_string(),
-                expected_hash.clone(),
-                "+@all".to_string(),
-                "~*".to_string(),
-            ],
+            &["on", &expected_hash.to_uppercase(), "+@all"].map(String::from),
         )
         .unwrap();
-
         assert_eq!(mgr.check_auth(Some("bob"), pass), Ok("bob".to_string()));
-        assert!(mgr.check_auth(Some("bob"), "wrong_pw").is_err());
+        // Malformed hashes are rejected instead of being stored.
+        assert!(mgr.set_user("carol", &["#abc".to_string()]).is_err());
+
+        // '<' removes a password.
+        mgr.set_user("alice", &[format!("<{}", pass)]).unwrap();
+        assert!(mgr.check_auth(Some("alice"), pass).is_err());
+    }
+
+    #[test]
+    fn test_default_user_auth_required_semantics() {
+        let mut mgr = AclManager::new();
+        assert!(!mgr.is_auth_required_for_default());
+        // A hash-only password still requires auth (no plaintext stored).
+        mgr.set_user("default", &[hash_password_sha256("x")])
+            .unwrap();
+        assert!(mgr.is_auth_required_for_default());
+        mgr.set_requirepass("");
+        assert!(!mgr.is_auth_required_for_default());
+        assert_eq!(mgr.requirepass, None);
+        mgr.set_requirepass("pw");
+        assert!(mgr.is_auth_required_for_default());
+        assert_eq!(mgr.requirepass.as_deref(), Some("pw"));
+        assert!(mgr.check_auth(None, "pw").is_ok());
+        // Disabled default user: auth required even if nopass.
+        mgr.set_user("default", &["nopass".to_string(), "off".to_string()])
+            .unwrap();
+        assert!(mgr.is_auth_required_for_default());
     }
 
     #[test]
