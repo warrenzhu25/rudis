@@ -185,7 +185,7 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
                     let now_ms = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
-                        .as_millis() as u128;
+                        .as_millis();
                     now_ms + ms
                 } else {
                     ms

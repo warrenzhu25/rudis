@@ -489,10 +489,11 @@ pub fn execute_geo_query(
     let mut last_processed: Option<GeoHashBits> = None;
 
     for hash_box in areas {
-        if let Some(last) = last_processed {
-            if last.bits == hash_box.bits && last.step == hash_box.step {
-                continue;
-            }
+        if let Some(last) = last_processed
+            && last.bits == hash_box.bits
+            && last.step == hash_box.step
+        {
+            continue;
         }
         last_processed = Some(hash_box);
 

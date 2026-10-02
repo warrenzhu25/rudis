@@ -1885,21 +1885,84 @@ impl Command {
                 }
                 !crate::scripting::is_function_read_only(function)
             }
-            _ => match crate::connection::get_cmd_name(self) {
-                "SET" | "SETEX" | "PSETEX" | "SETNX" | "MSET" | "MSETNX" | "MSETEX" | "GETSET"
-                | "GETDEL" | "APPEND" | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "INCRBYFLOAT"
-                | "DEL" | "UNLINK" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT"
-                | "PERSIST" | "HEXPIRE" | "HEXPIREAT" | "HPEXPIRE" | "HPEXPIREAT" | "HPERSIST"
-                | "HSETEX" | "HSET" | "HSETNX" | "HMSET" | "HDEL" | "HINCRBY" | "HINCRBYFLOAT"
-                | "LPUSH" | "RPUSH" | "LPUSHX" | "RPUSHX" | "LPOP" | "RPOP" | "LSET" | "LTRIM"
-                | "LREM" | "LMOVE" | "BLMOVE" | "BLPOP" | "BRPOP" | "BRPOPLPUSH" | "LMPOP"
-                | "BLMPOP" | "SADD" | "SREM" | "SPOP" | "SMOVE" | "ZADD" | "ZINCRBY" | "ZREM"
-                | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "ZREMRANGEBYLEX" | "ZPOPMAX"
-                | "ZPOPMIN" | "BZPOPMAX" | "BZPOPMIN" | "ZMPOP" | "BZMPOP" | "XADD" | "XDEL"
-                | "XTRIM" | "XGROUP" | "XACK" | "XCLAIM" | "XAUTOCLAIM" | "FLUSHDB"
-                | "FLUSHALL" => true,
-                _ => false,
-            },
+            _ => matches!(
+                crate::connection::get_cmd_name(self),
+                "SET"
+                    | "SETEX"
+                    | "PSETEX"
+                    | "SETNX"
+                    | "MSET"
+                    | "MSETNX"
+                    | "MSETEX"
+                    | "GETSET"
+                    | "GETDEL"
+                    | "APPEND"
+                    | "INCR"
+                    | "DECR"
+                    | "INCRBY"
+                    | "DECRBY"
+                    | "INCRBYFLOAT"
+                    | "DEL"
+                    | "UNLINK"
+                    | "EXPIRE"
+                    | "PEXPIRE"
+                    | "EXPIREAT"
+                    | "PEXPIREAT"
+                    | "PERSIST"
+                    | "HEXPIRE"
+                    | "HEXPIREAT"
+                    | "HPEXPIRE"
+                    | "HPEXPIREAT"
+                    | "HPERSIST"
+                    | "HSETEX"
+                    | "HSET"
+                    | "HSETNX"
+                    | "HMSET"
+                    | "HDEL"
+                    | "HINCRBY"
+                    | "HINCRBYFLOAT"
+                    | "LPUSH"
+                    | "RPUSH"
+                    | "LPUSHX"
+                    | "RPUSHX"
+                    | "LPOP"
+                    | "RPOP"
+                    | "LSET"
+                    | "LTRIM"
+                    | "LREM"
+                    | "LMOVE"
+                    | "BLMOVE"
+                    | "BLPOP"
+                    | "BRPOP"
+                    | "BRPOPLPUSH"
+                    | "LMPOP"
+                    | "BLMPOP"
+                    | "SADD"
+                    | "SREM"
+                    | "SPOP"
+                    | "SMOVE"
+                    | "ZADD"
+                    | "ZINCRBY"
+                    | "ZREM"
+                    | "ZREMRANGEBYRANK"
+                    | "ZREMRANGEBYSCORE"
+                    | "ZREMRANGEBYLEX"
+                    | "ZPOPMAX"
+                    | "ZPOPMIN"
+                    | "BZPOPMAX"
+                    | "BZPOPMIN"
+                    | "ZMPOP"
+                    | "BZMPOP"
+                    | "XADD"
+                    | "XDEL"
+                    | "XTRIM"
+                    | "XGROUP"
+                    | "XACK"
+                    | "XCLAIM"
+                    | "XAUTOCLAIM"
+                    | "FLUSHDB"
+                    | "FLUSHALL"
+            ),
         }
     }
 }
@@ -1999,10 +2062,10 @@ fn parse_min_idle_time(s: &str) -> Result<u64, String> {
         return Err("ERR min-idle-time is not an integer".to_string());
     }
     if s.starts_with('-') {
-        if let Ok(val) = s.parse::<i64>() {
-            if val < 0 {
-                return Err("ERR min-idle-time must be a positive integer".to_string());
-            }
+        if let Ok(val) = s.parse::<i64>()
+            && val < 0
+        {
+            return Err("ERR min-idle-time must be a positive integer".to_string());
         }
         return Err("ERR min-idle-time is not an integer".to_string());
     }
@@ -7017,10 +7080,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     if args.len() != 3 {
                         return Err("wrong number of arguments for 'pfdebug' command".to_string());
                     }
-                    let on = match args[2].to_ascii_lowercase().as_slice() {
-                        b"on" | b"1" | b"yes" => true,
-                        _ => false,
-                    };
+                    let on = matches!(
+                        args[2].to_ascii_lowercase().as_slice(),
+                        b"on" | b"1" | b"yes"
+                    );
                     Ok(Some(Command::PfdebugSimd(on)))
                 }
                 _ => Err("unknown subcommand for 'pfdebug' command".to_string()),
@@ -7392,10 +7455,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     _ => return Err("syntax error".to_string()),
                 }
             }
-            if let (Some(c), Some(mc)) = (count, maxcount) {
-                if mc < c {
-                    return Err("ERR MAXCOUNT must be greater than or equal to COUNT".to_string());
-                }
+            if let (Some(c), Some(mc)) = (count, maxcount)
+                && mc < c
+            {
+                return Err("ERR MAXCOUNT must be greater than or equal to COUNT".to_string());
             }
             let rem = args.len() - i;
             if rem < 2 || !rem.is_multiple_of(2) {
@@ -7578,7 +7641,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         let val: i64 = s
                             .parse()
                             .map_err(|_| "ERR value is not an integer or out of range")?;
-                        if val < 1 || val > 86400 {
+                        if !(1..=86400).contains(&val) {
                             return Err("ERR IDMP-DURATION must be between 1 and 86400".to_string());
                         }
                         duration = Some(val as u64);
@@ -7596,7 +7659,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         let val: i64 = s
                             .parse()
                             .map_err(|_| "ERR value is not an integer or out of range")?;
-                        if val < 1 || val > 10000 {
+                        if !(1..=10000).contains(&val) {
                             return Err("ERR IDMP-MAXSIZE must be between 1 and 10000".to_string());
                         }
                         maxsize = Some(val as usize);
@@ -8075,10 +8138,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 (Some(g), Some(c)) => (g, c),
                 _ => return Err("syntax error".to_string()),
             };
-            if let (Some(c), Some(mc)) = (count, maxcount) {
-                if mc < c {
-                    return Err("ERR MAXCOUNT must be greater than or equal to COUNT".to_string());
-                }
+            if let (Some(c), Some(mc)) = (count, maxcount)
+                && mc < c
+            {
+                return Err("ERR MAXCOUNT must be greater than or equal to COUNT".to_string());
             }
             let rem = args.len() - i;
             if rem < 2 || !rem.is_multiple_of(2) {
@@ -8158,12 +8221,12 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         let s = std::str::from_utf8(&args[i + 1])
                             .map_err(|_| "ERR value is not an integer or out of range")?;
                         if s.starts_with('-') {
-                            if let Ok(rc_i) = s.parse::<i64>() {
-                                if rc_i < 0 {
-                                    return Err(
-                                        "ERR Invalid RETRYCOUNT value, must be >= 0".to_string()
-                                    );
-                                }
+                            if let Ok(rc_i) = s.parse::<i64>()
+                                && rc_i < 0
+                            {
+                                return Err(
+                                    "ERR Invalid RETRYCOUNT value, must be >= 0".to_string()
+                                );
                             }
                             return Err("ERR value is not an integer or out of range".to_string());
                         }
@@ -8471,13 +8534,12 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         return Err("ERR FIELDS keyword specified multiple times".to_string());
                     }
                     fields_idx = Some(i);
-                    if i + 1 < args.len() {
-                        if let Ok(n) = parse_integer(&args[i + 1]) {
-                            if n > 0 {
-                                i += 2 + n as usize;
-                                continue;
-                            }
-                        }
+                    if i + 1 < args.len()
+                        && let Ok(n) = parse_integer(&args[i + 1])
+                        && n > 0
+                    {
+                        i += 2 + n as usize;
+                        continue;
                     }
                     i += 1;
                 } else {
@@ -8582,13 +8644,12 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         return Err("ERR FIELDS keyword specified multiple times".to_string());
                     }
                     fields_idx = Some(i);
-                    if i + 1 < args.len() {
-                        if let Ok(n) = parse_integer(&args[i + 1]) {
-                            if n > 0 {
-                                i += 2 + (n as usize) * 2;
-                                continue;
-                            }
-                        }
+                    if i + 1 < args.len()
+                        && let Ok(n) = parse_integer(&args[i + 1])
+                        && n > 0
+                    {
+                        i += 2 + (n as usize) * 2;
+                        continue;
                     }
                     i += 1;
                 } else {
@@ -9938,10 +9999,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 };
                 if let (Some(IncrexBound::Float(lb)), Some(IncrexBound::Float(ub))) =
                     (lbound, ubound)
+                    && lb > ub
                 {
-                    if lb > ub {
-                        return Err("LBOUND can't be greater than UBOUND".to_string());
-                    }
+                    return Err("LBOUND can't be greater than UBOUND".to_string());
                 }
                 Ok(Some(Command::Increx {
                     key,
@@ -9975,10 +10035,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 } else {
                     None
                 };
-                if let (Some(IncrexBound::Int(lb)), Some(IncrexBound::Int(ub))) = (lbound, ubound) {
-                    if lb > ub {
-                        return Err("LBOUND can't be greater than UBOUND".to_string());
-                    }
+                if let (Some(IncrexBound::Int(lb)), Some(IncrexBound::Int(ub))) = (lbound, ubound)
+                    && lb > ub
+                {
+                    return Err("LBOUND can't be greater than UBOUND".to_string());
                 }
                 Ok(Some(Command::Increx {
                     key,

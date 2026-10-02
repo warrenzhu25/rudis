@@ -95,13 +95,15 @@ pub fn estimate_incomplete_qbuf_cap(buf: &[u8]) -> usize {
             while end < buf.len() && buf[end].is_ascii_digit() {
                 end += 1;
             }
-            if end > start && end + 1 < buf.len() && buf[end] == b'\r' && buf[end + 1] == b'\n' {
-                if let Ok(s) = std::str::from_utf8(&buf[start..end])
-                    && let Ok(n) = s.parse::<usize>()
-                    && n <= 512 * 1024 * 1024
-                {
-                    max_bulk = max_bulk.max(n);
-                }
+            if end > start
+                && end + 1 < buf.len()
+                && buf[end] == b'\r'
+                && buf[end + 1] == b'\n'
+                && let Ok(s) = std::str::from_utf8(&buf[start..end])
+                && let Ok(n) = s.parse::<usize>()
+                && n <= 512 * 1024 * 1024
+            {
+                max_bulk = max_bulk.max(n);
             }
             i = end;
         } else {
@@ -1050,10 +1052,10 @@ pub fn record_error_stat(prefix: &str, cmd_name: Option<&str>) {
     if let Ok(mut map) = ERROR_STATS.write() {
         *map.entry(prefix.to_string()).or_insert(0) += 1;
     }
-    if let Some(cmd) = cmd_name {
-        if let Ok(mut map) = FAILED_CMD_STATS.write() {
-            *map.entry(cmd.to_lowercase()).or_insert(0) += 1;
-        }
+    if let Some(cmd) = cmd_name
+        && let Ok(mut map) = FAILED_CMD_STATS.write()
+    {
+        *map.entry(cmd.to_lowercase()).or_insert(0) += 1;
     }
 }
 
@@ -3125,12 +3127,11 @@ pub async fn handle_connection(
                             batch_bytes
                         };
                     }
-                } else if !pause_cron {
-                    if let Some(c) = client_registry.borrow_mut().get_mut(&client_id)
-                        && c.qbuf_cap > 32768
-                    {
-                        c.qbuf_cap = 16384;
-                    }
+                } else if !pause_cron
+                    && let Some(c) = client_registry.borrow_mut().get_mut(&client_id)
+                    && c.qbuf_cap > 32768
+                {
+                    c.qbuf_cap = 16384;
                 }
 
                 // 1. Parse all complete commands currently in the buffer
@@ -6682,10 +6683,10 @@ pub fn pattern_subst_and_field(pattern: &[u8], item: &[u8]) -> (Bytes, Option<By
                 arrow_pos = Some(actual_arrow);
             }
         }
-    } else if let Some(arrow) = pattern.windows(2).position(|w| w == b"->") {
-        if arrow + 2 < pattern.len() {
-            arrow_pos = Some(arrow);
-        }
+    } else if let Some(arrow) = pattern.windows(2).position(|w| w == b"->")
+        && arrow + 2 < pattern.len()
+    {
+        arrow_pos = Some(arrow);
     }
 
     let (key_pat, field) = match arrow_pos {
@@ -9093,16 +9094,15 @@ async fn execute_command(
                             && !pat_str.contains('?')
                             && !pat_str.contains('[');
                         for (name, val) in &all_configs {
-                            if (is_exact && pat_str == *name)
+                            if ((is_exact && pat_str == *name)
                                 || (!is_exact
                                     && crate::pubsub::glob_match(
                                         pat_str.as_bytes(),
                                         name.as_bytes(),
-                                    ))
+                                    )))
+                                && seen.insert(*name)
                             {
-                                if seen.insert(*name) {
-                                    matched.push((*name, val.as_str()));
-                                }
+                                matched.push((*name, val.as_str()));
                             }
                         }
                         if is_exact {
@@ -9199,19 +9199,19 @@ async fn execute_command(
                         } else if p_str == "port" {
                             match val_str.parse::<u16>() {
                                 Ok(new_port) => {
-                                    if new_port != 0 && new_port != router.port {
-                                        if let Err(e) =
+                                    if new_port != 0
+                                        && new_port != router.port
+                                        && let Err(e) =
                                             std::net::TcpListener::bind(("127.0.0.1", new_port))
-                                        {
-                                            out.extend_from_slice(
+                                    {
+                                        out.extend_from_slice(
                                                 format!(
                                                     "-ERR CONFIG SET failed (possibly related to argument 'port') - Unable to listen on this port: {}\r\n",
                                                     e
                                                 )
                                                 .as_bytes(),
                                             );
-                                            return false;
-                                        }
+                                        return false;
                                     }
                                 }
                                 Err(_) => {
@@ -9354,13 +9354,13 @@ async fn execute_command(
                                 );
                                 return false;
                             }
-                        } else if p_str == "tracking-table-max-keys" {
-                            if val_str.parse::<usize>().is_err() {
-                                out.extend_from_slice(
-                                    b"-ERR Invalid argument for CONFIG SET tracking-table-max-keys\r\n",
-                                );
-                                return false;
-                            }
+                        } else if p_str == "tracking-table-max-keys"
+                            && val_str.parse::<usize>().is_err()
+                        {
+                            out.extend_from_slice(
+                                b"-ERR Invalid argument for CONFIG SET tracking-table-max-keys\r\n",
+                            );
+                            return false;
                         }
                     }
 
@@ -10605,18 +10605,18 @@ async fn execute_command(
                             }
                             let need_aof = router.aof.is_some();
                             let need_rep = crate::replication::has_connected_replicas(router.port);
-                            if need_aof || need_rep {
-                                if let Some(bytes) = crate::aof::command_to_resp(&rep) {
-                                    if let Some(aof_writer) = router.aof.as_deref() {
-                                        aof_writer.borrow_mut().append(&bytes);
-                                    }
-                                    if need_rep {
-                                        crate::replication::propagate_shard_bytes(
-                                            router.port,
-                                            router.shard_id,
-                                            &bytes,
-                                        );
-                                    }
+                            if (need_aof || need_rep)
+                                && let Some(bytes) = crate::aof::command_to_resp(&rep)
+                            {
+                                if let Some(aof_writer) = router.aof.as_deref() {
+                                    aof_writer.borrow_mut().append(&bytes);
+                                }
+                                if need_rep {
+                                    crate::replication::propagate_shard_bytes(
+                                        router.port,
+                                        router.shard_id,
+                                        &bytes,
+                                    );
                                 }
                             }
                         }
@@ -11470,23 +11470,23 @@ async fn execute_command(
             // 1. Cluster checks
             if router.cluster_enabled {
                 let key_slot = crate::router::key_slot(key);
-                if let Some(dest) = store {
-                    if key_slot != crate::router::key_slot(dest) {
-                        out.extend_from_slice(
-                            b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
-                        );
-                        return false;
-                    }
+                if let Some(dest) = store
+                    && key_slot != crate::router::key_slot(dest)
+                {
+                    out.extend_from_slice(
+                        b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                    );
+                    return false;
                 }
-                if let Some(by_pat) = by {
-                    if by_pat.contains(&b'*') {
-                        let by_slot = crate::router::pattern_hash_slot(by_pat);
-                        if by_slot != Some(key_slot) {
-                            out.extend_from_slice(
+                if let Some(by_pat) = by
+                    && by_pat.contains(&b'*')
+                {
+                    let by_slot = crate::router::pattern_hash_slot(by_pat);
+                    if by_slot != Some(key_slot) {
+                        out.extend_from_slice(
                                 b"-ERR BY option of SORT denied in Cluster mode when keys formed by the pattern may be in different slots.\r\n",
                             );
-                            return false;
-                        }
+                        return false;
                     }
                 }
                 for get_pat in get {
@@ -14744,7 +14744,7 @@ async fn execute_command(
             if crate::scripting::delete_function(&lib) {
                 out.extend_from_slice(b"+OK\r\n");
             } else {
-                write_resp_err(out, format!("ERR Library not found"));
+                write_resp_err(out, "ERR Library not found");
             }
             false
         }
@@ -18728,13 +18728,13 @@ pub fn execute_local_command(
                 Ok(()) => {
                     record_change!(cmd);
                     notify_keyspace_event(NOTIFY_GENERIC, "restore", key);
-                    if let Some(prev) = prev_type {
-                        if prev != "none" {
-                            notify_keyspace_event(NOTIFY_OVERWRITTEN, "overwritten", key);
-                            let new_type = db.type_of(key.as_ref());
-                            if prev != new_type {
-                                notify_keyspace_event(NOTIFY_TYPE_CHANGED, "type_changed", key);
-                            }
+                    if let Some(prev) = prev_type
+                        && prev != "none"
+                    {
+                        notify_keyspace_event(NOTIFY_OVERWRITTEN, "overwritten", key);
+                        let new_type = db.type_of(key.as_ref());
+                        if prev != new_type {
+                            notify_keyspace_event(NOTIFY_TYPE_CHANGED, "type_changed", key);
                         }
                     }
                     out.extend_from_slice(b"+OK\r\n");
@@ -22298,7 +22298,7 @@ pub fn execute_local_command(
             false
         }
         Command::Latency(sub) => {
-            write_latency_response(&sub, out);
+            write_latency_response(sub, out);
             false
         }
         Command::PubsubHelp => {

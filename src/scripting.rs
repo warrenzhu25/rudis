@@ -83,10 +83,10 @@ pub fn is_script_read_only(script: &[u8]) -> bool {
     {
         let header = rest.lines().next().unwrap_or("");
         for token in header.split_whitespace() {
-            if let Some(flags_str) = token.strip_prefix("flags=") {
-                if flags_str.split(',').any(|f| f == "no-writes") {
-                    return true;
-                }
+            if let Some(flags_str) = token.strip_prefix("flags=")
+                && flags_str.split(',').any(|f| f == "no-writes")
+            {
+                return true;
             }
         }
     }
@@ -241,10 +241,10 @@ pub fn load_function(code: &str, replace: bool) -> Result<String, String> {
         let (k, v) = pair.map_err(|e| e.to_string())?;
         real_g.set(k, v).map_err(|e| e.to_string())?;
     }
-    if let Ok(table_mod) = real_g.get::<mlua::Table>("table") {
-        if let Ok(unpack_fn) = table_mod.get::<mlua::Function>("unpack") {
-            let _ = real_g.set("unpack", unpack_fn);
-        }
+    if let Ok(table_mod) = real_g.get::<mlua::Table>("table")
+        && let Ok(unpack_fn) = table_mod.get::<mlua::Function>("unpack")
+    {
+        let _ = real_g.set("unpack", unpack_fn);
     }
     // Remove globals not allowed during FUNCTION LOAD
     for disallowed in [
@@ -842,11 +842,11 @@ pub fn call_function(
                     _ => {}
                 }
             }
-            if let (Some(name), Some(f)) = (name_opt, func_opt) {
-                if name.to_lowercase() == target_name_lower {
-                    let key = lua.create_registry_value(f)?;
-                    *target_fn_clone.borrow_mut() = Some(key);
-                }
+            if let (Some(name), Some(f)) = (name_opt, func_opt)
+                && name.to_lowercase() == target_name_lower
+            {
+                let key = lua.create_registry_value(f)?;
+                *target_fn_clone.borrow_mut() = Some(key);
             }
             Ok(())
         })
@@ -1074,12 +1074,11 @@ fn setup_redis_lua_env(
 
     if let Ok(os_tbl) = real_g.get::<mlua::Table>("os") {
         for pair in os_tbl.clone().pairs::<Value, Value>() {
-            if let Ok((k, _)) = pair {
-                if let Value::String(s) = &k {
-                    if s.as_bytes() != b"clock" {
-                        let _ = os_tbl.set(k, Value::Nil);
-                    }
-                }
+            if let Ok((k, _)) = pair
+                && let Value::String(s) = &k
+                && s.as_bytes() != b"clock"
+            {
+                let _ = os_tbl.set(k, Value::Nil);
             }
         }
     }
@@ -2349,10 +2348,7 @@ fn register_redis_module(
     redis.set("status_reply", status_reply)?;
 
     let error_reply = lua.create_function(|lua, msg: String| {
-        let clean = msg
-            .replace("\r\n", "  ")
-            .replace('\r', " ")
-            .replace('\n', " ");
+        let clean = msg.replace("\r\n", "  ").replace(['\r', '\n'], " ");
         let final_msg = if clean.is_empty() {
             "ERR".to_string()
         } else {
@@ -2717,10 +2713,7 @@ fn lua_val_to_resp_with_depth(
                 return Ok(());
             }
             if let Ok(err_str) = t.raw_get::<String>("err") {
-                let sanitized = err_str
-                    .replace("\r\n", "  ")
-                    .replace('\r', " ")
-                    .replace('\n', " ");
+                let sanitized = err_str.replace("\r\n", "  ").replace(['\r', '\n'], " ");
                 let final_err = if sanitized.is_empty() || sanitized == "ERR" {
                     "ERR ".to_string()
                 } else {

@@ -1107,6 +1107,12 @@ pub struct IdmpProducer {
     pub order: std::collections::VecDeque<Bytes>,
 }
 
+impl Default for IdmpProducer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IdmpProducer {
     pub fn new() -> Self {
         Self {
@@ -1215,11 +1221,11 @@ impl RudisStream {
         let chunk_size = STREAM_NODE_MAX_ENTRIES
             .load(std::sync::atomic::Ordering::Relaxed)
             .max(1);
-        if let Some(back) = self.nodes.back_mut() {
-            if back.len() < chunk_size {
-                back.push(id);
-                return;
-            }
+        if let Some(back) = self.nodes.back_mut()
+            && back.len() < chunk_size
+        {
+            back.push(id);
+            return;
         }
         self.nodes.push_back(vec![id]);
     }
@@ -1260,13 +1266,13 @@ impl RudisStream {
         } else if cmp_last == std::cmp::Ordering::Greater {
             return None;
         }
-        if let Some(fid) = first_id {
-            if max_deleted_entry_id == StreamId::default() || max_deleted_entry_id < fid {
-                if id < &fid {
-                    return Some(entries_added.saturating_sub(entries_len as u64));
-                } else if id == &fid {
-                    return Some(entries_added.saturating_sub(entries_len as u64) + 1);
-                }
+        if let Some(fid) = first_id
+            && (max_deleted_entry_id == StreamId::default() || max_deleted_entry_id < fid)
+        {
+            if id < &fid {
+                return Some(entries_added.saturating_sub(entries_len as u64));
+            } else if id == &fid {
+                return Some(entries_added.saturating_sub(entries_len as u64) + 1);
             }
         }
         if *id != StreamId::default() && id < &max_deleted_entry_id {
@@ -1295,14 +1301,12 @@ impl RudisStream {
             && self.max_deleted_entry_id != StreamId::default()
             && grp.last_delivered_id <= self.max_deleted_entry_id;
 
-        if let Some(fid) = first_id {
-            if grp.last_delivered_id >= fid {
-                if let Some(er) = grp.entries_read {
-                    if !has_tombstones_ahead {
-                        return Some(self.entries_added.saturating_sub(er));
-                    }
-                }
-            }
+        if let Some(fid) = first_id
+            && grp.last_delivered_id >= fid
+            && let Some(er) = grp.entries_read
+            && !has_tombstones_ahead
+        {
+            return Some(self.entries_added.saturating_sub(er));
         }
 
         if let Some(er) = self.estimate_distance_from_first_ever_entry(&grp.last_delivered_id) {
@@ -1353,12 +1357,12 @@ impl RudisStream {
         now_ms: u64,
     ) -> Option<StreamId> {
         self.purge_expired_idmp(now_ms);
-        if let Some(prod) = self.idmp_producers.get(producer) {
-            if let Some((sid, added_at)) = prod.iids.get(iid) {
-                let duration_ms = self.get_idmp_duration().saturating_mul(1000);
-                if now_ms.saturating_sub(*added_at) <= duration_ms {
-                    return Some(*sid);
-                }
+        if let Some(prod) = self.idmp_producers.get(producer)
+            && let Some((sid, added_at)) = prod.iids.get(iid)
+        {
+            let duration_ms = self.get_idmp_duration().saturating_mul(1000);
+            if now_ms.saturating_sub(*added_at) <= duration_ms {
+                return Some(*sid);
             }
         }
         None
@@ -1367,10 +1371,7 @@ impl RudisStream {
     pub fn record_idmp(&mut self, producer: Bytes, iid: Bytes, stream_id: StreamId, now_ms: u64) {
         self.purge_expired_idmp(now_ms);
         let maxsize = self.get_idmp_maxsize();
-        let prod = self
-            .idmp_producers
-            .entry(producer)
-            .or_insert_with(IdmpProducer::new);
+        let prod = self.idmp_producers.entry(producer).or_default();
         if let Some(val) = prod.iids.get_mut(&iid) {
             *val = (stream_id, now_ms);
         } else {
@@ -4710,7 +4711,7 @@ impl RudisTable {
                     IncrexTtlAction::SetPxat(ms) => Command::Set {
                         key,
                         value: rep_val,
-                        expire_in: Some(std::time::Duration::from_millis(ms as u64)),
+                        expire_in: Some(std::time::Duration::from_millis(ms)),
                         condition: crate::resp::SetCondition::None,
                         get: false,
                         keepttl: false,
@@ -4950,7 +4951,7 @@ impl RudisTable {
                     IncrexTtlAction::SetPxat(ms) => Command::Set {
                         key,
                         value: rep_val,
-                        expire_in: Some(std::time::Duration::from_millis(ms as u64)),
+                        expire_in: Some(std::time::Duration::from_millis(ms)),
                         condition: crate::resp::SetCondition::None,
                         get: false,
                         keepttl: false,
@@ -11788,7 +11789,7 @@ impl RudisTable {
         if let Some(max) = maxlen {
             if trim_strategy == StreamTrimStrategy::Acked {
                 let mut to_remove = Vec::new();
-                for (&id, _) in &stream.entries {
+                for &id in stream.entries.keys() {
                     if stream.entries.len() - to_remove.len() <= max
                         || trimmed + to_remove.len() >= max_limit
                     {
@@ -11817,10 +11818,10 @@ impl RudisTable {
                         stream.entries.remove(&id);
                         if trim_strategy == StreamTrimStrategy::DelRef {
                             for grp in stream.groups.values_mut() {
-                                if let Some(pel_entry) = grp.pel.remove(&id) {
-                                    if let Some(cons) = grp.consumers.get_mut(&pel_entry.consumer) {
-                                        cons.pel.remove(&id);
-                                    }
+                                if let Some(pel_entry) = grp.pel.remove(&id)
+                                    && let Some(cons) = grp.consumers.get_mut(&pel_entry.consumer)
+                                {
+                                    cons.pel.remove(&id);
                                 }
                             }
                         }
@@ -11834,10 +11835,10 @@ impl RudisTable {
                         stream.remove_entry_from_nodes(&id);
                         if trim_strategy == StreamTrimStrategy::DelRef {
                             for grp in stream.groups.values_mut() {
-                                if let Some(pel_entry) = grp.pel.remove(&id) {
-                                    if let Some(cons) = grp.consumers.get_mut(&pel_entry.consumer) {
-                                        cons.pel.remove(&id);
-                                    }
+                                if let Some(pel_entry) = grp.pel.remove(&id)
+                                    && let Some(cons) = grp.consumers.get_mut(&pel_entry.consumer)
+                                {
+                                    cons.pel.remove(&id);
                                 }
                             }
                         }
@@ -11852,7 +11853,7 @@ impl RudisTable {
         if let Some(min_id) = minid {
             if trim_strategy == StreamTrimStrategy::Acked {
                 let mut to_remove = Vec::new();
-                for (&id, _) in &stream.entries {
+                for &id in stream.entries.keys() {
                     if id >= min_id || trimmed + to_remove.len() >= max_limit {
                         break;
                     }
@@ -11883,10 +11884,10 @@ impl RudisTable {
                         stream.entries.remove(&id);
                         if trim_strategy == StreamTrimStrategy::DelRef {
                             for grp in stream.groups.values_mut() {
-                                if let Some(pel_entry) = grp.pel.remove(&id) {
-                                    if let Some(cons) = grp.consumers.get_mut(&pel_entry.consumer) {
-                                        cons.pel.remove(&id);
-                                    }
+                                if let Some(pel_entry) = grp.pel.remove(&id)
+                                    && let Some(cons) = grp.consumers.get_mut(&pel_entry.consumer)
+                                {
+                                    cons.pel.remove(&id);
                                 }
                             }
                         }
@@ -11903,10 +11904,10 @@ impl RudisTable {
                         stream.remove_entry_from_nodes(&id);
                         if trim_strategy == StreamTrimStrategy::DelRef {
                             for grp in stream.groups.values_mut() {
-                                if let Some(pel_entry) = grp.pel.remove(&id) {
-                                    if let Some(cons) = grp.consumers.get_mut(&pel_entry.consumer) {
-                                        cons.pel.remove(&id);
-                                    }
+                                if let Some(pel_entry) = grp.pel.remove(&id)
+                                    && let Some(cons) = grp.consumers.get_mut(&pel_entry.consumer)
+                                {
+                                    cons.pel.remove(&id);
                                 }
                             }
                         }
@@ -11979,11 +11980,11 @@ impl RudisTable {
             if let Some(entry) = self.table.get_slot_mut(idx) {
                 match &mut entry.val {
                     RudisValue::Stream(stream) => {
-                        if let (Some(p), Some(iid)) = (&pid, &iid_opt) {
-                            if let Some(dup_id) = stream.find_unexpired_idmp(p, iid, now_ms) {
-                                stream.iids_duplicates += 1;
-                                return Ok(StreamAddResult::Duplicate(dup_id));
-                            }
+                        if let (Some(p), Some(iid)) = (&pid, &iid_opt)
+                            && let Some(dup_id) = stream.find_unexpired_idmp(p, iid, now_ms)
+                        {
+                            stream.iids_duplicates += 1;
+                            return Ok(StreamAddResult::Duplicate(dup_id));
                         }
                         let final_id = Self::compute_stream_id(stream, add_id)?;
                         stream.last_id = final_id;
@@ -12155,15 +12156,14 @@ impl RudisTable {
     #[inline]
     pub fn is_non_empty_stream(&mut self, key: &[u8]) -> bool {
         let h = hash_key(key);
-        if let Some(idx) = self.table.find(key, h) {
-            if !self.check_expired_slot(idx) {
-                if let Some(entry) = self.table.get_slot(idx) {
-                    return match &entry.val {
-                        RudisValue::Stream(s) => !s.entries.is_empty(),
-                        _ => false,
-                    };
-                }
-            }
+        if let Some(idx) = self.table.find(key, h)
+            && !self.check_expired_slot(idx)
+            && let Some(entry) = self.table.get_slot(idx)
+        {
+            return match &entry.val {
+                RudisValue::Stream(s) => !s.entries.is_empty(),
+                _ => false,
+            };
         }
         false
     }
@@ -12201,22 +12201,21 @@ impl RudisTable {
                             let mut entries = Vec::new();
                             if id_str == "+" {
                                 if let Some((&last_id, fields)) = stream.entries.iter().next_back()
+                                    && entries.len() < per_stream_limit
+                                    && total_entries < max_total
                                 {
-                                    if entries.len() < per_stream_limit && total_entries < max_total
+                                    let entry_bytes: usize = 20
+                                        + fields
+                                            .iter()
+                                            .map(|(f, v)| f.len() + v.len() + 10)
+                                            .sum::<usize>();
+                                    if total_entries == 0
+                                        || total_bytes + entry_bytes <= max_bytes
+                                        || entries.is_empty()
                                     {
-                                        let entry_bytes: usize = 20
-                                            + fields
-                                                .iter()
-                                                .map(|(f, v)| f.len() + v.len() + 10)
-                                                .sum::<usize>();
-                                        if total_entries == 0
-                                            || total_bytes + entry_bytes <= max_bytes
-                                            || entries.is_empty()
-                                        {
-                                            entries.push((last_id, fields.clone()));
-                                            total_entries += 1;
-                                            total_bytes += entry_bytes;
-                                        }
+                                        entries.push((last_id, fields.clone()));
+                                        total_entries += 1;
+                                        total_bytes += entry_bytes;
                                     }
                                 }
                             } else {
@@ -12415,22 +12414,22 @@ impl RudisTable {
                             "ERR The ID specified in XSETID is smaller than the target stream top item",
                         );
                     }
-                    if let Some(ea) = entries_added {
-                        if (s.entries.len() as u64) > ea {
-                            return Err(
-                                "ERR The entries_added specified in XSETID is smaller than the target stream length",
-                            );
-                        }
+                    if let Some(ea) = entries_added
+                        && (s.entries.len() as u64) > ea
+                    {
+                        return Err(
+                            "ERR The entries_added specified in XSETID is smaller than the target stream length",
+                        );
                     }
                 }
                 s.last_id = last_id;
                 if let Some(ea) = entries_added {
                     s.entries_added = ea;
                 }
-                if let Some(md) = max_deleted_id {
-                    if md != StreamId::default() {
-                        s.max_deleted_entry_id = md;
-                    }
+                if let Some(md) = max_deleted_id
+                    && md != StreamId::default()
+                {
+                    s.max_deleted_entry_id = md;
                 }
                 Ok(())
             }
@@ -12674,15 +12673,15 @@ impl RudisTable {
                     .unwrap_or_default()
                     .as_millis() as u64;
                 s.purge_expired_idmp(now_ms);
-                if let Some(prod) = s.idmp_producers.get(&pid) {
-                    if let Some((existing_sid, _)) = prod.iids.get(&iid) {
-                        if *existing_sid == stream_id {
-                            return Ok(());
-                        } else {
-                            return Err(
-                                "ERR IID already exists for this producer with a different stream ID",
-                            );
-                        }
+                if let Some(prod) = s.idmp_producers.get(&pid)
+                    && let Some((existing_sid, _)) = prod.iids.get(&iid)
+                {
+                    if *existing_sid == stream_id {
+                        return Ok(());
+                    } else {
+                        return Err(
+                            "ERR IID already exists for this producer with a different stream ID",
+                        );
                     }
                 }
                 s.record_idmp(pid, iid, stream_id, now_ms);
@@ -14118,10 +14117,11 @@ impl RudisTable {
                             *total_entries += 1;
                             *total_bytes += entry_bytes;
 
-                            if !old_consumer.is_empty() && old_consumer != consumer {
-                                if let Some(old_c) = grp.consumers.get_mut(&old_consumer) {
-                                    old_c.pel.remove(&id);
-                                }
+                            if !old_consumer.is_empty()
+                                && old_consumer != consumer
+                                && let Some(old_c) = grp.consumers.get_mut(&old_consumer)
+                            {
+                                old_c.pel.remove(&id);
                             }
                             let new_delivery_count = del_cnt + 1;
                             if let Some(pe) = grp.pel.get_mut(&id) {
@@ -14165,10 +14165,10 @@ impl RudisTable {
                             *total_bytes += entry_bytes;
                         }
 
-                        if !new_entries.is_empty() {
-                            if let Some(cons) = grp.consumers.get_mut(&consumer) {
-                                cons.active_time_ms = Some(now);
-                            }
+                        if !new_entries.is_empty()
+                            && let Some(cons) = grp.consumers.get_mut(&consumer)
+                        {
+                            cons.active_time_ms = Some(now);
                         }
 
                         for (id, _, _) in &new_entries {
@@ -14178,7 +14178,7 @@ impl RudisTable {
                                         && stream_max_deleted != StreamId::default()
                                         && grp.last_delivered_id <= stream_max_deleted;
                                     if stream_first_id
-                                        .map_or(false, |fid| grp.last_delivered_id >= fid)
+                                        .is_some_and(|fid| grp.last_delivered_id >= fid)
                                         && !has_tombstones_ahead
                                     {
                                         grp.entries_read = Some(er + 1);
@@ -14508,10 +14508,10 @@ impl RudisTable {
                     } else {
                         now.saturating_sub(pel_entry.delivery_time_ms) as i64
                     };
-                    if let Some(min_idle) = min_idle {
-                        if idle < min_idle as i64 {
-                            continue;
-                        }
+                    if let Some(min_idle) = min_idle
+                        && idle < min_idle as i64
+                    {
+                        continue;
                     }
                     results.push((
                         id,

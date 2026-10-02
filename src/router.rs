@@ -34,14 +34,14 @@ pub fn pattern_hash_slot(pattern: &[u8]) -> Option<u16> {
             return None;
         } else if s.is_none() && b == b'{' {
             s = Some(i);
-        } else if let Some(start) = s {
-            if b == b'}' {
-                if i == start + 1 {
-                    s = None;
-                } else {
-                    let tag = &pattern[start + 1..i];
-                    return Some(crc16::State::<crc16::XMODEM>::calculate(tag) % 16384);
-                }
+        } else if let Some(start) = s
+            && b == b'}'
+        {
+            if i == start + 1 {
+                s = None;
+            } else {
+                let tag = &pattern[start + 1..i];
+                return Some(crc16::State::<crc16::XMODEM>::calculate(tag) % 16384);
             }
         }
     }
@@ -58,22 +58,22 @@ fn parse_resp_array_to_bytes(resp: &[u8]) -> Vec<Bytes> {
         None => return items,
     };
     while i < resp.len() {
-        if resp[i] == b'$' {
-            if let Some(nl) = resp[i..].windows(2).position(|w| w == b"\r\n") {
-                let len_str = &resp[i + 1..i + nl];
-                if let Ok(len) = std::str::from_utf8(len_str).unwrap_or("").parse::<isize>() {
-                    let data_start = i + nl + 2;
-                    if len < 0 {
-                        i = data_start;
-                    } else {
-                        let data_end = data_start + len as usize;
-                        if data_end <= resp.len() {
-                            items.push(Bytes::copy_from_slice(&resp[data_start..data_end]));
-                        }
-                        i = data_end + 2;
+        if resp[i] == b'$'
+            && let Some(nl) = resp[i..].windows(2).position(|w| w == b"\r\n")
+        {
+            let len_str = &resp[i + 1..i + nl];
+            if let Ok(len) = std::str::from_utf8(len_str).unwrap_or("").parse::<isize>() {
+                let data_start = i + nl + 2;
+                if len < 0 {
+                    i = data_start;
+                } else {
+                    let data_end = data_start + len as usize;
+                    if data_end <= resp.len() {
+                        items.push(Bytes::copy_from_slice(&resp[data_start..data_end]));
                     }
-                    continue;
+                    i = data_end + 2;
                 }
+                continue;
             }
         }
         break;
@@ -899,16 +899,15 @@ impl Router {
             let res = self
                 .execute_remote(target, Command::Hget { key, field })
                 .await;
-            if res.starts_with(b"$") && !res.starts_with(b"$-1") {
-                if let Some(pos) = res.windows(2).position(|w| w == b"\r\n") {
-                    let len_str = &res[1..pos];
-                    if let Ok(len) = std::str::from_utf8(len_str).unwrap_or("").parse::<usize>() {
-                        let data_start = pos + 2;
-                        if data_start + len <= res.len() {
-                            return Some(Bytes::copy_from_slice(
-                                &res[data_start..data_start + len],
-                            ));
-                        }
+            if res.starts_with(b"$")
+                && !res.starts_with(b"$-1")
+                && let Some(pos) = res.windows(2).position(|w| w == b"\r\n")
+            {
+                let len_str = &res[1..pos];
+                if let Ok(len) = std::str::from_utf8(len_str).unwrap_or("").parse::<usize>() {
+                    let data_start = pos + 2;
+                    if data_start + len <= res.len() {
+                        return Some(Bytes::copy_from_slice(&res[data_start..data_start + len]));
                     }
                 }
             }
@@ -936,15 +935,13 @@ impl Router {
                     },
                 )
                 .await;
-            if res.starts_with(b":") {
-                if let Some(pos) = res.windows(2).position(|w| w == b"\r\n") {
-                    if let Ok(cnt) = std::str::from_utf8(&res[1..pos])
-                        .unwrap_or("")
-                        .parse::<usize>()
-                    {
-                        return cnt;
-                    }
-                }
+            if res.starts_with(b":")
+                && let Some(pos) = res.windows(2).position(|w| w == b"\r\n")
+                && let Ok(cnt) = std::str::from_utf8(&res[1..pos])
+                    .unwrap_or("")
+                    .parse::<usize>()
+            {
+                return cnt;
             }
             0
         }

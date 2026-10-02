@@ -153,8 +153,8 @@ pub fn hll_decode_registers(bytes: &[u8]) -> Result<[u8; 16384], &'static str> {
     let mut regs = [0u8; 16384];
     if encoding == HLL_DENSE {
         let dense_data = &bytes[HLL_HDR_SIZE..];
-        for i in 0..16384 {
-            regs[i] = hll_dense_get_register(dense_data, i);
+        for (i, reg) in regs.iter_mut().enumerate() {
+            *reg = hll_dense_get_register(dense_data, i);
         }
     } else {
         let mut reg_idx = 0;
