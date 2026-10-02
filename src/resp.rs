@@ -1844,7 +1844,9 @@ impl Command {
 
     pub fn is_write_command(&self) -> bool {
         match self {
-            Command::Eval { script, read_only, .. } => {
+            Command::Eval {
+                script, read_only, ..
+            } => {
                 if *read_only {
                     return false;
                 }
@@ -1873,29 +1875,31 @@ impl Command {
                     false
                 }
             }
-            Command::Fcall { function, read_only, .. } => {
+            Command::Fcall {
+                function,
+                read_only,
+                ..
+            } => {
                 if *read_only {
                     return false;
                 }
                 !crate::scripting::is_function_read_only(function)
             }
-            _ => {
-                match crate::connection::get_cmd_name(self) {
-                    "SET" | "SETEX" | "PSETEX" | "SETNX" | "MSET" | "MSETNX" | "MSETEX"
-                    | "GETSET" | "GETDEL" | "APPEND" | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "INCRBYFLOAT"
-                    | "DEL" | "UNLINK" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT" | "PERSIST"
-                    | "HEXPIRE" | "HEXPIREAT" | "HPEXPIRE" | "HPEXPIREAT" | "HPERSIST" | "HSETEX"
-                    | "HSET" | "HSETNX" | "HMSET" | "HDEL" | "HINCRBY" | "HINCRBYFLOAT"
-                    | "LPUSH" | "RPUSH" | "LPUSHX" | "RPUSHX" | "LPOP" | "RPOP" | "LSET" | "LTRIM" | "LREM" | "LMOVE"
-                    | "BLMOVE" | "BLPOP" | "BRPOP" | "BRPOPLPUSH" | "LMPOP" | "BLMPOP"
-                    | "SADD" | "SREM" | "SPOP" | "SMOVE"
-                    | "ZADD" | "ZINCRBY" | "ZREM" | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "ZREMRANGEBYLEX"
-                    | "ZPOPMAX" | "ZPOPMIN" | "BZPOPMAX" | "BZPOPMIN" | "ZMPOP" | "BZMPOP"
-                    | "XADD" | "XDEL" | "XTRIM" | "XGROUP" | "XACK" | "XCLAIM" | "XAUTOCLAIM"
-                    | "FLUSHDB" | "FLUSHALL" => true,
-                    _ => false,
-                }
-            }
+            _ => match crate::connection::get_cmd_name(self) {
+                "SET" | "SETEX" | "PSETEX" | "SETNX" | "MSET" | "MSETNX" | "MSETEX" | "GETSET"
+                | "GETDEL" | "APPEND" | "INCR" | "DECR" | "INCRBY" | "DECRBY" | "INCRBYFLOAT"
+                | "DEL" | "UNLINK" | "EXPIRE" | "PEXPIRE" | "EXPIREAT" | "PEXPIREAT"
+                | "PERSIST" | "HEXPIRE" | "HEXPIREAT" | "HPEXPIRE" | "HPEXPIREAT" | "HPERSIST"
+                | "HSETEX" | "HSET" | "HSETNX" | "HMSET" | "HDEL" | "HINCRBY" | "HINCRBYFLOAT"
+                | "LPUSH" | "RPUSH" | "LPUSHX" | "RPUSHX" | "LPOP" | "RPOP" | "LSET" | "LTRIM"
+                | "LREM" | "LMOVE" | "BLMOVE" | "BLPOP" | "BRPOP" | "BRPOPLPUSH" | "LMPOP"
+                | "BLMPOP" | "SADD" | "SREM" | "SPOP" | "SMOVE" | "ZADD" | "ZINCRBY" | "ZREM"
+                | "ZREMRANGEBYRANK" | "ZREMRANGEBYSCORE" | "ZREMRANGEBYLEX" | "ZPOPMAX"
+                | "ZPOPMIN" | "BZPOPMAX" | "BZPOPMIN" | "ZMPOP" | "BZMPOP" | "XADD" | "XDEL"
+                | "XTRIM" | "XGROUP" | "XACK" | "XCLAIM" | "XAUTOCLAIM" | "FLUSHDB"
+                | "FLUSHALL" => true,
+                _ => false,
+            },
         }
     }
 }
@@ -2114,7 +2118,10 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
             return Ok(None);
         }
         if buf[scan_cursor] != b'$' {
-            return Err(format!("Protocol error: expected '$', got '{}'", buf[scan_cursor] as char));
+            return Err(format!(
+                "Protocol error: expected '$', got '{}'",
+                buf[scan_cursor] as char
+            ));
         }
 
         let (next_crlf, next_advance) = match find_newline_at(buf, scan_cursor) {
@@ -2428,7 +2435,10 @@ fn split_inline_args(line: &[u8]) -> Result<Vec<Bytes>, String> {
                                 b'b' => arg.push(b'\x08'),
                                 b'a' => arg.push(b'\x07'),
                                 b'x' if p.len() > 3 => {
-                                    if let Ok(b) = u8::from_str_radix(std::str::from_utf8(&p[2..4]).unwrap_or(""), 16) {
+                                    if let Ok(b) = u8::from_str_radix(
+                                        std::str::from_utf8(&p[2..4]).unwrap_or(""),
+                                        16,
+                                    ) {
                                         arg.push(b);
                                         p = &p[4..];
                                         continue;
@@ -5947,7 +5957,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 match sub.as_str() {
                     "COUNT" => {
                         if args.len() != 2 {
-                            return Err("wrong number of arguments for 'command|count' command".to_string());
+                            return Err(
+                                "wrong number of arguments for 'command|count' command".to_string()
+                            );
                         }
                         Ok(Some(Command::CommandCount))
                     }
@@ -5970,13 +5982,17 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     }
                     "GETKEYS" => {
                         if args.len() < 3 {
-                            return Err("wrong number of arguments for 'command|getkeys' command".to_string());
+                            return Err("wrong number of arguments for 'command|getkeys' command"
+                                .to_string());
                         }
                         Ok(Some(Command::CommandGetkeys(args[2..].to_vec())))
                     }
                     "GETKEYSANDFLAGS" => {
                         if args.len() < 3 {
-                            return Err("wrong number of arguments for 'command|getkeysandflags' command".to_string());
+                            return Err(
+                                "wrong number of arguments for 'command|getkeysandflags' command"
+                                    .to_string(),
+                            );
                         }
                         Ok(Some(Command::CommandGetkeysAndFlags(args[2..].to_vec())))
                     }
@@ -6049,7 +6065,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let cmd_name = String::from_utf8_lossy(&args[0]).to_uppercase();
             let read_only = cmd_name == "EVAL_RO";
             if args.len() < 3 {
-                return Err(format!("wrong number of arguments for '{}' command", cmd_name.to_lowercase()));
+                return Err(format!(
+                    "wrong number of arguments for '{}' command",
+                    cmd_name.to_lowercase()
+                ));
             }
             let script = args[1].clone();
             let numkeys_str = std::str::from_utf8(&args[2]).unwrap_or("");
@@ -6077,7 +6096,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let cmd_name = String::from_utf8_lossy(&args[0]).to_uppercase();
             let read_only = cmd_name == "EVALSHA_RO";
             if args.len() < 3 {
-                return Err(format!("wrong number of arguments for '{}' command", cmd_name.to_lowercase()));
+                return Err(format!(
+                    "wrong number of arguments for '{}' command",
+                    cmd_name.to_lowercase()
+                ));
             }
             let sha = args[1].clone();
             let numkeys_str = std::str::from_utf8(&args[2]).unwrap_or("");
@@ -7120,7 +7142,8 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         }
                         let l_str = std::str::from_utf8(&args[i + 1])
                             .map_err(|_| "value is not an integer or out of range")?;
-                        let l: i64 = l_str.parse()
+                        let l: i64 = l_str
+                            .parse()
                             .map_err(|_| "value is not an integer or out of range")?;
                         if l < 0 {
                             return Err("ERR The LIMIT argument must be >= 0.".to_string());
@@ -7189,10 +7212,15 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
             }
             if limit_seen && maxlen.is_none() && minid.is_none() {
-                return Err("syntax error, LIMIT cannot be used without specifying a trimming strategy".to_string());
+                return Err(
+                    "syntax error, LIMIT cannot be used without specifying a trimming strategy"
+                        .to_string(),
+                );
             }
             if limit_seen && !approx {
-                return Err("syntax error, LIMIT cannot be used without the special ~ option".to_string());
+                return Err(
+                    "syntax error, LIMIT cannot be used without the special ~ option".to_string(),
+                );
             }
             if i >= args.len() {
                 return Err("wrong number of arguments for 'xadd' command".to_string());
@@ -7201,7 +7229,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 .map_err(|_| "Invalid stream ID specified as stream command argument")?;
             let id = crate::table::StreamAddId::parse(id_str).map_err(|e| e.to_string())?;
             if idmp.is_some() && !matches!(id, crate::table::StreamAddId::Auto) {
-                return Err("ERR IDMP/IDMPAUTO can be used only with auto-generated IDs".to_string());
+                return Err(
+                    "ERR IDMP/IDMPAUTO can be used only with auto-generated IDs".to_string()
+                );
             }
             i += 1;
             let rem = args.len() - i;
@@ -7355,7 +7385,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         break;
                     }
                     "CLAIM" => {
-                        return Err("ERR The CLAIM option is only supported with XREADGROUP".to_string());
+                        return Err(
+                            "ERR The CLAIM option is only supported with XREADGROUP".to_string()
+                        );
                     }
                     _ => return Err("syntax error".to_string()),
                 }
@@ -7461,7 +7493,8 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         }
                         let l_str = std::str::from_utf8(&args[i + 1])
                             .map_err(|_| "value is not an integer or out of range")?;
-                        let l: i64 = l_str.parse()
+                        let l: i64 = l_str
+                            .parse()
                             .map_err(|_| "value is not an integer or out of range")?;
                         if l < 0 {
                             return Err("ERR The LIMIT argument must be >= 0.".to_string());
@@ -7500,10 +7533,15 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
             }
             if limit_seen && maxlen.is_none() && minid.is_none() {
-                return Err("syntax error, LIMIT cannot be used without specifying a trimming strategy".to_string());
+                return Err(
+                    "syntax error, LIMIT cannot be used without specifying a trimming strategy"
+                        .to_string(),
+                );
             }
             if limit_seen && !approx {
-                return Err("syntax error, LIMIT cannot be used without the special ~ option".to_string());
+                return Err(
+                    "syntax error, LIMIT cannot be used without the special ~ option".to_string(),
+                );
             }
             Ok(Some(Command::Xtrim {
                 key,
@@ -7537,7 +7575,8 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         if s.starts_with("00") || s.contains('.') {
                             return Err("ERR value is not an integer or out of range".to_string());
                         }
-                        let val: i64 = s.parse()
+                        let val: i64 = s
+                            .parse()
                             .map_err(|_| "ERR value is not an integer or out of range")?;
                         if val < 1 || val > 86400 {
                             return Err("ERR IDMP-DURATION must be between 1 and 86400".to_string());
@@ -7554,7 +7593,8 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         if s.starts_with("00") || s.contains('.') {
                             return Err("ERR value is not an integer or out of range".to_string());
                         }
-                        let val: i64 = s.parse()
+                        let val: i64 = s
+                            .parse()
                             .map_err(|_| "ERR value is not an integer or out of range")?;
                         if val < 1 || val > 10000 {
                             return Err("ERR IDMP-MAXSIZE must be between 1 and 10000".to_string());
@@ -7578,8 +7618,8 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let key = args[1].clone();
             let last_id_str = std::str::from_utf8(&args[2])
                 .map_err(|_| "Invalid stream ID specified as stream command argument")?;
-            let last_id = crate::table::StreamId::parse_exact(last_id_str)
-                .map_err(|e| e.to_string())?;
+            let last_id =
+                crate::table::StreamId::parse_exact(last_id_str).map_err(|e| e.to_string())?;
 
             let mut entries_added = None;
             let mut max_deleted_id = None;
@@ -7590,7 +7630,8 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 if opt == "ENTRIESADDED" && moreargs > 0 {
                     let ea_str = std::str::from_utf8(&args[i + 1])
                         .map_err(|_| "value is not an integer or out of range")?;
-                    let ea_i: i64 = ea_str.parse()
+                    let ea_i: i64 = ea_str
+                        .parse()
                         .map_err(|_| "value is not an integer or out of range")?;
                     if ea_i < 0 {
                         return Err("ERR entries_added must be positive".to_string());
@@ -7600,7 +7641,8 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 } else if opt == "MAXDELETEDID" && moreargs > 0 {
                     let md_str = std::str::from_utf8(&args[i + 1])
                         .map_err(|_| "Invalid stream ID specified as stream command argument")?;
-                    let md = crate::table::StreamId::parse_exact(md_str).map_err(|e| e.to_string())?;
+                    let md =
+                        crate::table::StreamId::parse_exact(md_str).map_err(|e| e.to_string())?;
                     if last_id < md {
                         return Err("ERR The ID specified in XSETID is smaller than the provided max_deleted_entry_id".to_string());
                     }
@@ -7673,7 +7715,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             i += 1;
             let remaining = args.len() - i;
             if numids > remaining {
-                return Err("ERR The `numids` parameter must match the number of arguments".to_string());
+                return Err(
+                    "ERR The `numids` parameter must match the number of arguments".to_string(),
+                );
             }
             if numids < remaining {
                 return Err("syntax error".to_string());
@@ -7744,7 +7788,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             i += 1;
             let remaining = args.len() - i;
             if numids > remaining {
-                return Err("ERR The `numids` parameter must match the number of arguments".to_string());
+                return Err(
+                    "ERR The `numids` parameter must match the number of arguments".to_string(),
+                );
             }
             if numids < remaining {
                 return Err("syntax error".to_string());
@@ -7756,7 +7802,12 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 let id = crate::table::StreamId::parse_exact(s).map_err(|e| e.to_string())?;
                 ids.push(id);
             }
-            Ok(Some(Command::Xackdel { key, group, strategy, ids }))
+            Ok(Some(Command::Xackdel {
+                key,
+                group,
+                strategy,
+                ids,
+            }))
         }
         "XIDMPRECORD" => {
             if args.len() != 5 {
@@ -7802,12 +7853,15 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                                 if i + 1 >= args.len() {
                                     return Err("syntax error".to_string());
                                 }
-                                let s = std::str::from_utf8(&args[i + 1])
-                                    .map_err(|_| "value is not an integer or out of range".to_string())?;
-                                let er: i64 = s.parse()
-                                    .map_err(|_| "value is not an integer or out of range".to_string())?;
+                                let s = std::str::from_utf8(&args[i + 1]).map_err(|_| {
+                                    "value is not an integer or out of range".to_string()
+                                })?;
+                                let er: i64 = s.parse().map_err(|_| {
+                                    "value is not an integer or out of range".to_string()
+                                })?;
                                 if er < -1 {
-                                    return Err("ERR value for ENTRIESREAD must be positive or -1".to_string());
+                                    return Err("ERR value for ENTRIESREAD must be positive or -1"
+                                        .to_string());
                                 }
                                 if er >= 0 {
                                     entries_read = Some(er as u64);
@@ -7885,7 +7939,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                                 "value is not an integer or out of range".to_string()
                             })?;
                             if er < -1 {
-                                return Err("ERR value for ENTRIESREAD must be positive or -1".to_string());
+                                return Err(
+                                    "ERR value for ENTRIESREAD must be positive or -1".to_string()
+                                );
                             }
                             if er >= 0 {
                                 entries_read = Some(er as u64);
@@ -7904,7 +7960,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
                 "HELP" => {
                     if args.len() != 2 {
-                        return Err("wrong number of arguments for 'xgroup|help' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'xgroup|help' command".to_string()
+                        );
                     }
                     Ok(Some(Command::XgroupHelp))
                 }
@@ -7939,7 +7997,8 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         if i + 1 >= args.len() {
                             return Err("syntax error".to_string());
                         }
-                        let s = std::str::from_utf8(&args[i + 1]).map_err(|_| "ERR min-idle-time is not an integer")?;
+                        let s = std::str::from_utf8(&args[i + 1])
+                            .map_err(|_| "ERR min-idle-time is not an integer")?;
                         let min_idle = parse_min_idle_time(s)?;
                         claim = Some(min_idle);
                         i += 2;
@@ -7988,9 +8047,13 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             return Err("ERR timeout is not an integer or out of range".to_string());
                         }
                         let b_i: i64 = std::str::from_utf8(&args[i + 1])
-                            .map_err(|_| "ERR timeout is not an integer or out of range".to_string())?
+                            .map_err(|_| {
+                                "ERR timeout is not an integer or out of range".to_string()
+                            })?
                             .parse()
-                            .map_err(|_| "ERR timeout is not an integer or out of range".to_string())?;
+                            .map_err(|_| {
+                                "ERR timeout is not an integer or out of range".to_string()
+                            })?;
                         if b_i < 0 {
                             return Err("ERR timeout is negative".to_string());
                         }
@@ -8083,9 +8146,13 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     "RETRYCOUNT" => {
                         if i + 1 >= args.len() {
                             if ids.is_none() {
-                                return Err("wrong number of arguments for 'xnack' command".to_string());
+                                return Err(
+                                    "wrong number of arguments for 'xnack' command".to_string()
+                                );
                             } else {
-                                return Err("ERR Unrecognized XNACK option 'RETRYCOUNT'".to_string());
+                                return Err(
+                                    "ERR Unrecognized XNACK option 'RETRYCOUNT'".to_string()
+                                );
                             }
                         }
                         let s = std::str::from_utf8(&args[i + 1])
@@ -8093,7 +8160,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         if s.starts_with('-') {
                             if let Ok(rc_i) = s.parse::<i64>() {
                                 if rc_i < 0 {
-                                    return Err("ERR Invalid RETRYCOUNT value, must be >= 0".to_string());
+                                    return Err(
+                                        "ERR Invalid RETRYCOUNT value, must be >= 0".to_string()
+                                    );
                                 }
                             }
                             return Err("ERR value is not an integer or out of range".to_string());
@@ -8104,7 +8173,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                                 i += 2;
                             }
                             Err(_) => {
-                                return Err("ERR value is not an integer or out of range".to_string());
+                                return Err(
+                                    "ERR value is not an integer or out of range".to_string()
+                                );
                             }
                         }
                     }
@@ -8127,10 +8198,12 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         }
                         let mut parsed_ids = Vec::with_capacity(numids);
                         for id_arg in &args[i..i + numids] {
-                            let s = std::str::from_utf8(id_arg)
-                                .map_err(|_| "ERR Invalid stream ID specified as stream command argument")?;
-                            let id = crate::table::StreamId::parse_exact(s)
-                                .map_err(|_| "ERR Invalid stream ID specified as stream command argument")?;
+                            let s = std::str::from_utf8(id_arg).map_err(
+                                |_| "ERR Invalid stream ID specified as stream command argument",
+                            )?;
+                            let id = crate::table::StreamId::parse_exact(s).map_err(
+                                |_| "ERR Invalid stream ID specified as stream command argument",
+                            )?;
                             parsed_ids.push(id);
                         }
                         ids = Some(parsed_ids);
@@ -8140,7 +8213,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         if mode.is_none() && i == 3 {
                             return Err("ERR mode must be SILENT, FAIL, or FATAL".to_string());
                         }
-                        return Err(format!("ERR Unrecognized XNACK option '{}'", String::from_utf8_lossy(&args[i])));
+                        return Err(format!(
+                            "ERR Unrecognized XNACK option '{}'",
+                            String::from_utf8_lossy(&args[i])
+                        ));
                     }
                 }
             }
@@ -8343,8 +8419,8 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 ));
             }
             let key = args[1].clone();
-            let numfields = parse_integer(&args[3])
-                .map_err(|_| "value is not an integer or out of range")?;
+            let numfields =
+                parse_integer(&args[3]).map_err(|_| "value is not an integer or out of range")?;
             if numfields <= 0 {
                 return Err("ERR Parameter `numFields` should be greater than 0".to_string());
             }
@@ -8370,8 +8446,8 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'hpersist' command".to_string());
             }
             let key = args[1].clone();
-            let numfields = parse_integer(&args[3])
-                .map_err(|_| "value is not an integer or out of range")?;
+            let numfields =
+                parse_integer(&args[3]).map_err(|_| "value is not an integer or out of range")?;
             if numfields <= 0 {
                 return Err("ERR Parameter `numFields` should be greater than 0".to_string());
             }
@@ -8454,8 +8530,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         if *idx + 1 >= args.len() || (*idx + 1 >= fields_idx && *idx < fields_end) {
                             return Err("ERR syntax error".to_string());
                         }
-                        let val = parse_integer(&args[*idx + 1])
-                            .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
+                        let val = parse_integer(&args[*idx + 1]).map_err(|_| {
+                            "ERR value is not an integer or out of range".to_string()
+                        })?;
                         if (opt == "EX" || opt == "PX") && val <= 0 {
                             return Err("ERR invalid expire time in 'hgetex' command".to_string());
                         }
@@ -8585,8 +8662,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         if *idx + 1 >= args.len() || (*idx + 1 >= fields_idx && *idx < fields_end) {
                             return Err("ERR syntax error".to_string());
                         }
-                        let val = parse_integer(&args[*idx + 1])
-                            .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
+                        let val = parse_integer(&args[*idx + 1]).map_err(|_| {
+                            "ERR value is not an integer or out of range".to_string()
+                        })?;
                         if (opt == "EX" || opt == "PX") && val <= 0 {
                             return Err("ERR invalid expire time in 'hsetex' command".to_string());
                         }
@@ -8750,7 +8828,8 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         }
                         let s = std::str::from_utf8(&args[i + 1])
                             .map_err(|_| "ERR COUNT must be > 0".to_string())?;
-                        let val: i64 = s.parse().map_err(|_| "ERR COUNT must be > 0".to_string())?;
+                        let val: i64 =
+                            s.parse().map_err(|_| "ERR COUNT must be > 0".to_string())?;
                         if val <= 0 || val > i32::MAX as i64 {
                             return Err("ERR COUNT must be > 0".to_string());
                         }
@@ -8836,7 +8915,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 }
                 "HELP" => {
                     if args.len() != 2 {
-                        return Err("wrong number of arguments for 'xinfo|help' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'xinfo|help' command".to_string()
+                        );
                     }
                     Ok(Some(Command::Xinfo(XinfoSubcommand::Help)))
                 }
@@ -9671,11 +9752,12 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         if i >= args.len() {
                             return Err("syntax error".to_string());
                         }
-                        let s = std::str::from_utf8(&args[i])
-                            .map_err(|_| "Increment is not an integer or out of range".to_string())?;
-                        let val = s
-                            .parse::<i64>()
-                            .map_err(|_| "Increment is not an integer or out of range".to_string())?;
+                        let s = std::str::from_utf8(&args[i]).map_err(|_| {
+                            "Increment is not an integer or out of range".to_string()
+                        })?;
+                        let val = s.parse::<i64>().map_err(|_| {
+                            "Increment is not an integer or out of range".to_string()
+                        })?;
                         byint_val = Some(val);
                     }
                     "BYFLOAT" => {
@@ -9854,7 +9936,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 } else {
                     None
                 };
-                if let (Some(IncrexBound::Float(lb)), Some(IncrexBound::Float(ub))) = (lbound, ubound) {
+                if let (Some(IncrexBound::Float(lb)), Some(IncrexBound::Float(ub))) =
+                    (lbound, ubound)
+                {
                     if lb > ub {
                         return Err("LBOUND can't be greater than UBOUND".to_string());
                     }
@@ -10551,7 +10635,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "LOAD" => {
                     if args.len() < 3 {
                         return Err(
-                            "wrong number of arguments for 'function load' command".to_string(),
+                            "wrong number of arguments for 'function load' command".to_string()
                         );
                     }
                     let (replace, code) = if args.len() == 3 {
@@ -10561,16 +10645,24 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         if opt == "REPLACE" {
                             (true, args[3].clone())
                         } else {
-                            return Err(format!("ERR Unknown option given: '{}'", String::from_utf8_lossy(&args[2])));
+                            return Err(format!(
+                                "ERR Unknown option given: '{}'",
+                                String::from_utf8_lossy(&args[2])
+                            ));
                         }
                     } else {
-                        return Err(format!("ERR Unknown option given: '{}'", String::from_utf8_lossy(&args[2])));
+                        return Err(format!(
+                            "ERR Unknown option given: '{}'",
+                            String::from_utf8_lossy(&args[2])
+                        ));
                     };
                     Ok(Some(Command::FunctionLoad { replace, code }))
                 }
                 "DUMP" => {
                     if args.len() != 2 {
-                        return Err("wrong number of arguments for 'function dump' command".to_string());
+                        return Err(
+                            "wrong number of arguments for 'function dump' command".to_string()
+                        );
                     }
                     Ok(Some(Command::FunctionDump))
                 }
@@ -10629,7 +10721,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         let mode = String::from_utf8_lossy(&args[2]).to_uppercase();
                         if mode != "ASYNC" && mode != "SYNC" {
                             return Err(
-                                "ERR FUNCTION FLUSH only supports SYNC|ASYNC option".to_string(),
+                                "ERR FUNCTION FLUSH only supports SYNC|ASYNC option".to_string()
                             );
                         }
                     }
@@ -10641,20 +10733,26 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 "DELETE" => {
                     if args.len() != 3 {
                         return Err(
-                            "wrong number of arguments for 'function delete' command".to_string(),
+                            "wrong number of arguments for 'function delete' command".to_string()
                         );
                     }
                     let lib = String::from_utf8_lossy(&args[2]).to_string();
                     Ok(Some(Command::FunctionDelete(lib)))
                 }
-                _ => Err("ERR unknown subcommand or wrong number of arguments for 'function' command".to_string()),
+                _ => Err(
+                    "ERR unknown subcommand or wrong number of arguments for 'function' command"
+                        .to_string(),
+                ),
             }
         }
         "FCALL" | "FCALL_RO" => {
             let cmd_name = String::from_utf8_lossy(&args[0]).to_uppercase();
             let read_only = cmd_name == "FCALL_RO";
             if args.len() < 3 {
-                return Err(format!("wrong number of arguments for '{}' command", cmd_name.to_lowercase()));
+                return Err(format!(
+                    "wrong number of arguments for '{}' command",
+                    cmd_name.to_lowercase()
+                ));
             }
             let function = String::from_utf8_lossy(&args[1]).to_string();
             let numkeys_str = std::str::from_utf8(&args[2]).unwrap_or("");
@@ -10664,7 +10762,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             let numkeys: usize = match numkeys_str.parse::<usize>() {
                 Ok(n) => n,
                 Err(_) => {
-                    return Err("ERR Bad number of keys provided, please give a non negative number".to_string());
+                    return Err(
+                        "ERR Bad number of keys provided, please give a non negative number"
+                            .to_string(),
+                    );
                 }
             };
             if 3 + numkeys > args.len() {
@@ -10928,7 +11029,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     || lat < crate::geo::GEO_LAT_MIN
                     || lat > crate::geo::GEO_LAT_MAX
                 {
-                    return Err(format!("invalid longitude,latitude pair {:.6},{:.6}", lon, lat));
+                    return Err(format!(
+                        "invalid longitude,latitude pair {:.6},{:.6}",
+                        lon, lat
+                    ));
                 }
                 let member = args[idx + 2].clone();
                 items.push((lon, lat, member));
@@ -10996,7 +11100,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 || lat < crate::geo::GEO_LAT_MIN
                 || lat > crate::geo::GEO_LAT_MAX
             {
-                return Err(format!("invalid longitude,latitude pair {:.6},{:.6}", lon, lat));
+                return Err(format!(
+                    "invalid longitude,latitude pair {:.6},{:.6}",
+                    lon, lat
+                ));
             }
             let radius: f64 = std::str::from_utf8(&args[4])
                 .map_err(|_| "value is not a valid float")?
@@ -11087,7 +11194,11 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if args.len() < 5 {
                 return Err(format!(
                     "wrong number of arguments for '{}' command",
-                    if is_ro { "georadiusbymember_ro" } else { "georadiusbymember" }
+                    if is_ro {
+                        "georadiusbymember_ro"
+                    } else {
+                        "georadiusbymember"
+                    }
                 ));
             }
             let key = args[1].clone();
@@ -11218,7 +11329,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             || lat < crate::geo::GEO_LAT_MIN
                             || lat > crate::geo::GEO_LAT_MAX
                         {
-                            return Err(format!("invalid longitude,latitude pair {:.6},{:.6}", lon, lat));
+                            return Err(format!(
+                                "invalid longitude,latitude pair {:.6},{:.6}",
+                                lon, lat
+                            ));
                         }
                         idx += 2;
                         from_lonlat = Some((lon, lat));
@@ -11288,10 +11402,15 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 idx += 1;
             }
             if from_member.is_none() && from_lonlat.is_none() {
-                return Err("exactly one of FROMMEMBER or FROMLONLAT can be specified for GEOSEARCH".to_string());
+                return Err(
+                    "exactly one of FROMMEMBER or FROMLONLAT can be specified for GEOSEARCH"
+                        .to_string(),
+                );
             }
             if by_radius.is_none() && by_box.is_none() {
-                return Err("exactly one of BYRADIUS and BYBOX can be specified for GEOSEARCH".to_string());
+                return Err(
+                    "exactly one of BYRADIUS and BYBOX can be specified for GEOSEARCH".to_string(),
+                );
             }
             if any && count.is_none() {
                 return Err("the ANY argument requires COUNT argument".to_string());
@@ -11352,7 +11471,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             || lat < crate::geo::GEO_LAT_MIN
                             || lat > crate::geo::GEO_LAT_MAX
                         {
-                            return Err(format!("invalid longitude,latitude pair {:.6},{:.6}", lon, lat));
+                            return Err(format!(
+                                "invalid longitude,latitude pair {:.6},{:.6}",
+                                lon, lat
+                            ));
                         }
                         idx += 2;
                         from_lonlat = Some((lon, lat));
@@ -11423,10 +11545,16 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 idx += 1;
             }
             if from_member.is_none() && from_lonlat.is_none() {
-                return Err("exactly one of FROMMEMBER or FROMLONLAT can be specified for GEOSEARCHSTORE".to_string());
+                return Err(
+                    "exactly one of FROMMEMBER or FROMLONLAT can be specified for GEOSEARCHSTORE"
+                        .to_string(),
+                );
             }
             if by_radius.is_none() && by_box.is_none() {
-                return Err("exactly one of BYRADIUS and BYBOX can be specified for GEOSEARCHSTORE".to_string());
+                return Err(
+                    "exactly one of BYRADIUS and BYBOX can be specified for GEOSEARCHSTORE"
+                        .to_string(),
+                );
             }
             if any && count.is_none() {
                 return Err("the ANY argument requires COUNT argument".to_string());

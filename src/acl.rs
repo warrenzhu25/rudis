@@ -326,8 +326,14 @@ impl AclManager {
                     user.disallowed_commands.clear();
                 } else if c == "scripting" {
                     for cmd in &[
-                        "eval", "evalsha", "eval_ro", "evalsha_ro", "function", "fcall",
-                        "fcall_ro", "script",
+                        "eval",
+                        "evalsha",
+                        "eval_ro",
+                        "evalsha_ro",
+                        "function",
+                        "fcall",
+                        "fcall_ro",
+                        "script",
                     ] {
                         if user.all_commands {
                             user.disallowed_commands.remove(*cmd);
@@ -337,9 +343,24 @@ impl AclManager {
                     }
                 } else if c == "string" {
                     for cmd in &[
-                        "get", "set", "mget", "mset", "incr", "decr", "incrby", "decrby",
-                        "incrbyfloat", "append", "strlen", "getset", "getdel", "getex",
-                        "setnx", "setex", "psetex", "msetnx",
+                        "get",
+                        "set",
+                        "mget",
+                        "mset",
+                        "incr",
+                        "decr",
+                        "incrby",
+                        "decrby",
+                        "incrbyfloat",
+                        "append",
+                        "strlen",
+                        "getset",
+                        "getdel",
+                        "getex",
+                        "setnx",
+                        "setex",
+                        "psetex",
+                        "msetnx",
                     ] {
                         if user.all_commands {
                             user.disallowed_commands.remove(*cmd);
@@ -355,8 +376,14 @@ impl AclManager {
                     user.allowed_commands.clear();
                 } else if c == "scripting" {
                     for cmd in &[
-                        "eval", "evalsha", "eval_ro", "evalsha_ro", "function", "fcall",
-                        "fcall_ro", "script",
+                        "eval",
+                        "evalsha",
+                        "eval_ro",
+                        "evalsha_ro",
+                        "function",
+                        "fcall",
+                        "fcall_ro",
+                        "script",
                     ] {
                         if user.all_commands {
                             user.disallowed_commands.insert(cmd.to_string());

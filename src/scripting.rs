@@ -1,5 +1,5 @@
-use bytes::Bytes;
 use crate::resp::Command;
+use bytes::Bytes;
 use mlua::{Lua, MultiValue, Value};
 use sha1::{Digest, Sha1};
 use std::cell::RefCell;
@@ -128,8 +128,14 @@ thread_local! {
 }
 
 fn validate_library_or_function_name(bytes: &[u8]) -> Result<(), &'static str> {
-    if bytes.is_empty() || !bytes.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_') {
-        Err("Library names can only contain letters, numbers, or underscores(_) and must be at least one character long")
+    if bytes.is_empty()
+        || !bytes
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        Err(
+            "Library names can only contain letters, numbers, or underscores(_) and must be at least one character long",
+        )
     } else {
         Ok(())
     }
@@ -142,10 +148,7 @@ fn is_valid_function_flag(flag: &str) -> bool {
     )
 }
 
-fn create_load_redis_proxy(
-    lua: &Lua,
-    reg_fn: mlua::Function,
-) -> mlua::Result<mlua::Table> {
+fn create_load_redis_proxy(lua: &Lua, reg_fn: mlua::Function) -> mlua::Result<mlua::Table> {
     let raw_load_redis = lua.create_table()?;
     raw_load_redis.set("register_function", reg_fn)?;
     raw_load_redis.set("REDIS_VERSION", "7.2.0")?;
@@ -731,14 +734,13 @@ fn format_eval_error(err: &str, sha: &str) -> String {
             global_name, sha
         );
     }
-    let final_prefix = if msg.starts_with("ERR ")
-        || msg.starts_with("NOSCRIPT ")
-        || msg.starts_with("WRONGTYPE ")
-    {
-        msg.to_string()
-    } else {
-        format!("ERR {}", msg)
-    };
+    let final_prefix =
+        if msg.starts_with("ERR ") || msg.starts_with("NOSCRIPT ") || msg.starts_with("WRONGTYPE ")
+        {
+            msg.to_string()
+        } else {
+            format!("ERR {}", msg)
+        };
     format!("{} script: {}, on @user_script:1.", final_prefix, sha)
 }
 
@@ -1402,14 +1404,7 @@ fn register_cjson_module(lua: &Lua, real_g: &mlua::Table) -> mlua::Result<()> {
         let parsed: serde_json::Value = serde_json::from_str(&s).map_err(|e| {
             mlua::Error::RuntimeError(format!("Expected value but found invalid token: {}", e))
         })?;
-        json_val_to_lua(
-            lua,
-            parsed,
-            &cfg_dec.borrow(),
-            &null_dec,
-            &array_mt_dec,
-            1,
-        )
+        json_val_to_lua(lua, parsed, &cfg_dec.borrow(), &null_dec, &array_mt_dec, 1)
     })?;
     cjson.set("decode", decode_fn)?;
 
@@ -1780,8 +1775,7 @@ fn pack_lua_val(val: &Value, out: &mut Vec<u8>, depth: usize) -> mlua::Result<()
             }
             if len > 0
                 && pairs.len() == len
-                && (1..=len)
-                    .all(|i| t.raw_get::<Value>(i).is_ok_and(|v| v != Value::Nil))
+                && (1..=len).all(|i| t.raw_get::<Value>(i).is_ok_and(|v| v != Value::Nil))
             {
                 if len <= 15 {
                     out.push(0x90 | (len as u8));
@@ -2074,7 +2068,8 @@ fn register_redis_module(
                 Value::Number(n) => cmd_args.push(Bytes::from(n.to_string())),
                 _ => {
                     return Err(mlua::Error::RuntimeError(
-                        "ERR Lua redis lib command arguments must be strings or integers".to_string(),
+                        "ERR Lua redis lib command arguments must be strings or integers"
+                            .to_string(),
                     ));
                 }
             }
@@ -2259,10 +2254,7 @@ fn register_redis_module(
             | Command::Bgsave
             | Command::Bgrewriteaof => {
                 let tbl = lua.create_table()?;
-                tbl.set(
-                    "err",
-                    "ERR This Redis command is not allowed from script",
-                )?;
+                tbl.set("err", "ERR This Redis command is not allowed from script")?;
                 return Ok(Value::Table(tbl));
             }
             _ => {}
@@ -2357,7 +2349,10 @@ fn register_redis_module(
     redis.set("status_reply", status_reply)?;
 
     let error_reply = lua.create_function(|lua, msg: String| {
-        let clean = msg.replace("\r\n", "  ").replace('\r', " ").replace('\n', " ");
+        let clean = msg
+            .replace("\r\n", "  ")
+            .replace('\r', " ")
+            .replace('\n', " ");
         let final_msg = if clean.is_empty() {
             "ERR".to_string()
         } else {
@@ -2367,9 +2362,7 @@ fn register_redis_module(
         tbl.set("err", final_msg.clone())?;
         let mt = lua.create_table()?;
         let err_clone = final_msg;
-        let tostring_fn = lua.create_function(move |_lua, ()| {
-            Ok(err_clone.clone())
-        })?;
+        let tostring_fn = lua.create_function(move |_lua, ()| Ok(err_clone.clone()))?;
         mt.set("__tostring", tostring_fn)?;
         let _ = tbl.set_metatable(Some(mt));
         Ok(Value::Table(tbl))
@@ -2410,7 +2403,8 @@ fn register_redis_module(
                 Value::Number(n) => cmd_args.push(Bytes::from(n.to_string())),
                 _ => {
                     return Err(mlua::Error::RuntimeError(
-                        "ERR Lua redis lib command arguments must be strings or integers".to_string(),
+                        "ERR Lua redis lib command arguments must be strings or integers"
+                            .to_string(),
                     ));
                 }
             }
@@ -2577,7 +2571,10 @@ fn parse_resp_element(lua: &Lua, buf: &mut bytes::BytesMut) -> mlua::Result<Valu
     }
     match buf[0] {
         b'+' => {
-            let c = buf.windows(2).position(|w| w == b"\r\n").unwrap_or(buf.len());
+            let c = buf
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .unwrap_or(buf.len());
             let s = String::from_utf8_lossy(&buf[1..c]).to_string();
             buf.advance(c + 2);
             let st = lua.create_table()?;
@@ -2585,7 +2582,10 @@ fn parse_resp_element(lua: &Lua, buf: &mut bytes::BytesMut) -> mlua::Result<Valu
             Ok(Value::Table(st))
         }
         b'-' => {
-            let c = buf.windows(2).position(|w| w == b"\r\n").unwrap_or(buf.len());
+            let c = buf
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .unwrap_or(buf.len());
             let s = String::from_utf8_lossy(&buf[1..c]).to_string();
             buf.advance(c + 2);
             let et = lua.create_table()?;
@@ -2593,7 +2593,10 @@ fn parse_resp_element(lua: &Lua, buf: &mut bytes::BytesMut) -> mlua::Result<Valu
             Ok(Value::Table(et))
         }
         b':' => {
-            let c = buf.windows(2).position(|w| w == b"\r\n").unwrap_or(buf.len());
+            let c = buf
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .unwrap_or(buf.len());
             let n: i64 = std::str::from_utf8(&buf[1..c])
                 .unwrap_or("0")
                 .parse()
@@ -2602,7 +2605,10 @@ fn parse_resp_element(lua: &Lua, buf: &mut bytes::BytesMut) -> mlua::Result<Valu
             Ok(Value::Integer(n))
         }
         b'$' => {
-            let c = buf.windows(2).position(|w| w == b"\r\n").unwrap_or(buf.len());
+            let c = buf
+                .windows(2)
+                .position(|w| w == b"\r\n")
+                .unwrap_or(buf.len());
             let len: i64 = std::str::from_utf8(&buf[1..c])
                 .unwrap_or("-1")
                 .parse()
@@ -2711,7 +2717,10 @@ fn lua_val_to_resp_with_depth(
                 return Ok(());
             }
             if let Ok(err_str) = t.raw_get::<String>("err") {
-                let sanitized = err_str.replace("\r\n", "  ").replace('\r', " ").replace('\n', " ");
+                let sanitized = err_str
+                    .replace("\r\n", "  ")
+                    .replace('\r', " ")
+                    .replace('\n', " ");
                 let final_err = if sanitized.is_empty() || sanitized == "ERR" {
                     "ERR ".to_string()
                 } else {
@@ -2876,8 +2885,17 @@ mod tests {
 
         let buf = aof.borrow().buffer().to_vec();
         let aof_str = String::from_utf8_lossy(&buf);
-        assert!(aof_str.contains("SET"), "AOF buffer must contain SET command");
-        assert!(aof_str.contains("test_key"), "AOF buffer must contain test_key");
-        assert!(aof_str.contains("test_val"), "AOF buffer must contain test_val");
+        assert!(
+            aof_str.contains("SET"),
+            "AOF buffer must contain SET command"
+        );
+        assert!(
+            aof_str.contains("test_key"),
+            "AOF buffer must contain test_key"
+        );
+        assert!(
+            aof_str.contains("test_val"),
+            "AOF buffer must contain test_val"
+        );
     }
 }

@@ -896,14 +896,18 @@ impl Router {
         if target == self.shard_id {
             self.local_db.borrow_mut().hget(&key, &field).ok().flatten()
         } else {
-            let res = self.execute_remote(target, Command::Hget { key, field }).await;
+            let res = self
+                .execute_remote(target, Command::Hget { key, field })
+                .await;
             if res.starts_with(b"$") && !res.starts_with(b"$-1") {
                 if let Some(pos) = res.windows(2).position(|w| w == b"\r\n") {
                     let len_str = &res[1..pos];
                     if let Ok(len) = std::str::from_utf8(len_str).unwrap_or("").parse::<usize>() {
                         let data_start = pos + 2;
                         if data_start + len <= res.len() {
-                            return Some(Bytes::copy_from_slice(&res[data_start..data_start + len]));
+                            return Some(Bytes::copy_from_slice(
+                                &res[data_start..data_start + len],
+                            ));
                         }
                     }
                 }
@@ -915,14 +919,29 @@ impl Router {
     pub async fn rpush(&self, key: Bytes, elements: Vec<Bytes>) -> usize {
         let target = self.target_shard(&key);
         if target == self.shard_id {
-            let len = self.local_db.borrow_mut().rpush(key.clone(), elements).unwrap_or(0);
+            let len = self
+                .local_db
+                .borrow_mut()
+                .rpush(key.clone(), elements)
+                .unwrap_or(0);
             crate::connection::notify_list_or_defer(&mut self.local_db.borrow_mut(), &key);
             len
         } else {
-            let res = self.execute_remote(target, Command::Rpush { key, values: elements.into() }).await;
+            let res = self
+                .execute_remote(
+                    target,
+                    Command::Rpush {
+                        key,
+                        values: elements.into(),
+                    },
+                )
+                .await;
             if res.starts_with(b":") {
                 if let Some(pos) = res.windows(2).position(|w| w == b"\r\n") {
-                    if let Ok(cnt) = std::str::from_utf8(&res[1..pos]).unwrap_or("").parse::<usize>() {
+                    if let Ok(cnt) = std::str::from_utf8(&res[1..pos])
+                        .unwrap_or("")
+                        .parse::<usize>()
+                    {
                         return cnt;
                     }
                 }
@@ -931,47 +950,74 @@ impl Router {
         }
     }
 
-    pub async fn get_collection_for_sort(&self, key: &Bytes) -> Result<(String, Vec<Bytes>), &'static str> {
+    pub async fn get_collection_for_sort(
+        &self,
+        key: &Bytes,
+    ) -> Result<(String, Vec<Bytes>), &'static str> {
         let target = self.target_shard(key);
         if target == self.shard_id {
             let mut db = self.local_db.borrow_mut();
             let t = db.type_of(key);
             match t {
                 "none" => Ok(("none".to_string(), Vec::new())),
-                "list" => Ok(("list".to_string(), db.lrange(key, 0, -1).unwrap_or_default())),
+                "list" => Ok((
+                    "list".to_string(),
+                    db.lrange(key, 0, -1).unwrap_or_default(),
+                )),
                 "set" => Ok(("set".to_string(), db.smembers(key).unwrap_or_default())),
                 "zset" => {
-                    let items = db.zrange(
-                        key,
-                        &crate::table::ZRangeOpts {
-                            start: 0,
-                            stop: -1,
-                            ..Default::default()
-                        },
-                    ).map(|pairs| pairs.into_iter().map(|(m, _)| m).collect()).unwrap_or_default();
+                    let items = db
+                        .zrange(
+                            key,
+                            &crate::table::ZRangeOpts {
+                                start: 0,
+                                stop: -1,
+                                ..Default::default()
+                            },
+                        )
+                        .map(|pairs| pairs.into_iter().map(|(m, _)| m).collect())
+                        .unwrap_or_default();
                     Ok(("zset".to_string(), items))
                 }
                 _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
             }
         } else {
-            let type_resp = self.execute_remote(target, Command::Type(key.clone())).await;
+            let type_resp = self
+                .execute_remote(target, Command::Type(key.clone()))
+                .await;
             if type_resp == b"+none\r\n" {
                 Ok(("none".to_string(), Vec::new()))
             } else if type_resp == b"+list\r\n" {
-                let range_resp = self.execute_remote(target, Command::Lrange { key: key.clone(), start: 0, stop: -1 }).await;
+                let range_resp = self
+                    .execute_remote(
+                        target,
+                        Command::Lrange {
+                            key: key.clone(),
+                            start: 0,
+                            stop: -1,
+                        },
+                    )
+                    .await;
                 Ok(("list".to_string(), parse_resp_array_to_bytes(&range_resp)))
             } else if type_resp == b"+set\r\n" {
-                let smembers_resp = self.execute_remote(target, Command::Smembers(key.clone())).await;
+                let smembers_resp = self
+                    .execute_remote(target, Command::Smembers(key.clone()))
+                    .await;
                 Ok(("set".to_string(), parse_resp_array_to_bytes(&smembers_resp)))
             } else if type_resp == b"+zset\r\n" {
-                let zrange_resp = self.execute_remote(target, Command::Zrange {
-                    key: key.clone(),
-                    opts: crate::table::ZRangeOpts {
-                        start: 0,
-                        stop: -1,
-                        ..Default::default()
-                    },
-                }).await;
+                let zrange_resp = self
+                    .execute_remote(
+                        target,
+                        Command::Zrange {
+                            key: key.clone(),
+                            opts: crate::table::ZRangeOpts {
+                                start: 0,
+                                stop: -1,
+                                ..Default::default()
+                            },
+                        },
+                    )
+                    .await;
                 Ok(("zset".to_string(), parse_resp_array_to_bytes(&zrange_resp)))
             } else {
                 Err("WRONGTYPE Operation against a key holding the wrong kind of value")
@@ -1022,9 +1068,19 @@ impl Router {
                 kind
             };
             crate::connection::notify_set_key_events(self, prev_kind, "string", &key);
-            crate::connection::notify_keyspace_event_sync(self, crate::connection::NOTIFY_STRING, "set", &key);
+            crate::connection::notify_keyspace_event_sync(
+                self,
+                crate::connection::NOTIFY_STRING,
+                "set",
+                &key,
+            );
             if expire_in.is_some() {
-                crate::connection::notify_keyspace_event_sync(self, crate::connection::NOTIFY_GENERIC, "expire", &key);
+                crate::connection::notify_keyspace_event_sync(
+                    self,
+                    crate::connection::NOTIFY_GENERIC,
+                    "expire",
+                    &key,
+                );
             }
             let max_mem = self.tier_stats.max_memory.load(Ordering::Relaxed);
             if max_mem > 0 {
@@ -1667,7 +1723,12 @@ impl Router {
             let deleted = db.del(&key);
             if deleted {
                 db.delete_document_local(&String::from_utf8_lossy(&key));
-                crate::connection::notify_keyspace_event_sync(self, crate::connection::NOTIFY_GENERIC, "del", &key);
+                crate::connection::notify_keyspace_event_sync(
+                    self,
+                    crate::connection::NOTIFY_GENERIC,
+                    "del",
+                    &key,
+                );
                 crate::connection::notify_stream_or_defer(&mut db, &key);
                 if let Some(aof) = &self.aof
                     && let Some(bytes) = crate::aof::command_to_resp(&Command::Del(smallvec![key]))
@@ -2179,7 +2240,11 @@ impl Router {
         let mut out = String::new();
         let now = std::time::Instant::now();
         for client in local_registry.borrow().values() {
-            if client.stats.killed.load(std::sync::atomic::Ordering::Relaxed) {
+            if client
+                .stats
+                .killed
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 continue;
             }
             if !filter_ids.is_empty() && !filter_ids.contains(&client.id) {
@@ -2191,14 +2256,38 @@ impl Router {
                 .lock()
                 .unwrap()
                 .is_blocked(client.id);
-            let flags = if client.is_monitor { "O" } else if is_blocked { "b" } else { "N" };
+            let flags = if client.is_monitor {
+                "O"
+            } else if is_blocked {
+                "b"
+            } else {
+                "N"
+            };
             let (qbuf, qbuf_free) = client.effective_qbuf(idle);
-            let tot_net_in = client.stats.tot_net_in.load(std::sync::atomic::Ordering::Relaxed);
-            let tot_net_out = client.stats.tot_net_out.load(std::sync::atomic::Ordering::Relaxed);
-            let tot_cmds = client.stats.tot_cmds.load(std::sync::atomic::Ordering::Relaxed);
-            let read_events = client.stats.read_events.load(std::sync::atomic::Ordering::Relaxed);
-            let pipe_sum = client.stats.pipeline_len_sum.load(std::sync::atomic::Ordering::Relaxed);
-            let pipe_cnt = client.stats.pipeline_len_cnt.load(std::sync::atomic::Ordering::Relaxed);
+            let tot_net_in = client
+                .stats
+                .tot_net_in
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let tot_net_out = client
+                .stats
+                .tot_net_out
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let tot_cmds = client
+                .stats
+                .tot_cmds
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let read_events = client
+                .stats
+                .read_events
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let pipe_sum = client
+                .stats
+                .pipeline_len_sum
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let pipe_cnt = client
+                .stats
+                .pipeline_len_cnt
+                .load(std::sync::atomic::Ordering::Relaxed);
             out.push_str(&format!(
                 "id={} addr={} laddr=127.0.0.1:{} fd=8 name={} age={} idle={} flags={} db=0 sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf={} qbuf-free={} argv-mem=10 multi-mem=0 rbs=1024 rbp=0 obl=0 oll=0 omem={} omem-shared=0 omem-unshared=0 tot-mem=22306 events=r cmd={} user=default redir=-1 resp=2 lib-name={} lib-ver={} io-thread=0 tot-net-in={} tot-net-out={} tot-cmds={} read-events={} avg-pipeline-len-sum={} avg-pipeline-len-cnt={}\n",
                 client.id,

@@ -2197,7 +2197,8 @@ impl ShardDb {
         trim_strategy: crate::table::StreamTrimStrategy,
         limit: Option<usize>,
     ) -> Result<usize, &'static str> {
-        self.table.xtrim(key, maxlen, minid, approx, trim_strategy, limit)
+        self.table
+            .xtrim(key, maxlen, minid, approx, trim_strategy, limit)
     }
 
     #[inline]
@@ -2218,7 +2219,8 @@ impl ShardDb {
         entries_added: Option<u64>,
         max_deleted_id: Option<crate::table::StreamId>,
     ) -> Result<(), &'static str> {
-        self.table.xsetid(key, last_id, entries_added, max_deleted_id)
+        self.table
+            .xsetid(key, last_id, entries_added, max_deleted_id)
     }
 
     #[inline]
@@ -3285,7 +3287,8 @@ impl ShardDb {
         mkstream: bool,
         entries_read: Option<u64>,
     ) -> Result<(), &'static str> {
-        self.table.xgroup_create(key, group, id_str, mkstream, entries_read)
+        self.table
+            .xgroup_create(key, group, id_str, mkstream, entries_read)
     }
 
     #[inline]
@@ -3337,9 +3340,29 @@ impl ShardDb {
         max_bytes: usize,
         total_entries: &mut usize,
         total_bytes: &mut usize,
-    ) -> Result<(Vec<(crate::table::StreamId, Vec<(Bytes, Bytes)>, Option<(u64, usize)>)>, bool), &'static str> {
-        self.table
-            .xreadgroup(key, group, consumer, id_str, count, noack, claim, max_bytes, total_entries, total_bytes)
+    ) -> Result<
+        (
+            Vec<(
+                crate::table::StreamId,
+                Vec<(Bytes, Bytes)>,
+                Option<(u64, usize)>,
+            )>,
+            bool,
+        ),
+        &'static str,
+    > {
+        self.table.xreadgroup(
+            key,
+            group,
+            consumer,
+            id_str,
+            count,
+            noack,
+            claim,
+            max_bytes,
+            total_entries,
+            total_bytes,
+        )
     }
 
     #[inline]
@@ -3356,7 +3379,12 @@ impl ShardDb {
     }
 
     #[inline]
-    pub fn earliest_claim_wait_ms(&mut self, key: &[u8], group: &[u8], min_idle: u64) -> Option<u64> {
+    pub fn earliest_claim_wait_ms(
+        &mut self,
+        key: &[u8],
+        group: &[u8],
+        min_idle: u64,
+    ) -> Option<u64> {
         self.table.earliest_claim_wait_ms(key, group, min_idle)
     }
 

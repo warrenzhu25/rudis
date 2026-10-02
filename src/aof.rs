@@ -2166,8 +2166,9 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
                             format!("*{}\r\n$4\r\nXADD\r\n${}\r\n", num_args, k.len()).as_bytes(),
                         )?;
                         writer.write_all(k)?;
-                        writer
-                            .write_all(format!("\r\n${}\r\n{}\r\n", id_str.len(), id_str).as_bytes())?;
+                        writer.write_all(
+                            format!("\r\n${}\r\n{}\r\n", id_str.len(), id_str).as_bytes(),
+                        )?;
                         for (f, v) in fields {
                             writer.write_all(format!("${}\r\n", f.len()).as_bytes())?;
                             writer.write_all(f.as_ref())?;
@@ -2182,9 +2183,8 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
                     let last_id_str = stream.last_id.to_string();
                     let ea_str = stream.entries_added.to_string();
                     let md_str = stream.max_deleted_entry_id.to_string();
-                    writer.write_all(
-                        format!("*7\r\n$6\r\nXSETID\r\n${}\r\n", k.len()).as_bytes(),
-                    )?;
+                    writer
+                        .write_all(format!("*7\r\n$6\r\nXSETID\r\n${}\r\n", k.len()).as_bytes())?;
                     writer.write_all(k)?;
                     writer.write_all(
                         format!(
@@ -2201,44 +2201,33 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
                     if let Some(er) = grp.entries_read {
                         let er_str = er.to_string();
                         writer.write_all(
-                            format!(
-                                "*7\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n${}\r\n",
-                                k.len()
-                            ).as_bytes()
+                            format!("*7\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n${}\r\n", k.len())
+                                .as_bytes(),
                         )?;
                         writer.write_all(k)?;
-                        writer.write_all(
-                            format!(
-                                "\r\n${}\r\n", grp.name.len()
-                            ).as_bytes()
-                        )?;
+                        writer.write_all(format!("\r\n${}\r\n", grp.name.len()).as_bytes())?;
                         writer.write_all(&grp.name)?;
                         writer.write_all(
                             format!(
                                 "\r\n${}\r\n{}\r\n$11\r\nENTRIESREAD\r\n${}\r\n{}\r\n",
-                                last_deliv_str.len(), last_deliv_str,
-                                er_str.len(), er_str
-                            ).as_bytes()
+                                last_deliv_str.len(),
+                                last_deliv_str,
+                                er_str.len(),
+                                er_str
+                            )
+                            .as_bytes(),
                         )?;
                     } else {
                         writer.write_all(
-                            format!(
-                                "*5\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n${}\r\n",
-                                k.len()
-                            ).as_bytes()
+                            format!("*5\r\n$6\r\nXGROUP\r\n$6\r\nCREATE\r\n${}\r\n", k.len())
+                                .as_bytes(),
                         )?;
                         writer.write_all(k)?;
-                        writer.write_all(
-                            format!(
-                                "\r\n${}\r\n", grp.name.len()
-                            ).as_bytes()
-                        )?;
+                        writer.write_all(format!("\r\n${}\r\n", grp.name.len()).as_bytes())?;
                         writer.write_all(&grp.name)?;
                         writer.write_all(
-                            format!(
-                                "\r\n${}\r\n{}\r\n",
-                                last_deliv_str.len(), last_deliv_str
-                            ).as_bytes()
+                            format!("\r\n${}\r\n{}\r\n", last_deliv_str.len(), last_deliv_str)
+                                .as_bytes(),
                         )?;
                     }
                     count += 1;
@@ -2253,23 +2242,12 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
                             let dt_str = deliv_time.to_string();
                             let rc_str = pe.delivery_count.to_string();
                             writer.write_all(
-                                format!(
-                                    "*10\r\n$6\r\nXCLAIM\r\n${}\r\n",
-                                    k.len()
-                                ).as_bytes()
+                                format!("*10\r\n$6\r\nXCLAIM\r\n${}\r\n", k.len()).as_bytes(),
                             )?;
                             writer.write_all(k)?;
-                            writer.write_all(
-                                format!(
-                                    "\r\n${}\r\n", grp.name.len()
-                                ).as_bytes()
-                            )?;
+                            writer.write_all(format!("\r\n${}\r\n", grp.name.len()).as_bytes())?;
                             writer.write_all(&grp.name)?;
-                            writer.write_all(
-                                format!(
-                                    "\r\n${}\r\n", c_name.len()
-                                ).as_bytes()
-                            )?;
+                            writer.write_all(format!("\r\n${}\r\n", c_name.len()).as_bytes())?;
                             writer.write_all(c_name)?;
                             writer.write_all(
                                 format!(
@@ -2288,17 +2266,10 @@ pub fn rewrite_shard_aof(db: &mut ShardDb, dir: &Path, shard_id: usize) -> std::
                             let sid_str = sid.to_string();
                             let rc_str = pe.delivery_count.to_string();
                             writer.write_all(
-                                format!(
-                                    "*10\r\n$5\r\nXNACK\r\n${}\r\n",
-                                    k.len()
-                                ).as_bytes()
+                                format!("*10\r\n$5\r\nXNACK\r\n${}\r\n", k.len()).as_bytes(),
                             )?;
                             writer.write_all(k)?;
-                            writer.write_all(
-                                format!(
-                                    "\r\n${}\r\n", grp.name.len()
-                                ).as_bytes()
-                            )?;
+                            writer.write_all(format!("\r\n${}\r\n", grp.name.len()).as_bytes())?;
                             writer.write_all(&grp.name)?;
                             writer.write_all(
                                 format!(

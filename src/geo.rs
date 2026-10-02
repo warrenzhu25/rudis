@@ -52,7 +52,10 @@ impl GeoUnit {
 /// Latitude bits are in even positions (0, 2, 4...) and longitude bits are in odd positions (1, 3, 5...).
 pub fn encode_geohash(lon: f64, lat: f64) -> Result<u64, String> {
     if lon < GEO_LON_MIN || lon > GEO_LON_MAX || lat < GEO_LAT_MIN || lat > GEO_LAT_MAX {
-        return Err(format!("ERR invalid longitude,latitude pair {:.6},{:.6}", lon, lat));
+        return Err(format!(
+            "ERR invalid longitude,latitude pair {:.6},{:.6}",
+            lon, lat
+        ));
     }
 
     let lat_offset = ((lat - GEO_LAT_MIN) / (GEO_LAT_MAX - GEO_LAT_MIN)) * ((1u64 << 26) as f64);
@@ -85,7 +88,10 @@ pub fn decode_geohash(hash: u64) -> (f64, f64) {
     let max_val = (1u64 << 26) as f64;
     let lat = GEO_LAT_MIN + ((ilat as f64 + 0.5) / max_val) * (GEO_LAT_MAX - GEO_LAT_MIN);
     let lon = GEO_LON_MIN + ((ilon as f64 + 0.5) / max_val) * (GEO_LON_MAX - GEO_LON_MIN);
-    (lon.clamp(GEO_LON_MIN, GEO_LON_MAX), lat.clamp(GEO_LAT_MIN, GEO_LAT_MAX))
+    (
+        lon.clamp(GEO_LON_MIN, GEO_LON_MAX),
+        lat.clamp(GEO_LAT_MIN, GEO_LAT_MAX),
+    )
 }
 
 /// Formats a 52-bit geohash into an 11-character Redis-standard base32 string.
@@ -93,8 +99,10 @@ pub fn decode_geohash(hash: u64) -> (f64, f64) {
 /// and re-encoded using standard geohash latitude range [-90.0, 90.0] before emitting base32.
 pub fn geohash_to_base32(score: u64) -> String {
     let (lon, lat) = decode_geohash(score);
-    let lat_offset = (((lat - (-90.0)) / 180.0) * ((1u64 << 26) as f64)).clamp(0.0, ((1u64 << 26) - 1) as f64) as u64;
-    let lon_offset = (((lon - (-180.0)) / 360.0) * ((1u64 << 26) as f64)).clamp(0.0, ((1u64 << 26) - 1) as f64) as u64;
+    let lat_offset = (((lat - (-90.0)) / 180.0) * ((1u64 << 26) as f64))
+        .clamp(0.0, ((1u64 << 26) - 1) as f64) as u64;
+    let lon_offset = (((lon - (-180.0)) / 360.0) * ((1u64 << 26) as f64))
+        .clamp(0.0, ((1u64 << 26) - 1) as f64) as u64;
     let mut hash = 0u64;
     for i in 0..26 {
         let bit_lat = (lat_offset >> i) & 1;
@@ -177,8 +185,10 @@ pub fn geohash_move_y(hash: &mut GeoHashBits, d: i8) {
 pub fn encode_with_step(lon: f64, lat: f64, step: u8) -> GeoHashBits {
     let lat_clamped = lat.clamp(GEO_LAT_MIN, GEO_LAT_MAX);
     let lon_clamped = lon.clamp(GEO_LON_MIN, GEO_LON_MAX);
-    let lat_offset = ((lat_clamped - GEO_LAT_MIN) / (GEO_LAT_MAX - GEO_LAT_MIN)) * ((1u64 << step) as f64);
-    let lon_offset = ((lon_clamped - GEO_LON_MIN) / (GEO_LON_MAX - GEO_LON_MIN)) * ((1u64 << step) as f64);
+    let lat_offset =
+        ((lat_clamped - GEO_LAT_MIN) / (GEO_LAT_MAX - GEO_LAT_MIN)) * ((1u64 << step) as f64);
+    let lon_offset =
+        ((lon_clamped - GEO_LON_MIN) / (GEO_LON_MAX - GEO_LON_MIN)) * ((1u64 << step) as f64);
     let lat_int = (lat_offset as u64).min((1u64 << step) - 1);
     let lon_int = (lon_offset as u64).min((1u64 << step) - 1);
     let mut bits = 0u64;
@@ -245,11 +255,7 @@ pub enum GeoSearchShape {
     Box { width_m: f64, height_m: f64 },
 }
 
-pub fn geohash_bounding_box(
-    shape: &GeoSearchShape,
-    center_lon: f64,
-    center_lat: f64,
-) -> [f64; 4] {
+pub fn geohash_bounding_box(shape: &GeoSearchShape, center_lon: f64, center_lat: f64) -> [f64; 4] {
     let (width, height) = match *shape {
         GeoSearchShape::Radius { radius_m } => (radius_m, radius_m),
         GeoSearchShape::Box { width_m, height_m } => (width_m / 2.0, height_m / 2.0),
@@ -268,8 +274,16 @@ pub fn geohash_bounding_box(
         180.0
     };
     let southern = center_lat < 0.0;
-    let min_lon = if southern { center_lon - long_delta_bottom } else { center_lon - long_delta_top };
-    let max_lon = if southern { center_lon + long_delta_bottom } else { center_lon + long_delta_top };
+    let min_lon = if southern {
+        center_lon - long_delta_bottom
+    } else {
+        center_lon - long_delta_top
+    };
+    let max_lon = if southern {
+        center_lon + long_delta_bottom
+    } else {
+        center_lon + long_delta_top
+    };
     let min_lat = center_lat - lat_delta;
     let max_lat = center_lat + lat_delta;
     [min_lon, min_lat, max_lon, max_lat]
@@ -322,14 +336,22 @@ pub fn calculate_search_areas(
     let mut hash = encode_with_step(center_lon, center_lat, steps);
 
     let get_neighbors = |h: GeoHashBits| -> [GeoHashBits; 8] {
-        let mut n = h; geohash_move_y(&mut n, 1);
-        let mut s = h; geohash_move_y(&mut s, -1);
-        let mut e = h; geohash_move_x(&mut e, 1);
-        let mut w = h; geohash_move_x(&mut w, -1);
-        let mut ne = e; geohash_move_y(&mut ne, 1);
-        let mut nw = w; geohash_move_y(&mut nw, 1);
-        let mut se = e; geohash_move_y(&mut se, -1);
-        let mut sw = w; geohash_move_y(&mut sw, -1);
+        let mut n = h;
+        geohash_move_y(&mut n, 1);
+        let mut s = h;
+        geohash_move_y(&mut s, -1);
+        let mut e = h;
+        geohash_move_x(&mut e, 1);
+        let mut w = h;
+        geohash_move_x(&mut w, -1);
+        let mut ne = e;
+        geohash_move_y(&mut ne, 1);
+        let mut nw = w;
+        geohash_move_y(&mut nw, 1);
+        let mut se = e;
+        geohash_move_y(&mut se, -1);
+        let mut sw = w;
+        geohash_move_y(&mut sw, -1);
         [n, s, e, w, ne, nw, se, sw]
     };
 
@@ -526,9 +548,17 @@ pub fn execute_geo_query(
 
     if let Some(is_asc) = effective_asc {
         if is_asc {
-            results.sort_by(|a, b| a.dist_m.partial_cmp(&b.dist_m).unwrap_or(std::cmp::Ordering::Equal));
+            results.sort_by(|a, b| {
+                a.dist_m
+                    .partial_cmp(&b.dist_m)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         } else {
-            results.sort_by(|a, b| b.dist_m.partial_cmp(&a.dist_m).unwrap_or(std::cmp::Ordering::Equal));
+            results.sort_by(|a, b| {
+                b.dist_m
+                    .partial_cmp(&a.dist_m)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         }
     }
 

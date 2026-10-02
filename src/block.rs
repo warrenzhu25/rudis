@@ -216,7 +216,10 @@ impl BlockHub {
     }
 
     pub fn blocking_keys_on_nokey_count(&self) -> usize {
-        self.stream_waiters.values().filter(|v| !v.is_empty()).count()
+        self.stream_waiters
+            .values()
+            .filter(|v| !v.is_empty())
+            .count()
     }
 
     pub fn register_blocked_client(&mut self, client_id: u64, sender: Sender<BlockedListResult>) {
@@ -603,7 +606,8 @@ impl BlockHub {
         is_cross_shard: bool,
         sender: Sender<BlockedStreamResult>,
     ) {
-        self.blocked_stream_clients.insert(client_id, sender.clone());
+        self.blocked_stream_clients
+            .insert(client_id, sender.clone());
         let entry = self.stream_waiters.entry(key.clone()).or_default();
         if !entry.iter().any(|w| w.client_id == client_id) {
             entry.push(StreamWaiter {
