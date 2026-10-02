@@ -76,3 +76,46 @@ fn test_lock_free_spsc_queue_and_mesh() {
     h_producer.join().unwrap();
     h_consumer.join().unwrap();
 }
+
+#[test]
+fn test_mesh_async_ping_pong_never_loses_wakeup() {
+    // Two monoio shards bounce a message back and forth through
+    // `recv_async`, so each one parks on every round. A lost wakeup leaves a
+    // shard parked with a message queued and the watchdog fires.
+    const ROUNDS: usize = 50_000;
+    let (mesh, receivers) = rudis::mailbox::create_shard_mesh(2);
+    let mut receivers = receivers.into_iter();
+    let (rx_0, rx_1) = (receivers.next().unwrap(), receivers.next().unwrap());
+    let (tx_0, tx_1) = (mesh[0][1].clone(), mesh[1][0].clone());
+    let msg = || rudis::shard::ShardMessage::NotifyList { keys: Vec::new() };
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let done_1 = done_tx.clone();
+    let run = |f: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>| {
+        thread::spawn(move || {
+            monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(f)
+        })
+    };
+    run(Box::pin(async move {
+        for _ in 0..ROUNDS {
+            tx_0.send(msg()).unwrap();
+            rx_0.recv_async().await.unwrap();
+        }
+        let _ = done_tx.send(());
+    }));
+    run(Box::pin(async move {
+        for _ in 0..ROUNDS {
+            rx_1.recv_async().await.unwrap();
+            tx_1.send(msg()).unwrap();
+        }
+        let _ = done_1.send(());
+    }));
+    for _ in 0..2 {
+        done_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("a shard stayed parked with a queued message (lost wakeup)");
+    }
+}

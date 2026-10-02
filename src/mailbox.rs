@@ -544,6 +544,13 @@ impl ShardSender {
     #[inline(always)]
     pub fn send(&self, msg: crate::shard::ShardMessage) -> Result<(), SendError> {
         self.ring.push(msg);
+        // Dekker handshake with `ShardReceiver::recv*`: the receiver stores
+        // `sleeping = true` and then re-checks the rings; we publish the
+        // message and then read `sleeping`. Without a full fence the push
+        // (a Release store, or a mutex unlock on the overflow path) may be
+        // ordered after the load, so both sides miss each other and the
+        // receiver sleeps with a message queued.
+        std::sync::atomic::fence(Ordering::SeqCst);
         if self.target_sleeping.0.load(Ordering::SeqCst) {
             let _ = self.target_notify.try_send(());
         }
@@ -579,6 +586,9 @@ impl ShardReceiver {
             }
 
             self.sleeping.0.store(true, Ordering::SeqCst);
+            // Pairs with the fence in `ShardSender::send`: the flag must be
+            // visible before the rings are re-checked.
+            std::sync::atomic::fence(Ordering::SeqCst);
             if let Ok(msg) = self.try_recv() {
                 self.sleeping.0.store(false, Ordering::Relaxed);
                 return Ok(msg);
@@ -604,6 +614,9 @@ impl ShardReceiver {
             }
 
             self.sleeping.0.store(true, Ordering::SeqCst);
+            // Pairs with the fence in `ShardSender::send`: the flag must be
+            // visible before the rings are re-checked.
+            std::sync::atomic::fence(Ordering::SeqCst);
             if let Ok(msg) = self.try_recv() {
                 self.sleeping.0.store(false, Ordering::Relaxed);
                 return Ok(msg);
@@ -926,6 +939,39 @@ mod tests {
             assert_eq!(keys[0], Bytes::from("k2"));
         } else {
             panic!("unexpected message");
+        }
+    }
+
+    #[test]
+    fn test_mesh_ping_pong_never_loses_wakeup() {
+        // Each side sleeps in `recv()` while the other sends, which exercises
+        // the sleeping-flag handshake on every round. A lost wakeup leaves a
+        // thread asleep with a message queued, and the watchdog fires.
+        const ROUNDS: usize = 200_000;
+        let (mesh, receivers) = create_shard_mesh(2);
+        let msg = || crate::shard::ShardMessage::NotifyList { keys: Vec::new() };
+        let (tx_a, rx_a) = (mesh[0][1].clone(), receivers[0].clone());
+        let (tx_b, rx_b) = (mesh[1][0].clone(), receivers[1].clone());
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let done_b = done_tx.clone();
+        thread::spawn(move || {
+            for _ in 0..ROUNDS {
+                tx_a.send(msg()).unwrap();
+                rx_a.recv().unwrap();
+            }
+            let _ = done_tx.send(());
+        });
+        thread::spawn(move || {
+            for _ in 0..ROUNDS {
+                rx_b.recv().unwrap();
+                tx_b.send(msg()).unwrap();
+            }
+            let _ = done_b.send(());
+        });
+        for _ in 0..2 {
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("a shard slept through a queued message (lost wakeup)");
         }
     }
 }
