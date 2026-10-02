@@ -11161,9 +11161,10 @@ fn test_slowlog_operational_observability_e2e() {
     assert!(info_resp.contains("slowlog_commands_time_ms_sum:"));
     assert!(info_resp.contains("slowlog_commands_time_ms_max:"));
 
-    // 9. Reset slowlog
+    // 9. Reset slowlog. With log-slower-than 0 the RESET itself is logged,
+    // exactly as in Valkey, so the log holds one entry afterwards.
     assert_eq!(send_and_read(&mut client, b"SLOWLOG RESET\r\n"), "+OK\r\n");
-    assert_eq!(send_and_read(&mut client, b"SLOWLOG LEN\r\n"), ":0\r\n");
+    assert_eq!(send_and_read(&mut client, b"SLOWLOG LEN\r\n"), ":1\r\n");
 }
 
 #[test]
