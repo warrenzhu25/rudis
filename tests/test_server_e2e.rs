@@ -3304,15 +3304,15 @@ fn test_lua_scripting_engine_e2e() {
             "EVAL",
             "return {KEYS[1], KEYS[2], ARGV[1], ARGV[2]}",
             "2",
-            "keyA",
-            "keyB",
+            "{l}keyA",
+            "{l}keyB",
             "val1",
             "val2",
         ],
     );
     assert_eq!(
         keys_argv_resp,
-        "*4\r\n$4\r\nkeyA\r\n$4\r\nkeyB\r\n$4\r\nval1\r\n$4\r\nval2\r\n"
+        "*4\r\n$7\r\n{l}keyA\r\n$7\r\n{l}keyB\r\n$4\r\nval1\r\n$4\r\nval2\r\n"
     );
 
     // 3. redis.call SET and GET
@@ -3334,15 +3334,16 @@ fn test_lua_scripting_engine_e2e() {
     );
     assert_eq!(get_resp, "$7\r\nlua_val\r\n");
 
-    // Multiple operations and table inspection
+    // Multiple operations and table inspection (keys share a hash tag so
+    // they live on one shard; scripts may not span shards)
     let multi_resp = send_cmd(
         &mut client,
         &[
             "EVAL",
             "redis.call('SET', KEYS[1], ARGV[1]); return redis.call('INCRBY', KEYS[2], ARGV[2])",
             "2",
-            "k_str",
-            "k_num",
+            "{lua}k_str",
+            "{lua}k_num",
             "hello",
             "50",
         ],
@@ -3356,7 +3357,7 @@ fn test_lua_scripting_engine_e2e() {
             "EVAL",
             "local res = redis.pcall('INCRBY', KEYS[1], 'not_a_num'); if res['err'] then return res['err'] else return 'ok' end",
             "1",
-            "k_num",
+            "{lua}k_num",
         ],
     );
     assert!(
@@ -3398,7 +3399,7 @@ fn test_lua_scripting_engine_e2e() {
     assert_eq!(exists_resp, "*2\r\n:1\r\n:0\r\n");
 
     // EVALSHA execution
-    let evalsha_resp = send_cmd(&mut client, &["EVALSHA", sha, "1", "k_str"]);
+    let evalsha_resp = send_cmd(&mut client, &["EVALSHA", sha, "1", "{lua}k_str"]);
     assert_eq!(evalsha_resp, "$5\r\nhello\r\n");
 
     // SCRIPT FLUSH
@@ -3409,7 +3410,7 @@ fn test_lua_scripting_engine_e2e() {
     assert_eq!(exists_after_flush, "*1\r\n:0\r\n");
 
     // EVALSHA after flush should return NOSCRIPT error
-    let evalsha_err = send_cmd(&mut client, &["EVALSHA", sha, "1", "k_str"]);
+    let evalsha_err = send_cmd(&mut client, &["EVALSHA", sha, "1", "{lua}k_str"]);
     assert!(
         evalsha_err.starts_with("-NOSCRIPT"),
         "Expected -NOSCRIPT error, got {}",
@@ -15246,6 +15247,72 @@ fn test_pipeline_keeps_order_across_shards_e2e() {
             &got[pos.saturating_sub(40)..(pos + 40).min(got.len())],
             &want[pos.saturating_sub(40)..(pos + 40).min(want.len())]
         );
+    }
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}
+
+#[test]
+fn test_scripts_reject_keys_on_several_shards_e2e() {
+    // A script runs against one shard's database. Declared keys owned by
+    // other shards must be rejected, not silently read/written on the wrong
+    // shard.
+    let port = 16978;
+    let port_s = port.to_string();
+    let args = ["--port", &port_s, "--threads", "4", "--no-pin"];
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+
+    // 16 plain keys always span more than one of 4 shards.
+    let spread: Vec<String> = (0..16).map(|i| format!("ev:k{}", i)).collect();
+    let mut cmd: Vec<&str> = vec!["EVAL", "redis.call('set', KEYS[1], 'x') return 1", "16"];
+    cmd.extend(spread.iter().map(|s| s.as_str()));
+    let r = resp_cmd(&mut c, &cmd);
+    assert!(r.starts_with("-CROSSSLOT"), "EVAL across shards: {}", r);
+    assert_eq!(resp_cmd(&mut c, &["GET", "ev:k0"]), "$-1\r\n");
+
+    let sha = resp_cmd(
+        &mut c,
+        &["SCRIPT", "LOAD", "redis.call('set', KEYS[1], 'x') return 1"],
+    );
+    let sha = sha.lines().nth(1).unwrap().to_string();
+    let mut cmd: Vec<&str> = vec!["EVALSHA", &sha, "16"];
+    cmd.extend(spread.iter().map(|s| s.as_str()));
+    let r = resp_cmd(&mut c, &cmd);
+    assert!(r.starts_with("-CROSSSLOT"), "EVALSHA across shards: {}", r);
+
+    let lib = "#!lua name=evlib\nredis.register_function('evset', function(keys, args) return redis.call('set', keys[1], 'f') end)";
+    assert_eq!(
+        resp_cmd(&mut c, &["FUNCTION", "LOAD", lib]),
+        "$5\r\nevlib\r\n"
+    );
+    let mut cmd: Vec<&str> = vec!["FCALL", "evset", "16"];
+    cmd.extend(spread.iter().map(|s| s.as_str()));
+    let r = resp_cmd(&mut c, &cmd);
+    assert!(r.starts_with("-CROSSSLOT"), "FCALL across shards: {}", r);
+    assert_eq!(resp_cmd(&mut c, &["GET", "ev:k0"]), "$-1\r\n");
+
+    // Keys sharing a hash tag live on one shard and keep working, and the
+    // writes are visible to plain reads afterwards.
+    for i in 0..8 {
+        let (a, b) = (format!("{{ev{}}}a", i), format!("{{ev{}}}b", i));
+        let r = resp_cmd(
+            &mut c,
+            &[
+                "EVAL",
+                "redis.call('set', KEYS[1], '1') redis.call('set', KEYS[2], '2') return 1",
+                "2",
+                &a,
+                &b,
+            ],
+        );
+        assert_eq!(r, ":1\r\n");
+        assert_eq!(resp_cmd(&mut c, &["GET", &a]), "$1\r\n1\r\n");
+        assert_eq!(resp_cmd(&mut c, &["GET", &b]), "$1\r\n2\r\n");
+        let r = resp_cmd(&mut c, &["FCALL", "evset", "2", &a, &b]);
+        assert_eq!(r, "+OK\r\n");
+        assert_eq!(resp_cmd(&mut c, &["GET", &a]), "$1\r\nf\r\n");
     }
     drop(c);
     shutdown_and_wait(port, &mut child);

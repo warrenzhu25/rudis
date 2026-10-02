@@ -14590,6 +14590,10 @@ async fn execute_command(
                 auth_user.clone()
             };
             CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = effective_user.clone());
+            if keys_span_shards(&keys, |k| router.target_shard(k)) {
+                out.extend_from_slice(SCRIPT_CROSS_SHARD_ERR);
+                return false;
+            }
             if let Some(first_key) = keys.first() {
                 let target = router.target_shard(first_key);
                 if target != router.shard_id {
@@ -14639,6 +14643,10 @@ async fn execute_command(
                 auth_user.clone()
             };
             CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = effective_user.clone());
+            if keys_span_shards(&keys, |k| router.target_shard(k)) {
+                out.extend_from_slice(SCRIPT_CROSS_SHARD_ERR);
+                return false;
+            }
             if let Some(first_key) = keys.first() {
                 let target = router.target_shard(first_key);
                 if target != router.shard_id {
@@ -14792,6 +14800,10 @@ async fn execute_command(
                 auth_user.clone()
             };
             CURRENT_AUTH_USER.with(|u| *u.borrow_mut() = effective_user.clone());
+            if keys_span_shards(&keys, |k| router.target_shard(k)) {
+                out.extend_from_slice(SCRIPT_CROSS_SHARD_ERR);
+                return false;
+            }
             if let Some(first_key) = keys.first() {
                 let target = router.target_shard(first_key);
                 if target != router.shard_id {
@@ -23655,6 +23667,23 @@ async fn flush_remote_batches(
     }
 }
 
+/// Error returned when a script's declared keys live on different shards.
+const SCRIPT_CROSS_SHARD_ERR: &[u8] = b"-CROSSSLOT Keys in request don't hash to the same slot\r\n";
+
+/// True when the declared keys of a script (EVAL/EVALSHA/FCALL) are owned by
+/// more than one shard. A script runs against a single shard's database, so
+/// such a script would silently read and write the wrong data for the keys
+/// owned elsewhere; it must be rejected instead.
+fn keys_span_shards(keys: &[Bytes], shard_of: impl Fn(&[u8]) -> usize) -> bool {
+    match keys.split_first() {
+        Some((first, rest)) => {
+            let owner = shard_of(first);
+            rest.iter().any(|k| shard_of(k) != owner)
+        }
+        None => false,
+    }
+}
+
 pub(crate) struct RecvBytesMut(pub BytesMut);
 
 unsafe impl monoio::buf::IoBufMut for RecvBytesMut {
@@ -24175,6 +24204,27 @@ mod tests {
         assert_eq!(other.responders.len(), 8);
         assert_eq!(other.remote_batches.len(), 8);
         recycle_conn_scratch(other);
+    }
+
+    #[test]
+    fn test_keys_span_shards() {
+        let shard_of = |k: &[u8]| crate::router::target_shard(k, 4);
+        assert!(!keys_span_shards(&[], shard_of));
+        assert!(!keys_span_shards(&[Bytes::from("a")], shard_of));
+        let tagged = [
+            Bytes::from("{t}a"),
+            Bytes::from("{t}b"),
+            Bytes::from("{t}c"),
+        ];
+        assert!(!keys_span_shards(&tagged, shard_of));
+        // With 4 shards, some pair of plain keys must land on different shards.
+        let keys: Vec<Bytes> = (0..16).map(|i| Bytes::from(format!("k{i}"))).collect();
+        assert!(keys_span_shards(&keys, shard_of));
+        // Only the first key's owner matters as the reference shard.
+        assert!(keys_span_shards(
+            &[Bytes::from("x"), Bytes::from("y")],
+            |k| k[0] as usize
+        ));
     }
 
     #[monoio::test]
