@@ -16238,3 +16238,36 @@ fn test_commandstats_reports_measured_usec_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child);
 }
+
+#[test]
+fn test_incr_decr_keep_their_own_command_name_e2e() {
+    let port = 16963;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    let mut admin = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    admin
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let setuser = [
+        "ACL", "SETUSER", "u", "on", "nopass", "~*", "+@all", "-incr",
+    ];
+    assert_eq!(resp_cmd(&mut admin, &setuser), "+OK\r\n");
+
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["AUTH", "u", "x"]), "+OK\r\n");
+    // `-incr` must deny INCR without denying INCRBY, DECR or DECRBY.
+    let denied = resp_cmd(&mut c, &["INCR", "ctr"]);
+    assert!(denied.starts_with("-NOPERM"), "INCR: {denied:?}");
+    assert_eq!(resp_cmd(&mut c, &["INCRBY", "ctr", "1"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["DECR", "ctr"]), ":0\r\n");
+    assert_eq!(resp_cmd(&mut c, &["DECRBY", "ctr", "2"]), ":-2\r\n");
+
+    let info = info_section(&mut admin, "commandstats");
+    for cmd in ["incrby", "decr", "decrby"] {
+        assert_eq!(cmdstat_field(&info, cmd, "calls"), 1.0, "{cmd}:\n{info}");
+    }
+    drop(c);
+    drop(admin);
+    shutdown_and_wait(port, &mut child);
+}

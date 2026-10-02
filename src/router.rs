@@ -1906,7 +1906,11 @@ impl Router {
             let res = self.local_db.borrow_mut().incr_by(key.clone(), delta);
             if res.is_ok()
                 && let Some(aof) = &self.aof
-                && let Some(bytes) = crate::aof::command_to_resp(&Command::IncrBy(key, delta))
+                && let Some(bytes) = crate::aof::command_to_resp(&Command::IncrBy(
+                    key,
+                    delta,
+                    crate::resp::IncrName::IncrBy,
+                ))
             {
                 aof.borrow_mut().append(&bytes);
             }

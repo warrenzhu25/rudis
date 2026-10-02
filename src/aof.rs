@@ -295,7 +295,7 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             Some(buf)
         }
-        Command::IncrBy(key, delta) => {
+        Command::IncrBy(key, delta, _) => {
             let d_str = delta.to_string();
             buf.extend_from_slice(format!("*3\r\n$6\r\nINCRBY\r\n${}\r\n", key.len()).as_bytes());
             buf.extend_from_slice(key);

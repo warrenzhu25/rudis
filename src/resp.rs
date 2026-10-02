@@ -354,6 +354,26 @@ pub enum XnackMode {
     Fatal,
 }
 
+/// The command a [`Command::IncrBy`] was parsed from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IncrName {
+    Incr,
+    Decr,
+    IncrBy,
+    DecrBy,
+}
+
+impl IncrName {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            IncrName::Incr => "INCR",
+            IncrName::Decr => "DECR",
+            IncrName::IncrBy => "INCRBY",
+            IncrName::DecrBy => "DECRBY",
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum Command {
     Object(ObjectSubcommand),
@@ -459,7 +479,9 @@ pub enum Command {
     Del(SmallVec<[Bytes; 1]>),
     Unlink(SmallVec<[Bytes; 1]>),
     Exists(SmallVec<[Bytes; 1]>),
-    IncrBy(Bytes, i64),
+    /// INCR, DECR, INCRBY and DECRBY, all as a signed delta. The name the
+    /// client used is kept for ACL checks, stats and MONITOR.
+    IncrBy(Bytes, i64, IncrName),
     Expire {
         key: Bytes,
         duration: Duration,
@@ -2272,6 +2294,7 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
                         return Ok(Some(Command::IncrBy(
                             frame.slice(k_start..k_start + k_len),
                             1,
+                            IncrName::Incr,
                         )));
                     }
                     if cmd_bytes.eq_ignore_ascii_case(b"HGET") && num_args == 3 {
@@ -3304,7 +3327,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
         }
         "INCR" => {
             if args.len() == 2 {
-                return Ok(Some(Command::IncrBy(args[1].clone(), 1)));
+                return Ok(Some(Command::IncrBy(args[1].clone(), 1, IncrName::Incr)));
             }
             if (args.len() == 3 || args.len() == 4)
                 && let Some(val) = std::str::from_utf8(&args[2])
@@ -3322,7 +3345,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
         }
         "DECR" => {
             if args.len() == 2 {
-                return Ok(Some(Command::IncrBy(args[1].clone(), -1)));
+                return Ok(Some(Command::IncrBy(args[1].clone(), -1, IncrName::Decr)));
             }
             if (args.len() == 3 || args.len() == 4)
                 && let Some(val) = std::str::from_utf8(&args[2])
@@ -3346,7 +3369,11 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 .ok()
                 .and_then(|s| s.parse::<i64>().ok())
                 .ok_or_else(|| "value is not an integer or out of range".to_string())?;
-            Ok(Some(Command::IncrBy(args[1].clone(), delta)))
+            Ok(Some(Command::IncrBy(
+                args[1].clone(),
+                delta,
+                IncrName::IncrBy,
+            )))
         }
         "DECRBY" => {
             if args.len() != 3 {
@@ -3359,7 +3386,11 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             if delta == i64::MIN {
                 return Err("increment or decrement would overflow".to_string());
             }
-            Ok(Some(Command::IncrBy(args[1].clone(), -delta)))
+            Ok(Some(Command::IncrBy(
+                args[1].clone(),
+                -delta,
+                IncrName::DecrBy,
+            )))
         }
         "EXPIRE" => {
             if args.len() < 3 {

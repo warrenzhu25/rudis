@@ -276,29 +276,27 @@ pub fn command_to_slowlog_argv(cmd: &Command) -> (Vec<Bytes>, usize) {
             let len = args.len();
             (args, len)
         }
-        Command::IncrBy(key, delta) => {
-            if *delta == 1 {
-                (vec![Bytes::from_static(b"incr"), key.clone()], 2)
-            } else if *delta == -1 {
-                (vec![Bytes::from_static(b"decr"), key.clone()], 2)
-            } else if *delta < 0 {
-                (
+        Command::IncrBy(key, delta, name) => {
+            use crate::resp::IncrName;
+            match name {
+                IncrName::Incr => (vec![Bytes::from_static(b"incr"), key.clone()], 2),
+                IncrName::Decr => (vec![Bytes::from_static(b"decr"), key.clone()], 2),
+                IncrName::DecrBy => (
                     vec![
                         Bytes::from_static(b"decrby"),
                         key.clone(),
                         Bytes::from((-delta).to_string()),
                     ],
                     3,
-                )
-            } else {
-                (
+                ),
+                IncrName::IncrBy => (
                     vec![
                         Bytes::from_static(b"incrby"),
                         key.clone(),
                         Bytes::from(delta.to_string()),
                     ],
                     3,
-                )
+                ),
             }
         }
         Command::Incrbyfloat { key, increment } => {

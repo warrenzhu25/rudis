@@ -4804,7 +4804,7 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         Command::Get(key)
         | Command::Getex { key, .. }
         | Command::Set { key, .. }
-        | Command::IncrBy(key, _)
+        | Command::IncrBy(key, _, _)
         | Command::Expire { key, .. }
         | Command::Persist(key)
         | Command::Ttl(key, _)
@@ -5056,7 +5056,7 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
 pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
     match cmd {
         Command::Get(k)
-        | Command::IncrBy(k, _)
+        | Command::IncrBy(k, _, _)
         | Command::Expire { key: k, .. }
         | Command::Persist(k)
         | Command::Ttl(k, _)
@@ -6022,7 +6022,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Del(_) => "DEL",
         Command::Unlink(_) => "UNLINK",
         Command::Exists(_) => "EXISTS",
-        Command::IncrBy(_, _) => "INCRBY",
+        Command::IncrBy(_, _, name) => name.as_str(),
         Command::Expire { .. } => "EXPIRE",
         Command::Persist(_) => "PERSIST",
         Command::Ttl(_, _) => "TTL",
@@ -8464,12 +8464,14 @@ async fn execute_command(
             write_resp_integer(out, count as i64);
             false
         }
-        Command::IncrBy(key, delta) => {
+        Command::IncrBy(key, delta, name) => {
             match router.incr_by(key.clone(), delta).await {
                 Ok(val) => {
                     notify_key_invalidation(router.port, key.as_ref(), client_id);
                     notify_keyspace_event_sync(router, NOTIFY_STRING, "incrby", key.as_ref());
-                    if let Some(bytes) = crate::aof::command_to_resp(&Command::IncrBy(key, delta)) {
+                    if let Some(bytes) =
+                        crate::aof::command_to_resp(&Command::IncrBy(key, delta, name))
+                    {
                         crate::replication::propagate_bytes(router.port, &bytes);
                     }
                     write_resp_integer(out, val);
@@ -16015,7 +16017,7 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::Getex { key, .. }
         | Command::Set { key, .. }
         | Command::Digest(key)
-        | Command::IncrBy(key, _)
+        | Command::IncrBy(key, _, _)
         | Command::Expire { key, .. }
         | Command::Persist(key)
         | Command::Ttl(key, _)
@@ -16369,7 +16371,7 @@ pub fn target_shard_and_hash_of_cmd(cmd: &Command, num_shards: usize) -> Option<
         | Command::Zadd { key, .. }
         | Command::Get(key)
         | Command::Set { key, .. }
-        | Command::IncrBy(key, _)
+        | Command::IncrBy(key, _, _)
         | Command::Lrange { key, .. }
         | Command::Zrange { key, .. } => {
             Some(crate::router::target_shard_and_hash(key, num_shards))
@@ -16937,7 +16939,7 @@ pub fn execute_local_command(
             write_resp_integer(out, count as i64);
             false
         }
-        Command::IncrBy(key, delta) => {
+        Command::IncrBy(key, delta, _) => {
             match db.incr_by_slice(key.as_ref(), *delta) {
                 Ok(val) => {
                     record_change!(cmd);
@@ -23303,7 +23305,7 @@ async fn execute_commands_squashed(
                     }
                     responses[idx] = crate::shard::CompactResp::OK;
                     continue;
-                } else if write_fast_path && let Command::IncrBy(ref key, delta) = cmd {
+                } else if write_fast_path && let Command::IncrBy(ref key, delta, _) = cmd {
                     has_local_writes = true;
                     match local_db.table.incr_by_slice_with_hash(key, key_hash, delta) {
                         Ok(val) => {
@@ -24485,6 +24487,38 @@ mod tests {
     }
 
     #[test]
+    fn test_incr_family_keeps_command_name() {
+        for (wire, name, delta, argv) in [
+            ("INCR", "INCR", 1, "incr k"),
+            ("DECR", "DECR", -1, "decr k"),
+            ("INCRBY 1", "INCRBY", 1, "incrby k 1"),
+            ("DECRBY 1", "DECRBY", -1, "decrby k 1"),
+            ("INCRBY -5", "INCRBY", -5, "incrby k -5"),
+        ] {
+            let mut parts: Vec<&str> = wire.split(' ').collect();
+            parts.insert(1, "k");
+            let mut raw = format!("*{}\r\n", parts.len());
+            for p in &parts {
+                raw.push_str(&format!("${}\r\n{}\r\n", p.len(), p));
+            }
+            let mut buf = bytes::BytesMut::from(raw.as_str());
+            let cmd = crate::resp::parse_command(&mut buf).unwrap().unwrap();
+            assert!(
+                matches!(cmd, Command::IncrBy(_, d, _) if d == delta),
+                "{wire}: {cmd:?}"
+            );
+            assert_eq!(get_cmd_name(&cmd), name, "{wire}");
+            assert_eq!(acl_cmd_name(&cmd), name, "{wire}");
+            let (args, _) = crate::slowlog::command_to_slowlog_argv(&cmd);
+            let shown: Vec<String> = args
+                .iter()
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect();
+            assert_eq!(shown.join(" "), argv, "{wire}");
+        }
+    }
+
+    #[test]
     fn test_isolated_panics_counter() {
         let initial = get_isolated_panics();
         inc_isolated_panics();
@@ -24650,7 +24684,8 @@ mod tests {
         ])));
         assert!(notifies_same_when_batched(&Command::IncrBy(
             Bytes::from("k"),
-            1
+            1,
+            crate::resp::IncrName::Incr
         )));
         // MSET is a write that was not checked: it keeps the pipeline unbatched.
         assert!(!notifies_same_when_batched(&Command::Mset(vec![(
@@ -24941,9 +24976,11 @@ mod tests {
         scratch
             .commands
             .push(Command::Exists(smallvec::smallvec![Bytes::from("k1")]));
-        scratch
-            .commands
-            .push(Command::IncrBy(Bytes::from("cnt"), 5));
+        scratch.commands.push(Command::IncrBy(
+            Bytes::from("cnt"),
+            5,
+            crate::resp::IncrName::IncrBy,
+        ));
         scratch
             .commands
             .push(Command::Del(smallvec::smallvec![Bytes::from("k1")]));

@@ -519,7 +519,7 @@ pub fn run_shard_worker(
                         if res.is_ok()
                             && let Some(aof) = &cross_shard_aof
                                 && let Some(bytes) = crate::aof::command_to_resp(
-                                    &crate::resp::Command::IncrBy(key, delta),
+                                    &crate::resp::Command::IncrBy(key, delta, crate::resp::IncrName::IncrBy),
                                 ) {
                                     aof.borrow_mut().append(&bytes);
                                 }
@@ -708,7 +708,7 @@ pub fn run_shard_worker(
                                         continue;
                                     } else if aof_ref.is_none()
                                         && !crate::replication::has_connected_replicas(r.port)
-                                        && let Command::IncrBy(ref key, delta) = cmd
+                                        && let Command::IncrBy(ref key, delta, _) = cmd
                                     {
                                         has_writes = true;
                                         match r.local_db.borrow_mut().table.incr_by_slice_with_hash(key, key_hash, delta) {
@@ -1105,7 +1105,7 @@ pub fn run_shard_worker(
                                     && aof_ref.is_none()
                                     && !crate::replication::has_connected_replicas(cross_shard_router.port)
                                     && crate::connection::NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) == 0
-                                    && let Command::IncrBy(ref key, delta) = cmd
+                                    && let Command::IncrBy(ref key, delta, _) = cmd
                                 {
                                     has_writes = true;
                                     match db.table.incr_by_slice_with_hash(key, key_hash, delta) {
