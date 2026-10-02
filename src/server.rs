@@ -2097,6 +2097,28 @@ pub fn run_shard_worker(
             }
         }
 
+        // 4.9 SIGTERM/SIGINT: save like a plain SHUTDOWN, and stay up if that
+        // fails (Redis logs "can't exit" and keeps serving).
+        if shard_id == 0 {
+            let r = router.clone();
+            monoio::spawn(async move {
+                while !crate::shutdown::is_shutting_down() {
+                    monoio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    if !crate::shutdown::take_shutdown_signal() {
+                        continue;
+                    }
+                    println!("Received SIGTERM/SIGINT, scheduling shutdown...");
+                    match r.save_before_shutdown(None).await {
+                        Ok(()) => crate::shutdown::request_shutdown(),
+                        Err(e) => eprintln!(
+                            "Error trying to save the DB, can't exit: {}. Fix the problem and send the signal again, or use SHUTDOWN NOSAVE.",
+                            e
+                        ),
+                    }
+                }
+            });
+        }
+
         // 5. Accept loops: one per bound address, sharing the client id sequence.
         let next_client_id = Rc::new(std::cell::Cell::new(((shard_id as u64) << 48) + 1));
         let mut listeners = listeners.into_iter();

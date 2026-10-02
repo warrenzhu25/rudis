@@ -3196,6 +3196,24 @@ impl Router {
         self.perform_save_rdb().await
     }
 
+    /// The save step of `SHUTDOWN [SAVE|NOSAVE]` and SIGTERM. Returns an
+    /// error if a snapshot was required and failed; callers must then keep
+    /// running rather than exit and lose the data, as Redis does.
+    pub async fn save_before_shutdown(&self, save: Option<bool>) -> Result<(), String> {
+        let has_points = !crate::config::save_points(self.base_port).is_empty();
+        if !crate::config::should_save_on_shutdown(save, has_points) {
+            return Ok(());
+        }
+        // Let an in-flight BGSAVE finish rather than fail on "in progress".
+        while self.is_saving.load(Ordering::SeqCst) {
+            monoio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        println!("Saving the final RDB snapshot before exiting.");
+        self.save_rdb().await?;
+        println!("DB saved on disk");
+        Ok(())
+    }
+
     pub async fn bgsave(&self) -> Result<(), String> {
         if self
             .is_saving

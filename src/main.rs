@@ -195,6 +195,7 @@ fn main() {
     }
 
     rudis::aof::set_aof_load_truncated(server_config.aof_load_truncated);
+    rudis::config::set_save_points(port, server_config.save_points.clone());
     let aof_config = rudis::aof::AofConfig {
         enabled: server_config.appendonly,
         dir: server_config.dir.clone(),

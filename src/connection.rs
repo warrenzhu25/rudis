@@ -15533,12 +15533,15 @@ async fn execute_command(
         }
         Command::MemcachedQuit => true,
         Command::Shutdown { save } => {
-            if save == Some(true) {
-                let _ = router.save_rdb().await;
+            if let Err(e) = router.save_before_shutdown(save).await {
+                eprintln!("Error trying to save the DB, can't exit: {}", e);
+                out.extend_from_slice(b"-ERR Errors trying to SHUTDOWN. Check logs.\r\n");
+                false
+            } else {
+                crate::shutdown::request_shutdown();
+                out.extend_from_slice(b"+OK\r\n");
+                true
             }
-            crate::shutdown::request_shutdown();
-            out.extend_from_slice(b"+OK\r\n");
-            true
         }
         Command::Readonly | Command::Readwrite => {
             out.extend_from_slice(b"+OK\r\n");

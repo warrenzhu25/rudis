@@ -23,6 +23,9 @@ pub struct RudisConfig {
     pub cluster_enabled: bool,
     pub tiered_offload_threshold: u64,
     pub tiered_upload_threshold: u64,
+    /// `save <seconds> <changes>` points. Empty (the default) means no
+    /// snapshots unless asked for, unlike Redis's built-in defaults.
+    pub save_points: Vec<(u64, u64)>,
     pub extra_directives: HashMap<String, String>,
 }
 
@@ -47,9 +50,50 @@ impl Default for RudisConfig {
             cluster_enabled: false,
             tiered_offload_threshold: 60,
             tiered_upload_threshold: 80,
+            save_points: Vec::new(),
             extra_directives: HashMap::new(),
         }
     }
+}
+
+/// Parses a `save` value: `<seconds> <changes>` pairs, or `""` for none.
+pub fn parse_save_points(spec: &str) -> Result<Vec<(u64, u64)>, String> {
+    let spec = spec.trim();
+    if spec.is_empty() || spec == "\"\"" || spec == "''" {
+        return Ok(Vec::new());
+    }
+    let nums = spec
+        .split_whitespace()
+        .map(|n| {
+            n.parse::<u64>()
+                .map_err(|_| format!("'{}' is not a number", n))
+        })
+        .collect::<Result<Vec<u64>, String>>()?;
+    if nums.len() % 2 != 0 {
+        return Err("expected <seconds> <changes> pairs".to_string());
+    }
+    Ok(nums.chunks(2).map(|p| (p[0], p[1])).collect())
+}
+
+static SAVE_POINTS: std::sync::Mutex<Option<HashMap<u16, Vec<(u64, u64)>>>> =
+    std::sync::Mutex::new(None);
+
+pub fn set_save_points(port: u16, points: Vec<(u64, u64)>) {
+    let mut map = SAVE_POINTS.lock().unwrap_or_else(|e| e.into_inner());
+    map.get_or_insert_with(HashMap::new).insert(port, points);
+}
+
+pub fn save_points(port: u16) -> Vec<(u64, u64)> {
+    let map = SAVE_POINTS.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref()
+        .and_then(|m| m.get(&port).cloned())
+        .unwrap_or_default()
+}
+
+/// Redis rule: `SHUTDOWN SAVE` always snapshots, `NOSAVE` never does, and
+/// plain `SHUTDOWN` (or SIGTERM) snapshots when save points are configured.
+pub fn should_save_on_shutdown(save: Option<bool>, has_save_points: bool) -> bool {
+    save.unwrap_or(has_save_points)
 }
 
 impl RudisConfig {
@@ -192,6 +236,16 @@ impl RudisConfig {
                         )
                     })?;
                     config.tiered_upload_threshold = val;
+                }
+                "save" => {
+                    // Like Redis: each line adds points; `save ""` clears them.
+                    let points = parse_save_points(&rest.join(" "))
+                        .map_err(|e| format!("Invalid save at line {}: {}", line_num + 1, e))?;
+                    if points.is_empty() {
+                        config.save_points.clear();
+                    } else {
+                        config.save_points.extend(points);
+                    }
                 }
                 other => {
                     config
@@ -468,10 +522,28 @@ mod tests {
         assert!(cfg.cluster_enabled);
         assert_eq!(cfg.tiered_offload_threshold, 65);
         assert_eq!(cfg.tiered_upload_threshold, 85);
-        assert_eq!(
-            cfg.extra_directives.get("save").map(|s| s.as_str()),
-            Some("900 1")
-        );
+        assert_eq!(cfg.save_points, vec![(900, 1)]);
+    }
+
+    #[test]
+    fn test_parse_save_points_and_shutdown_rule() {
+        assert!(RudisConfig::parse_str("").unwrap().save_points.is_empty());
+        let cfg = RudisConfig::parse_str("save 900 1\nsave 300 10 60 10000\n").unwrap();
+        assert_eq!(cfg.save_points, vec![(900, 1), (300, 10), (60, 10000)]);
+        let cfg = RudisConfig::parse_str("save 900 1\nsave \"\"\n").unwrap();
+        assert!(cfg.save_points.is_empty());
+        assert!(RudisConfig::parse_str("save 900\n").is_err());
+        assert!(RudisConfig::parse_str("save 900 x\n").is_err());
+        assert_eq!(parse_save_points("''").unwrap(), vec![]);
+
+        set_save_points(1, vec![(1, 1)]);
+        assert_eq!(save_points(1), vec![(1, 1)]);
+        assert!(save_points(2).is_empty());
+
+        assert!(should_save_on_shutdown(Some(true), false));
+        assert!(!should_save_on_shutdown(Some(false), true));
+        assert!(should_save_on_shutdown(None, true));
+        assert!(!should_save_on_shutdown(None, false));
     }
 
     #[test]

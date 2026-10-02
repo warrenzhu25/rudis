@@ -14983,3 +14983,125 @@ fn test_failed_save_does_not_block_later_saves_e2e() {
     shutdown_and_wait(port, &mut child);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn wait_exit(
+    child: &mut std::process::Child,
+    within: Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + within;
+    while std::time::Instant::now() < deadline {
+        if let Some(s) = child.try_wait().unwrap() {
+            return Some(s);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    None
+}
+
+#[test]
+fn test_sigterm_and_shutdown_save_when_save_points_configured_e2e() {
+    let port = 16982;
+    let dir = std::env::temp_dir().join(format!("rudis-shutsave-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let conf = dir.join("save.conf");
+    std::fs::write(&conf, "save 3600 1\n").unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--aof-dir",
+        dir.to_str().unwrap(),
+        "-c",
+        conf.to_str().unwrap(),
+    ];
+    let rdb = dir.join("dump.rdb");
+    let sigterm = |child: &std::process::Child| unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    };
+
+    // 1. SIGTERM snapshots before exiting, and the data comes back.
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["SET", "a", "1"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SET", "b", "2"]), "+OK\r\n");
+    drop(c);
+    sigterm(&child);
+    let status = wait_exit(&mut child, Duration::from_secs(20)).expect("SIGTERM must stop rudis");
+    assert!(status.success(), "{status}");
+    assert!(rdb.is_file(), "SIGTERM must save when save points are set");
+
+    // 2. Plain SHUTDOWN saves too; SHUTDOWN NOSAVE does not.
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert_eq!(
+        resp_cmd(&mut c, &["MGET", "a", "b"]),
+        "*2\r\n$1\r\n1\r\n$1\r\n2\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["SET", "c", "3"]), "+OK\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["GET", "c"]), "$1\r\n3\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SET", "d", "4"]), "+OK\r\n");
+    let _ = c.write_all(b"*2\r\n$8\r\nSHUTDOWN\r\n$6\r\nNOSAVE\r\n");
+    drop(c);
+    wait_exit(&mut child, Duration::from_secs(20)).expect("SHUTDOWN NOSAVE must stop rudis");
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["EXISTS", "d"]), ":0\r\n");
+
+    // 3. If the save fails, neither SHUTDOWN nor SIGTERM may exit.
+    std::fs::remove_file(&rdb).unwrap();
+    std::fs::create_dir_all(&rdb).unwrap();
+    assert_eq!(
+        resp_cmd(&mut c, &["SHUTDOWN"]),
+        "-ERR Errors trying to SHUTDOWN. Check logs.\r\n"
+    );
+    sigterm(&child);
+    assert!(
+        wait_exit(&mut child, Duration::from_secs(1)).is_none(),
+        "exited without saving"
+    );
+    assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n");
+    std::fs::remove_dir(&rdb).unwrap();
+    // Once the problem is fixed, a new signal saves and exits.
+    sigterm(&child);
+    let status = wait_exit(&mut child, Duration::from_secs(20)).expect("SIGTERM must stop rudis");
+    assert!(status.success(), "{status}");
+    assert!(rdb.is_file());
+    drop(c);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_shutdown_without_save_points_writes_no_rdb_e2e() {
+    let port = 16981;
+    let dir = std::env::temp_dir().join(format!("rudis-shutnosave-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--aof-dir",
+        dir.to_str().unwrap(),
+    ];
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["SET", "a", "1"]), "+OK\r\n");
+    drop(c);
+    unsafe {
+        libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    wait_exit(&mut child, Duration::from_secs(20)).expect("SIGTERM must stop rudis");
+    assert!(!dir.join("dump.rdb").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}

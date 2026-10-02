@@ -33,7 +33,21 @@ pub fn install_signal_handlers() {
 }
 
 extern "C" fn handle_signal(_sig: libc::c_int) {
-    request_shutdown();
+    // Async-signal-safe: only set a flag. A shard task picks it up, saves
+    // if configured, and then calls `request_shutdown`.
+    SHUTDOWN_SIGNALLED.store(true, Ordering::SeqCst);
+}
+
+static SHUTDOWN_SIGNALLED: AtomicBool = AtomicBool::new(false);
+
+/// Takes a pending SIGTERM/SIGINT, if any.
+pub fn take_shutdown_signal() -> bool {
+    SHUTDOWN_SIGNALLED.swap(false, Ordering::SeqCst)
+}
+
+/// Simulates a signal (for tests).
+pub fn signal_shutdown() {
+    SHUTDOWN_SIGNALLED.store(true, Ordering::SeqCst);
 }
 
 #[cfg(test)]
@@ -55,6 +69,17 @@ mod tests {
 
         reset_shutdown();
         assert!(!is_shutting_down());
+    }
+
+    #[test]
+    fn test_signal_is_pending_until_taken_and_does_not_stop_by_itself() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_shutdown();
+        signal_shutdown();
+        // The save step decides; the signal alone must not stop the server.
+        assert!(!is_shutting_down());
+        assert!(take_shutdown_signal());
+        assert!(!take_shutdown_signal());
     }
 
     #[test]
