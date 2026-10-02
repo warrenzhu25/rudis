@@ -14945,3 +14945,41 @@ fn test_aof_survives_thread_count_changes_e2e() {
     shutdown_and_wait(port, &mut child);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_failed_save_does_not_block_later_saves_e2e() {
+    let port = 16983;
+    let dir = std::env::temp_dir().join(format!("rudis-savefail-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--aof-dir",
+        dir.to_str().unwrap(),
+    ];
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["SET", "k", "v"]), "+OK\r\n");
+    // dump.rdb is a directory, so publishing the snapshot fails.
+    std::fs::create_dir_all(dir.join("dump.rdb")).unwrap();
+    for _ in 0..2 {
+        let r = resp_cmd(&mut c, &["SAVE"]);
+        assert!(r.starts_with("-ERR") && !r.contains("in progress"), "{r}");
+    }
+    assert_eq!(
+        std::fs::read_dir(&dir).unwrap().count(),
+        1,
+        "temp file left"
+    );
+    std::fs::remove_dir(dir.join("dump.rdb")).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["SAVE"]), "+OK\r\n");
+    assert!(dir.join("dump.rdb").is_file());
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}

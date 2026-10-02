@@ -3385,13 +3385,23 @@ impl Router {
     pub async fn perform_save_rdb(&self) -> Result<(), String> {
         static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let tmp_id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let filename = self.db_dir.join("dump.rdb");
         let tmp_filename =
             self.db_dir
                 .join(format!("dump.rdb.tmp.{}_{}", std::process::id(), tmp_id));
+        let res = self.write_rdb_file(&tmp_filename).await;
+        if let Err(ref e) = res {
+            eprintln!("Error saving DB on disk: {}", e);
+            let _ = std::fs::remove_file(&tmp_filename);
+        }
+        // Clear the flag on every path, or one failed save blocks all later ones.
+        self.is_saving.store(false, Ordering::SeqCst);
+        res
+    }
 
+    async fn write_rdb_file(&self, tmp_filename: &std::path::Path) -> Result<(), String> {
+        let filename = self.db_dir.join("dump.rdb");
         use std::io::Write;
-        let mut file = std::fs::File::create(&tmp_filename).map_err(|e| e.to_string())?;
+        let mut file = std::fs::File::create(tmp_filename).map_err(|e| e.to_string())?;
 
         let header = b"REDIS0011\xFE\x00";
         file.write_all(header).map_err(|e| e.to_string())?;
@@ -3411,17 +3421,19 @@ impl Router {
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
                 let (tx, rx) = flume::bounded(1);
-                if sender
+                // A missing shard would silently drop its keys from the dump.
+                sender
                     .send(ShardMessage::SaveRdbChunk { responder: tx })
-                    .is_ok()
-                    && let Ok(chunk) = rx.recv_async().await
-                {
-                    if !chunk.is_empty() {
-                        crc = crate::table::crc64_update(crc, &chunk);
-                        file.write_all(&chunk).map_err(|e| e.to_string())?;
-                    }
-                    drop(chunk);
+                    .map_err(|_| format!("shard {} is not reachable", sid))?;
+                let chunk = rx
+                    .recv_async()
+                    .await
+                    .map_err(|_| format!("shard {} did not return its data", sid))?;
+                if !chunk.is_empty() {
+                    crc = crate::table::crc64_update(crc, &chunk);
+                    file.write_all(&chunk).map_err(|e| e.to_string())?;
                 }
+                drop(chunk);
             }
         }
 
@@ -3431,7 +3443,7 @@ impl Router {
         file.write_all(&crc.to_le_bytes())
             .map_err(|e| e.to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
-        std::fs::rename(&tmp_filename, &filename).map_err(|e| e.to_string())?;
+        std::fs::rename(tmp_filename, &filename).map_err(|e| e.to_string())?;
         let _ = crate::aof::sync_parent_dir(std::path::Path::new(&filename));
 
         let now_unix = std::time::SystemTime::now()
@@ -3439,7 +3451,6 @@ impl Router {
             .unwrap_or_default()
             .as_secs();
         self.last_save_time.store(now_unix, Ordering::Relaxed);
-        self.is_saving.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -3572,6 +3583,41 @@ mod tests {
         assert!(!rt.block_on(router.check_auto_tier()));
         assert!(!router.is_auto_tiering.get());
         crate::tiering::set_max_memory(port, 0);
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn test_failed_save_clears_in_progress_flag_and_temp_file() {
+        let (mut router, db) = single_shard_router(19873);
+        db.borrow_mut()
+            .set(Bytes::from("k"), Bytes::from("v"), None);
+        let dir = std::env::temp_dir().join(format!("rudis-savefail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        router.db_dir = dir.clone();
+        // dump.rdb is a directory, so the final rename fails.
+        std::fs::create_dir_all(dir.join("dump.rdb")).unwrap();
+        let err = block_on(router.save_rdb()).unwrap_err();
+        assert!(!err.contains("in progress"), "{err}");
+        // The flag was cleared: a retry fails for the real reason again.
+        let err2 = block_on(router.save_rdb()).unwrap_err();
+        assert!(!err2.contains("in progress"), "{err2}");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "temp file left"
+        );
+        std::fs::remove_dir(dir.join("dump.rdb")).unwrap();
+        block_on(router.save_rdb()).unwrap();
+        assert!(dir.join("dump.rdb").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
