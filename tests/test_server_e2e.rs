@@ -5349,11 +5349,12 @@ fn test_dragonfly_compatibility_suite_e2e() {
         "$5\r\napple\r\n"
     );
 
-    // Memcached GET command (retrieves multiple keys)
+    // Multi-key memcached `get` is ambiguous with Redis GET on a shared port;
+    // Redis semantics win (GET takes exactly one key).
     let mc_get = b"get mc_fruit non_existent\r\n";
     assert_eq!(
         send_and_read(&mut client, mc_get),
-        "VALUE mc_fruit 0 5\r\napple\r\nEND\r\n"
+        "-ERR wrong number of arguments for 'get' command\r\n"
     );
 
     // Memcached STATS
