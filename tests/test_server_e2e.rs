@@ -5389,7 +5389,7 @@ fn test_harness_and_extended_command_coverage_e2e() {
     assert_eq!(send_and_read(&mut client, b"SELECT 9\r\n"), "+OK\r\n");
     assert_eq!(
         send_and_read(&mut client, b"CLIENT KILL 127.0.0.1:9999\r\n"),
-        "+OK\r\n"
+        "-ERR No such client\r\n"
     );
     assert_eq!(send_and_read(&mut client, b"SLOWLOG RESET\r\n"), "+OK\r\n");
     assert_eq!(send_and_read(&mut client, b"SLOWLOG LEN\r\n"), ":0\r\n");
@@ -5423,7 +5423,7 @@ fn test_harness_and_extended_command_coverage_e2e() {
     assert_eq!(
         send_and_read(
             &mut client,
-            b"JSON.SET jext $ {\"num\":10,\"str\":\"hello\",\"arr\":[1,2,3]}\r\n"
+            b"JSON.SET jext $ '{\"num\":10,\"str\":\"hello\",\"arr\":[1,2,3]}'\r\n"
         ),
         "+OK\r\n"
     );
