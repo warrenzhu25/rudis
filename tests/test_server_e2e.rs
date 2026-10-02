@@ -2474,7 +2474,7 @@ fn test_rdb_cold_start_restore_e2e() {
     // Verify all keys restored cleanly across shards
     assert_eq!(
         send_and_read(&mut client2, b"GET cold_str\r\n"),
-        "$15\r\n\"rudis_is_fast\"\r\n"
+        "$13\r\nrudis_is_fast\r\n"
     );
     assert_eq!(
         send_and_read(&mut client2, b"GET cold_int\r\n"),
@@ -2524,7 +2524,7 @@ fn test_cluster_migrate_slot_e2e() {
     );
     assert_eq!(
         send_and_read(&mut client1, format!("GET {}\r\n", key).as_bytes()),
-        "$13\r\n\"transferred\"\r\n"
+        "$11\r\ntransferred\r\n"
     );
 
     // Migrate this slot to server2
@@ -2544,7 +2544,7 @@ fn test_cluster_migrate_slot_e2e() {
     // Server 2 should now have the key
     assert_eq!(
         send_and_read(&mut client2, format!("GET {}\r\n", key).as_bytes()),
-        "$13\r\n\"transferred\"\r\n"
+        "$11\r\ntransferred\r\n"
     );
 
     // Test CLUSTER REBALANCE
@@ -2597,7 +2597,7 @@ fn test_blocking_operations_e2e() {
     });
 
     let resp = send_and_read(&mut client1, b"BLPOP {t}:list 3\r\n");
-    assert_eq!(resp, "*2\r\n$8\r\n{t}:list\r\n$11\r\n\"woken_val\"\r\n");
+    assert_eq!(resp, "*2\r\n$8\r\n{t}:list\r\n$9\r\nwoken_val\r\n");
     handle.join().unwrap();
 
     // 4. XREAD BLOCK timeout on non-existent stream
@@ -7506,7 +7506,7 @@ fn test_extended_types_rdb_persistence_e2e() {
     assert_eq!(
         send_and_read(
             &mut client,
-            b"JSON.SET doc:ext_1 $ {\"title\":\"test\",\"rating\":5}\r\n"
+            b"JSON.SET doc:ext_1 $ '{\"title\":\"test\",\"rating\":5}'\r\n"
         ),
         "+OK\r\n"
     );
@@ -7615,21 +7615,21 @@ fn test_json_mget_multi_shard_parallel_fanout_e2e() {
     assert_eq!(
         send_and_read(
             &mut client,
-            b"JSON.SET user:1 $ {\"name\":\"alice\",\"age\":30,\"score\":95}\r\n"
+            b"JSON.SET user:1 $ '{\"name\":\"alice\",\"age\":30,\"score\":95}'\r\n"
         ),
         "+OK\r\n"
     );
     assert_eq!(
         send_and_read(
             &mut client,
-            b"JSON.SET user:2 $ {\"name\":\"bob\",\"age\":25,\"score\":88}\r\n"
+            b"JSON.SET user:2 $ '{\"name\":\"bob\",\"age\":25,\"score\":88}'\r\n"
         ),
         "+OK\r\n"
     );
     assert_eq!(
         send_and_read(
             &mut client,
-            b"JSON.SET user:3 $ {\"name\":\"carol\",\"age\":35,\"score\":92}\r\n"
+            b"JSON.SET user:3 $ '{\"name\":\"carol\",\"age\":35,\"score\":92}'\r\n"
         ),
         "+OK\r\n"
     );
@@ -7825,7 +7825,7 @@ fn test_aof_bgrewriteaof_compaction_e2e() {
         ":2\r\n"
     );
     assert_eq!(
-        send_and_read(&mut client1, b"JSON.SET doc1 $ {\"val\":\"compacted\"}\r\n"),
+        send_and_read(&mut client1, b"JSON.SET doc1 $ '{\"val\":\"compacted\"}'\r\n"),
         "+OK\r\n"
     );
 
@@ -7930,7 +7930,7 @@ fn test_extended_rdb_full_server_bgsave_and_restore_e2e() {
     assert_eq!(
         send_and_read(
             &mut client1,
-            b"JSON.SET doc_snap $ {\"status\":\"persisted\",\"tier\":1}\r\n"
+            b"JSON.SET doc_snap $ '{\"status\":\"persisted\",\"tier\":1}'\r\n"
         ),
         "+OK\r\n"
     );
