@@ -86,3 +86,42 @@ jobs:
         run: python3 scripts/check_perf_regression.py
 
 
+  redis_tcl_suites:
+    name: Redis TCL compatibility suites
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Keep in sync with rust-toolchain.toml.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@1.99.0
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: Install tclsh
+        run: sudo apt-get update && sudo apt-get install -y tcl
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Run the core TCL suites
+        run: SKIP_BUILD=1 bash scripts/run_redis_test_suite.sh 16379 all
+
+      - name: Upload server log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rudis-tcl-server-log
+          path: /tmp/rudis_tcl_test_16379.log

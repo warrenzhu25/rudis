@@ -14,42 +14,58 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Ensure binary is built
-echo "Building Rudis release binary..."
-~/.cargo/bin/cargo build --release
+# Ensure binary is built (SKIP_BUILD=1 reuses target/release/rudis).
+if [ "${SKIP_BUILD:-0}" != "1" ]; then
+    echo "Building Rudis release binary..."
+    CARGO=$(command -v cargo || echo ~/.cargo/bin/cargo)
+    "$CARGO" build --release
+fi
 
-# Clean log
 TEST_LOG="/tmp/rudis_tcl_test_${PORT}.log"
+SERVER_DIR="/tmp/rudis_tcl_server_${PORT}"
 rm -f "$TEST_LOG"
 killall -9 rudis 2>/dev/null || true
 sleep 0.5
 
-# Determine thread count (single-thread for unit/scripting which tests non-clustered cross-key Lua)
-THREADS=${4:-}
-if [ -z "$THREADS" ]; then
-    if [ "$SUITE_ARG" = "unit/scripting" ] || [ "$SUITE_ARG" = "unit/functions" ]; then
-        THREADS=1
-    else
-        THREADS=2
+RUDIS_PID=""
+stop_server() {
+    if [ -n "$RUDIS_PID" ]; then
+        kill -9 "$RUDIS_PID" 2>/dev/null || true
+        wait "$RUDIS_PID" 2>/dev/null || true
+        RUDIS_PID=""
     fi
-fi
-
-# Start rudis server in background
-echo "Starting Rudis server on port $PORT (threads: $THREADS)..."
-./target/release/rudis --port "$PORT" --threads "$THREADS" --no-pin > "$TEST_LOG" 2>&1 &
-RUDIS_PID=$!
-
-cleanup() {
-    echo "Stopping Rudis server (PID $RUDIS_PID)..."
-    kill -9 "$RUDIS_PID" 2>/dev/null || true
 }
-trap cleanup EXIT
+trap stop_server EXIT
 
-# Wait for server to bind
-sleep 1
-if ! nc -z 127.0.0.1 "$PORT" 2>/dev/null && ! timeout 1 bash -c "</dev/tcp/127.0.0.1/$PORT" 2>/dev/null; then
-    sleep 1
-fi
+# Each suite gets a fresh server, so one suite's state or crash cannot fail
+# the next. unit/scripting and unit/functions run cross-key Lua that needs
+# a single shard; the rest use 2 (override with the 4th argument).
+start_server() {
+    local suite=$1
+    local threads=${THREADS_ARG:-}
+    if [ -z "$threads" ]; then
+        if [ "$suite" = "unit/scripting" ] || [ "$suite" = "unit/functions" ]; then
+            threads=1
+        else
+            threads=2
+        fi
+    fi
+    echo "Starting Rudis server on port $PORT (threads: $threads)..."
+    # Run in a scratch dir: suites SAVE, and a dump.rdb left in the repo
+    # would be loaded by every server later started there (e.g. e2e tests).
+    rm -rf "$SERVER_DIR" && mkdir -p "$SERVER_DIR"
+    (cd "$SERVER_DIR" && exec "$REPO_ROOT/target/release/rudis" --port "$PORT" --threads "$threads" --no-pin) >> "$TEST_LOG" 2>&1 &
+    RUDIS_PID=$!
+    for _ in $(seq 1 50); do
+        if timeout 1 bash -c "</dev/tcp/127.0.0.1/$PORT" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    echo "Rudis did not start on port $PORT"
+    return 1
+}
+THREADS_ARG=${4:-}
 
 CORE_SUITES=(
     "unit/type/string"
@@ -121,6 +137,8 @@ PASSED_SUITES=()
 for suite in "${TARGET_SUITES[@]}"; do
     echo ""
     echo ">>> Running TCL Suite: $suite ..."
+    stop_server
+    start_server "$suite" || { FAILED_SUITES+=("$suite"); continue; }
     if tclsh test_helper.tcl \
         --host 127.0.0.1 \
         --port "$PORT" \
