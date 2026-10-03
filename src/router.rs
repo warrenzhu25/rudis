@@ -91,6 +91,24 @@ pub fn slot_to_shard(slot: u16, num_shards: usize) -> usize {
     }
 }
 
+/// Picks the shard for a key hash. FxHash carries entropy only upward (each
+/// step multiplies), so its low bits ignore the high bytes of the last
+/// chunk, and `hash % n` put keys differing only there on one shard: all of
+/// "sk:0".."sk:9", or fixed-width keys like "key:0001".."key:9999". The
+/// splitmix64 finalizer folds every bit into the low ones; its constants
+/// differ from the table's own `mix_hash`, so shard choice and bucket
+/// choice stay independent.
+#[inline(always)]
+pub fn shard_of_hash(hash: u64, num_shards: usize) -> usize {
+    let mut x = hash;
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58476d1ce4e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d049bb133111eb);
+    x ^= x >> 31;
+    (x % num_shards as u64) as usize
+}
+
 /// Calculates the target shard ID for a given key.
 /// In Redis Cluster mode, uses CRC16 slot mapping.
 /// In standalone mode, uses high-performance 64-bit hashing for optimal key distribution across cores.
@@ -103,7 +121,7 @@ pub fn target_shard(key: &[u8], num_shards: usize) -> usize {
         slot_to_shard(slot, num_shards)
     } else {
         let tag = extract_hash_tag(key);
-        (crate::table::hash_key(tag) as usize) % num_shards
+        shard_of_hash(crate::table::hash_key(tag), num_shards)
     }
 }
 
@@ -122,7 +140,7 @@ pub fn target_shard_and_hash(key: &[u8], num_shards: usize) -> (usize, u64) {
         } else {
             crate::table::hash_key(tag)
         };
-        ((shard_hash as usize) % num_shards, key_hash)
+        (shard_of_hash(shard_hash, num_shards), key_hash)
     }
 }
 
@@ -3697,6 +3715,40 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_keys_differing_in_last_bytes_spread_over_shards() {
+        // Short keys and fixed-width keys used to all land on one shard.
+        let families: [Vec<String>; 3] = [
+            (0..64).map(|i| format!("sk:{}", i % 10)).collect(),
+            (0..1000).map(|i| format!("key:{i:04}")).collect(),
+            (0..1000).map(|i| format!("user:{i:08}")).collect(),
+        ];
+        for keys in &families {
+            let distinct: std::collections::HashSet<&String> = keys.iter().collect();
+            for n in [2usize, 4, 8] {
+                let mut counts = vec![0usize; n];
+                for k in &distinct {
+                    counts[target_shard(k.as_bytes(), n)] += 1;
+                }
+                let fair = distinct.len() / n;
+                let min = *counts.iter().min().unwrap();
+                let used = counts.iter().filter(|&&c| c > 0).count();
+                let balanced = if distinct.len() < 100 {
+                    used * 2 >= n
+                } else {
+                    min * 2 > fair
+                };
+                assert!(balanced, "{n} shards, keys like {:?}: {counts:?}", keys[0]);
+            }
+        }
+        // Hash tags still pin keys to one shard.
+        assert_eq!(target_shard(b"{u1}:a", 4), target_shard(b"{u1}:b", 4));
+        assert_eq!(
+            target_shard_and_hash(b"{u1}:a", 4).0,
+            target_shard(b"u1", 4)
+        );
+    }
 
     fn single_shard_router(port: u16) -> (Router, Rc<RefCell<ShardDb>>) {
         let db = Rc::new(RefCell::new(ShardDb::new(port)));
