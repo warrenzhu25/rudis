@@ -2969,9 +2969,7 @@ async fn execute_tx_step(
 
                     let use_vll = sorted_shards.len() > 1;
                     let tx_id = if use_vll {
-                        static NEXT_TX: std::sync::atomic::AtomicU64 =
-                            std::sync::atomic::AtomicU64::new(1);
-                        let id = NEXT_TX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let id = next_tx_id();
                         router.acquire_tx_locks(&sorted_shards, id).await;
                         id
                     } else {
@@ -14085,14 +14083,23 @@ async fn execute_command(
         Command::Rename {
             ref key,
             ref newkey,
-            ..
+            nx,
         } => {
             let target_src = router.target_shard(key);
             let target_dst = router.target_shard(newkey);
             if target_src != target_dst {
-                out.extend_from_slice(
-                    b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
-                );
+                if router.cluster_enabled {
+                    out.extend_from_slice(
+                        b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                    );
+                } else {
+                    let mode = if nx {
+                        CrossShardMove::RenameNx
+                    } else {
+                        CrossShardMove::Rename
+                    };
+                    out.extend_from_slice(&move_key_across_shards(router, key, newkey, mode).await);
+                }
                 return false;
             }
             if target_src == router.shard_id {
@@ -14111,14 +14118,26 @@ async fn execute_command(
         Command::Copy {
             ref source,
             ref destination,
-            ..
+            destination_db,
+            replace,
         } => {
             let target_src = router.target_shard(source);
             let target_dst = router.target_shard(destination);
             if target_src != target_dst {
-                out.extend_from_slice(
-                    b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
-                );
+                if router.cluster_enabled || destination_db.is_some() {
+                    out.extend_from_slice(
+                        b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                    );
+                } else {
+                    let mode = if replace {
+                        CrossShardMove::CopyReplace
+                    } else {
+                        CrossShardMove::Copy
+                    };
+                    out.extend_from_slice(
+                        &move_key_across_shards(router, source, destination, mode).await,
+                    );
+                }
                 return false;
             }
             if target_src == router.shard_id {
@@ -24175,6 +24194,145 @@ fn keys_span_shards(keys: &[Bytes], shard_of: impl Fn(&[u8]) -> usize) -> bool {
             rest.iter().any(|k| shard_of(k) != owner)
         }
         None => false,
+    }
+}
+
+/// Ids for `Router::acquire_tx_locks`, shared by EXEC and the cross-shard
+/// key commands so a lock is never released by a different holder.
+static NEXT_TX_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_tx_id() -> u64 {
+    NEXT_TX_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Runs `cmd` on `shard`, locally or through its mailbox, and returns the
+/// RESP reply.
+async fn exec_on_shard(router: &Router, shard: usize, cmd: Command) -> Vec<u8> {
+    if shard == router.shard_id {
+        let mut out = Vec::new();
+        execute_local_command(
+            &cmd,
+            &mut router.local_db.borrow_mut(),
+            &mut out,
+            router.aof.as_deref(),
+        );
+        out
+    } else {
+        router.execute_remote(shard, cmd).await
+    }
+}
+
+/// Payload of a `$N\r\n...\r\n` bulk reply; None for nil or anything else.
+fn resp_bulk_payload(resp: &[u8]) -> Option<Bytes> {
+    let rest = resp.strip_prefix(b"$")?;
+    let nl = rest.iter().position(|&b| b == b'\n')?;
+    let len: usize = std::str::from_utf8(&rest[..nl])
+        .ok()?
+        .trim_end()
+        .parse()
+        .ok()?;
+    let body = rest.get(nl + 1..nl + 1 + len)?;
+    Some(Bytes::copy_from_slice(body))
+}
+
+/// Value of a `:N\r\n` integer reply, keeping the sign.
+fn resp_integer(resp: &[u8]) -> Option<i64> {
+    resp.strip_prefix(b":")
+        .and_then(|r| r.strip_suffix(b"\r\n"))
+        .and_then(|n| std::str::from_utf8(n).ok())
+        .and_then(|n| n.parse().ok())
+}
+
+/// How [`move_key_across_shards`] treats the source and an existing target.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CrossShardMove {
+    /// RENAME: overwrite the target, delete the source.
+    Rename,
+    /// RENAMENX: fail if the target exists, delete the source.
+    RenameNx,
+    /// COPY without REPLACE: fail if the target exists, keep the source.
+    Copy,
+    /// COPY REPLACE: overwrite the target, keep the source.
+    CopyReplace,
+}
+
+/// RENAME / RENAMENX / COPY for keys owned by different shards. The value
+/// moves as a DUMP payload plus its absolute expiry and is RESTOREd on the
+/// target shard, then the source is deleted for renames. Both shards are
+/// held with the same tx locks EXEC uses, so this is serialized with
+/// transactions and other cross-shard moves (two concurrent renames of one
+/// key cannot both copy it), with the same isolation EXEC gives against
+/// plain commands. Each shard logs and replicates its own RESTORE / DEL.
+/// Returns the command's reply.
+async fn move_key_across_shards(
+    router: &Router,
+    src: &Bytes,
+    dst: &Bytes,
+    mode: CrossShardMove,
+) -> Vec<u8> {
+    router.ensure_loaded(src).await;
+    router.ensure_loaded(dst).await;
+    let (s, d) = (router.target_shard(src), router.target_shard(dst));
+    let mut shards = [s, d];
+    shards.sort_unstable();
+    // Inside EXEC the transaction already holds the locks of all its keys.
+    let lock = !IN_TX.get();
+    let tx_id = next_tx_id();
+    if lock {
+        router.acquire_tx_locks(&shards, tx_id).await;
+    }
+    let res = async {
+        let dump = exec_on_shard(router, s, Command::Dump(src.clone())).await;
+        let Some(payload) = resp_bulk_payload(&dump) else {
+            return if dump.starts_with(b"-") {
+                Err(dump)
+            } else {
+                Ok(None)
+            };
+        };
+        let expire_at =
+            resp_integer(&exec_on_shard(router, s, Command::Expiretime(src.clone(), true)).await)
+                .unwrap_or(-1);
+        let replace = matches!(mode, CrossShardMove::Rename | CrossShardMove::CopyReplace);
+        if !replace {
+            let exists =
+                exec_on_shard(router, d, Command::Exists(smallvec::smallvec![dst.clone()])).await;
+            if resp_integer(&exists).unwrap_or(0) > 0 {
+                return Ok(Some(false));
+            }
+        }
+        let restored = exec_on_shard(
+            router,
+            d,
+            Command::Restore {
+                key: dst.clone(),
+                ttl_ms: expire_at.max(0) as u64,
+                serialized: payload,
+                replace: true,
+                absttl: expire_at > 0,
+            },
+        )
+        .await;
+        if restored.starts_with(b"-") {
+            return Err(restored);
+        }
+        if matches!(mode, CrossShardMove::Rename | CrossShardMove::RenameNx) {
+            let _ = exec_on_shard(router, s, Command::Del(smallvec::smallvec![src.clone()])).await;
+        }
+        Ok(Some(true))
+    }
+    .await;
+    if lock {
+        router.release_tx_locks(&shards, tx_id).await;
+    }
+    let renames = matches!(mode, CrossShardMove::Rename | CrossShardMove::RenameNx);
+    match res {
+        Ok(Some(true)) if mode == CrossShardMove::Rename => b"+OK\r\n".to_vec(),
+        Ok(Some(true)) => b":1\r\n".to_vec(),
+        Ok(Some(false)) => b":0\r\n".to_vec(),
+        Ok(None) if renames => b"-ERR no such key\r\n".to_vec(),
+        Ok(None) => b":0\r\n".to_vec(),
+        Err(e) => e,
     }
 }
 

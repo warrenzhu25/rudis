@@ -16829,3 +16829,83 @@ fn test_script_access_to_non_local_key_is_rejected_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child);
 }
+
+#[test]
+fn test_rename_and_copy_across_shards_e2e() {
+    let port = 16951;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "4", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // With 4 shards most of these pairs land on different shards, which used
+    // to fail with CROSSSLOT in standalone mode.
+    for i in 0..16 {
+        let (a, b, cp) = (format!("ra:{i}"), format!("rb:{i}"), format!("rc:{i}"));
+        assert_eq!(resp_cmd(&mut c, &["RPUSH", &a, "x", "y"]), ":2\r\n");
+        assert_eq!(resp_cmd(&mut c, &["PEXPIRE", &a, "100000"]), ":1\r\n");
+        assert_eq!(resp_cmd(&mut c, &["RENAME", &a, &b]), "+OK\r\n", "{a}");
+        assert_eq!(resp_cmd(&mut c, &["EXISTS", &a]), ":0\r\n");
+        assert_eq!(
+            resp_cmd(&mut c, &["LRANGE", &b, "0", "-1"]),
+            "*2\r\n$1\r\nx\r\n$1\r\ny\r\n"
+        );
+        let ttl: i64 = resp_cmd(&mut c, &["PTTL", &b])[1..].trim().parse().unwrap();
+        assert!(ttl > 90_000 && ttl <= 100_000, "TTL kept: {ttl}");
+        assert_eq!(resp_cmd(&mut c, &["COPY", &b, &cp]), ":1\r\n");
+        assert_eq!(resp_cmd(&mut c, &["COPY", &b, &cp]), ":0\r\n");
+        assert_eq!(resp_cmd(&mut c, &["LLEN", &cp]), ":2\r\n");
+        assert_eq!(resp_cmd(&mut c, &["SET", &a, "s"]), "+OK\r\n");
+        assert_eq!(resp_cmd(&mut c, &["RENAMENX", &a, &b]), ":0\r\n");
+        assert_eq!(resp_cmd(&mut c, &["COPY", &a, &cp, "REPLACE"]), ":1\r\n");
+        assert_eq!(resp_cmd(&mut c, &["GET", &cp]), "$1\r\ns\r\n");
+        assert_eq!(resp_cmd(&mut c, &["RENAME", &a, &b]), "+OK\r\n");
+        assert_eq!(resp_cmd(&mut c, &["GET", &b]), "$1\r\ns\r\n");
+        assert_eq!(
+            resp_cmd(&mut c, &["RENAME", &a, &b]),
+            "-ERR no such key\r\n"
+        );
+    }
+    assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), ":32\r\n");
+
+    // Inside MULTI/EXEC, where the transaction already holds the shard locks.
+    assert_eq!(resp_cmd(&mut c, &["SET", "tx:a", "1"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["MULTI"]), "+OK\r\n");
+    for (from, to) in [("tx:a", "tx:b"), ("tx:b", "tx:c"), ("tx:c", "tx:d")] {
+        assert_eq!(resp_cmd(&mut c, &["RENAME", from, to]), "+QUEUED\r\n");
+    }
+    assert_eq!(resp_cmd(&mut c, &["EXEC"]), "*3\r\n+OK\r\n+OK\r\n+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "tx:d"]), "$1\r\n1\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["EXISTS", "tx:a", "tx:b", "tx:c"]),
+        ":0\r\n"
+    );
+
+    // Concurrent renames of one key must not duplicate it. The targets share
+    // a hash tag, so for each source the renames are either all local to one
+    // shard or all cross-shard (serialized by the shard locks).
+    for j in 0..4 {
+        let src = format!("rs:{j}");
+        assert_eq!(resp_cmd(&mut c, &["SET", &src, "v"]), "+OK\r\n");
+        let racers: Vec<_> = (0..8)
+            .map(|i| {
+                let src = src.clone();
+                std::thread::spawn(move || {
+                    let mut r = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                    r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    resp_cmd(&mut r, &["RENAME", &src, &format!("{{rdst}}:{j}:{i}")])
+                })
+            })
+            .collect();
+        let oks = racers
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .filter(|r| r == "+OK\r\n")
+            .count();
+        assert_eq!(oks, 1, "{src}");
+        let keys = resp_cmd(&mut c, &["KEYS", &format!("{{rdst}}:{j}:*")]);
+        assert!(keys.starts_with("*1\r\n"), "{src}: {keys}");
+        assert_eq!(resp_cmd(&mut c, &["EXISTS", &src]), ":0\r\n");
+    }
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}
