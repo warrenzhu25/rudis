@@ -2558,6 +2558,24 @@ pub fn script_touches_non_local_key(cmd: &Command) -> bool {
     })
 }
 
+/// The shard of the first key `cmd` touches that this shard does not own.
+pub fn script_non_local_target(cmd: &Command) -> Option<usize> {
+    CURRENT_ROUTER.with(|cr| {
+        let router = cr.borrow().as_ref().cloned()?;
+        if router.num_shards <= 1 {
+            return None;
+        }
+        let mut target = None;
+        for_each_cmd_key(cmd, |k| {
+            let shard = router.target_shard(k);
+            if target.is_none() && shard != router.shard_id {
+                target = Some(shard);
+            }
+        });
+        target
+    })
+}
+
 pub fn publish_sync(channel: &[u8], message: &[u8]) -> usize {
     CURRENT_ROUTER.with(|cr| {
         if let Some(router) = cr.borrow().as_ref() {
@@ -15039,14 +15057,29 @@ async fn execute_command(
             }
             let script_str = String::from_utf8_lossy(&script);
             crate::scripting::load_script(&script);
-            match crate::scripting::eval_script(
+            if keys.is_empty() {
+                crate::scripting::arm_script_redirect();
+            }
+            let result = crate::scripting::eval_script(
                 &script_str,
                 &keys,
                 &args,
                 &router.local_db,
                 router.aof.as_deref(),
                 read_only,
-            ) {
+            );
+            if let Some(target) = crate::scripting::take_script_redirect() {
+                let cmd = Command::Eval {
+                    script,
+                    keys,
+                    args,
+                    read_only,
+                    auth_user: effective_user,
+                };
+                out.extend_from_slice(&router.execute_remote(target, cmd).await);
+                return false;
+            }
+            match result {
                 Ok(resp) => out.extend_from_slice(&resp),
                 Err(e) => {
                     write_resp_err(out, e);
@@ -15092,14 +15125,29 @@ async fn execute_command(
             }
             let sha_str = String::from_utf8_lossy(&sha);
             if let Some(script) = crate::scripting::get_script(&sha_str) {
-                match crate::scripting::eval_script(
+                if keys.is_empty() {
+                    crate::scripting::arm_script_redirect();
+                }
+                let result = crate::scripting::eval_script(
                     &script,
                     &keys,
                     &args,
                     &router.local_db,
                     router.aof.as_deref(),
                     read_only,
-                ) {
+                );
+                if let Some(target) = crate::scripting::take_script_redirect() {
+                    let cmd = Command::Evalsha {
+                        sha,
+                        keys,
+                        args,
+                        read_only,
+                        auth_user: effective_user,
+                    };
+                    out.extend_from_slice(&router.execute_remote(target, cmd).await);
+                    return false;
+                }
+                match result {
                     Ok(resp) => out.extend_from_slice(&resp),
                     Err(e) => {
                         write_resp_err(out, e);
@@ -15247,14 +15295,29 @@ async fn execute_command(
                     return false;
                 }
             }
-            match crate::scripting::call_function(
+            if keys.is_empty() {
+                crate::scripting::arm_script_redirect();
+            }
+            let result = crate::scripting::call_function(
                 &function,
                 &keys,
                 &args,
                 &router.local_db,
                 router.aof.as_deref(),
                 read_only,
-            ) {
+            );
+            if let Some(target) = crate::scripting::take_script_redirect() {
+                let cmd = Command::Fcall {
+                    function,
+                    keys,
+                    args,
+                    read_only,
+                    auth_user: effective_user,
+                };
+                out.extend_from_slice(&router.execute_remote(target, cmd).await);
+                return false;
+            }
+            match result {
                 Ok(res) => {
                     for k in &keys {
                         notify_key_invalidation(router.port, k.as_ref(), client_id);

@@ -16819,12 +16819,18 @@ fn test_script_access_to_non_local_key_is_rejected_e2e() {
     let keys: Vec<String> = (0..8).map(|i| format!("sk:{i}")).collect();
     // A keyless script runs on the connection's shard. Writing a key owned
     // by another shard used to land in the wrong table: KEYS and DBSIZE
-    // listed it but GET returned nil.
+    // listed it but GET returned nil. (A script whose first command touches
+    // another shard's key is rerun there, so start with a keyless command.)
     let mut rejected = 0;
     for k in &keys {
         let r = resp_cmd(
             &mut c,
-            &["EVAL", "return redis.call('set',ARGV[1],'v')", "0", k],
+            &[
+                "EVAL",
+                "redis.call('ping'); return redis.call('set',ARGV[1],'v')",
+                "0",
+                k,
+            ],
         );
         if r == "+OK\r\n" {
             assert_eq!(resp_cmd(&mut c, &["GET", k]), "$1\r\nv\r\n", "{k}");
@@ -16837,7 +16843,12 @@ fn test_script_access_to_non_local_key_is_rejected_e2e() {
             // redis.pcall reports it as an error reply too.
             let r = resp_cmd(
                 &mut c,
-                &["EVAL", "return redis.pcall('get',ARGV[1])", "0", k],
+                &[
+                    "EVAL",
+                    "redis.call('ping'); return redis.pcall('get',ARGV[1])",
+                    "0",
+                    k,
+                ],
             );
             assert!(
                 r.starts_with("-ERR Script attempted to access a non local key"),
@@ -17524,6 +17535,67 @@ fn test_blocking_pops_and_rare_writes_replicate_e2e() {
     drop(r);
     shutdown_and_wait(rport, &mut replica);
     shutdown_and_wait(mport, &mut master);
+}
+
+#[test]
+fn test_keyless_script_runs_on_owner_of_first_key_e2e() {
+    let port = 16934u16;
+    let ps = port.to_string();
+    let mut server = spawn_rudis_listening(&["--port", &ps, "--threads", "4", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // Scripts that declare no keys used to fail whenever the key they
+    // touch lived on another shard than the client's connection.
+    for i in 0..32 {
+        let key = format!("ks:{i}");
+        let r = resp_cmd(
+            &mut c,
+            &["EVAL", "return redis.call('SET', ARGV[1], 'v')", "0", &key],
+        );
+        assert_eq!(r, "+OK\r\n", "{key}");
+        assert_eq!(resp_cmd(&mut c, &["GET", &key]), "$1\r\nv\r\n");
+    }
+    resp_cmd(
+        &mut c,
+        &[
+            "FUNCTION",
+            "LOAD",
+            "REPLACE",
+            "#!lua name=kl\nredis.register_function('kl', function(k, a) return redis.call('INCR', a[1]) end)",
+        ],
+    );
+    for i in 0..32 {
+        let key = format!("kf:{i}");
+        assert_eq!(
+            resp_cmd(&mut c, &["FCALL", "kl", "0", &key]),
+            ":1\r\n",
+            "{key}"
+        );
+    }
+    // Only a first command may move the script: after anything ran, a key
+    // of another shard is still an error, and nothing ran twice.
+    let mut errors = 0;
+    for i in 0..32 {
+        let key = format!("kp:{i}");
+        let r = resp_cmd(
+            &mut c,
+            &[
+                "EVAL",
+                "redis.call('INCR', 'kp:counter{x}'); return redis.call('SET', ARGV[1], 'v')",
+                "0",
+                &key,
+            ],
+        );
+        if r.starts_with("-ERR Script attempted to access a non local key") {
+            errors += 1;
+        } else {
+            assert_eq!(r, "+OK\r\n");
+        }
+    }
+    assert!(errors > 0);
+    assert_eq!(resp_cmd(&mut c, &["GET", "kp:counter{x}"]), "$2\r\n32\r\n");
+    let _ = server.kill();
+    let _ = server.wait();
 }
 
 #[test]

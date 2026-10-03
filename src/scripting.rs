@@ -123,6 +123,61 @@ pub fn count_libraries() -> usize {
     FUNCTION_LIBS.read().unwrap().len()
 }
 
+/// Where a script that declared no keys may still run. With several shards
+/// such a script runs on the client's shard; if its very first command
+/// touches a key of another shard, nothing has happened yet, so the
+/// dispatcher can rerun it on that key's shard (see `arm_script_redirect`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScriptRedirect {
+    Off,
+    /// No command issued yet; a non-local key redirects.
+    Armed,
+    /// A command ran; non-local keys are errors from now on.
+    Disarmed,
+    /// Rerun on this shard; every further command fails.
+    To(usize),
+}
+
+thread_local! {
+    static SCRIPT_REDIRECT: std::cell::Cell<ScriptRedirect> =
+        const { std::cell::Cell::new(ScriptRedirect::Off) };
+}
+
+/// Lets the next script on this thread be redirected to another shard if
+/// its first command touches a key there. Call `take_script_redirect` after
+/// it returns.
+pub fn arm_script_redirect() {
+    SCRIPT_REDIRECT.set(ScriptRedirect::Armed);
+}
+
+/// Ends the armed script; returns the shard to rerun it on, if any. The
+/// script's own result must then be discarded.
+pub fn take_script_redirect() -> Option<usize> {
+    match SCRIPT_REDIRECT.replace(ScriptRedirect::Off) {
+        ScriptRedirect::To(shard) => Some(shard),
+        _ => None,
+    }
+}
+
+/// Checks a command a script is about to run against the redirect state;
+/// true means fail it with the non-local key error, unrecorded.
+fn script_redirects(cmd: &Command) -> bool {
+    match SCRIPT_REDIRECT.get() {
+        ScriptRedirect::Off | ScriptRedirect::Disarmed => false,
+        ScriptRedirect::To(_) => true,
+        ScriptRedirect::Armed => match crate::connection::script_non_local_target(cmd) {
+            Some(shard) => {
+                SCRIPT_REDIRECT.set(ScriptRedirect::To(shard));
+                true
+            }
+            None => {
+                SCRIPT_REDIRECT.set(ScriptRedirect::Disarmed);
+                false
+            }
+        },
+    }
+}
+
 thread_local! {
     pub static SCRIPT_RECORDED_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -2108,6 +2163,11 @@ fn register_redis_module(
             SCRIPT_RECORDED_ERROR.set(true);
             return Err(mlua::Error::RuntimeError(err));
         }
+        if script_redirects(&cmd) {
+            return Err(mlua::Error::RuntimeError(
+                crate::connection::SCRIPT_NON_LOCAL_KEY_ERR.to_string(),
+            ));
+        }
         if crate::connection::script_touches_non_local_key(&cmd) {
             crate::connection::record_rejected_stat(crate::connection::get_cmd_name(&cmd));
             crate::connection::record_error_stat("ERR", None);
@@ -2270,6 +2330,11 @@ fn register_redis_module(
             SCRIPT_RECORDED_ERROR.set(true);
             let tbl = lua.create_table()?;
             tbl.set("err", err)?;
+            return Ok(Value::Table(tbl));
+        }
+        if script_redirects(&cmd) {
+            let tbl = lua.create_table()?;
+            tbl.set("err", crate::connection::SCRIPT_NON_LOCAL_KEY_ERR)?;
             return Ok(Value::Table(tbl));
         }
         if crate::connection::script_touches_non_local_key(&cmd) {
