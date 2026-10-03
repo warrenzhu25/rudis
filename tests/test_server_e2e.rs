@@ -16271,3 +16271,100 @@ fn test_incr_decr_keep_their_own_command_name_e2e() {
     drop(admin);
     shutdown_and_wait(port, &mut child);
 }
+
+/// Sends `args` followed by PING and returns everything before the PONG.
+fn resp_cmd_full(c: &mut TcpStream, args: &[&str]) -> String {
+    let mut out = format!("*{}\r\n", args.len());
+    for a in args {
+        out.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+    }
+    out.push_str("*1\r\n$4\r\nPING\r\n");
+    c.write_all(out.as_bytes()).unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 65536];
+    while !got.ends_with(b"+PONG\r\n") {
+        let n = c.read(&mut buf).unwrap();
+        assert!(n > 0, "connection closed");
+        got.extend_from_slice(&buf[..n]);
+    }
+    got.truncate(got.len() - b"+PONG\r\n".len());
+    String::from_utf8(got).unwrap()
+}
+
+/// Returns the (bucket_usec, cumulative_count) pairs of a single-command
+/// LATENCY HISTOGRAM reply.
+fn histogram_pairs(reply: &str) -> Vec<(u64, u64)> {
+    let (_, tail) = reply
+        .split_once("histogram_usec\r\n")
+        .unwrap_or_else(|| panic!("no histogram_usec in {reply:?}"));
+    let nums: Vec<u64> = tail
+        .lines()
+        .filter_map(|l| l.strip_prefix(':'))
+        .map(|n| n.parse().unwrap())
+        .collect();
+    nums.chunks(2).map(|p| (p[0], p[1])).collect()
+}
+
+#[test]
+fn test_latency_histogram_reports_real_buckets_e2e() {
+    let port = 16962;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    resp_cmd_full(&mut c, &["SET", "warm", "v"]);
+    assert_eq!(resp_cmd(&mut c, &["CONFIG", "RESETSTAT"]), "+OK\r\n");
+    // After a reset only CONFIG RESETSTAT itself has been recorded.
+    let all = resp_cmd_full(&mut c, &["LATENCY", "HISTOGRAM"]);
+    assert!(
+        all.starts_with("*2\r\n$16\r\nconfig|resetstat\r\n"),
+        "{all:?}"
+    );
+    assert!(all.contains("calls\r\n:1\r\n"), "{all:?}");
+
+    for i in 0..5 {
+        let k = format!("lh:{i}");
+        assert_eq!(resp_cmd(&mut c, &["SET", &k, "v"]), "+OK\r\n");
+    }
+    // Pipelined commands go through the batching path and must count too.
+    let mut pipeline = String::new();
+    for i in 0..100 {
+        let k = format!("lhp:{i}");
+        pipeline.push_str(&format!(
+            "*3\r\n$3\r\nSET\r\n${}\r\n{k}\r\n$1\r\nv\r\n",
+            k.len()
+        ));
+    }
+    pipeline.push_str("*1\r\n$4\r\nPING\r\n");
+    c.write_all(pipeline.as_bytes()).unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 65536];
+    while !got.ends_with(b"+PONG\r\n") {
+        let n = c.read(&mut buf).unwrap();
+        assert!(n > 0, "connection closed");
+        got.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(resp_cmd(&mut c, &["DEBUG", "SLEEP", "0.02"]), "+OK\r\n");
+    assert!(resp_cmd(&mut c, &["CONFIG", "GET", "maxmemory"]).starts_with("*2\r\n"));
+
+    let set = resp_cmd_full(&mut c, &["LATENCY", "HISTOGRAM", "set"]);
+    assert!(set.starts_with("*2\r\n$3\r\nset\r\n"), "{set:?}");
+    assert!(set.contains("calls\r\n:105\r\n"), "{set:?}");
+    let pairs = histogram_pairs(&set);
+    assert_eq!(pairs.last().unwrap().1, 105, "{set:?}");
+    assert!(pairs.iter().all(|&(b, _)| b.is_power_of_two()), "{set:?}");
+
+    // A 20ms command must land in a bucket of at least 16384 usec.
+    let debug = resp_cmd_full(&mut c, &["LATENCY", "HISTOGRAM", "debug"]);
+    let pairs = histogram_pairs(&debug);
+    assert_eq!(pairs.len(), 1, "{debug:?}");
+    assert!(pairs[0].0 >= 16384 && pairs[0].1 == 1, "{debug:?}");
+
+    // A parent name selects all of its subcommands.
+    let config = resp_cmd_full(&mut c, &["LATENCY", "HISTOGRAM", "config"]);
+    assert!(config.starts_with("*4\r\n"), "{config:?}");
+    assert!(config.contains("config|get") && config.contains("config|resetstat"));
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}

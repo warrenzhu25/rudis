@@ -611,12 +611,47 @@ static CLIENT_WATCH_TAINTED: std::sync::LazyLock<
     std::sync::RwLock<hashbrown::HashMap<(u16, u64), bool>>,
 > = std::sync::LazyLock::new(|| std::sync::RwLock::new(hashbrown::HashMap::new()));
 
-/// Calls and total execution time of one command, as reported by
-/// INFO commandstats.
+/// Number of latency histogram buckets; bucket `i` counts calls taking at
+/// most 2^i microseconds (the last one also takes everything slower).
+pub const LATENCY_BUCKETS: usize = 31;
+
+/// Calls, total execution time and latency distribution of one command,
+/// as reported by INFO commandstats and LATENCY HISTOGRAM.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct CmdStat {
     pub calls: u64,
     pub nanos: u64,
+    pub hist: [u64; LATENCY_BUCKETS],
+}
+
+impl CmdStat {
+    /// Adds `calls` calls taking `nanos` in total. All of them land in the
+    /// bucket of their average latency.
+    #[inline]
+    fn add(&mut self, calls: u64, nanos: u64) {
+        self.calls += calls;
+        self.nanos += nanos;
+        let usec = nanos / 1000 / calls.max(1);
+        self.hist[latency_bucket(usec)] += calls;
+    }
+
+    fn merge(&mut self, other: &CmdStat) {
+        self.calls += other.calls;
+        self.nanos += other.nanos;
+        for (a, b) in self.hist.iter_mut().zip(other.hist.iter()) {
+            *a += b;
+        }
+    }
+}
+
+/// Index of the smallest power-of-two bucket holding `usec`.
+#[inline]
+fn latency_bucket(usec: u64) -> usize {
+    if usec <= 1 {
+        0
+    } else {
+        ((64 - (usec - 1).leading_zeros()) as usize).min(LATENCY_BUCKETS - 1)
+    }
 }
 
 pub static CMD_STATS: std::sync::LazyLock<std::sync::RwLock<hashbrown::HashMap<String, CmdStat>>> =
@@ -640,9 +675,7 @@ pub fn record_cmd_stat(name: &'static str) {
 pub fn record_cmd_stats(name: &'static str, calls: u64, nanos: u64) {
     LOCAL_CMD_STATS.with(|stats| {
         let mut map = stats.borrow_mut();
-        let stat = map.entry(name).or_default();
-        stat.calls += calls;
-        stat.nanos += nanos;
+        map.entry(name).or_default().add(calls, nanos);
     });
     LOCAL_CMD_COUNT.with(|count| {
         let c = count.get() + calls as usize;
@@ -746,9 +779,10 @@ pub fn flush_local_cmd_stats() {
         }
         if let Ok(mut global_map) = CMD_STATS.write() {
             for (&cmd, stat) in local_map.iter() {
-                let global = global_map.entry(cmd.to_lowercase()).or_default();
-                global.calls += stat.calls;
-                global.nanos += stat.nanos;
+                global_map
+                    .entry(cmd.to_lowercase())
+                    .or_default()
+                    .merge(stat);
             }
         }
         local_map.clear();
@@ -762,43 +796,22 @@ pub fn reset_local_cmd_stats() {
 
 pub static LATENCY_MONITOR_THRESHOLD: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
-pub static LATENCY_HISTOGRAM: std::sync::LazyLock<
-    std::sync::RwLock<std::collections::BTreeMap<String, u64>>,
-> = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::BTreeMap::new()));
 pub static LATENCY_EVENTS: std::sync::LazyLock<
     std::sync::RwLock<std::collections::BTreeMap<String, Vec<(u64, u64)>>>,
 > = std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::BTreeMap::new()));
 
-pub fn record_latency_histogram_cmd(cmd: &Command) {
-    if matches!(cmd, Command::Latency(_)) {
-        return;
-    }
-    let name = match cmd {
-        Command::ConfigGet(_) => "config|get".to_string(),
-        Command::ConfigSet(pairs) => {
-            let p_lower = pairs
-                .first()
-                .map(|(p, _)| String::from_utf8_lossy(p).to_lowercase())
-                .unwrap_or_default();
-            if p_lower == "resetstat" {
-                "config|resetstat".to_string()
-            } else if p_lower == "rewrite" {
-                "config|rewrite".to_string()
-            } else {
-                "config|set".to_string()
-            }
-        }
-        _ => get_cmd_name(cmd).to_lowercase(),
-    };
-    if let Ok(mut map) = LATENCY_HISTOGRAM.write() {
-        *map.entry(name).or_insert(0) += 1;
-    }
-}
-
-pub fn reset_latency_histogram() {
-    if let Ok(mut map) = LATENCY_HISTOGRAM.write() {
-        map.clear();
-        map.insert("config|resetstat".to_string(), 1);
+/// Name a command is counted under in INFO commandstats and LATENCY
+/// HISTOGRAM: [`get_cmd_name`], with CONFIG split into its subcommands
+/// like Redis does.
+fn stat_cmd_name(cmd: &Command) -> &'static str {
+    match cmd {
+        Command::ConfigGet(_) => "config|get",
+        Command::ConfigSet(pairs) => match pairs.first() {
+            Some((p, _)) if p.eq_ignore_ascii_case(b"resetstat") => "config|resetstat",
+            Some((p, _)) if p.eq_ignore_ascii_case(b"rewrite") => "config|rewrite",
+            _ => "config|set",
+        },
+        _ => get_cmd_name(cmd),
     }
 }
 
@@ -904,34 +917,40 @@ pub fn write_latency_response(sub: &LatencySubcommand, out: &mut Vec<u8>) {
             }
         }
         LatencySubcommand::Histogram(cmds) => {
-            let map = LATENCY_HISTOGRAM.read().unwrap();
-            let matched: Vec<(&String, u64)> = map
+            // Callers flush every shard's pending stats first.
+            let map = CMD_STATS.read().unwrap();
+            let wanted: Vec<String> = cmds.iter().map(|c| c.to_lowercase()).collect();
+            let mut matched: Vec<(&String, &CmdStat)> = map
                 .iter()
-                .filter(|&(k, &calls)| {
-                    if calls == 0 {
-                        return false;
-                    }
-                    if cmds.is_empty() {
-                        true
-                    } else {
-                        cmds.iter().any(|c| {
-                            let cl = c.to_lowercase();
-                            *k == cl || k.starts_with(&format!("{}|", cl))
-                        })
-                    }
+                .filter(|&(k, stat)| {
+                    stat.calls > 0
+                        && (wanted.is_empty()
+                            || wanted.iter().any(|c| {
+                                k == c
+                                    || (k.starts_with(c.as_str()) && k[c.len()..].starts_with('|'))
+                            }))
                 })
-                .map(|(k, &c)| (k, c))
                 .collect();
+            matched.sort_by(|a, b| a.0.cmp(b.0));
             write_resp_array_header(out, matched.len() * 2);
-            for (k, calls) in matched {
+            for (k, stat) in matched {
                 write_resp_bulk(out, k.as_bytes());
                 write_resp_array_header(out, 4);
                 write_resp_bulk(out, b"calls");
-                write_resp_integer(out, calls as i64);
+                write_resp_integer(out, stat.calls as i64);
                 write_resp_bulk(out, b"histogram_usec");
-                write_resp_array_header(out, 2);
-                write_resp_integer(out, 1);
-                write_resp_integer(out, calls as i64);
+                // Like Redis: (bucket upper bound in usec, cumulative calls)
+                // for every non-empty power-of-two bucket.
+                let buckets = stat.hist.iter().filter(|&&n| n > 0).count();
+                write_resp_array_header(out, buckets * 2);
+                let mut cumulative = 0u64;
+                for (i, &n) in stat.hist.iter().enumerate() {
+                    if n > 0 {
+                        cumulative += n;
+                        write_resp_integer(out, 1i64 << i);
+                        write_resp_integer(out, cumulative as i64);
+                    }
+                }
             }
         }
         LatencySubcommand::Help => {
@@ -7543,14 +7562,14 @@ async fn execute_command(
         broadcast_monitor(router.port, &addr_s, &monitor_argv);
     }
     let cmd_name = get_cmd_name(&cmd);
+    // Also feeds LATENCY HISTOGRAM, all in thread-local state.
     let _cmd_stat_guard = CmdStatGuard {
-        name: cmd_name,
+        name: stat_cmd_name(&cmd),
         start: (!may_block(&cmd)).then(std::time::Instant::now),
     };
     if cmd.is_write_command() {
         crate::snapshot::note_write();
     }
-    record_latency_histogram_cmd(&cmd);
 
     let slow_threshold =
         crate::slowlog::SLOWLOG_LOG_SLOWER_THAN.load(std::sync::atomic::Ordering::Relaxed);
@@ -9414,7 +9433,6 @@ async fn execute_command(
                         if p0 == "resetstat" {
                             router.reset_command_stats().await;
                             reset_error_stats();
-                            reset_latency_histogram();
                             crate::slowlog::reset_slowlog_stats();
                             crate::table::reset_expired_keys();
                             out.extend_from_slice(b"+OK\r\n");
@@ -15943,6 +15961,9 @@ async fn execute_command(
             false
         }
         Command::Latency(sub) => {
+            if matches!(sub, LatencySubcommand::Histogram(_)) {
+                router.flush_all_command_stats().await;
+            }
             write_latency_response(&sub, out);
             false
         }
@@ -23760,7 +23781,6 @@ async fn execute_commands_squashed(
                 | Command::Quit
                 | Command::Time
                 | Command::Echo(_)
-                | Command::Latency(_)
                 | Command::PubsubHelp
                 | Command::FunctionStats
                 | Command::FunctionKill
@@ -24516,6 +24536,46 @@ mod tests {
                 .collect();
             assert_eq!(shown.join(" "), argv, "{wire}");
         }
+    }
+
+    #[test]
+    fn test_latency_histogram_buckets_and_reply() {
+        let buckets: Vec<usize> = [0, 1, 2, 3, 4, 5, 128, 129, 1 << 40]
+            .iter()
+            .map(|&us| latency_bucket(us))
+            .collect();
+        assert_eq!(buckets, [0, 0, 1, 2, 2, 3, 7, 8, LATENCY_BUCKETS - 1]);
+
+        let mut stat = CmdStat::default();
+        stat.add(1, 500); // < 1us
+        stat.add(1, 3_000); // 3us -> <= 4us
+        stat.add(2, 200_000); // two calls averaging 100us -> <= 128us
+        let mut merged = CmdStat::default();
+        merged.merge(&stat);
+        assert_eq!((merged.calls, merged.nanos), (4, 203_500));
+        CMD_STATS
+            .write()
+            .unwrap()
+            .insert("unittest|histo".to_string(), merged);
+
+        let mut out = Vec::new();
+        write_latency_response(
+            &LatencySubcommand::Histogram(vec!["UNITTEST".into()]),
+            &mut out,
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "*2\r\n$14\r\nunittest|histo\r\n*4\r\n$5\r\ncalls\r\n:4\r\n$14\r\nhistogram_usec\r\n\
+             *6\r\n:1\r\n:1\r\n:4\r\n:2\r\n:128\r\n:4\r\n"
+        );
+        // A prefix that is not a whole parent command name does not match.
+        let mut out = Vec::new();
+        write_latency_response(
+            &LatencySubcommand::Histogram(vec!["unittest|h".into()]),
+            &mut out,
+        );
+        assert_eq!(out, b"*0\r\n");
+        CMD_STATS.write().unwrap().remove("unittest|histo");
     }
 
     #[test]
