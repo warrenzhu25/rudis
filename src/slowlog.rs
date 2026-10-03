@@ -815,10 +815,17 @@ mod tests {
             .into(),
         };
 
-        log_command_if_slow(&cmd, 100, "127.0.0.1:5000", "test");
+        log_command_if_slow(&cmd, 100, "127.0.0.1:5000", "truncation-test");
+        // Other lib tests run in parallel and may log their own commands to
+        // the global slowlog while the threshold is 0, so look up this test's
+        // entry by client name instead of expecting it to be the only one.
         let entries = slowlog_get(None);
-        assert_eq!(entries.len(), 1);
-        let e = &entries[0];
+        let mine: Vec<_> = entries
+            .iter()
+            .filter(|e| e.client_name == "truncation-test")
+            .collect();
+        assert_eq!(mine.len(), 1);
+        let e = mine[0];
         assert_eq!(e.original_argc, 5); // sadd + key + 3 members
         assert_eq!(e.argv.len(), 3); // trimmed to max_argc
         // Arg 0: sadd
