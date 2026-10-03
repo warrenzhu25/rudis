@@ -2886,9 +2886,9 @@ fn test_valkey_missing_features_e2e() {
         ":1\r\n"
     );
 
-    // SMOVE cross-slot error
+    // SMOVE across shards works in standalone mode, like Redis.
     let smove_cross = send_and_read(&mut client, b"SMOVE {s1} cross_slot_dest b\r\n");
-    assert!(smove_cross.starts_with("-CROSSSLOT"));
+    assert_eq!(smove_cross, ":1\r\n");
 
     // 4. Sorted Set commands: ZMSCORE, ZRANDMEMBER, ZREMRANGEBYRANK, ZREMRANGEBYSCORE, ZREMRANGEBYLEX, ZLEXCOUNT, ZSCAN
     send_and_read(&mut client, b"ZADD {z1} 10 m1 20 m2 30 m3\r\n");
@@ -2937,8 +2937,9 @@ fn test_valkey_missing_features_e2e() {
     let lmove_resp = send_and_read(&mut client, b"LMOVE {l1} {l1}_dst LEFT RIGHT\r\n");
     assert_eq!(lmove_resp, "$3\r\none\r\n");
 
+    // LMOVE across shards works in standalone mode, like Redis.
     let lmove_cross = send_and_read(&mut client, b"LMOVE {l1} cross_slot LEFT RIGHT\r\n");
-    assert!(lmove_cross.starts_with("-CROSSSLOT"));
+    assert_eq!(lmove_cross, "$8\r\ninserted\r\n");
 
     // BLMOVE immediate
     let blmove_immediate = send_and_read(&mut client, b"BLMOVE {l1}_dst {l1} LEFT LEFT 0.1\r\n");
@@ -16905,6 +16906,141 @@ fn test_rename_and_copy_across_shards_e2e() {
         let keys = resp_cmd(&mut c, &["KEYS", &format!("{{rdst}}:{j}:*")]);
         assert!(keys.starts_with("*1\r\n"), "{src}: {keys}");
         assert_eq!(resp_cmd(&mut c, &["EXISTS", &src]), ":0\r\n");
+    }
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}
+
+#[test]
+fn test_lmove_and_smove_across_shards_e2e() {
+    let port = 16950;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "4", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // With 4 shards most of these pairs land on different shards, which used
+    // to fail with CROSSSLOT in standalone mode.
+    for i in 0..16 {
+        let (la, lb, sa, sb, st) = (
+            format!("la:{i}"),
+            format!("lb:{i}"),
+            format!("sa:{i}"),
+            format!("sb:{i}"),
+            format!("st:{i}"),
+        );
+        assert_eq!(resp_cmd(&mut c, &["RPUSH", &la, "a", "b", "c"]), ":3\r\n");
+        assert_eq!(
+            resp_cmd(&mut c, &["LMOVE", &la, &lb, "LEFT", "RIGHT"]),
+            "$1\r\na\r\n",
+            "{la}"
+        );
+        assert_eq!(
+            resp_cmd(&mut c, &["LMOVE", &la, &lb, "RIGHT", "LEFT"]),
+            "$1\r\nc\r\n"
+        );
+        assert_eq!(resp_cmd(&mut c, &["RPOPLPUSH", &la, &lb]), "$1\r\nb\r\n");
+        assert_eq!(resp_cmd(&mut c, &["RPOPLPUSH", &la, &lb]), "$-1\r\n");
+        assert_eq!(resp_cmd(&mut c, &["EXISTS", &la]), ":0\r\n");
+        assert_eq!(
+            resp_cmd(&mut c, &["LRANGE", &lb, "0", "-1"]),
+            "*3\r\n$1\r\nb\r\n$1\r\nc\r\n$1\r\na\r\n"
+        );
+        assert_eq!(resp_cmd(&mut c, &["SET", &st, "x"]), "+OK\r\n");
+        let wrongtype = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+        assert_eq!(
+            resp_cmd(&mut c, &["LMOVE", &la, &st, "LEFT", "LEFT"]),
+            "$-1\r\n"
+        );
+        assert_eq!(
+            resp_cmd(&mut c, &["LMOVE", &lb, &st, "LEFT", "LEFT"]),
+            wrongtype
+        );
+        assert_eq!(
+            resp_cmd(&mut c, &["LMOVE", &st, &lb, "LEFT", "LEFT"]),
+            wrongtype
+        );
+        assert_eq!(resp_cmd(&mut c, &["LLEN", &lb]), ":3\r\n");
+
+        assert_eq!(resp_cmd(&mut c, &["SADD", &sa, "m", "n"]), ":2\r\n");
+        assert_eq!(
+            resp_cmd(&mut c, &["SMOVE", &sa, &sb, "m"]),
+            ":1\r\n",
+            "{sa}"
+        );
+        assert_eq!(resp_cmd(&mut c, &["SMOVE", &sa, &sb, "zz"]), ":0\r\n");
+        assert_eq!(resp_cmd(&mut c, &["SADD", &sb, "n"]), ":1\r\n");
+        assert_eq!(resp_cmd(&mut c, &["SMOVE", &sa, &sb, "n"]), ":1\r\n");
+        assert_eq!(resp_cmd(&mut c, &["EXISTS", &sa]), ":0\r\n");
+        assert_eq!(resp_cmd(&mut c, &["SCARD", &sb]), ":2\r\n");
+        assert_eq!(resp_cmd(&mut c, &["SMOVE", &sa, &st, "m"]), ":0\r\n");
+        assert_eq!(resp_cmd(&mut c, &["SMOVE", &sb, &st, "m"]), wrongtype);
+        assert_eq!(resp_cmd(&mut c, &["SMOVE", &st, &sb, "m"]), wrongtype);
+        assert_eq!(resp_cmd(&mut c, &["SMOVE", &sb, &lb, "m"]), wrongtype);
+        assert_eq!(resp_cmd(&mut c, &["SCARD", &sb]), ":2\r\n");
+    }
+    assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), ":48\r\n");
+
+    // Inside MULTI/EXEC, where the transaction already holds the shard locks.
+    assert_eq!(resp_cmd(&mut c, &["RPUSH", "tx:a", "1", "2"]), ":2\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SADD", "tx:s1", "m"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["MULTI"]), "+OK\r\n");
+    for (from, to) in [("tx:a", "tx:b"), ("tx:b", "tx:c"), ("tx:a", "tx:d")] {
+        assert_eq!(resp_cmd(&mut c, &["RPOPLPUSH", from, to]), "+QUEUED\r\n");
+    }
+    assert_eq!(
+        resp_cmd(&mut c, &["SMOVE", "tx:s1", "tx:s2", "m"]),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["EXEC"]),
+        "*4\r\n$1\r\n2\r\n$1\r\n2\r\n$1\r\n1\r\n:1\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["LRANGE", "tx:c", "0", "-1"]),
+        "*1\r\n$1\r\n2\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["LRANGE", "tx:d", "0", "-1"]),
+        "*1\r\n$1\r\n1\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["SISMEMBER", "tx:s2", "m"]), ":1\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["EXISTS", "tx:a", "tx:b", "tx:s1"]),
+        ":0\r\n"
+    );
+
+    // Concurrent moves out of one list must neither lose nor duplicate
+    // elements. Each racer moves into its own list; the targets share a hash
+    // tag, so the moves are all local to one shard or all cross-shard.
+    for j in 0..4 {
+        let src = format!("ls:{j}");
+        let elems: Vec<String> = (0..64).map(|e| e.to_string()).collect();
+        let mut args = vec!["RPUSH", &src];
+        args.extend(elems.iter().map(String::as_str));
+        assert_eq!(resp_cmd(&mut c, &args), ":64\r\n");
+        let racers: Vec<_> = (0..8)
+            .map(|i| {
+                let src = src.clone();
+                std::thread::spawn(move || {
+                    let mut r = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                    r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let dst = format!("{{ldst}}:{j}:{i}");
+                    (0..16)
+                        .filter(|_| resp_cmd(&mut r, &["RPOPLPUSH", &src, &dst]) != "$-1\r\n")
+                        .count()
+                })
+            })
+            .collect();
+        let moved: usize = racers.into_iter().map(|t| t.join().unwrap()).sum();
+        assert_eq!(moved, 64, "{src}");
+        assert_eq!(resp_cmd(&mut c, &["EXISTS", &src]), ":0\r\n");
+        let total: usize = (0..8)
+            .map(|i| {
+                let n = resp_cmd(&mut c, &["LLEN", &format!("{{ldst}}:{j}:{i}")]);
+                n[1..].trim().parse::<usize>().unwrap()
+            })
+            .sum();
+        assert_eq!(total, 64, "{src}");
     }
     drop(c);
     shutdown_and_wait(port, &mut child);

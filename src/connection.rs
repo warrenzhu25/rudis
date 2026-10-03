@@ -11931,14 +11931,23 @@ async fn execute_command(
         Command::Smove {
             ref source,
             ref destination,
-            ..
+            ref member,
         } => {
             let s_target = router.target_shard(source);
             let d_target = router.target_shard(destination);
             if s_target != d_target {
-                out.extend_from_slice(
-                    b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
-                );
+                if router.cluster_enabled {
+                    out.extend_from_slice(
+                        b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                    );
+                } else {
+                    let op = CrossShardElementMove::Set {
+                        member: member.clone(),
+                    };
+                    out.extend_from_slice(
+                        &move_element_across_shards(router, source, destination, op).await,
+                    );
+                }
                 return false;
             }
             if s_target == router.shard_id {
@@ -12180,14 +12189,25 @@ async fn execute_command(
         Command::Lmove {
             ref source,
             ref destination,
-            ..
+            where_from,
+            where_to,
         } => {
             let s_target = router.target_shard(source);
             let d_target = router.target_shard(destination);
             if s_target != d_target {
-                out.extend_from_slice(
-                    b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
-                );
+                if router.cluster_enabled {
+                    out.extend_from_slice(
+                        b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                    );
+                } else {
+                    let op = CrossShardElementMove::List {
+                        from: where_from,
+                        to: where_to,
+                    };
+                    out.extend_from_slice(
+                        &move_element_across_shards(router, source, destination, op).await,
+                    );
+                }
                 return false;
             }
             if s_target == router.shard_id {
@@ -24334,6 +24354,129 @@ async fn move_key_across_shards(
         Ok(None) => b":0\r\n".to_vec(),
         Err(e) => e,
     }
+}
+
+/// An element move between keys on different shards.
+enum CrossShardElementMove {
+    /// LMOVE / RPOPLPUSH: pop from `from` of the source list, push to `to`
+    /// of the destination list.
+    List {
+        from: crate::table::ListDirection,
+        to: crate::table::ListDirection,
+    },
+    /// SMOVE of one member between sets.
+    Set { member: Bytes },
+}
+
+/// LMOVE / RPOPLPUSH / SMOVE for keys owned by different shards, under the
+/// same tx locks as [`move_key_across_shards`]. Checks the types like Redis
+/// does (a missing source wins over a wrong-typed destination), then pops or
+/// removes the element on the source shard and pushes or adds it on the
+/// destination shard; each shard logs, replicates and notifies its own half
+/// (lpop + rpush, srem + sadd), which are also the events Redis emits.
+/// Returns the command's reply.
+async fn move_element_across_shards(
+    router: &Router,
+    src: &Bytes,
+    dst: &Bytes,
+    op: CrossShardElementMove,
+) -> Vec<u8> {
+    router.ensure_loaded(src).await;
+    router.ensure_loaded(dst).await;
+    let (s, d) = (router.target_shard(src), router.target_shard(dst));
+    let mut shards = [s, d];
+    shards.sort_unstable();
+    // Inside EXEC the transaction already holds the locks of all its keys.
+    let lock = !IN_TX.get();
+    let tx_id = next_tx_id();
+    if lock {
+        router.acquire_tx_locks(&shards, tx_id).await;
+    }
+    const WRONGTYPE: &[u8] =
+        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+    let (kind, missing): (&[u8], Vec<u8>) = match op {
+        CrossShardElementMove::List { .. } => {
+            let mut nil = Vec::new();
+            write_resp_null(&mut nil);
+            (b"+list\r\n", nil)
+        }
+        CrossShardElementMove::Set { .. } => (b"+set\r\n", b":0\r\n".to_vec()),
+    };
+    let reply = async {
+        let src_type = exec_on_shard(router, s, Command::Type(src.clone())).await;
+        if src_type == b"+none\r\n" {
+            return missing;
+        }
+        if src_type != kind {
+            return WRONGTYPE.to_vec();
+        }
+        let dst_type = exec_on_shard(router, d, Command::Type(dst.clone())).await;
+        if dst_type != b"+none\r\n" && dst_type != kind {
+            return WRONGTYPE.to_vec();
+        }
+        match op {
+            CrossShardElementMove::List { from, to } => {
+                let pop = match from {
+                    crate::table::ListDirection::Left => Command::Lpop {
+                        key: src.clone(),
+                        count: None,
+                    },
+                    crate::table::ListDirection::Right => Command::Rpop {
+                        key: src.clone(),
+                        count: None,
+                    },
+                };
+                let popped = exec_on_shard(router, s, pop).await;
+                let Some(elem) = resp_bulk_payload(&popped) else {
+                    return popped;
+                };
+                let values = smallvec::smallvec![elem.clone()];
+                let push = match to {
+                    crate::table::ListDirection::Left => Command::Lpush {
+                        key: dst.clone(),
+                        values,
+                    },
+                    crate::table::ListDirection::Right => Command::Rpush {
+                        key: dst.clone(),
+                        values,
+                    },
+                };
+                let _ = exec_on_shard(router, d, push).await;
+                let mut out = Vec::new();
+                write_resp_bulk(&mut out, &elem);
+                out
+            }
+            CrossShardElementMove::Set { member } => {
+                let removed = exec_on_shard(
+                    router,
+                    s,
+                    Command::Srem {
+                        key: src.clone(),
+                        members: vec![member.clone()],
+                    },
+                )
+                .await;
+                if resp_integer(&removed) != Some(1) {
+                    return removed;
+                }
+                let _ = exec_on_shard(
+                    router,
+                    d,
+                    Command::Sadd {
+                        key: dst.clone(),
+                        members: smallvec::smallvec![member],
+                    },
+                )
+                .await;
+                b":1\r\n".to_vec()
+            }
+        }
+    }
+    .await;
+    if lock {
+        router.release_tx_locks(&shards, tx_id).await;
+    }
+    reply
 }
 
 /// Value of a `:N\r\n` integer reply; 0 for errors or any other reply.
