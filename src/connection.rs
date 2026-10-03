@@ -12220,9 +12220,24 @@ async fn execute_command(
             let s_target = router.target_shard(source);
             let d_target = router.target_shard(destination);
             if s_target != d_target {
-                out.extend_from_slice(
-                    b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
-                );
+                if router.cluster_enabled {
+                    out.extend_from_slice(
+                        b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                    );
+                } else {
+                    return blmove_across_shards(
+                        router,
+                        client_registry,
+                        client_id,
+                        source,
+                        destination,
+                        where_from,
+                        where_to,
+                        timeout,
+                        out,
+                    )
+                    .await;
+                }
                 return false;
             }
             let start_len = out.len();
@@ -24424,6 +24439,116 @@ async fn move_element_across_shards(
         router.release_tx_locks(&shards, tx_id).await;
     }
     reply
+}
+
+/// BLMOVE / BRPOPLPUSH for keys owned by different shards (standalone
+/// mode). If the source has an element, moves it like LMOVE does. Otherwise
+/// blocks as a one-element pop on the source; once served (the source's
+/// shard pops, logs and replicates that half), pushes the element to the
+/// destination's shard. If the destination meanwhile holds another type,
+/// the element goes back where it came from and the reply is WRONGTYPE,
+/// as if it had never been popped. Returns whether the client disconnected.
+#[allow(clippy::too_many_arguments)]
+async fn blmove_across_shards(
+    router: &Router,
+    client_registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
+    client_id: u64,
+    source: &Bytes,
+    destination: &Bytes,
+    where_from: crate::table::ListDirection,
+    where_to: crate::table::ListDirection,
+    timeout: f64,
+    out: &mut Vec<u8>,
+) -> bool {
+    let op = CrossShardElementMove::List {
+        from: where_from,
+        to: where_to,
+    };
+    let reply = move_element_across_shards(router, source, destination, op).await;
+    let is_nil = reply == b"$-1\r\n" || reply == b"_\r\n";
+    if !is_nil || IN_TX.get() {
+        out.extend_from_slice(&reply);
+        return false;
+    }
+
+    let to_pop_type = |dir: crate::table::ListDirection| match dir {
+        crate::table::ListDirection::Left => crate::block::ListPopType::Left,
+        crate::table::ListDirection::Right => crate::block::ListPopType::Right,
+    };
+    let _guard = BlockedClientGuard {
+        port: router.port,
+        client_id,
+    };
+    let (tx, rx) = flume::bounded(1);
+    {
+        let hub_arc = crate::block::get_block_hub_for_port(router.port);
+        let mut hub = hub_arc.lock().unwrap();
+        hub.register_blocked_client(client_id, tx.clone());
+        hub.register_list_waiter(client_id, source.clone(), to_pop_type(where_from), 1, tx);
+    }
+    let raw_fd = client_registry.borrow().get(&client_id).map(|c| c.raw_fd);
+    let (recv_res, client_disconnected) = wait_for_blocked_result(&rx, timeout, raw_fd).await;
+    CURRENT_CLIENT_ID.set(client_id);
+    EXECUTING_CLIENT_ID.set(client_id);
+    if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
+        ACTIVE_COMMAND_CLIENT_ID.store(client_id, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    let push = |key: &Bytes, dir: crate::table::ListDirection, elem: Bytes| {
+        let values = smallvec::smallvec![elem];
+        match dir {
+            crate::table::ListDirection::Left => Command::Lpush {
+                key: key.clone(),
+                values,
+            },
+            crate::table::ListDirection::Right => Command::Rpush {
+                key: key.clone(),
+                values,
+            },
+        }
+    };
+    match recv_res {
+        Some(crate::block::BlockedListResult::Popped(_, mut vals)) => {
+            let Some(elem) = vals.pop() else {
+                write_resp_null(out);
+                return client_disconnected;
+            };
+            let (s, d) = (
+                router.target_shard(source),
+                router.target_shard(destination),
+            );
+            let dst_type = exec_on_shard(router, d, Command::Type(destination.clone())).await;
+            if dst_type != b"+none\r\n" && dst_type != b"+list\r\n" {
+                let _ = exec_on_shard(router, s, push(source, where_from, elem)).await;
+                out.extend_from_slice(
+                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                );
+                return client_disconnected;
+            }
+            let _ = exec_on_shard(router, d, push(destination, where_to, elem.clone())).await;
+            if client_disconnected {
+                return true;
+            }
+            write_resp_bulk(out, &elem);
+            notify_key_invalidation(router.port, source.as_ref(), client_id);
+            notify_key_invalidation(router.port, destination.as_ref(), client_id);
+        }
+        _ if client_disconnected => return true,
+        Some(crate::block::BlockedListResult::Unblocked(
+            crate::block::ClientUnblockType::WrongType,
+        )) => {
+            out.extend_from_slice(
+                b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+            );
+        }
+        Some(crate::block::BlockedListResult::Unblocked(
+            crate::block::ClientUnblockType::Error,
+        )) => {
+            out.extend_from_slice(b"-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n");
+        }
+        _ => write_resp_null(out),
+    }
+    false
 }
 
 /// Runs one command per `(shard, command)` pair, the local shard's inline

@@ -17079,6 +17079,116 @@ fn test_lmove_and_smove_across_shards_e2e() {
 }
 
 #[test]
+fn test_blmove_across_shards_e2e() {
+    let port = 16937;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "4", "--no-pin"], port);
+    let connect = move || {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        c
+    };
+    let mut c = connect();
+    // Pairs of keys on different shards: these used to fail with CROSSSLOT.
+    let pair = |prefix: &str| -> (String, String) {
+        let a = format!("{prefix}:src");
+        let b = (0..)
+            .map(|i| format!("{prefix}:dst{i}"))
+            .find(|b| target_shard(b.as_bytes(), 4) != target_shard(a.as_bytes(), 4))
+            .unwrap();
+        (a, b)
+    };
+    let wait_blocked = |c: &mut TcpStream, n: usize| {
+        for _ in 0..200 {
+            if resp_cmd(c, &["INFO", "clients"]).contains(&format!("blocked_clients:{n}\r\n")) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("client never blocked");
+    };
+    let is_nil = |r: &str| r == "$-1\r\n" || r == "*-1\r\n";
+
+    // Source has an element: moved right away.
+    let (src, dst) = pair("now");
+    resp_cmd(&mut c, &["RPUSH", &src, "a", "b"]);
+    assert_eq!(
+        resp_cmd(&mut c, &["BLMOVE", &src, &dst, "LEFT", "RIGHT", "1"]),
+        "$1\r\na\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["BRPOPLPUSH", &src, &dst, "1"]),
+        "$1\r\nb\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["LRANGE", &dst, "0", "-1"]),
+        "*2\r\n$1\r\nb\r\n$1\r\na\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["EXISTS", &src]), ":0\r\n");
+
+    // Empty source: times out.
+    let r = resp_cmd(&mut c, &["BLMOVE", &src, &dst, "LEFT", "LEFT", "0.1"]);
+    assert!(is_nil(&r), "{r}");
+
+    // Empty source: blocks until a push, then moves the element.
+    for (cmd, from) in [
+        (vec!["BLMOVE", "RIGHT", "LEFT"], "RIGHT"),
+        (vec!["BRPOPLPUSH"], "RIGHT"),
+        (vec!["BLMOVE", "LEFT", "RIGHT"], "LEFT"),
+    ] {
+        let (src, dst) = pair(&format!("blk{}{}", cmd.join(""), from));
+        let (s2, d2) = (src.clone(), dst.clone());
+        let waiter = thread::spawn(move || {
+            let mut w = connect();
+            let mut args = vec![cmd[0], &s2, &d2];
+            args.extend(&cmd[1..]);
+            args.push("5");
+            resp_cmd(&mut w, &args)
+        });
+        wait_blocked(&mut c, 1);
+        assert_eq!(resp_cmd(&mut c, &["RPUSH", &src, "x", "y"]), ":2\r\n");
+        let (moved, kept) = if from == "RIGHT" {
+            ("y", "x")
+        } else {
+            ("x", "y")
+        };
+        assert_eq!(waiter.join().unwrap(), format!("$1\r\n{moved}\r\n"));
+        assert_eq!(
+            resp_cmd(&mut c, &["LRANGE", &src, "0", "-1"]),
+            format!("*1\r\n$1\r\n{kept}\r\n")
+        );
+        assert_eq!(
+            resp_cmd(&mut c, &["LRANGE", &dst, "0", "-1"]),
+            format!("*1\r\n$1\r\n{moved}\r\n")
+        );
+    }
+
+    // The destination turned into another type while blocked: the element
+    // stays in the source and the client gets WRONGTYPE.
+    let (src, dst) = pair("wt");
+    let (s2, d2) = (src.clone(), dst.clone());
+    let waiter = thread::spawn(move || {
+        let mut w = connect();
+        resp_cmd(&mut w, &["BLMOVE", &s2, &d2, "LEFT", "LEFT", "5"])
+    });
+    wait_blocked(&mut c, 1);
+    assert_eq!(resp_cmd(&mut c, &["SET", &dst, "str"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["RPUSH", &src, "p", "q"]), ":2\r\n");
+    assert_eq!(
+        waiter.join().unwrap(),
+        "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["LRANGE", &src, "0", "-1"]),
+        "*2\r\n$1\r\np\r\n$1\r\nq\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["GET", &dst]), "$3\r\nstr\r\n");
+
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}
+
+#[test]
 fn test_msetnx_across_shards_e2e() {
     let port = 16949;
     let port_s = port.to_string();
