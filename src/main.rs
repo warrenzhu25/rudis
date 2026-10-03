@@ -197,6 +197,15 @@ fn main() {
     rudis::aof::set_aof_load_truncated(server_config.aof_load_truncated);
     rudis::mailbox::set_cross_shard_spin(server_config.cross_shard_spin);
     rudis::config::set_save_points(port, server_config.save_points.clone());
+    if let Some(v) = server_config.extra_directives.get("repl-backlog-size") {
+        match rudis::tiering::parse_memory_bytes(v) {
+            Some(bytes) => rudis::replication::set_repl_backlog_size(bytes as usize),
+            None => {
+                eprintln!("Invalid repl-backlog-size: {}", v);
+                std::process::exit(1);
+            }
+        }
+    }
     let aof_config = rudis::aof::AofConfig {
         enabled: server_config.appendonly,
         dir: server_config.dir.clone(),

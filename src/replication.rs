@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReplicationRole {
@@ -21,10 +21,73 @@ pub enum ReplicationRole {
 
 pub struct ConnectedReplica {
     pub id: u64,
+    /// Wakes the replica's writer task; the bytes are in `pending`.
     pub sender: flume::Sender<Vec<u8>>,
     pub listening_port: AtomicU64,
     pub ack_offset: AtomicU64,
     pub last_ack_time: AtomicU64,
+    /// Set while the replica's full-sync snapshot is being taken.
+    pub full_sync: Option<FullSyncCut>,
+    /// Stream bytes not yet taken by the writer task, appended in offset
+    /// order under the backlog lock.
+    pending: Mutex<Vec<u8>>,
+    /// A wakeup is queued on `sender` and the writer has not taken
+    /// `pending` since, so appenders need not queue another.
+    wake_queued: AtomicBool,
+}
+
+/// Per-shard cut of the replication stream for a replica in full sync.
+///
+/// There is no fork, so each shard serializes its part of the snapshot on
+/// its own thread at a different moment. Shard `i` arms itself right after
+/// serializing; since a shard applies and replicates its changes on its own
+/// thread, everything it replicated before arming is in the snapshot and
+/// everything after is not. Changes from armed shards are buffered in
+/// `pre` until every shard is armed, then sent right after the snapshot.
+pub struct FullSyncCut {
+    armed: Vec<std::sync::atomic::AtomicBool>,
+    all_armed: std::sync::atomic::AtomicBool,
+    pre: Mutex<Vec<u8>>,
+}
+
+enum Delivery {
+    Send,
+    Buffer,
+    Skip,
+}
+
+impl ConnectedReplica {
+    /// What to do with bytes replicated by `shard` (None: unknown shard).
+    fn delivery(&self, shard: Option<usize>) -> Delivery {
+        let Some(cut) = &self.full_sync else {
+            return Delivery::Send;
+        };
+        if cut.all_armed.load(Ordering::Acquire) {
+            return Delivery::Send;
+        }
+        match shard {
+            Some(i) if !cut.armed.get(i).is_some_and(|a| a.load(Ordering::Acquire)) => {
+                Delivery::Skip
+            }
+            _ => Delivery::Buffer,
+        }
+    }
+
+    /// Appends stream bytes; returns true when the caller must wake the
+    /// writer (after releasing the backlog lock).
+    fn append_pending(&self, bytes: &[u8]) -> bool {
+        self.pending.lock().unwrap().extend_from_slice(bytes);
+        !self.wake_queued.swap(true, Ordering::AcqRel)
+    }
+
+    /// Takes everything appended so far. The writer task calls this on each
+    /// wakeup; an empty result just means a coalesced wakeup.
+    pub fn take_pending(&self) -> Vec<u8> {
+        // Clear the flag first: an append racing with the take then either
+        // lands in this batch or queues a new wakeup.
+        self.wake_queued.store(false, Ordering::Release);
+        std::mem::take(&mut *self.pending.lock().unwrap())
+    }
 }
 
 pub struct ShardReplicaFlow {
@@ -90,6 +153,26 @@ impl ReplicationBacklog {
         self.first_byte_offset = current_master_offset.saturating_sub(self.len as u64) + 1;
     }
 
+    /// Changes the capacity to `new_size` bytes, keeping the most recent
+    /// history that fits.
+    pub fn resize(&mut self, new_size: usize) {
+        let new_size = new_size.max(1);
+        if new_size == self.max_size {
+            return;
+        }
+        let keep = self.len.min(new_size);
+        let mut buffer = vec![0u8; new_size];
+        let start = (self.write_idx + self.max_size - keep) % self.max_size;
+        let first = (self.max_size - start).min(keep);
+        buffer[..first].copy_from_slice(&self.buffer[start..start + first]);
+        buffer[first..keep].copy_from_slice(&self.buffer[..keep - first]);
+        self.first_byte_offset += (self.len - keep) as u64;
+        self.buffer = buffer;
+        self.write_idx = keep % new_size;
+        self.len = keep;
+        self.max_size = new_size;
+    }
+
     pub fn can_partial_sync(&self, target_offset: u64, current_master_offset: u64) -> bool {
         if target_offset > current_master_offset + 1 {
             return false;
@@ -136,6 +219,10 @@ pub struct ReplicationHub {
     pub cancel_sync: RwLock<Option<flume::Sender<()>>>,
     pub shard_flows: RwLock<HashMap<usize, HashMap<u64, Arc<ShardReplicaFlow>>>>,
     pub has_shard_flows: std::sync::atomic::AtomicBool,
+    /// Replica offsets `[lo, hi)` from which a partial resync would be
+    /// wrong: a full-synced replica got the bytes in that range in another
+    /// order than the backlog holds them (see `finish_full_sync`).
+    psync_holes: Mutex<Vec<(u64, u64)>>,
 }
 
 impl ReplicationHub {
@@ -161,11 +248,12 @@ impl ReplicationHub {
             is_slave_atomic: std::sync::atomic::AtomicBool::new(false),
             has_replicas: std::sync::atomic::AtomicBool::new(false),
             backlog_active: std::sync::atomic::AtomicBool::new(true),
-            backlog: RwLock::new(ReplicationBacklog::new(1024 * 1024)),
+            backlog: RwLock::new(ReplicationBacklog::new(repl_backlog_size())),
             replicas: RwLock::new(HashMap::new()),
             cancel_sync: RwLock::new(None),
             shard_flows: RwLock::new(HashMap::new()),
             has_shard_flows: std::sync::atomic::AtomicBool::new(false),
+            psync_holes: Mutex::new(Vec::new()),
         }
     }
 
@@ -228,18 +316,97 @@ impl ReplicationHub {
         id: u64,
         sender: flume::Sender<Vec<u8>>,
     ) -> Arc<ConnectedReplica> {
+        // Registering under the backlog lock orders it against propagation.
+        let _backlog = self.backlog.write().unwrap();
+        self.insert_replica(id, sender, None)
+    }
+
+    fn insert_replica(
+        &self,
+        id: u64,
+        sender: flume::Sender<Vec<u8>>,
+        full_sync: Option<FullSyncCut>,
+    ) -> Arc<ConnectedReplica> {
         let rep = Arc::new(ConnectedReplica {
             id,
             sender,
             listening_port: AtomicU64::new(0),
             ack_offset: AtomicU64::new(0),
             last_ack_time: AtomicU64::new(0),
+            full_sync,
+            pending: Mutex::new(Vec::new()),
+            wake_queued: AtomicBool::new(false),
         });
         self.replicas.write().unwrap().insert(id, rep.clone());
         self.has_replicas.store(true, Ordering::Release);
         self.backlog_active.store(true, Ordering::Release);
         HAS_ACTIVE_REPLICATION.store(true, Ordering::Release);
         rep
+    }
+
+    /// Registers a replica about to receive a full sync of `num_shards`
+    /// shards. Must happen before any shard serializes its snapshot; each
+    /// shard then calls `arm_full_sync` right after serializing.
+    pub fn register_full_sync_replica(
+        &self,
+        id: u64,
+        sender: flume::Sender<Vec<u8>>,
+        num_shards: usize,
+    ) -> Arc<ConnectedReplica> {
+        let cut = FullSyncCut {
+            armed: (0..num_shards)
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect(),
+            all_armed: std::sync::atomic::AtomicBool::new(false),
+            pre: Mutex::new(Vec::new()),
+        };
+        let _backlog = self.backlog.write().unwrap();
+        self.insert_replica(id, sender, Some(cut))
+    }
+
+    /// Called on shard `shard_id`'s thread right after it serialized its
+    /// snapshot for replica `id`.
+    pub fn arm_full_sync(&self, id: u64, shard_id: usize) {
+        let _backlog = self.backlog.write().unwrap();
+        if let Some(rep) = self.replicas.read().unwrap().get(&id)
+            && let Some(cut) = &rep.full_sync
+            && let Some(armed) = cut.armed.get(shard_id)
+        {
+            armed.store(true, Ordering::Release);
+        }
+    }
+
+    /// Ends the snapshot phase of replica `id` once every shard is armed.
+    /// Returns the offset to announce in +FULLRESYNC and the bytes to send
+    /// right after the snapshot; from then on the replica gets the live
+    /// stream, so its offset matches the master's.
+    pub fn finish_full_sync(&self, id: u64) -> (u64, Vec<u8>) {
+        let _backlog = self.backlog.write().unwrap();
+        let offset = self.master_repl_offset.load(Ordering::SeqCst);
+        let pre = match self.replicas.read().unwrap().get(&id) {
+            Some(rep) => match &rep.full_sync {
+                Some(cut) => {
+                    let pre = std::mem::take(&mut *cut.pre.lock().unwrap());
+                    cut.all_armed.store(true, Ordering::Release);
+                    pre
+                }
+                None => Vec::new(),
+            },
+            None => Vec::new(),
+        };
+        let start = offset.saturating_sub(pre.len() as u64);
+        if start < offset {
+            self.psync_holes.lock().unwrap().push((start, offset));
+        }
+        (start, pre)
+    }
+
+    fn in_psync_hole(&self, replica_offset: u64, backlog_start: u64) -> bool {
+        let mut holes = self.psync_holes.lock().unwrap();
+        holes.retain(|&(_, hi)| hi >= backlog_start);
+        holes
+            .iter()
+            .any(|&(lo, hi)| replica_offset >= lo && replica_offset < hi)
     }
 
     pub fn unregister_replica(&self, id: u64) {
@@ -347,16 +514,19 @@ impl ReplicationHub {
             return None;
         }
 
+        // Hold the backlog lock until the replica is registered, so no
+        // change lands between the diff and the live stream.
+        let backlog = self.backlog.write().unwrap();
         let current_offset = self.master_repl_offset.load(Ordering::SeqCst);
-        let backlog = self.backlog.read().unwrap();
-        if !backlog.can_partial_sync(target_offset, current_offset) {
+        if !backlog.can_partial_sync(target_offset, current_offset)
+            || self.in_psync_hole(req_offset as u64, backlog.first_byte_offset)
+        {
             return None;
         }
 
         let diff = backlog.get_diff(target_offset, current_offset)?;
+        let rep = self.insert_replica(client_id, sender, None);
         drop(backlog);
-
-        let rep = self.register_replica(client_id, sender);
         Some((current_replid, diff, rep))
     }
 
@@ -386,99 +556,72 @@ impl ReplicationHub {
         if !replid_matches {
             return false;
         }
-        let current_offset = self.master_repl_offset.load(Ordering::SeqCst);
         let backlog = self.backlog.read().unwrap();
+        let current_offset = self.master_repl_offset.load(Ordering::SeqCst);
         backlog.can_partial_sync(target_offset, current_offset)
+            && !self.in_psync_hole(req_offset as u64, backlog.first_byte_offset)
     }
 
     pub fn propagate(&self, bytes: &[u8]) {
-        if !self.is_master() {
-            return;
-        }
-        if !self.backlog_active.load(Ordering::Relaxed)
-            && !self.has_replicas.load(Ordering::Relaxed)
-        {
-            return;
-        }
-        if self.backlog_active.load(Ordering::Relaxed) {
-            let new_offset = self
-                .master_repl_offset
-                .fetch_add(bytes.len() as u64, Ordering::SeqCst)
-                + bytes.len() as u64;
-            self.backlog.write().unwrap().append(bytes, new_offset);
-        }
-
-        if self.has_replicas.load(Ordering::Relaxed) {
-            let dead: Vec<u64> = {
-                let reps = self.replicas.read().unwrap();
-                let mut to_remove = Vec::new();
-                for (&id, rep) in reps.iter() {
-                    if rep.sender.send(bytes.to_vec()).is_err() {
-                        to_remove.push(id);
-                    }
-                }
-                to_remove
-            };
-            if !dead.is_empty() {
-                let mut reps = self.replicas.write().unwrap();
-                for id in dead {
-                    reps.remove(&id);
-                }
-            }
-        }
-
-        // Also broadcast to all shard flows if generic propagate was called
-        if self.has_shard_flows.load(Ordering::Relaxed) {
-            let dead_flows: Vec<(usize, u64)> = {
-                let flows = self.shard_flows.read().unwrap();
-                let mut dead = Vec::new();
-                for (&sid, map) in flows.iter() {
-                    for (&cid, flow) in map {
-                        flow.lsn.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                        if flow.sender.send(bytes.to_vec()).is_err() {
-                            dead.push((sid, cid));
-                        }
-                    }
-                }
-                dead
-            };
-            if !dead_flows.is_empty() {
-                let mut flows = self.shard_flows.write().unwrap();
-                for (sid, cid) in dead_flows {
-                    if let Some(map) = flows.get_mut(&sid) {
-                        map.remove(&cid);
-                    }
-                }
-            }
-        }
+        self.deliver(None, bytes);
     }
 
     pub fn propagate_shard(&self, shard_id: usize, bytes: &[u8]) {
+        self.deliver(Some(shard_id), bytes);
+    }
+
+    /// Appends `bytes` to the backlog and queues them for replicas. The
+    /// offset, the backlog append and the per-replica appends happen under
+    /// the backlog lock, so every replica and the backlog see the same order
+    /// of changes, and an offset always names the same byte for all of them.
+    /// Writer wakeups (which may syscall) happen after releasing the lock.
+    fn deliver(&self, shard: Option<usize>, bytes: &[u8]) {
         if !self.is_master() {
             return;
         }
-        if self.backlog_active.load(Ordering::Relaxed) {
-            let new_offset = self
-                .master_repl_offset
-                .fetch_add(bytes.len() as u64, Ordering::SeqCst)
-                + bytes.len() as u64;
-            self.backlog.write().unwrap().append(bytes, new_offset);
-        }
-        if self.has_replicas.load(Ordering::Relaxed) {
-            let dead: Vec<u64> = {
-                let reps = self.replicas.read().unwrap();
-                let mut to_remove = Vec::new();
-                for (&id, rep) in reps.iter() {
-                    if rep.sender.send(bytes.to_vec()).is_err() {
-                        to_remove.push(id);
+        if self.backlog_active.load(Ordering::Relaxed) || self.has_replicas.load(Ordering::Relaxed)
+        {
+            let mut wake: Vec<Arc<ConnectedReplica>> = Vec::new();
+            {
+                let mut backlog = self.backlog.write().unwrap();
+                if self.backlog_active.load(Ordering::Relaxed) {
+                    let new_offset = self
+                        .master_repl_offset
+                        .fetch_add(bytes.len() as u64, Ordering::SeqCst)
+                        + bytes.len() as u64;
+                    backlog.append(bytes, new_offset);
+                }
+                if self.has_replicas.load(Ordering::Relaxed) {
+                    let reps = self.replicas.read().unwrap();
+                    for rep in reps.values() {
+                        match rep.delivery(shard) {
+                            Delivery::Send => {
+                                if rep.append_pending(bytes) {
+                                    wake.push(rep.clone());
+                                }
+                            }
+                            Delivery::Buffer => {
+                                if let Some(cut) = &rep.full_sync {
+                                    cut.pre.lock().unwrap().extend_from_slice(bytes);
+                                }
+                            }
+                            Delivery::Skip => {}
+                        }
                     }
                 }
-                to_remove
-            };
+            }
+            let dead: Vec<u64> = wake
+                .iter()
+                .filter(|rep| rep.sender.send(Vec::new()).is_err())
+                .map(|rep| rep.id)
+                .collect();
             if !dead.is_empty() {
                 let mut reps = self.replicas.write().unwrap();
                 for id in dead {
                     reps.remove(&id);
+                }
+                if reps.is_empty() {
+                    self.has_replicas.store(false, Ordering::Release);
                 }
             }
         }
@@ -486,25 +629,26 @@ impl ReplicationHub {
         if !self.has_shard_flows.load(Ordering::Relaxed) {
             return;
         }
-
-        let dead_flows: Vec<u64> = {
+        let dead_flows: Vec<(usize, u64)> = {
             let flows = self.shard_flows.read().unwrap();
             let mut dead = Vec::new();
-            if let Some(map) = flows.get(&shard_id) {
+            for (&sid, map) in flows.iter() {
+                if shard.is_some_and(|s| s != sid) {
+                    continue;
+                }
                 for (&cid, flow) in map {
                     flow.lsn.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     if flow.sender.send(bytes.to_vec()).is_err() {
-                        dead.push(cid);
+                        dead.push((sid, cid));
                     }
                 }
             }
             dead
         };
-
         if !dead_flows.is_empty() {
             let mut flows = self.shard_flows.write().unwrap();
-            if let Some(map) = flows.get_mut(&shard_id) {
-                for cid in dead_flows {
+            for (sid, cid) in dead_flows {
+                if let Some(map) = flows.get_mut(&sid) {
                     map.remove(&cid);
                 }
             }
@@ -654,6 +798,24 @@ pub fn get_replication_hub(port: u16) -> Arc<ReplicationHub> {
         .clone()
 }
 
+static REPL_BACKLOG_SIZE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(1024 * 1024);
+
+/// `repl-backlog-size` in bytes.
+pub fn repl_backlog_size() -> usize {
+    REPL_BACKLOG_SIZE.load(Ordering::Relaxed)
+}
+
+/// Sets `repl-backlog-size` and resizes every existing backlog, keeping
+/// its most recent history.
+pub fn set_repl_backlog_size(bytes: usize) {
+    let bytes = bytes.max(16 * 1024);
+    REPL_BACKLOG_SIZE.store(bytes, Ordering::Relaxed);
+    for hub in REPLICATION_HUBS.read().unwrap().values() {
+        hub.backlog.write().unwrap().resize(bytes);
+    }
+}
+
 #[inline(always)]
 pub fn has_connected_replicas(port: u16) -> bool {
     if !HAS_ACTIVE_REPLICATION.load(Ordering::Relaxed) {
@@ -731,16 +893,28 @@ pub fn propagate_shard_bytes(port: u16, shard_id: usize, bytes: &[u8]) {
     hub.propagate_shard(shard_id, bytes);
 }
 
-pub fn record_mutation(
+/// Appends the mutation built by `make` to this shard's AOF and replicates
+/// it. Must run on the thread of the shard that owns the data (`shard_id`),
+/// right after applying the change, so that the AOF, the replication stream
+/// and full-sync snapshots all see each shard's changes in apply order.
+/// `make` only runs when there is somewhere to log to.
+pub fn log_shard_mutation(
     port: u16,
+    shard_id: usize,
     aof: Option<&std::cell::RefCell<crate::aof::AofWriter>>,
-    cmd: &crate::resp::Command,
+    make: impl FnOnce() -> crate::resp::Command,
 ) {
-    if let Some(bytes) = crate::aof::command_to_resp(cmd) {
+    let replicate = has_connected_replicas(port);
+    if aof.is_none() && !replicate {
+        return;
+    }
+    if let Some(bytes) = crate::aof::command_to_resp(&make()) {
         if let Some(aof) = aof {
             aof.borrow_mut().append(&bytes);
         }
-        propagate_bytes(port, &bytes);
+        if replicate {
+            propagate_shard_bytes(port, shard_id, &bytes);
+        }
     }
 }
 
@@ -1265,6 +1439,93 @@ mod tests {
             hub.try_partial_resync(4, tx.clone(), &replid, (current_offset + 10) as i64)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn test_backlog_resize_keeps_newest_bytes() {
+        let mut backlog = ReplicationBacklog::new(8);
+        backlog.append(b"abcdef", 6);
+        backlog.append(b"ghij", 10); // wraps: holds "cdefghij", first byte 3
+        assert_eq!(backlog.first_byte_offset, 3);
+
+        backlog.resize(4);
+        assert_eq!(backlog.len(), 4);
+        assert_eq!(backlog.first_byte_offset, 7);
+        assert_eq!(backlog.get_diff(7, 10), Some(b"ghij".to_vec()));
+        assert_eq!(backlog.get_diff(6, 10), None);
+        backlog.append(b"kl", 12);
+        assert_eq!(backlog.get_diff(9, 12), Some(b"ijkl".to_vec()));
+
+        backlog.resize(16);
+        assert_eq!(backlog.first_byte_offset, 9);
+        assert_eq!(backlog.get_diff(9, 12), Some(b"ijkl".to_vec()));
+        backlog.append(b"mnop", 16);
+        assert_eq!(backlog.get_diff(9, 16), Some(b"ijklmnop".to_vec()));
+    }
+
+    #[test]
+    fn test_full_sync_cut_skips_buffers_then_streams() {
+        let hub = ReplicationHub::new(19997);
+        hub.propagate_shard(0, b"old");
+        let (tx, rx) = flume::unbounded();
+        let rep = hub.register_full_sync_replica(7, tx, 2);
+
+        // Neither shard has serialized yet: the snapshot will contain it.
+        hub.propagate_shard(1, b"in-snap");
+        assert!(rx.try_recv().is_err());
+
+        // Shard 0 serialized: its later changes are not in the snapshot.
+        hub.arm_full_sync(7, 0);
+        hub.propagate_shard(0, b"after0");
+        hub.propagate_shard(1, b"in-snap2");
+        assert!(rx.try_recv().is_err());
+        hub.arm_full_sync(7, 1);
+        hub.propagate_shard(1, b"after1");
+        assert!(rx.try_recv().is_err());
+        assert!(rep.take_pending().is_empty());
+
+        let offset = hub.master_repl_offset.load(Ordering::SeqCst);
+        let (start, pre) = hub.finish_full_sync(7);
+        assert_eq!(pre, b"after0after1");
+        assert_eq!(start, offset - pre.len() as u64);
+
+        hub.propagate_shard(1, b"live");
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(rep.take_pending(), b"live");
+
+        // The replica's stream diverges from the backlog in [start, offset),
+        // so a partial resync from inside it must be refused.
+        let replid = hub.master_replid.clone();
+        let (tx2, _rx2) = flume::unbounded();
+        assert!(!hub.can_partial_resync(&replid, start as i64));
+        assert!(
+            hub.try_partial_resync(8, tx2.clone(), &replid, (start + 1) as i64)
+                .is_none()
+        );
+        let now = hub.master_repl_offset.load(Ordering::SeqCst);
+        assert!(
+            hub.try_partial_resync(8, tx2, &replid, now as i64)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_partial_resync_registers_before_next_change() {
+        let hub = ReplicationHub::new(19996);
+        hub.propagate(b"a");
+        let replid = hub.master_replid.clone();
+        let (tx, rx) = flume::unbounded();
+        let (_, diff, rep) = hub.try_partial_resync(1, tx, &replid, 0).unwrap();
+        assert_eq!(diff, b"a");
+        hub.propagate(b"b");
+        hub.propagate(b"c");
+        // One wakeup for both changes, which arrive in order in one batch.
+        assert!(rx.try_recv().is_ok());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(rep.take_pending(), b"bc");
+        hub.propagate(b"d");
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(rep.take_pending(), b"d");
     }
 
     #[test]

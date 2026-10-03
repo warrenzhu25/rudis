@@ -403,9 +403,7 @@ pub fn run_shard_worker(
                         expire_in,
                         responder,
                     } => {
-                        if let Some(aof) = &cross_shard_aof
-                            && let Some(bytes) =
-                                crate::aof::command_to_resp(&crate::resp::Command::Set {
+                        crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(), || crate::resp::Command::Set {
                                     key: key.clone(),
                                     value: value.clone(),
                                     expire_in,
@@ -413,10 +411,7 @@ pub fn run_shard_worker(
                                     get: false,
                                     keepttl: false,
                                     past_expired: false,
-                                })
-                        {
-                            aof.borrow_mut().append(&bytes);
-                        }
+                                });
                         cross_shard_db
                             .borrow_mut()
                             .set(key, value, expire_in);
@@ -440,9 +435,7 @@ pub fn run_shard_worker(
                         }
                     }
                     ShardMessage::FastSet { descriptor } => {
-                        if let Some(aof) = &cross_shard_aof
-                            && let Some(bytes) =
-                                crate::aof::command_to_resp(&crate::resp::Command::Set {
+                        crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(), || crate::resp::Command::Set {
                                     key: descriptor.key.clone(),
                                     value: descriptor.value.clone(),
                                     expire_in: descriptor.expire_in,
@@ -450,10 +443,7 @@ pub fn run_shard_worker(
                                     get: false,
                                     keepttl: false,
                                     past_expired: false,
-                                })
-                        {
-                            aof.borrow_mut().append(&bytes);
-                        }
+                                });
                         cross_shard_db
                             .borrow_mut()
                             .set(descriptor.key.clone(), descriptor.value.clone(), descriptor.expire_in);
@@ -472,14 +462,9 @@ pub fn run_shard_worker(
                             db.delete_document_local(&String::from_utf8_lossy(&key));
                             crate::connection::notify_keyspace_event_sync(&cross_shard_router, crate::connection::NOTIFY_GENERIC, "del", &key);
                             crate::connection::notify_stream_or_defer(&mut db, &key);
-                            if let Some(aof) = &cross_shard_aof
-                                && let Some(bytes) =
-                                    crate::aof::command_to_resp(&crate::resp::Command::Del(smallvec![
+                            crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(), || crate::resp::Command::Del(smallvec![
                                         key,
-                                    ]))
-                                {
-                                    aof.borrow_mut().append(&bytes);
-                                }
+                                    ]));
                         }
                         let _ = responder.send(deleted);
                     }
@@ -497,13 +482,9 @@ pub fn run_shard_worker(
                                 }
                             }
                         }
-                        if count > 0
-                            && let Some(aof) = &cross_shard_aof
-                            && let Some(bytes) =
-                                crate::aof::command_to_resp(&crate::resp::Command::Del(SmallVec::from_vec(deleted_keys)))
-                        {
-                            aof.borrow_mut().append(&bytes);
-                        }
+                        if count > 0 {
+crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(), || crate::resp::Command::Del(SmallVec::from_vec(deleted_keys)));
+}
                         let _ = responder.send(count);
                     }
                     ShardMessage::ActiveDefrag { responder } => {
@@ -520,13 +501,9 @@ pub fn run_shard_worker(
                         responder,
                     } => {
                         let res = cross_shard_db.borrow_mut().incr_by(key.clone(), delta);
-                        if res.is_ok()
-                            && let Some(aof) = &cross_shard_aof
-                                && let Some(bytes) = crate::aof::command_to_resp(
-                                    &crate::resp::Command::IncrBy(key, delta, crate::resp::IncrName::IncrBy),
-                                ) {
-                                    aof.borrow_mut().append(&bytes);
-                                }
+                        if res.is_ok() {
+crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(), || crate::resp::Command::IncrBy(key, delta, crate::resp::IncrName::IncrBy));
+}
                         let _ = responder.send(res);
                     }
                     ShardMessage::Expire {
@@ -543,16 +520,11 @@ pub fn run_shard_worker(
                             if crate::connection::HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
                                 crate::connection::notify_key_invalidation(cross_shard_router.port, key.as_ref(), 0);
                             }
-                            if let Some(aof) = &cross_shard_aof
-                                && let Some(bytes) = crate::aof::command_to_resp(
-                                    &crate::resp::Command::Expire {
+                            crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(), || crate::resp::Command::Expire {
                                         key,
                                         duration,
                                         opts,
-                                    },
-                                ) {
-                                aof.borrow_mut().append(&bytes);
-                            }
+                                    });
                         }
                         let _ = responder.send(res);
                     }
@@ -565,12 +537,7 @@ pub fn run_shard_worker(
                             if crate::connection::HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
                                 crate::connection::notify_key_invalidation(cross_shard_router.port, key.as_ref(), 0);
                             }
-                            if let Some(aof) = &cross_shard_aof
-                                && let Some(bytes) =
-                                    crate::aof::command_to_resp(&crate::resp::Command::Persist(key))
-                                {
-                                    aof.borrow_mut().append(&bytes);
-                                }
+                            crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(), || crate::resp::Command::Persist(key));
                         }
                         let _ = responder.send(res);
                     }
@@ -1544,12 +1511,7 @@ pub fn run_shard_worker(
                                 }
                             }
                         }
-                        if let Some(aof) = &cross_shard_aof
-                            && let Some(bytes) =
-                                crate::aof::command_to_resp(&crate::resp::Command::Mset(pairs.clone()))
-                            {
-                                aof.borrow_mut().append(&bytes);
-                            }
+                        crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(), || crate::resp::Command::Mset(pairs.clone()));
                         cross_shard_router.check_auto_tier_after_write();
                         pairs.clear();
                         let _ = responder.send(pairs);
@@ -1619,12 +1581,7 @@ pub fn run_shard_worker(
                         mut pairs,
                         descriptor,
                     } => {
-                        if let Some(aof) = &cross_shard_aof
-                            && let Some(bytes) =
-                                crate::aof::command_to_resp(&crate::resp::Command::Mset(pairs.clone()))
-                        {
-                            aof.borrow_mut().append(&bytes);
-                        }
+                        crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(), || crate::resp::Command::Mset(pairs.clone()));
                         {
                             let mut db = cross_shard_db.borrow_mut();
                             for (k, v) in pairs.drain(..) {
@@ -1706,9 +1663,12 @@ pub fn run_shard_worker(
                         }
                         let _ = responder.send(());
                     }
-                    ShardMessage::SaveRdbChunk { responder } => {
+                    ShardMessage::SaveRdbChunk { responder, arm_replica } => {
                         let mut buf = Vec::new();
                         cross_shard_db.borrow_mut().save_rdb_chunk(&mut buf);
+                        if let Some(id) = arm_replica {
+                            crate::replication::get_replication_hub(port).arm_full_sync(id, shard_id);
+                        }
                         let _ = responder.send(buf);
                     }
                     ShardMessage::Publish {

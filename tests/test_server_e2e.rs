@@ -5987,6 +5987,21 @@ fn test_psync_partial_resync_continue_e2e() {
     }
     assert!(!replid.is_empty(), "Failed to extract master_replid");
 
+    // Like Redis, the backlog starts recording once a replica attaches, so
+    // attach one first instead of relying on other tests having done so.
+    let mut first = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    first
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    first.write_all(b"PSYNC ? -1\r\n").unwrap();
+    let mut fbuf = [0u8; 256];
+    let n = first.read(&mut fbuf).unwrap();
+    assert!(
+        String::from_utf8_lossy(&fbuf[..n]).starts_with("+FULLRESYNC"),
+        "{}",
+        String::from_utf8_lossy(&fbuf[..n])
+    );
+
     // 2. Pre-populate some keys and check offset
     assert_eq!(send_and_read(&mut master, b"SET k1 v1\r\n"), "+OK\r\n");
     assert_eq!(send_and_read(&mut master, b"SET k2 v2\r\n"), "+OK\r\n");
@@ -17392,6 +17407,117 @@ fn test_blocking_pops_and_rare_writes_replicate_e2e() {
             "{check:?}"
         );
     }
+    drop(m);
+    drop(r);
+    shutdown_and_wait(rport, &mut replica);
+    shutdown_and_wait(mport, &mut master);
+}
+
+#[test]
+fn test_full_sync_under_concurrent_writes_matches_master_e2e() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (mport, rport) = (16943u16, 16942u16);
+    let (ms, rs) = (mport.to_string(), rport.to_string());
+    let mut master = spawn_rudis_listening(&["--port", &ms, "--threads", "4", "--no-pin"], mport);
+    let mut replica = spawn_rudis_listening(&["--port", &rs, "--threads", "2", "--no-pin"], rport);
+    let connect = |port: u16| {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        c
+    };
+    let mut m = connect(mport);
+    let mut r = connect(rport);
+
+    // repl-backlog-size used to be stored but never applied.
+    assert_eq!(
+        resp_cmd(&mut m, &["CONFIG", "SET", "repl-backlog-size", "8mb"]),
+        "+OK\r\n"
+    );
+    let info = resp_cmd(&mut m, &["INFO", "replication"]);
+    assert!(info.contains("repl_backlog_size:8388608"), "{info}");
+
+    // Bulk data so each shard's snapshot takes a moment.
+    for batch in 0..20 {
+        let mut args: Vec<String> = vec!["MSET".into()];
+        for i in 0..1000 {
+            args.push(format!("bulk:{batch}:{i}"));
+            args.push("v".repeat(64));
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        assert_eq!(resp_cmd(&mut m, &args), "+OK\r\n");
+    }
+
+    // Non-idempotent writes on keys of every shard, running across the full
+    // sync and a partial resync. A change that the snapshot misses or the
+    // stream repeats leaves a counter off.
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            let stop = stop.clone();
+            thread::spawn(move || {
+                let mut c = connect(mport);
+                let mut n = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    let key = format!("ctr:{}", (n * 7 + w) % 64);
+                    let reply = resp_cmd(&mut c, &["INCR", &key]);
+                    assert!(reply.starts_with(':'), "{reply}");
+                    n += 1;
+                }
+            })
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(200));
+    let wait_connected = |r: &mut TcpStream| {
+        let mut role = String::new();
+        for _ in 0..200 {
+            role = resp_cmd(r, &["ROLE"]);
+            if role.contains("connected") {
+                return;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        panic!("replica never connected: {role}");
+    };
+    assert_eq!(
+        resp_cmd(&mut r, &["REPLICAOF", "127.0.0.1", &ms]),
+        "+OK\r\n"
+    );
+    wait_connected(&mut r);
+    thread::sleep(Duration::from_millis(300));
+    // Reconnect to the same master: this resumes from the backlog.
+    assert_eq!(
+        resp_cmd(&mut r, &["REPLICAOF", "127.0.0.1", &ms]),
+        "+OK\r\n"
+    );
+    wait_connected(&mut r);
+    thread::sleep(Duration::from_millis(300));
+    stop.store(true, Ordering::Relaxed);
+    for w in writers {
+        w.join().unwrap();
+    }
+
+    resp_cmd(&mut m, &["SET", "repl:done", "1"]);
+    let mut synced = false;
+    for _ in 0..200 {
+        if resp_cmd(&mut r, &["GET", "repl:done"]) == "$1\r\n1\r\n" {
+            synced = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(synced, "replica never caught up");
+    for i in 0..64 {
+        let key = format!("ctr:{i}");
+        assert_eq!(
+            resp_cmd(&mut m, &["GET", &key]),
+            resp_cmd(&mut r, &["GET", &key]),
+            "{key}"
+        );
+    }
+    assert_eq!(resp_cmd(&mut m, &["DBSIZE"]), resp_cmd(&mut r, &["DBSIZE"]));
+    let stats = resp_cmd(&mut m, &["INFO", "stats"]);
+    assert!(stats.contains("sync_full:1\r\n"), "{stats}");
+    assert!(stats.contains("sync_partial_ok:1\r\n"), "{stats}");
     drop(m);
     drop(r);
     shutdown_and_wait(rport, &mut replica);

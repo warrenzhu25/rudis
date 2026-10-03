@@ -4734,6 +4734,7 @@ async fn run_master_replica_stream(
 
     let is_sync = matches!(&psync_cmd, Command::Sync);
 
+    let repl;
     if !is_sync {
         let (req_replid, req_offset) = match &psync_cmd {
             Command::Psync { replid, offset } => {
@@ -4743,7 +4744,8 @@ async fn run_master_replica_stream(
         };
 
         let partial = hub.try_partial_resync(client_id, write_tx.clone(), req_replid, req_offset);
-        if let Some((replid, diff, _repl)) = partial {
+        if let Some((replid, diff, rep)) = partial {
+            repl = rep;
             crate::server_stats::add(crate::server_stats::Stat::SyncPartialOk, 1);
             let mut initial_msg = format!("+CONTINUE {}\r\n", replid).into_bytes();
             initial_msg.extend_from_slice(&diff);
@@ -4758,16 +4760,17 @@ async fn run_master_replica_stream(
                 crate::server_stats::add(crate::server_stats::Stat::SyncPartialErr, 1);
             }
             crate::server_stats::add(crate::server_stats::Stat::SyncFull, 1);
-            let rdb = router.generate_full_rdb().await;
-            let _repl = hub.register_replica(client_id, write_tx.clone());
+            // Register before any shard serializes, so each shard's changes
+            // after its snapshot reach the replica (see FullSyncCut).
+            repl = hub.register_full_sync_replica(client_id, write_tx.clone(), router.num_shards);
+            let rdb = router.generate_full_rdb(Some(client_id)).await;
+            let (offset, after_snapshot) = hub.finish_full_sync(client_id);
 
             let replid = hub.master_replid.clone();
-            let offset = hub
-                .master_repl_offset
-                .load(std::sync::atomic::Ordering::SeqCst);
             let mut initial_msg =
                 format!("+FULLRESYNC {} {}\r\n${}\r\n", replid, offset, rdb.len()).into_bytes();
             initial_msg.extend_from_slice(&rdb);
+            initial_msg.extend_from_slice(&after_snapshot);
             if writer.write_all(initial_msg).await.0.is_err() {
                 hub.unregister_replica(client_id);
                 return;
@@ -4775,11 +4778,13 @@ async fn run_master_replica_stream(
         }
     } else {
         crate::server_stats::add(crate::server_stats::Stat::SyncFull, 1);
-        let rdb = router.generate_full_rdb().await;
-        let _repl = hub.register_replica(client_id, write_tx.clone());
+        repl = hub.register_full_sync_replica(client_id, write_tx.clone(), router.num_shards);
+        let rdb = router.generate_full_rdb(Some(client_id)).await;
+        let (_, after_snapshot) = hub.finish_full_sync(client_id);
         let mut initial_msg = format!("${}\r\n", rdb.len()).into_bytes();
         initial_msg.extend_from_slice(&rdb);
         initial_msg.extend_from_slice(b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n");
+        initial_msg.extend_from_slice(&after_snapshot);
         if writer.write_all(initial_msg).await.0.is_err() {
             hub.unregister_replica(client_id);
             return;
@@ -4788,7 +4793,13 @@ async fn run_master_replica_stream(
 
     let writer_hub = hub.clone();
     monoio::spawn(async move {
-        while let Ok(data) = write_rx.recv_async().await {
+        // Each wakeup carries no data: everything queued since the last one
+        // is in the replica's pending buffer and goes out in one write.
+        while write_rx.recv_async().await.is_ok() {
+            let data = repl.take_pending();
+            if data.is_empty() {
+                continue;
+            }
             if writer.write_all(data).await.0.is_err() {
                 break;
             }
@@ -4851,7 +4862,10 @@ async fn run_shard_replication_flow(
         buf
     } else {
         let (tx, rx) = flume::bounded(1);
-        let msg = crate::shard::ShardMessage::SaveRdbChunk { responder: tx };
+        let msg = crate::shard::ShardMessage::SaveRdbChunk {
+            responder: tx,
+            arm_replica: None,
+        };
         if router.senders[shard_id].send(msg).is_ok() {
             rx.recv_async().await.unwrap_or_default()
         } else {
@@ -8052,10 +8066,9 @@ async fn execute_command(
                         if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
                             notify_key_invalidation(router.port, key.as_ref(), client_id);
                         }
+                        // The owner shard logged and replicated the change.
+                        let _ = change;
                         notify_keyspace_event_sync(router, NOTIFY_GENERIC, event, key.as_ref());
-                        if let Some(bytes) = crate::aof::command_to_resp(&change) {
-                            crate::replication::propagate_bytes(router.port, &bytes);
-                        }
                     }
                     write_resp_bulk(out, &v);
                 }
@@ -8185,12 +8198,7 @@ async fn execute_command(
                     crate::table::inc_expired_keys();
                     if exists {
                         db.del(&key);
-                        if let Some(aof) = &router.aof
-                            && let Some(bytes) =
-                                crate::aof::command_to_resp(&Command::Del(smallvec![key.clone()]))
-                        {
-                            aof.borrow_mut().append(&bytes);
-                        }
+                        router.log_mutation(|| Command::Del(smallvec![key.clone()]));
                     }
                     if get {
                         if let Some(v) = current_val {
@@ -8210,32 +8218,15 @@ async fn execute_command(
                 let prev_kind = db.type_of(key.as_ref());
                 db.set_extended(key.clone(), value.clone(), expire_in, keepttl);
                 notify_stream_or_defer(&mut db, &key);
-                if let Some(aof) = &router.aof
-                    && let Some(bytes) = crate::aof::command_to_resp(&Command::Set {
-                        key: key.clone(),
-                        value: value.clone(),
-                        expire_in,
-                        condition: condition.clone(),
-                        get,
-                        keepttl,
-                        past_expired,
-                    })
-                {
-                    aof.borrow_mut().append(&bytes);
-                }
-                if crate::replication::has_connected_replicas(router.port)
-                    && let Some(bytes) = crate::aof::command_to_resp(&Command::Set {
-                        key: key.clone(),
-                        value: value.clone(),
-                        expire_in,
-                        condition,
-                        get,
-                        keepttl,
-                        past_expired,
-                    })
-                {
-                    crate::replication::propagate_bytes(router.port, &bytes);
-                }
+                router.log_mutation(|| Command::Set {
+                    key: key.clone(),
+                    value: value.clone(),
+                    expire_in,
+                    condition,
+                    get,
+                    keepttl,
+                    past_expired,
+                });
 
                 if get {
                     if let Some(v) = current_val {
@@ -8298,11 +8289,7 @@ async fn execute_command(
             false
         }
         Command::Mset(pairs) => {
-            if crate::replication::has_connected_replicas(router.port)
-                && let Some(bytes) = crate::aof::command_to_resp(&Command::Mset(pairs.clone()))
-            {
-                crate::replication::propagate_bytes(router.port, &bytes);
-            }
+            // Each owner shard logs and replicates its part of the MSET.
             if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
                 let was_defer = DEFER_BCAST_FLUSH.replace(true);
                 DEFER_BCAST_FLUSH_GLOBAL.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -8514,11 +8501,6 @@ async fn execute_command(
                 for key in &keys {
                     crate::search::delete_document_hook(&String::from_utf8_lossy(key));
                 }
-                if crate::replication::has_connected_replicas(router.port)
-                    && let Some(bytes) = crate::aof::command_to_resp(&Command::Del(keys))
-                {
-                    crate::replication::propagate_bytes(router.port, &bytes);
-                }
             }
             write_resp_integer(out, count as i64);
             false
@@ -8546,11 +8528,6 @@ async fn execute_command(
             if count > 0 {
                 for key in &keys {
                     crate::search::delete_document_hook(&String::from_utf8_lossy(key));
-                }
-                if crate::replication::has_connected_replicas(router.port)
-                    && let Some(bytes) = crate::aof::command_to_resp(&Command::Unlink(keys))
-                {
-                    crate::replication::propagate_bytes(router.port, &bytes);
                 }
             }
             write_resp_integer(out, count as i64);
@@ -8603,11 +8580,7 @@ async fn execute_command(
                 Ok(val) => {
                     notify_key_invalidation(router.port, key.as_ref(), client_id);
                     notify_keyspace_event_sync(router, NOTIFY_STRING, "incrby", key.as_ref());
-                    if let Some(bytes) =
-                        crate::aof::command_to_resp(&Command::IncrBy(key, delta, name))
-                    {
-                        crate::replication::propagate_bytes(router.port, &bytes);
-                    }
+                    let _ = name;
                     write_resp_integer(out, val);
                 }
                 Err(err) => {
@@ -8630,13 +8603,6 @@ async fn execute_command(
                     notify_key_invalidation(router.port, key.as_ref(), client_id);
                 }
                 notify_keyspace_event_sync(router, NOTIFY_GENERIC, "expire", key.as_ref());
-                if let Some(bytes) = crate::aof::command_to_resp(&Command::Expire {
-                    key: key.clone(),
-                    duration,
-                    opts,
-                }) {
-                    crate::replication::propagate_bytes(router.port, &bytes);
-                }
                 out.extend_from_slice(b":1\r\n");
             } else {
                 out.extend_from_slice(b":0\r\n");
@@ -8653,9 +8619,6 @@ async fn execute_command(
                     notify_key_invalidation(router.port, key.as_ref(), client_id);
                 }
                 notify_keyspace_event_sync(router, NOTIFY_GENERIC, "persist", key.as_ref());
-                if let Some(bytes) = crate::aof::command_to_resp(&Command::Persist(key)) {
-                    crate::replication::propagate_bytes(router.port, &bytes);
-                }
                 out.extend_from_slice(b":1\r\n");
             } else {
                 out.extend_from_slice(b":0\r\n");
@@ -9342,8 +9305,6 @@ async fn execute_command(
             false
         }
         Command::ConfigGet(_) | Command::ConfigSet(_) => {
-            static CONFIG_REPL_BACKLOG_SIZE: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(1048576);
             static CONFIG_BACKUP_SEALED_TTL: std::sync::atomic::AtomicU64 =
                 std::sync::atomic::AtomicU64::new(86400);
             static CONFIG_MAXMEMORY_SAMPLES: std::sync::atomic::AtomicU64 =
@@ -9422,9 +9383,7 @@ async fn execute_command(
                         .load(std::sync::atomic::Ordering::Relaxed)
                         .to_string();
                     let port_str = router.port.to_string();
-                    let repl_backlog = CONFIG_REPL_BACKLOG_SIZE
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        .to_string();
+                    let repl_backlog = crate::replication::repl_backlog_size().to_string();
                     let backup_ttl = CONFIG_BACKUP_SEALED_TTL
                         .load(std::sync::atomic::Ordering::Relaxed)
                         .to_string();
@@ -10002,8 +9961,7 @@ async fn execute_command(
                             }
                         } else if p_str == "repl-backlog-size" {
                             if let Some(bytes) = crate::tiering::parse_memory_bytes(&val_str) {
-                                CONFIG_REPL_BACKLOG_SIZE
-                                    .store(bytes, std::sync::atomic::Ordering::Relaxed);
+                                crate::replication::set_repl_backlog_size(bytes as usize);
                             }
                         } else if p_str == "backup-sealed-ttl" {
                             if let Ok(v) = val_str.parse::<u64>() {
@@ -20198,7 +20156,11 @@ pub fn execute_local_command(
                                 aof_w.borrow_mut().append(&bytes);
                             }
                             if need_rep {
-                                crate::replication::propagate_bytes(db.port, &bytes);
+                                crate::replication::propagate_shard_bytes(
+                                    db.port,
+                                    db.shard_id,
+                                    &bytes,
+                                );
                             }
                         }
                     }
@@ -23936,11 +23898,6 @@ async fn execute_commands_squashed(
                 stat_run.restart();
             }
             stat_run.note("MSET");
-            if crate::replication::has_connected_replicas(router.port)
-                && let Some(bytes) = crate::aof::command_to_resp(&Command::Mset(pairs.clone()))
-            {
-                crate::replication::propagate_bytes(router.port, &bytes);
-            }
             if HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
                 for (key, _) in &pairs {
                     notify_key_invalidation(router.port, key.as_ref(), client_id);

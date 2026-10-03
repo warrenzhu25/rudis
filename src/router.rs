@@ -184,6 +184,12 @@ pub struct Router {
 }
 
 impl Router {
+    /// Logs a mutation applied to this shard's data to the AOF and the
+    /// replication stream (see `replication::log_shard_mutation`).
+    pub fn log_mutation(&self, make: impl FnOnce() -> Command) {
+        crate::replication::log_shard_mutation(self.port, self.shard_id, self.aof.as_deref(), make);
+    }
+
     pub fn new(
         shard_id: usize,
         num_shards: usize,
@@ -1075,19 +1081,15 @@ impl Router {
     pub async fn set(&self, key: Bytes, value: Bytes, expire_in: Option<Duration>) {
         let target = self.target_shard(&key);
         if target == self.shard_id {
-            if let Some(aof) = &self.aof
-                && let Some(bytes) = crate::aof::command_to_resp(&Command::Set {
-                    key: key.clone(),
-                    value: value.clone(),
-                    expire_in,
-                    condition: crate::resp::SetCondition::None,
-                    get: false,
-                    keepttl: false,
-                    past_expired: false,
-                })
-            {
-                aof.borrow_mut().append(&bytes);
-            }
+            self.log_mutation(|| Command::Set {
+                key: key.clone(),
+                value: value.clone(),
+                expire_in,
+                condition: crate::resp::SetCondition::None,
+                get: false,
+                keepttl: false,
+                past_expired: false,
+            });
             let prev_kind = {
                 let mut db = self.local_db.borrow_mut();
                 let kind = db.type_of(&key);
@@ -1549,11 +1551,7 @@ impl Router {
                     db.set(k.clone(), v.clone(), None);
                 }
             }
-            if let Some(aof) = &self.aof
-                && let Some(bytes) = crate::aof::command_to_resp(&crate::resp::Command::Mset(pairs))
-            {
-                aof.borrow_mut().append(&bytes);
-            }
+            self.log_mutation(|| crate::resp::Command::Mset(pairs));
             self.check_auto_tier_after_write();
             return None;
         }
@@ -1583,13 +1581,7 @@ impl Router {
         // Fast path: all pairs are local
         if !has_remote {
             if !local_batch.is_empty() {
-                if let Some(aof) = &self.aof
-                    && let Some(bytes) = crate::aof::command_to_resp(&crate::resp::Command::Mset(
-                        local_batch.clone(),
-                    ))
-                {
-                    aof.borrow_mut().append(&bytes);
-                }
+                self.log_mutation(|| crate::resp::Command::Mset(local_batch.clone()));
                 {
                     let mut db = self.local_db.borrow_mut();
                     for (k, v) in local_batch {
@@ -1621,12 +1613,7 @@ impl Router {
 
         // Execute local batch CONCURRENTLY while remote shards process their batches
         if !local_batch.is_empty() {
-            if let Some(aof) = &self.aof
-                && let Some(bytes) =
-                    crate::aof::command_to_resp(&crate::resp::Command::Mset(local_batch.clone()))
-            {
-                aof.borrow_mut().append(&bytes);
-            }
+            self.log_mutation(|| crate::resp::Command::Mset(local_batch.clone()));
             {
                 let mut db = self.local_db.borrow_mut();
                 for (k, v) in local_batch {
@@ -1756,11 +1743,7 @@ impl Router {
                     &key,
                 );
                 crate::connection::notify_stream_or_defer(&mut db, &key);
-                if let Some(aof) = &self.aof
-                    && let Some(bytes) = crate::aof::command_to_resp(&Command::Del(smallvec![key]))
-                {
-                    aof.borrow_mut().append(&bytes);
-                }
+                self.log_mutation(|| Command::Del(smallvec![key]));
             }
             deleted
         } else {
@@ -1806,12 +1789,8 @@ impl Router {
                     }
                 }
             }
-            if count > 0
-                && let Some(aof) = &self.aof
-                && let Some(bytes) =
-                    crate::aof::command_to_resp(&Command::Del(SmallVec::from_vec(deleted_keys)))
-            {
-                aof.borrow_mut().append(&bytes);
+            if count > 0 {
+                self.log_mutation(|| Command::Del(SmallVec::from_vec(deleted_keys)));
             }
             return count;
         }
@@ -1851,12 +1830,8 @@ impl Router {
                     }
                 }
             }
-            if !deleted_local.is_empty()
-                && let Some(aof) = &self.aof
-                && let Some(bytes) =
-                    crate::aof::command_to_resp(&Command::Del(SmallVec::from_vec(deleted_local)))
-            {
-                aof.borrow_mut().append(&bytes);
+            if !deleted_local.is_empty() {
+                self.log_mutation(|| Command::Del(SmallVec::from_vec(deleted_local)));
             }
         }
 
@@ -1932,15 +1907,8 @@ impl Router {
         let target = self.target_shard(&key);
         if target == self.shard_id {
             let res = self.local_db.borrow_mut().incr_by(key.clone(), delta);
-            if res.is_ok()
-                && let Some(aof) = &self.aof
-                && let Some(bytes) = crate::aof::command_to_resp(&Command::IncrBy(
-                    key,
-                    delta,
-                    crate::resp::IncrName::IncrBy,
-                ))
-            {
-                aof.borrow_mut().append(&bytes);
+            if res.is_ok() {
+                self.log_mutation(|| Command::IncrBy(key, delta, crate::resp::IncrName::IncrBy));
             }
             res
         } else {
@@ -1969,15 +1937,12 @@ impl Router {
         let target = self.target_shard(&key);
         if target == self.shard_id {
             let res = self.local_db.borrow_mut().expire(&key, duration, opts);
-            if res
-                && let Some(aof) = &self.aof
-                && let Some(bytes) = crate::aof::command_to_resp(&Command::Expire {
+            if res {
+                self.log_mutation(|| Command::Expire {
                     key,
                     duration,
                     opts,
-                })
-            {
-                aof.borrow_mut().append(&bytes);
+                });
             }
             res
         } else {
@@ -2000,11 +1965,8 @@ impl Router {
         let target = self.target_shard(&key);
         if target == self.shard_id {
             let res = self.local_db.borrow_mut().persist(&key);
-            if res
-                && let Some(aof) = &self.aof
-                && let Some(bytes) = crate::aof::command_to_resp(&Command::Persist(key))
-            {
-                aof.borrow_mut().append(&bytes);
+            if res {
+                self.log_mutation(|| Command::Persist(key));
             }
             res
         } else {
@@ -2547,11 +2509,7 @@ impl Router {
                 .unwrap()
                 .notify_all_streams(&mut db);
         }
-        if let Some(aof) = &self.aof
-            && let Some(bytes) = crate::aof::command_to_resp(&Command::Flushdb)
-        {
-            aof.borrow_mut().append(&bytes);
-        }
+        self.log_mutation(|| Command::Flushdb);
         let _ = self
             .execute_remote_many(self.to_other_shards(|| Command::Flushdb))
             .await;
@@ -3410,13 +3368,19 @@ impl Router {
         }
     }
 
-    pub async fn generate_full_rdb(&self) -> Vec<u8> {
+    /// Serializes every shard into one RDB. With `arm_replica`, each shard
+    /// arms that replica's stream cut right after serializing (see
+    /// `replication::FullSyncCut`).
+    pub async fn generate_full_rdb(&self, arm_replica: Option<u64>) -> Vec<u8> {
         let mut full_rdb = Vec::new();
         full_rdb.extend_from_slice(b"REDIS0011");
         full_rdb.extend_from_slice(&[0xFE, 0x00]);
 
         // Local shard chunk
         self.local_db.borrow_mut().save_rdb_chunk(&mut full_rdb);
+        if let Some(id) = arm_replica {
+            crate::replication::get_replication_hub(self.port).arm_full_sync(id, self.shard_id);
+        }
 
         // Remote shard chunks
         let mut responders = Vec::new();
@@ -3424,7 +3388,10 @@ impl Router {
             if sid != self.shard_id {
                 let (tx, rx) = flume::bounded(1);
                 if sender
-                    .send(ShardMessage::SaveRdbChunk { responder: tx })
+                    .send(ShardMessage::SaveRdbChunk {
+                        responder: tx,
+                        arm_replica,
+                    })
                     .is_ok()
                 {
                     responders.push(rx);
@@ -3576,7 +3543,10 @@ impl Router {
                 let (tx, rx) = flume::bounded(1);
                 // A missing shard would silently drop its keys from the dump.
                 sender
-                    .send(ShardMessage::SaveRdbChunk { responder: tx })
+                    .send(ShardMessage::SaveRdbChunk {
+                        responder: tx,
+                        arm_replica: None,
+                    })
                     .map_err(|_| format!("shard {} is not reachable", sid))?;
                 let chunk = rx
                     .recv_async()

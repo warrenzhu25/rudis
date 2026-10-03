@@ -446,6 +446,9 @@ pub enum ShardMessage {
     },
     SaveRdbChunk {
         responder: flume::Sender<Vec<u8>>,
+        /// Replica (client id) whose full sync this chunk is for; the shard
+        /// arms the replica's stream cut right after serializing.
+        arm_replica: Option<u64>,
     },
     Publish {
         channel: Bytes,
