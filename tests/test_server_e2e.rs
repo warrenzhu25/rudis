@@ -17045,3 +17045,155 @@ fn test_lmove_and_smove_across_shards_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child);
 }
+
+#[test]
+fn test_msetnx_across_shards_e2e() {
+    let port = 16949;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "4", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // 8 keys span all 4 shards, which used to fail with CROSSSLOT in
+    // standalone mode.
+    let keys: Vec<String> = (0..8).map(|i| format!("nx:{i}")).collect();
+    let mut args = vec!["MSETNX".to_string()];
+    for k in &keys {
+        args.extend([k.clone(), format!("v-{k}")]);
+    }
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    assert_eq!(resp_cmd(&mut c, &args), ":1\r\n");
+    for k in &keys {
+        assert_eq!(
+            resp_cmd(&mut c, &["GET", k]),
+            format!("${}\r\nv-{k}\r\n", k.len() + 2)
+        );
+    }
+    // One existing key anywhere blocks all of them.
+    assert_eq!(resp_cmd(&mut c, &args), ":0\r\n");
+    assert_eq!(resp_cmd(&mut c, &["DEL", "nx:0", "nx:1", "nx:2"]), ":3\r\n");
+    assert_eq!(resp_cmd(&mut c, &args), ":0\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["EXISTS", "nx:0", "nx:1", "nx:2"]),
+        ":0\r\n"
+    );
+    // Duplicate keys: the last value wins, like MSET.
+    assert_eq!(
+        resp_cmd(&mut c, &["MSETNX", "d:a", "1", "d:b", "2", "d:a", "3"]),
+        ":1\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["MGET", "d:a", "d:b"]),
+        "*2\r\n$1\r\n3\r\n$1\r\n2\r\n"
+    );
+    // Inside MULTI/EXEC, where the transaction already holds the locks.
+    assert_eq!(resp_cmd(&mut c, &["MULTI"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["MSETNX", "t:a", "1", "t:b", "2", "t:c", "3"]),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["MSETNX", "t:c", "x", "t:d", "4"]),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["EXEC"]), "*2\r\n:1\r\n:0\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["MGET", "t:a", "t:b", "t:c", "t:d"]),
+        "*4\r\n$1\r\n1\r\n$1\r\n2\r\n$1\r\n3\r\n$-1\r\n"
+    );
+    // Racing MSETNX calls over overlapping keys: exactly one wins and its
+    // values are the ones set, never a mix.
+    for j in 0..4 {
+        let racers: Vec<_> = (0..8)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    let mut r = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                    r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let mut a = vec!["MSETNX".to_string()];
+                    for k in 0..6 {
+                        a.extend([format!("race:{j}:{k}"), i.to_string()]);
+                    }
+                    let a: Vec<&str> = a.iter().map(String::as_str).collect();
+                    resp_cmd(&mut r, &a)
+                })
+            })
+            .collect();
+        let wins = racers
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .filter(|r| r == ":1\r\n")
+            .count();
+        assert_eq!(wins, 1, "round {j}");
+        let vals: Vec<String> = (0..6)
+            .map(|k| resp_cmd(&mut c, &["GET", &format!("race:{j}:{k}")]))
+            .collect();
+        assert!(vals.iter().all(|v| v == &vals[0]), "round {j}: {vals:?}");
+    }
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}
+
+#[test]
+fn test_bitop_across_shards_e2e() {
+    let port = 16948;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "4", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // With 4 shards most of these key triples span shards, which used to
+    // fail with CROSSSLOT in standalone mode.
+    for i in 0..16 {
+        let (a, b, d) = (format!("ba:{i}"), format!("bb:{i}"), format!("bd:{i}"));
+        assert_eq!(resp_cmd(&mut c, &["SET", &a, "\x0f\x0f"]), "+OK\r\n");
+        assert_eq!(resp_cmd(&mut c, &["SET", &b, "\x33"]), "+OK\r\n");
+        assert_eq!(
+            resp_cmd(&mut c, &["BITOP", "AND", &d, &a, &b]),
+            ":2\r\n",
+            "{d}"
+        );
+        assert_eq!(resp_cmd(&mut c, &["GET", &d]), "$2\r\n\x03\x00\r\n");
+        assert_eq!(resp_cmd(&mut c, &["BITOP", "or", &d, &a, &b]), ":2\r\n");
+        assert_eq!(resp_cmd(&mut c, &["GET", &d]), "$2\r\n\x3f\x0f\r\n");
+        assert_eq!(
+            resp_cmd(&mut c, &["BITOP", "XOR", &d, &a, &b, "nokey"]),
+            ":2\r\n"
+        );
+        assert_eq!(resp_cmd(&mut c, &["GET", &d]), "$2\r\n\x3c\x0f\r\n");
+        assert_eq!(resp_cmd(&mut c, &["BITOP", "NOT", &d, &b]), ":1\r\n");
+        // !0x33 == 0xcc: 4 bits set.
+        assert_eq!(resp_cmd(&mut c, &["BITCOUNT", &d]), ":4\r\n");
+        // An empty result deletes the destination, like Redis.
+        assert_eq!(
+            resp_cmd(&mut c, &["BITOP", "AND", &d, "n1", "n2"]),
+            ":0\r\n"
+        );
+        assert_eq!(resp_cmd(&mut c, &["EXISTS", &d]), ":0\r\n");
+        assert_eq!(
+            resp_cmd(&mut c, &["RPUSH", &b, "x"]),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+        );
+        assert_eq!(resp_cmd(&mut c, &["DEL", &b]), ":1\r\n");
+        assert_eq!(resp_cmd(&mut c, &["RPUSH", &b, "x"]), ":1\r\n");
+        assert_eq!(
+            resp_cmd(&mut c, &["BITOP", "OR", &d, &a, &b]),
+            "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+        );
+        assert_eq!(resp_cmd(&mut c, &["EXISTS", &d]), ":0\r\n");
+    }
+    // Inside MULTI/EXEC, where the transaction already holds the locks.
+    assert_eq!(resp_cmd(&mut c, &["SET", "tx:x", "\x01"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SET", "tx:y", "\x02"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["MULTI"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["BITOP", "OR", "tx:z", "tx:x", "tx:y"]),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut c, &["BITOP", "XOR", "tx:w", "tx:z", "tx:x"]),
+        "+QUEUED\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["EXEC"]), "*2\r\n:1\r\n:1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "tx:z"]), "$1\r\n\x03\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "tx:w"]), "$1\r\n\x02\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}

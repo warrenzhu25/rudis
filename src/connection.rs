@@ -14183,9 +14183,13 @@ async fn execute_command(
                 .iter()
                 .all(|(k, _)| router.target_shard(k) == first_shard);
             if !all_same_shard {
-                out.extend_from_slice(
-                    b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
-                );
+                if router.cluster_enabled {
+                    out.extend_from_slice(
+                        b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                    );
+                } else {
+                    out.extend_from_slice(&msetnx_across_shards(router, pairs).await);
+                }
                 return false;
             }
             if first_shard == router.shard_id {
@@ -14258,18 +14262,22 @@ async fn execute_command(
             false
         }
         Command::Bitop {
+            ref op,
             ref destkey,
             ref srckeys,
-            ..
         } => {
             let first_shard = router.target_shard(destkey);
             let all_same = srckeys
                 .iter()
                 .all(|k| router.target_shard(k) == first_shard);
             if !all_same {
-                out.extend_from_slice(
-                    b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
-                );
+                if router.cluster_enabled {
+                    out.extend_from_slice(
+                        b"-CROSSSLOT Keys in request don't hash to the same slot\r\n",
+                    );
+                } else {
+                    out.extend_from_slice(&bitop_across_shards(router, op, destkey, srckeys).await);
+                }
                 return false;
             }
             if first_shard == router.shard_id {
@@ -24471,6 +24479,156 @@ async fn move_element_across_shards(
                 b":1\r\n".to_vec()
             }
         }
+    }
+    .await;
+    if lock {
+        router.release_tx_locks(&shards, tx_id).await;
+    }
+    reply
+}
+
+/// Runs one command per `(shard, command)` pair, the local shard's inline
+/// and all remote ones concurrently, and returns the replies in input order.
+async fn exec_on_shards(router: &Router, cmds: Vec<(usize, Command)>) -> Vec<Vec<u8>> {
+    let mut replies = vec![Vec::new(); cmds.len()];
+    let mut remote_idx = Vec::new();
+    let mut remote = Vec::new();
+    for (i, (shard, cmd)) in cmds.into_iter().enumerate() {
+        if shard == router.shard_id {
+            replies[i] = exec_on_shard(router, shard, cmd).await;
+        } else {
+            remote_idx.push(i);
+            remote.push((shard, cmd));
+        }
+    }
+    if !remote.is_empty() {
+        for (i, reply) in remote_idx
+            .into_iter()
+            .zip(router.execute_remote_many(remote).await)
+        {
+            replies[i] = reply;
+        }
+    }
+    replies
+}
+
+/// MSETNX for keys owned by several shards. Holding all their tx locks
+/// (unless inside EXEC, which already holds them), checks that none of the
+/// keys exists, then MSETs each shard's pairs. Like EXEC, it is atomic
+/// against transactions and other cross-shard moves, not against plain
+/// commands. Returns the command's reply.
+async fn msetnx_across_shards(router: &Router, pairs: &[(Bytes, Bytes)]) -> Vec<u8> {
+    let mut groups: Vec<(usize, Vec<(Bytes, Bytes)>)> = Vec::new();
+    for (k, v) in pairs {
+        router.ensure_loaded(k).await;
+        let shard = router.target_shard(k);
+        match groups.iter_mut().find(|(s, _)| *s == shard) {
+            Some((_, group)) => group.push((k.clone(), v.clone())),
+            None => groups.push((shard, vec![(k.clone(), v.clone())])),
+        }
+    }
+    let mut shards: Vec<usize> = groups.iter().map(|(s, _)| *s).collect();
+    shards.sort_unstable();
+    let lock = !IN_TX.get();
+    let tx_id = next_tx_id();
+    if lock {
+        router.acquire_tx_locks(&shards, tx_id).await;
+    }
+    let exists = exec_on_shards(
+        router,
+        groups
+            .iter()
+            .map(|(s, group)| {
+                (
+                    *s,
+                    Command::Exists(group.iter().map(|(k, _)| k.clone()).collect()),
+                )
+            })
+            .collect(),
+    )
+    .await;
+    let reply = if let Some(err) = exists.iter().find(|r| r.starts_with(b"-")) {
+        err.clone()
+    } else if exists.iter().any(|r| resp_integer(r) != Some(0)) {
+        b":0\r\n".to_vec()
+    } else {
+        let set = exec_on_shards(
+            router,
+            groups
+                .into_iter()
+                .map(|(s, group)| (s, Command::Mset(group)))
+                .collect(),
+        )
+        .await;
+        match set.into_iter().find(|r| r.starts_with(b"-")) {
+            Some(err) => err,
+            None => b":1\r\n".to_vec(),
+        }
+    };
+    if lock {
+        router.release_tx_locks(&shards, tx_id).await;
+    }
+    reply
+}
+
+/// BITOP for keys owned by several shards. Holding their tx locks (unless
+/// inside EXEC), GETs the sources, computes the result here and stores it on
+/// the destination's shard, deleting the destination for an empty result
+/// like Redis. Returns the command's reply.
+async fn bitop_across_shards(
+    router: &Router,
+    op: &str,
+    destkey: &Bytes,
+    srckeys: &[Bytes],
+) -> Vec<u8> {
+    let mut shards = Vec::with_capacity(srckeys.len() + 1);
+    for k in std::iter::once(destkey).chain(srckeys) {
+        router.ensure_loaded(k).await;
+        shards.push(router.target_shard(k));
+    }
+    shards.sort_unstable();
+    shards.dedup();
+    let lock = !IN_TX.get();
+    let tx_id = next_tx_id();
+    if lock {
+        router.acquire_tx_locks(&shards, tx_id).await;
+    }
+    let reply = async {
+        let gets = exec_on_shards(
+            router,
+            srckeys
+                .iter()
+                .map(|k| (router.target_shard(k), Command::Get(k.clone())))
+                .collect(),
+        )
+        .await;
+        let mut buffers = Vec::with_capacity(gets.len());
+        for reply in gets {
+            if reply.starts_with(b"-") {
+                return reply;
+            }
+            buffers.push(resp_bulk_payload(&reply).map_or_else(Vec::new, |b| b.to_vec()));
+        }
+        let result = match crate::table::RudisTable::bitop_compute(&op.to_uppercase(), &buffers) {
+            Ok(result) => result,
+            Err(err) => {
+                let mut out = Vec::new();
+                write_resp_err(&mut out, err);
+                return out;
+            }
+        };
+        let len = result.len();
+        let dst = router.target_shard(destkey);
+        let store = if len == 0 {
+            Command::Del(smallvec::smallvec![destkey.clone()])
+        } else {
+            Command::Mset(vec![(destkey.clone(), Bytes::from(result))])
+        };
+        let stored = exec_on_shard(router, dst, store).await;
+        if stored.starts_with(b"-") {
+            return stored;
+        }
+        format!(":{len}\r\n").into_bytes()
     }
     .await;
     if lock {
