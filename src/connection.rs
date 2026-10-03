@@ -381,8 +381,6 @@ pub fn tx_has_cross_slot(tx_queue: &[Command]) -> bool {
     false
 }
 
-pub static DIRTY_CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
 #[inline]
 pub fn write_resp_null(out: &mut Vec<u8>) {
     if CURRENT_CLIENT_RESP3.get() {
@@ -6981,7 +6979,6 @@ async fn handle_bzpop(
             match res {
                 Ok(mut items) => {
                     if let Some((m, s)) = items.pop() {
-                        DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let rep_cmd = if is_min {
                             Command::Zpopmin {
                                 key: k.clone(),
@@ -11107,7 +11104,6 @@ async fn execute_command(
                         drop(db);
 
                         if let Some(rep) = rep_cmd {
-                            DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                                 for_each_cmd_key(&rep, |k| {
                                     touch_watched_key(router.port, k);
@@ -11672,7 +11668,6 @@ async fn execute_command(
                     match db.lpop(k, 1) {
                         Ok(mut vals) => {
                             if let Some(v) = vals.pop() {
-                                DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 popped = Some((k.clone(), v));
                                 break;
                             }
@@ -11806,7 +11801,6 @@ async fn execute_command(
                     match db.rpop(k, 1) {
                         Ok(mut vals) => {
                             if let Some(v) = vals.pop() {
-                                DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 popped = Some((k.clone(), v));
                                 break;
                             }
@@ -12617,7 +12611,6 @@ async fn execute_command(
                     match res {
                         Ok(vals) => {
                             if !vals.is_empty() {
-                                DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 let rep_cmd = match where_from {
                                     crate::table::ListDirection::Left => Command::Lpop {
                                         key: k.clone(),
@@ -12714,7 +12707,6 @@ async fn execute_command(
                     match res {
                         Ok(vals) => {
                             if !vals.is_empty() {
-                                DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 let rep_cmd = match where_from {
                                     crate::table::ListDirection::Left => Command::Lpop {
                                         key: k.clone(),
@@ -12900,7 +12892,6 @@ async fn execute_command(
                     match res {
                         Ok(items) => {
                             if !items.is_empty() {
-                                DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 let rep_cmd = if is_min {
                                     Command::Zpopmin {
                                         key: k.clone(),
@@ -12984,7 +12975,6 @@ async fn execute_command(
                     match res {
                         Ok(items) => {
                             if !items.is_empty() {
-                                DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 let rep_cmd = if is_min {
                                     Command::Zpopmin {
                                         key: k.clone(),
@@ -16690,7 +16680,6 @@ pub fn execute_local_command(
     };
     macro_rules! record_change {
         ($cmd_expr:expr) => {
-            DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed)
                 || HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
             {
@@ -19165,9 +19154,6 @@ pub fn execute_local_command(
             match db.bitfield(key.clone(), ops) {
                 Ok((results, changes)) => {
                     if changes > 0 && !*readonly {
-                        for _ in 0..changes {
-                            DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
                         if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                             touch_watched_key(db.port, key.as_ref());
                         }
@@ -19641,10 +19627,6 @@ pub fn execute_local_command(
         Command::Xdelex { key, strategy, ids } => {
             let (res, dirty_count) = db.xdelex(key, *strategy, ids);
             if dirty_count > 0 {
-                DIRTY_CHANGES.fetch_add(
-                    (dirty_count - 1) as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
                 record_change!(cmd);
             }
             write_resp_array_header(out, res.len());
@@ -19920,10 +19902,6 @@ pub fn execute_local_command(
         } => {
             let (res, dirty_count) = db.xackdel(key, group, *strategy, ids);
             if dirty_count > 0 {
-                DIRTY_CHANGES.fetch_add(
-                    (dirty_count - 1) as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
                 record_change!(cmd);
             }
             write_resp_array_header(out, res.len());
@@ -20202,7 +20180,6 @@ pub fn execute_local_command(
             match db.smove(source, destination.clone(), member.clone()) {
                 Ok(res) => {
                     if res.moved {
-                        DIRTY_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         touch_watched_key(db.port, source.as_ref());
                         if res.dst_added {
                             touch_watched_key(db.port, destination.as_ref());

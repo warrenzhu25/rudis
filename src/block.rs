@@ -392,8 +392,6 @@ impl BlockHub {
                         };
                         if let Some(vals) = popped {
                             if !vals.is_empty() {
-                                crate::connection::DIRTY_CHANGES
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 let _ = waiter
                                     .sender
                                     .send(BlockedListResult::Popped(key.clone(), vals));
@@ -433,8 +431,6 @@ impl BlockHub {
                             }
                         };
                         if let Some(val) = popped {
-                            crate::connection::DIRTY_CHANGES
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             match where_to {
                                 ListPopType::Left => {
                                     let _ = table.lpush(destination.clone(), vec![val.clone()]);
@@ -490,8 +486,6 @@ impl BlockHub {
                             ordering,
                         ) {
                             Ok(Some(vals)) => {
-                                crate::connection::DIRTY_CHANGES
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 crate::connection::touch_watched_key(self.port, key.as_ref());
                                 crate::connection::touch_watched_key(
                                     self.port,
@@ -571,8 +565,6 @@ impl BlockHub {
                 };
                 if let Some(items) = popped {
                     if !items.is_empty() {
-                        crate::connection::DIRTY_CHANGES
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let _ = waiter.sender.send(BlockedZSetResult::Popped {
                             key: key.clone(),
                             items,
