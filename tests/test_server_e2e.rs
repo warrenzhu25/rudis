@@ -16516,3 +16516,92 @@ fn test_info_stats_counts_pubsub_channels_and_patterns_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child);
 }
+
+#[test]
+fn test_info_stats_counts_keyspace_hits_and_misses_e2e() {
+    let port = 16959;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // Writes do not count.
+    assert_eq!(resp_cmd(&mut c, &["SET", "k1", "v"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["HSET", "h", "f", "v"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["RPUSH", "l", "a"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SADD", "st", "a"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["ZADD", "z", "1", "a"]), ":1\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["SET", "gone", "v", "PX", "1"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["CONFIG", "RESETSTAT"]), "+OK\r\n");
+    std::thread::sleep(Duration::from_millis(5));
+
+    let hits_misses = |c: &mut TcpStream| {
+        let info = info_section(c, "stats");
+        (
+            info_num(&info, "keyspace_hits"),
+            info_num(&info, "keyspace_misses"),
+        )
+    };
+    assert_eq!(hits_misses(&mut c), (0.0, 0.0));
+
+    assert_eq!(resp_cmd(&mut c, &["GET", "k1"]), "$1\r\nv\r\n"); // hit
+    assert_eq!(resp_cmd(&mut c, &["GET", "nokey"]), "$-1\r\n"); // miss
+    assert_eq!(resp_cmd(&mut c, &["GET", "gone"]), "$-1\r\n"); // expired: miss
+    resp_cmd(&mut c, &["GET", "l"]); // wrong type, but the key exists: hit
+    // 2 hits, 1 miss.
+    assert_eq!(
+        resp_cmd(&mut c, &["MGET", "k1", "nokey", "k1"]),
+        "*3\r\n$1\r\nv\r\n$-1\r\n$1\r\nv\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["HGET", "h", "f"]), "$1\r\nv\r\n"); // hit
+    assert_eq!(resp_cmd(&mut c, &["HGET", "h", "nofield"]), "$-1\r\n"); // key exists: hit
+    assert_eq!(resp_cmd(&mut c, &["HGET", "noh", "f"]), "$-1\r\n"); // miss
+    assert_eq!(resp_cmd(&mut c, &["EXISTS", "k1", "nokey"]), ":1\r\n"); // 1 hit, 1 miss
+    assert_eq!(
+        resp_cmd(&mut c, &["LRANGE", "l", "0", "-1"]),
+        "*1\r\n$1\r\na\r\n"
+    ); // hit
+    assert_eq!(hits_misses(&mut c), (8.0, 5.0));
+
+    // Pipelined reads take the batched path (the fast paths of each shard).
+    assert_eq!(resp_cmd_full(&mut c, &["GET", "k1"]), "$1\r\nv\r\n"); // hit
+    let batch: &[(&[&str], bool)] = &[
+        (&["GET", "nokey"], false),
+        (&["HGET", "h", "f"], true),
+        (&["HGET", "noh", "f"], false),
+        (&["EXISTS", "k1"], true),
+        (&["EXISTS", "nokey"], false),
+        (&["SISMEMBER", "st", "a"], true),
+        (&["SISMEMBER", "nost", "a"], false),
+        (&["LRANGE", "l", "0", "-1"], true),
+        (&["LRANGE", "nol", "0", "-1"], false),
+        (&["ZRANGE", "z", "0", "-1"], true),
+        (&["ZRANGE", "noz", "0", "-1"], false),
+    ];
+    let mut pipeline = String::new();
+    for (args, _) in batch {
+        pipeline.push_str(&format!("*{}\r\n", args.len()));
+        for a in *args {
+            pipeline.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+        }
+    }
+    pipeline.push_str("*1\r\n$4\r\nPING\r\n");
+    c.write_all(pipeline.as_bytes()).unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !got.ends_with(b"+PONG\r\n") {
+        let n = c.read(&mut buf).unwrap();
+        assert!(n > 0, "connection closed");
+        got.extend_from_slice(&buf[..n]);
+    }
+    let hits = batch.iter().filter(|(_, hit)| *hit).count() as f64;
+    let misses = batch.len() as f64 - hits;
+    assert_eq!(hits_misses(&mut c), (9.0 + hits, 5.0 + misses));
+
+    assert_eq!(resp_cmd(&mut c, &["CONFIG", "RESETSTAT"]), "+OK\r\n");
+    assert_eq!(hits_misses(&mut c), (0.0, 0.0));
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}

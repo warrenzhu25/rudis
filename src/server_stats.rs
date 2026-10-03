@@ -1,7 +1,8 @@
 //! Process-wide counters behind the INFO `# Stats` section:
 //! total_commands_processed, total_connections_received,
-//! rejected_connections, total_net_input_bytes / total_net_output_bytes and
-//! the instantaneous_* rates derived from them.
+//! rejected_connections, total_net_input_bytes / total_net_output_bytes,
+//! keyspace_hits / keyspace_misses and the instantaneous_* rates derived
+//! from them.
 //!
 //! Every thread owns one cache-line-aligned slot and is its only writer, so
 //! bumping a counter is a relaxed load and store on a line no other thread
@@ -23,9 +24,11 @@ pub enum Stat {
     RejectedConnections,
     NetInputBytes,
     NetOutputBytes,
+    KeyspaceHits,
+    KeyspaceMisses,
 }
 
-const NUM_STATS: usize = 5;
+const NUM_STATS: usize = 7;
 
 #[repr(align(128))]
 struct Slot {
@@ -58,6 +61,20 @@ pub fn add(stat: Stat, n: u64) {
     });
 }
 
+/// Counts one key looked up by a read command: a hit if it exists, as
+/// Redis does in lookupKeyRead.
+#[inline]
+pub fn note_key_lookup(found: bool) {
+    add(
+        if found {
+            Stat::KeyspaceHits
+        } else {
+            Stat::KeyspaceMisses
+        },
+        1,
+    );
+}
+
 fn raw_total(stat: Stat) -> u64 {
     SLOTS
         .lock()
@@ -78,6 +95,8 @@ const ALL: [Stat; NUM_STATS] = [
     Stat::RejectedConnections,
     Stat::NetInputBytes,
     Stat::NetOutputBytes,
+    Stat::KeyspaceHits,
+    Stat::KeyspaceMisses,
 ];
 
 /// Restarts every counter from zero (CONFIG RESETSTAT).

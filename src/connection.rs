@@ -8497,6 +8497,7 @@ async fn execute_command(
                 } else {
                     router.exists(keys[0].clone()).await
                 };
+                crate::server_stats::note_key_lookup(exists);
                 record_client_read(router.port, client_id, keys[0].as_ref());
                 write_resp_integer(out, if exists { 1 } else { 0 });
                 return false;
@@ -8504,8 +8505,17 @@ async fn execute_command(
             let (local, remote) = router.group_keys_by_shard(&keys);
             let mut count = {
                 let mut db = router.local_db.borrow_mut();
-                local.iter().filter(|k| db.exists(k.as_ref())).count()
+                local
+                    .iter()
+                    .filter(|k| {
+                        let found = db.exists(k.as_ref());
+                        crate::server_stats::note_key_lookup(found);
+                        found
+                    })
+                    .count()
             };
+            // The remote shards run EXISTS through execute_local_command,
+            // which counts their keys.
             let remote = remote
                 .into_iter()
                 .map(|(shard, ks)| (shard, Command::Exists(smallvec::SmallVec::from_vec(ks))))
@@ -8583,6 +8593,7 @@ async fn execute_command(
         }
         Command::Ttl(key, in_millis) => {
             let res = router.ttl(key, in_millis).await;
+            crate::server_stats::note_key_lookup(res != -2);
             out.extend_from_slice(format!(":{}\r\n", res).as_bytes());
             false
         }
@@ -8824,7 +8835,7 @@ async fn execute_command(
             let pubsub_patterns = router.pubsub_numpat().await;
             let pubsubshard_channels = router.pubsub_shardchannels(None).await.len();
             let stats_str = format!(
-                "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\ninstantaneous_ops_per_sec:{}\r\ntotal_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\ninstantaneous_input_kbps:{:.2}\r\ninstantaneous_output_kbps:{:.2}\r\nrejected_connections:{}\r\nsync_full:0\r\nsync_partial_ok:0\r\nsync_partial_err:0\r\nexpired_keys:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nkeyspace_hits:0\r\nkeyspace_misses:0\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\npubsubshard_channels:{}\r\nlatest_fork_usec:0\r\ntotal_error_replies:{}\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\nmigrate_cached_sockets:0\r\ntracking_total_items:{}\r\ntracking_total_keys:{}\r\ntracking_total_prefixes:{}\r\n",
+                "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\ninstantaneous_ops_per_sec:{}\r\ntotal_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\ninstantaneous_input_kbps:{:.2}\r\ninstantaneous_output_kbps:{:.2}\r\nrejected_connections:{}\r\nsync_full:0\r\nsync_partial_ok:0\r\nsync_partial_err:0\r\nexpired_keys:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nkeyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\npubsubshard_channels:{}\r\nlatest_fork_usec:0\r\ntotal_error_replies:{}\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\nmigrate_cached_sockets:0\r\ntracking_total_items:{}\r\ntracking_total_keys:{}\r\ntracking_total_prefixes:{}\r\n",
                 total(Stat::ConnectionsReceived),
                 total(Stat::Commands),
                 ops_per_sec,
@@ -8836,6 +8847,8 @@ async fn execute_command(
                 crate::table::get_expired_keys(),
                 crate::table::get_expired_keys_active(),
                 crate::table::get_evicted_keys(),
+                total(Stat::KeyspaceHits),
+                total(Stat::KeyspaceMisses),
                 pubsub_channels,
                 pubsub_patterns,
                 pubsubshard_channels,
@@ -14837,6 +14850,7 @@ async fn execute_command(
         }
         Command::Expiretime(key, in_millis) => {
             let ts = router.expiretime(key, in_millis).await;
+            crate::server_stats::note_key_lookup(ts != -2);
             out.extend_from_slice(format!(":{}\r\n", ts).as_bytes());
             false
         }
@@ -16468,6 +16482,85 @@ fn reindex_hash_for_search(db: &mut ShardDb, key: &[u8]) {
     }
 }
 
+/// Calls `f` with each key a read command reads, for client tracking and
+/// keyspace hit/miss statistics.
+fn for_each_read_key(cmd: &Command, mut f: impl FnMut(&[u8])) {
+    match cmd {
+        Command::Get(k)
+        | Command::Ttl(k, _)
+        | Command::Expiretime(k, _)
+        | Command::Hlen(k)
+        | Command::Hgetall(k)
+        | Command::Hkeys(k)
+        | Command::Hvals(k)
+        | Command::Llen(k)
+        | Command::Smembers(k)
+        | Command::Scard(k)
+        | Command::Zcard(k)
+        | Command::Type(k)
+        | Command::Strlen(k)
+        | Command::Dump(k)
+        | Command::Xlen(k) => f(k.as_ref()),
+        Command::Hget { key, .. }
+        | Command::Hmget { key, .. }
+        | Command::Hexists { key, .. }
+        | Command::Hstrlen { key, .. }
+        | Command::Hrandfield { key, .. }
+        | Command::Hscan { key, .. }
+        | Command::Lrange { key, .. }
+        | Command::Lindex { key, .. }
+        | Command::Lpos { key, .. }
+        | Command::Sismember { key, .. }
+        | Command::Smismember { key, .. }
+        | Command::Srandmember { key, .. }
+        | Command::Sscan { key, .. }
+        | Command::Zscore { key, .. }
+        | Command::Zmscore { key, .. }
+        | Command::Zrank { key, .. }
+        | Command::Zrevrank { key, .. }
+        | Command::Zcount { key, .. }
+        | Command::Zlexcount { key, .. }
+        | Command::Zrange { key, .. }
+        | Command::Zrandmember { key, .. }
+        | Command::Zscan { key, .. }
+        | Command::Getbit { key, .. }
+        | Command::Bitcount { key, .. }
+        | Command::Bitpos { key, .. }
+        | Command::Getrange { key, .. }
+        | Command::Xrange { key, .. }
+        | Command::Xrevrange { key, .. }
+        | Command::Xpending { key, .. } => f(key.as_ref()),
+        Command::Exists(keys) => {
+            for k in keys {
+                f(k.as_ref());
+            }
+        }
+        Command::Mget(keys)
+        | Command::Pfcount { keys }
+        | Command::Sinter(keys)
+        | Command::Sunion(keys)
+        | Command::Sdiff(keys) => {
+            for k in keys {
+                f(k.as_ref());
+            }
+        }
+        Command::Sintercard { keys, .. }
+        | Command::Sunioncard { keys, .. }
+        | Command::Sdiffcard { keys, .. }
+        | Command::Zdiff { keys, .. }
+        | Command::Zinter { keys, .. }
+        | Command::Zunion { keys, .. } => {
+            for k in keys {
+                f(k.as_ref());
+            }
+        }
+        Command::Sort {
+            key, store: None, ..
+        } => f(key.as_ref()),
+        _ => {}
+    }
+}
+
 pub fn execute_local_command(
     cmd: &Command,
     db: &mut ShardDb,
@@ -16516,82 +16609,7 @@ pub fn execute_local_command(
     impl<'a> Drop for ReadTrackGuard<'a> {
         fn drop(&mut self) {
             if self.cid != 0 && HAS_TRACKING_CLIENTS.load(std::sync::atomic::Ordering::Relaxed) {
-                match self.cmd {
-                    Command::Get(k)
-                    | Command::Ttl(k, _)
-                    | Command::Expiretime(k, _)
-                    | Command::Hlen(k)
-                    | Command::Hgetall(k)
-                    | Command::Hkeys(k)
-                    | Command::Hvals(k)
-                    | Command::Llen(k)
-                    | Command::Smembers(k)
-                    | Command::Scard(k)
-                    | Command::Zcard(k)
-                    | Command::Type(k)
-                    | Command::Strlen(k)
-                    | Command::Dump(k)
-                    | Command::Xlen(k) => record_client_read(self.port, self.cid, k.as_ref()),
-                    Command::Hget { key, .. }
-                    | Command::Hmget { key, .. }
-                    | Command::Hexists { key, .. }
-                    | Command::Hstrlen { key, .. }
-                    | Command::Hrandfield { key, .. }
-                    | Command::Hscan { key, .. }
-                    | Command::Lrange { key, .. }
-                    | Command::Lindex { key, .. }
-                    | Command::Lpos { key, .. }
-                    | Command::Sismember { key, .. }
-                    | Command::Smismember { key, .. }
-                    | Command::Srandmember { key, .. }
-                    | Command::Sscan { key, .. }
-                    | Command::Zscore { key, .. }
-                    | Command::Zmscore { key, .. }
-                    | Command::Zrank { key, .. }
-                    | Command::Zrevrank { key, .. }
-                    | Command::Zcount { key, .. }
-                    | Command::Zlexcount { key, .. }
-                    | Command::Zrange { key, .. }
-                    | Command::Zrandmember { key, .. }
-                    | Command::Zscan { key, .. }
-                    | Command::Getbit { key, .. }
-                    | Command::Bitcount { key, .. }
-                    | Command::Bitpos { key, .. }
-                    | Command::Getrange { key, .. }
-                    | Command::Xrange { key, .. }
-                    | Command::Xrevrange { key, .. }
-                    | Command::Xpending { key, .. } => {
-                        record_client_read(self.port, self.cid, key.as_ref())
-                    }
-                    Command::Exists(keys) => {
-                        for k in keys {
-                            record_client_read(self.port, self.cid, k.as_ref());
-                        }
-                    }
-                    Command::Mget(keys)
-                    | Command::Pfcount { keys }
-                    | Command::Sinter(keys)
-                    | Command::Sunion(keys)
-                    | Command::Sdiff(keys) => {
-                        for k in keys {
-                            record_client_read(self.port, self.cid, k.as_ref());
-                        }
-                    }
-                    Command::Sintercard { keys, .. }
-                    | Command::Sunioncard { keys, .. }
-                    | Command::Sdiffcard { keys, .. }
-                    | Command::Zdiff { keys, .. }
-                    | Command::Zinter { keys, .. }
-                    | Command::Zunion { keys, .. } => {
-                        for k in keys {
-                            record_client_read(self.port, self.cid, k.as_ref());
-                        }
-                    }
-                    Command::Sort {
-                        key, store: None, ..
-                    } => record_client_read(self.port, self.cid, key.as_ref()),
-                    _ => {}
-                }
+                for_each_read_key(self.cmd, |k| record_client_read(self.port, self.cid, k));
             }
         }
     }
@@ -16600,6 +16618,13 @@ pub fn execute_local_command(
         cid,
         cmd,
     };
+    // GET and MGET read through counting table accessors; probe the keys of
+    // the other read commands for INFO keyspace_hits / keyspace_misses.
+    if !matches!(cmd, Command::Get(_) | Command::Mget(_)) {
+        for_each_read_key(cmd, |k| {
+            crate::server_stats::note_key_lookup(db.table.key_is_live(k))
+        });
+    }
     match cmd {
         Command::Get(key) => {
             match db.get(key) {
@@ -23404,6 +23429,7 @@ async fn execute_commands_squashed(
                     && keys.len() == 1
                 {
                     let exists = local_db.table.exists_with_hash(keys[0].as_ref(), key_hash);
+                    crate::server_stats::note_key_lookup(exists);
                     responses[idx] = if exists {
                         crate::shard::CompactResp::INT_1
                     } else {

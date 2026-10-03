@@ -2961,6 +2961,22 @@ impl RudisTable {
         None
     }
 
+    /// Whether `key` exists and has not expired, without touching it or
+    /// deleting it if expired.
+    pub fn key_is_live(&self, key: &[u8]) -> bool {
+        match self.table.find_entry(key, hash_key(key)) {
+            Some((_, entry)) => match entry.expire_at {
+                Some(expire_at) => {
+                    crate::connection::ALLOW_ACCESS_EXPIRED
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        || Instant::now() < expire_at
+                }
+                None => true,
+            },
+            None => false,
+        }
+    }
+
     pub fn is_key_expired(&mut self, key: &[u8]) -> bool {
         let h = hash_key(key);
         if let Some(idx) = self.table.find(key, h) {
@@ -2986,8 +3002,10 @@ impl RudisTable {
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
+                crate::server_stats::note_key_lookup(false);
                 return Ok(None);
             }
+            crate::server_stats::note_key_lookup(true);
             let val_ref = match &entry.val {
                 RudisValue::Cooled { val, .. } => val.as_ref(),
                 other => other,
@@ -3003,6 +3021,7 @@ impl RudisTable {
             }
             res
         } else {
+            crate::server_stats::note_key_lookup(false);
             Ok(None)
         }
     }
@@ -3030,8 +3049,10 @@ impl RudisTable {
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
+                crate::server_stats::note_key_lookup(false);
                 return Ok(None);
             }
+            crate::server_stats::note_key_lookup(true);
             let val_ref = match &entry.val {
                 RudisValue::Cooled { val, .. } => val.as_ref(),
                 other => other,
@@ -3052,6 +3073,7 @@ impl RudisTable {
             }
             res
         } else {
+            crate::server_stats::note_key_lookup(false);
             Ok(None)
         }
     }
@@ -3066,9 +3088,11 @@ impl RudisTable {
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
+                crate::server_stats::note_key_lookup(false);
                 crate::connection::write_resp_null(out);
                 return Ok(true);
             }
+            crate::server_stats::note_key_lookup(true);
             let val_ref = match &entry.val {
                 RudisValue::Cooled { val, .. } => val.as_ref(),
                 other => other,
@@ -3094,6 +3118,7 @@ impl RudisTable {
             }
             res
         } else {
+            crate::server_stats::note_key_lookup(false);
             Ok(false)
         }
     }
@@ -6049,8 +6074,10 @@ impl RudisTable {
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
+                crate::server_stats::note_key_lookup(false);
                 return Ok(crate::shard::CompactResp::NULL);
             }
+            crate::server_stats::note_key_lookup(true);
             match &entry.val {
                 RudisValue::SmallHash(pairs) => {
                     let f_len = field.len();
@@ -6082,6 +6109,7 @@ impl RudisTable {
                 _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
             }
         } else {
+            crate::server_stats::note_key_lookup(false);
             Ok(crate::shard::CompactResp::NULL)
         }
     }
@@ -7488,6 +7516,7 @@ impl RudisTable {
         mut stop: i64,
         out: &mut Vec<u8>,
     ) -> Result<crate::shard::CompactResp, &'static str> {
+        crate::server_stats::note_key_lookup(self.key_is_live(key));
         if let Some((idx, entry)) = self.table.find_entry(key, h) {
             if self.num_expires > 0
                 && let Some(expire_at) = entry.expire_at
@@ -8425,8 +8454,10 @@ impl RudisTable {
                 && Instant::now() >= expire_at
             {
                 self.expire_slot(idx);
+                crate::server_stats::note_key_lookup(false);
                 return Ok(crate::shard::CompactResp::INT_0);
             }
+            crate::server_stats::note_key_lookup(true);
             match &entry.val {
                 RudisValue::Set(set) => {
                     let m_hash = hash64(member);
@@ -8439,6 +8470,7 @@ impl RudisTable {
                 _ => Err("WRONGTYPE Operation against a key holding the wrong kind of value"),
             }
         } else {
+            crate::server_stats::note_key_lookup(false);
             Ok(crate::shard::CompactResp::INT_0)
         }
     }
@@ -9977,6 +10009,7 @@ impl RudisTable {
         is_resp3: bool,
         out: &mut Vec<u8>,
     ) -> Result<crate::shard::CompactResp, &'static str> {
+        crate::server_stats::note_key_lookup(self.key_is_live(key));
         if !opts.by_score && !opts.by_lex {
             if let Some((idx, entry)) = self.table.find_entry(key, h) {
                 if self.num_expires > 0
