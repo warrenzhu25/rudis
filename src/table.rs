@@ -11294,7 +11294,6 @@ impl RudisTable {
             return Err("wrong number of arguments for 'bitop' command");
         }
         let mut buffers = Vec::with_capacity(srckeys.len());
-        let mut max_len = 0;
         for k in srckeys {
             let h = hash_key(k);
             let b = if let Some(idx) = self.table.find(k, h) {
@@ -11316,16 +11315,30 @@ impl RudisTable {
             } else {
                 Vec::new()
             };
-            max_len = max_len.max(b.len());
             buffers.push(b);
         }
 
+        let result = Self::bitop_compute(&op, &buffers)?;
+        let len = result.len();
+        if len == 0 {
+            // Like Redis, an empty result deletes the destination.
+            self.del(destkey.as_ref());
+        } else {
+            self.set(destkey, Bytes::from(result), None);
+        }
+        Ok(len)
+    }
+
+    /// BITOP `op` (upper case) over the source strings, a missing key being
+    /// an empty string. The result is as long as the longest source.
+    pub fn bitop_compute(op: &str, buffers: &[Vec<u8>]) -> Result<Vec<u8>, &'static str> {
+        let max_len = buffers.iter().map(Vec::len).max().unwrap_or(0);
         let mut result = vec![0u8; max_len];
-        match op.as_str() {
+        match op {
             "AND" => {
                 for (i, out) in result.iter_mut().enumerate() {
                     let mut b = 0xFF;
-                    for buf in &buffers {
+                    for buf in buffers {
                         b &= buf.get(i).copied().unwrap_or(0);
                     }
                     *out = b;
@@ -11334,7 +11347,7 @@ impl RudisTable {
             "OR" => {
                 for (i, out) in result.iter_mut().enumerate() {
                     let mut b = 0;
-                    for buf in &buffers {
+                    for buf in buffers {
                         b |= buf.get(i).copied().unwrap_or(0);
                     }
                     *out = b;
@@ -11343,7 +11356,7 @@ impl RudisTable {
             "XOR" => {
                 for (i, out) in result.iter_mut().enumerate() {
                     let mut b = 0;
-                    for buf in &buffers {
+                    for buf in buffers {
                         b ^= buf.get(i).copied().unwrap_or(0);
                     }
                     *out = b;
@@ -11400,7 +11413,7 @@ impl RudisTable {
                 for (i, out) in result.iter_mut().enumerate() {
                     let mut ones = 0u8;
                     let mut more_than_one = 0u8;
-                    for buf in &buffers {
+                    for buf in buffers {
                         let byte = buf.get(i).copied().unwrap_or(0);
                         more_than_one |= ones & byte;
                         ones ^= byte;
@@ -11411,9 +11424,7 @@ impl RudisTable {
             _ => return Err("syntax error"),
         }
 
-        let len = result.len();
-        self.set(destkey, Bytes::from(result), None);
-        Ok(len)
+        Ok(result)
     }
 
     // HYPERLOGLOG OPERATIONS
@@ -16376,6 +16387,19 @@ mod tests {
             table.get(b"knot").unwrap(),
             Some(Bytes::from_static(b"\xf0"))
         );
+
+        // An empty result deletes the destination, like Redis.
+        assert_eq!(
+            table
+                .bitop(
+                    "AND",
+                    Bytes::from_static(b"kor"),
+                    &[Bytes::from_static(b"nokey1"), Bytes::from_static(b"nokey2")]
+                )
+                .unwrap(),
+            0
+        );
+        assert!(!table.exists(b"kor"));
 
         // 5. HYPERLOGLOG: PFADD & PFCOUNT
         let elements_a = vec![
