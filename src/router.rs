@@ -2513,17 +2513,26 @@ impl Router {
         (local, remote)
     }
 
+    /// Commands for every shard but this one, for fan-outs that go through
+    /// [`Self::execute_remote_many`] and so cost one round trip in total.
+    fn to_other_shards(&self, cmd: impl Fn() -> Command) -> Vec<(usize, Command)> {
+        (0..self.num_shards)
+            .filter(|&sid| sid != self.shard_id)
+            .map(|sid| (sid, cmd()))
+            .collect()
+    }
+
     pub async fn dbsize(&self) -> usize {
         let mut total = self.local_db.borrow_mut().dbsize();
-        for sid in 0..self.num_shards {
-            if sid != self.shard_id {
-                let res = self.execute_remote(sid, Command::Dbsize).await;
-                if let Ok(s) = std::str::from_utf8(&res)
-                    && let Some(num_str) = s.strip_prefix(':').and_then(|x| x.split("\r\n").next())
-                    && let Ok(n) = num_str.parse::<usize>()
-                {
-                    total += n;
-                }
+        for res in self
+            .execute_remote_many(self.to_other_shards(|| Command::Dbsize))
+            .await
+        {
+            if let Ok(s) = std::str::from_utf8(&res)
+                && let Some(num_str) = s.strip_prefix(':').and_then(|x| x.split("\r\n").next())
+                && let Ok(n) = num_str.parse::<usize>()
+            {
+                total += n;
             }
         }
         total
@@ -2543,11 +2552,9 @@ impl Router {
         {
             aof.borrow_mut().append(&bytes);
         }
-        for sid in 0..self.num_shards {
-            if sid != self.shard_id {
-                let _ = self.execute_remote(sid, Command::Flushdb).await;
-            }
-        }
+        let _ = self
+            .execute_remote_many(self.to_other_shards(|| Command::Flushdb))
+            .await;
     }
 
     pub async fn publish(&self, channel: Bytes, message: Bytes) -> usize {

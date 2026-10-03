@@ -16666,3 +16666,36 @@ fn test_get_getex_lcs_on_non_string_key_return_wrongtype_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child);
 }
+
+#[test]
+fn test_dbsize_flushdb_fan_out_to_all_shards_e2e() {
+    let port = 16954;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "4", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // 200 keys land on all four shards.
+    for i in 0..200 {
+        assert_eq!(
+            resp_cmd(&mut c, &["SET", &format!("fan:{i}"), "v"]),
+            "+OK\r\n"
+        );
+    }
+    assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), ":200\r\n");
+    assert_eq!(resp_cmd(&mut c, &["FLUSHDB"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), ":0\r\n");
+    for i in 0..200 {
+        assert_eq!(resp_cmd(&mut c, &["EXISTS", &format!("fan:{i}")]), ":0\r\n");
+    }
+    for i in 0..50 {
+        assert_eq!(
+            resp_cmd(&mut c, &["SET", &format!("fan:{i}"), "v"]),
+            "+OK\r\n"
+        );
+    }
+    assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), ":50\r\n");
+    assert_eq!(resp_cmd(&mut c, &["FLUSHALL"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), ":0\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}
