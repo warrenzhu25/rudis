@@ -2536,6 +2536,30 @@ fn collect_publish_counts(mut pending: Vec<flume::Receiver<usize>>) -> usize {
     count
 }
 
+/// Error for a command issued by a script that touches a key this shard does
+/// not own. Scripts run synchronously against the local shard's data only,
+/// so such a command would silently read or write the wrong shard (a key
+/// written there is invisible to normal commands). Like Redis Cluster, reject
+/// it instead.
+pub const SCRIPT_NON_LOCAL_KEY_ERR: &str = "ERR Script attempted to access a non local key: \
+     pass every key the script uses in KEYS, and use hash tags so they all map to one shard";
+
+pub fn script_touches_non_local_key(cmd: &Command) -> bool {
+    CURRENT_ROUTER.with(|cr| {
+        let Some(router) = cr.borrow().as_ref().cloned() else {
+            return false;
+        };
+        if router.num_shards <= 1 {
+            return false;
+        }
+        let mut non_local = false;
+        for_each_cmd_key(cmd, |k| {
+            non_local |= router.target_shard(k) != router.shard_id;
+        });
+        non_local
+    })
+}
+
 pub fn publish_sync(channel: &[u8], message: &[u8]) -> usize {
     CURRENT_ROUTER.with(|cr| {
         if let Some(router) = cr.borrow().as_ref() {

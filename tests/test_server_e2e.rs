@@ -16775,3 +16775,57 @@ fn test_lua_publish_from_two_shards_does_not_deadlock_e2e() {
         let _ = d.join();
     }
 }
+
+#[test]
+fn test_script_access_to_non_local_key_is_rejected_e2e() {
+    let port = 16952;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "4", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let keys: Vec<String> = (0..8).map(|i| format!("sk:{i}")).collect();
+    // A keyless script runs on the connection's shard. Writing a key owned
+    // by another shard used to land in the wrong table: KEYS and DBSIZE
+    // listed it but GET returned nil.
+    let mut rejected = 0;
+    for k in &keys {
+        let r = resp_cmd(
+            &mut c,
+            &["EVAL", "return redis.call('set',ARGV[1],'v')", "0", k],
+        );
+        if r == "+OK\r\n" {
+            assert_eq!(resp_cmd(&mut c, &["GET", k]), "$1\r\nv\r\n", "{k}");
+        } else {
+            assert!(
+                r.starts_with("-ERR Script attempted to access a non local key"),
+                "{k}: {r}"
+            );
+            assert_eq!(resp_cmd(&mut c, &["EXISTS", k]), ":0\r\n", "{k}");
+            // redis.pcall reports it as an error reply too.
+            let r = resp_cmd(
+                &mut c,
+                &["EVAL", "return redis.pcall('get',ARGV[1])", "0", k],
+            );
+            assert!(
+                r.starts_with("-ERR Script attempted to access a non local key"),
+                "{r}"
+            );
+            rejected += 1;
+        }
+    }
+    assert!(rejected > 0, "all 8 keys on the connection's shard?");
+    // Declaring the key routes the script to its shard, so it always works.
+    for k in &keys {
+        assert_eq!(
+            resp_cmd(
+                &mut c,
+                &["EVAL", "return redis.call('set',KEYS[1],'w')", "1", k]
+            ),
+            "+OK\r\n"
+        );
+        assert_eq!(resp_cmd(&mut c, &["GET", k]), "$1\r\nw\r\n", "{k}");
+    }
+    assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), ":8\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}

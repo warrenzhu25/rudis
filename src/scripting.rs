@@ -2108,6 +2108,14 @@ fn register_redis_module(
             SCRIPT_RECORDED_ERROR.set(true);
             return Err(mlua::Error::RuntimeError(err));
         }
+        if crate::connection::script_touches_non_local_key(&cmd) {
+            crate::connection::record_rejected_stat(crate::connection::get_cmd_name(&cmd));
+            crate::connection::record_error_stat("ERR", None);
+            SCRIPT_RECORDED_ERROR.set(true);
+            return Err(mlua::Error::RuntimeError(
+                crate::connection::SCRIPT_NON_LOCAL_KEY_ERR.to_string(),
+            ));
+        }
         match &cmd {
             Command::Cluster(_)
             | Command::Replicaof { .. }
@@ -2262,6 +2270,14 @@ fn register_redis_module(
             SCRIPT_RECORDED_ERROR.set(true);
             let tbl = lua.create_table()?;
             tbl.set("err", err)?;
+            return Ok(Value::Table(tbl));
+        }
+        if crate::connection::script_touches_non_local_key(&cmd) {
+            crate::connection::record_rejected_stat(crate::connection::get_cmd_name(&cmd));
+            crate::connection::record_error_stat("ERR", None);
+            SCRIPT_RECORDED_ERROR.set(true);
+            let tbl = lua.create_table()?;
+            tbl.set("err", crate::connection::SCRIPT_NON_LOCAL_KEY_ERR)?;
             return Ok(Value::Table(tbl));
         }
         match &cmd {
