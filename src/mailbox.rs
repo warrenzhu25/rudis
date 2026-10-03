@@ -21,6 +21,27 @@ impl<T> std::ops::DerefMut for CachePadded<T> {
     }
 }
 
+/// Suspends the current task until every task already queued on this thread
+/// has run, so monoio also gets to reap I/O completions in between. monoio
+/// 0.2 has no public `yield_now`, and a task that wakes itself while being
+/// polled is re-queued at the *front* (`LocalScheduler::yield_now`), so it
+/// would just run again. A wake from another task goes to the back instead,
+/// so a tiny spawned task delivers the wake.
+pub async fn yield_now() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            let waker = cx.waker().clone();
+            monoio::spawn(async move { waker.wake() });
+            std::task::Poll::Pending
+        }
+    })
+    .await
+}
+
 /// `cross-shard-spin`: how many times a connection polls for a cross-shard
 /// reply before parking its task. Polling burns the shard's CPU while other
 /// connections on it wait, so the default is 0 (park immediately and let the
@@ -770,6 +791,33 @@ mod tests {
         assert_eq!(cross_shard_spin(), 64);
         set_cross_shard_spin(0);
         assert_eq!(cross_shard_spin(), 0);
+    }
+
+    #[test]
+    fn test_yield_now_lets_other_tasks_run() {
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // Spawned like the mailbox task in server.rs (block_on's own
+            // future is re-polled before queued tasks, so it can't yield).
+            monoio::spawn(async {
+                let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+                let ran2 = ran.clone();
+                monoio::spawn(async move { ran2.set(true) });
+                // A task that never awaits anything else, like the mailbox
+                // task under a steady message stream, must still let others
+                // run.
+                let mut spins = 0;
+                while !ran.get() && spins < 1000 {
+                    yield_now().await;
+                    spins += 1;
+                }
+                assert!(ran.get(), "spawned task never ran");
+            })
+            .await;
+        });
     }
 
     #[test]

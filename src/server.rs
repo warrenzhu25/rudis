@@ -2009,6 +2009,11 @@ pub fn run_shard_worker(
                 }
                 burst += 1;
                 if burst >= 64 {
+                    // recv_async is Ready while messages are queued, so
+                    // without a yield a steady stream from other shards
+                    // would keep this task running and starve the local
+                    // connections on this thread.
+                    crate::mailbox::yield_now().await;
                     break;
                 }
                 match rx.try_recv() {
