@@ -318,6 +318,52 @@ pub fn notify_keyspace_event(event_type: u32, event: &str, key: &[u8]) {
     });
 }
 
+/// A blocking command first checks its keys and, finding nothing to serve,
+/// then registers as a waiter. A push that lands on a key's owner shard in
+/// between (shards run concurrently, and the check itself may await remote
+/// hops) finds no waiter and wakes nobody, leaving the client blocked until
+/// its timeout. Called right after registering: asks each key's owner to run
+/// the wakeup again, so a push from that window serves the new waiter.
+pub fn recheck_blocking_keys<'a>(router: &Router, keys: impl IntoIterator<Item = &'a Bytes>) {
+    let hub_arc = crate::block::get_block_hub_for_port(router.port);
+    let mut remote: Vec<Vec<Bytes>> = Vec::new();
+    for k in keys {
+        let shard = router.target_shard(k);
+        if shard == router.shard_id {
+            let mut db = router.local_db.borrow_mut();
+            let mut hub = hub_arc.lock().unwrap();
+            if hub.is_paused() {
+                hub.add_pending_notify(k.clone());
+                continue;
+            }
+            hub.notify_stream(&mut db, k);
+            hub.notify_list(&mut db.table, k);
+            hub.notify_zset(&mut db.table, k);
+        } else {
+            if remote.is_empty() {
+                remote.resize(router.num_shards, Vec::new());
+            }
+            remote[shard].push(k.clone());
+        }
+    }
+    for (shard, keys) in remote.into_iter().enumerate() {
+        if keys.is_empty() {
+            continue;
+        }
+        {
+            // While paused, resume() routes pending keys to their owners.
+            let mut hub = hub_arc.lock().unwrap();
+            if hub.is_paused() {
+                for k in keys {
+                    hub.add_pending_notify(k);
+                }
+                continue;
+            }
+        }
+        let _ = router.senders[shard].send(ShardMessage::NotifyList { keys });
+    }
+}
+
 #[inline]
 pub fn notify_list_or_defer(db: &mut ShardDb, key: &Bytes) {
     touch_watched_key(db.port, key.as_ref());
@@ -7340,10 +7386,11 @@ async fn handle_bzpop(
         let hub_arc = crate::block::get_block_hub_for_port(router.port);
         let mut hub = hub_arc.lock().unwrap();
         hub.register_blocked_zset_client(client_id, tx.clone());
-        for k in keys {
-            hub.register_zset_waiter(client_id, k, pop_type, 1, false, tx.clone());
+        for k in keys.iter() {
+            hub.register_zset_waiter(client_id, k.clone(), pop_type, 1, false, tx.clone());
         }
     }
+    recheck_blocking_keys(router, keys.iter());
 
     let raw_fd = client_registry.borrow().get(&client_id).map(|c| c.raw_fd);
     let (recv_res, client_disconnected) = wait_for_blocked_result(&rx, timeout, raw_fd).await;
@@ -11310,6 +11357,7 @@ async fn execute_command(
                             );
                         }
                     }
+                    recheck_blocking_keys(router, keys.iter());
 
                     let raw_fd = client_registry.borrow().get(&client_id).map(|c| c.raw_fd);
                     if let Command::Xreadgroup {
@@ -11525,6 +11573,7 @@ async fn execute_command(
                                     );
                                 }
                             }
+                            recheck_blocking_keys(router, keys.iter());
 
                             let remaining_ms = match deadline {
                                 Some(dl) => {
@@ -11803,6 +11852,7 @@ async fn execute_command(
                     );
                 }
             }
+            recheck_blocking_keys(router, keys.iter());
 
             let raw_fd = client_registry.borrow().get(&client_id).map(|c| c.raw_fd);
             let (recv_res, client_disconnected) =
@@ -11946,6 +11996,7 @@ async fn execute_command(
                     );
                 }
             }
+            recheck_blocking_keys(router, keys.iter());
 
             let raw_fd = client_registry.borrow().get(&client_id).map(|c| c.raw_fd);
             let (recv_res, client_disconnected) =
@@ -12375,6 +12426,7 @@ async fn execute_command(
                     tx,
                 );
             }
+            recheck_blocking_keys(router, std::iter::once(source));
 
             let raw_fd = client_registry.borrow().get(&client_id).map(|c| c.raw_fd);
             let (recv_res, client_disconnected) =
@@ -12583,6 +12635,7 @@ async fn execute_command(
                     tx,
                 );
             }
+            recheck_blocking_keys(router, std::iter::once(source));
 
             let raw_fd = client_registry.borrow().get(&client_id).map(|c| c.raw_fd);
             let (recv_res, client_disconnected) =
@@ -12863,6 +12916,7 @@ async fn execute_command(
                     hub.register_list_waiter(client_id, k.clone(), pop_type, count, tx.clone());
                 }
             }
+            recheck_blocking_keys(router, keys.iter());
 
             let raw_fd = client_registry.borrow().get(&client_id).map(|c| c.raw_fd);
             let (recv_res, client_disconnected) =
@@ -13106,10 +13160,18 @@ async fn execute_command(
                 let hub_arc = crate::block::get_block_hub_for_port(router.port);
                 let mut hub = hub_arc.lock().unwrap();
                 hub.register_blocked_zset_client(client_id, tx.clone());
-                for k in keys {
-                    hub.register_zset_waiter(client_id, k, pop_type, count, true, tx.clone());
+                for k in keys.iter() {
+                    hub.register_zset_waiter(
+                        client_id,
+                        k.clone(),
+                        pop_type,
+                        count,
+                        true,
+                        tx.clone(),
+                    );
                 }
             }
+            recheck_blocking_keys(router, keys.iter());
 
             let raw_fd = client_registry.borrow().get(&client_id).map(|c| c.raw_fd);
             let (recv_res, client_disconnected) =
@@ -24628,6 +24690,7 @@ async fn blmove_across_shards(
         hub.register_blocked_client(client_id, tx.clone());
         hub.register_list_waiter(client_id, source.clone(), to_pop_type(where_from), 1, tx);
     }
+    recheck_blocking_keys(router, std::iter::once(source));
     let raw_fd = client_registry.borrow().get(&client_id).map(|c| c.raw_fd);
     let (recv_res, client_disconnected) = wait_for_blocked_result(&rx, timeout, raw_fd).await;
     CURRENT_CLIENT_ID.set(client_id);

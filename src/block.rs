@@ -384,6 +384,14 @@ impl BlockHub {
                 if waiter.sender.is_disconnected() {
                     continue;
                 }
+                // Nothing to serve yet: stay blocked. Without this a move
+                // waiter whose destination has the wrong type would fail
+                // with WRONGTYPE on a wakeup check before any element
+                // arrived; Redis only fails once an element is there.
+                if !table.exists(key.as_ref()) {
+                    waiters.push_front(waiter);
+                    break;
+                }
                 match waiter.op {
                     WaiterOp::Pop { pop_type, count } => {
                         let popped = match pop_type {

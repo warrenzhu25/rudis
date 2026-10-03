@@ -18084,3 +18084,76 @@ fn test_dbfilename_is_used_for_save_and_load_e2e() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_blocking_pops_never_miss_a_concurrent_push_e2e() {
+    // The pusher's command can reach the key's owner shard while the blocked
+    // client is between "all keys empty" and "registered as a waiter". That
+    // push must still wake it; it used to be lost about half of the time
+    // with 4 shards, leaving the client blocked until its timeout.
+    let port = 16987;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "4", "--no-pin"], port);
+    let cases: [(&str, &[&str], &[&str]); 5] = [
+        ("BLPOP", &["BLPOP", "{k}", "1"], &["RPUSH", "{k}", "x"]),
+        ("BRPOP", &["BRPOP", "{k}", "1"], &["RPUSH", "{k}", "x"]),
+        (
+            "BLMPOP",
+            &["BLMPOP", "1", "1", "{k}", "LEFT"],
+            &["RPUSH", "{k}", "x"],
+        ),
+        (
+            "BLMOVE",
+            &["BLMOVE", "{k}", "{k}:dst", "LEFT", "RIGHT", "1"],
+            &["RPUSH", "{k}", "x"],
+        ),
+        (
+            "BZPOPMIN",
+            &["BZPOPMIN", "{k}", "1"],
+            &["ZADD", "{k}", "1", "x"],
+        ),
+    ];
+    for (name, block, push) in cases {
+        let mut slow = 0;
+        for i in 0..40 {
+            let key = format!("bwake:{name}:{i}");
+            let sub = |args: &[&str]| -> Vec<String> {
+                args.iter().map(|a| a.replace("{k}", &key)).collect()
+            };
+            let block = sub(block);
+            let push = sub(push);
+            let mut rd = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let mut w = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            rd.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            w.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let encode = |args: &[String]| {
+                let mut out = format!("*{}\r\n", args.len());
+                for a in args {
+                    out.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+                }
+                out
+            };
+            let started = std::time::Instant::now();
+            rd.write_all(encode(&block).as_bytes()).unwrap();
+            w.write_all(encode(&push).as_bytes()).unwrap();
+            let mut buf = [0u8; 256];
+            let n = w.read(&mut buf).unwrap();
+            assert!(
+                buf[..n].starts_with(b":") || buf[..n].starts_with(b"+"),
+                "{name}"
+            );
+            let n = rd.read(&mut buf).unwrap();
+            let reply = String::from_utf8_lossy(&buf[..n]).to_string();
+            assert!(
+                !reply.starts_with("*-1") && !reply.starts_with("$-1") && !reply.starts_with("_"),
+                "{name} missed the push and timed out: {reply:?}"
+            );
+            if started.elapsed() > Duration::from_millis(500) {
+                slow += 1;
+            }
+        }
+        assert_eq!(slow, 0, "{name}: wakeups waited for the timeout");
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
