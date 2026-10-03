@@ -17527,6 +17527,52 @@ fn test_blocking_pops_and_rare_writes_replicate_e2e() {
 }
 
 #[test]
+fn test_dirty_counts_only_real_changes_e2e() {
+    let port = 16935u16;
+    let ps = port.to_string();
+    let mut server = spawn_rudis_listening(&["--port", &ps, "--threads", "2", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let dirty = |c: &mut TcpStream| -> u64 {
+        let info = resp_cmd(c, &["INFO", "persistence"]);
+        info.lines()
+            .find_map(|l| l.strip_prefix("rdb_changes_since_last_save:"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    let d0 = dirty(&mut c);
+    resp_cmd(&mut c, &["SETBIT", "bits", "0", "1"]);
+    resp_cmd(&mut c, &["BITFIELD", "bf", "SET", "i5", "0", "1"]);
+    assert_eq!(dirty(&mut c), d0 + 2);
+    // Same values again: nothing changes.
+    resp_cmd(&mut c, &["SETBIT", "bits", "0", "1"]);
+    resp_cmd(&mut c, &["BITFIELD", "bf", "SET", "i5", "0", "1"]);
+    assert_eq!(dirty(&mut c), d0 + 2);
+
+    resp_cmd(&mut c, &["XADD", "s", "1-0", "f", "v"]);
+    resp_cmd(&mut c, &["XGROUP", "CREATE", "s", "g", "0"]);
+    resp_cmd(&mut c, &["XGROUP", "CREATECONSUMER", "s", "g", "alice"]);
+    let d1 = dirty(&mut c);
+    let r = resp_cmd(
+        &mut c,
+        &["XREADGROUP", "GROUP", "g", "alice", "STREAMS", "s", ">"],
+    );
+    assert!(r.contains("1-0"), "{r}");
+    assert_eq!(dirty(&mut c), d1 + 1);
+    // Re-reading the pending list is not a change.
+    let r = resp_cmd(
+        &mut c,
+        &["XREADGROUP", "GROUP", "g", "alice", "STREAMS", "s", "0"],
+    );
+    assert!(r.contains("1-0"), "{r}");
+    assert_eq!(dirty(&mut c), d1 + 1);
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
+#[test]
 fn test_replica_output_buffer_limit_disconnects_stuck_replica_e2e() {
     use std::io::{Read, Write};
     let port = 16936u16;

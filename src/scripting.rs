@@ -2170,7 +2170,7 @@ fn register_redis_module(
         }
 
         crate::connection::record_cmd_stat(cmd_name);
-        if cmd.is_write_command() {
+        if cmd.is_write_command() && !crate::connection::dirty_counted_on_change(&cmd) {
             crate::snapshot::note_write();
         }
         crate::connection::inc_active_client_tot_cmds();
@@ -2340,7 +2340,7 @@ fn register_redis_module(
         }
 
         crate::connection::record_cmd_stat(cmd_name);
-        if cmd.is_write_command() {
+        if cmd.is_write_command() && !crate::connection::dirty_counted_on_change(&cmd) {
             crate::snapshot::note_write();
         }
         crate::connection::inc_active_client_tot_cmds();

@@ -49,6 +49,15 @@ pub fn note_write() {
     MY_WRITE_SLOT.with(|&i| WRITES[i].0.fetch_add(1, Ordering::Relaxed));
 }
 
+/// Counts `n` changes made by one command, for the commands that count
+/// their actual changes (see `connection::dirty_counted_on_change`).
+#[inline]
+pub fn note_changes(n: u64) {
+    if n > 0 {
+        MY_WRITE_SLOT.with(|&i| WRITES[i].0.fetch_add(n, Ordering::Relaxed));
+    }
+}
+
 fn dirty_now() -> u64 {
     WRITES.iter().map(|s| s.0.load(Ordering::Relaxed)).sum()
 }

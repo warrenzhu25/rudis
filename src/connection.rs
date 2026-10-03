@@ -7732,7 +7732,7 @@ async fn execute_command(
         name: stat_cmd_name(&cmd),
         start: (!may_block(&cmd)).then(std::time::Instant::now),
     };
-    if cmd.is_write_command() {
+    if cmd.is_write_command() && !dirty_counted_on_change(&cmd) {
         crate::snapshot::note_write();
     }
 
@@ -16686,6 +16686,17 @@ fn for_each_read_key(cmd: &Command, mut f: impl FnMut(&[u8])) {
     }
 }
 
+/// Write commands that, like in Redis, count toward
+/// `rdb_changes_since_last_save` only for what they actually change, when
+/// they execute. Other write commands count once per call up front.
+#[inline]
+pub fn dirty_counted_on_change(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Setbit { .. } | Command::Bitfield { .. } | Command::Xreadgroup { .. }
+    )
+}
+
 pub fn execute_local_command(
     cmd: &Command,
     db: &mut ShardDb,
@@ -19119,6 +19130,7 @@ pub fn execute_local_command(
             match db.setbit(key.clone(), *offset, *value) {
                 Ok((old, changed)) => {
                     if changed {
+                        crate::snapshot::note_changes(1);
                         record_change!(cmd);
                     }
                     notify_keyspace_event(NOTIFY_STRING, "setbit", key);
@@ -19178,6 +19190,7 @@ pub fn execute_local_command(
             match db.bitfield(key.clone(), ops) {
                 Ok((results, changes)) => {
                     if changes > 0 && !*readonly {
+                        crate::snapshot::note_changes(changes as u64);
                         if HAS_WATCHED_KEYS.load(std::sync::atomic::Ordering::Relaxed) {
                             touch_watched_key(db.port, key.as_ref());
                         }
@@ -19835,6 +19848,9 @@ pub fn execute_local_command(
                 ) {
                     Ok((entries, modified)) => {
                         if modified {
+                            // Reading the pending list only updates delivery
+                            // metadata, which (like Redis) is no change.
+                            crate::snapshot::note_changes(1);
                             any_modified = true;
                             notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", k);
                         }
@@ -23470,7 +23486,7 @@ async fn execute_commands_squashed(
     // time spent awaiting other shards is left out of the batch segments.
     let mut stat_run = CmdStatBatch::new();
     for (idx, cmd) in commands.drain(..).enumerate() {
-        if cmd.is_write_command() {
+        if cmd.is_write_command() && !dirty_counted_on_change(&cmd) {
             crate::snapshot::note_write();
         }
         if let Some((target, key_hash)) = target_shard_and_hash_of_cmd(&cmd, router.num_shards) {
