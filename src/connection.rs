@@ -2504,25 +2504,60 @@ pub fn notify_set_key_events_local(prev_kind: &str, new_kind: &str, key: &[u8]) 
     }
 }
 
+/// How long `publish_sync` / `spublish_sync` wait for other shards to report
+/// their receiver counts. They run inside synchronous code (Lua scripts,
+/// batched commands) that holds the shard thread, so they must not block on
+/// another shard indefinitely: two shards publishing to each other from
+/// scripts at the same time used to deadlock the whole server. Delivery does
+/// not depend on the wait (the message is already in the remote mailbox);
+/// only the returned count can come up short when a receiving shard is
+/// itself stuck in synchronous code for longer than this.
+const SYNC_PUBLISH_COUNT_WAIT: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Sums the receiver counts that arrive within [`SYNC_PUBLISH_COUNT_WAIT`].
+fn collect_publish_counts(mut pending: Vec<flume::Receiver<usize>>) -> usize {
+    let deadline = std::time::Instant::now() + SYNC_PUBLISH_COUNT_WAIT;
+    let mut count = 0;
+    while !pending.is_empty() {
+        pending.retain(|rx| match rx.try_recv() {
+            Ok(c) => {
+                count += c;
+                false
+            }
+            Err(flume::TryRecvError::Empty) => true,
+            Err(flume::TryRecvError::Disconnected) => false,
+        });
+        if pending.is_empty() || std::time::Instant::now() >= deadline {
+            break;
+        }
+        // The replying shard may share this core when threads > cores.
+        std::thread::yield_now();
+    }
+    count
+}
+
 pub fn publish_sync(channel: &[u8], message: &[u8]) -> usize {
     CURRENT_ROUTER.with(|cr| {
         if let Some(router) = cr.borrow().as_ref() {
-            let mut count = router.pubsub.borrow().publish(channel, message);
+            let count = router.pubsub.borrow().publish(channel, message);
+            let mut pending = Vec::new();
             for (sid, sender) in router.senders.iter().enumerate() {
                 if sid != router.shard_id && router.presence_table.is_shard_interested(sid, channel)
                 {
                     let (tx, rx) = flume::bounded(1);
-                    let _ = sender.send(ShardMessage::Publish {
-                        channel: Bytes::copy_from_slice(channel),
-                        message: Bytes::copy_from_slice(message),
-                        responder: tx,
-                    });
-                    if let Ok(c) = rx.recv() {
-                        count += c;
+                    if sender
+                        .send(ShardMessage::Publish {
+                            channel: Bytes::copy_from_slice(channel),
+                            message: Bytes::copy_from_slice(message),
+                            responder: tx,
+                        })
+                        .is_ok()
+                    {
+                        pending.push(rx);
                     }
                 }
             }
-            count
+            count + collect_publish_counts(pending)
         } else {
             0
         }
@@ -2537,12 +2572,18 @@ pub fn spublish_sync(channel: &[u8], message: &[u8]) -> usize {
                 router.pubsub.borrow().spublish(channel, message)
             } else {
                 let (tx, rx) = flume::bounded(1);
-                let _ = router.senders[target_shard].send(ShardMessage::Spublish {
-                    channel: Bytes::copy_from_slice(channel),
-                    message: Bytes::copy_from_slice(message),
-                    responder: tx,
-                });
-                rx.recv().unwrap_or(0)
+                if router.senders[target_shard]
+                    .send(ShardMessage::Spublish {
+                        channel: Bytes::copy_from_slice(channel),
+                        message: Bytes::copy_from_slice(message),
+                        responder: tx,
+                    })
+                    .is_ok()
+                {
+                    collect_publish_counts(vec![rx])
+                } else {
+                    0
+                }
             }
         } else {
             0

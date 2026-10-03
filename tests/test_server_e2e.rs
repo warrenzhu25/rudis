@@ -16699,3 +16699,79 @@ fn test_dbsize_flushdb_fan_out_to_all_shards_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child);
 }
+
+#[test]
+fn test_lua_publish_from_two_shards_does_not_deadlock_e2e() {
+    let port = 16953;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    // Subscribers on both shards, so each shard's PUBLISH must reach the other.
+    let mut subs: Vec<TcpStream> = (0..6)
+        .map(|_| {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.write_all(b"*2\r\n$9\r\nSUBSCRIBE\r\n$2\r\npc\r\n")
+                .unwrap();
+            s
+        })
+        .collect();
+    for s in &mut subs {
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 256];
+        let n = s.read(&mut buf).unwrap();
+        assert!(String::from_utf8_lossy(&buf[..n]).contains("subscribe"));
+    }
+    // Keep the subscriber sockets drained so the server never blocks on them.
+    let drainers: Vec<_> = subs
+        .into_iter()
+        .map(|mut s| {
+            std::thread::spawn(move || {
+                s.set_read_timeout(Some(Duration::from_millis(500)))
+                    .unwrap();
+                let mut buf = [0u8; 65536];
+                let mut idle = 0;
+                while idle < 10 {
+                    match s.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(_) => idle = 0,
+                        Err(_) => idle += 1,
+                    }
+                }
+            })
+        })
+        .collect();
+
+    // With nobody else publishing, a script gets the full receiver count.
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        resp_cmd(
+            &mut c,
+            &["EVAL", "return redis.call('publish','pc','x')", "0"]
+        ),
+        ":6\r\n"
+    );
+
+    // Scripts on both shards publishing at once used to block each shard
+    // thread on the other's reply forever, hanging the whole server.
+    let script = "for i=1,200 do redis.call('publish','pc','x') end return 1";
+    let publishers: Vec<_> = (0..8)
+        .map(|_| {
+            std::thread::spawn(move || {
+                let mut p = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                p.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                for _ in 0..5 {
+                    assert_eq!(resp_cmd(&mut p, &["EVAL", script, "0"]), ":1\r\n");
+                }
+            })
+        })
+        .collect();
+    for p in publishers {
+        p.join().expect("publisher got no EVAL reply");
+    }
+    assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    for d in drainers {
+        let _ = d.join();
+    }
+}
