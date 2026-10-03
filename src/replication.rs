@@ -223,6 +223,13 @@ pub struct ReplicationHub {
     /// wrong: a full-synced replica got the bytes in that range in another
     /// order than the backlog holds them (see `finish_full_sync`).
     psync_holes: Mutex<Vec<(u64, u64)>>,
+    /// Socket of the running replica worker's master link, so `stop_sync`
+    /// can interrupt a worker parked in a read.
+    sync_conn: Mutex<Option<std::os::unix::io::RawFd>>,
+    /// Closed when the latest replica worker exits; the next worker waits
+    /// on it so two workers never apply changes or update the offset at
+    /// the same time.
+    worker_exit: Mutex<Option<flume::Receiver<()>>>,
 }
 
 impl ReplicationHub {
@@ -254,6 +261,8 @@ impl ReplicationHub {
             shard_flows: RwLock::new(HashMap::new()),
             has_shard_flows: std::sync::atomic::AtomicBool::new(false),
             psync_holes: Mutex::new(Vec::new()),
+            sync_conn: Mutex::new(None),
+            worker_exit: Mutex::new(None),
         }
     }
 
@@ -303,6 +312,14 @@ impl ReplicationHub {
     pub fn stop_sync(&self) {
         if let Some(cancel) = self.cancel_sync.write().unwrap().take() {
             let _ = cancel.send(());
+        }
+        // Wake a worker blocked reading from its master so it sees the
+        // cancel now rather than after the master's next write. The worker
+        // clears the slot before closing the socket, so the fd is open.
+        if let Some(fd) = *self.sync_conn.lock().unwrap() {
+            unsafe {
+                libc::shutdown(fd, libc::SHUT_RDWR);
+            }
         }
     }
 
@@ -961,16 +978,35 @@ pub fn start_replica_sync(
 
     let (cancel_tx, cancel_rx) = flume::bounded(1);
     *hub.cancel_sync.write().unwrap() = Some(cancel_tx);
+    let (exit_tx, exit_rx) = flume::bounded::<()>(1);
+    let prev_exit = hub.worker_exit.lock().unwrap().replace(exit_rx);
 
     let hub_clone = hub.clone();
     monoio::spawn(async move {
+        // The previous worker (stopped above) may still be applying a
+        // command or updating the offset; the PSYNC offset must be read
+        // after it is done, or the resumed stream repeats changes.
+        if let Some(prev) = prev_exit {
+            let _ = prev.recv_async().await;
+        }
         run_replica_worker(port, master_host, master_port, router, cancel_rx, hub_clone).await;
+        drop(exit_tx);
     });
 }
 
 #[inline]
 fn is_sync_cancelled(rx: &flume::Receiver<()>) -> bool {
     rx.try_recv().is_ok() || rx.is_disconnected()
+}
+
+/// Clears `ReplicationHub::sync_conn` when the worker's master link goes
+/// away (before its socket is closed).
+struct SyncConnGuard<'a>(&'a ReplicationHub);
+
+impl Drop for SyncConnGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.sync_conn.lock().unwrap() = None;
+    }
 }
 
 async fn run_replica_worker(
@@ -1018,6 +1054,13 @@ async fn run_replica_worker(
                 continue 'reconnect_loop;
             }
         };
+        *hub.sync_conn.lock().unwrap() = Some(std::os::unix::io::AsRawFd::as_raw_fd(&stream));
+        // Declared after `stream`, so it is dropped (clearing the slot)
+        // before the socket is closed.
+        let _conn_guard = SyncConnGuard(&hub);
+        if is_sync_cancelled(&cancel_rx) {
+            break 'reconnect_loop;
+        }
 
         let mut buf = bytes::BytesMut::with_capacity(65536);
         let mut read_buf = vec![0u8; 8192];
