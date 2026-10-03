@@ -17197,3 +17197,42 @@ fn test_bitop_across_shards_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child);
 }
+
+#[test]
+fn test_writes_missing_from_hand_list_are_writes_e2e() {
+    let port = 16947;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // A no-writes script must not be able to modify data with any write
+    // command, including ones like SETBIT and SETRANGE.
+    for call in [
+        "redis.call('setbit',KEYS[1],0,1)",
+        "redis.call('setrange',KEYS[1],0,'x')",
+    ] {
+        let script = format!("#!lua flags=no-writes\nreturn {call}");
+        let r = resp_cmd(&mut c, &["EVAL", &script, "1", "ro:k"]);
+        assert!(
+            r.contains("Write commands are not allowed from read-only scripts"),
+            "{call}: {r}"
+        );
+    }
+    assert_eq!(resp_cmd(&mut c, &["EXISTS", "ro:k"]), ":0\r\n");
+    // SETBIT counts toward `save <secs> <changes>`.
+    let changes = |c: &mut TcpStream| -> u64 {
+        let info = resp_cmd(c, &["INFO", "persistence"]);
+        let line = info
+            .lines()
+            .find(|l| l.starts_with("rdb_changes_since_last_save:"))
+            .unwrap()
+            .to_string();
+        line.split(':').nth(1).unwrap().trim().parse().unwrap()
+    };
+    let before = changes(&mut c);
+    assert_eq!(resp_cmd(&mut c, &["SETBIT", "bits", "3", "1"]), ":0\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SETRANGE", "str", "0", "abc"]), ":3\r\n");
+    assert_eq!(changes(&mut c), before + 2);
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}

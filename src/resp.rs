@@ -1907,86 +1907,112 @@ impl Command {
                 }
                 !crate::scripting::is_function_read_only(function)
             }
-            _ => matches!(
-                crate::connection::get_cmd_name(self),
-                "SET"
-                    | "SETEX"
-                    | "PSETEX"
-                    | "SETNX"
-                    | "MSET"
-                    | "MSETNX"
-                    | "MSETEX"
-                    | "GETSET"
-                    | "GETDEL"
-                    | "APPEND"
-                    | "INCR"
-                    | "DECR"
-                    | "INCRBY"
-                    | "DECRBY"
-                    | "INCRBYFLOAT"
-                    | "DEL"
-                    | "UNLINK"
-                    | "EXPIRE"
-                    | "PEXPIRE"
-                    | "EXPIREAT"
-                    | "PEXPIREAT"
-                    | "PERSIST"
-                    | "HEXPIRE"
-                    | "HEXPIREAT"
-                    | "HPEXPIRE"
-                    | "HPEXPIREAT"
-                    | "HPERSIST"
-                    | "HSETEX"
-                    | "HSET"
-                    | "HSETNX"
-                    | "HMSET"
-                    | "HDEL"
-                    | "HINCRBY"
-                    | "HINCRBYFLOAT"
-                    | "LPUSH"
-                    | "RPUSH"
-                    | "LPUSHX"
-                    | "RPUSHX"
-                    | "LPOP"
-                    | "RPOP"
-                    | "LSET"
-                    | "LTRIM"
-                    | "LREM"
-                    | "LMOVE"
-                    | "BLMOVE"
-                    | "BLPOP"
-                    | "BRPOP"
-                    | "BRPOPLPUSH"
-                    | "LMPOP"
-                    | "BLMPOP"
-                    | "SADD"
-                    | "SREM"
-                    | "SPOP"
-                    | "SMOVE"
-                    | "ZADD"
-                    | "ZINCRBY"
-                    | "ZREM"
-                    | "ZREMRANGEBYRANK"
-                    | "ZREMRANGEBYSCORE"
-                    | "ZREMRANGEBYLEX"
-                    | "ZPOPMAX"
-                    | "ZPOPMIN"
-                    | "BZPOPMAX"
-                    | "BZPOPMIN"
-                    | "ZMPOP"
-                    | "BZMPOP"
-                    | "XADD"
-                    | "XDEL"
-                    | "XTRIM"
-                    | "XGROUP"
-                    | "XACK"
-                    | "XCLAIM"
-                    | "XAUTOCLAIM"
-                    | "FLUSHDB"
-                    | "FLUSHALL"
-            ),
+            _ => {
+                matches!(
+                    crate::connection::get_cmd_name(self),
+                    "SET"
+                        | "SETEX"
+                        | "PSETEX"
+                        | "SETNX"
+                        | "MSET"
+                        | "MSETNX"
+                        | "MSETEX"
+                        | "GETSET"
+                        | "GETDEL"
+                        | "APPEND"
+                        | "INCR"
+                        | "DECR"
+                        | "INCRBY"
+                        | "DECRBY"
+                        | "INCRBYFLOAT"
+                        | "DEL"
+                        | "UNLINK"
+                        | "EXPIRE"
+                        | "PEXPIRE"
+                        | "EXPIREAT"
+                        | "PEXPIREAT"
+                        | "PERSIST"
+                        | "HEXPIRE"
+                        | "HEXPIREAT"
+                        | "HPEXPIRE"
+                        | "HPEXPIREAT"
+                        | "HPERSIST"
+                        | "HSETEX"
+                        | "HSET"
+                        | "HSETNX"
+                        | "HMSET"
+                        | "HDEL"
+                        | "HINCRBY"
+                        | "HINCRBYFLOAT"
+                        | "LPUSH"
+                        | "RPUSH"
+                        | "LPUSHX"
+                        | "RPUSHX"
+                        | "LPOP"
+                        | "RPOP"
+                        | "LSET"
+                        | "LTRIM"
+                        | "LREM"
+                        | "LMOVE"
+                        | "BLMOVE"
+                        | "BLPOP"
+                        | "BRPOP"
+                        | "BRPOPLPUSH"
+                        | "LMPOP"
+                        | "BLMPOP"
+                        | "SADD"
+                        | "SREM"
+                        | "SPOP"
+                        | "SMOVE"
+                        | "ZADD"
+                        | "ZINCRBY"
+                        | "ZREM"
+                        | "ZREMRANGEBYRANK"
+                        | "ZREMRANGEBYSCORE"
+                        | "ZREMRANGEBYLEX"
+                        | "ZPOPMAX"
+                        | "ZPOPMIN"
+                        | "BZPOPMAX"
+                        | "BZPOPMIN"
+                        | "ZMPOP"
+                        | "BZMPOP"
+                        | "XADD"
+                        | "XDEL"
+                        | "XTRIM"
+                        | "XGROUP"
+                        | "XACK"
+                        | "XCLAIM"
+                        | "XAUTOCLAIM"
+                        | "FLUSHDB"
+                        | "FLUSHALL"
+                ) || is_write_in_command_table(crate::connection::acl_cmd_name(self))
+            }
         }
     }
+}
+
+/// Whether `name` (as returned by `acl_cmd_name`) is in the `@write`
+/// category of the command table generated from Valkey's, i.e. carries the
+/// WRITE flag. Cached per thread by the name's address, since every command
+/// goes through here.
+fn is_write_in_command_table(name: &'static str) -> bool {
+    thread_local! {
+        static CACHE: std::cell::RefCell<fxhash::FxHashMap<(usize, usize), bool>> =
+            std::cell::RefCell::new(fxhash::FxHashMap::default());
+    }
+    CACHE.with(|cache| {
+        *cache
+            .borrow_mut()
+            .entry((name.as_ptr() as usize, name.len()))
+            .or_insert_with(|| {
+                let write_bit = crate::acl_categories::CATEGORIES
+                    .iter()
+                    .position(|c| *c == "write")
+                    .map_or(0, |i| 1u32 << i);
+                crate::acl::command_index(name)
+                    .is_some_and(|i| crate::acl_categories::COMMANDS[i].cats & write_bit != 0)
+            })
+    })
 }
 
 fn parse_memcached_storage_command(buf: &mut BytesMut) -> Result<Option<Option<Command>>, String> {
@@ -13823,6 +13849,41 @@ fn find_newline_at(buf: &[u8], start: usize) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_write_command_follows_command_table() {
+        let parse = |line: &str| {
+            let mut buf = BytesMut::from(format!("{line}\r\n").as_str());
+            parse_command(&mut buf).unwrap().unwrap()
+        };
+        for line in [
+            "SET k v",
+            "SETBIT k 0 1",
+            "BITFIELD k SET i5 0 1",
+            "SETRANGE k 0 x",
+            "BITOP AND d a b",
+            "RENAME a b",
+            "COPY a b",
+            "PFADD h a",
+            "GEOADD g 1 2 m",
+            "LINSERT l BEFORE a b",
+            "RPOPLPUSH a b",
+            "SINTERSTORE d a b",
+            "HINCRBY h f 1",
+        ] {
+            assert!(parse(line).is_write_command(), "{line}");
+        }
+        for line in [
+            "GET k",
+            "GETBIT k 0",
+            "PFCOUNT h",
+            "SMEMBERS s",
+            "PING",
+            "INFO",
+        ] {
+            assert!(!parse(line).is_write_command(), "{line}");
+        }
+    }
 
     #[test]
     fn test_resp_get() {
