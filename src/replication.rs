@@ -1142,6 +1142,84 @@ pub fn start_replica_sync(
     });
 }
 
+/// `masteruser` / `masterauth` per server port.
+static MASTER_AUTH: LazyLock<RwLock<HashMap<u16, (Option<String>, Option<String>)>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Sets `masterauth` (empty = none).
+pub fn set_masterauth(port: u16, pass: &str) {
+    let mut m = MASTER_AUTH.write().unwrap();
+    m.entry(port).or_default().1 = (!pass.is_empty()).then(|| pass.to_string());
+}
+
+/// Sets `masteruser` (empty = none, i.e. AUTH as the default user).
+pub fn set_masteruser(port: u16, user: &str) {
+    let mut m = MASTER_AUTH.write().unwrap();
+    m.entry(port).or_default().0 = (!user.is_empty()).then(|| user.to_string());
+}
+
+/// The AUTH command a replica sends to its master, if `masterauth` is set.
+fn master_auth_command(port: u16) -> Option<Vec<u8>> {
+    let m = MASTER_AUTH.read().unwrap();
+    let (user, pass) = m.get(&port)?;
+    let pass = pass.as_ref()?;
+    let mut args: Vec<&[u8]> = vec![b"AUTH"];
+    if let Some(u) = user {
+        args.push(u.as_bytes());
+    }
+    args.push(pass.as_bytes());
+    let mut out = format!("*{}\r\n", args.len()).into_bytes();
+    for a in args {
+        out.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+        out.extend_from_slice(a);
+        out.extend_from_slice(b"\r\n");
+    }
+    Some(out)
+}
+
+fn resolve_master_addr(host: &str, port: u16) -> Option<std::net::SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let mut addrs = (host, port).to_socket_addrs().ok()?;
+    let first = addrs.next()?;
+    // Prefer IPv4 like the old "localhost" special case did.
+    Some(
+        std::iter::once(first)
+            .chain(addrs)
+            .find(|a| a.is_ipv4())
+            .unwrap_or(first),
+    )
+}
+
+/// `replicaof <host> <port>` from the config file, started once the server
+/// is up (see server.rs).
+static STARTUP_REPLICAOF: LazyLock<Mutex<HashMap<u16, (String, u16)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Parses a config-file `replicaof` value and queues it for startup.
+/// `no one` clears it.
+pub fn set_startup_replicaof(port: u16, value: &str) -> Result<(), String> {
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    let mut m = STARTUP_REPLICAOF.lock().unwrap();
+    match parts.as_slice() {
+        [no, one] if no.eq_ignore_ascii_case("no") && one.eq_ignore_ascii_case("one") => {
+            m.remove(&port);
+            Ok(())
+        }
+        [host, mport] => {
+            let mport = mport
+                .parse::<u16>()
+                .map_err(|_| format!("invalid master port '{}'", mport))?;
+            m.insert(port, (host.to_string(), mport));
+            Ok(())
+        }
+        _ => Err("expected <masterip> <masterport>".to_string()),
+    }
+}
+
+pub fn take_startup_replicaof(port: u16) -> Option<(String, u16)> {
+    STARTUP_REPLICAOF.lock().unwrap().remove(&port)
+}
+
 #[inline]
 fn is_sync_cancelled(rx: &flume::Receiver<()>) -> bool {
     rx.try_recv().is_ok() || rx.is_disconnected()
@@ -1168,26 +1246,21 @@ async fn run_replica_worker(
     use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
     use monoio::net::TcpStream;
 
-    let addr_str = format!("{}:{}", master_host, master_port);
-    let addr: std::net::SocketAddr = match addr_str.parse() {
-        Ok(a) => a,
-        Err(_) => {
-            if master_host == "localhost" {
-                format!("127.0.0.1:{}", master_port).parse().unwrap()
-            } else {
-                return;
-            }
-        }
-    };
-
     'reconnect_loop: loop {
         if is_sync_cancelled(&cancel_rx) {
             break 'reconnect_loop;
         }
 
-        let mut stream = match TcpStream::connect(&addr).await {
-            Ok(s) => s,
-            Err(_) => {
+        // Resolved on every attempt, so a master behind a DNS name (e.g. a
+        // Kubernetes service) is found again after it moves.
+        let addr = resolve_master_addr(&master_host, master_port);
+        let connected = match addr {
+            Some(addr) => TcpStream::connect(&addr).await.ok(),
+            None => None,
+        };
+        let mut stream = match connected {
+            Some(s) => s,
+            None => {
                 if let ReplicationRole::Slave {
                     ref mut link_status,
                     ..
@@ -1265,14 +1338,33 @@ async fn run_replica_worker(
             }};
         }
 
-        // 1. PING
+        // 1. PING. A master with a password answers -NOAUTH before AUTH,
+        // which Redis accepts here too.
         let line = send_and_expect_line!(b"*1\r\n$4\r\nPING\r\n");
-        if !line.starts_with(b"+PONG") {
+        if !line.starts_with(b"+PONG") && !line.starts_with(b"-NOAUTH") {
             if is_sync_cancelled(&cancel_rx) {
                 break 'reconnect_loop;
             }
             monoio::time::sleep(std::time::Duration::from_millis(50)).await;
             continue 'reconnect_loop;
+        }
+
+        // 1b. AUTH with masteruser/masterauth.
+        if let Some(auth) = master_auth_command(hub.port) {
+            let line = send_and_expect_line!(auth);
+            if !line.starts_with(b"+OK") {
+                eprintln!(
+                    "Unable to AUTH to MASTER {}:{}: {}",
+                    master_host,
+                    master_port,
+                    String::from_utf8_lossy(&line).trim_end()
+                );
+                if is_sync_cancelled(&cancel_rx) {
+                    break 'reconnect_loop;
+                }
+                monoio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                continue 'reconnect_loop;
+            }
         }
 
         // 2. REPLCONF listening-port

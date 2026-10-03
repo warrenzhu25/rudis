@@ -2441,6 +2441,8 @@ pub fn apply_config_value(
         "maxmemory-clients" => *CONFIG_MAXMEMORY_CLIENTS.write().unwrap() = val_str.to_string(),
         "backupdirname" => *CONFIG_BACKUPDIRNAME.write().unwrap() = val_str.to_string(),
         "slaveof" | "replicaof" => *CONFIG_SLAVEOF.write().unwrap() = val_str.to_string(),
+        "masterauth" => crate::replication::set_masterauth(port, val_str),
+        "masteruser" => crate::replication::set_masteruser(port, val_str),
         _ => return Ok(false),
     }
     Ok(true)

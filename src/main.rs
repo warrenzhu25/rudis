@@ -219,6 +219,12 @@ fn main() {
     rudis::config::set_save_points(port, server_config.save_points.clone());
     let mut ignored_directives: Vec<&str> = Vec::new();
     for (name, value) in &server_config.extra_directives {
+        if (name == "replicaof" || name == "slaveof")
+            && let Err(e) = rudis::replication::set_startup_replicaof(port, value)
+        {
+            eprintln!("FATAL CONFIG: invalid '{}' directive: {}", name, e);
+            std::process::exit(1);
+        }
         match rudis::connection::apply_config_value(port, port, name, value) {
             Ok(true) => {}
             Ok(false) => {

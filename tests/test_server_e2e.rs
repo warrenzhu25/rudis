@@ -17960,3 +17960,71 @@ fn test_config_file_directives_are_applied_or_rejected_e2e() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_replicaof_and_masterauth_in_config_file_e2e() {
+    let (mport, rport) = (16956u16, 16957u16);
+    let dir = std::env::temp_dir().join(format!("rudis-replicaof-conf-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mconf = dir.join("master.conf");
+    std::fs::write(&mconf, "requirepass s3cret\n").unwrap();
+    // A host name (not an IP literal) and masterauth, as typically deployed.
+    let rconf = dir.join("replica.conf");
+    std::fs::write(
+        &rconf,
+        format!("replicaof localhost {mport}\nmasterauth s3cret\n"),
+    )
+    .unwrap();
+    let (mport_s, rport_s) = (mport.to_string(), rport.to_string());
+    let mut master = spawn_rudis_listening(
+        &[
+            "--port",
+            &mport_s,
+            "--threads",
+            "2",
+            "--no-pin",
+            "-c",
+            mconf.to_str().unwrap(),
+        ],
+        mport,
+    );
+    let mut replica = spawn_rudis_listening(
+        &[
+            "--port",
+            &rport_s,
+            "--threads",
+            "2",
+            "--no-pin",
+            "-c",
+            rconf.to_str().unwrap(),
+        ],
+        rport,
+    );
+    let mut m = TcpStream::connect(("127.0.0.1", mport)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(resp_cmd(&mut m, &["AUTH", "s3cret"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut m, &["SET", "conf:k", "v1"]), "+OK\r\n");
+    let mut r = TcpStream::connect(("127.0.0.1", rport)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if resp_cmd(&mut r, &["GET", "conf:k"]) == "$2\r\nv1\r\n" {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replica never synced: {}",
+            resp_cmd(&mut r, &["INFO", "replication"])
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    let info = resp_cmd(&mut r, &["INFO", "replication"]);
+    assert!(info.contains("role:slave"), "{info}");
+    assert!(info.contains("master_link_status:up"), "{info}");
+    let _ = replica.kill();
+    let _ = replica.wait();
+    let _ = master.kill();
+    let _ = master.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
