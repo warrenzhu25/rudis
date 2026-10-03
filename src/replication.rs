@@ -1211,7 +1211,7 @@ async fn run_replica_worker(
         }
 
         let mut buf = bytes::BytesMut::with_capacity(65536);
-        let mut read_buf = vec![0u8; 8192];
+        let mut read_buf = vec![0u8; 64 * 1024];
 
         macro_rules! send_and_expect_line {
             ($payload:expr) => {{
@@ -1460,8 +1460,11 @@ async fn run_replica_worker(
             }
         }
 
-        // 9. Streaming loop: receive and apply mutations
+        // 9. Streaming loop: receive and apply mutations. Commands for other
+        // shards are batched per read and applied with one message per
+        // shard; the offset advances once the whole batch is applied.
         let mut current_offset = initial_offset;
+        let mut batch: Vec<Vec<crate::resp::Command>> = vec![Vec::new(); router.num_shards];
         loop {
             if is_sync_cancelled(&cancel_rx) {
                 break 'reconnect_loop;
@@ -1477,6 +1480,8 @@ async fn run_replica_worker(
                         match &cmd {
                             crate::resp::Command::Replconf(args) => {
                                 if args.len() >= 2 && args[0].eq_ignore_ascii_case(b"getack") {
+                                    // Acknowledge only what is applied.
+                                    router.flush_replica_batch(&mut batch).await;
                                     let off_str = current_offset.to_string();
                                     let ack_reply = format!(
                                         "*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n${}\r\n{}\r\n",
@@ -1488,16 +1493,8 @@ async fn run_replica_worker(
                             }
                             crate::resp::Command::Ping(_) => {}
                             _ => {
-                                router.execute_replica_command(cmd).await;
+                                router.apply_replica_command_batched(cmd, &mut batch).await;
                             }
-                        }
-
-                        if let ReplicationRole::Slave {
-                            ref mut master_repl_offset,
-                            ..
-                        } = *hub.role.write().unwrap()
-                        {
-                            *master_repl_offset = current_offset;
                         }
                     }
                     Ok(None) => break,
@@ -1506,6 +1503,14 @@ async fn run_replica_worker(
                         break;
                     }
                 }
+            }
+            router.flush_replica_batch(&mut batch).await;
+            if let ReplicationRole::Slave {
+                ref mut master_repl_offset,
+                ..
+            } = *hub.role.write().unwrap()
+            {
+                *master_repl_offset = current_offset;
             }
 
             let (res, returned) = stream.read(read_buf).await;

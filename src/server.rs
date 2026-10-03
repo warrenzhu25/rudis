@@ -1836,6 +1836,16 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         execute_local_command(&cmd, &mut db, &mut dummy_out, aof_ref);
                         let _ = responder.send(());
                     }
+                    ShardMessage::ExecuteReplicaCmds { cmds, responder } => {
+                        let mut db = cross_shard_db.borrow_mut();
+                        let mut dummy_out = Vec::new();
+                        let aof_ref = cross_shard_aof.as_deref();
+                        for cmd in &cmds {
+                            dummy_out.clear();
+                            execute_local_command(cmd, &mut db, &mut dummy_out, aof_ref);
+                        }
+                        let _ = responder.send(());
+                    }
                     ShardMessage::FlushCommandStats { responder } => {
                         crate::connection::flush_local_cmd_stats();
                         let _ = responder.send(());

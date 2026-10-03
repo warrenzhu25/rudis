@@ -539,6 +539,11 @@ pub enum ShardMessage {
         cmd: Box<Command>,
         responder: flume::Sender<()>,
     },
+    /// Replicated commands for this shard, applied in order.
+    ExecuteReplicaCmds {
+        cmds: Vec<Command>,
+        responder: flume::Sender<()>,
+    },
     TierSpill {
         key: Bytes,
         responder: flume::Sender<bool>,

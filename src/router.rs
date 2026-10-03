@@ -3437,6 +3437,54 @@ impl Router {
         }
     }
 
+    /// Applies a replicated command, deferring commands for other shards
+    /// into `batch` (one Vec per shard) until `flush_replica_batch`. Each
+    /// shard still applies its commands in stream order; commands that span
+    /// shards flush the batch first, so they see every earlier change.
+    pub async fn apply_replica_command_batched(&self, cmd: Command, batch: &mut [Vec<Command>]) {
+        match crate::connection::target_shard_of_cmd(&cmd, self.num_shards) {
+            Some(target) if target == self.shard_id => {
+                let mut dummy_out = Vec::new();
+                crate::connection::execute_local_command(
+                    &cmd,
+                    &mut self.local_db.borrow_mut(),
+                    &mut dummy_out,
+                    self.aof.as_deref(),
+                );
+            }
+            Some(target) if target < batch.len() => batch[target].push(cmd),
+            _ => {
+                self.flush_replica_batch(batch).await;
+                self.execute_replica_command(cmd).await;
+            }
+        }
+    }
+
+    /// Sends each shard its deferred replicated commands in one message and
+    /// waits until all of them are applied.
+    pub async fn flush_replica_batch(&self, batch: &mut [Vec<Command>]) {
+        let (tx, rx) = flume::unbounded();
+        let mut sent = 0;
+        for (target, cmds) in batch.iter_mut().enumerate() {
+            if cmds.is_empty() {
+                continue;
+            }
+            let msg = ShardMessage::ExecuteReplicaCmds {
+                cmds: std::mem::take(cmds),
+                responder: tx.clone(),
+            };
+            if self.senders[target].send(msg).is_ok() {
+                sent += 1;
+            }
+        }
+        drop(tx);
+        for _ in 0..sent {
+            if rx.recv_async().await.is_err() {
+                break;
+            }
+        }
+    }
+
     pub async fn execute_replica_command(&self, cmd: Command) {
         if let Some(target) = crate::connection::target_shard_of_cmd(&cmd, self.num_shards) {
             if target == self.shard_id {
