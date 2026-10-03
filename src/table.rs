@@ -8986,9 +8986,15 @@ impl RudisTable {
             .find(source, h_src)
             .filter(|&idx| !self.check_expired_slot(idx));
 
-        if let Some(idx) = src_idx
-            && let Some(entry) = self.table.get_slot(idx)
-        {
+        // Like Redis, a missing source replies 0 before the destination's
+        // type is checked.
+        let Some(src_idx) = src_idx else {
+            return Ok(SmoveResult {
+                moved: false,
+                dst_added: false,
+            });
+        };
+        if let Some(entry) = self.table.get_slot(src_idx) {
             match &entry.val {
                 RudisValue::Set(_) => {}
                 _ => {
@@ -9017,16 +9023,6 @@ impl RudisTable {
             }
         } else {
             false
-        };
-
-        let src_idx = match src_idx {
-            Some(idx) => idx,
-            None => {
-                return Ok(SmoveResult {
-                    moved: false,
-                    dst_added: false,
-                });
-            }
         };
 
         let contains_member = match self.table.get_slot(src_idx).map(|e| &e.val) {
@@ -17344,6 +17340,29 @@ mod tests {
         assert_eq!(out, b"$1\r\nb\r\n");
         assert_eq!(table.len(), 0);
         assert!(!table.table.has_deleted());
+    }
+
+    #[test]
+    fn test_smove_missing_source_wins_over_wrong_type_destination() {
+        let mut table = RudisTable::new();
+        let hk = Bytes::from("hash");
+        let hh = hash_key(hk.as_ref());
+        let (f, v) = (Bytes::from("f"), Bytes::from("v"));
+        assert_eq!(table.hset_single_field_with_hash(&hk, hh, &f, &v), Ok(1));
+        // Redis replies 0 for a missing source, whatever the destination is.
+        let r = table.smove(b"nokey", hk.clone(), Bytes::from("m")).unwrap();
+        assert!(!r.moved && !r.dst_added);
+        // With an existing source set the destination's type is checked.
+        let sk = Bytes::from("set");
+        let m = Bytes::from("m");
+        assert_eq!(
+            table.sadd_single_member_with_hash(&sk, hash_key(sk.as_ref()), &m),
+            Ok(1)
+        );
+        assert!(table.smove(sk.as_ref(), hk.clone(), m.clone()).is_err());
+        assert!(table.smove(hk.as_ref(), sk.clone(), m.clone()).is_err());
+        let r = table.smove(sk.as_ref(), Bytes::from("set2"), m).unwrap();
+        assert!(r.moved && r.dst_added);
     }
 
     #[test]
