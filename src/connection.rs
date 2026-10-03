@@ -16693,7 +16693,12 @@ fn for_each_read_key(cmd: &Command, mut f: impl FnMut(&[u8])) {
 pub fn dirty_counted_on_change(cmd: &Command) -> bool {
     matches!(
         cmd,
-        Command::Setbit { .. } | Command::Bitfield { .. } | Command::Xreadgroup { .. }
+        Command::Setbit { .. }
+            | Command::Bitfield { .. }
+            | Command::Xreadgroup { .. }
+            | Command::Xdel { .. }
+            | Command::Xdelex { .. }
+            | Command::Xtrim { .. }
     )
 }
 
@@ -19587,6 +19592,7 @@ pub fn execute_local_command(
             match db.xdel(key, ids) {
                 Ok(count) => {
                     if count > 0 {
+                        crate::snapshot::note_changes(count as u64);
                         record_change!(cmd);
                         notify_keyspace_event(NOTIFY_STREAM, "xdel", key);
                     }
@@ -19609,6 +19615,7 @@ pub fn execute_local_command(
             match db.xtrim(key, *maxlen, *minid, *approx, *trim_strategy, *limit) {
                 Ok(count) => {
                     if count > 0 {
+                        crate::snapshot::note_changes(count as u64);
                         record_change!(cmd);
                         notify_keyspace_event(NOTIFY_STREAM, "xtrim", key);
                     }
@@ -19664,6 +19671,7 @@ pub fn execute_local_command(
         Command::Xdelex { key, strategy, ids } => {
             let (res, dirty_count) = db.xdelex(key, *strategy, ids);
             if dirty_count > 0 {
+                crate::snapshot::note_changes(dirty_count as u64);
                 record_change!(cmd);
             }
             write_resp_array_header(out, res.len());
