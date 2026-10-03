@@ -69,6 +69,12 @@ struct Args {
     /// Enable Redis Cluster mode with per-shard direct routing (e.g. --cluster-enabled yes)
     #[arg(long)]
     cluster_enabled: Option<String>,
+
+    /// Accept the experimental, non-Redis command families (JSON., BF., CF.,
+    /// CMS., TOPK., FT., SEMANTIC., CRDT., LLM., MCP., XDP.). Most of their
+    /// writes are not persisted to the AOF or replicated (yes|no, default no)
+    #[arg(long)]
+    enable_experimental_commands: Option<String>,
 }
 
 fn get_process_affinity_cores() -> Vec<usize> {
@@ -196,6 +202,20 @@ fn main() {
 
     rudis::aof::set_aof_load_truncated(server_config.aof_load_truncated);
     rudis::mailbox::set_cross_shard_spin(server_config.cross_shard_spin);
+    if let Some(v) = args.enable_experimental_commands {
+        server_config.enable_experimental_commands = match v.to_lowercase().as_str() {
+            "yes" => true,
+            "no" => false,
+            other => {
+                eprintln!(
+                    "FATAL CONFIG: --enable-experimental-commands expects yes|no, got '{}'",
+                    other
+                );
+                std::process::exit(1);
+            }
+        };
+    }
+    rudis::resp::set_experimental_commands(server_config.enable_experimental_commands);
     rudis::config::set_save_points(port, server_config.save_points.clone());
     if let Some(v) = server_config.extra_directives.get("repl-backlog-size") {
         match rudis::tiering::parse_memory_bytes(v) {

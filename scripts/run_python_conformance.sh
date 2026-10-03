@@ -25,7 +25,7 @@ echo "============================================================"
 TEST_LOG="/tmp/rudis_py_conformance_${PORT}.log"
 rm -f "$TEST_LOG"
 
-./target/release/rudis --port "$PORT" --threads 2 --no-pin > "$TEST_LOG" 2>&1 &
+./target/release/rudis --port "$PORT" --threads 2 --no-pin --enable-experimental-commands yes > "$TEST_LOG" 2>&1 &
 RUDIS_PID=$!
 
 cleanup() {

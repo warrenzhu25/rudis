@@ -19,6 +19,9 @@ pub struct RudisConfig {
     pub appendfsync_every_sec: bool,
     /// `cross-shard-spin`: polls before parking on a cross-shard reply.
     pub cross_shard_spin: usize,
+    /// `enable-experimental-commands`: accept the non-Redis command families
+    /// (JSON., BF., FT., CRDT., ...; see `resp::is_experimental_command_name`).
+    pub enable_experimental_commands: bool,
     pub aof_load_truncated: bool,
     pub dir: PathBuf,
     pub requirepass: Option<String>,
@@ -48,6 +51,7 @@ impl Default for RudisConfig {
             appendonly: false,
             appendfsync_every_sec: true,
             cross_shard_spin: 0,
+            enable_experimental_commands: false,
             aof_load_truncated: true,
             dir: PathBuf::from("."),
             requirepass: None,
@@ -189,6 +193,19 @@ impl RudisConfig {
                     config.cross_shard_spin = rest[0].parse::<usize>().map_err(|e| {
                         format!("Invalid cross-shard-spin at line {}: {}", line_num + 1, e)
                     })?;
+                }
+                "enable-experimental-commands" => {
+                    config.enable_experimental_commands = match rest[0].to_lowercase().as_str() {
+                        "yes" => true,
+                        "no" => false,
+                        other => {
+                            return Err(format!(
+                                "Invalid enable-experimental-commands at line {}: '{}' (expected yes|no)",
+                                line_num + 1,
+                                other
+                            ));
+                        }
+                    };
                 }
                 "appendfsync" => {
                     config.appendfsync_every_sec =
@@ -523,6 +540,21 @@ mod tests {
         );
         assert!(RudisConfig::parse_str("cross-shard-spin -1").is_err());
         assert!(RudisConfig::parse_str("cross-shard-spin lots").is_err());
+    }
+
+    #[test]
+    fn test_parse_enable_experimental_commands() {
+        assert!(
+            !RudisConfig::parse_str("")
+                .unwrap()
+                .enable_experimental_commands
+        );
+        assert!(
+            RudisConfig::parse_str("enable-experimental-commands yes")
+                .unwrap()
+                .enable_experimental_commands
+        );
+        assert!(RudisConfig::parse_str("enable-experimental-commands maybe").is_err());
     }
 
     #[test]

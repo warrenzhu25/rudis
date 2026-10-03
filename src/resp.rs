@@ -2692,6 +2692,43 @@ fn parse_lmovem_trailer(args: &[Bytes]) -> Result<(LmovemMode, usize, LmovemOrde
     Ok((mode, count_num as usize, ordering))
 }
 
+// On in this crate's unit tests, which exercise every parser.
+static EXPERIMENTAL_COMMANDS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(cfg!(test));
+
+/// Enables the experimental command families (`enable-experimental-commands`).
+pub fn set_experimental_commands(enabled: bool) {
+    EXPERIMENTAL_COMMANDS.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn experimental_commands_enabled() -> bool {
+    EXPERIMENTAL_COMMANDS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Command families that are off unless `enable-experimental-commands` is
+/// set. They are not Redis/Valkey commands, and most of their writes are
+/// neither written to the AOF nor replicated, so a restart or failover
+/// silently loses that data and replicas never see it. MCP./XDP. also
+/// expose tool calls and packet-filter control.
+const EXPERIMENTAL_PREFIXES: &[&str] = &[
+    "JSON.",
+    "BF.",
+    "CF.",
+    "CMS.",
+    "TOPK.",
+    "FT.",
+    "SEMANTIC.",
+    "CRDT.",
+    "LLM.",
+    "MCP.",
+    "XDP.",
+];
+
+/// `name` must be upper case.
+pub fn is_experimental_command_name(name: &str) -> bool {
+    EXPERIMENTAL_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
 pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
     if args.is_empty() {
         return Ok(None);
@@ -2700,6 +2737,16 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
     let mut cmd_buf = [0u8; 64];
     let mut cmd_heap = String::new();
     let cmd_name = bytes_to_uppercase_ascii(&args[0], &mut cmd_buf, &mut cmd_heap);
+
+    // No core command has a '.', so this costs one byte scan on the hot path.
+    if cmd_name.as_bytes().contains(&b'.')
+        && !experimental_commands_enabled()
+        && is_experimental_command_name(cmd_name)
+    {
+        return Ok(Some(Command::Unknown(
+            String::from_utf8_lossy(&args[0]).into_owned(),
+        )));
+    }
 
     match cmd_name {
         "AUTH" => {

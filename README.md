@@ -632,6 +632,13 @@ Details: [Component 20 — Agent Memory, LLM Quota & Checkpoints](docs/design/20
 Status reflects source-verified behavior as of this revision, not aspiration. "Design doc"
 links go to the corresponding source-verified subsystem specification.
 
+> [!IMPORTANT]
+> The non-Redis command families `JSON.*`, `BF.*`, `CF.*`, `CMS.*`, `TOPK.*`, `FT.*`,
+> `SEMANTIC.*`, `CRDT.*`, `LLM.*`, `MCP.*` and `XDP.*` are **off by default** and answer
+> `ERR unknown command`. Most of their writes are not written to the AOF or replicated, so data
+> written with them is lost on restart or failover. Enable them with
+> `enable-experimental-commands yes` (config file) or `--enable-experimental-commands yes`.
+
 | Subsystem | Status | Notes | Design Doc |
 | :--- | :---: | :--- | :--- |
 | **Thread-per-core engine** | Implemented | Shared-nothing shards on Monoio/`io_uring`, lock-free cross-shard mesh. | [01](docs/design/01_reactor_runtime.md) / [04](docs/design/04_sharding_mesh.md) |

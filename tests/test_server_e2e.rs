@@ -22,6 +22,9 @@ fn start_test_server(port: u16, num_shards: usize) {
 
 fn start_test_server_with_aof(port: u16, num_shards: usize, aof_config: rudis::aof::AofConfig) {
     rudis::shutdown::reset_shutdown();
+    // These in-process servers also cover the experimental families; the
+    // default (off) is tested against the real binary.
+    rudis::resp::set_experimental_commands(true);
     let (senders_mesh, receivers) = rudis::mailbox::create_shard_mesh(num_shards);
 
     for (shard_id, rx) in receivers.into_iter().enumerate() {
@@ -17522,4 +17525,59 @@ fn test_full_sync_under_concurrent_writes_matches_master_e2e() {
     drop(r);
     shutdown_and_wait(rport, &mut replica);
     shutdown_and_wait(mport, &mut master);
+}
+
+#[test]
+fn test_experimental_commands_off_by_default_e2e() {
+    let connect = |port: u16| {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c
+    };
+    let probes: [&[&str]; 5] = [
+        &["JSON.SET", "j", "$", "{\"a\":1}"],
+        &["bf.add", "b", "x"],
+        &["CMS.INITBYDIM", "c", "10", "5"],
+        &["FT._LIST"],
+        &["CRDT.SET", "k", "v"],
+    ];
+
+    let port = 16939u16;
+    let ps = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &ps, "--threads", "2", "--no-pin"], port);
+    let mut c = connect(port);
+    for args in probes {
+        let reply = resp_cmd(&mut c, args);
+        assert!(
+            reply.starts_with(&format!("-ERR unknown command '{}'", args[0])),
+            "{args:?}: {reply}"
+        );
+    }
+    // Core commands are unaffected.
+    assert_eq!(resp_cmd(&mut c, &["SET", "a.b", "1"]), "+OK\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+
+    let port = 16938u16;
+    let ps = port.to_string();
+    let mut child = spawn_rudis_listening(
+        &[
+            "--port",
+            &ps,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--enable-experimental-commands",
+            "yes",
+        ],
+        port,
+    );
+    let mut c = connect(port);
+    assert_eq!(
+        resp_cmd(&mut c, &["JSON.SET", "j", "$", "{\"a\":1}"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["BF.ADD", "b", "x"]), ":1\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
 }
