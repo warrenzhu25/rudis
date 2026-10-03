@@ -3250,6 +3250,20 @@ fn test_replica_partial_resync_reconnect_e2e() {
         "$2\r\nv5\r\n"
     );
 
+    // The master counted the full and the partial resync. The stats are
+    // process-wide and other tests in this binary replicate too, so only
+    // lower bounds hold.
+    let stats = send_and_read(&mut master_client, b"INFO stats\r\n");
+    let stat = |name: &str| -> u64 {
+        stats
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("{name} missing: {stats}"))
+    };
+    assert!(stat("sync_full:") >= 1, "{stats}");
+    assert!(stat("sync_partial_ok:") >= 1, "{stats}");
+
     // 6. Test promotion to master via REPLICAOF NO ONE
     assert_eq!(
         send_and_read(&mut replica_client, b"REPLICAOF NO ONE\r\n"),

@@ -1,8 +1,8 @@
 //! Process-wide counters behind the INFO `# Stats` section:
 //! total_commands_processed, total_connections_received,
 //! rejected_connections, total_net_input_bytes / total_net_output_bytes,
-//! keyspace_hits / keyspace_misses and the instantaneous_* rates derived
-//! from them.
+//! keyspace_hits / keyspace_misses, sync_full / sync_partial_ok /
+//! sync_partial_err and the instantaneous_* rates derived from them.
 //!
 //! Every thread owns one cache-line-aligned slot and is its only writer, so
 //! bumping a counter is a relaxed load and store on a line no other thread
@@ -26,9 +26,15 @@ pub enum Stat {
     NetOutputBytes,
     KeyspaceHits,
     KeyspaceMisses,
+    /// Full resyncs served to replicas.
+    SyncFull,
+    /// PSYNC requests accepted as partial resyncs.
+    SyncPartialOk,
+    /// PSYNC requests for a partial resync that needed a full one.
+    SyncPartialErr,
 }
 
-const NUM_STATS: usize = 7;
+const NUM_STATS: usize = 10;
 
 #[repr(align(128))]
 struct Slot {
@@ -97,6 +103,9 @@ const ALL: [Stat; NUM_STATS] = [
     Stat::NetOutputBytes,
     Stat::KeyspaceHits,
     Stat::KeyspaceMisses,
+    Stat::SyncFull,
+    Stat::SyncPartialOk,
+    Stat::SyncPartialErr,
 ];
 
 /// Restarts every counter from zero (CONFIG RESETSTAT).

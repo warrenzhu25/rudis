@@ -4744,6 +4744,7 @@ async fn run_master_replica_stream(
 
         let partial = hub.try_partial_resync(client_id, write_tx.clone(), req_replid, req_offset);
         if let Some((replid, diff, _repl)) = partial {
+            crate::server_stats::add(crate::server_stats::Stat::SyncPartialOk, 1);
             let mut initial_msg = format!("+CONTINUE {}\r\n", replid).into_bytes();
             initial_msg.extend_from_slice(&diff);
             if writer.write_all(initial_msg).await.0.is_err() {
@@ -4751,6 +4752,12 @@ async fn run_master_replica_stream(
                 return;
             }
         } else {
+            // Like Redis, a failed partial resync only counts as an error
+            // when the replica asked for a specific history.
+            if req_replid != "?" {
+                crate::server_stats::add(crate::server_stats::Stat::SyncPartialErr, 1);
+            }
+            crate::server_stats::add(crate::server_stats::Stat::SyncFull, 1);
             let rdb = router.generate_full_rdb().await;
             let _repl = hub.register_replica(client_id, write_tx.clone());
 
@@ -4767,6 +4774,7 @@ async fn run_master_replica_stream(
             }
         }
     } else {
+        crate::server_stats::add(crate::server_stats::Stat::SyncFull, 1);
         let rdb = router.generate_full_rdb().await;
         let _repl = hub.register_replica(client_id, write_tx.clone());
         let mut initial_msg = format!("${}\r\n", rdb.len()).into_bytes();
@@ -8894,7 +8902,7 @@ async fn execute_command(
             let pubsub_patterns = router.pubsub_numpat().await;
             let pubsubshard_channels = router.pubsub_shardchannels(None).await.len();
             let stats_str = format!(
-                "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\ninstantaneous_ops_per_sec:{}\r\ntotal_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\ninstantaneous_input_kbps:{:.2}\r\ninstantaneous_output_kbps:{:.2}\r\nrejected_connections:{}\r\nsync_full:0\r\nsync_partial_ok:0\r\nsync_partial_err:0\r\nexpired_keys:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nkeyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\npubsubshard_channels:{}\r\nlatest_fork_usec:0\r\ntotal_error_replies:{}\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\nmigrate_cached_sockets:0\r\ntracking_total_items:{}\r\ntracking_total_keys:{}\r\ntracking_total_prefixes:{}\r\n",
+                "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\ninstantaneous_ops_per_sec:{}\r\ntotal_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\ninstantaneous_input_kbps:{:.2}\r\ninstantaneous_output_kbps:{:.2}\r\nrejected_connections:{}\r\nsync_full:{}\r\nsync_partial_ok:{}\r\nsync_partial_err:{}\r\nexpired_keys:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nkeyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\npubsubshard_channels:{}\r\nlatest_fork_usec:0\r\ntotal_error_replies:{}\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\nmigrate_cached_sockets:0\r\ntracking_total_items:{}\r\ntracking_total_keys:{}\r\ntracking_total_prefixes:{}\r\n",
                 total(Stat::ConnectionsReceived),
                 total(Stat::Commands),
                 ops_per_sec,
@@ -8903,6 +8911,9 @@ async fn execute_command(
                 in_bps as f64 / 1024.0,
                 out_bps as f64 / 1024.0,
                 total(Stat::RejectedConnections),
+                total(Stat::SyncFull),
+                total(Stat::SyncPartialOk),
+                total(Stat::SyncPartialErr),
                 crate::table::get_expired_keys(),
                 crate::table::get_expired_keys_active(),
                 crate::table::get_evicted_keys(),
