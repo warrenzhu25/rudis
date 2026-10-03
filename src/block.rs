@@ -392,6 +392,20 @@ impl BlockHub {
                         };
                         if let Some(vals) = popped {
                             if !vals.is_empty() {
+                                let count = Some(vals.len());
+                                propagate_served(
+                                    self.port,
+                                    &match pop_type {
+                                        ListPopType::Left => crate::resp::Command::Lpop {
+                                            key: key.clone(),
+                                            count,
+                                        },
+                                        ListPopType::Right => crate::resp::Command::Rpop {
+                                            key: key.clone(),
+                                            count,
+                                        },
+                                    },
+                                );
                                 let _ = waiter
                                     .sender
                                     .send(BlockedListResult::Popped(key.clone(), vals));
@@ -439,6 +453,19 @@ impl BlockHub {
                                     let _ = table.rpush(destination.clone(), vec![val.clone()]);
                                 }
                             }
+                            let dir = |t: ListPopType| match t {
+                                ListPopType::Left => crate::table::ListDirection::Left,
+                                ListPopType::Right => crate::table::ListDirection::Right,
+                            };
+                            propagate_served(
+                                self.port,
+                                &crate::resp::Command::Lmove {
+                                    source: key.clone(),
+                                    destination: destination.clone(),
+                                    where_from: dir(where_from),
+                                    where_to: dir(where_to),
+                                },
+                            );
                             let dest_clone = destination.clone();
                             crate::connection::touch_watched_key(self.port, destination.as_ref());
                             let _ = waiter
@@ -486,6 +513,19 @@ impl BlockHub {
                             ordering,
                         ) {
                             Ok(Some(vals)) => {
+                                propagate_served(
+                                    self.port,
+                                    &crate::resp::Command::Lmovem {
+                                        source: key.clone(),
+                                        destination: destination.clone(),
+                                        where_from: from_dir,
+                                        where_to: to_dir,
+                                        mode: crate::resp::LmovemMode::Exactly,
+                                        count: vals.len(),
+                                        ordering,
+                                        raw_tokens: None,
+                                    },
+                                );
                                 crate::connection::touch_watched_key(self.port, key.as_ref());
                                 crate::connection::touch_watched_key(
                                     self.port,
@@ -565,6 +605,20 @@ impl BlockHub {
                 };
                 if let Some(items) = popped {
                     if !items.is_empty() {
+                        let count = Some(items.len());
+                        propagate_served(
+                            self.port,
+                            &match waiter.pop_type {
+                                ZSetPopType::Min => crate::resp::Command::Zpopmin {
+                                    key: key.clone(),
+                                    count,
+                                },
+                                ZSetPopType::Max => crate::resp::Command::Zpopmax {
+                                    key: key.clone(),
+                                    count,
+                                },
+                            },
+                        );
                         let _ = waiter.sender.send(BlockedZSetResult::Popped {
                             key: key.clone(),
                             items,
@@ -667,6 +721,31 @@ impl BlockHub {
         let keys: Vec<Bytes> = self.stream_waiters.keys().cloned().collect();
         for k in keys {
             self.notify_stream(db, &k);
+        }
+    }
+}
+
+/// Logs and replicates a mutation made while serving a blocked client. It
+/// runs on the key owner's shard thread right after the write that woke the
+/// client, so the AOF and the replicas see the pop in the same order, and in
+/// the same shard's AOF, as the data change itself.
+fn propagate_served(port: u16, cmd: &crate::resp::Command) {
+    let Some(bytes) = crate::aof::command_to_resp(cmd) else {
+        return;
+    };
+    let mut shard_id = None;
+    crate::connection::CURRENT_ROUTER.with(|cr| {
+        if let Some(router) = cr.borrow().as_ref() {
+            shard_id = Some(router.shard_id);
+            if let Some(aof) = &router.aof {
+                aof.borrow_mut().append(&bytes);
+            }
+        }
+    });
+    if crate::replication::has_connected_replicas(port) {
+        match shard_id {
+            Some(id) => crate::replication::propagate_shard_bytes(port, id, &bytes),
+            None => crate::replication::propagate_bytes(port, &bytes),
         }
     }
 }

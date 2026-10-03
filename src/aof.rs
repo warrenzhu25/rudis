@@ -1955,8 +1955,252 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             buf.extend_from_slice(b"\r\n");
             Some(buf)
         }
+        Command::Lpushx { key, values } | Command::Rpushx { key, values } => {
+            let name: &[u8] = if matches!(cmd, Command::Lpushx { .. }) {
+                b"LPUSHX"
+            } else {
+                b"RPUSHX"
+            };
+            let mut args: Vec<&[u8]> = Vec::with_capacity(values.len() + 2);
+            args.push(name);
+            args.push(key);
+            args.extend(values.iter().map(|v| v.as_ref()));
+            Some(resp_argv(&args))
+        }
+        Command::Zpopmin { key, count } | Command::Zpopmax { key, count } => {
+            let name: &[u8] = if matches!(cmd, Command::Zpopmin { .. }) {
+                b"ZPOPMIN"
+            } else {
+                b"ZPOPMAX"
+            };
+            match count {
+                Some(c) => Some(resp_argv(&[name, key, c.to_string().as_bytes()])),
+                None => Some(resp_argv(&[name, key])),
+            }
+        }
+        Command::Zmpop {
+            keys,
+            is_min,
+            count,
+        } => {
+            let mut args: Vec<Vec<u8>> = Vec::with_capacity(keys.len() + 5);
+            args.push(b"ZMPOP".to_vec());
+            args.push(keys.len().to_string().into_bytes());
+            args.extend(keys.iter().map(|k| k.to_vec()));
+            args.push(if *is_min {
+                b"MIN".to_vec()
+            } else {
+                b"MAX".to_vec()
+            });
+            args.push(b"COUNT".to_vec());
+            args.push(count.to_string().into_bytes());
+            Some(resp_argv(&args))
+        }
+        Command::Sinterstore { destination, keys }
+        | Command::Sunionstore { destination, keys }
+        | Command::Sdiffstore { destination, keys }
+        | Command::Zdiffstore { destination, keys } => {
+            let name: &[u8] = match cmd {
+                Command::Sinterstore { .. } => b"SINTERSTORE",
+                Command::Sunionstore { .. } => b"SUNIONSTORE",
+                Command::Sdiffstore { .. } => b"SDIFFSTORE",
+                _ => b"ZDIFFSTORE",
+            };
+            let numkeys = keys.len().to_string();
+            let mut args: Vec<&[u8]> = Vec::with_capacity(keys.len() + 3);
+            args.push(name);
+            args.push(destination);
+            if matches!(cmd, Command::Zdiffstore { .. }) {
+                args.push(numkeys.as_bytes());
+            }
+            args.extend(keys.iter().map(|k| k.as_ref()));
+            Some(resp_argv(&args))
+        }
+        Command::Zunionstore {
+            destination,
+            keys,
+            weights,
+            aggregate,
+        }
+        | Command::Zinterstore {
+            destination,
+            keys,
+            weights,
+            aggregate,
+        } => {
+            let mut args: Vec<Vec<u8>> = Vec::with_capacity(keys.len() + weights.len() + 6);
+            args.push(if matches!(cmd, Command::Zunionstore { .. }) {
+                b"ZUNIONSTORE".to_vec()
+            } else {
+                b"ZINTERSTORE".to_vec()
+            });
+            args.push(destination.to_vec());
+            args.push(keys.len().to_string().into_bytes());
+            args.extend(keys.iter().map(|k| k.to_vec()));
+            if !weights.is_empty() {
+                args.push(b"WEIGHTS".to_vec());
+                args.extend(weights.iter().map(|w| w.to_string().into_bytes()));
+            }
+            let agg: Option<&[u8]> = match aggregate {
+                crate::table::Aggregate::Sum => None,
+                crate::table::Aggregate::Min => Some(b"MIN"),
+                crate::table::Aggregate::Max => Some(b"MAX"),
+                crate::table::Aggregate::Count => Some(b"COUNT"),
+            };
+            if let Some(a) = agg {
+                args.push(b"AGGREGATE".to_vec());
+                args.push(a.to_vec());
+            }
+            Some(resp_argv(&args))
+        }
+        Command::Geoadd {
+            key,
+            items,
+            nx,
+            xx,
+            ch,
+        } => {
+            let mut args: Vec<Vec<u8>> = Vec::with_capacity(items.len() * 3 + 5);
+            args.push(b"GEOADD".to_vec());
+            args.push(key.to_vec());
+            if *nx {
+                args.push(b"NX".to_vec());
+            }
+            if *xx {
+                args.push(b"XX".to_vec());
+            }
+            if *ch {
+                args.push(b"CH".to_vec());
+            }
+            for (lon, lat, member) in items {
+                args.push(lon.to_string().into_bytes());
+                args.push(lat.to_string().into_bytes());
+                args.push(member.to_vec());
+            }
+            Some(resp_argv(&args))
+        }
+        Command::Geosearchstore {
+            dest,
+            key,
+            from_member,
+            from_lonlat,
+            by_radius,
+            by_box,
+            asc,
+            count,
+            any,
+            storedist,
+        } => {
+            let unit = |u: &crate::geo::GeoUnit| -> Vec<u8> {
+                match u {
+                    crate::geo::GeoUnit::Meters => b"m".to_vec(),
+                    crate::geo::GeoUnit::Kilometers => b"km".to_vec(),
+                    crate::geo::GeoUnit::Miles => b"mi".to_vec(),
+                    crate::geo::GeoUnit::Feet => b"ft".to_vec(),
+                }
+            };
+            let mut args: Vec<Vec<u8>> = Vec::with_capacity(14);
+            args.push(b"GEOSEARCHSTORE".to_vec());
+            args.push(dest.to_vec());
+            args.push(key.to_vec());
+            if let Some(m) = from_member {
+                args.push(b"FROMMEMBER".to_vec());
+                args.push(m.to_vec());
+            }
+            if let Some((lon, lat)) = from_lonlat {
+                args.push(b"FROMLONLAT".to_vec());
+                args.push(lon.to_string().into_bytes());
+                args.push(lat.to_string().into_bytes());
+            }
+            if let Some((r, u)) = by_radius {
+                args.push(b"BYRADIUS".to_vec());
+                args.push(r.to_string().into_bytes());
+                args.push(unit(u));
+            }
+            if let Some((w, h, u)) = by_box {
+                args.push(b"BYBOX".to_vec());
+                args.push(w.to_string().into_bytes());
+                args.push(h.to_string().into_bytes());
+                args.push(unit(u));
+            }
+            match asc {
+                Some(true) => args.push(b"ASC".to_vec()),
+                Some(false) => args.push(b"DESC".to_vec()),
+                None => {}
+            }
+            if let Some(c) = count {
+                args.push(b"COUNT".to_vec());
+                args.push(c.to_string().into_bytes());
+                if *any {
+                    args.push(b"ANY".to_vec());
+                }
+            }
+            if *storedist {
+                args.push(b"STOREDIST".to_vec());
+            }
+            Some(resp_argv(&args))
+        }
+        Command::Xsetid {
+            key,
+            last_id,
+            entries_added,
+            max_deleted_id,
+        } => {
+            let mut args: Vec<Vec<u8>> = Vec::with_capacity(7);
+            args.push(b"XSETID".to_vec());
+            args.push(key.to_vec());
+            args.push(last_id.to_string().into_bytes());
+            if let Some(n) = entries_added {
+                args.push(b"ENTRIESADDED".to_vec());
+                args.push(n.to_string().into_bytes());
+            }
+            if let Some(id) = max_deleted_id {
+                args.push(b"MAXDELETEDID".to_vec());
+                args.push(id.to_string().into_bytes());
+            }
+            Some(resp_argv(&args))
+        }
+        Command::XgroupCreateConsumer {
+            key,
+            group,
+            consumer,
+        } => Some(resp_argv(&[
+            b"XGROUP".as_slice(),
+            b"CREATECONSUMER",
+            key,
+            group,
+            consumer,
+        ])),
+        Command::XgroupDelConsumer {
+            key,
+            group,
+            consumer,
+        } => Some(resp_argv(&[
+            b"XGROUP".as_slice(),
+            b"DELCONSUMER",
+            key,
+            group,
+            consumer,
+        ])),
+        // DELEX only records a change when the key was actually deleted, so
+        // the condition has already been evaluated: replay it as a plain DEL.
+        Command::Delex { key, .. } => Some(resp_argv(&[b"DEL".as_slice(), key])),
         _ => None,
     }
+}
+
+/// Encodes `args` as a RESP array of bulk strings.
+fn resp_argv<A: AsRef<[u8]>>(args: &[A]) -> Vec<u8> {
+    let mut buf =
+        Vec::with_capacity(16 + args.iter().map(|a| a.as_ref().len() + 16).sum::<usize>());
+    buf.extend_from_slice(format!("*{}\r\n", args.len()).as_bytes());
+    for a in args {
+        let a = a.as_ref();
+        buf.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+        buf.extend_from_slice(a);
+        buf.extend_from_slice(b"\r\n");
+    }
+    buf
 }
 
 static AOF_LOAD_TRUNCATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -2951,6 +3195,115 @@ mod tests {
         let p = std::env::temp_dir().join(format!("rudis-aoftail-{}-{}", std::process::id(), name));
         std::fs::write(&p, content).unwrap();
         p
+    }
+
+    fn parse_line(line: &str) -> Command {
+        let mut buf = bytes::BytesMut::from(format!("{line}\r\n").as_str());
+        match crate::resp::parse_command(&mut buf) {
+            Ok(Some(cmd)) => cmd,
+            other => panic!("{line}: {other:?}"),
+        }
+    }
+
+    fn parse_resp(bytes: &[u8]) -> Command {
+        let mut buf = bytes::BytesMut::from(bytes);
+        match crate::resp::parse_command(&mut buf) {
+            Ok(Some(cmd)) => cmd,
+            other => panic!("{:?}: {other:?}", String::from_utf8_lossy(bytes)),
+        }
+    }
+
+    /// A write command without an encoder arm is silently never written to
+    /// the AOF nor sent to replicas, so the replica diverges.
+    #[test]
+    fn test_write_commands_are_logged_and_replicated() {
+        // Commands whose encoding re-parses to the very same command.
+        let round_trip = [
+            "LPUSHX l a b",
+            "RPUSHX l a",
+            "ZPOPMIN z",
+            "ZPOPMAX z 3",
+            "ZMPOP 2 a b MAX COUNT 2",
+            "SINTERSTORE d a b",
+            "SUNIONSTORE d a",
+            "SDIFFSTORE d a b c",
+            "ZDIFFSTORE d 2 a b",
+            "ZUNIONSTORE d 2 a b WEIGHTS 2 0.5 AGGREGATE MAX",
+            "ZINTERSTORE d 2 a b AGGREGATE MIN",
+            "ZUNIONSTORE d 1 a",
+            "GEOADD g NX CH 13.361389 38.115556 Palermo 15.087269 37.502669 Catania",
+            "GEOSEARCHSTORE d s FROMLONLAT 15 37 BYRADIUS 200 km ASC COUNT 2 ANY STOREDIST",
+            "GEOSEARCHSTORE d s FROMMEMBER m BYBOX 400 300 mi DESC",
+            "XSETID s 5-1 ENTRIESADDED 7 MAXDELETEDID 3-0",
+            "XSETID s 9-9",
+            "XGROUP CREATECONSUMER s g c",
+            "XGROUP DELCONSUMER s g c",
+        ];
+        for line in round_trip {
+            let cmd = parse_line(line);
+            let bytes = command_to_resp(&cmd).unwrap_or_else(|| panic!("{line} not encoded"));
+            assert_eq!(parse_resp(&bytes), cmd, "{line}");
+        }
+        // DELEX only records a change once the key was deleted.
+        let bytes = command_to_resp(&parse_line("DELEX k IFEQ v")).unwrap();
+        assert_eq!(bytes, b"*2\r\n$3\r\nDEL\r\n$1\r\nk\r\n");
+
+        // Every write command must encode. GETEX, LMPOP and INCREX are
+        // excluded: their handlers log a translated command instead.
+        let writes = [
+            "APPEND k v",
+            "BITFIELD k SET i5 0 1",
+            "BITOP AND d a b",
+            "COPY a b",
+            "DECR k",
+            "DEL k",
+            "EXPIRE k 10",
+            "FLUSHALL",
+            "GETDEL k",
+            "GETSET k v",
+            "HDEL h f",
+            "HINCRBYFLOAT h f 1.5",
+            "HSET h f v",
+            "INCR k",
+            "LINSERT l BEFORE a b",
+            "LMOVE a b LEFT RIGHT",
+            "LPOP l",
+            "LPUSH l a",
+            "LREM l 1 a",
+            "LSET l 0 a",
+            "LTRIM l 0 1",
+            "MSET a 1 b 2",
+            "MSETNX a 1",
+            "PERSIST k",
+            "PFADD h a",
+            "PFMERGE d a b",
+            "RENAME a b",
+            "RPOPLPUSH a b",
+            "SADD s a",
+            "SET k v",
+            "SETBIT k 0 1",
+            "SETRANGE k 0 v",
+            "SMOVE a b m",
+            "SORT l STORE d",
+            "SPOP s",
+            "SREM s a",
+            "UNLINK k",
+            "XACK s g 1-1",
+            "XADD s * f v",
+            "XDEL s 1-1",
+            "XGROUP CREATE s g $ MKSTREAM",
+            "XTRIM s MAXLEN 10",
+            "ZADD z 1 a",
+            "ZINCRBY z 1 a",
+            "ZRANGESTORE d z 0 -1",
+            "ZREM z a",
+            "ZREMRANGEBYRANK z 0 1",
+        ];
+        for line in writes.iter().chain(round_trip.iter()) {
+            let cmd = parse_line(line);
+            assert!(cmd.is_write_command(), "{line} should be a write");
+            assert!(command_to_resp(&cmd).is_some(), "{line} not encoded");
+        }
     }
 
     #[test]

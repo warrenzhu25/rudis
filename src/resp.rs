@@ -1985,9 +1985,52 @@ impl Command {
                         | "XAUTOCLAIM"
                         | "FLUSHDB"
                         | "FLUSHALL"
-                ) || is_write_in_command_table(crate::connection::acl_cmd_name(self))
+                ) || {
+                    let name = crate::connection::acl_cmd_name(self);
+                    // rudis-only families (JSON, BF, FT, ...) share one
+                    // coarse name tagged @write for ACLs, so exclude their
+                    // read-only subcommands.
+                    is_write_in_command_table(name) && !self.is_family_read()
+                }
             }
         }
+    }
+
+    /// Read-only subcommands of the rudis-only command families whose
+    /// shared `acl_cmd_name` is tagged @write (see EXTRA in
+    /// scripts/gen_acl_categories.py).
+    fn is_family_read(&self) -> bool {
+        matches!(
+            self,
+            Command::JsonGet { .. }
+                | Command::JsonType { .. }
+                | Command::JsonStrLen { .. }
+                | Command::JsonArrLen { .. }
+                | Command::JsonObjKeys { .. }
+                | Command::JsonObjLen { .. }
+                | Command::JsonMget { .. }
+                | Command::BfExists { .. }
+                | Command::BfMexists { .. }
+                | Command::BfInfo(_)
+                | Command::CfExists { .. }
+                | Command::CfInfo(_)
+                | Command::CmsQuery { .. }
+                | Command::CmsInfo(_)
+                | Command::TopkQuery { .. }
+                | Command::TopkList(_)
+                | Command::TopkInfo(_)
+                | Command::FtSearch { .. }
+                | Command::FtAggregate { .. }
+                | Command::FtInfo(_)
+                | Command::FtExplain { .. }
+                | Command::FtList
+                | Command::FtProfile { .. }
+                | Command::SemanticGet { .. }
+                | Command::SemanticInfo(_)
+                | Command::CrdtGet(_)
+                | Command::CrdtSmembers(_)
+                | Command::CrdtDump
+        )
     }
 }
 
@@ -13870,6 +13913,10 @@ mod tests {
             "RPOPLPUSH a b",
             "SINTERSTORE d a b",
             "HINCRBY h f 1",
+            "SORT l STORE d",
+            "GEORADIUS g 0 0 1 km STORE d",
+            "JSON.SET j $ 1",
+            "BF.ADD b x",
         ] {
             assert!(parse(line).is_write_command(), "{line}");
         }
@@ -13880,6 +13927,13 @@ mod tests {
             "SMEMBERS s",
             "PING",
             "INFO",
+            "SORT_RO l",
+            "GEORADIUS_RO g 0 0 1 km",
+            "BITFIELD_RO k GET i5 0",
+            "JSON.GET j",
+            "BF.EXISTS b x",
+            "SEMANTIC.GET ns VECTOR 2 0.1 0.2",
+            "FT._LIST",
         ] {
             assert!(!parse(line).is_write_command(), "{line}");
         }

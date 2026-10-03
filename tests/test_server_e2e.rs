@@ -17250,3 +17250,150 @@ fn test_writes_missing_from_hand_list_are_writes_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child);
 }
+
+#[test]
+fn test_blocking_pops_and_rare_writes_replicate_e2e() {
+    let (mport, rport) = (16945u16, 16944u16);
+    let (ms, rs) = (mport.to_string(), rport.to_string());
+    let mut master = spawn_rudis_listening(&["--port", &ms, "--threads", "4", "--no-pin"], mport);
+    let mut replica = spawn_rudis_listening(&["--port", &rs, "--threads", "2", "--no-pin"], rport);
+    let connect = |port: u16| {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        c
+    };
+    let mut m = connect(mport);
+    let mut r = connect(rport);
+    assert_eq!(
+        resp_cmd(&mut r, &["REPLICAOF", "127.0.0.1", &ms]),
+        "+OK\r\n"
+    );
+    let mut role = String::new();
+    for _ in 0..100 {
+        role = resp_cmd(&mut r, &["ROLE"]);
+        if role.contains("connected") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(role.contains("connected"), "{role}");
+
+    // Immediate pops: with 4 shards most keys are owned by another shard than
+    // the connection's, which used to replicate the pop twice.
+    let lists: Vec<String> = (0..8).map(|i| format!("l{i}")).collect();
+    let zsets: Vec<String> = (0..8).map(|i| format!("z{i}")).collect();
+    for (l, z) in lists.iter().zip(&zsets) {
+        resp_cmd(&mut m, &["RPUSH", l, "a", "b", "c", "d", "e"]);
+        resp_cmd(&mut m, &["ZADD", z, "1", "a", "2", "b", "3", "c", "4", "d"]);
+        resp_cmd(&mut m, &["BLPOP", l, "1"]);
+        resp_cmd(&mut m, &["BRPOP", l, "1"]);
+        resp_cmd(&mut m, &["BZPOPMIN", z, "1"]);
+        resp_cmd(&mut m, &["BZPOPMAX", z, "1"]);
+        resp_cmd(&mut m, &["LPUSHX", l, "x"]);
+    }
+    // Blocked pops served by a later push: the block hub pops on the key's
+    // shard and never used to replicate BLPOP/BRPOP.
+    let blocked: Vec<(&str, &str)> = vec![
+        ("BLPOP", "bl"),
+        ("BRPOP", "br"),
+        ("BZPOPMIN", "bz"),
+        ("BZPOPMAX", "bx"),
+    ];
+    let waiters: Vec<_> = blocked
+        .iter()
+        .map(|(cmd, key)| {
+            let (cmd, key) = (cmd.to_string(), key.to_string());
+            thread::spawn(move || {
+                let mut c = connect(mport);
+                resp_cmd(&mut c, &[&cmd, &key, "5"])
+            })
+        })
+        .collect();
+    let mut queued = false;
+    for _ in 0..100 {
+        let info = resp_cmd(&mut m, &["INFO", "clients"]);
+        if info.contains("blocked_clients:4") {
+            queued = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(queued, "waiters never blocked");
+    for key in ["bl", "br"] {
+        resp_cmd(&mut m, &["RPUSH", key, "x", "y", "z"]);
+    }
+    for key in ["bz", "bx"] {
+        resp_cmd(&mut m, &["ZADD", key, "1", "x", "2", "y", "3", "z"]);
+    }
+    for w in waiters {
+        let reply = w.join().unwrap();
+        assert!(reply.starts_with("*"), "{reply}");
+    }
+    // Writes the AOF encoder used to drop.
+    resp_cmd(&mut m, &["SADD", "{s}a", "1", "2", "3"]);
+    resp_cmd(&mut m, &["SADD", "{s}b", "2", "3", "4"]);
+    resp_cmd(&mut m, &["SINTERSTORE", "{s}i", "{s}a", "{s}b"]);
+    resp_cmd(&mut m, &["ZADD", "{z}a", "1", "m", "2", "n"]);
+    resp_cmd(
+        &mut m,
+        &[
+            "ZUNIONSTORE",
+            "{z}u",
+            "2",
+            "{z}a",
+            "{z}a",
+            "WEIGHTS",
+            "1",
+            "2",
+        ],
+    );
+    resp_cmd(
+        &mut m,
+        &["GEOADD", "geo", "13.361389", "38.115556", "Palermo"],
+    );
+    resp_cmd(&mut m, &["SET", "dx", "v"]);
+    resp_cmd(&mut m, &["DELEX", "dx", "IFEQ", "v"]);
+    resp_cmd(&mut m, &["SET", "repl:done", "1"]);
+    let mut synced = false;
+    for _ in 0..100 {
+        if resp_cmd(&mut r, &["GET", "repl:done"]) == "$1\r\n1\r\n" {
+            synced = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(synced, "replica never caught up");
+
+    let mut checks: Vec<Vec<String>> = Vec::new();
+    for l in lists.iter().chain(["bl", "br"].map(String::from).iter()) {
+        checks.push(vec!["LRANGE".into(), l.clone(), "0".into(), "-1".into()]);
+    }
+    for z in zsets
+        .iter()
+        .chain(["bz", "bx", "{z}u"].map(String::from).iter())
+    {
+        checks.push(vec![
+            "ZRANGE".into(),
+            z.clone(),
+            "0".into(),
+            "-1".into(),
+            "WITHSCORES".into(),
+        ]);
+    }
+    checks.push(vec!["SORT_RO".into(), "{s}i".into()]);
+    checks.push(vec!["GEOHASH".into(), "geo".into(), "Palermo".into()]);
+    checks.push(vec!["EXISTS".into(), "dx".into()]);
+    checks.push(vec!["DBSIZE".into()]);
+    for check in &checks {
+        let args: Vec<&str> = check.iter().map(String::as_str).collect();
+        assert_eq!(
+            resp_cmd(&mut m, &args),
+            resp_cmd(&mut r, &args),
+            "{check:?}"
+        );
+    }
+    drop(m);
+    drop(r);
+    shutdown_and_wait(rport, &mut replica);
+    shutdown_and_wait(mport, &mut master);
+}

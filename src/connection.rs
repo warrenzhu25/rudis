@@ -6201,7 +6201,13 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Lrem { .. } => "LREM",
         Command::Lpos { .. } => "LPOS",
         Command::Linsert { .. } => "LINSERT",
-        Command::Sort { .. } => "SORT",
+        Command::Sort { readonly, .. } => {
+            if *readonly {
+                "SORT_RO"
+            } else {
+                "SORT"
+            }
+        }
         Command::Lmove { .. } => "LMOVE",
         Command::Blmove { .. } => "BLMOVE",
         Command::Lmovem { .. } => "LMOVEM",
@@ -6438,7 +6444,19 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Geodist { .. } => "GEODIST",
         Command::Geopos { .. } => "GEOPOS",
         Command::Geohash { .. } => "GEOHASH",
+        // The parser does not keep the _RO spelling; a store-less query is
+        // what GEORADIUS_RO accepts, and is read-only either way.
+        Command::Georadius {
+            store: None,
+            storedist: None,
+            ..
+        } => "GEORADIUS_RO",
         Command::Georadius { .. } => "GEORADIUS",
+        Command::Georadiusbymember {
+            store: None,
+            storedist: None,
+            ..
+        } => "GEORADIUSBYMEMBER_RO",
         Command::Georadiusbymember { .. } => "GEORADIUSBYMEMBER",
         Command::Geosearch { .. } => "GEOSEARCH",
         Command::Geosearchstore { .. } => "GEOSEARCHSTORE",
@@ -7003,7 +7021,11 @@ async fn handle_bzpop(
                                 aof_w.borrow_mut().append(&bytes);
                             }
                             if crate::replication::has_connected_replicas(router.port) {
-                                crate::replication::propagate_bytes(router.port, &bytes);
+                                crate::replication::propagate_shard_bytes(
+                                    router.port,
+                                    router.shard_id,
+                                    &bytes,
+                                );
                             }
                         }
                         popped = Some((k.clone(), m, s));
@@ -7078,26 +7100,8 @@ async fn handle_bzpop(
 
     match recv_res {
         Some(crate::block::BlockedZSetResult::Popped { key, mut items, .. }) => {
+            // The block hub logged and replicated the pop on the key's shard.
             if let Some((m, s)) = items.pop() {
-                let rep_cmd = if is_min {
-                    Command::Zpopmin {
-                        key: key.clone(),
-                        count: Some(1),
-                    }
-                } else {
-                    Command::Zpopmax {
-                        key: key.clone(),
-                        count: Some(1),
-                    }
-                };
-                if let Some(bytes) = crate::aof::command_to_resp(&rep_cmd) {
-                    if let Some(aof_w) = &router.aof {
-                        aof_w.borrow_mut().append(&bytes);
-                    }
-                    if crate::replication::has_connected_replicas(router.port) {
-                        crate::replication::propagate_bytes(router.port, &bytes);
-                    }
-                }
                 format_bzpop_response(out, &key, &m, s);
             } else {
                 write_resp_null_array(out);
@@ -7900,7 +7904,7 @@ async fn execute_command(
 
     if crate::replication::HAS_SLAVE_INSTANCE.load(std::sync::atomic::Ordering::Relaxed)
         && crate::replication::get_replication_hub(router.port).is_slave()
-        && crate::aof::command_to_resp(&cmd).is_some()
+        && (cmd.is_write_command() || crate::aof::command_to_resp(&cmd).is_some())
     {
         out.extend_from_slice(b"-READONLY You can't write against a read only replica.\r\n");
         return false;
@@ -11668,6 +11672,7 @@ async fn execute_command(
         }
         Command::Blpop { keys, timeout } => {
             let mut popped: Option<(Bytes, Bytes)> = None;
+            let mut popped_locally = false;
             for k in &keys {
                 let target = router.target_shard(k);
                 if target == router.shard_id {
@@ -11680,6 +11685,7 @@ async fn execute_command(
                         Ok(mut vals) => {
                             if let Some(v) = vals.pop() {
                                 popped = Some((k.clone(), v));
+                                popped_locally = true;
                                 break;
                             }
                         }
@@ -11710,16 +11716,24 @@ async fn execute_command(
             }
 
             if let Some((k, v)) = popped {
-                let rep_cmd = Command::Lpop {
-                    key: k.clone(),
-                    count: None,
-                };
-                if let Some(bytes) = crate::aof::command_to_resp(&rep_cmd) {
-                    if let Some(aof_w) = &router.aof {
-                        aof_w.borrow_mut().append(&bytes);
-                    }
-                    if crate::replication::has_connected_replicas(router.port) {
-                        crate::replication::propagate_bytes(router.port, &bytes);
+                // A remote pop was already logged and replicated by the owner
+                // shard's execute_local_command; only a local pop needs it here.
+                if popped_locally {
+                    let rep_cmd = Command::Lpop {
+                        key: k.clone(),
+                        count: None,
+                    };
+                    if let Some(bytes) = crate::aof::command_to_resp(&rep_cmd) {
+                        if let Some(aof_w) = &router.aof {
+                            aof_w.borrow_mut().append(&bytes);
+                        }
+                        if crate::replication::has_connected_replicas(router.port) {
+                            crate::replication::propagate_shard_bytes(
+                                router.port,
+                                router.shard_id,
+                                &bytes,
+                            );
+                        }
                     }
                 }
                 out.extend_from_slice(b"*2\r\n$");
@@ -11802,6 +11816,7 @@ async fn execute_command(
         }
         Command::Brpop { keys, timeout } => {
             let mut popped: Option<(Bytes, Bytes)> = None;
+            let mut popped_locally = false;
             for k in &keys {
                 let target = router.target_shard(k);
                 if target == router.shard_id {
@@ -11813,6 +11828,7 @@ async fn execute_command(
                         Ok(mut vals) => {
                             if let Some(v) = vals.pop() {
                                 popped = Some((k.clone(), v));
+                                popped_locally = true;
                                 break;
                             }
                         }
@@ -11843,16 +11859,24 @@ async fn execute_command(
             }
 
             if let Some((k, v)) = popped {
-                let rep_cmd = Command::Rpop {
-                    key: k.clone(),
-                    count: None,
-                };
-                if let Some(bytes) = crate::aof::command_to_resp(&rep_cmd) {
-                    if let Some(aof_w) = &router.aof {
-                        aof_w.borrow_mut().append(&bytes);
-                    }
-                    if crate::replication::has_connected_replicas(router.port) {
-                        crate::replication::propagate_bytes(router.port, &bytes);
+                // A remote pop was already logged and replicated by the owner
+                // shard's execute_local_command; only a local pop needs it here.
+                if popped_locally {
+                    let rep_cmd = Command::Rpop {
+                        key: k.clone(),
+                        count: None,
+                    };
+                    if let Some(bytes) = crate::aof::command_to_resp(&rep_cmd) {
+                        if let Some(aof_w) = &router.aof {
+                            aof_w.borrow_mut().append(&bytes);
+                        }
+                        if crate::replication::has_connected_replicas(router.port) {
+                            crate::replication::propagate_shard_bytes(
+                                router.port,
+                                router.shard_id,
+                                &bytes,
+                            );
+                        }
                     }
                 }
                 out.extend_from_slice(b"*2\r\n$");
@@ -12320,21 +12344,9 @@ async fn execute_command(
 
             match recv_res {
                 Some(crate::block::BlockedListResult::Popped(_, mut vals)) => {
+                    // The block hub logged and replicated the move on the
+                    // key's shard.
                     if let Some(val) = vals.pop() {
-                        let rep_cmd = Command::Lmove {
-                            source: source.clone(),
-                            destination: destination.clone(),
-                            where_from,
-                            where_to,
-                        };
-                        if let Some(bytes) = crate::aof::command_to_resp(&rep_cmd) {
-                            if let Some(aof_w) = &router.aof {
-                                aof_w.borrow_mut().append(&bytes);
-                            }
-                            if crate::replication::has_connected_replicas(router.port) {
-                                crate::replication::propagate_bytes(router.port, &bytes);
-                            }
-                        }
                         write_resp_bulk(out, &val);
                         notify_key_invalidation(router.port, source.as_ref(), client_id);
                         if source != destination {
@@ -12535,24 +12547,8 @@ async fn execute_command(
 
             match recv_res {
                 Some(crate::block::BlockedListResult::Popped(_, vals)) => {
-                    let rep_cmd = Command::Lmovem {
-                        source: source.clone(),
-                        destination: destination.clone(),
-                        where_from,
-                        where_to,
-                        mode: crate::resp::LmovemMode::Exactly,
-                        count: vals.len(),
-                        ordering,
-                        raw_tokens: None,
-                    };
-                    if let Some(bytes) = crate::aof::command_to_resp(&rep_cmd) {
-                        if let Some(aof_w) = &router.aof {
-                            aof_w.borrow_mut().append(&bytes);
-                        }
-                        if crate::replication::has_connected_replicas(router.port) {
-                            crate::replication::propagate_bytes(router.port, &bytes);
-                        }
-                    }
+                    // The block hub logged and replicated the move on the
+                    // key's shard.
                     let samekey = source == destination;
                     let push_event = if where_to == crate::table::ListDirection::Left {
                         "lpush"
@@ -12637,7 +12633,11 @@ async fn execute_command(
                                         aof_w.borrow_mut().append(&bytes);
                                     }
                                     if crate::replication::has_connected_replicas(router.port) {
-                                        crate::replication::propagate_bytes(router.port, &bytes);
+                                        crate::replication::propagate_shard_bytes(
+                                            router.port,
+                                            router.shard_id,
+                                            &bytes,
+                                        );
                                     }
                                 }
                                 popped = Some((k.clone(), vals));
@@ -12733,7 +12733,11 @@ async fn execute_command(
                                         aof_w.borrow_mut().append(&bytes);
                                     }
                                     if crate::replication::has_connected_replicas(router.port) {
-                                        crate::replication::propagate_bytes(router.port, &bytes);
+                                        crate::replication::propagate_shard_bytes(
+                                            router.port,
+                                            router.shard_id,
+                                            &bytes,
+                                        );
                                     }
                                 }
                                 popped = Some((k.clone(), vals));
@@ -12823,24 +12827,8 @@ async fn execute_command(
 
             match recv_res {
                 Some(crate::block::BlockedListResult::Popped(k, vals)) => {
-                    let rep_cmd = match where_from {
-                        crate::table::ListDirection::Left => Command::Lpop {
-                            key: k.clone(),
-                            count: Some(vals.len()),
-                        },
-                        crate::table::ListDirection::Right => Command::Rpop {
-                            key: k.clone(),
-                            count: Some(vals.len()),
-                        },
-                    };
-                    if let Some(bytes) = crate::aof::command_to_resp(&rep_cmd) {
-                        if let Some(aof_w) = &router.aof {
-                            aof_w.borrow_mut().append(&bytes);
-                        }
-                        if crate::replication::has_connected_replicas(router.port) {
-                            crate::replication::propagate_bytes(router.port, &bytes);
-                        }
-                    }
+                    // The block hub logged and replicated the pop on the
+                    // key's shard.
                     out.extend_from_slice(b"*2\r\n$");
                     out.extend_from_slice(k.len().to_string().as_bytes());
                     out.extend_from_slice(b"\r\n");
@@ -12919,7 +12907,11 @@ async fn execute_command(
                                         aof_w.borrow_mut().append(&bytes);
                                     }
                                     if crate::replication::has_connected_replicas(router.port) {
-                                        crate::replication::propagate_bytes(router.port, &bytes);
+                                        crate::replication::propagate_shard_bytes(
+                                            router.port,
+                                            router.shard_id,
+                                            &bytes,
+                                        );
                                     }
                                 }
                                 popped = Some((k.clone(), items));
@@ -13002,7 +12994,11 @@ async fn execute_command(
                                         aof_w.borrow_mut().append(&bytes);
                                     }
                                     if crate::replication::has_connected_replicas(router.port) {
-                                        crate::replication::propagate_bytes(router.port, &bytes);
+                                        crate::replication::propagate_shard_bytes(
+                                            router.port,
+                                            router.shard_id,
+                                            &bytes,
+                                        );
                                     }
                                 }
                                 popped = Some((k.clone(), items));
@@ -13078,25 +13074,8 @@ async fn execute_command(
 
             match recv_res {
                 Some(crate::block::BlockedZSetResult::Popped { key, items, .. }) => {
-                    let rep_cmd = if is_min {
-                        Command::Zpopmin {
-                            key: key.clone(),
-                            count: Some(items.len()),
-                        }
-                    } else {
-                        Command::Zpopmax {
-                            key: key.clone(),
-                            count: Some(items.len()),
-                        }
-                    };
-                    if let Some(bytes) = crate::aof::command_to_resp(&rep_cmd) {
-                        if let Some(aof_w) = &router.aof {
-                            aof_w.borrow_mut().append(&bytes);
-                        }
-                        if crate::replication::has_connected_replicas(router.port) {
-                            crate::replication::propagate_bytes(router.port, &bytes);
-                        }
-                    }
+                    // The block hub logged and replicated the pop on the
+                    // key's shard.
                     format_zmpop_response(out, &key, &items);
                 }
                 Some(crate::block::BlockedZSetResult::Unblocked(
@@ -13322,7 +13301,12 @@ async fn execute_command(
             let del_cmd = Command::Del(smallvec::smallvec![dst.clone()]);
             if dst_target == router.shard_id {
                 let mut tmp = Vec::new();
-                execute_local_command(&del_cmd, &mut router.local_db.borrow_mut(), &mut tmp, None);
+                execute_local_command(
+                    &del_cmd,
+                    &mut router.local_db.borrow_mut(),
+                    &mut tmp,
+                    router.aof.as_deref(),
+                );
             } else {
                 let _ = router.execute_remote(dst_target, del_cmd).await;
             }
@@ -13673,7 +13657,12 @@ async fn execute_command(
             let del_cmd = Command::Del(smallvec::smallvec![destination.clone()]);
             if dest_target == router.shard_id {
                 let mut tmp = Vec::new();
-                execute_local_command(&del_cmd, &mut router.local_db.borrow_mut(), &mut tmp, None);
+                execute_local_command(
+                    &del_cmd,
+                    &mut router.local_db.borrow_mut(),
+                    &mut tmp,
+                    router.aof.as_deref(),
+                );
             } else {
                 let _ = router.execute_remote(dest_target, del_cmd).await;
             }
@@ -13968,7 +13957,12 @@ async fn execute_command(
             let del_cmd = Command::Del(smallvec::smallvec![destination.clone()]);
             if dest_target == router.shard_id {
                 let mut tmp = Vec::new();
-                execute_local_command(&del_cmd, &mut router.local_db.borrow_mut(), &mut tmp, None);
+                execute_local_command(
+                    &del_cmd,
+                    &mut router.local_db.borrow_mut(),
+                    &mut tmp,
+                    router.aof.as_deref(),
+                );
             } else {
                 let _ = router.execute_remote(dest_target, del_cmd).await;
             }
