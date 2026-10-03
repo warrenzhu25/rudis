@@ -11001,6 +11001,8 @@ fn test_per_shard_parallel_replication_stream_e2e() {
     };
 
     let mut ctrl = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    // Fail instead of hanging the whole serial run if a reply never comes.
+    ctrl.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
     // 1. Handshake with REPLCONF capa dragonfly
     let capa_cmd = format_resp_cmd(&["REPLCONF", "capa", "dragonfly"]);
@@ -11018,6 +11020,9 @@ fn test_per_shard_parallel_replication_stream_e2e() {
     let mut flows = Vec::new();
     for sid in 0..num_shards {
         let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
         let sid_str = sid.to_string();
         let flow_cmd = format_resp_cmd(&["DFLY", "FLOW", "mock_replid", "SYNC1", &sid_str]);
         let resp = send_and_read(&mut stream, &flow_cmd);
@@ -11050,6 +11055,9 @@ fn test_per_shard_parallel_replication_stream_e2e() {
     }
 
     let mut client = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
 
     // 4. Write key_shard0
     let set_cmd0 = format_resp_cmd(&["SET", &key_shard0, "val0"]);
@@ -16602,6 +16610,59 @@ fn test_info_stats_counts_keyspace_hits_and_misses_e2e() {
 
     assert_eq!(resp_cmd(&mut c, &["CONFIG", "RESETSTAT"]), "+OK\r\n");
     assert_eq!(hits_misses(&mut c), (0.0, 0.0));
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}
+
+#[test]
+fn test_get_getex_lcs_on_non_string_key_return_wrongtype_e2e() {
+    let port = 16955;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    const WRONGTYPE: &str =
+        "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+    // Enough keys to land on the connection's own shard and on the other one.
+    let keys: Vec<String> = (0..8).map(|i| format!("wt:{i}")).collect();
+    for k in &keys {
+        assert_eq!(resp_cmd(&mut c, &["RPUSH", k, "a"]), ":1\r\n");
+        assert_eq!(resp_cmd(&mut c, &["GET", k]), WRONGTYPE, "GET {k}");
+        assert_eq!(resp_cmd(&mut c, &["GETEX", k]), WRONGTYPE, "GETEX {k}");
+        assert_eq!(resp_cmd(&mut c, &["LCS", k, "nokey"]), WRONGTYPE, "LCS {k}");
+        assert_eq!(resp_cmd(&mut c, &["GETEX", k, "EX", "100"]), WRONGTYPE);
+        // The failed GETEX must not have set a TTL.
+        assert_eq!(resp_cmd(&mut c, &["TTL", k]), ":-1\r\n");
+    }
+    // Pipelined GETs take the batched path.
+    let mut pipeline = String::new();
+    for k in &keys {
+        pipeline.push_str(&format!("*2\r\n$3\r\nGET\r\n${}\r\n{k}\r\n", k.len()));
+    }
+    assert_eq!(resp_cmd_full(&mut c, &["GET", "wt:0"]), WRONGTYPE);
+    pipeline.push_str("*1\r\n$4\r\nPING\r\n");
+    c.write_all(pipeline.as_bytes()).unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !got.ends_with(b"+PONG\r\n") {
+        let n = c.read(&mut buf).unwrap();
+        assert!(n > 0, "connection closed");
+        got.extend_from_slice(&buf[..n]);
+    }
+    assert_eq!(
+        String::from_utf8(got).unwrap(),
+        WRONGTYPE.repeat(keys.len()) + "+PONG\r\n"
+    );
+    // MGET reports non-string keys as nil, like Redis.
+    assert_eq!(
+        resp_cmd(&mut c, &["MGET", "wt:0", "wt:1"]),
+        "*2\r\n$-1\r\n$-1\r\n"
+    );
+    // Strings and missing keys are unaffected.
+    assert_eq!(resp_cmd(&mut c, &["SET", "s", "v"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "s"]), "$1\r\nv\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GETEX", "s"]), "$1\r\nv\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "nokey"]), "$-1\r\n");
     drop(c);
     shutdown_and_wait(port, &mut child);
 }

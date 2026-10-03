@@ -808,6 +808,17 @@ impl ShardDb {
         self.table.get(key).ok().flatten()
     }
 
+    /// GET semantics: like [`ShardDb::get`] but a key holding another type
+    /// is a WRONGTYPE error. A tiered key reads as `Ok(None)`; callers load
+    /// it from the cold tier.
+    #[inline(always)]
+    pub fn get_checked(&mut self, key: &[u8]) -> Result<Option<Bytes>, &'static str> {
+        match self.table.get(key) {
+            Err(_) if self.table.is_tiered(key).is_some() => Ok(None),
+            res => res,
+        }
+    }
+
     #[inline(always)]
     pub fn get_with_hash(&mut self, key: &[u8], h: u64) -> Option<Bytes> {
         self.table.get_with_hash(key, h).ok().flatten()

@@ -275,6 +275,9 @@ impl ScatterMsetDescriptor {
 pub struct FastGetDescriptor {
     pub key: Bytes,
     pub val: CachePadded<UnsafeCell<Option<Bytes>>>,
+    /// Set by [`FastGetDescriptor::finish_wrong_type`]: the key holds a
+    /// non-string value.
+    pub wrong_type: AtomicBool,
     pub done: AtomicBool,
     pub notify: flume::Sender<()>,
 }
@@ -288,9 +291,17 @@ impl FastGetDescriptor {
         Self {
             key,
             val: CachePadded(UnsafeCell::new(None)),
+            wrong_type: AtomicBool::new(false),
             done: AtomicBool::new(false),
             notify,
         }
+    }
+
+    /// Completes the GET with a WRONGTYPE error.
+    #[inline(always)]
+    pub fn finish_wrong_type(&self) {
+        self.wrong_type.store(true, Ordering::Relaxed);
+        self.finish(None);
     }
 
     #[inline(always)]

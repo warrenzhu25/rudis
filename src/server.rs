@@ -424,9 +424,11 @@ pub fn run_shard_worker(
                         let _ = responder.send(());
                     }
                     ShardMessage::FastGet { descriptor } => {
-                        let val = cross_shard_db.borrow_mut().get(&descriptor.key);
-                        if let Some(v) = val {
+                        let val = cross_shard_db.borrow_mut().get_checked(&descriptor.key);
+                        if let Ok(Some(v)) = val {
                             descriptor.finish(Some(v));
+                        } else if val.is_err() {
+                            descriptor.finish_wrong_type();
                         } else if cross_shard_db.borrow_mut().table.is_tiered(&descriptor.key).is_some() {
                             let r = cross_shard_router.clone();
                             monoio::spawn(async move {

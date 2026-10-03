@@ -149,6 +149,8 @@ pub struct MsetInFlight {
     notify_rx: flume::Receiver<()>,
 }
 
+const WRONGTYPE_ERR: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
+
 /// The router handles dispatching operations.
 /// If the key belongs to the current shard, it directly touches `local_db` without locking.
 /// If the key belongs to a peer shard, it routes the message across cores via the mesh.
@@ -863,9 +865,31 @@ impl Router {
     }
 
     pub async fn get(&self, key: Bytes) -> Option<Bytes> {
+        self.get_checked(key).await.unwrap_or(None)
+    }
+
+    /// Local half of [`Router::get_checked`].
+    #[inline(always)]
+    pub async fn get_local_checked(&self, key: &Bytes) -> Result<Option<Bytes>, &'static str> {
+        let val = self.local_db.borrow_mut().get_checked(key)?;
+        if let Some(v) = val {
+            self.tier_stats.ram_hits.fetch_add(1, Ordering::Relaxed);
+            return Ok(Some(v));
+        }
+        if self.local_db.borrow().tier_manager.is_some()
+            && self.local_db.borrow_mut().table.is_tiered(key).is_some()
+        {
+            return Ok(self.read_cold_key_local(key).await);
+        }
+        Ok(None)
+    }
+
+    /// GET with Redis semantics: a key holding another type is a WRONGTYPE
+    /// error rather than a missing key.
+    pub async fn get_checked(&self, key: Bytes) -> Result<Option<Bytes>, &'static str> {
         let target = self.target_shard(&key);
         if target == self.shard_id {
-            self.get_local_direct(&key).await
+            self.get_local_checked(&key).await
         } else {
             let (tx, rx) = self.acquire_notify_channel();
             let desc = Arc::new(crate::mailbox::FastGetDescriptor::new(key, tx.clone()));
@@ -885,9 +909,13 @@ impl Router {
                     }
                 }
                 while rx.try_recv().is_ok() {}
-                unsafe { (*desc.val.get()).take() }
+                if desc.wrong_type.load(Ordering::Relaxed) {
+                    Err(WRONGTYPE_ERR)
+                } else {
+                    Ok(unsafe { (*desc.val.get()).take() })
+                }
             } else {
-                None
+                Ok(None)
             };
             self.release_notify_channel(tx, rx);
             res

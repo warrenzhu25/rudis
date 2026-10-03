@@ -7924,29 +7924,19 @@ async fn execute_command(
         Command::Get(key) => {
             let target = target_shard(&key, router.num_shards);
             let val = if target == router.shard_id {
-                let local_val = router.local_db.borrow_mut().get(&key);
-                if let Some(v) = local_val {
-                    router
-                        .tier_stats
-                        .ram_hits
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    Some(v)
-                } else if router.local_db.borrow_mut().table.is_tiered(&key).is_none() {
-                    None
-                } else {
-                    router.get(key.clone()).await
-                }
+                router.get_local_checked(&key).await
             } else {
-                router.get(key.clone()).await
+                router.get_checked(key.clone()).await
             };
             record_client_read(router.port, client_id, key.as_ref());
             match val {
-                Some(v) => {
+                Ok(Some(v)) => {
                     write_resp_bulk(out, &v);
                 }
-                None => {
+                Ok(None) => {
                     write_resp_null(out);
                 }
+                Err(err) => write_resp_err(out, err),
             }
             false
         }
@@ -7956,7 +7946,13 @@ async fn execute_command(
             persist,
         } => {
             record_client_read(router.port, client_id, key.as_ref());
-            let val = router.get(key.clone()).await;
+            let val = match router.get_checked(key.clone()).await {
+                Ok(val) => val,
+                Err(err) => {
+                    write_resp_err(out, err);
+                    return false;
+                }
+            };
             match val {
                 Some(v) => {
                     let ttl_change = if persist {
@@ -8328,14 +8324,17 @@ async fn execute_command(
             min_match_len,
             with_match_len,
         } => {
-            let val1 = match router.get(key1).await {
-                Some(v) => v,
-                None => Bytes::new(),
-            };
-            let val2 = match router.get(key2).await {
-                Some(v) => v,
-                None => Bytes::new(),
-            };
+            let mut vals = [Bytes::new(), Bytes::new()];
+            for (val, key) in vals.iter_mut().zip([key1, key2]) {
+                match router.get_checked(key).await {
+                    Ok(v) => *val = v.unwrap_or_default(),
+                    Err(err) => {
+                        write_resp_err(out, err);
+                        return false;
+                    }
+                }
+            }
+            let [val1, val2] = vals;
             let s1 = val1.as_ref();
             let s2 = val2.as_ref();
             let m = s1.len();
@@ -16627,13 +16626,14 @@ pub fn execute_local_command(
     }
     match cmd {
         Command::Get(key) => {
-            match db.get(key) {
-                Some(v) => {
+            match db.get_checked(key) {
+                Ok(Some(v)) => {
                     write_resp_bulk(out, &v);
                 }
-                None => {
+                Ok(None) => {
                     out.extend_from_slice(b"$-1\r\n");
                 }
+                Err(err) => write_resp_err(out, err),
             }
             false
         }
@@ -16642,7 +16642,13 @@ pub fn execute_local_command(
             expire_in,
             persist,
         } => {
-            let val = db.get(key.as_ref());
+            let val = match db.get_checked(key.as_ref()) {
+                Ok(val) => val,
+                Err(err) => {
+                    write_resp_err(out, err);
+                    return false;
+                }
+            };
             match val {
                 Some(v) => {
                     let ttl_change = if *persist {
