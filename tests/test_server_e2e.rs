@@ -17527,6 +17527,87 @@ fn test_blocking_pops_and_rare_writes_replicate_e2e() {
 }
 
 #[test]
+fn test_replica_output_buffer_limit_disconnects_stuck_replica_e2e() {
+    use std::io::{Read, Write};
+    let port = 16936u16;
+    let ps = port.to_string();
+    let mut master = spawn_rudis_listening(&["--port", &ps, "--threads", "2", "--no-pin"], port);
+    let mut m = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    assert_eq!(
+        resp_cmd(
+            &mut m,
+            &[
+                "CONFIG",
+                "SET",
+                "client-output-buffer-limit",
+                "replica 1mb 0 0"
+            ]
+        ),
+        "+OK\r\n"
+    );
+
+    // A replica that takes the snapshot and then stops reading.
+    let mut stuck = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stuck
+        .write_all(b"*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n")
+        .unwrap();
+    stuck
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut head = [0u8; 64];
+    let n = stuck.read(&mut head).unwrap();
+    assert!(head[..n].starts_with(b"+FULLRESYNC"), "{:?}", &head[..n]);
+    let mut connected = false;
+    for _ in 0..100 {
+        if resp_cmd(&mut m, &["INFO", "replication"]).contains("connected_slaves:1") {
+            connected = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(connected);
+
+    // Far more stream than the limit plus what the sockets can hold.
+    let value = "v".repeat(256 * 1024);
+    for i in 0..256 {
+        assert_eq!(
+            resp_cmd(&mut m, &["SET", &format!("big:{i}"), &value]),
+            "+OK\r\n"
+        );
+    }
+
+    let mut stats = String::new();
+    let mut dropped = false;
+    for _ in 0..250 {
+        stats = resp_cmd(&mut m, &["INFO", "stats"]);
+        if stats.contains("client_output_buffer_limit_disconnections:1") {
+            dropped = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(dropped, "{stats}");
+    let info = resp_cmd(&mut m, &["INFO", "replication"]);
+    assert!(info.contains("connected_slaves:0"), "{info}");
+
+    // The stuck replica sees the link closed once it drains it.
+    let mut buf = vec![0u8; 1 << 20];
+    let mut drained = 0usize;
+    loop {
+        match stuck.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => drained += n,
+        }
+    }
+    assert!(drained < 64 << 20, "{drained}");
+    // The master keeps serving.
+    assert_eq!(resp_cmd(&mut m, &["PING"]), "+PONG\r\n");
+    let _ = master.kill();
+    let _ = master.wait();
+}
+
+#[test]
 fn test_full_sync_under_concurrent_writes_matches_master_e2e() {
     use std::sync::atomic::{AtomicBool, Ordering};
     let (mport, rport) = (16943u16, 16942u16);

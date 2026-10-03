@@ -32,9 +32,11 @@ pub enum Stat {
     SyncPartialOk,
     /// PSYNC requests for a partial resync that needed a full one.
     SyncPartialErr,
+    /// Clients disconnected for breaking client-output-buffer-limit.
+    ClientOutputBufferLimitDisconnections,
 }
 
-const NUM_STATS: usize = 10;
+const NUM_STATS: usize = 11;
 
 #[repr(align(128))]
 struct Slot {
@@ -106,6 +108,7 @@ const ALL: [Stat; NUM_STATS] = [
     Stat::SyncFull,
     Stat::SyncPartialOk,
     Stat::SyncPartialErr,
+    Stat::ClientOutputBufferLimitDisconnections,
 ];
 
 /// Restarts every counter from zero (CONFIG RESETSTAT).

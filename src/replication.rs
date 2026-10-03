@@ -34,6 +34,33 @@ pub struct ConnectedReplica {
     /// A wakeup is queued on `sender` and the writer has not taken
     /// `pending` since, so appenders need not queue another.
     wake_queued: AtomicBool,
+    /// Bytes the writer took from `pending` and is still writing.
+    inflight: std::sync::atomic::AtomicUsize,
+    /// Set once the buffered stream broke `client-output-buffer-limit
+    /// replica`; nothing more is buffered and the writer drops the link.
+    overflowed: AtomicBool,
+    /// When the buffered stream last went above the soft limit (ms since
+    /// `limit_clock_ms`'s epoch, 0 while below it).
+    soft_since_ms: AtomicU64,
+    /// The replica's socket while its connection owns it, so breaking the
+    /// output limit can drop the link even while the writer is blocked.
+    conn_fd: Mutex<Option<i32>>,
+}
+
+/// Below this many buffered bytes the output limits are not looked up.
+const OUTPUT_LIMIT_CHECK_MIN: usize = 64 * 1024;
+
+#[cfg(test)]
+thread_local! {
+    /// Replica output limit for tests on this thread, instead of the
+    /// process-wide config.
+    static TEST_REPLICA_LIMIT: std::cell::Cell<Option<crate::connection::BufferLimit>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn limit_clock_ms() -> u64 {
+    static EPOCH: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+    EPOCH.elapsed().as_millis() as u64 + 1
 }
 
 /// Per-shard cut of the replication stream for a replica in full sync.
@@ -76,17 +103,126 @@ impl ConnectedReplica {
     /// Appends stream bytes; returns true when the caller must wake the
     /// writer (after releasing the backlog lock).
     fn append_pending(&self, bytes: &[u8]) -> bool {
-        self.pending.lock().unwrap().extend_from_slice(bytes);
+        if self.overflowed.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut pending = self.pending.lock().unwrap();
+        pending.extend_from_slice(bytes);
+        let buffered = pending.len() + self.inflight.load(Ordering::Relaxed);
+        if self.over_output_limit(buffered) {
+            *pending = Vec::new();
+            drop(pending);
+            // Always wake, so the writer notices and drops the link.
+            self.wake_queued.store(true, Ordering::Release);
+            return true;
+        }
+        drop(pending);
         !self.wake_queued.swap(true, Ordering::AcqRel)
     }
 
+    /// Buffers bytes that must follow the full-sync snapshot; returns true
+    /// when this broke the output limit.
+    fn append_pre(&self, cut: &FullSyncCut, bytes: &[u8]) -> bool {
+        if self.overflowed.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut pre = cut.pre.lock().unwrap();
+        pre.extend_from_slice(bytes);
+        if self.over_output_limit(pre.len()) {
+            *pre = Vec::new();
+            return true;
+        }
+        false
+    }
+
+    /// Checks `buffered` bytes against `client-output-buffer-limit replica`
+    /// and marks the replica overflowed when it breaks the hard limit, or
+    /// stays above the soft limit for the configured seconds.
+    fn over_output_limit(&self, buffered: usize) -> bool {
+        if buffered < OUTPUT_LIMIT_CHECK_MIN {
+            if self.soft_since_ms.load(Ordering::Relaxed) != 0 {
+                self.soft_since_ms.store(0, Ordering::Relaxed);
+            }
+            return false;
+        }
+        #[cfg(test)]
+        if let Some(limit) = TEST_REPLICA_LIMIT.with(|l| l.get()) {
+            return self.over_limit(buffered, limit);
+        }
+        let limit = crate::connection::get_client_output_buffer_limit(
+            crate::connection::ClientClass::Replica,
+        );
+        self.over_limit(buffered, limit)
+    }
+
+    fn over_limit(&self, buffered: usize, limit: crate::connection::BufferLimit) -> bool {
+        let used = buffered as u64;
+        let over = if limit.hard_limit > 0 && used >= limit.hard_limit {
+            true
+        } else if limit.soft_limit > 0 && used >= limit.soft_limit {
+            let now = limit_clock_ms();
+            let since = self.soft_since_ms.load(Ordering::Relaxed);
+            if since == 0 {
+                self.soft_since_ms.store(now, Ordering::Relaxed);
+                limit.soft_seconds == 0
+            } else {
+                now.saturating_sub(since) >= limit.soft_seconds.saturating_mul(1000)
+            }
+        } else {
+            if self.soft_since_ms.load(Ordering::Relaxed) != 0 {
+                self.soft_since_ms.store(0, Ordering::Relaxed);
+            }
+            false
+        };
+        if over {
+            self.overflowed.store(true, Ordering::Release);
+        }
+        over
+    }
+
+    /// Lets `drop_link` shut down `fd`. Call `detach_fd` before the
+    /// socket closes, so a reused fd number is never shut down.
+    pub fn attach_fd(&self, fd: i32) {
+        let mut slot = self.conn_fd.lock().unwrap();
+        *slot = Some(fd);
+        if self.is_overflowed() {
+            unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+        }
+    }
+
+    pub fn detach_fd(&self) {
+        *self.conn_fd.lock().unwrap() = None;
+    }
+
+    /// Shuts the replica's socket down; its writer and reader then fail
+    /// and the replica reconnects.
+    pub fn drop_link(&self) {
+        if let Some(fd) = *self.conn_fd.lock().unwrap() {
+            unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+        }
+    }
+
+    /// True once the replica broke its output buffer limit.
+    pub fn is_overflowed(&self) -> bool {
+        self.overflowed.load(Ordering::Acquire)
+    }
+
     /// Takes everything appended so far. The writer task calls this on each
-    /// wakeup; an empty result just means a coalesced wakeup.
+    /// wakeup; an empty result just means a coalesced wakeup. The taken
+    /// bytes count against the output limit until `finish_write`.
     pub fn take_pending(&self) -> Vec<u8> {
         // Clear the flag first: an append racing with the take then either
         // lands in this batch or queues a new wakeup.
         self.wake_queued.store(false, Ordering::Release);
-        std::mem::take(&mut *self.pending.lock().unwrap())
+        let mut pending = self.pending.lock().unwrap();
+        let data = std::mem::take(&mut *pending);
+        self.inflight.store(data.len(), Ordering::Relaxed);
+        data
+    }
+
+    /// The writer finished writing the batch from `take_pending`.
+    pub fn finish_write(&self) {
+        self.inflight.store(0, Ordering::Relaxed);
     }
 }
 
@@ -353,6 +489,10 @@ impl ReplicationHub {
             full_sync,
             pending: Mutex::new(Vec::new()),
             wake_queued: AtomicBool::new(false),
+            inflight: std::sync::atomic::AtomicUsize::new(0),
+            overflowed: AtomicBool::new(false),
+            soft_since_ms: AtomicU64::new(0),
+            conn_fd: Mutex::new(None),
         });
         self.replicas.write().unwrap().insert(id, rep.clone());
         self.has_replicas.store(true, Ordering::Release);
@@ -618,13 +758,21 @@ impl ReplicationHub {
                                 }
                             }
                             Delivery::Buffer => {
-                                if let Some(cut) = &rep.full_sync {
-                                    cut.pre.lock().unwrap().extend_from_slice(bytes);
+                                if let Some(cut) = &rep.full_sync
+                                    && rep.append_pre(cut, bytes)
+                                {
+                                    wake.push(rep.clone());
                                 }
                             }
                             Delivery::Skip => {}
                         }
                     }
+                }
+            }
+            for rep in &wake {
+                if rep.is_overflowed() {
+                    // The writer may be blocked on the full socket.
+                    rep.drop_link();
                 }
             }
             let dead: Vec<u64> = wake
@@ -1550,6 +1698,77 @@ mod tests {
             hub.try_partial_resync(8, tx2, &replid, now as i64)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn test_replica_output_limit_hard_and_soft() {
+        use crate::connection::BufferLimit;
+        let hub = ReplicationHub::new(19995);
+        let replid = hub.master_replid.clone();
+        let (tx, _rx) = flume::unbounded();
+        let (_, _, rep) = hub.try_partial_resync(1, tx, &replid, 0).unwrap();
+        let limit = BufferLimit::new(1000, 500, 1);
+        assert!(!rep.over_limit(499, limit));
+        // Above the soft limit: allowed for soft_seconds, then not.
+        assert!(!rep.over_limit(600, limit));
+        assert!(!rep.over_limit(700, limit));
+        std::thread::sleep(std::time::Duration::from_millis(1050));
+        assert!(rep.over_limit(700, limit));
+        assert!(rep.is_overflowed());
+
+        let (tx, _rx) = flume::unbounded();
+        let (_, _, rep) = hub.try_partial_resync(2, tx, &replid, 0).unwrap();
+        // Dropping below the soft limit restarts the soft timer.
+        assert!(!rep.over_limit(600, limit));
+        assert!(!rep.over_limit(100, limit));
+        assert_eq!(rep.soft_since_ms.load(Ordering::Relaxed), 0);
+        assert!(rep.over_limit(1000, limit));
+        // 0 disables a limit.
+        let (tx, _rx) = flume::unbounded();
+        let (_, _, rep) = hub.try_partial_resync(3, tx, &replid, 0).unwrap();
+        assert!(!rep.over_limit(usize::MAX / 2, BufferLimit::new(0, 0, 0)));
+        // soft_seconds 0: over the soft limit at all is too much.
+        assert!(rep.over_limit(600, BufferLimit::new(0, 500, 0)));
+    }
+
+    #[test]
+    fn test_replica_over_output_limit_stops_buffering() {
+        let hub = ReplicationHub::new(19994);
+        let replid = hub.master_replid.clone();
+        let (tx, rx) = flume::unbounded();
+        let (_, _, rep) = hub.try_partial_resync(1, tx, &replid, 0).unwrap();
+        TEST_REPLICA_LIMIT
+            .with(|l| l.set(Some(crate::connection::BufferLimit::new(4 << 20, 0, 0))));
+        // The writer is stuck, so the stream piles up past the hard limit.
+        let chunk = vec![b'x'; 1 << 20];
+        for _ in 0..5 {
+            hub.propagate(&chunk);
+        }
+        assert!(rep.is_overflowed());
+        assert!(rep.pending.lock().unwrap().capacity() < (1 << 20));
+        // The writer was woken to drop the link.
+        assert!(rx.try_iter().count() >= 2);
+        hub.propagate(b"more");
+        assert!(rep.take_pending().is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_full_sync_buffer_counts_against_output_limit() {
+        let hub = ReplicationHub::new(19993);
+        let (tx, rx) = flume::unbounded();
+        let rep = hub.register_full_sync_replica(9, tx, 1);
+        hub.arm_full_sync(9, 0);
+        TEST_REPLICA_LIMIT
+            .with(|l| l.set(Some(crate::connection::BufferLimit::new(4 << 20, 0, 0))));
+        let chunk = vec![b'x'; 1 << 20];
+        for _ in 0..5 {
+            hub.propagate_shard(0, &chunk);
+        }
+        assert!(rep.is_overflowed());
+        assert!(rx.try_recv().is_ok());
+        let (_, pre) = hub.finish_full_sync(9);
+        assert!(pre.is_empty());
     }
 
     #[test]

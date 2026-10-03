@@ -4016,12 +4016,20 @@ async fn run_pubsub_loop(
 
             let ps_limits = get_client_output_buffer_limit(ClientClass::Pubsub);
             if ps_limits.hard_limit > 0 && queued_bytes as u64 >= ps_limits.hard_limit {
+                crate::server_stats::add(
+                    crate::server_stats::Stat::ClientOutputBufferLimitDisconnections,
+                    1,
+                );
                 break;
             }
             if ps_limits.soft_limit > 0 && queued_bytes as u64 >= ps_limits.soft_limit {
                 let now = Instant::now();
                 if let Some(st) = soft_start {
                     if now.duration_since(st).as_secs() >= ps_limits.soft_seconds {
+                        crate::server_stats::add(
+                            crate::server_stats::Stat::ClientOutputBufferLimitDisconnections,
+                            1,
+                        );
                         break;
                     }
                 } else {
@@ -4721,6 +4729,17 @@ async fn run_pubsub_loop(
     }
 }
 
+fn replica_output_limit_reached(client_id: u64) {
+    crate::server_stats::add(
+        crate::server_stats::Stat::ClientOutputBufferLimitDisconnections,
+        1,
+    );
+    eprintln!(
+        "Client id={} flags=S closed for overcoming of output buffer limits.",
+        client_id
+    );
+}
+
 async fn run_master_replica_stream(
     stream: TcpStream,
     client_id: u64,
@@ -4729,6 +4748,7 @@ async fn run_master_replica_stream(
     psync_cmd: Command,
 ) {
     let hub = crate::replication::get_replication_hub(router.port);
+    let raw_fd = std::os::unix::io::AsRawFd::as_raw_fd(&stream);
     let (mut reader, mut writer) = stream.into_split();
     let (write_tx, write_rx) = flume::unbounded::<Vec<u8>>();
 
@@ -4765,6 +4785,11 @@ async fn run_master_replica_stream(
             repl = hub.register_full_sync_replica(client_id, write_tx.clone(), router.num_shards);
             let rdb = router.generate_full_rdb(Some(client_id)).await;
             let (offset, after_snapshot) = hub.finish_full_sync(client_id);
+            if repl.is_overflowed() {
+                replica_output_limit_reached(client_id);
+                hub.unregister_replica(client_id);
+                return;
+            }
 
             let replid = hub.master_replid.clone();
             let mut initial_msg =
@@ -4781,6 +4806,11 @@ async fn run_master_replica_stream(
         repl = hub.register_full_sync_replica(client_id, write_tx.clone(), router.num_shards);
         let rdb = router.generate_full_rdb(Some(client_id)).await;
         let (_, after_snapshot) = hub.finish_full_sync(client_id);
+        if repl.is_overflowed() {
+            replica_output_limit_reached(client_id);
+            hub.unregister_replica(client_id);
+            return;
+        }
         let mut initial_msg = format!("${}\r\n", rdb.len()).into_bytes();
         initial_msg.extend_from_slice(&rdb);
         initial_msg.extend_from_slice(b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n");
@@ -4791,19 +4821,33 @@ async fn run_master_replica_stream(
         }
     }
 
+    repl.attach_fd(raw_fd);
+    let reader_repl = repl.clone();
     let writer_hub = hub.clone();
     monoio::spawn(async move {
         // Each wakeup carries no data: everything queued since the last one
         // is in the replica's pending buffer and goes out in one write.
         while write_rx.recv_async().await.is_ok() {
+            if repl.is_overflowed() {
+                break;
+            }
             let data = repl.take_pending();
             if data.is_empty() {
                 continue;
             }
-            if writer.write_all(data).await.0.is_err() {
+            let failed = writer.write_all(data).await.0.is_err();
+            repl.finish_write();
+            if failed {
                 break;
             }
         }
+        if repl.is_overflowed() {
+            // Like Redis, drop the link; the replica reconnects and
+            // resyncs. Shutting the socket down also ends the reader.
+            replica_output_limit_reached(client_id);
+            repl.drop_link();
+        }
+        repl.detach_fd();
         writer_hub.unregister_replica(client_id);
     });
 
@@ -4839,6 +4883,7 @@ async fn run_master_replica_stream(
             Err(_) => break,
         }
     }
+    reader_repl.detach_fd();
     hub.unregister_replica(client_id);
 }
 
@@ -8869,7 +8914,7 @@ async fn execute_command(
             let pubsub_patterns = router.pubsub_numpat().await;
             let pubsubshard_channels = router.pubsub_shardchannels(None).await.len();
             let stats_str = format!(
-                "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\ninstantaneous_ops_per_sec:{}\r\ntotal_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\ninstantaneous_input_kbps:{:.2}\r\ninstantaneous_output_kbps:{:.2}\r\nrejected_connections:{}\r\nsync_full:{}\r\nsync_partial_ok:{}\r\nsync_partial_err:{}\r\nexpired_keys:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nkeyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\npubsubshard_channels:{}\r\nlatest_fork_usec:0\r\ntotal_error_replies:{}\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\nmigrate_cached_sockets:0\r\ntracking_total_items:{}\r\ntracking_total_keys:{}\r\ntracking_total_prefixes:{}\r\n",
+                "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\ninstantaneous_ops_per_sec:{}\r\ntotal_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\ninstantaneous_input_kbps:{:.2}\r\ninstantaneous_output_kbps:{:.2}\r\nrejected_connections:{}\r\nsync_full:{}\r\nsync_partial_ok:{}\r\nsync_partial_err:{}\r\nexpired_keys:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nkeyspace_hits:{}\r\nkeyspace_misses:{}\r\npubsub_channels:{}\r\npubsub_patterns:{}\r\npubsubshard_channels:{}\r\nlatest_fork_usec:0\r\ntotal_error_replies:{}\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\nmigrate_cached_sockets:0\r\ntracking_total_items:{}\r\ntracking_total_keys:{}\r\ntracking_total_prefixes:{}\r\nclient_output_buffer_limit_disconnections:{}\r\n",
                 total(Stat::ConnectionsReceived),
                 total(Stat::Commands),
                 ops_per_sec,
@@ -8896,6 +8941,7 @@ async fn execute_command(
                 tracking_total_items,
                 tracking_total_keys,
                 tracking_total_prefixes,
+                total(Stat::ClientOutputBufferLimitDisconnections),
             );
             let (blocked_clients_count, total_blocking_keys, total_blocking_keys_on_nokey) = {
                 let hub_arc = crate::block::get_block_hub_for_port(router.port);
