@@ -117,11 +117,22 @@ jobs:
         run: cargo build --release
 
       - name: Run the core TCL suites
-        run: SKIP_BUILD=1 bash scripts/run_redis_test_suite.sh 16379 all
+        run: |
+          set -o pipefail
+          SKIP_BUILD=1 bash scripts/run_redis_test_suite.sh 16379 all 2>&1 | tee /tmp/rudis_tcl_suites.log
+
+      # Annotations are visible on the run page without downloading logs.
+      - name: Report failing TCL tests
+        if: failure()
+        run: |
+          grep -E '\[(err|exception|TIMEOUT)\]|Failed:|Killing still running' /tmp/rudis_tcl_suites.log \
+            | head -30 | while IFS= read -r line; do echo "::error title=TCL::${line}"; done
 
       - name: Upload server log on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: rudis-tcl-server-log
-          path: /tmp/rudis_tcl_test_16379.log
+          path: |
+            /tmp/rudis_tcl_test_16379.log
+            /tmp/rudis_tcl_suites.log
