@@ -673,6 +673,7 @@ pub fn record_cmd_stat(name: &'static str) {
 /// Adds `calls` calls of `name` taking `nanos` in total to this thread's
 /// command statistics.
 pub fn record_cmd_stats(name: &'static str, calls: u64, nanos: u64) {
+    crate::server_stats::add(crate::server_stats::Stat::Commands, calls);
     LOCAL_CMD_STATS.with(|stats| {
         let mut map = stats.borrow_mut();
         map.entry(name).or_default().add(calls, nanos);
@@ -2579,10 +2580,12 @@ pub async fn handle_tls_connection(
     let max_c = MAX_CLIENTS.load(std::sync::atomic::Ordering::Relaxed);
     if max_c > 0 && current_clients > max_c {
         ACTIVE_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        crate::server_stats::add(crate::server_stats::Stat::RejectedConnections, 1);
         let err_msg = b"-ERR max number of clients reached\r\n";
         let _ = session.write_plaintext(&mut stream, err_msg).await;
         return;
     }
+    crate::server_stats::add(crate::server_stats::Stat::ConnectionsReceived, 1);
 
     let raw_fd = stream.as_raw_fd();
     let now = Instant::now();
@@ -2657,6 +2660,7 @@ pub async fn handle_tls_connection(
             Ok(n) => n,
             Err(_) => break,
         };
+        crate::server_stats::add(crate::server_stats::Stat::NetInputBytes, n as u64);
 
         buf.extend_from_slice(&temp_plain[..n]);
 
@@ -2694,6 +2698,10 @@ pub async fn handle_tls_connection(
         }
 
         if !out_buf.is_empty() {
+            crate::server_stats::add(
+                crate::server_stats::Stat::NetOutputBytes,
+                out_buf.len() as u64,
+            );
             let write_chunk = std::mem::take(&mut out_buf);
             if session
                 .write_plaintext(&mut stream, &write_chunk)
@@ -3084,10 +3092,12 @@ pub async fn handle_connection(
     let max_c = MAX_CLIENTS.load(std::sync::atomic::Ordering::Relaxed);
     if max_c > 0 && current_clients > max_c {
         ACTIVE_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        crate::server_stats::add(crate::server_stats::Stat::RejectedConnections, 1);
         let err_msg = b"-ERR max number of clients reached\r\n";
         let _ = stream.write_all(err_msg.to_vec()).await;
         return;
     }
+    crate::server_stats::add(crate::server_stats::Stat::ConnectionsReceived, 1);
 
     let raw_fd = stream.as_raw_fd();
     let now = Instant::now();
@@ -3220,6 +3230,7 @@ pub async fn handle_connection(
                 stats
                     .tot_net_in
                     .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+                crate::server_stats::add(crate::server_stats::Stat::NetInputBytes, n as u64);
                 // Drain any additional bytes waiting in kernel TCP socket buffer if spare capacity was completely filled
                 if n == avail_before {
                     loop {
@@ -3240,6 +3251,10 @@ pub async fn handle_connection(
                             stats
                                 .tot_net_in
                                 .fetch_add(drain_n as u64, std::sync::atomic::Ordering::Relaxed);
+                            crate::server_stats::add(
+                                crate::server_stats::Stat::NetInputBytes,
+                                drain_n as u64,
+                            );
                             unsafe {
                                 buf.set_len(buf.len() + drain_n as usize);
                             }
@@ -3305,6 +3320,10 @@ pub async fn handle_connection(
                                     drain_n as u64,
                                     std::sync::atomic::Ordering::Relaxed,
                                 );
+                                crate::server_stats::add(
+                                    crate::server_stats::Stat::NetInputBytes,
+                                    drain_n as u64,
+                                );
                                 unsafe {
                                     buf.set_len(buf.len() + drain_n as usize);
                                 }
@@ -3323,6 +3342,10 @@ pub async fn handle_connection(
                                 stats.tot_net_out.fetch_add(
                                     out_buf.len() as u64,
                                     std::sync::atomic::Ordering::Relaxed,
+                                );
+                                crate::server_stats::add(
+                                    crate::server_stats::Stat::NetOutputBytes,
+                                    out_buf.len() as u64,
                                 );
                                 let write_chunk = std::mem::take(&mut out_buf);
                                 let _ = stream.write_all(write_chunk).await.0;
@@ -3420,6 +3443,10 @@ pub async fn handle_connection(
                         stats
                             .tot_net_out
                             .fetch_add(out_buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                        crate::server_stats::add(
+                            crate::server_stats::Stat::NetOutputBytes,
+                            out_buf.len() as u64,
+                        );
                         let write_chunk = std::mem::take(&mut out_buf);
                         let _ = stream.write_all(write_chunk).await.0;
                     }
@@ -3559,6 +3586,10 @@ pub async fn handle_connection(
                                     out_buf.len() as u64,
                                     std::sync::atomic::Ordering::Relaxed,
                                 );
+                                crate::server_stats::add(
+                                    crate::server_stats::Stat::NetOutputBytes,
+                                    out_buf.len() as u64,
+                                );
                                 let write_chunk = std::mem::take(&mut out_buf);
                                 let (res, returned_buf) = stream.write_all(write_chunk).await;
                                 out_buf = returned_buf;
@@ -3689,6 +3720,7 @@ pub async fn handle_connection(
                     stats
                         .tot_net_out
                         .fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
+                    crate::server_stats::add(crate::server_stats::Stat::NetOutputBytes, len as u64);
                     let send_ret = unsafe {
                         libc::send(
                             raw_fd,
@@ -3938,6 +3970,7 @@ async fn run_pubsub_loop(
                 soft_start = None;
             }
 
+            crate::server_stats::add(crate::server_stats::Stat::NetOutputBytes, data_len as u64);
             if writer.write_all(data).await.0.is_err() {
                 break;
             }
@@ -4576,6 +4609,7 @@ async fn run_pubsub_loop(
         match res {
             Ok(0) => break,
             Ok(n) => {
+                crate::server_stats::add(crate::server_stats::Stat::NetInputBytes, n as u64);
                 buf.extend_from_slice(&read_buf[..n]);
                 while !buf.is_empty() {
                     match parse_command(&mut buf) {
@@ -8784,8 +8818,18 @@ async fn execute_command(
                 tracking_total_keys,
                 tracking_total_prefixes,
             ) = get_tracking_info_stats(router.port);
+            use crate::server_stats::{Stat, total};
+            let (ops_per_sec, in_bps, out_bps) = crate::server_stats::instantaneous();
             let stats_str = format!(
-                "# Stats\r\ntotal_connections_received:0\r\ntotal_commands_processed:0\r\ninstantaneous_ops_per_sec:0\r\ntotal_net_input_bytes:0\r\ntotal_net_output_bytes:0\r\ninstantaneous_input_kbps:0.00\r\ninstantaneous_output_kbps:0.00\r\nrejected_connections:0\r\nsync_full:0\r\nsync_partial_ok:0\r\nsync_partial_err:0\r\nexpired_keys:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nkeyspace_hits:0\r\nkeyspace_misses:0\r\npubsub_channels:0\r\npubsub_patterns:0\r\nlatest_fork_usec:0\r\ntotal_error_replies:{}\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\nmigrate_cached_sockets:0\r\ntracking_total_items:{}\r\ntracking_total_keys:{}\r\ntracking_total_prefixes:{}\r\n",
+                "# Stats\r\ntotal_connections_received:{}\r\ntotal_commands_processed:{}\r\ninstantaneous_ops_per_sec:{}\r\ntotal_net_input_bytes:{}\r\ntotal_net_output_bytes:{}\r\ninstantaneous_input_kbps:{:.2}\r\ninstantaneous_output_kbps:{:.2}\r\nrejected_connections:{}\r\nsync_full:0\r\nsync_partial_ok:0\r\nsync_partial_err:0\r\nexpired_keys:{}\r\nexpired_keys_active:{}\r\nevicted_keys:{}\r\nkeyspace_hits:0\r\nkeyspace_misses:0\r\npubsub_channels:0\r\npubsub_patterns:0\r\nlatest_fork_usec:0\r\ntotal_error_replies:{}\r\nslowlog_commands_count:{}\r\nslowlog_commands_time_ms_sum:{:.2}\r\nslowlog_commands_time_ms_max:{:.2}\r\nmigrate_cached_sockets:0\r\ntracking_total_items:{}\r\ntracking_total_keys:{}\r\ntracking_total_prefixes:{}\r\n",
+                total(Stat::ConnectionsReceived),
+                total(Stat::Commands),
+                ops_per_sec,
+                total(Stat::NetInputBytes),
+                total(Stat::NetOutputBytes),
+                in_bps as f64 / 1024.0,
+                out_bps as f64 / 1024.0,
+                total(Stat::RejectedConnections),
                 crate::table::get_expired_keys(),
                 crate::table::get_expired_keys_active(),
                 crate::table::get_evicted_keys(),
@@ -9435,6 +9479,7 @@ async fn execute_command(
                             reset_error_stats();
                             crate::slowlog::reset_slowlog_stats();
                             crate::table::reset_expired_keys();
+                            crate::server_stats::reset();
                             out.extend_from_slice(b"+OK\r\n");
                             return false;
                         } else if p0 == "rewrite" {

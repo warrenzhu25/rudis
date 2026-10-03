@@ -16368,3 +16368,97 @@ fn test_latency_histogram_reports_real_buckets_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child);
 }
+
+/// Returns the value of `field:` in an INFO reply.
+fn info_num(info: &str, field: &str) -> f64 {
+    let prefix = format!("{field}:");
+    info.lines()
+        .find_map(|l| l.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("no {field} in:\n{info}"))
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn test_info_stats_counts_commands_bytes_and_connections_e2e() {
+    let port = 16961;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["CONFIG", "RESETSTAT"]), "+OK\r\n");
+
+    let mut sent = 0usize;
+    let mut received = 0usize;
+    for i in 0..10 {
+        let k = format!("st:{i}");
+        let req = format!("*3\r\n$3\r\nSET\r\n${}\r\n{k}\r\n$1\r\nv\r\n", k.len());
+        sent += req.len();
+        received += send_and_read(&mut c, req.as_bytes()).len();
+    }
+    // 200 pipelined GETs plus a PING: 201 commands in one write.
+    let mut pipeline = String::new();
+    for i in 0..200 {
+        let k = format!("st:{}", i % 10);
+        pipeline.push_str(&format!("*2\r\n$3\r\nGET\r\n${}\r\n{k}\r\n", k.len()));
+    }
+    pipeline.push_str("*1\r\n$4\r\nPING\r\n");
+    sent += pipeline.len();
+    c.write_all(pipeline.as_bytes()).unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 65536];
+    while !got.ends_with(b"+PONG\r\n") {
+        let n = c.read(&mut buf).unwrap();
+        assert!(n > 0, "connection closed");
+        got.extend_from_slice(&buf[..n]);
+    }
+    received += got.len();
+
+    let info = info_section(&mut c, "stats");
+    // CONFIG RESETSTAT itself is counted after the reset, like in Redis.
+    assert_eq!(info_num(&info, "total_commands_processed"), 212.0, "{info}");
+    let net_in = info_num(&info, "total_net_input_bytes") as usize;
+    assert!(
+        net_in >= sent && net_in < sent + 200,
+        "{net_in} vs {sent}:\n{info}"
+    );
+    let net_out = info_num(&info, "total_net_output_bytes") as usize;
+    assert!(net_out >= received, "{net_out} vs {received}:\n{info}");
+    assert_eq!(info_num(&info, "total_connections_received"), 0.0, "{info}");
+
+    // Accepted and rejected connections.
+    let extra: Vec<TcpStream> = (0..2)
+        .map(|_| {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            assert_eq!(resp_cmd(&mut s, &["PING"]), "+PONG\r\n");
+            s
+        })
+        .collect();
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "maxclients", "3"]),
+        "+OK\r\n"
+    );
+    let mut over = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    over.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut reply = [0u8; 128];
+    let n = over.read(&mut reply).unwrap();
+    assert!(reply[..n].starts_with(b"-ERR max number of clients"));
+    drop(over);
+    drop(extra);
+
+    // Keep a steady load for a while so the 100ms rate samples see it.
+    let deadline = std::time::Instant::now() + Duration::from_millis(800);
+    while std::time::Instant::now() < deadline {
+        assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n");
+    }
+    let info = info_section(&mut c, "stats");
+    assert_eq!(info_num(&info, "total_connections_received"), 2.0, "{info}");
+    assert_eq!(info_num(&info, "rejected_connections"), 1.0, "{info}");
+    assert!(info_num(&info, "instantaneous_ops_per_sec") > 0.0, "{info}");
+    assert!(info_num(&info, "instantaneous_input_kbps") > 0.0, "{info}");
+    assert!(info_num(&info, "instantaneous_output_kbps") > 0.0, "{info}");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}

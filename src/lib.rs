@@ -27,6 +27,7 @@ pub mod router;
 pub mod scripting;
 pub mod search;
 pub mod server;
+pub mod server_stats;
 pub mod shard;
 pub mod shutdown;
 pub mod slowlog;

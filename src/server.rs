@@ -248,6 +248,8 @@ pub fn run_shard_worker(
             loop {
                 monoio::time::sleep(std::time::Duration::from_millis(100)).await;
                 active_db.borrow_mut().active_expire_cycle();
+                // Rates for INFO instantaneous_*; extra calls are no-ops.
+                crate::server_stats::sample();
             }
         });
 
