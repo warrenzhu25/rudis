@@ -130,7 +130,7 @@ pub fn run_shard_worker(
         // 2.5 RDB Snapshot Restore on startup
         // Follow Redis specification: if AOF is enabled, AOF is authoritative; otherwise load RDB.
         if !aof_config.enabled {
-            let rdb_path = aof_config.dir.join("dump.rdb");
+            let rdb_path = aof_config.dir.join(crate::config::dbfilename(base_port));
             if rdb_path.exists() {
                 match crate::table::load_rdb(&rdb_path, &mut local_db.borrow_mut(), shard_id, num_shards) {
                     Ok(n) => {

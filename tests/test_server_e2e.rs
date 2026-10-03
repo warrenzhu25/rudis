@@ -18028,3 +18028,59 @@ fn test_replicaof_and_masterauth_in_config_file_e2e() {
     let _ = master.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_dbfilename_is_used_for_save_and_load_e2e() {
+    let port = 16958;
+    let dir = std::env::temp_dir().join(format!("rudis-dbfilename-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let conf = dir.join("rudis.conf");
+    std::fs::write(
+        &conf,
+        format!("dir {}\ndbfilename cache.rdb\n", dir.display()),
+    )
+    .unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "-c",
+        conf.to_str().unwrap(),
+    ];
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "GET", "dbfilename"]),
+        "*2\r\n$10\r\ndbfilename\r\n$9\r\ncache.rdb\r\n"
+    );
+    let canon = std::fs::canonicalize(&dir).unwrap().display().to_string();
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "GET", "dir"]),
+        format!("*2\r\n$3\r\ndir\r\n${}\r\n{}\r\n", canon.len(), canon)
+    );
+    assert_eq!(resp_cmd(&mut c, &["SET", "dbf:k", "v"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["SAVE"]), "+OK\r\n");
+    assert!(dir.join("cache.rdb").is_file());
+    assert!(!dir.join("dump.rdb").exists());
+    assert!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "dbfilename", "../escape.rdb"]).starts_with("-ERR")
+    );
+    drop(c);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // The snapshot is loaded back from the configured file name.
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["GET", "dbf:k"]), "$1\r\nv\r\n");
+    drop(c);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}

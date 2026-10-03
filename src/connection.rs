@@ -2441,6 +2441,7 @@ pub fn apply_config_value(
         "maxmemory-clients" => *CONFIG_MAXMEMORY_CLIENTS.write().unwrap() = val_str.to_string(),
         "backupdirname" => *CONFIG_BACKUPDIRNAME.write().unwrap() = val_str.to_string(),
         "slaveof" | "replicaof" => *CONFIG_SLAVEOF.write().unwrap() = val_str.to_string(),
+        "dbfilename" => crate::config::set_dbfilename(base_port, val_str)?,
         "masterauth" => crate::replication::set_masterauth(port, val_str),
         "masteruser" => crate::replication::set_masteruser(port, val_str),
         _ => return Ok(false),
@@ -9632,7 +9633,7 @@ async fn execute_command(
                     let backup_dir = CONFIG_BACKUPDIRNAME.read().unwrap().clone();
                     let slaveof_cfg = CONFIG_SLAVEOF.read().unwrap().clone();
 
-                    let all_configs: [(&str, String); 44] = [
+                    let all_configs: [(&str, String); 46] = [
                         ("port", port_str),
                         (
                             "protected-mode",
@@ -9698,6 +9699,14 @@ async fn execute_command(
                         ("lazyfree-lazy-expire", lazy_exp),
                         ("latency-monitor-threshold", latency_thresh),
                         ("tracking-table-max-keys", tracking_max),
+                        (
+                            "dir",
+                            std::fs::canonicalize(&router.db_dir)
+                                .unwrap_or_else(|_| router.db_dir.clone())
+                                .display()
+                                .to_string(),
+                        ),
+                        ("dbfilename", crate::config::dbfilename(router.base_port)),
                     ];
                     let hidden_configs: [(&str, String); 2] = [
                         ("key-load-delay", key_load_delay),
@@ -9829,6 +9838,17 @@ async fn execute_command(
                                 out.extend_from_slice(
                                     format!(
                                         "-ERR CONFIG SET failed (possibly related to argument 'appendfsync') - {}\r\n",
+                                        e
+                                    )
+                                    .as_bytes(),
+                                );
+                                return false;
+                            }
+                        } else if p_str == "dbfilename" {
+                            if let Err(e) = crate::config::validate_dbfilename(&val_str) {
+                                out.extend_from_slice(
+                                    format!(
+                                        "-ERR CONFIG SET failed (possibly related to argument 'dbfilename') - {}\r\n",
                                         e
                                     )
                                     .as_bytes(),

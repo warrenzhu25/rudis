@@ -407,6 +407,34 @@ pub fn save_points(port: u16) -> Vec<(u64, u64)> {
         .unwrap_or_default()
 }
 
+static DB_FILENAMES: std::sync::Mutex<Option<HashMap<u16, String>>> = std::sync::Mutex::new(None);
+
+pub const DEFAULT_DBFILENAME: &str = "dump.rdb";
+
+/// Sets `dbfilename`, the RDB file name inside `dir`. Like Redis, it must be
+/// a plain file name, not a path.
+pub fn set_dbfilename(port: u16, name: &str) -> Result<(), String> {
+    validate_dbfilename(name)?;
+    let mut map = DB_FILENAMES.lock().unwrap_or_else(|e| e.into_inner());
+    map.get_or_insert_with(HashMap::new)
+        .insert(port, name.to_string());
+    Ok(())
+}
+
+pub fn validate_dbfilename(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+        return Err("dbfilename can't be a path, just a filename".to_string());
+    }
+    Ok(())
+}
+
+pub fn dbfilename(port: u16) -> String {
+    let map = DB_FILENAMES.lock().unwrap_or_else(|e| e.into_inner());
+    map.as_ref()
+        .and_then(|m| m.get(&port).cloned())
+        .unwrap_or_else(|| DEFAULT_DBFILENAME.to_string())
+}
+
 /// Redis rule: `SHUTDOWN SAVE` always snapshots, `NOSAVE` never does, and
 /// plain `SHUTDOWN` (or SIGTERM) snapshots when save points are configured.
 pub fn should_save_on_shutdown(save: Option<bool>, has_save_points: bool) -> bool {
@@ -996,6 +1024,13 @@ mod tests {
         set_save_points(1, vec![(1, 1)]);
         assert_eq!(save_points(1), vec![(1, 1)]);
         assert!(save_points(2).is_empty());
+
+        assert_eq!(dbfilename(3), "dump.rdb");
+        set_dbfilename(3, "cache.rdb").unwrap();
+        assert_eq!(dbfilename(3), "cache.rdb");
+        assert!(set_dbfilename(3, "../x.rdb").is_err());
+        assert!(set_dbfilename(3, "").is_err());
+        assert_eq!(dbfilename(3), "cache.rdb");
 
         assert!(should_save_on_shutdown(Some(true), false));
         assert!(!should_save_on_shutdown(Some(false), true));

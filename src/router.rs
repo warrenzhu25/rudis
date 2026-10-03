@@ -3568,9 +3568,9 @@ impl Router {
     pub async fn perform_save_rdb(&self) -> Result<(), String> {
         static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let tmp_id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp_filename =
-            self.db_dir
-                .join(format!("dump.rdb.tmp.{}_{}", std::process::id(), tmp_id));
+        let tmp_filename = self
+            .db_dir
+            .join(format!("temp-{}-{}.rdb", std::process::id(), tmp_id));
         let snap = crate::snapshot::state(self.base_port);
         let dirty_before = snap.begin();
         let res = self.write_rdb_file(&tmp_filename).await;
@@ -3585,7 +3585,7 @@ impl Router {
     }
 
     async fn write_rdb_file(&self, tmp_filename: &std::path::Path) -> Result<(), String> {
-        let filename = self.db_dir.join("dump.rdb");
+        let filename = self.db_dir.join(crate::config::dbfilename(self.base_port));
         use std::io::Write;
         let mut file = std::fs::File::create(tmp_filename).map_err(|e| e.to_string())?;
 
