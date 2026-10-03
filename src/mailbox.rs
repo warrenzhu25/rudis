@@ -637,19 +637,45 @@ impl ShardSender {
 
 /// Receiver handle for a shard worker.
 /// Checks incoming SPSC rings from all shards without locks, sleeping only when all are drained.
-#[derive(Clone)]
 pub struct ShardReceiver {
     pub shard_id: usize,
     pub incoming_rings: Vec<std::sync::Arc<SpscQueue<crate::shard::ShardMessage>>>,
     pub notify_rx: flume::Receiver<()>,
     pub sleeping: std::sync::Arc<CachePadded<AtomicBool>>,
+    /// Ring that `try_recv` checks first; it moves past the ring that last
+    /// delivered, so every producer shard gets a turn. Only the consumer
+    /// touches it, so Relaxed is enough; it is atomic to keep the type Sync.
+    pub next_ring: AtomicUsize,
+}
+
+impl Clone for ShardReceiver {
+    fn clone(&self) -> Self {
+        Self {
+            shard_id: self.shard_id,
+            incoming_rings: self.incoming_rings.clone(),
+            notify_rx: self.notify_rx.clone(),
+            sleeping: self.sleeping.clone(),
+            next_ring: AtomicUsize::new(self.next_ring.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl ShardReceiver {
+    /// Pops from the incoming rings round-robin. Always starting at ring 0
+    /// let a busy low-numbered shard delay every message from the others.
+    /// Each ring stays FIFO; there is no ordering across rings anyway.
     #[inline(always)]
     pub fn try_recv(&self) -> Result<crate::shard::ShardMessage, RecvError> {
-        for ring in &self.incoming_rings {
-            if let Some(msg) = ring.pop() {
+        let n = self.incoming_rings.len();
+        let start = self.next_ring.load(Ordering::Relaxed);
+        for i in 0..n {
+            let mut idx = start + i;
+            if idx >= n {
+                idx -= n;
+            }
+            if let Some(msg) = self.incoming_rings[idx].pop() {
+                self.next_ring
+                    .store(if idx + 1 == n { 0 } else { idx + 1 }, Ordering::Relaxed);
                 return Ok(msg);
             }
         }
@@ -763,6 +789,7 @@ pub fn create_shard_mesh(num_shards: usize) -> (Vec<Vec<ShardSender>>, Vec<Shard
             incoming_rings: incoming,
             notify_rx: notifier.1,
             sleeping,
+            next_ring: AtomicUsize::new(0),
         });
     }
 
@@ -791,6 +818,41 @@ mod tests {
         assert_eq!(cross_shard_spin(), 64);
         set_cross_shard_spin(0);
         assert_eq!(cross_shard_spin(), 0);
+    }
+
+    #[test]
+    fn test_try_recv_round_robins_across_producer_shards() {
+        let (senders, receivers) = create_shard_mesh(3);
+        let msg = |key: &'static str| crate::shard::ShardMessage::ExpireTime {
+            key: Bytes::from_static(key.as_bytes()),
+            in_millis: false,
+            responder: flume::bounded(1).0,
+        };
+        let key_of = |m: crate::shard::ShardMessage| match m {
+            crate::shard::ShardMessage::ExpireTime { key, .. } => key,
+            _ => unreachable!(),
+        };
+        // Shard 0 has a backlog for shard 1; shard 2 then sends one message.
+        for _ in 0..10 {
+            senders[0][1].send(msg("from0")).unwrap();
+        }
+        senders[2][1].send(msg("from2")).unwrap();
+        let rx = &receivers[1];
+        let first_two = [
+            key_of(rx.try_recv().unwrap()),
+            key_of(rx.try_recv().unwrap()),
+        ];
+        assert!(
+            first_two.contains(&Bytes::from_static(b"from2")),
+            "shard 2's message waited behind shard 0's backlog: {first_two:?}"
+        );
+        // The rest of shard 0's backlog is still delivered.
+        let mut rest = 0;
+        while let Ok(m) = rx.try_recv() {
+            assert_eq!(key_of(m), Bytes::from_static(b"from0"));
+            rest += 1;
+        }
+        assert_eq!(rest, 9);
     }
 
     #[test]
