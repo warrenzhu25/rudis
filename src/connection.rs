@@ -2273,6 +2273,179 @@ pub static ACTIVE_CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 pub static MAX_CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(10000);
 pub static MAX_MEMORY_POLICY: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
 
+static CONFIG_BACKUP_SEALED_TTL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(86400);
+static CONFIG_MAXMEMORY_SAMPLES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(5);
+static CONFIG_CLIENT_QUERY_BUFFER_LIMIT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1073741824);
+static CONFIG_KEY_LOAD_DELAY: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+static CONFIG_LUA_TIME_LIMIT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(5000);
+static CONFIG_OOM_SCORE_ADJ: std::sync::LazyLock<std::sync::RwLock<String>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new("no".to_string()));
+static CONFIG_OOM_SCORE_ADJ_VALUES: std::sync::LazyLock<std::sync::RwLock<String>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new("0 200 800".to_string()));
+static CONFIG_MAXMEMORY_CLIENTS: std::sync::LazyLock<std::sync::RwLock<String>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new("0".to_string()));
+static CONFIG_BACKUPDIRNAME: std::sync::LazyLock<std::sync::RwLock<String>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new("backup".to_string()));
+static CONFIG_SLAVEOF: std::sync::LazyLock<std::sync::RwLock<String>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(String::new()));
+
+fn parse_config_num<T: std::str::FromStr>(name: &str, val: &str) -> Result<T, String> {
+    val.trim()
+        .parse::<T>()
+        .map_err(|_| format!("argument '{}' for '{}' is not a valid number", val, name))
+}
+
+fn parse_config_bytes(name: &str, val: &str) -> Result<u64, String> {
+    crate::tiering::parse_memory_bytes(val).ok_or_else(|| {
+        format!(
+            "argument '{}' for '{}' is not a valid memory size",
+            val, name
+        )
+    })
+}
+
+fn parse_config_bool(name: &str, val: &str) -> Result<bool, String> {
+    match val.to_ascii_lowercase().as_str() {
+        "yes" => Ok(true),
+        "no" => Ok(false),
+        _ => Err(format!("argument for '{}' must be 'yes' or 'no'", name)),
+    }
+}
+
+/// Applies one runtime-settable config parameter. Shared by `CONFIG SET`
+/// (after its own validation pass) and by config-file loading at startup.
+///
+/// Returns `Ok(true)` when the parameter was applied, `Ok(false)` when rudis
+/// has no runtime setting for it, and `Err` when the value is invalid.
+pub fn apply_config_value(
+    port: u16,
+    base_port: u16,
+    name: &str,
+    val_str: &str,
+) -> Result<bool, String> {
+    use std::sync::atomic::Ordering;
+    match name {
+        "proto-max-bulk-len" => {
+            crate::resp::set_proto_max_bulk_len(parse_config_bytes(name, val_str)? as usize)
+        }
+        "maxmemory" => crate::tiering::set_max_memory(port, parse_config_bytes(name, val_str)?),
+        "tiered-offload-threshold" => {
+            crate::tiering::set_offload_threshold_pct(port, parse_config_num(name, val_str)?)
+        }
+        "tiered-upload-threshold" => {
+            crate::tiering::set_upload_threshold_pct(port, parse_config_num(name, val_str)?)
+        }
+        "hash-max-listpack-entries" | "hash-max-ziplist-entries" => {
+            HASH_MAX_ENTRIES.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
+        }
+        "hash-max-listpack-value" | "hash-max-ziplist-value" => {
+            HASH_MAX_VALUE.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
+        }
+        "stream-node-max-entries" => crate::table::STREAM_NODE_MAX_ENTRIES
+            .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
+        "stream-idmp-duration" => crate::table::STREAM_IDMP_DURATION.store(
+            parse_config_num::<i64>(name, val_str)? as u64,
+            Ordering::Relaxed,
+        ),
+        "stream-idmp-maxsize" => crate::table::STREAM_IDMP_MAXSIZE.store(
+            parse_config_num::<i64>(name, val_str)? as usize,
+            Ordering::Relaxed,
+        ),
+        "min-replicas-to-write" => {
+            MIN_REPLICAS_TO_WRITE.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
+        }
+        "slowlog-log-slower-than" => crate::slowlog::SLOWLOG_LOG_SLOWER_THAN
+            .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
+        "slowlog-max-len" => {
+            crate::slowlog::SLOWLOG_MAX_LEN
+                .store(parse_config_num(name, val_str)?, Ordering::Relaxed);
+            crate::slowlog::trim_slowlog_buffer();
+        }
+        "slowlog-entry-max-argc" => crate::slowlog::SLOWLOG_ENTRY_MAX_ARGC
+            .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
+        "slowlog-entry-max-string-len" => crate::slowlog::SLOWLOG_ENTRY_MAX_STRING_LEN
+            .store(parse_config_num(name, val_str)?, Ordering::Relaxed),
+        "client-output-buffer-limit" => {
+            set_client_output_buffer_limit_str(val_str).map_err(|e| {
+                e.trim_start_matches("-ERR ")
+                    .trim_end_matches("\r\n")
+                    .to_string()
+            })?
+        }
+        "latency-monitor-threshold" => {
+            LATENCY_MONITOR_THRESHOLD.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
+        }
+        "maxclients" => set_max_clients(parse_config_num(name, val_str)?),
+        "protected-mode" => {
+            crate::netsec::set_protected_mode(base_port, parse_config_bool(name, val_str)?)
+        }
+        "maxmemory-policy" => set_max_memory_policy(val_str),
+        "requirepass" => {
+            let acl = crate::acl::get_acl_for_port(port);
+            acl.write().unwrap().set_requirepass(val_str);
+        }
+        "notify-keyspace-events" => set_notify_keyspace_events_str(val_str),
+        "aof-load-truncated" => {
+            crate::aof::set_aof_load_truncated(parse_config_bool(name, val_str)?)
+        }
+        "lazyfree-lazy-expire" => {
+            crate::table::set_lazyfree_lazy_expire(parse_config_bool(name, val_str)?)
+        }
+        "tracking-table-max-keys" => {
+            TRACKING_TABLE_MAX_KEYS.store(parse_config_num(name, val_str)?, Ordering::Relaxed);
+            if !PAUSE_CRON.load(Ordering::Relaxed) {
+                enforce_tracking_max_keys(port);
+            }
+        }
+        "rdb-key-save-delay" => {
+            let v: u64 = parse_config_num(name, val_str)?;
+            RDB_KEY_SAVE_DELAY.store(v, Ordering::Relaxed);
+            if v == 0 {
+                RDB_BGSAVE_IN_PROGRESS.store(false, Ordering::Relaxed);
+            }
+        }
+        "repl-backlog-size" => {
+            crate::replication::set_repl_backlog_size(parse_config_bytes(name, val_str)? as usize)
+        }
+        "backup-sealed-ttl" => {
+            CONFIG_BACKUP_SEALED_TTL.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
+        }
+        "maxmemory-samples" => {
+            CONFIG_MAXMEMORY_SAMPLES.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
+        }
+        "client-query-buffer-limit" => CONFIG_CLIENT_QUERY_BUFFER_LIMIT
+            .store(parse_config_bytes(name, val_str)?, Ordering::Relaxed),
+        "key-load-delay" => {
+            CONFIG_KEY_LOAD_DELAY.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
+        }
+        "lua-time-limit" | "busy-reply-threshold" => {
+            CONFIG_LUA_TIME_LIMIT.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
+        }
+        "oom-score-adj" => *CONFIG_OOM_SCORE_ADJ.write().unwrap() = val_str.to_string(),
+        "oom-score-adj-values" => {
+            *CONFIG_OOM_SCORE_ADJ_VALUES.write().unwrap() = val_str.to_string()
+        }
+        "cross-shard-spin" => {
+            crate::mailbox::set_cross_shard_spin(parse_config_num(name, val_str)?)
+        }
+        "appendfsync" => {
+            crate::aof::set_fsync_every_sec(base_port, crate::aof::parse_appendfsync(val_str)?)
+        }
+        "save" => {
+            crate::config::set_save_points(base_port, crate::config::parse_save_points(val_str)?)
+        }
+        "maxmemory-clients" => *CONFIG_MAXMEMORY_CLIENTS.write().unwrap() = val_str.to_string(),
+        "backupdirname" => *CONFIG_BACKUPDIRNAME.write().unwrap() = val_str.to_string(),
+        "slaveof" | "replicaof" => *CONFIG_SLAVEOF.write().unwrap() = val_str.to_string(),
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
 pub fn set_max_clients(limit: usize) {
     MAX_CLIENTS.store(limit, std::sync::atomic::Ordering::Relaxed);
 }
@@ -9369,27 +9542,6 @@ async fn execute_command(
             false
         }
         Command::ConfigGet(_) | Command::ConfigSet(_) => {
-            static CONFIG_BACKUP_SEALED_TTL: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(86400);
-            static CONFIG_MAXMEMORY_SAMPLES: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(5);
-            static CONFIG_CLIENT_QUERY_BUFFER_LIMIT: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(1073741824);
-            static CONFIG_KEY_LOAD_DELAY: std::sync::atomic::AtomicI64 =
-                std::sync::atomic::AtomicI64::new(0);
-            static CONFIG_LUA_TIME_LIMIT: std::sync::atomic::AtomicU64 =
-                std::sync::atomic::AtomicU64::new(5000);
-            static CONFIG_OOM_SCORE_ADJ: std::sync::LazyLock<std::sync::RwLock<String>> =
-                std::sync::LazyLock::new(|| std::sync::RwLock::new("no".to_string()));
-            static CONFIG_OOM_SCORE_ADJ_VALUES: std::sync::LazyLock<std::sync::RwLock<String>> =
-                std::sync::LazyLock::new(|| std::sync::RwLock::new("0 200 800".to_string()));
-            static CONFIG_MAXMEMORY_CLIENTS: std::sync::LazyLock<std::sync::RwLock<String>> =
-                std::sync::LazyLock::new(|| std::sync::RwLock::new("0".to_string()));
-            static CONFIG_BACKUPDIRNAME: std::sync::LazyLock<std::sync::RwLock<String>> =
-                std::sync::LazyLock::new(|| std::sync::RwLock::new("backup".to_string()));
-            static CONFIG_SLAVEOF: std::sync::LazyLock<std::sync::RwLock<String>> =
-                std::sync::LazyLock::new(|| std::sync::RwLock::new(String::new()));
-
             match cmd {
                 Command::ConfigGet(patterns) => {
                     let max_mem = crate::tiering::get_max_memory(router.port).to_string();
@@ -9910,173 +10062,8 @@ async fn execute_command(
                     for (param, val) in &pairs {
                         let p_str = String::from_utf8_lossy(param).to_lowercase();
                         let val_str = String::from_utf8_lossy(val);
-                        if p_str == "proto-max-bulk-len" {
-                            if let Ok(n) = val_str.parse::<usize>() {
-                                crate::resp::set_proto_max_bulk_len(n);
-                            }
-                        } else if p_str == "maxmemory" {
-                            if let Some(bytes) = crate::tiering::parse_memory_bytes(&val_str) {
-                                crate::tiering::set_max_memory(router.port, bytes);
-                            }
-                        } else if p_str == "tiered-offload-threshold" {
-                            if let Ok(pct) = val_str.parse::<u64>() {
-                                crate::tiering::set_offload_threshold_pct(router.port, pct);
-                            }
-                        } else if p_str == "tiered-upload-threshold" {
-                            if let Ok(pct) = val_str.parse::<u64>() {
-                                crate::tiering::set_upload_threshold_pct(router.port, pct);
-                            }
-                        } else if p_str == "hash-max-listpack-entries"
-                            || p_str == "hash-max-ziplist-entries"
-                        {
-                            if let Ok(n) = val_str.parse::<usize>() {
-                                HASH_MAX_ENTRIES.store(n, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        } else if p_str == "hash-max-listpack-value"
-                            || p_str == "hash-max-ziplist-value"
-                        {
-                            if let Ok(n) = val_str.parse::<usize>() {
-                                HASH_MAX_VALUE.store(n, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        } else if p_str == "stream-node-max-entries" {
-                            if let Ok(n) = val_str.parse::<usize>() {
-                                crate::table::STREAM_NODE_MAX_ENTRIES
-                                    .store(n, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        } else if p_str == "stream-idmp-duration" {
-                            if let Ok(n) = val_str.parse::<i64>() {
-                                crate::table::STREAM_IDMP_DURATION
-                                    .store(n as u64, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        } else if p_str == "stream-idmp-maxsize" {
-                            if let Ok(n) = val_str.parse::<i64>() {
-                                crate::table::STREAM_IDMP_MAXSIZE
-                                    .store(n as usize, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        } else if p_str == "min-replicas-to-write" {
-                            if let Ok(n) = val_str.parse::<usize>() {
-                                MIN_REPLICAS_TO_WRITE
-                                    .store(n, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        } else if p_str == "slowlog-log-slower-than" {
-                            if let Ok(v) = val_str.parse::<i64>() {
-                                crate::slowlog::SLOWLOG_LOG_SLOWER_THAN
-                                    .store(v, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        } else if p_str == "slowlog-max-len" {
-                            if let Ok(v) = val_str.parse::<usize>() {
-                                crate::slowlog::SLOWLOG_MAX_LEN
-                                    .store(v, std::sync::atomic::Ordering::Relaxed);
-                                crate::slowlog::trim_slowlog_buffer();
-                            }
-                        } else if p_str == "slowlog-entry-max-argc" {
-                            if let Ok(v) = val_str.parse::<usize>() {
-                                crate::slowlog::SLOWLOG_ENTRY_MAX_ARGC
-                                    .store(v, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        } else if p_str == "slowlog-entry-max-string-len" {
-                            if let Ok(v) = val_str.parse::<usize>() {
-                                crate::slowlog::SLOWLOG_ENTRY_MAX_STRING_LEN
-                                    .store(v, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        } else if p_str == "client-output-buffer-limit" {
-                            let _ = set_client_output_buffer_limit_str(&val_str);
-                        } else if p_str == "latency-monitor-threshold" {
-                            if let Ok(v) = val_str.parse::<i64>() {
-                                LATENCY_MONITOR_THRESHOLD
-                                    .store(v, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        } else if p_str == "maxclients" {
-                            if let Ok(n) = val_str.parse::<usize>() {
-                                set_max_clients(n);
-                            }
-                        } else if p_str == "protected-mode" {
-                            crate::netsec::set_protected_mode(
-                                router.base_port,
-                                val_str.eq_ignore_ascii_case("yes"),
-                            );
-                        } else if p_str == "maxmemory-policy" {
-                            set_max_memory_policy(&val_str);
-                        } else if p_str == "requirepass" {
-                            let acl = crate::acl::get_acl_for_port(router.port);
-                            acl.write().unwrap().set_requirepass(&val_str);
-                        } else if p_str == "notify-keyspace-events" {
-                            set_notify_keyspace_events_str(&val_str);
-                        } else if p_str == "aof-load-truncated" {
-                            crate::aof::set_aof_load_truncated(val_str.eq_ignore_ascii_case("yes"));
-                        } else if p_str == "lazyfree-lazy-expire" {
-                            let v = val_str.eq_ignore_ascii_case("yes");
-                            crate::table::set_lazyfree_lazy_expire(v);
-                        } else if p_str == "tracking-table-max-keys" {
-                            if let Ok(n) = val_str.parse::<usize>() {
-                                TRACKING_TABLE_MAX_KEYS
-                                    .store(n, std::sync::atomic::Ordering::Relaxed);
-                                if !PAUSE_CRON.load(std::sync::atomic::Ordering::Relaxed) {
-                                    enforce_tracking_max_keys(router.port);
-                                }
-                            }
-                        } else if p_str == "rdb-key-save-delay" {
-                            if let Ok(v) = val_str.parse::<u64>() {
-                                RDB_KEY_SAVE_DELAY.store(v, std::sync::atomic::Ordering::Relaxed);
-                                if v == 0 {
-                                    RDB_BGSAVE_IN_PROGRESS
-                                        .store(false, std::sync::atomic::Ordering::Relaxed);
-                                }
-                            }
-                        } else if p_str == "repl-backlog-size" {
-                            if let Some(bytes) = crate::tiering::parse_memory_bytes(&val_str) {
-                                crate::replication::set_repl_backlog_size(bytes as usize);
-                            }
-                        } else if p_str == "backup-sealed-ttl" {
-                            if let Ok(v) = val_str.parse::<u64>() {
-                                CONFIG_BACKUP_SEALED_TTL
-                                    .store(v, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        } else if p_str == "maxmemory-samples" {
-                            if let Ok(v) = val_str.parse::<u64>() {
-                                CONFIG_MAXMEMORY_SAMPLES
-                                    .store(v, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        } else if p_str == "client-query-buffer-limit" {
-                            if let Some(bytes) = crate::tiering::parse_memory_bytes(&val_str) {
-                                CONFIG_CLIENT_QUERY_BUFFER_LIMIT
-                                    .store(bytes, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        } else if p_str == "key-load-delay" {
-                            if let Ok(v) = val_str.parse::<i64>() {
-                                CONFIG_KEY_LOAD_DELAY
-                                    .store(v, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        } else if p_str == "lua-time-limit" || p_str == "busy-reply-threshold" {
-                            if let Ok(v) = val_str.parse::<u64>() {
-                                CONFIG_LUA_TIME_LIMIT
-                                    .store(v, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        } else if p_str == "oom-score-adj" {
-                            *CONFIG_OOM_SCORE_ADJ.write().unwrap() = val_str.to_string();
-                        } else if p_str == "oom-score-adj-values" {
-                            *CONFIG_OOM_SCORE_ADJ_VALUES.write().unwrap() = val_str.to_string();
-                        } else if p_str == "cross-shard-spin" {
-                            if let Ok(n) = val_str.parse::<usize>() {
-                                crate::mailbox::set_cross_shard_spin(n);
-                            }
-                        } else if p_str == "appendfsync" {
-                            // Validated in phase 1.
-                            if let Ok(every_sec) = crate::aof::parse_appendfsync(&val_str) {
-                                crate::aof::set_fsync_every_sec(router.base_port, every_sec);
-                            }
-                        } else if p_str == "save" {
-                            // Validated in phase 1.
-                            if let Ok(points) = crate::config::parse_save_points(&val_str) {
-                                crate::config::set_save_points(router.base_port, points);
-                            }
-                        } else if p_str == "maxmemory-clients" {
-                            *CONFIG_MAXMEMORY_CLIENTS.write().unwrap() = val_str.to_string();
-                        } else if p_str == "backupdirname" {
-                            *CONFIG_BACKUPDIRNAME.write().unwrap() = val_str.to_string();
-                        } else if p_str == "slaveof" || p_str == "replicaof" {
-                            *CONFIG_SLAVEOF.write().unwrap() = val_str.to_string();
-                        }
+                        // Validated in phase 1.
+                        let _ = apply_config_value(router.port, router.base_port, &p_str, &val_str);
                     }
                     out.extend_from_slice(b"+OK\r\n");
                     false

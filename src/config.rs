@@ -34,7 +34,13 @@ pub struct RudisConfig {
     /// `save <seconds> <changes>` points. Empty (the default) means no
     /// snapshots unless asked for, unlike Redis's built-in defaults.
     pub save_points: Vec<(u64, u64)>,
-    pub extra_directives: HashMap<String, String>,
+    /// `user <name> <rules...>` lines, applied to the ACL at startup.
+    pub users: Vec<(String, Vec<String>)>,
+    /// Other recognised directives, in file order (a directive such as
+    /// `client-output-buffer-limit` may legitimately appear several times).
+    /// Applied at startup through `connection::apply_config_value`; the ones
+    /// rudis has no setting for are reported and ignored.
+    pub extra_directives: Vec<(String, String)>,
 }
 
 impl Default for RudisConfig {
@@ -62,7 +68,8 @@ impl Default for RudisConfig {
             tiered_offload_threshold: 60,
             tiered_upload_threshold: 80,
             save_points: Vec::new(),
-            extra_directives: HashMap::new(),
+            users: Vec::new(),
+            extra_directives: Vec::new(),
         }
     }
 }
@@ -84,6 +91,305 @@ pub fn parse_save_points(spec: &str) -> Result<Vec<(u64, u64)>, String> {
         return Err("expected <seconds> <changes> pairs".to_string());
     }
     Ok(nums.chunks(2).map(|p| (p[0], p[1])).collect())
+}
+
+const MAX_INCLUDE_DEPTH: usize = 16;
+
+/// Directive names accepted by Redis 7 / Valkey 8 config files (generated
+/// from valkey/src/config.c, plus its deprecated names and a few Redis 7.4+
+/// additions). Used to tell directives rudis does not implement, which are
+/// ignored with a warning, from typos, which are fatal like in Redis.
+const REDIS_CONFIG_NAMES: &[&str] = &[
+    "aclfile",
+    "acllog-max-len",
+    "acl-pubsub-default",
+    "activedefrag",
+    "active-defrag-cycle-max",
+    "active-defrag-cycle-min",
+    "active-defrag-cycle-us",
+    "active-defrag-ignore-bytes",
+    "active-defrag-max-scan-fields",
+    "active-defrag-threshold-lower",
+    "active-defrag-threshold-upper",
+    "active-expire-effort",
+    "activerehashing",
+    "always-show-logo",
+    "aof-disable-auto-gc",
+    "aof-load-truncated",
+    "aof-rewrite-cpulist",
+    "aof_rewrite_cpulist",
+    "aof-rewrite-incremental-fsync",
+    "aof-timestamp-enabled",
+    "aof-use-rdb-preamble",
+    "appenddirname",
+    "appendfilename",
+    "appendfsync",
+    "appendonly",
+    "auto-aof-rewrite-min-size",
+    "auto-aof-rewrite-percentage",
+    "availability-zone",
+    "bgsave-cpulist",
+    "bgsave_cpulist",
+    "bind",
+    "bind-source-addr",
+    "bio-cpulist",
+    "bio_cpulist",
+    "busy-reply-threshold",
+    "client-default-resp",
+    "client-output-buffer-limit",
+    "client-query-buffer-limit",
+    "cluster-allow-pubsubshard-when-down",
+    "cluster-allow-reads-when-down",
+    "cluster-allow-replica-migration",
+    "cluster-announce-bus-port",
+    "cluster-announce-client-ipv4",
+    "cluster-announce-client-ipv6",
+    "cluster-announce-client-port",
+    "cluster-announce-client-tls-port",
+    "cluster-announce-hostname",
+    "cluster-announce-human-nodename",
+    "cluster-announce-ip",
+    "cluster-announce-port",
+    "cluster-announce-tls-port",
+    "cluster-blacklist-ttl",
+    "cluster-config-file",
+    "cluster-config-save-behavior",
+    "cluster-databases",
+    "cluster-enabled",
+    "cluster-link-sendbuf-limit",
+    "cluster-manual-failover-timeout",
+    "cluster-message-gossip-perc",
+    "cluster-migration-barrier",
+    "cluster-node-timeout",
+    "cluster-ping-interval",
+    "cluster-port",
+    "cluster-preferred-endpoint-type",
+    "cluster-replica-no-failover",
+    "cluster-replica-validity-factor",
+    "cluster-require-full-coverage",
+    "cluster-slave-no-failover",
+    "cluster-slave-validity-factor",
+    "cluster-slot-migration-log-max-len",
+    "cluster-slot-stats-enabled",
+    "commandlog-execution-slower-than",
+    "commandlog-large-reply-max-len",
+    "commandlog-large-request-max-len",
+    "commandlog-reply-larger-than",
+    "commandlog-request-larger-than",
+    "commandlog-slow-execution-max-len",
+    "crash-log-enabled",
+    "crash-memcheck-enabled",
+    "daemonize",
+    "databases",
+    "dbfilename",
+    "debug-context",
+    "dir",
+    "disable-thp",
+    "dual-channel-replication-enabled",
+    "dynamic-hz",
+    "enable-debug-assert",
+    "enable-debug-command",
+    "enable-module-command",
+    "enable-protected-configs",
+    "events-per-io-thread",
+    "extended-redis-compatibility",
+    "hash-max-listpack-entries",
+    "hash-max-listpack-value",
+    "hash-max-ziplist-entries",
+    "hash-max-ziplist-value",
+    "hash-seed",
+    "hide-user-data-from-log",
+    "hll-sparse-max-bytes",
+    "hz",
+    "ignore-warnings",
+    "import-mode",
+    "io-threads",
+    "io-threads-always-active",
+    "io-threads-do-reads",
+    "jemalloc-bg-thread",
+    "key-load-delay",
+    "latency-monitor-threshold",
+    "latency-tracking",
+    "latency-tracking-info-percentiles",
+    "lazyfree-lazy-eviction",
+    "lazyfree-lazy-expire",
+    "lazyfree-lazy-server-del",
+    "lazyfree-lazy-user-del",
+    "lazyfree-lazy-user-flush",
+    "lfu-decay-time",
+    "lfu-log-factor",
+    "list-compress-depth",
+    "list-max-listpack-size",
+    "list-max-ziplist-entries",
+    "list-max-ziplist-size",
+    "list-max-ziplist-value",
+    "loading-process-events-interval-bytes",
+    "locale-collate",
+    "logfile",
+    "log-format",
+    "loglevel",
+    "log-timestamp-format",
+    "lua-enable-deprecated-api",
+    "lua-enable-insecure-api",
+    "lua-replicate-commands",
+    "lua-time-limit",
+    "masterauth",
+    "masteruser",
+    "maxclients",
+    "maxmemory",
+    "maxmemory-clients",
+    "maxmemory-eviction-tenacity",
+    "maxmemory-policy",
+    "maxmemory-samples",
+    "max-new-connections-per-cycle",
+    "max-new-tls-connections-per-cycle",
+    "min-io-threads-avoid-copy-reply",
+    "min-replicas-max-lag",
+    "min-replicas-to-write",
+    "min-slaves-max-lag",
+    "min-slaves-to-write",
+    "min-string-size-avoid-copy-reply",
+    "min-string-size-avoid-copy-reply-threaded",
+    "mptcp",
+    "no-appendfsync-on-rewrite",
+    "notify-keyspace-events",
+    "oom-score-adj",
+    "oom-score-adj-values",
+    "pidfile",
+    "port",
+    "prefetch-batch-max-size",
+    "primaryauth",
+    "primaryuser",
+    "proc-title-template",
+    "propagation-error-behavior",
+    "protected-mode",
+    "proto-max-bulk-len",
+    "rdbchecksum",
+    "rdbcompression",
+    "rdb-del-sync-files",
+    "rdb-key-save-delay",
+    "rdb-save-incremental-fsync",
+    "rdb-version-check",
+    "rdma-bind",
+    "rdma-completion-vector",
+    "rdma-port",
+    "rdma-rx-size",
+    "repl-backlog-size",
+    "repl-backlog-ttl",
+    "repl-disable-tcp-nodelay",
+    "repl-diskless-load",
+    "repl-diskless-sync",
+    "repl-diskless-sync-delay",
+    "repl-diskless-sync-max-replicas",
+    "replica-announced",
+    "replica-announce-ip",
+    "replica-announce-port",
+    "replica-ignore-disk-write-errors",
+    "replica-ignore-maxmemory",
+    "replica-lazy-flush",
+    "replicaof",
+    "replica-priority",
+    "replica-read-only",
+    "replica-serve-stale-data",
+    "repl-mptcp",
+    "repl-ping-replica-period",
+    "repl-ping-slave-period",
+    "repl-timeout",
+    "req-res-logfile",
+    "requirepass",
+    "sanitize-dump-payload",
+    "save",
+    "server-cpulist",
+    "server_cpulist",
+    "set-max-intset-entries",
+    "set-max-listpack-entries",
+    "set-max-listpack-value",
+    "set-proc-title",
+    "shard-threads",
+    "shutdown-on-sigint",
+    "shutdown-on-sigterm",
+    "shutdown-timeout",
+    "slave-announce-ip",
+    "slave-announce-port",
+    "slave-ignore-maxmemory",
+    "slave-lazy-flush",
+    "slaveof",
+    "slave-priority",
+    "slave-read-only",
+    "slave-serve-stale-data",
+    "slot-migration-max-failover-repl-bytes",
+    "slowlog-log-slower-than",
+    "slowlog-max-len",
+    "socket-mark-id",
+    "stop-writes-on-bgsave-error",
+    "stream-node-max-bytes",
+    "stream-node-max-entries",
+    "supervised",
+    "syslog-enabled",
+    "syslog-facility",
+    "syslog-ident",
+    "tcp-backlog",
+    "tcp-keepalive",
+    "timeout",
+    "tls-auth-clients",
+    "tls-auth-clients-user",
+    "tls-auto-reload-interval",
+    "tls-ca-cert-dir",
+    "tls-ca-cert-file",
+    "tls-cert-file",
+    "tls-ciphers",
+    "tls-ciphersuites",
+    "tls-client-cert-file",
+    "tls-client-key-file",
+    "tls-client-key-file-pass",
+    "tls-cluster",
+    "tls-dh-params-file",
+    "tls-key-file",
+    "tls-key-file-pass",
+    "tls-port",
+    "tls-prefer-server-ciphers",
+    "tls-protocols",
+    "tls-replication",
+    "tls-session-cache-size",
+    "tls-session-cache-timeout",
+    "tls-session-caching",
+    "tracking-table-max-keys",
+    "unixsocket",
+    "unixsocketgroup",
+    "unixsocketperm",
+    "use-exit-on-panic",
+    "watchdog-period",
+    "zset-max-listpack-entries",
+    "zset-max-listpack-value",
+    "zset-max-ziplist-entries",
+    "zset-max-ziplist-value",
+];
+
+/// rudis-specific directives that are not handled by `RudisConfig::parse_str`
+/// itself but by `connection::apply_config_value`.
+const RUDIS_CONFIG_NAMES: &[&str] = &[
+    "backup-sealed-ttl",
+    "backupdirname",
+    "key-load-delay",
+    "stream-idmp-duration",
+    "stream-idmp-maxsize",
+];
+
+/// Whether `name` is a directive Redis/Valkey or rudis accept. Module
+/// configs (`module.option`) are accepted too; they are reported as ignored.
+fn is_known_directive(name: &str) -> bool {
+    REDIS_CONFIG_NAMES.contains(&name) || RUDIS_CONFIG_NAMES.contains(&name) || name.contains('.')
+}
+
+/// Strips one pair of matching surrounding quotes, so `notify-keyspace-events ""`
+/// means the empty string as it does in Redis.
+fn unquote(v: &str) -> &str {
+    let b = v.as_bytes();
+    if b.len() >= 2 && (b[0] == b'"' || b[0] == b'\'') && b[b.len() - 1] == b[0] {
+        &v[1..v.len() - 1]
+    } else {
+        v
+    }
 }
 
 static SAVE_POINTS: std::sync::Mutex<Option<HashMap<u16, Vec<(u64, u64)>>>> =
@@ -111,7 +417,12 @@ impl RudisConfig {
     /// Loads configuration from a string formatted like redis.conf
     pub fn parse_str(content: &str) -> Result<Self, String> {
         let mut config = Self::default();
+        config.parse_into(content, 0)?;
+        Ok(config)
+    }
 
+    fn parse_into(&mut self, content: &str, depth: usize) -> Result<(), String> {
+        let config = self;
         for (line_num, raw_line) in content.lines().enumerate() {
             let line = raw_line.trim();
             // Ignore empty lines and comment lines starting with #
@@ -291,15 +602,72 @@ impl RudisConfig {
                         config.save_points.extend(points);
                     }
                 }
+                "include" => {
+                    // Like Redis, a relative path is resolved against the
+                    // working directory, and later lines override earlier ones.
+                    if rest.len() != 1 || rest[0].contains(['*', '?', '[']) {
+                        return Err(format!(
+                            "Invalid include at line {}: expected a single file path (glob patterns are not supported)",
+                            line_num + 1
+                        ));
+                    }
+                    if depth >= MAX_INCLUDE_DEPTH {
+                        return Err(format!(
+                            "Invalid include at line {}: includes nested more than {} levels deep",
+                            line_num + 1,
+                            MAX_INCLUDE_DEPTH
+                        ));
+                    }
+                    let path = unquote(rest[0]);
+                    let content = fs::read_to_string(path).map_err(|e| {
+                        format!(
+                            "Failed to read included config file {:?} (line {}): {}",
+                            path,
+                            line_num + 1,
+                            e
+                        )
+                    })?;
+                    config
+                        .parse_into(&content, depth + 1)
+                        .map_err(|e| format!("In included file {:?}: {}", path, e))?;
+                }
+                "user" => {
+                    config.users.push((
+                        rest[0].to_string(),
+                        rest[1..].iter().map(|r| r.to_string()).collect(),
+                    ));
+                }
+                "rename-command" => {
+                    // Silently keeping a command that the operator meant to
+                    // rename or disable would be a security hole.
+                    return Err(format!(
+                        "Unsupported directive at line {}: rename-command is not supported by rudis; \
+                         restrict commands with ACL rules instead (e.g. `user default on nopass ~* &* +@all -flushall`)",
+                        line_num + 1
+                    ));
+                }
+                "loadmodule" => {
+                    return Err(format!(
+                        "Unsupported directive at line {}: rudis cannot load Redis modules",
+                        line_num + 1
+                    ));
+                }
                 other => {
+                    if !is_known_directive(other) {
+                        return Err(format!(
+                            "Bad directive or wrong number of arguments at line {}: '{}'",
+                            line_num + 1,
+                            other
+                        ));
+                    }
                     config
                         .extra_directives
-                        .insert(other.to_string(), rest.join(" "));
+                        .push((other.to_string(), unquote(&rest.join(" ")).to_string()));
                 }
             }
         }
 
-        Ok(config)
+        Ok(())
     }
 
     /// Loads configuration from a file path
@@ -657,6 +1025,77 @@ mod tests {
                 .protected_mode
         );
         assert!(RudisConfig::parse_str("protected-mode maybe\n").is_err());
+    }
+
+    #[test]
+    fn test_unknown_and_unsupported_directives() {
+        // Typos are fatal, like in Redis.
+        let err = RudisConfig::parse_str("maxmemroy 1gb\n").unwrap_err();
+        assert!(err.contains("Bad directive"), "{}", err);
+        assert!(RudisConfig::parse_str("rename-command FLUSHALL \"\"\n").is_err());
+        assert!(RudisConfig::parse_str("loadmodule /x.so\n").is_err());
+        // Known Redis directives are kept, in order and with repeats, for
+        // startup to apply or report; one pair of quotes is stripped.
+        let cfg = RudisConfig::parse_str(
+            "client-output-buffer-limit normal 0 0 0\n\
+             client-output-buffer-limit pubsub 32mb 8mb 60\n\
+             notify-keyspace-events \"\"\n\
+             databases 16\n\
+             search.timeout 5\n\
+             user bob on >pw +@all\n",
+        )
+        .unwrap();
+        let names: Vec<&str> = cfg
+            .extra_directives
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "client-output-buffer-limit",
+                "client-output-buffer-limit",
+                "notify-keyspace-events",
+                "databases",
+                "search.timeout"
+            ]
+        );
+        assert_eq!(cfg.extra_directives[1].1, "pubsub 32mb 8mb 60");
+        assert_eq!(cfg.extra_directives[2].1, "");
+        assert_eq!(
+            cfg.users,
+            vec![(
+                "bob".to_string(),
+                vec!["on".to_string(), ">pw".to_string(), "+@all".to_string()]
+            )]
+        );
+    }
+
+    #[test]
+    fn test_include_directive() {
+        let dir = std::env::temp_dir().join(format!("rudis-include-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let inc = dir.join("inc.conf");
+        fs::write(&inc, "maxclients 42\nslowlog-max-len 7\n").unwrap();
+        let cfg = RudisConfig::parse_str(&format!(
+            "maxclients 1\ninclude {}\nport 7001\n",
+            inc.display()
+        ))
+        .unwrap();
+        assert_eq!(cfg.maxclients, 42);
+        assert_eq!(cfg.port, 7001);
+        assert_eq!(
+            cfg.extra_directives,
+            vec![("slowlog-max-len".to_string(), "7".to_string())]
+        );
+        // Errors inside the included file and missing files are reported.
+        fs::write(&inc, "port nope\n").unwrap();
+        assert!(RudisConfig::parse_str(&format!("include {}\n", inc.display())).is_err());
+        assert!(RudisConfig::parse_str("include /nonexistent/rudis.conf\n").is_err());
+        // A self-include is cut off instead of recursing forever.
+        fs::write(&inc, format!("include {}\n", inc.display())).unwrap();
+        assert!(RudisConfig::parse_str(&format!("include {}\n", inc.display())).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -17890,3 +17890,73 @@ fn test_experimental_commands_off_by_default_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child);
 }
+
+#[test]
+fn test_config_file_directives_are_applied_or_rejected_e2e() {
+    let port = 16946;
+    let dir = std::env::temp_dir().join(format!("rudis-conf-apply-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let included = dir.join("included.conf");
+    std::fs::write(
+        &included,
+        "slowlog-log-slower-than 12345\n\
+         client-output-buffer-limit normal 0 0 0\n\
+         client-output-buffer-limit pubsub 1mb 512kb 30\n\
+         notify-keyspace-events \"\"\n\
+         databases 16\n",
+    )
+    .unwrap();
+    let conf = dir.join("main.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "include {}\nuser alice on >alicepw ~* &* +@all\n",
+            included.display()
+        ),
+    )
+    .unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "-c",
+        conf.to_str().unwrap(),
+    ];
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // Directives from the included file reach the running server...
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "GET", "slowlog-log-slower-than"]),
+        "*2\r\n$23\r\nslowlog-log-slower-than\r\n$5\r\n12345\r\n"
+    );
+    // ...including every line of a repeated directive.
+    let obl = resp_cmd(&mut c, &["CONFIG", "GET", "client-output-buffer-limit"]);
+    assert!(obl.contains("pubsub 1048576 524288 30"), "{obl}");
+    // `user` lines create ACL users.
+    assert_eq!(resp_cmd(&mut c, &["AUTH", "alice", "alicepw"]), "+OK\r\n");
+    shutdown_and_wait(port, &mut child);
+
+    // A typo or an unsupported security-relevant directive must stop startup
+    // instead of being silently ignored.
+    for bad in [
+        "slowlog-log-slower-thn 10\n",
+        "rename-command FLUSHALL \"\"\n",
+        "maxclients lots\n",
+    ] {
+        std::fs::write(&conf, bad).unwrap();
+        let status = std::process::Command::new(env!("CARGO_BIN_EXE_rudis"))
+            .args(args)
+            .env("MONOIO_FORCE_LEGACY_DRIVER", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("spawn rudis");
+        assert!(!status.success(), "rudis started with config {bad:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

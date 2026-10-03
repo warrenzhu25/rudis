@@ -217,13 +217,35 @@ fn main() {
     }
     rudis::resp::set_experimental_commands(server_config.enable_experimental_commands);
     rudis::config::set_save_points(port, server_config.save_points.clone());
-    if let Some(v) = server_config.extra_directives.get("repl-backlog-size") {
-        match rudis::tiering::parse_memory_bytes(v) {
-            Some(bytes) => rudis::replication::set_repl_backlog_size(bytes as usize),
-            None => {
-                eprintln!("Invalid repl-backlog-size: {}", v);
+    let mut ignored_directives: Vec<&str> = Vec::new();
+    for (name, value) in &server_config.extra_directives {
+        match rudis::connection::apply_config_value(port, port, name, value) {
+            Ok(true) => {}
+            Ok(false) => {
+                if !ignored_directives.contains(&name.as_str()) {
+                    ignored_directives.push(name);
+                }
+            }
+            Err(e) => {
+                eprintln!("FATAL CONFIG: invalid '{}' directive: {}", name, e);
                 std::process::exit(1);
             }
+        }
+    }
+    if !ignored_directives.is_empty() {
+        eprintln!(
+            "WARNING: config directives not supported by rudis were ignored: {}",
+            ignored_directives.join(", ")
+        );
+    }
+    for (user, rules) in &server_config.users {
+        if let Err(e) = rudis::acl::get_acl_for_port(port)
+            .write()
+            .unwrap()
+            .set_user(user, rules)
+        {
+            eprintln!("FATAL CONFIG: error in user declaration '{}': {}", user, e);
+            std::process::exit(1);
         }
     }
     let aof_config = rudis::aof::AofConfig {
