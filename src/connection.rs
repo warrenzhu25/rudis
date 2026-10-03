@@ -1077,12 +1077,14 @@ pub fn is_client_paused() -> Option<(u64, bool)> {
         return None;
     }
     let now = now_epoch_ms();
-    if now >= dl {
+    // Times are whole milliseconds, so `now == dl` can still be up to 1ms
+    // short of the full pause; only release once `dl` has passed.
+    if now > dl {
         let _ = unpause_clients();
         return None;
     }
     let write_only = PAUSE_WRITE_ONLY.load(std::sync::atomic::Ordering::Relaxed);
-    Some((dl - now, write_only))
+    Some((dl - now + 1, write_only))
 }
 
 #[inline]
@@ -1164,7 +1166,7 @@ pub async fn wait_if_client_paused(port: u16, client_id: u64, cmd: &Command) {
         )
         .await;
         drop(_guard);
-        if now_epoch_ms() >= PAUSE_DEADLINE_MS.load(std::sync::atomic::Ordering::Relaxed) {
+        if now_epoch_ms() > PAUSE_DEADLINE_MS.load(std::sync::atomic::Ordering::Relaxed) {
             let _ = unpause_clients();
             return;
         }
@@ -1192,7 +1194,7 @@ pub async fn wait_if_tx_paused(port: u16, client_id: u64, tx_queue: &[Command]) 
         )
         .await;
         drop(_guard);
-        if now_epoch_ms() >= PAUSE_DEADLINE_MS.load(std::sync::atomic::Ordering::Relaxed) {
+        if now_epoch_ms() > PAUSE_DEADLINE_MS.load(std::sync::atomic::Ordering::Relaxed) {
             let _ = unpause_clients();
             return;
         }
