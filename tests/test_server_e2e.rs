@@ -16462,3 +16462,57 @@ fn test_info_stats_counts_commands_bytes_and_connections_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child);
 }
+
+#[test]
+fn test_info_stats_counts_pubsub_channels_and_patterns_e2e() {
+    let port = 16960;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let pubsub_counts = |c: &mut TcpStream| {
+        let info = info_section(c, "stats");
+        ["pubsub_channels", "pubsub_patterns", "pubsubshard_channels"].map(|f| info_num(&info, f))
+    };
+    assert_eq!(pubsub_counts(&mut c), [0.0, 0.0, 0.0]);
+
+    // Subscribers on separate connections, so they may live on different shards.
+    let mut subs = Vec::new();
+    for args in [
+        &["SUBSCRIBE", "ch:a", "ch:b"][..],
+        &["SUBSCRIBE", "ch:b", "ch:c"][..],
+        &["PSUBSCRIBE", "p:*"][..],
+        &["SSUBSCRIBE", "sh:x"][..],
+    ] {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut req = format!("*{}\r\n", args.len());
+        for a in args {
+            req.push_str(&format!("${}\r\n{}\r\n", a.len(), a));
+        }
+        s.write_all(req.as_bytes()).unwrap();
+        // Wait for one confirmation per channel.
+        let mut got = String::new();
+        let mut buf = [0u8; 4096];
+        while got.matches("subscribe\r\n").count() < args.len() - 1 {
+            let n = s.read(&mut buf).unwrap();
+            assert!(n > 0, "connection closed");
+            got.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        subs.push(s);
+    }
+    assert_eq!(pubsub_counts(&mut c), [3.0, 1.0, 1.0]);
+
+    drop(subs);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let counts = pubsub_counts(&mut c);
+        if counts == [0.0, 0.0, 0.0] {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{counts:?}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}
