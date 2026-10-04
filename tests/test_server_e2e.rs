@@ -19819,3 +19819,91 @@ fn test_client_reply_off_skip_inside_one_pipeline_e2e() {
     }
     assert_eq!(String::from_utf8_lossy(&got), "+OK\r\n:5\r\n");
 }
+
+/// A hostile cluster-bus peer gets error replies or a hang-up, never a crash:
+/// MEET with a port above 55535 used to overflow `port + 10000` while holding
+/// the node-table lock, poisoning it for every later CLUSTER command.
+#[test]
+fn test_cluster_bus_survives_hostile_peer_e2e() {
+    let port: u16 = 17088;
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--cluster-enabled",
+        "yes",
+    ];
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = KillOnDrop(spawn_rudis_listening(&args, port));
+    let bus = || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(s) = TcpStream::connect(("127.0.0.1", port + 10000)) {
+                s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                return s;
+            }
+            assert!(std::time::Instant::now() < deadline, "cluster bus not up");
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let line = |s: &mut TcpStream, frame: &str| -> String {
+        s.write_all(frame.as_bytes()).unwrap();
+        let mut buf = [0u8; 4096];
+        let n = s.read(&mut buf).unwrap();
+        String::from_utf8_lossy(&buf[..n]).into_owned()
+    };
+
+    let mut b = bus();
+    assert_eq!(
+        line(&mut b, "MEET 127.0.0.1 65535 evil 1 0-1\r\n"),
+        "-ERR invalid port\r\n"
+    );
+    assert!(line(&mut b, "MEET 127.0.0.1 7001 peer 1 0-65535,9-3,1-2\r\n").starts_with("+PONG "));
+    let ranges = vec!["0-65535"; 2000].join(",");
+    assert_eq!(
+        line(&mut b, &format!("FAILOVER_ANNOUNCE peer 2 {ranges}\r\n")),
+        "+OK\r\n"
+    );
+    assert_eq!(
+        line(&mut b, "GARBAGE \u{1}\u{2}\r\n"),
+        "-ERR unknown clusterbus command\r\n"
+    );
+    drop(b);
+
+    // An endless line is cut off instead of buffered.
+    let mut b = bus();
+    let chunk = vec![b'A'; 64 * 1024];
+    let mut hung_up = false;
+    for _ in 0..64 {
+        if b.write_all(&chunk).is_err() {
+            hung_up = true;
+            break;
+        }
+    }
+    if !hung_up {
+        let mut rest = Vec::new();
+        assert!(matches!(b.read_to_end(&mut rest), Ok(0) | Err(_)));
+    }
+
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n");
+    let nodes = resp_cmd_full(&mut c, &["CLUSTER", "NODES"]);
+    assert!(nodes.contains("peer 127.0.0.1:7001@17001"), "{nodes}");
+    assert!(
+        !nodes.contains("evil") && !nodes.contains("65535"),
+        "{nodes}"
+    );
+    assert!(resp_cmd_full(&mut c, &["CLUSTER", "INFO"]).contains("cluster_known_nodes:"));
+    drop(c);
+    shutdown_and_wait(port, &mut child.0);
+}
