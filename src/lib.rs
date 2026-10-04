@@ -40,6 +40,7 @@ pub mod table;
 pub mod telemetry;
 pub mod tiering;
 pub mod tls;
+pub mod transport;
 pub mod vector;
 pub mod xdp;
 pub mod zerocopy;

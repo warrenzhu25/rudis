@@ -16,7 +16,7 @@ use crate::resp::{
 use crate::router::{Router, key_slot, target_shard};
 use crate::shard::{CompactResp, ShardDb, ShardMessage};
 
-const READ_BUFFER_SIZE: usize = 65536;
+pub(crate) const READ_BUFFER_SIZE: usize = 65536;
 
 pub type ResponderChannel = (
     flume::Sender<(Vec<(usize, Command)>, Vec<(usize, CompactResp)>)>,
@@ -71,6 +71,8 @@ pub struct ClientInfo {
     pub reply_mode: crate::resp::ClientReplyMode,
     pub is_monitor: bool,
     pub stats: std::sync::Arc<ClientStats>,
+    /// How other threads deliver MONITOR output to this client.
+    pub push: crate::transport::PushTarget,
 }
 
 impl ClientInfo {
@@ -252,6 +254,8 @@ pub fn set_client_output_buffer_limit_str(val: &str) -> Result<(), &'static str>
 #[derive(Clone, Debug)]
 pub struct GlobalClientEntry {
     pub raw_fd: std::os::unix::io::RawFd,
+    /// How other threads deliver tracking invalidations to this client.
+    pub push: crate::transport::PushTarget,
     pub track_tx: flume::Sender<Vec<u8>>,
     pub is_resp3: bool,
     pub auth_user: String,
@@ -1421,7 +1425,7 @@ pub static HAS_MONITOR_CLIENTS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 static MONITOR_CLIENTS: std::sync::LazyLock<
-    std::sync::RwLock<Vec<(u16, u64, std::os::unix::io::RawFd)>>,
+    std::sync::RwLock<Vec<(u16, u64, crate::transport::PushTarget)>>,
 > = std::sync::LazyLock::new(|| std::sync::RwLock::new(Vec::new()));
 
 #[inline(always)]
@@ -1429,10 +1433,10 @@ pub fn has_monitor_clients() -> bool {
     HAS_MONITOR_CLIENTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-pub fn register_monitor_client(port: u16, client_id: u64, raw_fd: std::os::unix::io::RawFd) {
+pub fn register_monitor_client(port: u16, client_id: u64, push: crate::transport::PushTarget) {
     let mut list = MONITOR_CLIENTS.write().unwrap();
-    if !list.iter().any(|&(p, id, _)| p == port && id == client_id) {
-        list.push((port, client_id, raw_fd));
+    if !list.iter().any(|(p, id, _)| *p == port && *id == client_id) {
+        list.push((port, client_id, push));
     }
     HAS_MONITOR_CLIENTS.store(!list.is_empty(), std::sync::atomic::Ordering::Release);
 }
@@ -1443,7 +1447,7 @@ pub fn unregister_monitor_client(port: u16, client_id: u64) {
     }
     let mut list = MONITOR_CLIENTS.write().unwrap();
     let prev_len = list.len();
-    list.retain(|&(p, id, _)| !(p == port && id == client_id));
+    list.retain(|(p, id, _)| !(*p == port && *id == client_id));
     if list.len() != prev_len {
         HAS_MONITOR_CLIENTS.store(!list.is_empty(), std::sync::atomic::Ordering::Release);
     }
@@ -1480,16 +1484,9 @@ pub fn broadcast_monitor(port: u16, source_addr: &str, argv: &[Bytes]) {
     line.push_str("\r\n");
     let bytes = line.as_bytes();
     let list = MONITOR_CLIENTS.read().unwrap();
-    for &(p, _, fd) in list.iter() {
-        if p == port {
-            unsafe {
-                libc::send(
-                    fd,
-                    bytes.as_ptr() as *const libc::c_void,
-                    bytes.len(),
-                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-                );
-            }
+    for (p, _, target) in list.iter() {
+        if *p == port {
+            target.push(bytes);
         }
     }
 }
@@ -1502,6 +1499,7 @@ pub fn register_global_client(
     port: u16,
     client_id: u64,
     raw_fd: std::os::unix::io::RawFd,
+    push: crate::transport::PushTarget,
     track_tx: flume::Sender<Vec<u8>>,
     is_resp3: bool,
     auth_user: String,
@@ -1512,6 +1510,7 @@ pub fn register_global_client(
         (port, client_id),
         GlobalClientEntry {
             raw_fd,
+            push,
             track_tx,
             is_resp3,
             auth_user,
@@ -1830,14 +1829,7 @@ fn send_raw_to_client_entry(target_id: u64, entry: &GlobalClientEntry, msg: Vec<
             let _ = entry.track_tx.send(msg);
         }
     } else {
-        unsafe {
-            libc::send(
-                entry.raw_fd,
-                msg.as_ptr() as *const libc::c_void,
-                msg.len(),
-                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-            );
-        }
+        entry.push.push(&msg);
     }
 }
 
@@ -2990,6 +2982,7 @@ pub async fn handle_tls_connection(
             reply_mode: crate::resp::ClientReplyMode::On,
             is_monitor: false,
             stats: std::sync::Arc::new(ClientStats::new(now, client_addr)),
+            push: crate::transport::PushTarget::Fd(raw_fd),
         },
     );
 
@@ -3466,8 +3459,34 @@ async fn execute_tx_step(
     }
 }
 
+/// Serves a plaintext TCP client.
 pub async fn handle_connection(
-    mut stream: TcpStream,
+    stream: TcpStream,
+    client_addr: SocketAddr,
+    client_id: u64,
+    client_registry: Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
+    router: Rc<Router>,
+) {
+    handle_client(
+        crate::transport::PlainTransport::new(stream),
+        client_addr,
+        client_id,
+        client_registry,
+        router,
+    )
+    .await
+}
+
+/// Reply to a replication handshake on a transport that cannot carry the
+/// replication stream (it takes over the raw TCP socket).
+const REPLICATION_NEEDS_PLAINTEXT: &[u8] =
+    b"-ERR replication links are only supported on the plaintext port\r\n";
+
+/// The client connection loop, shared by every transport (see
+/// `crate::transport`): parsing, transactions, pipeline squashing, Pub/Sub
+/// and replication mode switches, output-buffer limits and client stats.
+pub(crate) async fn handle_client<T: crate::transport::ClientTransport>(
+    mut transport: T,
     client_addr: SocketAddr,
     client_id: u64,
     client_registry: Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
@@ -3479,12 +3498,13 @@ pub async fn handle_connection(
         ACTIVE_CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         crate::server_stats::add(crate::server_stats::Stat::RejectedConnections, 1);
         let err_msg = b"-ERR max number of clients reached\r\n";
-        let _ = stream.write_all(err_msg.to_vec()).await;
+        let _ = transport.write_all(err_msg.to_vec()).await;
         return;
     }
     crate::server_stats::add(crate::server_stats::Stat::ConnectionsReceived, 1);
 
-    let raw_fd = stream.as_raw_fd();
+    let raw_fd = transport.raw_fd();
+    let push = transport.push_target();
     let now = Instant::now();
     let stats = std::sync::Arc::new(ClientStats::new(now, client_addr));
     let (track_tx, track_rx) = flume::unbounded::<Vec<u8>>();
@@ -3492,6 +3512,7 @@ pub async fn handle_connection(
         router.port,
         client_id,
         raw_fd,
+        push.clone(),
         track_tx.clone(),
         false,
         "default".to_string(),
@@ -3518,6 +3539,7 @@ pub async fn handle_connection(
             reply_mode: crate::resp::ClientReplyMode::On,
             is_monitor: false,
             stats: stats.clone(),
+            push,
         },
     );
 
@@ -3592,28 +3614,25 @@ pub async fn handle_connection(
     let mut auth_user = "default".to_string();
     let mut soft_limit_start: Option<Instant> = None;
 
-    const MIN_READ_SPARE: usize = 16 * 1024;
+    use crate::transport::MIN_READ_SPARE;
     loop {
         if buf.capacity() - buf.len() < MIN_READ_SPARE {
             buf.reserve(READ_BUFFER_SIZE);
         }
-        let avail_before = buf.capacity() - buf.len();
 
-        // Rent BytesMut directly to monoio's io_uring driver (zero intermediate read_buf memcpy)
-        let (res, RecvBytesMut(returned_buf)) =
-            match idle_read_limit(&router, client_id, &client_registry) {
-                None => stream.read(RecvBytesMut(buf)).await,
-                Some(limit) => {
-                    match monoio::time::timeout(limit, stream.read(RecvBytesMut(buf))).await {
-                        Ok(r) => r,
-                        Err(_) => {
-                            // Idle for `timeout` seconds: close, like Redis.
-                            buf = BytesMut::new();
-                            break;
-                        }
+        let (res, returned_buf) = match idle_read_limit(&router, client_id, &client_registry) {
+            None => transport.read(buf).await,
+            Some(limit) => {
+                match monoio::time::timeout(limit, transport.read(buf)).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        // Idle for `timeout` seconds: close, like Redis.
+                        buf = BytesMut::new();
+                        break;
                     }
                 }
-            };
+            }
+        };
         buf = returned_buf;
 
         match res {
@@ -3629,41 +3648,6 @@ pub async fn handle_connection(
                     .tot_net_in
                     .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
                 crate::server_stats::add(crate::server_stats::Stat::NetInputBytes, n as u64);
-                // Drain any additional bytes waiting in kernel TCP socket buffer if spare capacity was completely filled
-                if n == avail_before {
-                    loop {
-                        if buf.capacity() - buf.len() < MIN_READ_SPARE {
-                            buf.reserve(READ_BUFFER_SIZE);
-                        }
-                        let spare = buf.spare_capacity_mut();
-                        let spare_len = spare.len();
-                        let drain_n = unsafe {
-                            libc::recv(
-                                raw_fd,
-                                spare.as_mut_ptr() as *mut libc::c_void,
-                                spare_len,
-                                libc::MSG_DONTWAIT,
-                            )
-                        };
-                        if drain_n > 0 {
-                            stats
-                                .tot_net_in
-                                .fetch_add(drain_n as u64, std::sync::atomic::Ordering::Relaxed);
-                            crate::server_stats::add(
-                                crate::server_stats::Stat::NetInputBytes,
-                                drain_n as u64,
-                            );
-                            unsafe {
-                                buf.set_len(buf.len() + drain_n as usize);
-                            }
-                            if (drain_n as usize) < spare_len {
-                                break;
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                }
 
                 let batch_bytes = buf.len();
                 let pause_cron = PAUSE_CRON.load(std::sync::atomic::Ordering::Relaxed);
@@ -3701,18 +3685,7 @@ pub async fn handle_connection(
                         }
                         Ok(None) => {
                             // Incomplete frame: check if remaining bytes just arrived in kernel buffer
-                            if buf.capacity() - buf.len() < MIN_READ_SPARE {
-                                buf.reserve(READ_BUFFER_SIZE);
-                            }
-                            let spare = buf.spare_capacity_mut();
-                            let drain_n = unsafe {
-                                libc::recv(
-                                    raw_fd,
-                                    spare.as_mut_ptr() as *mut libc::c_void,
-                                    spare.len(),
-                                    libc::MSG_DONTWAIT,
-                                )
-                            };
+                            let drain_n = transport.read_ready(&mut buf);
                             if drain_n > 0 {
                                 stats.tot_net_in.fetch_add(
                                     drain_n as u64,
@@ -3722,9 +3695,6 @@ pub async fn handle_connection(
                                     crate::server_stats::Stat::NetInputBytes,
                                     drain_n as u64,
                                 );
-                                unsafe {
-                                    buf.set_len(buf.len() + drain_n as usize);
-                                }
                                 continue;
                             }
                             if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
@@ -3746,7 +3716,7 @@ pub async fn handle_connection(
                                     out_buf.len() as u64,
                                 );
                                 let write_chunk = std::mem::take(&mut out_buf);
-                                let _ = stream.write_all(write_chunk).await.0;
+                                let _ = transport.write_all(write_chunk).await.0;
                                 return;
                             }
                             if in_multi {
@@ -3846,29 +3816,49 @@ pub async fn handle_connection(
                             out_buf.len() as u64,
                         );
                         let write_chunk = std::mem::take(&mut out_buf);
-                        let _ = stream.write_all(write_chunk).await.0;
+                        let _ = transport.write_all(write_chunk).await.0;
                     }
                     let switch_cmd = commands.remove(0);
                     match switch_cmd {
                         Command::Psync { .. } | Command::Sync => {
-                            run_master_replica_stream(
-                                stream,
-                                client_id,
-                                client_registry,
-                                router,
-                                switch_cmd,
-                            )
-                            .await;
+                            match transport.into_tcp_stream() {
+                                Ok(stream) => {
+                                    run_master_replica_stream(
+                                        stream,
+                                        client_id,
+                                        client_registry,
+                                        router,
+                                        switch_cmd,
+                                    )
+                                    .await;
+                                }
+                                Err(mut transport) => {
+                                    let _ = transport
+                                        .write_all(REPLICATION_NEEDS_PLAINTEXT.to_vec())
+                                        .await;
+                                }
+                            }
                         }
                         Command::DflyFlow { shard_id, lsn, .. } => {
-                            run_shard_replication_flow(stream, client_id, router, shard_id, lsn)
-                                .await;
+                            match transport.into_tcp_stream() {
+                                Ok(stream) => {
+                                    run_shard_replication_flow(
+                                        stream, client_id, router, shard_id, lsn,
+                                    )
+                                    .await;
+                                }
+                                Err(mut transport) => {
+                                    let _ = transport
+                                        .write_all(REPLICATION_NEEDS_PLAINTEXT.to_vec())
+                                        .await;
+                                }
+                            }
                         }
                         initial_sub => {
                             update_global_client_pubsub(router.port, client_id, true);
                             std::mem::forget(_cleanup);
                             run_pubsub_loop(
-                                stream,
+                                transport,
                                 client_id,
                                 client_registry,
                                 router,
@@ -3989,7 +3979,7 @@ pub async fn handle_connection(
                                     out_buf.len() as u64,
                                 );
                                 let write_chunk = std::mem::take(&mut out_buf);
-                                let (res, returned_buf) = stream.write_all(write_chunk).await;
+                                let (res, returned_buf) = transport.write_all(write_chunk).await;
                                 out_buf = returned_buf;
                                 out_buf.clear();
                                 if res.is_err() {
@@ -4119,42 +4109,15 @@ pub async fn handle_connection(
                         .tot_net_out
                         .fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
                     crate::server_stats::add(crate::server_stats::Stat::NetOutputBytes, len as u64);
-                    let send_ret = unsafe {
-                        libc::send(
-                            raw_fd,
-                            out_buf.as_ptr() as *const libc::c_void,
-                            len,
-                            libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
-                        )
-                    };
-                    if send_ret == len as isize {
-                        out_buf.clear();
-                    } else if send_ret > 0 {
-                        let rem = out_buf[send_ret as usize..].to_vec();
-                        out_buf.clear();
-                        if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
-                            c.omem = rem.len();
-                        }
-                        let (write_res, _) = stream.write_all(rem).await;
-                        if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
-                            c.omem = 0;
-                        }
-                        if write_res.is_err() {
-                            break;
-                        }
-                    } else {
-                        if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
-                            c.omem = len;
-                        }
-                        let (write_res, returned_buf) = stream.write_all(out_buf).await;
-                        out_buf = returned_buf;
-                        out_buf.clear();
-                        if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
-                            c.omem = 0;
-                        }
-                        if write_res.is_err() {
-                            break;
-                        }
+                    let flushed = transport
+                        .flush(&mut out_buf, |omem| {
+                            if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
+                                c.omem = omem;
+                            }
+                        })
+                        .await;
+                    if flushed.is_err() {
+                        break;
                     }
                 }
 
@@ -4283,8 +4246,8 @@ pub fn reset_client_pubsub(router: &Router, client_id: u64) {
     }
 }
 
-async fn run_pubsub_loop(
-    stream: TcpStream,
+async fn run_pubsub_loop<T: crate::transport::ClientTransport>(
+    transport: T,
     client_id: u64,
     client_registry: Rc<RefCell<hashbrown::HashMap<u64, ClientInfo>>>,
     router: Rc<Router>,
@@ -4337,8 +4300,9 @@ async fn run_pubsub_loop(
         router: router.clone(),
     };
 
-    let (mut reader, mut writer) = stream.into_split();
+    use crate::transport::{TransportRead, TransportWrite};
     let (write_tx, write_rx) = flume::bounded::<Bytes>(4096);
+    let (mut reader, mut writer) = transport.into_split(&write_tx);
 
     let reg_writer = client_registry.clone();
     monoio::spawn(async move {
@@ -4377,7 +4341,7 @@ async fn run_pubsub_loop(
             }
 
             crate::server_stats::add(crate::server_stats::Stat::NetOutputBytes, data_len as u64);
-            if writer.write_all(data).await.0.is_err() {
+            if writer.write_bytes(data).await.is_err() {
                 break;
             }
             queued_bytes = queued_bytes.saturating_sub(data_len);
@@ -4387,7 +4351,6 @@ async fn run_pubsub_loop(
         }
     });
 
-    let mut read_buf = vec![0u8; READ_BUFFER_SIZE];
     let mut in_multi = false;
     let mut tx_queue: Vec<Command> = Vec::new();
     let mut asking = false;
@@ -5010,13 +4973,10 @@ async fn run_pubsub_loop(
     }
 
     loop {
-        let (res, returned_buf) = reader.read(read_buf).await;
-        read_buf = returned_buf;
-        match res {
+        match reader.read_append(&mut buf).await {
             Ok(0) => break,
             Ok(n) => {
                 crate::server_stats::add(crate::server_stats::Stat::NetInputBytes, n as u64);
-                buf.extend_from_slice(&read_buf[..n]);
                 while !buf.is_empty() {
                     match parse_command(&mut buf) {
                         Ok(Some(cmd)) => {
@@ -8702,7 +8662,7 @@ async fn execute_command(
         Command::Monitor => {
             if let Some(c) = client_registry.borrow_mut().get_mut(&client_id) {
                 c.is_monitor = true;
-                register_monitor_client(router.port, client_id, c.raw_fd);
+                register_monitor_client(router.port, client_id, c.push.clone());
             }
             out.extend_from_slice(b"+OK\r\n");
             false
@@ -26011,6 +25971,7 @@ mod tests {
             port,
             100,
             std::os::unix::io::AsRawFd::as_raw_fd(&ours),
+            crate::transport::PushTarget::Fd(std::os::unix::io::AsRawFd::as_raw_fd(&ours)),
             tx,
             true,
             "default".to_string(),
