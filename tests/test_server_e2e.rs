@@ -20507,3 +20507,134 @@ fn test_replica_aof_holds_the_synced_dataset_after_a_restart_e2e() {
     shutdown_and_wait(replica_port, &mut replica);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_replica_replies_loading_while_it_loads_a_full_sync_e2e() {
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let port: u16 = 17087;
+    let port_s = port.to_string();
+    let args = ["--port", &port_s, "--threads", "2", "--no-pin"];
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = KillOnDrop(spawn_rudis_listening(&args, port));
+
+    // Every key on one shard, which key-load-delay slows down: the other
+    // shard finishes its part early and serves its clients meanwhile.
+    let mut src = rudis::shard::ShardDb::new(0);
+    for i in 0..20_000 {
+        src.table.set(
+            bytes::Bytes::from(format!("{{t}}:{i}")),
+            bytes::Bytes::from_static(b"v"),
+            None,
+        );
+    }
+    let mut rdb = b"REDIS0011\xFE\x00".to_vec();
+    src.save_rdb_chunk(&mut rdb);
+    rdb.push(0xFF);
+    let crc = rudis::table::crc64(&rdb);
+    rdb.extend_from_slice(&crc.to_le_bytes());
+    drop(src);
+
+    let master = TcpListener::bind("127.0.0.1:0").unwrap();
+    let master_port = master.local_addr().unwrap().port();
+    thread::spawn(move || {
+        let Ok((mut conn, _)) = master.accept() else {
+            return;
+        };
+        conn.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        let mut read_to = |conn: &mut TcpStream, until: &[u8], crlfs: usize| {
+            got.clear();
+            loop {
+                if let Some(p) = got.windows(until.len()).position(|w| w == until) {
+                    let tail = &got[p + until.len()..];
+                    if tail.windows(2).filter(|w| w == b"\r\n").count() >= crlfs {
+                        return true;
+                    }
+                }
+                match conn.read(&mut buf) {
+                    Ok(n) if n > 0 => got.extend_from_slice(&buf[..n]),
+                    _ => return false,
+                }
+            }
+        };
+        let ok = read_to(&mut conn, b"PING\r\n", 0)
+            && conn.write_all(b"+PONG\r\n").is_ok()
+            && read_to(&mut conn, b"listening-port\r\n", 2)
+            && conn.write_all(b"+OK\r\n").is_ok()
+            && read_to(&mut conn, b"psync2\r\n", 0)
+            && conn.write_all(b"+OK\r\n").is_ok()
+            && read_to(&mut conn, b"PSYNC\r\n", 4);
+        if !ok {
+            return;
+        }
+        let replid = "b".repeat(40);
+        let mut reply = format!("+FULLRESYNC {replid} 0\r\n${}\r\n", rdb.len()).into_bytes();
+        reply.extend_from_slice(&rdb);
+        let _ = conn.write_all(&reply);
+        // Hold the link open until the test is done.
+        let _ = conn.read(&mut buf);
+    });
+
+    // Clients PING (not allowed while loading, like in Redis) rather than
+    // touch keys: a key command already queued on the loading shard would
+    // just wait for it, while PING runs on the client's own shard thread.
+    let loading_seen = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    // Enough clients that both shard threads have some.
+    let clients: Vec<_> = (0..16)
+        .map(|_| {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+            let (loading_seen, stop) = (loading_seen.clone(), stop.clone());
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let r = resp_cmd(&mut c, &["PING"]);
+                    if r.starts_with("-LOADING") {
+                        assert_eq!(r, "-LOADING Redis is loading the dataset in memory\r\n");
+                        loading_seen.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        assert_eq!(r, "+PONG\r\n");
+                    }
+                }
+            })
+        })
+        .collect();
+
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "key-load-delay", "50"]),
+        "+OK\r\n"
+    );
+    let mport = master_port.to_string();
+    assert_eq!(
+        resp_cmd(&mut c, &["REPLICAOF", "127.0.0.1", &mport]),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while !resp_cmd(&mut c, &["INFO", "replication"]).contains("master_link_status:up") {
+        assert!(std::time::Instant::now() < deadline, "sync never finished");
+        thread::sleep(Duration::from_millis(20));
+    }
+    stop.store(true, Ordering::Relaxed);
+    for t in clients {
+        t.join().unwrap();
+    }
+    assert!(loading_seen.load(Ordering::Relaxed) > 0, "no -LOADING seen");
+    assert_eq!(resp_cmd(&mut c, &["GET", "{t}:19999"]), "$1\r\nv\r\n");
+    assert_eq!(info_field(&mut c, "loading"), "0");
+    assert_eq!(resp_cmd(&mut c, &["REPLICAOF", "NO", "ONE"]), "+OK\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child.0);
+}

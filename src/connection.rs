@@ -2385,6 +2385,15 @@ static CONFIG_MAXMEMORY_SAMPLES: std::sync::atomic::AtomicU64 =
 static CONFIG_CLIENT_QUERY_BUFFER_LIMIT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1073741824);
 static CONFIG_KEY_LOAD_DELAY: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+/// `key-load-delay`: microseconds to pause after each key an RDB load
+/// adds, like Redis (which uses it to make loads observable in tests).
+/// Values <= 0 mean no pause.
+pub fn key_load_delay_us() -> u64 {
+    CONFIG_KEY_LOAD_DELAY
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(0) as u64
+}
 static CONFIG_LUA_TIME_LIMIT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(5000);
 static CONFIG_OOM_SCORE_ADJ: std::sync::LazyLock<std::sync::RwLock<String>> =
@@ -7428,6 +7437,43 @@ fn mode_switch_denied(
     }
 }
 
+/// Commands Redis flags `loading`: what a client may run while a replica
+/// loads its master's dataset. Everything else gets `-LOADING`.
+fn allowed_while_loading(cmd: &Command) -> bool {
+    let name = get_cmd_name(cmd);
+    name.starts_with("client|")
+        || name.starts_with("PUBSUB ")
+        || matches!(
+            name,
+            "ACL"
+                | "AUTH"
+                | "COMMAND"
+                | "CONFIG"
+                | "DEBUG"
+                | "HELLO"
+                | "INFO"
+                | "LATENCY"
+                | "MONITOR"
+                | "PSUBSCRIBE"
+                | "PUBLISH"
+                | "PUNSUBSCRIBE"
+                | "QUIT"
+                | "REPLCONF"
+                | "REPLICAOF"
+                | "RESET"
+                | "ROLE"
+                | "SELECT"
+                | "SHUTDOWN"
+                | "SLOWLOG"
+                | "SPUBLISH"
+                | "SSUBSCRIBE"
+                | "SUBSCRIBE"
+                | "SUNSUBSCRIBE"
+                | "TIME"
+                | "UNSUBSCRIBE"
+        )
+}
+
 async fn execute_command(
     cmd: Command,
     router: &Router,
@@ -7748,6 +7794,11 @@ async fn execute_command(
                 }
             }
         }
+    }
+
+    if crate::replication::is_loading(router.port) && !allowed_while_loading(&cmd) {
+        out.extend_from_slice(b"-LOADING Redis is loading the dataset in memory\r\n");
+        return false;
     }
 
     if crate::replication::HAS_SLAVE_INSTANCE.load(std::sync::atomic::Ordering::Relaxed)
@@ -8762,7 +8813,8 @@ async fn execute_command(
             let snap = crate::snapshot::state(router.base_port);
             let aof_rw = crate::snapshot::aof_rewrite_state(router.base_port);
             let persistence_str = format!(
-                "# Persistence\r\nloading:0\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\naof_enabled:{}\r\naof_rewrite_in_progress:{}\r\naof_last_bgrewrite_status:{}\r\n",
+                "# Persistence\r\nloading:{}\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\naof_enabled:{}\r\naof_rewrite_in_progress:{}\r\naof_last_bgrewrite_status:{}\r\n",
+                u8::from(crate::replication::is_loading(router.port)),
                 snap.changes_since_last_save(),
                 u8::from(RDB_BGSAVE_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed)),
                 snap.last_save_unix(),
@@ -22831,6 +22883,10 @@ async fn execute_commands_squashed(
         }
     }
     let mut can_squash = *authenticated;
+    // During a full-sync load, `execute_command` answers -LOADING.
+    if can_squash && crate::replication::is_loading(router.port) {
+        can_squash = false;
+    }
     // With keyspace notifications on, a pipeline is batched only if every
     // command emits its events the same way when batched.
     if can_squash && NOTIFY_KEYSPACE_FLAGS.load(std::sync::atomic::Ordering::Relaxed) != 0 {
@@ -24857,6 +24913,26 @@ mod tests {
         );
         assert_eq!(out, b"*0\r\n");
         CMD_STATS.write().unwrap().remove("unittest|histo");
+    }
+
+    #[test]
+    fn test_only_loading_flagged_commands_run_while_loading() {
+        for cmd in [
+            Command::Role,
+            Command::Time,
+            Command::Info(None),
+            Command::Client(ClientSubcommand::Id),
+            Command::PubsubNumpat,
+        ] {
+            assert!(allowed_while_loading(&cmd), "{}", get_cmd_name(&cmd));
+        }
+        for cmd in [
+            Command::Dbsize,
+            Command::Flushall,
+            Command::Get(Bytes::from_static(b"k")),
+        ] {
+            assert!(!allowed_while_loading(&cmd), "{}", get_cmd_name(&cmd));
+        }
     }
 
     #[test]

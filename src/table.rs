@@ -15100,8 +15100,15 @@ pub fn load_rdb_bytes(
     // The writer always terminates with 0xFF; every malformed/unsupported
     // record below `break`s early, which we turn into an error after the loop.
     let mut saw_eof = false;
+    let key_load_delay = crate::connection::key_load_delay_us();
+    let mut delayed_for = 0;
 
     while cursor < content_len {
+        // `key-load-delay` after each key this shard added.
+        if key_load_delay > 0 && count > delayed_for {
+            delayed_for = count;
+            std::thread::sleep(Duration::from_micros(key_load_delay));
+        }
         let op = data[cursor];
         if op == 0xFF {
             // EOF

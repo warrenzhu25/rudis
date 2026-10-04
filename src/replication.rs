@@ -382,6 +382,8 @@ pub struct ReplicationHub {
     /// on it so two workers never apply changes or update the offset at
     /// the same time.
     worker_exit: Mutex<Option<flume::Receiver<()>>>,
+    /// Set while this server loads a master's full-sync RDB.
+    loading: AtomicBool,
 }
 
 impl ReplicationHub {
@@ -413,6 +415,7 @@ impl ReplicationHub {
             shard_flows: RwLock::new(HashMap::new()),
             has_shard_flows: std::sync::atomic::AtomicBool::new(false),
             psync_holes: Mutex::new(Vec::new()),
+            loading: AtomicBool::new(false),
             sync_conn: Mutex::new(None),
             worker_exit: Mutex::new(None),
         }
@@ -997,6 +1000,36 @@ impl ReplicationHub {
 
 pub static HAS_ACTIVE_REPLICATION: AtomicBool = AtomicBool::new(false);
 pub static HAS_SLAVE_INSTANCE: AtomicBool = AtomicBool::new(false);
+
+/// Full-sync loads running in this process, so commands pay one relaxed
+/// load and only look up their server's flag while some load runs.
+static FULL_SYNC_LOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// True while the server on `port` loads a master's full-sync RDB, when
+/// data commands are refused with `-LOADING` like in Redis.
+#[inline]
+pub fn is_loading(port: u16) -> bool {
+    FULL_SYNC_LOADS.load(Ordering::Relaxed) != 0
+        && get_replication_hub(port).loading.load(Ordering::Relaxed)
+}
+
+/// Marks `hub` as loading until dropped, so a panicking load clears it too.
+struct LoadingGuard<'a>(&'a ReplicationHub);
+
+impl<'a> LoadingGuard<'a> {
+    fn new(hub: &'a ReplicationHub) -> Self {
+        hub.loading.store(true, Ordering::Relaxed);
+        FULL_SYNC_LOADS.fetch_add(1, Ordering::Relaxed);
+        Self(hub)
+    }
+}
+
+impl Drop for LoadingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.loading.store(false, Ordering::Relaxed);
+        FULL_SYNC_LOADS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 static REPLICATION_HUBS: LazyLock<RwLock<HashMap<u16, Arc<ReplicationHub>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
@@ -1685,7 +1718,11 @@ async fn run_replica_worker(
             // 7. Restore RDB into router. A failed load leaves the dataset
             // empty; forget the master's history too, so the next attempt
             // is a full resync rather than a partial one on top of nothing.
-            if let Err(e) = router.restore_rdb_bytes(rdb_bytes).await {
+            let loaded = {
+                let _loading = LoadingGuard::new(&hub);
+                router.restore_rdb_bytes(rdb_bytes).await
+            };
+            if let Err(e) = loaded {
                 eprintln!(
                     "Failed to load the RDB from MASTER {}:{}: {}",
                     master_host, master_port, e
@@ -2134,6 +2171,24 @@ mod tests {
         hub.make_master();
         assert!(hub.is_master());
         assert!(!hub.is_slave());
+    }
+
+    #[test]
+    fn test_loading_flag_covers_only_its_server_and_clears_on_drop() {
+        let hub = get_replication_hub(19991);
+        assert!(!is_loading(19991));
+        {
+            let _loading = LoadingGuard::new(&hub);
+            assert!(is_loading(19991));
+            assert!(!is_loading(19990));
+        }
+        assert!(!is_loading(19991));
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _loading = LoadingGuard::new(&hub);
+            panic!("load failed");
+        }));
+        assert!(panicked.is_err());
+        assert!(!is_loading(19991));
     }
 
     #[test]
