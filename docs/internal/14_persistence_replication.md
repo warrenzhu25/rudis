@@ -41,10 +41,10 @@ called out explicitly where it occurs.
                          │                        │
                     Some(bytes)                  None  ──────────────►  NOT written to AOF,
                          │                                               NOT propagated to replicas
-                         ▼                        ▼                      (see §3.8 — this currently
-              AofWriter::append (if Some)   ReplicationHub::propagate    affects the entire JSON.*,
-                         │                    (per port/shard)           BF./CF./CMS./TOPK.*, and
-              5ms flush task in server.rs          │                     CRDT.* command families)
+                         ▼                        ▼                      (see §3.9 — this currently
+              AofWriter::append (if Some)   ReplicationHub::propagate    affects the CRDT.* command
+                         │                    (per port/shard)           family)
+              5ms flush task in server.rs          │
               (write_all_at + ~1s fsync)            ├─► backlog.append (1MB ring buffer)
                                                      ├─► every ConnectedReplica.sender.send (PSYNC path)
                                                      └─► every ShardReplicaFlow.sender.send  (DFLY FLOW path)
@@ -297,13 +297,13 @@ task. `perform_rewrite_aof`:
      agent checkpoint threads (`db.agent_checkpoints`), and agent tool-call registries (`db.agent_tools`) are all
      snapshotted directly from live `ShardDb` state into the rewritten file, each via its own hand-written
      serialization block, **not** by going through `command_to_resp`.
-   - **Newly-found gap — probabilistic structures and CRDT state are never rewritten (and never AOF-logged at
-     all).** `rewrite_shard_aof` has no code path that touches `db.probabilistic_store` (Bloom filters, Cuckoo
-     filters, Count-Min Sketches, Top-K trackers) or `db.crdt_store`. This is consistent with §3.8 below: these
-     command families never had AOF-live-append support in the first place (`command_to_resp` has no arm for any
-     `BF.*`/`CF.*`/`CMS.*`/`TOPK.*`/`CRDT.*` command), so there is nothing for rewrite to compact — but it also
-     means **these data types have zero AOF-based durability**, full stop; they persist only via RDB (§3.9, tags
-     8/10/11/12/13).
+   - Probabilistic structures (Bloom, Cuckoo, Count-Min Sketch, Top-K) are rewritten as one
+     `BF.RESTORE`/`CF.RESTORE`/`CMS.RESTORE`/`TOPK.RESTORE <key> <payload>` per structure; the payload is the
+     same per-entry encoding the RDB uses (tags 8/10/11/12), since a filter or sketch can't be rebuilt from user
+     commands.
+   - **Remaining gap — CRDT state is never rewritten (and never AOF-logged at all).** `rewrite_shard_aof` has no
+     code path that touches `db.crdt_store`, and `command_to_resp` has no arm for any `CRDT.*` command, so CRDT
+     state has zero AOF-based durability; it persists only via RDB (§3.10, tag 13).
 3. `fsync`s the temp file, atomically `rename`s it over the live `appendonly-<shard>.aof`, and `fsync`s the
    containing directory (`sync_parent_dir`, `aof.rs:2571-2583`) so the rename survives a crash before the
    directory entry is durable.
@@ -429,48 +429,27 @@ enabled on this node, whether it's caught up to the fsync point, or whether `num
 is therefore functionally identical to `WAIT` today except for its reply shape; it provides no actual guarantee
 about local AOF durability.
 
-### 3.9 The JSON.*, probabilistic (`BF.*`/`CF.*`/`CMS.*`/`TOPK.*`), and CRDT.* command families have zero live AOF or replication coverage — traced end-to-end, newly confirmed
+### 3.9 Live AOF and replication coverage of the experimental families — JSON.* and probabilistic fixed, CRDT.* still uncovered
 
-This is the most significant finding from this pass. Every mutating command handler in `connection.rs` that
-wants AOF+replication effects calls the `record_change!` macro (`connection.rs:12740-12761`):
+Every mutating command handler in `connection.rs` that wants AOF+replication effects calls the `record_change!`
+macro, which appends `crate::aof::command_to_resp(cmd)` to the AOF and propagates it to replicas — but only if
+`command_to_resp` has an arm for that command; otherwise the write is silently neither logged nor replicated.
 
-```rust
-macro_rules! record_change {
-    ($cmd_expr:expr) => {
-        DIRTY_CHANGES.fetch_add(1, Ordering::Relaxed);
-        if HAS_WATCHED_KEYS.load(Ordering::Relaxed) { /* touch_watched_key for MULTI/WATCH */ }
-        let need_aof = aof.is_some();
-        let need_rep = crate::replication::has_connected_replicas(db.port);
-        if need_aof || need_rep {
-            if let Some(bytes) = crate::aof::command_to_resp($cmd_expr) {
-                if let Some(aof_w) = aof { aof_w.borrow_mut().append(&bytes); }
-                if need_rep { crate::replication::propagate_shard_bytes(db.port, db.shard_id, &bytes); }
-            }
-        }
-    };
-}
-```
+- **JSON.\*** (fixed in `2636a26`): SET, DEL, CLEAR, NUMINCRBY, NUMMULTBY, STRAPPEND, ARRAPPEND, ARRPOP and
+  TOGGLE are encoded as issued; replaying them in order rebuilds the same document. `BGREWRITEAOF` re-emits each
+  document as `JSON.SET key $ <json>`.
+- **`BF.*`/`CF.*`/`CMS.*`/`TOPK.*`** (fixed in `a52f9d2`): every write is encoded as issued. Replay is
+  deterministic: the hashes are fixed-seed and Top-K breaks count ties by the smallest item instead of hash-map
+  order. A `CF.ADD`/`CF.ADDNX` that fails with "filter is full" has already moved fingerprints, so it is logged
+  too. `BGREWRITEAOF` emits one `*.RESTORE` per structure (§3.3).
+- **`CRDT.*`: still uncovered.** No `command_to_resp` arm and no rewrite step, so CRDT state written after the
+  last RDB save is lost on an AOF-only restart and never reaches a PSYNC replica.
 
-`Command::JsonSet`/`JsonDel`/`JsonArrAppend`/and every other JSON-mutating variant call `record_change!(cmd)`
-after mutating `db.json_store` (e.g. `connection.rs:16790-16836`) — but, per §3.1, `command_to_resp` has **no
-match arm for any JSON command** (confirmed via a repo-wide `rg "Json" src/aof.rs`, zero hits). The `if let
-Some(bytes) = ...` therefore never fires: `DIRTY_CHANGES` still increments and `WATCH`ed-key invalidation still
-works correctly (those don't depend on `command_to_resp`), but **the mutation is never appended to the AOF and
-never propagated to a live PSYNC replica**. The exact same pattern was independently verified for `Command::BfAdd`
-(`connection.rs:17405-17419`, calls `record_change!(cmd)` after mutating `db.probabilistic_store.bloom_filters`)
-and holds for the rest of the `BF.*`/`CF.*`/`CMS.*`/`TOPK.*` family and for `CRDT.*` — none of these command
-enums appear anywhere in `aof.rs`.
+Vector-set (`VADD`/`VREM`/`VSETATTR`), semantic-cache (`SEMANTIC.*`) and agent-runtime (`AGENT.*`) commands have
+explicit `command_to_resp` arms and are AOF-logged and replicated live.
 
-**Practical consequence**: JSON documents, Bloom/Cuckoo filters, Count-Min Sketches, Top-K trackers, and CRDT
-state are captured correctly in a point-in-time RDB snapshot (§3.9 below, tags 7/8/10/11/12/13) and in a
-`BGREWRITEAOF` compaction snapshot *for JSON specifically* (§3.3 — `rewrite_shard_aof` does snapshot
-`db.json_store`, but not the probabilistic stores or CRDT store). But any live mutation to these types that
-happens **after** the last RDB save / AOF rewrite is invisible to both AOF replay on restart and to a connected
-PSYNC replica's live stream — a replica's JSON/probabilistic/CRDT state silently diverges from the master the
-moment such a write occurs, and an AOF-only deployment (`appendonly yes`, no scheduled `SAVE`) permanently loses
-these writes on any restart. Vector-set (`VADD`/`VREM`/`VSETATTR`), semantic-cache (`SEMANTIC.*`), and
-agent-runtime (`AGENT.*`) commands are **not** affected — all of those do have explicit `command_to_resp` arms
-(§3.1) and are correctly AOF-logged and replicated live.
+The experimental families are parsed only when `enable-experimental-commands` is on, and that includes AOF
+replay: restarting with it off turns their logged writes into unknown commands, which are skipped.
 
 ### 3.10 RDB save format — the "14-tag" record format is now (at least) 19 tags, and the `RudisValue::Tiered` zero-byte bug is fixed at the live code path but survives as dead code
 
@@ -583,11 +562,10 @@ periodic `bgsave`. A configured `save 900 1` directive is accepted at startup an
 
 ## 5. Known Bugs & Limitations (re-verified against current source)
 
-- **NEW, significant — JSON.\*, `BF.*`/`CF.*`/`CMS.*`/`TOPK.*`, and `CRDT.*` command families have no live AOF or
-  replication coverage** (§3.9): `command_to_resp` has no arm for any command in these three families, so
-  `record_change!`'s `if let Some(bytes) = ...` never fires for them. They persist only through point-in-time RDB
-  snapshots (and, for JSON only, `BGREWRITEAOF`'s one-shot compaction snapshot); any live write to these types is
-  invisible to a connected replica and to AOF replay after restart.
+- **`CRDT.*` has no live AOF or replication coverage** (§3.9): it persists only through point-in-time RDB
+  snapshots; any live write is invisible to a connected replica and to AOF replay after restart.
+- **RESOLVED — JSON.\* and `BF.*`/`CF.*`/`CMS.*`/`TOPK.*` writes are AOF-logged and replicated live**, and
+  `BGREWRITEAOF` snapshots both (§3.3, §3.9).
 - **NEW — `XAUTOCLAIM` is replicated/persisted as its original wall-clock-relative filter, not as its resolved
   claim set** (§3.1): a replica or an AOF replay can independently compute a different set of claimed messages
   than what the master actually claimed, because `min_idle_time` is re-evaluated against a different "now".
@@ -601,9 +579,8 @@ periodic `bgsave`. A configured `save 900 1` directive is accepted at startup an
   used in production (§3.10, §3.3): both `ShardDb::save_rdb_chunk` and `rewrite_shard_aof` now hydrate tiered
   values via `tier_manager.read_ptr_sync` before serializing them as `String` payloads.
 - **RESOLVED — AOF rewrite and compaction via `BGREWRITEAOF`** now additionally covers JSON, vector-set,
-  semantic-cache, and agent-runtime state (previously it covered only the base table + HLL + streams) — but still
-  does not cover probabilistic structures or CRDT state (§3.3), consistent with those families never having AOF
-  support at all.
+  semantic-cache, agent-runtime and probabilistic state (previously it covered only the base table + HLL +
+  streams) — but still does not cover CRDT state (§3.3), consistent with that family never having AOF support.
 - **STILL OPEN — `save N M` is parsed into a generic `extra_directives` map and never scheduled** (§3.11): no
   periodic-save mechanism exists anywhere in the codebase.
 - **STILL OPEN — RDB save uses blocking `std::fs` calls inside an `async fn`, and there is no `fork()`-based
@@ -629,8 +606,8 @@ periodic `bgsave`. A configured `save 900 1` directive is accepted at startup an
   large heap buffer for the whole dataset — keep new value types' rewrite logic writing through that same
   buffered writer rather than building an intermediate `Vec` (`aof.rs:1993`).
 * **Gotcha 3 (now with concrete, currently-shipping examples)**: A write command is invisible to both AOF and
-  replication unless it has an explicit arm in `command_to_resp` (§3.1) — **today this is true for every JSON.\*,
-  `BF.*`/`CF.*`/`CMS.*`/`TOPK.*`, and `CRDT.*` mutating command** (§3.9). Adding a new mutating command (or
+  replication unless it has an explicit arm in `command_to_resp` (§3.1) — **today this is true for every `CRDT.*`
+  mutating command** (§3.9). Adding a new mutating command (or
   fixing one of these families) requires adding a `command_to_resp` arm, or it will silently not persist or
   replicate live.
 * **Gotcha 4**: `DFLY FLOW` is a master-side-only capability today; do not assume rudis-to-rudis replication ever
