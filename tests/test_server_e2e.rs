@@ -20432,3 +20432,78 @@ fn test_flushall_clears_every_key_family_and_stays_flushed_after_aof_replay_e2e(
     shutdown_and_wait(port, &mut child);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_replica_aof_holds_the_synced_dataset_after_a_restart_e2e() {
+    let master_port: u16 = 17089;
+    let replica_port: u16 = 17088;
+    let dir = std::env::temp_dir().join(format!("rudis-syncaof-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mport = master_port.to_string();
+    let rport = replica_port.to_string();
+    let master_args = ["--port", &mport, "--threads", "2", "--no-pin"];
+    let replica_args = [
+        "--port",
+        &rport,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--aof",
+        "true",
+        "--aof-dir",
+        dir.to_str().unwrap(),
+    ];
+    let wait_for = |c: &mut TcpStream, args: &[&str], want: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let got = resp_cmd(c, args);
+            if got.contains(want) {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "{args:?}: {got:?}");
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+
+    let mut master = spawn_rudis_listening(&master_args, master_port);
+    let mut m = TcpStream::connect(("127.0.0.1", master_port)).unwrap();
+    m.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut replica = spawn_rudis_listening(&replica_args, replica_port);
+    let mut r = TcpStream::connect(("127.0.0.1", replica_port)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    for i in 0..20 {
+        let (mk, rk) = (format!("m:{i}"), format!("stale:{i}"));
+        assert_eq!(resp_cmd(&mut m, &["SET", &mk, "1"]), "+OK\r\n");
+        assert_eq!(resp_cmd(&mut r, &["SET", &rk, "1"]), "+OK\r\n");
+    }
+
+    assert_eq!(
+        resp_cmd(&mut r, &["REPLICAOF", "127.0.0.1", &mport]),
+        "+OK\r\n"
+    );
+    wait_for(&mut r, &["INFO", "replication"], "master_link_status:up");
+    // A change streamed after the sync must land in the new AOF too.
+    assert_eq!(resp_cmd(&mut m, &["SET", "m:after", "2"]), "+OK\r\n");
+    wait_for(&mut r, &["GET", "m:after"], "$1\r\n2\r\n");
+    assert_eq!(resp_cmd(&mut r, &["DBSIZE"]), ":21\r\n");
+    drop(r);
+    shutdown_and_wait(replica_port, &mut replica);
+    drop(m);
+    shutdown_and_wait(master_port, &mut master);
+
+    // Restarted on its own, the replica comes back with the master's data.
+    let mut replica = spawn_rudis_listening(&replica_args, replica_port);
+    let mut r = TcpStream::connect(("127.0.0.1", replica_port)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    assert_eq!(resp_cmd(&mut r, &["DBSIZE"]), ":21\r\n");
+    for i in 0..20 {
+        let (mk, rk) = (format!("m:{i}"), format!("stale:{i}"));
+        assert_eq!(resp_cmd(&mut r, &["GET", &mk]), "$1\r\n1\r\n", "{mk}");
+        assert_eq!(resp_cmd(&mut r, &["EXISTS", &rk]), ":0\r\n", "{rk}");
+    }
+    assert_eq!(resp_cmd(&mut r, &["GET", "m:after"]), "$1\r\n2\r\n");
+    drop(r);
+    shutdown_and_wait(replica_port, &mut replica);
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -3489,6 +3489,7 @@ impl Router {
     }
 
     async fn load_full_sync_rdb_on_all_shards(&self, data: Bytes) -> Result<(), String> {
+        let aof_dir = self.aof.as_ref().map(|_| self.db_dir.clone());
         let mut responders = Vec::new();
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
@@ -3496,16 +3497,20 @@ impl Router {
                 sender
                     .send(ShardMessage::RestoreRdbChunk {
                         data: data.clone(),
+                        aof_dir: aof_dir.clone(),
                         responder: tx,
                     })
                     .map_err(|_| format!("shard {sid} is gone"))?;
                 responders.push(rx);
             }
         }
-        let mut result =
-            self.local_db
-                .borrow_mut()
-                .load_full_sync_rdb(&data, self.shard_id, self.num_shards);
+        let local_aof = aof_dir.as_deref().zip(self.aof.as_ref());
+        let mut result = self.local_db.borrow_mut().load_full_sync_rdb(
+            &data,
+            self.shard_id,
+            self.num_shards,
+            local_aof,
+        );
         for rx in responders {
             let shard_result = rx
                 .recv_async()

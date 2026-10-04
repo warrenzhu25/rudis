@@ -4160,6 +4160,57 @@ mod tests {
     }
 
     #[test]
+    fn test_full_sync_load_rewrites_the_aof() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("rudis-aof-fullsync-unit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let aof_file = temp_dir.join("appendonly-0.aof");
+
+        let mut master = ShardDb::new(6379);
+        master.set(Bytes::from("fresh"), Bytes::from("1"), None);
+        let mut rdb = b"REDIS0011\xFE\x00".to_vec();
+        master.save_rdb_chunk(&mut rdb);
+        rdb.push(0xFF);
+        let crc = crate::table::crc64(&rdb);
+        rdb.extend_from_slice(&crc.to_le_bytes());
+
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let writer = std::rc::Rc::new(std::cell::RefCell::new(
+                AofWriter::open(aof_file.clone()).await.unwrap(),
+            ));
+            let mut replica = ShardDb::new(6379);
+            replica.set(Bytes::from("stale"), Bytes::from("1"), None);
+            writer
+                .borrow_mut()
+                .append(b"*3\r\n$3\r\nSET\r\n$5\r\nstale\r\n$1\r\n1\r\n");
+            AofWriter::flush_rc(&writer).await.unwrap();
+
+            replica
+                .load_full_sync_rdb(&rdb, 0, 1, Some((&temp_dir, &writer)))
+                .unwrap();
+            let mut replayed = ShardDb::new(6379);
+            replay_aof(&aof_file, &mut replayed).unwrap();
+            assert_eq!(replayed.get(b"fresh"), Some(Bytes::from("1")));
+            assert_eq!(replayed.get(b"stale"), None);
+
+            // A failed load leaves both the shard and its AOF empty.
+            assert!(
+                replica
+                    .load_full_sync_rdb(&rdb[..rdb.len() - 1], 0, 1, Some((&temp_dir, &writer)))
+                    .is_err()
+            );
+            let mut replayed = ShardDb::new(6379);
+            replay_aof(&aof_file, &mut replayed).unwrap();
+            assert_eq!(replayed.dbsize(), 0);
+        });
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
     fn test_sync_parent_dir_durability() {
         let temp_dir =
             std::env::temp_dir().join(format!("rudis-sync-dir-test-{}", std::process::id()));

@@ -544,6 +544,8 @@ pub enum ShardMessage {
     /// Replaces the shard's dataset with its part of a full-sync RDB.
     RestoreRdbChunk {
         data: Bytes,
+        /// The AOF directory when AOF is on, to rewrite it after the load.
+        aof_dir: Option<std::path::PathBuf>,
         responder: flume::Sender<Result<(), String>>,
     },
     ExecuteReplicaCmd {
@@ -1884,19 +1886,33 @@ impl ShardDb {
     /// Replaces this shard's dataset with its part of a master's full-sync
     /// RDB. Like Redis, the old dataset goes first, and a load that fails
     /// part-way leaves the shard empty rather than half loaded.
+    ///
+    /// With `aof` (its directory and the live writer), the shard's AOF is
+    /// then rewritten from what is in memory, loaded or emptied, before
+    /// anything else runs on the shard: otherwise a restart would replay
+    /// the pre-sync AOF instead of the master's dataset.
     pub fn load_full_sync_rdb(
         &mut self,
         data: &[u8],
         shard_id: usize,
         num_shards: usize,
+        aof: Option<(
+            &std::path::Path,
+            &std::rc::Rc<std::cell::RefCell<crate::aof::AofWriter>>,
+        )>,
     ) -> Result<(), String> {
         self.flushdb();
-        crate::table::load_rdb_bytes(data, self, shard_id, num_shards)
+        let loaded = crate::table::load_rdb_bytes(data, self, shard_id, num_shards)
             .map(|_| ())
             .map_err(|e| {
                 self.flushdb();
                 e.to_string()
-            })
+            });
+        if let Some((dir, writer)) = aof {
+            crate::aof::rewrite_and_swap_shard_aof(self, dir, shard_id, Some(writer))
+                .map_err(|e| format!("rewriting the AOF after the load: {e}"))?;
+        }
+        loaded
     }
 
     #[inline]

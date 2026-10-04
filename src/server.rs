@@ -1830,9 +1830,14 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                             }
                         }
                     }
-                    ShardMessage::RestoreRdbChunk { data, responder } => {
+                    ShardMessage::RestoreRdbChunk {
+                        data,
+                        aof_dir,
+                        responder,
+                    } => {
                         let mut db = cross_shard_db.borrow_mut();
-                        let _ = responder.send(db.load_full_sync_rdb(&data, shard_id, num_shards));
+                        let aof = aof_dir.as_deref().zip(cross_shard_aof.as_ref());
+                        let _ = responder.send(db.load_full_sync_rdb(&data, shard_id, num_shards, aof));
                     }
                     ShardMessage::ExecuteReplicaCmd { cmd, responder } => {
                         let mut db = cross_shard_db.borrow_mut();

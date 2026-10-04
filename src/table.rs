@@ -17898,14 +17898,16 @@ mod tests {
             Bytes::from_static(b"bf"),
             crate::probabilistic::BloomFilter::new(10, 0.01),
         );
-        replica.load_full_sync_rdb(&body(&chunk), 0, 1).unwrap();
+        replica
+            .load_full_sync_rdb(&body(&chunk), 0, 1, None)
+            .unwrap();
         assert!(replica.table.exists(b"fresh"));
         assert!(!replica.table.exists(b"stale"));
         assert!(replica.probabilistic_store.bloom_filters.is_empty());
 
         // Valid checksum, but the record is cut short.
         let cut = body(&chunk[..chunk.len() - 1]);
-        assert!(replica.load_full_sync_rdb(&cut, 0, 1).is_err());
+        assert!(replica.load_full_sync_rdb(&cut, 0, 1, None).is_err());
         assert_eq!(replica.dbsize(), 0);
     }
 
