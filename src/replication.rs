@@ -466,6 +466,9 @@ impl ReplicationHub {
     /// resync. The dataset may not match any offset of the master's.
     fn forget_master_history(&self) {
         let mut role = self.role.write().unwrap_or_else(|e| e.into_inner());
+        // A worker that panicked holding the lock poisoned it; the sync
+        // state it may have left half written is reset right here.
+        self.role.clear_poison();
         if let ReplicationRole::Slave {
             ref mut link_status,
             ref mut master_replid,
@@ -1179,9 +1182,59 @@ pub fn start_replica_sync(
         if let Some(prev) = prev_exit {
             let _ = prev.recv_async().await;
         }
-        run_replica_worker(port, master_host, master_port, router, cancel_rx, hub_clone).await;
+        let worker_cancel = cancel_rx.clone();
+        let worker_hub = hub_clone.clone();
+        supervise_replica_worker(
+            || {
+                run_replica_worker(
+                    port,
+                    master_host.clone(),
+                    master_port,
+                    router.clone(),
+                    worker_cancel.clone(),
+                    worker_hub.clone(),
+                )
+            },
+            |msg| {
+                eprintln!("Replication with MASTER {master_host}:{master_port} panicked: {msg}");
+                crate::connection::inc_isolated_panics();
+                // Stopped meanwhile (REPLICAOF NO ONE or another master):
+                // the role belongs to whoever stopped us now.
+                if cancel_rx.is_disconnected() {
+                    return false;
+                }
+                hub_clone.forget_master_history();
+                true
+            },
+            std::time::Duration::from_secs(1),
+        )
+        .await;
         drop(exit_tx);
     });
+}
+
+/// Runs the replica worker made by `start` until it returns. A panic in it
+/// is reported to `on_panic`, and if that returns true the worker restarts
+/// after `backoff`: replication reconnects instead of silently stopping.
+async fn supervise_replica_worker<W: Future<Output = ()>>(
+    mut start: impl FnMut() -> W,
+    mut on_panic: impl FnMut(&str) -> bool,
+    backoff: std::time::Duration,
+) {
+    loop {
+        let Err(panic) = crate::server::catch_unwind_async(start()).await else {
+            return;
+        };
+        let msg = panic
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("unknown panic");
+        if !on_panic(msg) {
+            return;
+        }
+        monoio::time::sleep(backoff).await;
+    }
 }
 
 /// `masteruser` / `masterauth` per server port.
@@ -1752,6 +1805,49 @@ async fn run_replica_worker(
 mod tests {
     use super::*;
     use bytes::BytesMut;
+
+    #[monoio::test(timer_enabled = true)]
+    async fn test_supervisor_restarts_a_panicked_worker_until_it_returns() {
+        let runs = std::cell::Cell::new(0);
+        let mut panics = Vec::new();
+        supervise_replica_worker(
+            || {
+                runs.set(runs.get() + 1);
+                let run = runs.get();
+                async move {
+                    if run == 1 {
+                        panic!("boom");
+                    }
+                }
+            },
+            |msg| {
+                panics.push(msg.to_string());
+                true
+            },
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(runs.get(), 2);
+        assert_eq!(panics, ["boom"]);
+    }
+
+    #[monoio::test(timer_enabled = true)]
+    async fn test_supervisor_stops_when_told_not_to_restart() {
+        let runs = std::cell::Cell::new(0);
+        supervise_replica_worker(
+            || {
+                runs.set(runs.get() + 1);
+                async { panic!("{}", String::from("owned boom")) }
+            },
+            |msg| {
+                assert_eq!(msg, "owned boom");
+                false
+            },
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(runs.get(), 1);
+    }
 
     #[test]
     fn test_backlog_append_and_diff() {
