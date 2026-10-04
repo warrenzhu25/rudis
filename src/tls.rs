@@ -12,8 +12,7 @@
 //! kernel.
 
 use std::cell::RefCell;
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
 use std::rc::Rc;
@@ -26,6 +25,7 @@ use monoio::io::{
     OwnedWriteHalf, Splitable,
 };
 use monoio::net::TcpStream;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection};
 
@@ -62,36 +62,62 @@ pub fn create_server_config(cert_der: &[u8], key_der: &[u8]) -> Result<Arc<Serve
     let cert = CertificateDer::from(cert_der.to_vec());
     let key = PrivateKeyDer::try_from(key_der.to_vec())
         .map_err(|e| format!("Invalid private key DER: {:?}", e))?;
+    server_config_from(vec![cert], key)
+}
 
+fn server_config_from(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<Arc<ServerConfig>, String> {
     let config = ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(vec![cert], key)
+        .with_single_cert(certs, key)
         .map_err(|e| format!("Failed to create rustls ServerConfig: {}", e))?;
 
     Ok(Arc::new(config))
 }
 
-/// Loads certificates and private key from PEM files.
+/// Loads the certificate chain and private key from files.
+///
+/// PEM files, the format `tls-cert-file`/`tls-key-file` take in Redis, may
+/// hold a full chain (leaf first) and a PKCS#8, PKCS#1 or SEC1 key. Files that
+/// are not PEM are read as one DER certificate and a DER key.
 pub fn load_certs_and_key_from_files(
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<Arc<ServerConfig>, String> {
-    let cert_file = File::open(cert_path).map_err(|e| format!("Cannot open cert file: {}", e))?;
-    let mut cert_reader = BufReader::new(cert_file);
-    let mut cert_bytes = Vec::new();
-    cert_reader
-        .read_to_end(&mut cert_bytes)
-        .map_err(|e| format!("Read cert error: {}", e))?;
+    let cert_bytes = std::fs::read(cert_path)
+        .map_err(|e| format!("Cannot read cert file {}: {}", cert_path.display(), e))?;
+    let key_bytes = std::fs::read(key_path)
+        .map_err(|e| format!("Cannot read key file {}: {}", key_path.display(), e))?;
 
-    let key_file = File::open(key_path).map_err(|e| format!("Cannot open key file: {}", e))?;
-    let mut key_reader = BufReader::new(key_file);
-    let mut key_bytes = Vec::new();
-    key_reader
-        .read_to_end(&mut key_bytes)
-        .map_err(|e| format!("Read key error: {}", e))?;
+    let certs = if is_pem(&cert_bytes) {
+        let certs = CertificateDer::pem_slice_iter(&cert_bytes)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Invalid certificate PEM in {}: {}", cert_path.display(), e))?;
+        if certs.is_empty() {
+            return Err(format!(
+                "No certificate (CERTIFICATE PEM block) in {}",
+                cert_path.display()
+            ));
+        }
+        certs
+    } else {
+        vec![CertificateDer::from(cert_bytes)]
+    };
+    let key = if is_pem(&key_bytes) {
+        PrivateKeyDer::from_pem_slice(&key_bytes)
+            .map_err(|e| format!("Invalid private key PEM in {}: {}", key_path.display(), e))?
+    } else {
+        PrivateKeyDer::try_from(key_bytes)
+            .map_err(|e| format!("Invalid private key DER in {}: {}", key_path.display(), e))?
+    };
+    server_config_from(certs, key)
+}
 
-    // Parse PEM using rcgen/rustls or fallback to raw DER
-    create_server_config(&cert_bytes, &key_bytes)
+/// Whether `bytes` look like PEM text rather than binary DER.
+fn is_pem(bytes: &[u8]) -> bool {
+    bytes.windows(11).any(|w| w == b"-----BEGIN ")
 }
 
 fn tls_error(e: rustls::Error) -> io::Error {
@@ -552,6 +578,7 @@ pub struct TlsWorkerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     #[test]
     fn test_tls_cert_generation_and_config() {
@@ -582,12 +609,121 @@ mod tests {
         assert!(create_server_config(&cert_der, &[0xDE, 0xAD, 0xBE, 0xEF]).is_err());
     }
 
+    /// Writes `files` into a fresh per-test temp directory and returns it.
+    fn temp_files(test: &str, files: &[(&str, &[u8])]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rudis-tls-{}-{}", test, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, data) in files {
+            std::fs::write(dir.join(name), data).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn test_load_pem_cert_and_key_files() {
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let dir = temp_files(
+            "pem",
+            &[
+                ("cert.pem", cert.pem().as_bytes()),
+                ("key.pem", key.serialize_pem().as_bytes()),
+            ],
+        );
+        let config = load_certs_and_key_from_files(&dir.join("cert.pem"), &dir.join("key.pem"))
+            .expect("PEM cert and key load");
+        let (client, server) = handshake(config, cert.der().to_vec());
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_pem_chain_presents_leaf_signed_by_ca() {
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .signed_by(&leaf_key, &issuer)
+            .unwrap();
+        // Leaf first, then the issuer, as certbot's fullchain.pem.
+        let chain = format!("{}{}", leaf.pem(), ca_cert.pem());
+        let dir = temp_files(
+            "chain",
+            &[
+                ("fullchain.pem", chain.as_bytes()),
+                ("key.pem", leaf_key.serialize_pem().as_bytes()),
+            ],
+        );
+        let config =
+            load_certs_and_key_from_files(&dir.join("fullchain.pem"), &dir.join("key.pem"))
+                .expect("PEM chain loads");
+        // The client trusts only the CA: the handshake succeeds only if the
+        // leaf from the file is served and verifies against its issuer.
+        let (client, server) = handshake(config, ca_cert.der().to_vec());
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_der_cert_and_key_files() {
+        let (cert_der, key_der) = generate_self_signed_cert(vec!["localhost".to_string()]).unwrap();
+        let dir = temp_files("der", &[("cert.der", &cert_der), ("key.der", &key_der)]);
+        let config = load_certs_and_key_from_files(&dir.join("cert.der"), &dir.join("key.der"))
+            .expect("DER cert and key load");
+        let (client, server) = handshake(config, cert_der);
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_load_cert_files_report_bad_input() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let key_pem = key.serialize_pem();
+        let dir = temp_files(
+            "bad",
+            &[
+                ("cert.pem", cert.pem().as_bytes()),
+                ("key.pem", key_pem.as_bytes()),
+                // A PEM file holding only a key, given as the certificate.
+                ("nocert.pem", key_pem.as_bytes()),
+                ("nokey.pem", cert.pem().as_bytes()),
+            ],
+        );
+        let load = |c: &str, k: &str| load_certs_and_key_from_files(&dir.join(c), &dir.join(k));
+        let err = load("nocert.pem", "key.pem").unwrap_err();
+        assert!(err.contains("certificate"), "{}", err);
+        let err = load("cert.pem", "nokey.pem").unwrap_err();
+        assert!(err.contains("private key"), "{}", err);
+        let err = load("missing.pem", "key.pem").unwrap_err();
+        assert!(err.contains("missing.pem"), "{}", err);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A client and server session that have completed a handshake in memory.
     fn connected_pair() -> (rustls::ClientConnection, ServerConnection) {
         let (cert_der, key_der) = generate_self_signed_cert(vec!["localhost".to_string()]).unwrap();
         let server_config = create_server_config(&cert_der, &key_der).unwrap();
+        handshake(server_config, cert_der)
+    }
+
+    /// Completes an in-memory handshake against `server_config`, with a
+    /// client that trusts only `trusted_cert_der` and connects to "localhost".
+    fn handshake(
+        server_config: Arc<ServerConfig>,
+        trusted_cert_der: Vec<u8>,
+    ) -> (rustls::ClientConnection, ServerConnection) {
         let mut roots = rustls::RootCertStore::empty();
-        roots.add(CertificateDer::from(cert_der)).unwrap();
+        roots.add(CertificateDer::from(trusted_cert_der)).unwrap();
         let client_config = Arc::new(
             rustls::ClientConfig::builder()
                 .with_root_certificates(roots)

@@ -3,8 +3,9 @@
 //! TLS clients must behave exactly like plaintext ones: same pipelining (with
 //! cross-shard squashing), transactions, Pub/Sub push delivery, blocking
 //! commands, CLIENT REPLY / CLIENT KILL, MONITOR and client-side-caching
-//! invalidation pushes. Every test here talks to one shared 4-shard server
-//! (plain port 17090, TLS port 17091) and uses its own key prefix.
+//! invalidation pushes. The in-process tests share one 4-shard server (plain
+//! port 17090, TLS port 17091) and each uses its own key prefix; the PEM
+//! certificate test runs the real binary on ports 17093/17094.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
@@ -489,4 +490,96 @@ fn test_tls_client_tracking_invalidation_push() {
             Reply::Array(Some(vec![Reply::bulk("tls:tracked")]))
         ])
     );
+}
+
+#[test]
+fn test_binary_serves_tls_with_pem_cert_files() {
+    // The real binary with --tls-cert-file/--tls-key-file in PEM, the format
+    // openssl and certbot write.
+    const BIN_PORT: u16 = 17093;
+    const BIN_TLS_PORT: u16 = 17094;
+    let dir = std::env::temp_dir().join(format!("rudis-tls-e2e-pem-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = rcgen::KeyPair::generate().unwrap();
+    let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    let (cert_path, key_path) = (dir.join("rudis.crt"), dir.join("rudis.key"));
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, key.serialize_pem()).unwrap();
+
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = KillOnDrop(
+        std::process::Command::new(env!("CARGO_BIN_EXE_rudis"))
+            .args([
+                "--port",
+                &BIN_PORT.to_string(),
+                "--threads",
+                "2",
+                "--no-pin",
+            ])
+            .args(["--tls-port", &BIN_TLS_PORT.to_string()])
+            .arg("--tls-cert-file")
+            .arg(&cert_path)
+            .arg("--tls-key-file")
+            .arg(&key_path)
+            .current_dir(&dir)
+            .env("MONOIO_FORCE_LEGACY_DRIVER", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn rudis"),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let sock = loop {
+        if let Ok(s) = TcpStream::connect(("127.0.0.1", BIN_TLS_PORT)) {
+            break s;
+        }
+        if let Some(status) = child.0.try_wait().unwrap() {
+            panic!("rudis exited before listening: {}", status);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "TLS port never opened"
+        );
+        thread::sleep(Duration::from_millis(50));
+    };
+    sock.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert.der().clone()).unwrap();
+    let config = Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let conn = rustls::ClientConnection::new(config, "localhost".try_into().unwrap()).unwrap();
+    let mut reader = BufReader::new(rustls::StreamOwned::new(conn, sock));
+    reader.get_mut().write_all(&encode(&[b"PING"])).unwrap();
+    assert_eq!(
+        read_reply(&mut reader).expect("PING over TLS"),
+        Reply::Simple("PONG".into())
+    );
+    drop(reader);
+
+    let mut plain = TcpStream::connect(("127.0.0.1", BIN_PORT)).unwrap();
+    let _ = plain.write_all(&encode(&[b"SHUTDOWN", b"NOSAVE"]));
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while child.0.try_wait().unwrap().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rudis did not shut down"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

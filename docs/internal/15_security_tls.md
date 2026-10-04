@@ -549,12 +549,12 @@ verification is supported (server-only TLS).
 ```rust
 pub fn load_certs_and_key_from_files(cert_path: &Path, key_path: &Path) -> Result<Arc<ServerConfig>, String>
 ```
-Reads both files to raw `Vec<u8>` via `BufReader::read_to_end` and forwards them **directly** to
-`create_server_config` as if they were already DER. There is **no PEM parsing anywhere in this
-crate** — `rg` for `pem`/`rustls-pemfile` across `Cargo.toml` and `src/tls.rs` finds zero hits.
-The function's own doc comment says "Loads certificates and private key from PEM files" and an
-inline comment says "Parse PEM using rcgen/rustls or fallback to raw DER", but no such parsing
-exists — see §6 for the resulting bug.
+Reads both files and decodes them with `rustls::pki_types::pem::PemObject` when they contain a
+`-----BEGIN ` marker: every `CERTIFICATE` block of the cert file becomes the served chain (leaf
+first, e.g. certbot's `fullchain.pem`), and the key file may hold a PKCS#8, PKCS#1 (RSA) or SEC1
+(EC) key. Files without a PEM marker are still accepted as one raw DER certificate and a DER key,
+which was the only format that worked before (see §6). Errors name the offending file, and
+`main.rs` aborts startup on them.
 
 ### 5.2 `TlsSession` and the handshake
 
@@ -635,7 +635,9 @@ scaffolding that reads like a working feature.
 
 ### New findings from this pass
 
-- **`load_certs_and_key_from_files` almost certainly fails on real PEM certs** (tls.rs:54-74).
+- **`load_certs_and_key_from_files` failed on real PEM certs** (tls.rs:54-74). **FIXED:** PEM
+  chains and keys are now decoded (§5.1), covered by unit tests and an e2e test that starts the
+  binary with PEM files. Original finding:
   The function reads the raw bytes of `--tls-cert-file`/`--tls-key-file` and passes them straight
   to `create_server_config` as DER — there is no PEM decoding anywhere in the crate (`rg` for
   `pem`/`rustls-pemfile` in `Cargo.toml`/`src/tls.rs` finds nothing). Real-world cert/key files
@@ -697,11 +699,6 @@ scaffolding that reads like a working feature.
 
 ## 8. Future Improvements
 
-- **High — fix `load_certs_and_key_from_files` to actually decode PEM** (§6). Add a PEM-decoding
-  step (e.g. `rustls-pemfile`, or `rcgen`'s own PEM helpers) before constructing
-  `CertificateDer`/`PrivateKeyDer`, or document that the flags require raw DER files today —
-  otherwise every real-world cert/key pair handed to `--tls-cert-file`/`--tls-key-file` will
-  panic the server at startup.
 - **Medium — remove plaintext password storage now that hashing exists** (§3.2, §3.7).
   `ACL SETUSER user >password` (and `requirepass`) still push the plaintext into
   `AclUser.passwords` in addition to hashing it — the hashing machinery exists but the plaintext
@@ -756,9 +753,8 @@ scaffolding that reads like a working feature.
   suite, RX control-record handling via `recvmsg` cmsgs), not just a `TCP_ULP` attach — a partial
   version is exactly what produced the old plaintext-bypass bug. Likewise, never `libc::send`
   directly on a TLS client's fd: deliver out-of-band data through `PushTarget` (§5.4).
-* **Gotcha 6**: `--tls-cert-file`/`--tls-key-file` currently expect **raw DER**, not PEM, despite
-  naming/doc comments suggesting PEM support (§6) — verify file format before deploying with
-  real certificates.
+* **Gotcha 6**: `--tls-cert-file`/`--tls-key-file` take PEM (a chain is allowed) or raw DER. Any
+  other content is a startup error, not a fallback to the self-signed certificate.
 
 ### How to Verify Changes
 ```bash
