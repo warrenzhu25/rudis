@@ -183,6 +183,15 @@ fn send_and_read_bytes(stream: &mut TcpStream, cmd: &[u8]) -> Vec<u8> {
     buf[..n].to_vec()
 }
 
+/// Whether a CLIENT LIST reply has a client with exactly this id. A substring
+/// check is not enough: ids carry the shard in their high bits, so shard 0's
+/// `id=2` is a prefix of shard 1's `id=281474976710657`.
+fn client_list_has_id(list: &str, id: u64) -> bool {
+    let field = format!("id={}", id);
+    list.lines()
+        .any(|line| line.split(' ').next() == Some(field.as_str()))
+}
+
 #[test]
 fn test_multithread_shared_nothing_e2e() {
     let port = 16380;
@@ -438,7 +447,7 @@ fn test_multithread_shared_nothing_e2e() {
     assert_eq!(getname_resp2, "$13\r\ntest_client_1\r\n");
 
     let list_resp = send_and_read(&mut stream, b"CLIENT LIST\r\n");
-    assert!(list_resp.contains(&format!("id={}", client_id)));
+    assert!(client_list_has_id(&list_resp, client_id));
     assert!(list_resp.contains("name=test_client_1"));
 
     // Connect a second client to test multi-client listing and cross-core aggregation
@@ -452,25 +461,29 @@ fn test_multithread_shared_nothing_e2e() {
 
     let _ = send_and_read(&mut stream2, b"CLIENT SETNAME test_client_2\r\n");
     let list_resp2 = send_and_read(&mut stream, b"CLIENT LIST\r\n");
-    assert!(list_resp2.contains(&format!("id={}", client_id)));
-    assert!(list_resp2.contains(&format!("id={}", client_id2)));
+    assert!(client_list_has_id(&list_resp2, client_id));
+    assert!(client_list_has_id(&list_resp2, client_id2));
     assert!(list_resp2.contains("name=test_client_1"));
     assert!(list_resp2.contains("name=test_client_2"));
 
-    // Drop second client and verify cleanup
+    // Drop second client and verify cleanup. The server unregisters a client
+    // once its shard reads the EOF, which a loaded machine can delay.
     drop(stream2);
-    let mut list_resp3 = String::new();
-    for _ in 0..10 {
-        thread::sleep(Duration::from_millis(30));
+    let mut list_resp3;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
         list_resp3 = send_and_read(&mut stream, b"CLIENT LIST\r\n");
-        if !list_resp3.contains(&format!("id={}", client_id2)) {
+        if !client_list_has_id(&list_resp3, client_id2) || std::time::Instant::now() >= deadline {
             break;
         }
+        thread::sleep(Duration::from_millis(10));
     }
-    assert!(list_resp3.contains(&format!("id={}", client_id)));
+    assert!(client_list_has_id(&list_resp3, client_id));
     assert!(
-        !list_resp3.contains(&format!("id={}", client_id2)),
-        "Disconnected client should be removed"
+        !client_list_has_id(&list_resp3, client_id2),
+        "Disconnected client should be removed (id={}): {}",
+        client_id2,
+        list_resp3
     );
 
     // 14. Test Redis Hash data structure (HSET, HGET, HMGET, HDEL, HEXISTS, HLEN, HGETALL, HKEYS, HVALS)
