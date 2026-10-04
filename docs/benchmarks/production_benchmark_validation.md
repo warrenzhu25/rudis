@@ -72,6 +72,25 @@ re-running both configurations back-to-back with several iterations each (`-i 10
 verdict below should be read as the original author's interpretation at the time, not as independently
 re-confirmed by this revision.
 
+### 2.2 Resolution: Interleaved A/B Re-run (2026-10-04)
+
+The open `GET` question was settled by running the build from just before the hardening changes
+(`f64ffa1`, the parent of `d8d02f7`) and the current build (`f50a26e`) back-to-back, alternating which
+went first in each of 8 rounds. Same machine shape as above: 8 shards on cores `0-7`, `memtier_benchmark`
+8 threads x 8 connections on cores `32-47`, pipeline 16, 1 KB values, 100,000 keys. Each round starts a
+fresh server in an empty directory, fills every key once with `--key-pattern P:P --requests allkeys`, then
+runs `GET` for 10 seconds.
+
+| Build | Runs | Median Ops/sec | Mean ± Std | Min / Max | Median p99 |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| `f64ffa1` (before hardening) | 8 | 971,257 | 981,341 ± 62,020 | 900,239 / 1,110,530 | 2.319 ms |
+| `f50a26e` (current) | 8 | 1,018,938 | 1,041,286 ± 62,563 | 969,074 / 1,166,236 | 1.775 ms |
+
+**There is no `GET` regression.** The current build is 4.9% faster at the median, and its p99 is 23% lower.
+Both builds land near 1M `GET` ops/sec on this machine, so the 886,960 figure above is in line with the
+older build too. The 1.50M mean from `benchmark_vs_dragonfly_valkey.md` was the outlier, which fits that
+report's own warning that this cell had a ~36% coefficient of variation.
+
 ---
 
 ## 3. Benchmark Execution Details
@@ -151,7 +170,8 @@ The `GET` workload's hit rate was 886,958.21 / 886,960.01 = 99.9998%, confirming
    figure is well below the nearest comparable baseline's mean, though within a documented high-variance
    band for that specific workload. This report flags rather than resolves that discrepancy; a multi-run
    `GET`-specific comparison is recommended before treating `GET` throughput as regression-free with the
-   same confidence as `SET`.
+   same confidence as `SET`. **Resolved since:** the interleaved 8-round A/B re-run in Section 2.2 shows
+   no `GET` regression (current build +4.9% median throughput, lower p99).
 
 ---
 
