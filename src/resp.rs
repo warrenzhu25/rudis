@@ -2078,9 +2078,11 @@ fn is_write_in_command_table(name: &'static str) -> bool {
 }
 
 fn parse_memcached_storage_command(buf: &mut BytesMut) -> Result<Option<Option<Command>>, String> {
-    let newline_pos = match find_crlf(buf) {
-        Some(pos) => pos,
-        None => return Ok(None),
+    // Only the first line is looked at: searching the whole buffer for a CRLF
+    // made a run of bare-LF frames quadratic.
+    let newline_pos = match find_newline(buf) {
+        Some((line_end, advance_len)) if advance_len == line_end + 2 => line_end,
+        _ => return Ok(None),
     };
     let line = &buf[..newline_pos];
     let first_space = match line.iter().position(|&b| b == b' ' || b == b'\t') {
@@ -2198,17 +2200,25 @@ fn parse_min_idle_time(s: &str) -> Result<u64, String> {
 /// Supports both RESP arrays (e.g., `*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n`)
 /// and inline commands (e.g., `GET foo\r\n`).
 pub fn parse_command(buf: &mut BytesMut) -> Result<Option<Command>, String> {
-    if buf.is_empty() {
-        return Ok(None);
-    }
-
-    if buf[0] == b'*' {
-        parse_resp_array(buf)
-    } else {
-        match parse_memcached_storage_command(buf)? {
-            Some(Some(cmd)) => Ok(Some(cmd)),
-            Some(None) => Ok(None),
-            None => parse_inline_command(buf),
+    // Frames that carry no command (blank inline lines, `*0`, `*-1`) are
+    // consumed here in a loop rather than by recursing: a peer can send
+    // millions of them for a byte or two each, which would overflow the stack.
+    loop {
+        if buf.is_empty() {
+            return Ok(None);
+        }
+        let mut skipped = false;
+        let parsed = if buf[0] == b'*' {
+            parse_resp_array(buf, &mut skipped)
+        } else {
+            match parse_memcached_storage_command(buf)? {
+                Some(Some(cmd)) => Ok(Some(cmd)),
+                Some(None) => Ok(None),
+                None => parse_inline_command(buf, &mut skipped),
+            }
+        };
+        if !skipped {
+            return parsed;
         }
     }
 }
@@ -2259,7 +2269,8 @@ pub fn set_proto_max_bulk_len(val: usize) {
     PROTO_MAX_BULK_LEN.store(val, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
+/// Sets `skipped` instead of returning when the frame is an empty array.
+fn parse_resp_array(buf: &mut BytesMut, skipped: &mut bool) -> Result<Option<Command>, String> {
     let (newline_pos, advance_len) = match find_newline(buf) {
         Some(res) => res,
         None => {
@@ -2273,7 +2284,8 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
     let line = &buf[1..newline_pos];
     if line.starts_with(b"-") {
         buf.advance(advance_len);
-        return parse_command(buf);
+        *skipped = true;
+        return Ok(None);
     }
     let num_args: usize = match parse_decimal_bytes(line) {
         Some(n) => {
@@ -2286,7 +2298,8 @@ fn parse_resp_array(buf: &mut BytesMut) -> Result<Option<Command>, String> {
     };
     if num_args == 0 {
         buf.advance(advance_len);
-        return parse_command(buf);
+        *skipped = true;
+        return Ok(None);
     }
 
     // First check if the full frame is present before consuming any bytes from buf
@@ -2668,7 +2681,8 @@ fn split_inline_args(line: &[u8]) -> Result<Vec<Bytes>, String> {
     Ok(args)
 }
 
-fn parse_inline_command(buf: &mut BytesMut) -> Result<Option<Command>, String> {
+/// Sets `skipped` instead of returning when the line is blank.
+fn parse_inline_command(buf: &mut BytesMut, skipped: &mut bool) -> Result<Option<Command>, String> {
     let (line_end, advance_len) = match find_newline(buf) {
         Some(res) => res,
         None => {
@@ -2684,7 +2698,8 @@ fn parse_inline_command(buf: &mut BytesMut) -> Result<Option<Command>, String> {
     buf.advance(advance_len);
 
     if parts.is_empty() {
-        return parse_command(buf);
+        *skipped = true;
+        return Ok(None);
     }
 
     build_command(parts)
@@ -13995,20 +14010,6 @@ pub fn parse_score_bound(arg: &[u8]) -> Result<(f64, bool), String> {
     }
 }
 
-fn find_crlf(buf: &[u8]) -> Option<usize> {
-    find_crlf_at(buf, 0)
-}
-
-fn find_crlf_at(buf: &[u8], start: usize) -> Option<usize> {
-    if buf.len() < start + 2 {
-        return None;
-    }
-    buf[start..]
-        .windows(2)
-        .position(|w| w == b"\r\n")
-        .map(|pos| start + pos)
-}
-
 fn find_newline(buf: &[u8]) -> Option<(usize, usize)> {
     find_newline_at(buf, 0)
 }
@@ -15584,6 +15585,33 @@ mod tests {
         let err = parse_command(&mut buf).unwrap_err();
         assert!(err.contains("bad data chunk"), "{err}");
         assert_eq!(parse_command(&mut buf), Ok(Some(Command::Ping(None))));
+    }
+
+    /// Blank lines, `*0` and `*-1` used to recurse once per frame, so a
+    /// buffer of them (a byte or two each) overflowed the stack and aborted
+    /// the process. They are skipped in a loop now; a 256 KiB stack is plenty.
+    #[test]
+    fn test_empty_frames_do_not_recurse() {
+        std::thread::Builder::new()
+            .stack_size(256 << 10)
+            .spawn(|| {
+                for frame in [&b"\n"[..], b"\r\n", b" \t\r\n", b"*0\r\n", b"*-1\r\n"] {
+                    let mut buf = BytesMut::new();
+                    for _ in 0..500_000 {
+                        buf.extend_from_slice(frame);
+                    }
+                    buf.extend_from_slice(b"*1\r\n$4\r\nPING\r\n");
+                    assert_eq!(parse_command(&mut buf), Ok(Some(Command::Ping(None))));
+                    assert!(buf.is_empty());
+                    // Only empty frames: all consumed, then more data is awaited.
+                    buf.extend_from_slice(&frame.repeat(1000));
+                    assert_eq!(parse_command(&mut buf), Ok(None));
+                    assert!(buf.is_empty());
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     /// Like RedisBloom, BF.RESERVE needs 0 < error rate < 1; NaN used to build

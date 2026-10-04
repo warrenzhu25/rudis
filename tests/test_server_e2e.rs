@@ -19907,3 +19907,33 @@ fn test_cluster_bus_survives_hostile_peer_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child.0);
 }
+
+/// Runs of empty frames (blank lines, `*0`, `*-1`) used to recurse once per
+/// frame in the parser; a client sending megabytes of them overflowed the
+/// shard thread's stack and the whole server died.
+#[test]
+fn test_empty_frame_flood_does_not_crash_e2e() {
+    let port: u16 = 17089;
+    let port_s = port.to_string();
+    let args = ["--port", &port_s, "--threads", "2", "--no-pin"];
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = KillOnDrop(spawn_rudis_listening(&args, port));
+    for frame in [&b"\n"[..], b"*0\r\n", b"*-1\r\n"] {
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let flood = frame.repeat((8 << 20) / frame.len());
+        c.write_all(&flood).unwrap();
+        assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n");
+    }
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child.0);
+}
