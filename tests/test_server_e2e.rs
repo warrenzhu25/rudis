@@ -18352,6 +18352,168 @@ fn test_json_writes_survive_restart_through_the_aof_e2e() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Writes to all four probabilistic families, optionally rewrites the AOF,
+/// restarts without an RDB and checks every query answers the same.
+fn probabilistic_writes_survive_restart(port: u16, rewrite: bool) {
+    let port_s = port.to_string();
+    let dir = std::env::temp_dir().join(format!(
+        "rudis-prob-aof-e2e-{}-{}",
+        port,
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_s = dir.to_str().unwrap();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--aof",
+        "true",
+        "--aof-dir",
+        dir_s,
+        "--enable-experimental-commands",
+        "yes",
+    ];
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    for cmd in [
+        &["BF.RESERVE", "pb:bf", "0.001", "100"][..],
+        &["BF.ADD", "pb:bf", "a"],
+        &["BF.MADD", "pb:bf", "b", "c"],
+        &["BF.ADD", "pb:bf2", "x"],
+        &["CF.RESERVE", "pb:cf", "64"],
+        &["CF.ADD", "pb:cf", "a"],
+        &["CF.ADD", "pb:cf", "b"],
+        &["CF.ADDNX", "pb:cf", "c"],
+        &["CF.DEL", "pb:cf", "b"],
+        &["CMS.INITBYDIM", "pb:cms", "100", "4"],
+        &["CMS.INCRBY", "pb:cms", "a", "5", "b", "7"],
+        &["CMS.INITBYPROB", "pb:cms2", "0.01", "0.99"],
+        &["CMS.INCRBY", "pb:cms2", "a", "3"],
+        &["TOPK.RESERVE", "pb:tk", "3"],
+        // Ties: which item gets evicted must not depend on the process.
+        &["TOPK.ADD", "pb:tk", "c", "a", "b", "d", "e", "a", "f"],
+    ] {
+        let reply = resp_cmd(&mut c, cmd);
+        assert!(!reply.starts_with('-'), "{cmd:?}: {reply}");
+    }
+    // Overfill a small cuckoo filter; the failed inserts change it too.
+    assert_eq!(resp_cmd(&mut c, &["CF.RESERVE", "pb:full", "4"]), "+OK\r\n");
+    let mut failed = 0;
+    for i in 0..40 {
+        let item = format!("i{i}");
+        failed += resp_cmd(&mut c, &["CF.ADD", "pb:full", &item]).starts_with('-') as usize;
+    }
+    assert!(failed > 0, "pb:full never filled up");
+
+    let queries: Vec<Vec<String>> = {
+        let mut q: Vec<Vec<String>> = vec![
+            vec![
+                "BF.MEXISTS".into(),
+                "pb:bf".into(),
+                "a".into(),
+                "b".into(),
+                "c".into(),
+                "z".into(),
+            ],
+            vec!["BF.EXISTS".into(), "pb:bf2".into(), "x".into()],
+            vec!["BF.INFO".into(), "pb:bf".into()],
+            vec!["CF.EXISTS".into(), "pb:cf".into(), "a".into()],
+            vec!["CF.EXISTS".into(), "pb:cf".into(), "b".into()],
+            vec!["CF.EXISTS".into(), "pb:cf".into(), "c".into()],
+            vec!["CF.INFO".into(), "pb:cf".into()],
+            vec!["CF.INFO".into(), "pb:full".into()],
+            vec![
+                "CMS.QUERY".into(),
+                "pb:cms".into(),
+                "a".into(),
+                "b".into(),
+                "z".into(),
+            ],
+            vec!["CMS.INFO".into(), "pb:cms".into()],
+            vec!["CMS.QUERY".into(), "pb:cms2".into(), "a".into()],
+            vec!["CMS.INFO".into(), "pb:cms2".into()],
+            vec![
+                "TOPK.QUERY".into(),
+                "pb:tk".into(),
+                "a".into(),
+                "b".into(),
+                "c".into(),
+                "f".into(),
+            ],
+            vec!["TOPK.LIST".into(), "pb:tk".into()],
+            vec!["TOPK.INFO".into(), "pb:tk".into()],
+        ];
+        q.extend((0..40).map(|i| vec!["CF.EXISTS".into(), "pb:full".into(), format!("i{i}")]));
+        q
+    };
+    let ask = |c: &mut TcpStream| -> Vec<String> {
+        queries
+            .iter()
+            .map(|q| {
+                let q: Vec<&str> = q.iter().map(String::as_str).collect();
+                resp_cmd(c, &q)
+            })
+            .collect()
+    };
+    let mut before = ask(&mut c);
+    assert_eq!(before[0], "*4\r\n:1\r\n:1\r\n:1\r\n:0\r\n");
+    assert_eq!(before[8], "*3\r\n:5\r\n:7\r\n:0\r\n");
+
+    if rewrite {
+        assert!(resp_cmd(&mut c, &["BGREWRITEAOF"]).starts_with('+'));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while info_field(&mut c, "aof_rewrite_in_progress") != "0" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rewrite never finished"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(info_field(&mut c, "aof_last_bgrewrite_status"), "ok");
+        // Writes after the rewrite are appended to the rewritten file.
+        assert_eq!(
+            resp_cmd(&mut c, &["CMS.INCRBY", "pb:cms", "a", "1"]),
+            "*1\r\n:6\r\n"
+        );
+        before = ask(&mut c);
+    }
+    drop(c);
+    {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(b"*2\r\n$8\r\nSHUTDOWN\r\n$6\r\nNOSAVE\r\n")
+            .unwrap();
+    }
+    let _ = child.wait();
+    // Nothing but the AOF can bring the structures back.
+    assert!(!dir.join("dump.rdb").exists());
+
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let after = ask(&mut c);
+    for ((q, b), a) in queries.iter().zip(&before).zip(&after) {
+        assert_eq!(a, b, "{q:?}");
+    }
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_probabilistic_writes_survive_restart_through_the_aof_e2e() {
+    probabilistic_writes_survive_restart(17081, false);
+}
+
+#[test]
+fn test_probabilistic_writes_survive_aof_rewrite_and_restart_e2e() {
+    probabilistic_writes_survive_restart(17082, true);
+}
+
 fn http_get(port: u16, path: &str) -> String {
     let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
     c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();

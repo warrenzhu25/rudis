@@ -2421,15 +2421,7 @@ impl ShardDb {
             buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
             buf.extend_from_slice(key);
             buf.push(8u8);
-            buf.extend_from_slice(&(bf.capacity as u64).to_le_bytes());
-            buf.extend_from_slice(&bf.error_rate.to_bits().to_le_bytes());
-            buf.extend_from_slice(&(bf.num_bits as u64).to_le_bytes());
-            buf.extend_from_slice(&(bf.num_hashes as u32).to_le_bytes());
-            buf.extend_from_slice(&(bf.count as u64).to_le_bytes());
-            buf.extend_from_slice(&(bf.bits.len() as u32).to_le_bytes());
-            for word in &bf.bits {
-                buf.extend_from_slice(&word.to_le_bytes());
-            }
+            bf.encode(buf);
         }
 
         // 3. Vector indexes
@@ -2486,15 +2478,7 @@ impl ShardDb {
             buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
             buf.extend_from_slice(key);
             buf.push(10u8);
-            buf.extend_from_slice(&(cf.capacity as u64).to_le_bytes());
-            buf.extend_from_slice(&(cf.num_buckets as u64).to_le_bytes());
-            buf.extend_from_slice(&(cf.count as u64).to_le_bytes());
-            buf.extend_from_slice(&(cf.buckets.len() as u32).to_le_bytes());
-            for bucket in &cf.buckets {
-                for &fp in bucket {
-                    buf.extend_from_slice(&fp.to_le_bytes());
-                }
-            }
+            cf.encode(buf);
         }
 
         // 5. Count-Min Sketches
@@ -2502,14 +2486,7 @@ impl ShardDb {
             buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
             buf.extend_from_slice(key);
             buf.push(11u8);
-            buf.extend_from_slice(&(cms.width as u64).to_le_bytes());
-            buf.extend_from_slice(&(cms.depth as u32).to_le_bytes());
-            buf.extend_from_slice(&cms.total_count.to_le_bytes());
-            for row in &cms.table {
-                for &cell in row {
-                    buf.extend_from_slice(&cell.to_le_bytes());
-                }
-            }
+            cms.encode(buf);
         }
 
         // 6. Top-K trackers
@@ -2517,13 +2494,7 @@ impl ShardDb {
             buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
             buf.extend_from_slice(key);
             buf.push(12u8);
-            buf.extend_from_slice(&(topk.k as u64).to_le_bytes());
-            buf.extend_from_slice(&(topk.items.len() as u32).to_le_bytes());
-            for (item_key, &count_val) in &topk.items {
-                buf.extend_from_slice(&(item_key.len() as u32).to_le_bytes());
-                buf.extend_from_slice(item_key);
-                buf.extend_from_slice(&count_val.to_le_bytes());
-            }
+            topk.encode(buf);
         }
 
         // 7. CRDT sync state
@@ -2809,39 +2780,9 @@ impl ShardDb {
                 data = &data[json_len..];
                 continue;
             } else if type_byte == 8 {
-                data = &data[1..];
-                if data.len() < 40 {
-                    return Err("Truncated BloomFilter header");
-                }
-                let capacity = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
-                let error_rate =
-                    f64::from_bits(u64::from_le_bytes(data[8..16].try_into().unwrap()));
-                let num_bits = u64::from_le_bytes(data[16..24].try_into().unwrap()) as usize;
-                let num_hashes = u32::from_le_bytes(data[24..28].try_into().unwrap()) as usize;
-                let count_val = u64::from_le_bytes(data[28..36].try_into().unwrap()) as usize;
-                let bits_len = u32::from_le_bytes(data[36..40].try_into().unwrap()) as usize;
-                data = &data[40..];
-                if data.len() < bits_len * 8 {
-                    return Err("Truncated BloomFilter bits");
-                }
-                let mut bits = Vec::with_capacity(bits_len);
-                for i in 0..bits_len {
-                    bits.push(u64::from_le_bytes(
-                        data[i * 8..(i + 1) * 8].try_into().unwrap(),
-                    ));
-                }
-                data = &data[bits_len * 8..];
-                self.probabilistic_store.bloom_filters.insert(
-                    key,
-                    crate::probabilistic::BloomFilter {
-                        capacity,
-                        error_rate,
-                        num_bits,
-                        num_hashes,
-                        count: count_val,
-                        bits,
-                    },
-                );
+                let (bf, used) = crate::probabilistic::BloomFilter::decode(&data[1..])?;
+                data = &data[1 + used..];
+                self.probabilistic_store.bloom_filters.insert(key, bf);
                 continue;
             } else if type_byte == 9 {
                 data = &data[1..];
@@ -2942,98 +2883,19 @@ impl ShardDb {
                 }
                 continue;
             } else if type_byte == 10 {
-                data = &data[1..];
-                if data.len() < 28 {
-                    return Err("Truncated CuckooFilter header");
-                }
-                let capacity = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
-                let num_buckets = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
-                let count_val = u64::from_le_bytes(data[16..24].try_into().unwrap()) as usize;
-                let buckets_len = u32::from_le_bytes(data[24..28].try_into().unwrap()) as usize;
-                data = &data[28..];
-                if data.len() < buckets_len * 8 {
-                    return Err("Truncated CuckooFilter buckets");
-                }
-                let mut buckets = Vec::with_capacity(buckets_len);
-                for i in 0..buckets_len {
-                    let base = i * 8;
-                    let fp0 = u16::from_le_bytes(data[base..base + 2].try_into().unwrap());
-                    let fp1 = u16::from_le_bytes(data[base + 2..base + 4].try_into().unwrap());
-                    let fp2 = u16::from_le_bytes(data[base + 4..base + 6].try_into().unwrap());
-                    let fp3 = u16::from_le_bytes(data[base + 6..base + 8].try_into().unwrap());
-                    buckets.push([fp0, fp1, fp2, fp3]);
-                }
-                data = &data[buckets_len * 8..];
-                self.probabilistic_store.cuckoo_filters.insert(
-                    key,
-                    crate::probabilistic::CuckooFilter {
-                        capacity,
-                        num_buckets,
-                        count: count_val,
-                        buckets,
-                    },
-                );
+                let (cf, used) = crate::probabilistic::CuckooFilter::decode(&data[1..])?;
+                data = &data[1 + used..];
+                self.probabilistic_store.cuckoo_filters.insert(key, cf);
                 continue;
             } else if type_byte == 11 {
-                data = &data[1..];
-                if data.len() < 20 {
-                    return Err("Truncated CountMinSketch header");
-                }
-                let width = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
-                let depth = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
-                let total_count = u64::from_le_bytes(data[12..20].try_into().unwrap());
-                data = &data[20..];
-                let total_cells = width * depth;
-                if data.len() < total_cells * 8 {
-                    return Err("Truncated CountMinSketch cells");
-                }
-                let mut table = Vec::with_capacity(depth);
-                for _ in 0..depth {
-                    let mut row = Vec::with_capacity(width);
-                    for _ in 0..width {
-                        let cell = u64::from_le_bytes(data[0..8].try_into().unwrap());
-                        data = &data[8..];
-                        row.push(cell);
-                    }
-                    table.push(row);
-                }
-                self.probabilistic_store.cms_sketches.insert(
-                    key,
-                    crate::probabilistic::CountMinSketch {
-                        width,
-                        depth,
-                        total_count,
-                        table,
-                    },
-                );
+                let (cms, used) = crate::probabilistic::CountMinSketch::decode(&data[1..])?;
+                data = &data[1 + used..];
+                self.probabilistic_store.cms_sketches.insert(key, cms);
                 continue;
             } else if type_byte == 12 {
-                data = &data[1..];
-                if data.len() < 12 {
-                    return Err("Truncated TopK header");
-                }
-                let k = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
-                let items_len = u32::from_le_bytes(data[8..12].try_into().unwrap()) as usize;
-                data = &data[12..];
-                let mut items = hashbrown::HashMap::with_capacity(items_len);
-                for _ in 0..items_len {
-                    if data.len() < 4 {
-                        return Err("Truncated TopK item len");
-                    }
-                    let item_len = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
-                    data = &data[4..];
-                    if data.len() < item_len + 8 {
-                        return Err("Truncated TopK item data");
-                    }
-                    let item_key = bytes::Bytes::copy_from_slice(&data[..item_len]);
-                    data = &data[item_len..];
-                    let count_val = u64::from_le_bytes(data[0..8].try_into().unwrap());
-                    data = &data[8..];
-                    items.insert(item_key, count_val);
-                }
-                self.probabilistic_store
-                    .topk_trackers
-                    .insert(key, crate::probabilistic::TopK { k, items });
+                let (topk, used) = crate::probabilistic::TopK::decode(&data[1..])?;
+                data = &data[1 + used..];
+                self.probabilistic_store.topk_trackers.insert(key, topk);
                 continue;
             } else if type_byte == 13 {
                 data = &data[1..];

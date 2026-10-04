@@ -1695,6 +1695,84 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             key,
             path.as_bytes(),
         ])),
+        // BF/CF/CMS/TOPK.* writes are logged as issued: the structures hash
+        // deterministically (no RNG, Top-K ties broken by item), so replaying
+        // them in order rebuilds the same state.
+        Command::BfReserve {
+            key,
+            error_rate,
+            capacity,
+        } => Some(resp_argv(&[
+            b"BF.RESERVE".as_slice(),
+            key,
+            error_rate.to_string().as_bytes(),
+            capacity.to_string().as_bytes(),
+        ])),
+        Command::BfAdd { key, item } => Some(resp_argv(&[
+            b"BF.ADD".as_slice(),
+            key.as_ref(),
+            item.as_ref(),
+        ])),
+        Command::BfMadd { key, items } | Command::TopkAdd { key, items } => {
+            let name: &[u8] = if matches!(cmd, Command::BfMadd { .. }) {
+                b"BF.MADD"
+            } else {
+                b"TOPK.ADD"
+            };
+            let mut args: Vec<&[u8]> = vec![name, key];
+            args.extend(items.iter().map(|i| i.as_ref()));
+            Some(resp_argv(&args))
+        }
+        Command::CfReserve { key, capacity } => Some(resp_argv(&[
+            b"CF.RESERVE".as_slice(),
+            key,
+            capacity.to_string().as_bytes(),
+        ])),
+        Command::CfAdd { key, item }
+        | Command::CfAddnx { key, item }
+        | Command::CfDel { key, item } => {
+            let name: &[u8] = match cmd {
+                Command::CfAdd { .. } => b"CF.ADD",
+                Command::CfAddnx { .. } => b"CF.ADDNX",
+                _ => b"CF.DEL",
+            };
+            Some(resp_argv(&[name, key.as_ref(), item.as_ref()]))
+        }
+        Command::CmsInitbydim { key, width, depth } => Some(resp_argv(&[
+            b"CMS.INITBYDIM".as_slice(),
+            key,
+            width.to_string().as_bytes(),
+            depth.to_string().as_bytes(),
+        ])),
+        Command::CmsInitbyprob {
+            key,
+            error,
+            probability,
+        } => Some(resp_argv(&[
+            b"CMS.INITBYPROB".as_slice(),
+            key,
+            error.to_string().as_bytes(),
+            probability.to_string().as_bytes(),
+        ])),
+        Command::CmsIncrby { key, pairs } => {
+            let incs: Vec<String> = pairs.iter().map(|(_, inc)| inc.to_string()).collect();
+            let mut args: Vec<&[u8]> = vec![b"CMS.INCRBY", key];
+            for ((item, _), inc) in pairs.iter().zip(&incs) {
+                args.push(item);
+                args.push(inc.as_bytes());
+            }
+            Some(resp_argv(&args))
+        }
+        Command::TopkReserve { key, topk } => Some(resp_argv(&[
+            b"TOPK.RESERVE".as_slice(),
+            key,
+            topk.to_string().as_bytes(),
+        ])),
+        Command::ProbRestore { kind, key, payload } => Some(resp_argv(&[
+            kind.restore_command().as_bytes(),
+            key,
+            payload,
+        ])),
         Command::SemanticSet {
             namespace,
             id,
@@ -3230,6 +3308,20 @@ fn write_rewritten_aof(
         }
     }
 
+    // 8. Snapshot probabilistic structures (BF/CF/CMS/TOPK.*) as their raw
+    //    state: Bloom and Count-Min contents can't be rebuilt from commands.
+    for (kind, key, payload) in db.probabilistic_store.encoded_entries() {
+        let cmd = Command::ProbRestore {
+            kind,
+            key: key.clone(),
+            payload: payload.into(),
+        };
+        if let Some(resp) = command_to_resp(&cmd) {
+            writer.write_all(&resp)?;
+            count += 1;
+        }
+    }
+
     writer.flush()?;
     let file = writer.into_inner().map_err(|e| e.into_error())?;
     file.sync_all()?;
@@ -3297,6 +3389,98 @@ mod tests {
             let bytes = command_to_resp(&cmd).unwrap_or_else(|| panic!("{args:?} not encoded"));
             assert_eq!(parse_resp(&bytes), cmd, "{args:?}");
         }
+    }
+
+    #[test]
+    fn test_probabilistic_writes_round_trip_through_aof_encoding() {
+        let writes: &[&[&str]] = &[
+            &["BF.RESERVE", "b", "0.001", "500"],
+            &["BF.RESERVE", "b", "0.1", "1"],
+            &["BF.ADD", "b", "x"],
+            &["BF.MADD", "b", "x", "y", "z"],
+            &["CF.RESERVE", "c", "64"],
+            &["CF.ADD", "c", "x"],
+            &["CF.ADDNX", "c", "x"],
+            &["CF.DEL", "c", "x"],
+            &["CMS.INITBYDIM", "m", "100", "4"],
+            &["CMS.INITBYPROB", "m", "0.001", "0.995"],
+            &["CMS.INCRBY", "m", "x", "3"],
+            &["CMS.INCRBY", "m", "x", "3", "y", "18446744073709551615"],
+            &["TOPK.RESERVE", "t", "10"],
+            &["TOPK.ADD", "t", "x"],
+            &["TOPK.ADD", "t", "x", "y", "x"],
+            &["BF.RESTORE", "b", "\x00\r\n\x01"],
+            &["CF.RESTORE", "c", ""],
+            &["CMS.RESTORE", "m", "p"],
+            &["TOPK.RESTORE", "t", "p"],
+        ];
+        for args in writes {
+            let cmd = parse_resp(&resp_argv(args));
+            assert!(cmd.is_write_command(), "{args:?} should be a write");
+            let bytes = command_to_resp(&cmd).unwrap_or_else(|| panic!("{args:?} not encoded"));
+            assert_eq!(parse_resp(&bytes), cmd, "{args:?}");
+        }
+    }
+
+    /// Replaying the logged BF/CF/CMS/TOPK writes, or a rewrite of the
+    /// result, rebuilds exactly the same structures.
+    #[test]
+    fn test_probabilistic_state_survives_aof_replay_and_rewrite() {
+        let dir = std::env::temp_dir().join(format!("rudis-aof-prob-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut db = ShardDb::new(6379);
+        let aof = std::cell::RefCell::new(AofWriter::new_in_memory());
+        let mut out = Vec::new();
+        let mut run = |db: &mut ShardDb, args: &[&str]| {
+            out.clear();
+            let cmd = parse_resp(&resp_argv(args));
+            crate::connection::execute_local_command(&cmd, db, &mut out, Some(&aof));
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        let scripted: &[&[&str]] = &[
+            &["BF.RESERVE", "bf", "0.001", "50"],
+            &["BF.ADD", "bf", "a"],
+            &["BF.MADD", "bf", "b", "c", "a"],
+            &["BF.ADD", "bf2", "x"],
+            &["CF.RESERVE", "cf", "4"],
+            &["CF.ADDNX", "cf", "i0"],
+            &["CF.DEL", "cf", "i0"],
+            &["CMS.INITBYDIM", "cms", "50", "3"],
+            &["CMS.INCRBY", "cms", "a", "5", "b", "7"],
+            &["CMS.INITBYPROB", "cms2", "0.01", "0.99"],
+            &["CMS.INCRBY", "cms2", "a", "1"],
+            &["CMS.INCRBY", "cms3", "x", "2"],
+            &["TOPK.RESERVE", "tk", "2"],
+            &["TOPK.ADD", "tk", "a", "b", "c", "d", "a"],
+            &["TOPK.ADD", "tk2", "z"],
+        ];
+        for args in scripted {
+            let reply = run(&mut db, args);
+            assert!(!reply.starts_with('-'), "{args:?}: {reply}");
+        }
+        // Overfill the cuckoo filter: failed inserts still move
+        // fingerprints, so they must be logged too.
+        let mut failed = 0;
+        for i in 0..64 {
+            let item = format!("i{i}");
+            failed += run(&mut db, &["CF.ADD", "cf", &item]).starts_with('-') as usize;
+        }
+        assert!(failed > 0, "the filter never filled up");
+
+        let log = dir.join("log.aof");
+        std::fs::write(&log, aof.borrow().buffer()).unwrap();
+        let mut replayed = ShardDb::new(6379);
+        replay_aof(&log, &mut replayed).unwrap();
+        assert_eq!(replayed.probabilistic_store, db.probabilistic_store);
+
+        let n = rewrite_shard_aof(&mut db, &dir, 0).unwrap();
+        assert_eq!(n, 8, "one *.RESTORE per structure");
+        let mut rewritten = ShardDb::new(6379);
+        let applied = replay_aof(&dir.join("appendonly-0.aof"), &mut rewritten).unwrap();
+        assert_eq!(applied, 8);
+        assert_eq!(rewritten.probabilistic_store, db.probabilistic_store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn parse_line(line: &str) -> Command {

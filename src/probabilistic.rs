@@ -24,7 +24,7 @@ fn double_hash(data: &[u8]) -> (u64, u64) {
 // 1. Bloom Filter
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BloomFilter {
     pub capacity: usize,
     pub error_rate: f64,
@@ -112,7 +112,7 @@ impl BloomFilter {
 const BUCKET_SIZE: usize = 4;
 const MAX_KICKS: usize = 500;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CuckooFilter {
     pub capacity: usize,
     pub num_buckets: usize,
@@ -231,7 +231,7 @@ impl CuckooFilter {
 // 3. Count-Min Sketch
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CountMinSketch {
     pub width: usize,
     pub depth: usize,
@@ -287,7 +287,7 @@ impl CountMinSketch {
 // 4. Top-K Frequency Tracker (Space-Saving Algorithm)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TopK {
     pub k: usize,
     pub items: HashMap<Bytes, u64>,
@@ -313,18 +313,16 @@ impl TopK {
             return None;
         }
 
-        // Space-Saving replacement: find element with minimum count
-        let mut min_key: Option<Bytes> = None;
-        let mut min_val = u64::MAX;
+        // Space-Saving replacement: find element with minimum count. Ties go
+        // to the smallest item, not to the HashMap's per-process iteration
+        // order, so replaying the same adds (AOF, replicas) evicts the same.
+        let min = self
+            .items
+            .iter()
+            .min_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)))
+            .map(|(k, &v)| (k.clone(), v));
 
-        for (k, &v) in &self.items {
-            if v < min_val {
-                min_val = v;
-                min_key = Some(k.clone());
-            }
-        }
-
-        if let Some(evicted) = min_key {
+        if let Some((evicted, min_val)) = min {
             self.items.remove(&evicted);
             self.items.insert(item, min_val + inc);
             return Some(evicted);
@@ -340,9 +338,11 @@ impl TopK {
         self.items.get(item).copied().unwrap_or(0)
     }
 
+    /// Items by descending count, ties by item, so the order is the same
+    /// in every process.
     pub fn list(&self) -> Vec<(Bytes, u64)> {
         let mut res: Vec<_> = self.items.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        res.sort_by_key(|a| std::cmp::Reverse(a.1));
+        res.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         res
     }
 }
@@ -351,7 +351,7 @@ impl TopK {
 // 5. Unified Probabilistic Store
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct ProbabilisticStore {
     pub bloom_filters: HashMap<Bytes, BloomFilter>,
     pub cuckoo_filters: HashMap<Bytes, CuckooFilter>,
@@ -362,6 +362,312 @@ pub struct ProbabilisticStore {
 impl ProbabilisticStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Every structure as `(kind, key, encoded state)`, for the AOF rewrite:
+    /// Bloom and Count-Min state can't be rebuilt from user commands.
+    pub fn encoded_entries(&self) -> impl Iterator<Item = (ProbKind, &Bytes, Vec<u8>)> {
+        fn enc<'a, T: 'a>(
+            kind: ProbKind,
+            f: fn(&T, &mut Vec<u8>),
+        ) -> impl Fn((&'a Bytes, &'a T)) -> (ProbKind, &'a Bytes, Vec<u8>) {
+            move |(key, v)| {
+                let mut buf = Vec::new();
+                f(v, &mut buf);
+                (kind, key, buf)
+            }
+        }
+        let bloom = self
+            .bloom_filters
+            .iter()
+            .map(enc(ProbKind::Bloom, BloomFilter::encode));
+        let cuckoo = self
+            .cuckoo_filters
+            .iter()
+            .map(enc(ProbKind::Cuckoo, CuckooFilter::encode));
+        let cms = self
+            .cms_sketches
+            .iter()
+            .map(enc(ProbKind::Cms, CountMinSketch::encode));
+        let topk = self
+            .topk_trackers
+            .iter()
+            .map(enc(ProbKind::TopK, TopK::encode));
+        bloom.chain(cuckoo).chain(cms).chain(topk)
+    }
+
+    /// Replaces `key`'s structure of `kind` with one decoded from `payload`
+    /// (as written by [`Self::encoded_entries`]). Malformed or trailing
+    /// bytes are an error and leave the store untouched.
+    pub fn restore(
+        &mut self,
+        kind: ProbKind,
+        key: Bytes,
+        payload: &[u8],
+    ) -> Result<(), &'static str> {
+        fn whole<T>(r: Result<(T, usize), &'static str>, len: usize) -> Result<T, &'static str> {
+            match r? {
+                (v, used) if used == len => Ok(v),
+                _ => Err("trailing bytes after the encoded state"),
+            }
+        }
+        let len = payload.len();
+        match kind {
+            ProbKind::Bloom => {
+                let v = whole(BloomFilter::decode(payload), len)?;
+                self.bloom_filters.insert(key, v);
+            }
+            ProbKind::Cuckoo => {
+                let v = whole(CuckooFilter::decode(payload), len)?;
+                self.cuckoo_filters.insert(key, v);
+            }
+            ProbKind::Cms => {
+                let v = whole(CountMinSketch::decode(payload), len)?;
+                self.cms_sketches.insert(key, v);
+            }
+            ProbKind::TopK => {
+                let v = whole(TopK::decode(payload), len)?;
+                self.topk_trackers.insert(key, v);
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 6. Binary encoding (RDB entries and the AOF rewrite's *.RESTORE commands)
+// ---------------------------------------------------------------------------
+
+/// Which probabilistic structure an encoded state belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbKind {
+    Bloom,
+    Cuckoo,
+    Cms,
+    TopK,
+}
+
+impl ProbKind {
+    /// The internal command that loads an encoded state of this kind.
+    pub fn restore_command(self) -> &'static str {
+        match self {
+            ProbKind::Bloom => "BF.RESTORE",
+            ProbKind::Cuckoo => "CF.RESTORE",
+            ProbKind::Cms => "CMS.RESTORE",
+            ProbKind::TopK => "TOPK.RESTORE",
+        }
+    }
+}
+
+/// Bounds-checked little-endian reader; never panics on short input.
+struct Reader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn take(&mut self, n: usize, err: &'static str) -> Result<&'a [u8], &'static str> {
+        let end = self.pos.checked_add(n).ok_or(err)?;
+        let s = self.data.get(self.pos..end).ok_or(err)?;
+        self.pos = end;
+        Ok(s)
+    }
+
+    fn u16(&mut self, err: &'static str) -> Result<u16, &'static str> {
+        Ok(u16::from_le_bytes(self.take(2, err)?.try_into().unwrap()))
+    }
+
+    fn u32(&mut self, err: &'static str) -> Result<usize, &'static str> {
+        Ok(u32::from_le_bytes(self.take(4, err)?.try_into().unwrap()) as usize)
+    }
+
+    fn u64(&mut self, err: &'static str) -> Result<u64, &'static str> {
+        Ok(u64::from_le_bytes(self.take(8, err)?.try_into().unwrap()))
+    }
+
+    fn remaining(&self) -> usize {
+        self.data.len() - self.pos
+    }
+}
+
+impl BloomFilter {
+    /// Appends the RDB encoding (type 8 payload).
+    pub fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.capacity as u64).to_le_bytes());
+        buf.extend_from_slice(&self.error_rate.to_bits().to_le_bytes());
+        buf.extend_from_slice(&(self.num_bits as u64).to_le_bytes());
+        buf.extend_from_slice(&(self.num_hashes as u32).to_le_bytes());
+        buf.extend_from_slice(&(self.count as u64).to_le_bytes());
+        buf.extend_from_slice(&(self.bits.len() as u32).to_le_bytes());
+        for word in &self.bits {
+            buf.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+
+    /// Decodes [`Self::encode`]'s output, returning the bytes consumed.
+    pub fn decode(data: &[u8]) -> Result<(Self, usize), &'static str> {
+        const HDR: &str = "Truncated BloomFilter header";
+        let mut r = Reader::new(data);
+        let capacity = r.u64(HDR)? as usize;
+        let error_rate = f64::from_bits(r.u64(HDR)?);
+        let num_bits = r.u64(HDR)? as usize;
+        let num_hashes = r.u32(HDR)?;
+        let count = r.u64(HDR)? as usize;
+        let bits_len = r.u32(HDR)?;
+        if num_bits == 0 || num_hashes == 0 || bits_len != num_bits.div_ceil(64) {
+            return Err("Invalid BloomFilter dimensions");
+        }
+        let raw = r.take(bits_len * 8, "Truncated BloomFilter bits")?;
+        let bits = raw
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|w| u64::from_le_bytes(*w))
+            .collect();
+        let bf = Self {
+            capacity,
+            error_rate,
+            num_bits,
+            num_hashes,
+            count,
+            bits,
+        };
+        Ok((bf, r.pos))
+    }
+}
+
+impl CuckooFilter {
+    /// Appends the RDB encoding (type 10 payload).
+    pub fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.capacity as u64).to_le_bytes());
+        buf.extend_from_slice(&(self.num_buckets as u64).to_le_bytes());
+        buf.extend_from_slice(&(self.count as u64).to_le_bytes());
+        buf.extend_from_slice(&(self.buckets.len() as u32).to_le_bytes());
+        for bucket in &self.buckets {
+            for &fp in bucket {
+                buf.extend_from_slice(&fp.to_le_bytes());
+            }
+        }
+    }
+
+    /// Decodes [`Self::encode`]'s output, returning the bytes consumed.
+    pub fn decode(data: &[u8]) -> Result<(Self, usize), &'static str> {
+        const HDR: &str = "Truncated CuckooFilter header";
+        const BODY: &str = "Truncated CuckooFilter buckets";
+        let mut r = Reader::new(data);
+        let capacity = r.u64(HDR)? as usize;
+        let num_buckets = r.u64(HDR)? as usize;
+        let count = r.u64(HDR)? as usize;
+        let buckets_len = r.u32(HDR)?;
+        if num_buckets == 0 || buckets_len != num_buckets {
+            return Err("Invalid CuckooFilter dimensions");
+        }
+        if r.remaining() < buckets_len * BUCKET_SIZE * 2 {
+            return Err(BODY);
+        }
+        let mut buckets = Vec::with_capacity(buckets_len);
+        for _ in 0..buckets_len {
+            let mut bucket = [0u16; BUCKET_SIZE];
+            for fp in &mut bucket {
+                *fp = r.u16(BODY)?;
+            }
+            buckets.push(bucket);
+        }
+        let cf = Self {
+            capacity,
+            num_buckets,
+            count,
+            buckets,
+        };
+        Ok((cf, r.pos))
+    }
+}
+
+impl CountMinSketch {
+    /// Appends the RDB encoding (type 11 payload).
+    pub fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.width as u64).to_le_bytes());
+        buf.extend_from_slice(&(self.depth as u32).to_le_bytes());
+        buf.extend_from_slice(&self.total_count.to_le_bytes());
+        for row in &self.table {
+            for &cell in row {
+                buf.extend_from_slice(&cell.to_le_bytes());
+            }
+        }
+    }
+
+    /// Decodes [`Self::encode`]'s output, returning the bytes consumed.
+    pub fn decode(data: &[u8]) -> Result<(Self, usize), &'static str> {
+        const HDR: &str = "Truncated CountMinSketch header";
+        const BODY: &str = "Truncated CountMinSketch cells";
+        let mut r = Reader::new(data);
+        let width = r.u64(HDR)? as usize;
+        let depth = r.u32(HDR)?;
+        let total_count = r.u64(HDR)?;
+        if width == 0 || depth == 0 {
+            return Err("Invalid CountMinSketch dimensions");
+        }
+        let cells_bytes = width
+            .checked_mul(depth)
+            .and_then(|c| c.checked_mul(8))
+            .ok_or(BODY)?;
+        let raw = r.take(cells_bytes, BODY)?;
+        let table = raw
+            .chunks_exact(width * 8)
+            .map(|row| {
+                row.as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|c| u64::from_le_bytes(*c))
+                    .collect()
+            })
+            .collect();
+        let cms = Self {
+            width,
+            depth,
+            total_count,
+            table,
+        };
+        Ok((cms, r.pos))
+    }
+}
+
+impl TopK {
+    /// Appends the RDB encoding (type 12 payload).
+    pub fn encode(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&(self.k as u64).to_le_bytes());
+        buf.extend_from_slice(&(self.items.len() as u32).to_le_bytes());
+        for (item, &count) in &self.items {
+            buf.extend_from_slice(&(item.len() as u32).to_le_bytes());
+            buf.extend_from_slice(item);
+            buf.extend_from_slice(&count.to_le_bytes());
+        }
+    }
+
+    /// Decodes [`Self::encode`]'s output, returning the bytes consumed.
+    pub fn decode(data: &[u8]) -> Result<(Self, usize), &'static str> {
+        const HDR: &str = "Truncated TopK header";
+        const ITEM: &str = "Truncated TopK item data";
+        let mut r = Reader::new(data);
+        let k = r.u64(HDR)? as usize;
+        let items_len = r.u32(HDR)?;
+        if k == 0 || items_len > k {
+            return Err("Invalid TopK dimensions");
+        }
+        // Each item takes at least 12 bytes; don't trust the count for the
+        // allocation.
+        let mut items = HashMap::with_capacity(items_len.min(r.remaining() / 12));
+        for _ in 0..items_len {
+            let item_len = r.u32("Truncated TopK item len")?;
+            let item = Bytes::copy_from_slice(r.take(item_len, ITEM)?);
+            let count = r.u64(ITEM)?;
+            items.insert(item, count);
+        }
+        Ok((Self { k, items }, r.pos))
     }
 }
 
@@ -413,5 +719,117 @@ mod tests {
         let list = tk.list();
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].0.as_ref(), b"userA");
+    }
+
+    #[test]
+    fn test_topk_ties_do_not_depend_on_hash_order() {
+        // Each tracker has its own random hasher seed; ties must still
+        // evict, and list, the same items in every one.
+        for _ in 0..20 {
+            let mut tk = TopK::new(3);
+            for item in ["c", "a", "b"] {
+                tk.add(Bytes::from(item), 1);
+            }
+            assert_eq!(tk.add(Bytes::from("d"), 1), Some(Bytes::from("a")));
+            assert_eq!(
+                tk.list(),
+                vec![
+                    (Bytes::from("d"), 2),
+                    (Bytes::from("b"), 1),
+                    (Bytes::from("c"), 1),
+                ]
+            );
+        }
+    }
+
+    fn sample_store() -> ProbabilisticStore {
+        let mut s = ProbabilisticStore::new();
+        let mut bf = BloomFilter::new(100, 0.01);
+        bf.add(b"x");
+        s.bloom_filters.insert(Bytes::from("bf"), bf);
+        let mut cf = CuckooFilter::new(16);
+        cf.add(b"x").unwrap();
+        s.cuckoo_filters.insert(Bytes::from("cf"), cf);
+        let mut cms = CountMinSketch::new(8, 2);
+        cms.incr_by(b"x", 3);
+        s.cms_sketches.insert(Bytes::from("cms"), cms);
+        let mut tk = TopK::new(2);
+        tk.add(Bytes::from("x"), 1);
+        tk.add(Bytes::from("y"), 2);
+        s.topk_trackers.insert(Bytes::from("tk"), tk);
+        s
+    }
+
+    #[test]
+    fn test_encoded_entries_restore_identical_state() {
+        let src = sample_store();
+        let mut dst = ProbabilisticStore::new();
+        let mut kinds = Vec::new();
+        for (kind, key, payload) in src.encoded_entries() {
+            kinds.push(kind);
+            dst.restore(kind, key.clone(), &payload).unwrap();
+        }
+        kinds.sort_by_key(|k| *k as u8);
+        assert_eq!(
+            kinds,
+            [
+                ProbKind::Bloom,
+                ProbKind::Cuckoo,
+                ProbKind::Cms,
+                ProbKind::TopK
+            ]
+        );
+        assert_eq!(dst, src);
+    }
+
+    #[test]
+    fn test_restore_rejects_malformed_payloads_without_panicking() {
+        let src = sample_store();
+        for (kind, key, payload) in src.encoded_entries() {
+            let mut dst = ProbabilisticStore::new();
+            // Every truncation, and trailing garbage, is an error.
+            for cut in 0..payload.len() {
+                assert!(dst.restore(kind, key.clone(), &payload[..cut]).is_err());
+            }
+            let mut long = payload.clone();
+            long.push(0);
+            assert!(dst.restore(kind, key.clone(), &long).is_err());
+            // Nothing was half-loaded.
+            assert_eq!(dst, ProbabilisticStore::new(), "{kind:?}");
+        }
+
+        // Headers whose dimensions would make later queries panic.
+        let mut s = ProbabilisticStore::new();
+        let k = Bytes::from("k");
+        let mut bf = Vec::new();
+        BloomFilter {
+            num_bits: 0,
+            bits: Vec::new(),
+            ..BloomFilter::new(10, 0.1)
+        }
+        .encode(&mut bf);
+        assert!(s.restore(ProbKind::Bloom, k.clone(), &bf).is_err());
+        let mut cf = Vec::new();
+        CuckooFilter {
+            num_buckets: 8,
+            ..CuckooFilter::new(16)
+        }
+        .encode(&mut cf);
+        assert!(s.restore(ProbKind::Cuckoo, k.clone(), &cf).is_err());
+        let mut cms = 0u64.to_le_bytes().to_vec();
+        cms.extend_from_slice(&1u32.to_le_bytes());
+        cms.extend_from_slice(&0u64.to_le_bytes());
+        assert!(s.restore(ProbKind::Cms, k.clone(), &cms).is_err());
+        let mut huge = u64::MAX.to_le_bytes().to_vec();
+        huge.extend_from_slice(&u32::MAX.to_le_bytes());
+        huge.extend_from_slice(&0u64.to_le_bytes());
+        assert!(s.restore(ProbKind::Cms, k.clone(), &huge).is_err());
+        let mut tk = 0u64.to_le_bytes().to_vec();
+        tk.extend_from_slice(&0u32.to_le_bytes());
+        assert!(s.restore(ProbKind::TopK, k.clone(), &tk).is_err());
+        let mut tk = 1u64.to_le_bytes().to_vec();
+        tk.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert!(s.restore(ProbKind::TopK, k, &tk).is_err());
+        assert_eq!(s, ProbabilisticStore::new());
     }
 }

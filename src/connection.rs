@@ -5477,6 +5477,7 @@ pub fn cmd_primary_key(cmd: &Command) -> Option<&bytes::Bytes> {
         | Command::TopkQuery { key, .. }
         | Command::TopkList(key)
         | Command::TopkInfo(key)
+        | Command::ProbRestore { key, .. }
         | Command::CrdtSet { key, .. }
         | Command::CrdtGet(key)
         | Command::CrdtDel(key)
@@ -5753,7 +5754,8 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
         | Command::TopkAdd { key, .. }
         | Command::TopkQuery { key, .. }
         | Command::TopkList(key)
-        | Command::TopkInfo(key) => f(key.as_ref()),
+        | Command::TopkInfo(key)
+        | Command::ProbRestore { key, .. } => f(key.as_ref()),
 
         Command::Smove {
             source,
@@ -6768,6 +6770,12 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         | Command::TopkQuery { .. }
         | Command::TopkList(_)
         | Command::TopkInfo(_) => "TOPK",
+        Command::ProbRestore { kind, .. } => match kind {
+            crate::probabilistic::ProbKind::Bloom => "BF",
+            crate::probabilistic::ProbKind::Cuckoo => "CF",
+            crate::probabilistic::ProbKind::Cms => "CMS",
+            crate::probabilistic::ProbKind::TopK => "TOPK",
+        },
         Command::FtCreate { .. }
         | Command::FtSearch { .. }
         | Command::FtAggregate { .. }
@@ -10908,6 +10916,7 @@ async fn execute_command(
         | Command::TopkQuery { .. }
         | Command::TopkList(_)
         | Command::TopkInfo(_)
+        | Command::ProbRestore { .. }
         | Command::Digest(_)
         | Command::Delex { .. }
         | Command::CrdtSet { .. }
@@ -16019,6 +16028,7 @@ pub fn target_shard_of_cmd(cmd: &Command, num_shards: usize) -> Option<usize> {
         | Command::TopkQuery { key, .. }
         | Command::TopkList(key)
         | Command::TopkInfo(key)
+        | Command::ProbRestore { key, .. }
         | Command::Sticky(key)
         | Command::Delex { key, .. }
         | Command::MemcachedSet { key, .. }
@@ -21383,6 +21393,9 @@ pub fn execute_local_command(
                     out.extend_from_slice(b":1\r\n");
                 }
                 Err(e) => {
+                    // A failed insert has already kicked fingerprints
+                    // around (and dropped one); replaying it does the same.
+                    record_change!(cmd);
                     out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes());
                 }
             }
@@ -21403,6 +21416,8 @@ pub fn execute_local_command(
                         out.extend_from_slice(b":1\r\n");
                     }
                     Err(e) => {
+                        // As in CF.ADD, the failed insert changed the filter.
+                        record_change!(cmd);
                         out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes());
                     }
                 }
@@ -21575,6 +21590,18 @@ pub fn execute_local_command(
                 write_resp_integer(out, tk.items.len() as i64);
             } else {
                 out.extend_from_slice(b"-ERR not found\r\n");
+            }
+            false
+        }
+        Command::ProbRestore { kind, key, payload } => {
+            match db.probabilistic_store.restore(*kind, key.clone(), payload) {
+                Ok(()) => {
+                    record_change!(cmd);
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                Err(e) => {
+                    out.extend_from_slice(format!("-ERR {}\r\n", e).as_bytes());
+                }
             }
             false
         }

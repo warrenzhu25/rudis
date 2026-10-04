@@ -1714,6 +1714,15 @@ pub enum Command {
     },
     TopkList(Bytes),
     TopkInfo(Bytes),
+    /// `BF.RESTORE`/`CF.RESTORE`/`CMS.RESTORE`/`TOPK.RESTORE key payload`:
+    /// replaces `key`'s structure with an encoded state. The AOF rewrite
+    /// emits these, since Bloom and Count-Min state can't be rebuilt from
+    /// the commands that made it.
+    ProbRestore {
+        kind: crate::probabilistic::ProbKind,
+        key: Bytes,
+        payload: Bytes,
+    },
     // Full-Text Search (FT.*)
     FtCreate {
         index: String,
@@ -2713,11 +2722,11 @@ pub fn experimental_commands_enabled() -> bool {
 }
 
 /// Command families that are off unless `enable-experimental-commands` is
-/// set. They are not Redis/Valkey commands, and apart from JSON. and
-/// SEMANTIC. most of their writes are neither written to the AOF nor
-/// replicated, so a restart or failover silently loses that data and
-/// replicas never see it. MCP./XDP. also expose tool calls and
-/// packet-filter control.
+/// set. They are not Redis/Valkey commands, and apart from JSON.,
+/// SEMANTIC., BF., CF., CMS. and TOPK. most of their writes are neither
+/// written to the AOF nor replicated, so a restart or failover silently
+/// loses that data and replicas never see it. MCP./XDP. also expose tool
+/// calls and packet-filter control.
 const EXPERIMENTAL_PREFIXES: &[&str] = &[
     "JSON.",
     "BF.",
@@ -12022,6 +12031,26 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'topk.info' command".to_string());
             }
             Ok(Some(Command::TopkInfo(args[1].clone())))
+        }
+        "BF.RESTORE" | "CF.RESTORE" | "CMS.RESTORE" | "TOPK.RESTORE" => {
+            use crate::probabilistic::ProbKind;
+            let kind = match cmd_name {
+                "BF.RESTORE" => ProbKind::Bloom,
+                "CF.RESTORE" => ProbKind::Cuckoo,
+                "CMS.RESTORE" => ProbKind::Cms,
+                _ => ProbKind::TopK,
+            };
+            if args.len() != 3 {
+                return Err(format!(
+                    "wrong number of arguments for '{}' command",
+                    kind.restore_command().to_ascii_lowercase()
+                ));
+            }
+            Ok(Some(Command::ProbRestore {
+                kind,
+                key: args[1].clone(),
+                payload: args[2].clone(),
+            }))
         }
         "FT.CREATE" => {
             if args.len() < 4 {
