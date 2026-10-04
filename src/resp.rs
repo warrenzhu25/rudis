@@ -2121,11 +2121,20 @@ fn parse_memcached_storage_command(buf: &mut BytesMut) -> Result<Option<Option<C
     };
     let noreply = parts.len() > 5 && parts[5].eq_ignore_ascii_case(b"noreply");
 
+    // Like an oversized RESP bulk, a data block beyond proto-max-bulk-len is a
+    // protocol error (closes the connection) rather than buffering it forever;
+    // this also keeps the length arithmetic below from overflowing.
+    if bytes_len > get_proto_max_bulk_len() {
+        return Err("Protocol error: invalid bulk length".to_string());
+    }
     let total_len = newline_pos + 2 + bytes_len + 2;
     if buf.len() < total_len {
         return Ok(Some(None));
     }
     if &buf[newline_pos + 2 + bytes_len..total_len] != b"\r\n" {
+        // Swallow the malformed block: the caller keeps parsing after a
+        // non-protocol error, so leaving it in `buf` would loop forever.
+        buf.advance(total_len);
         return Err("CLIENT_ERROR bad data chunk".to_string());
     }
 
@@ -2678,6 +2687,46 @@ fn parse_inline_command(buf: &mut BytesMut) -> Result<Option<Command>, String> {
     build_command(parts)
 }
 
+/// Returns the `count` arguments starting at `start` for a RediSearch-style
+/// `<KEYWORD> <count> arg...` option. The count is client-supplied, so it is
+/// validated against the arguments actually present (never looped over
+/// blindly); `start` may already be past the end of `args`.
+fn counted_args<'a>(
+    args: &'a [Bytes],
+    start: usize,
+    count: usize,
+    keyword: &str,
+) -> Result<&'a [Bytes], String> {
+    if count > args.len().saturating_sub(start) {
+        return Err(format!(
+            "Bad arguments for {keyword}: Expected an argument, but none provided"
+        ));
+    }
+    Ok(args.get(start..start + count).unwrap_or_default())
+}
+
+/// Field name with an optional leading `@` removed (FT.AGGREGATE syntax).
+fn strip_field_sigil(arg: &Bytes) -> String {
+    let f = String::from_utf8_lossy(arg);
+    f.strip_prefix('@').unwrap_or(&f).to_string()
+}
+
+/// Parses the name/value pairs of an FT.* `PARAMS <count> name value ...`
+/// option starting at `start` (an odd count ignores the trailing argument).
+/// Returns how many arguments were consumed.
+fn parse_ft_params(
+    args: &[Bytes],
+    start: usize,
+    count: usize,
+    params: &mut std::collections::HashMap<String, Vec<u8>>,
+) -> Result<usize, String> {
+    let pairs = counted_args(args, start, count / 2 * 2, "PARAMS")?;
+    for [k, v] in pairs.as_chunks::<2>().0 {
+        params.insert(String::from_utf8_lossy(k).to_string(), v.to_vec());
+    }
+    Ok(pairs.len())
+}
+
 fn parse_lmovem_trailer(args: &[Bytes]) -> Result<(LmovemMode, usize, LmovemOrdering), String> {
     if args.is_empty() {
         return Ok((LmovemMode::Count, 1, LmovemOrdering::Bulk));
@@ -3165,7 +3214,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             let numkeys = numkeys as usize;
 
-            let mut pairs = Vec::with_capacity(numkeys);
+            let mut pairs = Vec::with_capacity(numkeys.min(args.len() / 2));
             let mut condition = MsetexCondition::None;
             let mut expiry = MsetexExpiry::None;
             let mut idx = 2;
@@ -6317,7 +6366,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 Ok(n) => n,
                 Err(_) => return Err("ERR value is not an integer or out of range".to_string()),
             };
-            if 3 + numkeys > args.len() {
+            if numkeys > args.len() - 3 {
                 return Err("ERR Number of keys can't be greater than number of args".to_string());
             }
             let keys = args[3..3 + numkeys].to_vec();
@@ -6348,7 +6397,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 Ok(n) => n,
                 Err(_) => return Err("ERR value is not an integer or out of range".to_string()),
             };
-            if 3 + numkeys > args.len() {
+            if numkeys > args.len() - 3 {
                 return Err("ERR Number of keys can't be greater than number of args".to_string());
             }
             let keys = args[3..3 + numkeys].to_vec();
@@ -8826,7 +8875,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         && let Ok(n) = parse_integer(&args[i + 1])
                         && n > 0
                     {
-                        i += 2 + (n as usize) * 2;
+                        i = i.saturating_add((n as usize).saturating_mul(2).saturating_add(2));
                         continue;
                     }
                     i += 1;
@@ -8851,11 +8900,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             }
             let numfields = numfields as usize;
             let fields_start = fields_idx + 2;
-            let fields_end = fields_start + numfields * 2;
-
-            if fields_end > args.len() {
+            if numfields > (args.len() - fields_start) / 2 {
                 return Err("ERR wrong number of arguments for 'hsetex' command".to_string());
             }
+            let fields_end = fields_start + numfields * 2;
 
             let mut pairs = Vec::with_capacity(numfields);
             for [f, v] in args[fields_start..fields_end].as_chunks::<2>().0 {
@@ -10319,7 +10367,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         .map_err(|_| "value is not an integer or out of range")?
                         .parse()
                         .map_err(|_| "value is not an integer or out of range")?;
-                    if num == 0 || i + 2 + num > args.len() {
+                    if num == 0 || num > args.len() - (i + 2) {
                         return Err("syntax error".to_string());
                     }
                     let mut v = Vec::with_capacity(num);
@@ -10609,7 +10657,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         .map_err(|_| "value is not an integer or out of range")?
                         .parse()
                         .map_err(|_| "value is not an integer or out of range")?;
-                    if num == 0 || i + 2 + num > args.len() {
+                    if num == 0 || num > args.len() - (i + 2) {
                         return Err("syntax error".to_string());
                     }
                     let mut v = Vec::with_capacity(num);
@@ -11006,7 +11054,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     );
                 }
             };
-            if 3 + numkeys > args.len() {
+            if numkeys > args.len() - 3 {
                 return Err("ERR Number of keys can't be greater than number of args".to_string());
             }
             let keys = args[3..3 + numkeys].to_vec();
@@ -12068,12 +12116,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 } else if opt == "PREFIX" && i + 1 < args.len() {
                     let count: usize = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(1);
                     i += 2;
-                    for _ in 0..count {
-                        if i < args.len() {
-                            prefixes.push(String::from_utf8_lossy(&args[i]).to_string());
-                            i += 1;
-                        }
+                    for arg in counted_args(&args, i, count, "PREFIX")? {
+                        prefixes.push(String::from_utf8_lossy(arg).to_string());
                     }
+                    i += count;
                 } else if opt == "SCHEMA" {
                     i += 1;
                     break;
@@ -12194,7 +12240,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         let end = match nargs {
                             Some(n) => {
                                 i += 1;
-                                if n % 2 != 0 || i + n > args.len() {
+                                if n % 2 != 0 || n > args.len() - i {
                                     return Err(format!(
                                         "Bad arguments for vector similarity {} index arguments",
                                         algorithm
@@ -12419,25 +12465,16 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 } else if opt == "RETURN" && i + 1 < args.len() {
                     let count: usize = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(0);
                     i += 2;
-                    let mut r_fields = Vec::new();
-                    for _ in 0..count {
-                        if i < args.len() {
-                            r_fields.push(String::from_utf8_lossy(&args[i]).to_string());
-                            i += 1;
-                        }
-                    }
+                    let r_fields = counted_args(&args, i, count, "RETURN")?
+                        .iter()
+                        .map(|a| String::from_utf8_lossy(a).to_string())
+                        .collect();
+                    i += count;
                     options.return_fields = Some(r_fields);
                 } else if opt == "PARAMS" && i + 1 < args.len() {
                     let count: usize = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(0);
                     i += 2;
-                    for _ in 0..(count / 2) {
-                        if i + 1 < args.len() {
-                            let k = String::from_utf8_lossy(&args[i]).to_string();
-                            let v = args[i + 1].to_vec();
-                            options.params.insert(k, v);
-                            i += 2;
-                        }
-                    }
+                    i += parse_ft_params(&args, i, count, &mut options.params)?;
                 } else if opt == "DIALECT" && i + 1 < args.len() {
                     let d: u32 = String::from_utf8_lossy(&args[i + 1])
                         .parse()
@@ -12477,31 +12514,19 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 if opt == "LOAD" && i + 1 < args.len() {
                     let nargs: usize = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(0);
                     i += 2;
-                    for _ in 0..nargs {
-                        if i < args.len() {
-                            let mut f = String::from_utf8_lossy(&args[i]).to_string();
-                            if let Some(stripped) = f.strip_prefix('@') {
-                                f = stripped.to_string();
-                            }
-                            options.load_fields.push(f);
-                            i += 1;
-                        }
+                    for a in counted_args(&args, i, nargs, "LOAD")? {
+                        options.load_fields.push(strip_field_sigil(a));
                     }
+                    i += nargs;
                 } else if opt == "GROUPBY" && i + 1 < args.len() {
                     let num_fields: usize =
                         String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(0);
                     i += 2;
-                    let mut group_fields = Vec::new();
-                    for _ in 0..num_fields {
-                        if i < args.len() {
-                            let mut f = String::from_utf8_lossy(&args[i]).to_string();
-                            if let Some(stripped) = f.strip_prefix('@') {
-                                f = stripped.to_string();
-                            }
-                            group_fields.push(f);
-                            i += 1;
-                        }
-                    }
+                    let group_fields: Vec<String> = counted_args(&args, i, num_fields, "GROUPBY")?
+                        .iter()
+                        .map(strip_field_sigil)
+                        .collect();
+                    i += num_fields;
                     let mut reducers = Vec::new();
                     while i < args.len()
                         && String::from_utf8_lossy(&args[i]).to_uppercase() == "REDUCE"
@@ -12518,17 +12543,11 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             0
                         };
                         i += 1;
-                        let mut reduce_args = Vec::new();
-                        for _ in 0..nargs {
-                            if i < args.len() {
-                                let mut a = String::from_utf8_lossy(&args[i]).to_string();
-                                if let Some(stripped) = a.strip_prefix('@') {
-                                    a = stripped.to_string();
-                                }
-                                reduce_args.push(a);
-                                i += 1;
-                            }
-                        }
+                        let reduce_args: Vec<String> = counted_args(&args, i, nargs, "REDUCE")?
+                            .iter()
+                            .map(strip_field_sigil)
+                            .collect();
+                        i += nargs;
                         let mut alias = func.to_lowercase();
                         if i + 1 < args.len()
                             && String::from_utf8_lossy(&args[i]).to_uppercase() == "AS"
@@ -12915,14 +12934,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 } else if opt == "PARAMS" && i + 1 < args.len() {
                     let count: usize = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(0);
                     i += 2;
-                    for _ in 0..(count / 2) {
-                        if i + 1 < args.len() {
-                            let k = String::from_utf8_lossy(&args[i]).to_string();
-                            let v = args[i + 1].to_vec();
-                            options.params.insert(k, v);
-                            i += 2;
-                        }
-                    }
+                    i += parse_ft_params(&args, i, count, &mut options.params)?;
                 } else if (opt == "DIALECT" || opt == "TIMEOUT") && i + 1 < args.len() {
                     i += 2;
                 } else {
@@ -13046,25 +13058,16 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 } else if opt == "RETURN" && i + 1 < args.len() {
                     let count: usize = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(0);
                     i += 2;
-                    let mut r_fields = Vec::new();
-                    for _ in 0..count {
-                        if i < args.len() {
-                            r_fields.push(String::from_utf8_lossy(&args[i]).to_string());
-                            i += 1;
-                        }
-                    }
+                    let r_fields = counted_args(&args, i, count, "RETURN")?
+                        .iter()
+                        .map(|a| String::from_utf8_lossy(a).to_string())
+                        .collect();
+                    i += count;
                     options.return_fields = Some(r_fields);
                 } else if opt == "PARAMS" && i + 1 < args.len() {
                     let count: usize = String::from_utf8_lossy(&args[i + 1]).parse().unwrap_or(0);
                     i += 2;
-                    for _ in 0..(count / 2) {
-                        if i + 1 < args.len() {
-                            let k = String::from_utf8_lossy(&args[i]).to_string();
-                            let v = args[i + 1].to_vec();
-                            options.params.insert(k, v);
-                            i += 2;
-                        }
-                    }
+                    i += parse_ft_params(&args, i, count, &mut options.params)?;
                 } else if (opt == "DIALECT" || opt == "TIMEOUT") && i + 1 < args.len() {
                     i += 2;
                 } else {
@@ -13102,7 +13105,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             .ok()
                             .and_then(|s| s.parse::<usize>().ok())
                         {
-                            if dim == 0 || i + 2 + dim > args.len() {
+                            if dim == 0 || dim > args.len() - (i + 2) {
                                 return Err("invalid VECTOR dimension in 'semantic.set' command"
                                     .to_string());
                             }
@@ -13205,7 +13208,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             .ok()
                             .and_then(|s| s.parse::<usize>().ok())
                         {
-                            if dim == 0 || i + 2 + dim > args.len() {
+                            if dim == 0 || dim > args.len() - (i + 2) {
                                 return Err("invalid VECTOR dimension in 'semantic.get' command"
                                     .to_string());
                             }
@@ -13322,7 +13325,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             .ok()
                             .and_then(|s| s.parse::<usize>().ok())
                             && dim > 0
-                            && i + 2 + dim <= args.len()
+                            && dim <= args.len() - (i + 2)
                         {
                             let mut v = Vec::with_capacity(dim);
                             for k in 0..dim {
@@ -13385,7 +13388,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             .ok()
                             .and_then(|s| s.parse::<usize>().ok())
                             && dim > 0
-                            && i + 2 + dim <= args.len()
+                            && dim <= args.len() - (i + 2)
                         {
                             let mut v = Vec::with_capacity(dim);
                             for k in 0..dim {
@@ -13468,7 +13471,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             .ok()
                             .and_then(|s| s.parse::<usize>().ok())
                             && dim > 0
-                            && i + 2 + dim <= args.len()
+                            && dim <= args.len() - (i + 2)
                         {
                             let mut v = Vec::with_capacity(dim);
                             for k in 0..dim {
@@ -15304,5 +15307,239 @@ mod tests {
                 with_id: true,
             }
         );
+    }
+
+    fn cmd_args(parts: &[&str]) -> Vec<Bytes> {
+        parts.iter().map(|p| Bytes::from(p.to_string())).collect()
+    }
+
+    /// Hostile clients must get an error, never a panic, a hang or an
+    /// unbounded allocation. Inputs stay short (<= 10 args), so any loop or
+    /// capacity driven by a client-supplied count only terminates quickly if
+    /// that count is validated against the arguments actually present.
+    #[test]
+    fn test_build_command_survives_hostile_arguments() {
+        #[rustfmt::skip]
+        const TOKENS: &[&[u8]] = &[
+            b"", b"0", b"-1", b"1", b"2", b"3", b"-9223372036854775808", b"9223372036854775807",
+            b"18446744073709551615", b"18446744073709551616", b"2147483647", b"4294967295",
+            b"1000000000", b"nan", b"inf", b"1e400", b"0.5", b"\xff\xfe", b"\x00", b"k", b"$",
+            b"$.a", b"(1", b"-", b"+", b"*", b"0-0", b"1-", b"18446744073709551615-0", b"LIMIT",
+            b"COUNT", b"STORE", b"BY", b"GET", b"WITHSCORES", b"KEYS", b"MATCH", b"FIELDS", b"EX",
+            b"PX", b"NX", b"XX", b"STREAMS", b">", b"ID", b"IDS", b"FILTER", b"ARGS", b"AGGREGATE",
+            b"WEIGHTS", b"RANK", b"MAXLEN", b"~", b"VALUES", b"FP32", b"ELE", b"DIM", b"TYPE",
+            b"SCHEMA", b"ON", b"PREFIX", b"TEXT", b"VECTOR", b"VEC", b"QUERY", b"HNSW", b"FLAT",
+            b"RETURN", b"PARAMS", b"LOAD", b"GROUPBY", b"REDUCE", b"NUMKEYS", b"BLOCK",
+        ];
+        // Commands outside the ACL table (module families and extensions).
+        #[rustfmt::skip]
+        const EXTRA: &[&str] = &[
+            "AGENT.CHECKPOINT.GET", "AGENT.CHECKPOINT.HISTORY", "AGENT.CHECKPOINT.PUT",
+            "AGENT.MEM.ADD", "AGENT.MEM.CLEAR", "AGENT.MEM.COMPACT", "AGENT.MEM.CONTEXT",
+            "AGENT.MEM.INFO", "AGENT.TOOL.CLAIM", "AGENT.TOOL.COMPLETE", "BF.ADD", "BF.EXISTS",
+            "BF.INFO", "BF.MADD", "BF.MEXISTS", "BF.RESERVE", "CF.ADD", "CF.ADDNX", "CF.DEL",
+            "CF.EXISTS", "CF.INFO", "CF.RESERVE", "CMS.INCRBY", "CMS.INFO", "CMS.INITBYDIM",
+            "CMS.INITBYPROB", "CMS.QUERY", "CRDT.DEL", "CRDT.DUMP", "CRDT.GC", "CRDT.GET",
+            "CRDT.INCRBY", "CRDT.MERGE", "CRDT.SADD", "CRDT.SET", "CRDT.SMEMBERS", "CRDT.SREM",
+            "FT.ADD", "FT.AGGREGATE", "FT.ALTER", "FT.CREATE", "FT.DROPINDEX", "FT.EXPLAIN",
+            "FT.HYBRID", "FT.INFO", "FT._LIST", "FT.PROFILE", "FT.SEARCH", "JSON.ARRAPPEND",
+            "JSON.ARRLEN", "JSON.ARRPOP", "JSON.CLEAR", "JSON.DEL", "JSON.FORGET", "JSON.GET",
+            "JSON.MGET", "JSON.NUMINCRBY", "JSON.NUMMULTBY", "JSON.OBJKEYS", "JSON.OBJLEN",
+            "JSON.SET", "JSON.STRAPPEND", "JSON.STRLEN", "JSON.TOGGLE", "JSON.TYPE",
+            "LLM.QUOTA.INFO", "LLM.QUOTA.RESERVE", "LLM.QUOTA.SETTLE", "MCP.CALL", "MCP.RPC",
+            "MCP.TOOLS", "SEMANTIC.DEL", "SEMANTIC.FLUSH", "SEMANTIC.GET", "SEMANTIC.INFO",
+            "SEMANTIC.SET", "TOPK.ADD", "TOPK.INFO", "TOPK.LIST", "TOPK.QUERY", "TOPK.RESERVE",
+            "XDP.INFO", "XDP.INJECT", "XDP.PACKET", "XDP.RULE", "XDP.SOCKET", "XDP.STATS", "VDEL",
+            "DFLY",
+        ];
+        let mut names: Vec<Vec<Bytes>> = crate::acl_categories::COMMANDS
+            .iter()
+            .map(|c| {
+                c.name
+                    .split('|')
+                    .map(|w| Bytes::from(w.to_ascii_uppercase()))
+                    .collect()
+            })
+            .collect();
+        names.extend(EXTRA.iter().map(|n| vec![Bytes::from_static(n.as_bytes())]));
+
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for name in &names {
+            for extra in 0..=8 {
+                for _ in 0..40 {
+                    let mut args = name.clone();
+                    for _ in 0..extra {
+                        let t = TOKENS[(next() % TOKENS.len() as u64) as usize];
+                        args.push(Bytes::from_static(t));
+                    }
+                    let shown = format!("{args:?}");
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _ = build_command(args);
+                    }));
+                    assert!(res.is_ok(), "build_command panicked on {shown}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_untrusted_counts_are_rejected() {
+        let huge = "9223372036854775807";
+        let max = "18446744073709551615";
+        let rejected: &[&[&str]] = &[
+            // Used to loop 2^63 times.
+            &["FT.CREATE", "i", "PREFIX", huge, "a"],
+            &["FT.CREATE", "x", "0x10", "PREFIX", huge, "ARGS", "inf", "*"],
+            &["FT.SEARCH", "i", "*", "RETURN", huge, "f"],
+            &["FT.SEARCH", "i", "*", "PARAMS", max, "k", "v"],
+            &["FT.AGGREGATE", "i", "*", "LOAD", huge, "@f"],
+            &["FT.AGGREGATE", "i", "*", "GROUPBY", huge, "@f"],
+            &[
+                "FT.AGGREGATE",
+                "i",
+                "*",
+                "GROUPBY",
+                "1",
+                "@f",
+                "REDUCE",
+                "COUNT",
+                huge,
+            ],
+            &[
+                "FT.PROFILE",
+                "i",
+                "SEARCH",
+                "QUERY",
+                "*",
+                "PARAMS",
+                huge,
+                "k",
+                "v",
+            ],
+            &["FT.HYBRID", "i", "t", "v", "PARAMS", huge, "k", "v"],
+            &["FT.HYBRID", "i", "t", "v", "RETURN", huge, "f"],
+            // Used to overflow `start + count` and panic slicing.
+            &[
+                "FT.CREATE",
+                "i",
+                "SCHEMA",
+                "v",
+                "VECTOR",
+                "HNSW",
+                "18446744073709551614",
+                "DIM",
+                "2",
+            ],
+            &["HSETEX", "k", "FIELDS", huge, "f", "v"],
+            &["HSETEX", "k", "ELE", "FIELDS", huge, "\0"],
+            &["VADD", "k", "VALUES", max, "1", "e"],
+            &["VSIM", "k", "VALUES", max, "1"],
+            &["EVAL", "s", max, "k"],
+            &["EVALSHA", "s", max, "k"],
+            &["FCALL", "f", max, "k"],
+            &["SEMANTIC.SET", "ns", "id", "p", "r", "VECTOR", max, "1"],
+            &["SEMANTIC.GET", "ns", "VECTOR", max, "1"],
+            // Used to preallocate numkeys (2^31) pairs and abort.
+            &["MSETEX", "2147483647", "k", "v"],
+        ];
+        for parts in rejected {
+            let res = build_command(cmd_args(parts));
+            assert!(res.is_err(), "{parts:?} should be rejected, got {res:?}");
+        }
+        // A huge dim is no longer an overflow; it falls through to blob decoding.
+        for cmd in ["AGENT.MEM.ADD", "AGENT.MEM.COMPACT"] {
+            let _ = build_command(cmd_args(&[cmd, "s", "r", "c", "VEC", max, "1"]));
+        }
+        let _ = build_command(cmd_args(&[
+            "AGENT.MEM.CONTEXT",
+            "s",
+            "x",
+            "QUERY",
+            max,
+            "1",
+        ]));
+    }
+
+    #[test]
+    fn test_counted_options_still_parse_valid_input() {
+        match build_command(cmd_args(&[
+            "FT.CREATE",
+            "i",
+            "PREFIX",
+            "2",
+            "a:",
+            "b:",
+            "SCHEMA",
+            "t",
+            "TEXT",
+        ])) {
+            Ok(Some(Command::FtCreate { prefixes, .. })) => assert_eq!(prefixes, ["a:", "b:"]),
+            other => panic!("{other:?}"),
+        }
+        match build_command(cmd_args(&[
+            "FT.SEARCH",
+            "i",
+            "*",
+            "RETURN",
+            "1",
+            "f",
+            "PARAMS",
+            "3",
+            "k",
+            "v",
+            "DIALECT",
+            "2",
+        ])) {
+            Ok(Some(Command::FtSearch { options, .. })) => {
+                assert_eq!(options.return_fields, Some(vec!["f".to_string()]));
+                assert_eq!(options.params.get("k").map(Vec::as_slice), Some(&b"v"[..]));
+                assert_eq!(options.dialect, Some(2));
+            }
+            other => panic!("{other:?}"),
+        }
+        match build_command(cmd_args(&[
+            "FT.AGGREGATE",
+            "i",
+            "*",
+            "LOAD",
+            "2",
+            "@a",
+            "b",
+        ])) {
+            Ok(Some(Command::FtAggregate { options, .. })) => {
+                assert_eq!(options.load_fields, ["a", "b"]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_framing_rejects_hostile_lengths() {
+        // Oversized multibulk count: rejected before anything is allocated.
+        let mut buf = BytesMut::from("*1000000000\r\n");
+        let err = parse_command(&mut buf).unwrap_err();
+        assert!(err.contains("invalid multibulk length"), "{err}");
+        // At the limit the parser just waits for the arguments.
+        let mut buf = BytesMut::from("*1048576\r\n");
+        assert_eq!(parse_command(&mut buf), Ok(None));
+
+        // A memcached block length beyond proto-max-bulk-len closes the
+        // connection instead of overflowing or buffering forever.
+        let mut buf = BytesMut::from(format!("set k 0 0 {}\r\n", usize::MAX).as_str());
+        let err = parse_command(&mut buf).unwrap_err();
+        assert!(err.starts_with("Protocol error:"), "{err}");
+
+        // A bad data chunk is consumed, so the connection loop (which keeps
+        // parsing after a non-protocol error) makes progress.
+        let mut buf = BytesMut::from("set k 0 0 1\r\nab\r\nPING\r\n");
+        let err = parse_command(&mut buf).unwrap_err();
+        assert!(err.contains("bad data chunk"), "{err}");
+        assert_eq!(parse_command(&mut buf), Ok(Some(Command::Ping(None))));
     }
 }

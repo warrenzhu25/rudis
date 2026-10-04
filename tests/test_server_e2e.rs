@@ -19083,3 +19083,55 @@ fn test_bgsave_does_not_stall_shards_e2e() {
     drop(child);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Untrusted counts in command arguments must produce an error reply, not
+/// hang the connection's worker thread (FT.CREATE PREFIX used to loop 2^63
+/// times), panic or abort on a huge preallocation.
+#[test]
+fn test_hostile_argument_counts_get_error_replies_e2e() {
+    let port = 17083;
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--enable-experimental-commands",
+        "yes",
+    ];
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = KillOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let huge = "9223372036854775807";
+    let max = "18446744073709551615";
+    for cmd in [
+        &["FT.CREATE", "x", "0x10", "PREFIX", huge, "ARGS", "inf", "*"][..],
+        &["FT.SEARCH", "i", "*", "RETURN", huge, "f"],
+        &["FT.AGGREGATE", "i", "*", "LOAD", huge, "@f"],
+        &["HSETEX", "k", "FIELDS", huge, "f", "v"],
+        &["EVAL", "return 1", max, "k"],
+        &["MSETEX", "2147483647", "k", "v"],
+    ] {
+        let reply = resp_cmd(&mut c, cmd);
+        assert!(reply.starts_with("-ERR"), "{cmd:?}: {reply}");
+        assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n", "after {cmd:?}");
+    }
+
+    // A malformed memcached data block is answered and skipped instead of
+    // being re-parsed forever.
+    let reply = send_and_read(&mut c, b"set k 0 0 1\r\nab\r\n");
+    assert!(reply.contains("bad data chunk"), "{reply}");
+    assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n");
+    drop(c);
+
+    shutdown_and_wait(port, &mut child.0);
+}
