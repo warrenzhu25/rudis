@@ -15583,11 +15583,22 @@ fn test_failed_bgrewriteaof_is_reported_and_does_not_block_later_ones_e2e() {
         "--aof-dir",
         dir.to_str().unwrap(),
     ];
-    let mut child = spawn_rudis_listening(&args, port);
+    // Killed even if an assertion fails, so a failed run does not leave a
+    // server on the port for the next one.
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = KillOnDrop(spawn_rudis_listening(&args, port));
     let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
     c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     assert_eq!(resp_cmd(&mut c, &["SET", "rwf:k", "v"]), "+OK\r\n");
     assert_eq!(info_field(&mut c, "aof_enabled"), "1");
+    // BGREWRITEAOF marks the rewrite in progress before it replies, and a
+    // finished rewrite has its status set and accepts the next one.
     let wait_rewrite = |c: &mut TcpStream| {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while info_field(c, "aof_rewrite_in_progress") != "0" {
@@ -15624,14 +15635,14 @@ fn test_failed_bgrewriteaof_is_reported_and_does_not_block_later_ones_e2e() {
     assert_eq!(wait_rewrite(&mut c), "ok");
     assert_eq!(resp_cmd(&mut c, &["SET", "rwf:after", "2"]), "+OK\r\n");
     drop(c);
-    shutdown_and_wait(port, &mut child);
+    shutdown_and_wait(port, &mut child.0);
 
-    let mut child = spawn_rudis_listening(&args, port);
+    let mut child = KillOnDrop(spawn_rudis_listening(&args, port));
     let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
     assert_eq!(resp_cmd(&mut c, &["GET", "rwf:k"]), "$1\r\nv\r\n");
     assert_eq!(resp_cmd(&mut c, &["GET", "rwf:after"]), "$1\r\n2\r\n");
     drop(c);
-    shutdown_and_wait(port, &mut child);
+    shutdown_and_wait(port, &mut child.0);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

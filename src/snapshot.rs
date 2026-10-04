@@ -15,6 +15,7 @@ pub struct SnapshotState {
     last_attempt_unix: AtomicU64,
     dirty_at_last_save: AtomicU64,
     last_save_ok: AtomicBool,
+    in_progress: AtomicBool,
 }
 
 static STATES: Mutex<Option<HashMap<u16, Arc<SnapshotState>>>> = Mutex::new(None);
@@ -75,20 +76,26 @@ pub fn state(port: u16) -> Arc<SnapshotState> {
                 last_attempt_unix: AtomicU64::new(now),
                 dirty_at_last_save: AtomicU64::new(dirty_now()),
                 last_save_ok: AtomicBool::new(true),
+                in_progress: AtomicBool::new(false),
             })
         })
         .clone()
 }
 
 impl SnapshotState {
-    /// Call when a save starts; returns the change count it will cover.
+    /// Call when a save starts, before replying to the client, so INFO
+    /// shows it in progress from then on; returns the change count it will
+    /// cover.
     pub fn begin(&self) -> u64 {
         self.last_attempt_unix.store(unix_now(), Ordering::Relaxed);
+        self.in_progress.store(true, Ordering::SeqCst);
         dirty_now()
     }
 
-    /// Call when a save ends. On success the changes made before it began
-    /// are no longer pending; writes during the save still are.
+    /// Call when a save ends, after the save lock is released, so a client
+    /// that sees it finished can start the next one. On success the changes
+    /// made before it began are no longer pending; writes during the save
+    /// still are. The outcome is stored before `in_progress` is cleared.
     pub fn finish(&self, dirty_before: u64, ok: bool) {
         if ok {
             self.dirty_at_last_save
@@ -96,6 +103,11 @@ impl SnapshotState {
             self.last_save_unix.store(unix_now(), Ordering::Relaxed);
         }
         self.last_save_ok.store(ok, Ordering::Relaxed);
+        self.in_progress.store(false, Ordering::SeqCst);
+    }
+
+    pub fn in_progress(&self) -> bool {
+        self.in_progress.load(Ordering::SeqCst)
     }
 
     pub fn last_save_unix(&self) -> u64 {
@@ -163,22 +175,25 @@ pub fn aof_rewrite_state(port: u16) -> Arc<AofRewriteState> {
         .clone()
 }
 
+/// Same contract as `SnapshotState`: `begin` before the reply, `finish`
+/// after the save lock is released, and the outcome is visible by the time
+/// `in_progress` reads false (INFO may run on another shard thread).
 impl AofRewriteState {
     pub fn begin(&self) {
-        self.in_progress.store(true, Ordering::Relaxed);
+        self.in_progress.store(true, Ordering::SeqCst);
     }
 
     pub fn finish(&self, ok: bool) {
-        self.last_ok.store(ok, Ordering::Relaxed);
-        self.in_progress.store(false, Ordering::Relaxed);
+        self.last_ok.store(ok, Ordering::SeqCst);
+        self.in_progress.store(false, Ordering::SeqCst);
     }
 
     pub fn in_progress(&self) -> bool {
-        self.in_progress.load(Ordering::Relaxed)
+        self.in_progress.load(Ordering::SeqCst)
     }
 
     pub fn last_ok(&self) -> bool {
-        self.last_ok.load(Ordering::Relaxed)
+        self.last_ok.load(Ordering::SeqCst)
     }
 }
 

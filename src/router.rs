@@ -3328,8 +3328,9 @@ impl Router {
         {
             return Err("Background save already in progress".to_string());
         }
+        let dirty_before = crate::snapshot::state(self.base_port).begin();
         self.sync_aof().await;
-        self.perform_save_rdb().await
+        self.perform_save_rdb(dirty_before).await
     }
 
     /// The save step of `SHUTDOWN [SAVE|NOSAVE]` and SIGTERM. Returns an
@@ -3358,10 +3359,12 @@ impl Router {
         {
             return Err("Background save already in progress".to_string());
         }
+        // Begin before replying so INFO right after +OK shows the save.
+        let dirty_before = crate::snapshot::state(self.base_port).begin();
         let router_clone = self.clone();
         monoio::spawn(async move {
             router_clone.sync_aof().await;
-            let _ = router_clone.perform_save_rdb().await;
+            let _ = router_clone.perform_save_rdb(dirty_before).await;
         });
         Ok(())
     }
@@ -3374,6 +3377,9 @@ impl Router {
         {
             return Err("Background save or rewrite already in progress".to_string());
         }
+        // Begin before replying so INFO right after +OK shows the rewrite
+        // instead of the previous one's status.
+        crate::snapshot::aof_rewrite_state(self.base_port).begin();
         let router_clone = self.clone();
         monoio::spawn(async move {
             let _ = router_clone.perform_rewrite_aof().await;
@@ -3383,15 +3389,15 @@ impl Router {
 
     /// Rewrites every shard's AOF. Clears `is_saving` (set by
     /// `bgrewriteaof`) however it ends, and records the outcome for INFO.
+    /// The flag is cleared first: once INFO shows the rewrite finished, a
+    /// new BGREWRITEAOF must be accepted.
     pub async fn perform_rewrite_aof(&self) -> Result<usize, String> {
-        let status = crate::snapshot::aof_rewrite_state(self.base_port);
-        status.begin();
         let res = self.rewrite_all_shard_aofs().await;
         if let Err(e) = &res {
             eprintln!("[Shard {}] BGREWRITEAOF failed: {}", self.shard_id, e);
         }
-        status.finish(res.is_ok());
         self.is_saving.store(false, Ordering::SeqCst);
+        crate::snapshot::aof_rewrite_state(self.base_port).finish(res.is_ok());
         res
     }
 
@@ -3652,22 +3658,24 @@ impl Router {
         }
     }
 
-    pub async fn perform_save_rdb(&self) -> Result<(), String> {
+    /// Writes the RDB for a save whose state the caller began with
+    /// `snapshot::state(..).begin()`, which returned `dirty_before`.
+    pub async fn perform_save_rdb(&self, dirty_before: u64) -> Result<(), String> {
         static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let tmp_id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_filename = self
             .db_dir
             .join(format!("temp-{}-{}.rdb", std::process::id(), tmp_id));
-        let snap = crate::snapshot::state(self.base_port);
-        let dirty_before = snap.begin();
         let res = self.write_rdb_file(&tmp_filename).await;
-        snap.finish(dirty_before, res.is_ok());
         if let Err(ref e) = res {
             eprintln!("Error saving DB on disk: {}", e);
             let _ = std::fs::remove_file(&tmp_filename);
         }
         // Clear the flag on every path, or one failed save blocks all later ones.
+        // Clear it before `finish` so a save seen as finished is not still
+        // holding the flag.
         self.is_saving.store(false, Ordering::SeqCst);
+        crate::snapshot::state(self.base_port).finish(dirty_before, res.is_ok());
         res
     }
 
@@ -3994,6 +4002,40 @@ mod tests {
         std::fs::remove_dir(dir.join("dump.rdb")).unwrap();
         block_on(router.save_rdb()).unwrap();
         assert!(dir.join("dump.rdb").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_bg_save_and_rewrite_in_progress_from_reply_until_next_accepted() {
+        let (mut router, db) = single_shard_router(19875);
+        db.borrow_mut()
+            .set(Bytes::from("k"), Bytes::from("v"), None);
+        let dir = std::env::temp_dir().join(format!("rudis-bgstate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        router.db_dir = dir.clone();
+        let rewrite = crate::snapshot::aof_rewrite_state(router.base_port);
+        let save = crate::snapshot::state(router.base_port);
+        block_on(async {
+            for _ in 0..2 {
+                router.bgrewriteaof().await.unwrap();
+                // Before the spawned rewrite has run at all.
+                assert!(rewrite.in_progress());
+                while rewrite.in_progress() {
+                    monoio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                assert!(!router.is_saving.load(Ordering::SeqCst));
+                assert!(rewrite.last_ok());
+
+                router.bgsave().await.unwrap();
+                assert!(save.in_progress());
+                while save.in_progress() {
+                    monoio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                assert!(!router.is_saving.load(Ordering::SeqCst));
+                assert!(save.last_save_ok());
+            }
+        });
         let _ = std::fs::remove_dir_all(&dir);
     }
 

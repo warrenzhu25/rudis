@@ -8816,7 +8816,10 @@ async fn execute_command(
                 "# Persistence\r\nloading:{}\r\nrdb_changes_since_last_save:{}\r\nrdb_bgsave_in_progress:{}\r\nrdb_last_save_time:{}\r\nrdb_last_bgsave_status:{}\r\naof_enabled:{}\r\naof_rewrite_in_progress:{}\r\naof_last_bgrewrite_status:{}\r\n",
                 u8::from(crate::replication::is_loading(router.port)),
                 snap.changes_since_last_save(),
-                u8::from(RDB_BGSAVE_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed)),
+                u8::from(
+                    RDB_BGSAVE_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed)
+                        || snap.in_progress()
+                ),
                 snap.last_save_unix(),
                 if snap.last_save_ok() { "ok" } else { "err" },
                 u8::from(router.aof.is_some()),

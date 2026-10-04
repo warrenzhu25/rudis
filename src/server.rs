@@ -2135,10 +2135,15 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                 while !crate::shutdown::is_shutting_down() {
                     monoio::time::sleep(std::time::Duration::from_millis(100)).await;
                     let points = crate::config::save_points(r.base_port);
-                    if points.is_empty() || r.is_saving.load(std::sync::atomic::Ordering::SeqCst) {
+                    let snap = crate::snapshot::state(r.base_port);
+                    // `in_progress` too: a save releases `is_saving` just
+                    // before it records what it covered.
+                    if points.is_empty()
+                        || r.is_saving.load(std::sync::atomic::Ordering::SeqCst)
+                        || snap.in_progress()
+                    {
                         continue;
                     }
-                    let snap = crate::snapshot::state(r.base_port);
                     let now = crate::snapshot::unix_now();
                     if snap.save_due(&points, now) {
                         println!(
