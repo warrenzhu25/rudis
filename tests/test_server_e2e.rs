@@ -18143,6 +18143,57 @@ fn test_save_restores_tiered_keys_with_their_types_e2e() {
 }
 
 #[test]
+fn test_bgrewriteaof_keeps_tiered_keys_with_their_types_e2e() {
+    let port = 17072;
+    let dir = std::env::temp_dir().join(format!("rudis-tier-aof-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--aof",
+        "true",
+        "--aof-dir",
+        dir.to_str().unwrap(),
+    ];
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["SET", "ta:s", "hello"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["HSET", "ta:h", "f", "v"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["ZADD", "ta:z", "2.5", "m"]), ":1\r\n");
+    for k in ["ta:s", "ta:h", "ta:z"] {
+        assert_eq!(resp_cmd(&mut c, &["TIER", "SPILL", k]), ":1\r\n", "{k}");
+    }
+    assert!(resp_cmd(&mut c, &["BGREWRITEAOF"]).starts_with('+'));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while info_field(&mut c, "aof_rewrite_in_progress") != "0" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rewrite never finished"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(info_field(&mut c, "aof_last_bgrewrite_status"), "ok");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["GET", "ta:s"]), "$5\r\nhello\r\n");
+    assert_eq!(resp_cmd(&mut c, &["HGET", "ta:h", "f"]), "$1\r\nv\r\n");
+    assert_eq!(resp_cmd(&mut c, &["ZSCORE", "ta:z", "m"]), "$3\r\n2.5\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_blocking_pops_never_miss_a_concurrent_push_e2e() {
     // The pusher's command can reach the key's owner shard while the blocked
     // client is between "all keys empty" and "registered as a waiter". That

@@ -2384,6 +2384,17 @@ impl ShardDb {
         (raw.first() == Some(&ptr.value_type)).then_some(raw)
     }
 
+    /// Reads and decodes a tiered value, for paths that need the value itself
+    /// (such as the AOF rewrite).
+    pub fn hydrate_tiered(
+        &self,
+        ptr: crate::table::TieredPointer,
+    ) -> Option<crate::table::RudisValue> {
+        let raw = self.read_tiered_payload(ptr)?;
+        let (val, used) = crate::table::RudisTable::deserialize_val_payload(&raw).ok()?;
+        (used == raw.len()).then_some(val)
+    }
+
     pub fn save_extended_rdb_chunk(&self, buf: &mut Vec<u8>) {
         // 1. JSON documents
         for (key, val) in self.json_store.iter() {

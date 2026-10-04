@@ -2637,16 +2637,19 @@ fn write_rewritten_aof(
         let hydrated_val;
         let val_ref = match &entry.val {
             crate::table::RudisValue::Cooled { val, .. } => val.as_ref(),
-            crate::table::RudisValue::Tiered(ptr) => {
-                if let Some(ref tm) = db.tier_manager
-                    && let Ok((_, raw)) = tm.read_ptr_sync(*ptr)
-                {
-                    hydrated_val = crate::table::RudisValue::String(bytes::Bytes::from(raw));
+            crate::table::RudisValue::Tiered(ptr) => match db.hydrate_tiered(*ptr) {
+                Some(v) => {
+                    hydrated_val = v;
                     &hydrated_val
-                } else {
+                }
+                None => {
+                    tracing::error!(
+                        key = %String::from_utf8_lossy(k),
+                        "AOF rewrite: failed to read tiered value, key skipped"
+                    );
                     continue;
                 }
-            }
+            },
             other => other,
         };
         match val_ref {
@@ -4055,5 +4058,67 @@ mod tests {
         verify_restored(&mut aof_restored);
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_aof_rewrite_keeps_tiered_values_and_types() {
+        let dir = std::env::temp_dir().join(format!("rudis-aof-tier-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut db = ShardDb::new(0);
+            let tm = std::rc::Rc::new(
+                crate::tiering::ShardTierManager::open(0, 55557, &dir.join("tier"))
+                    .await
+                    .unwrap(),
+            );
+            db.tier_manager = Some(tm.clone());
+            db.set(
+                bytes::Bytes::from_static(b"s"),
+                bytes::Bytes::from_static(b"plain-value"),
+                Some(std::time::Duration::from_secs(1000)),
+            );
+            db.hset(
+                bytes::Bytes::from_static(b"h"),
+                vec![(
+                    bytes::Bytes::from_static(b"f"),
+                    bytes::Bytes::from_static(b"v"),
+                )],
+            )
+            .unwrap();
+            db.zadd(
+                bytes::Bytes::from_static(b"z"),
+                vec![(2.5, bytes::Bytes::from_static(b"m"))],
+                crate::table::ZAddFlags::default(),
+            )
+            .unwrap();
+            for key in [&b"s"[..], b"h", b"z"] {
+                let (payload, val_type) = db.table.get_value_for_spill(key).unwrap();
+                let ptr = tm
+                    .stash_record(&bytes::Bytes::copy_from_slice(key), &payload, val_type)
+                    .await
+                    .unwrap();
+                assert!(db.table.set_tiered_pointer(key, ptr));
+            }
+
+            rewrite_shard_aof(&mut db, &dir, 0).unwrap();
+            let mut restored = ShardDb::new(0);
+            replay_aof(&dir.join("appendonly-0.aof"), &mut restored).unwrap();
+            assert_eq!(
+                restored.get(b"s"),
+                Some(bytes::Bytes::from_static(b"plain-value"))
+            );
+            assert!(restored.ttl(b"s", false) > 900);
+            assert_eq!(
+                restored.hget(b"h", b"f").unwrap(),
+                Some(bytes::Bytes::from_static(b"v"))
+            );
+            assert_eq!(restored.zscore(b"z", b"m").unwrap(), Some(2.5));
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
