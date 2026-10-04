@@ -337,6 +337,12 @@ pub enum ShardMessage {
         key: Bytes,
         responder: flume::Sender<bool>,
     },
+    /// See [`crate::router::Router::del_if_unchanged`].
+    DelIfUnchanged {
+        key: Bytes,
+        payload: Bytes,
+        responder: flume::Sender<bool>,
+    },
     DelKeys {
         keys: Vec<Bytes>,
         responder: flume::Sender<usize>,
@@ -430,10 +436,6 @@ pub enum ShardMessage {
     SetSlotOwner {
         slot: u16,
         owner: usize,
-    },
-    DumpKey {
-        key: Bytes,
-        responder: flume::Sender<Option<(crate::table::RudisValue, Option<Duration>)>>,
     },
     SyncAof {
         responder: flume::Sender<()>,

@@ -18231,6 +18231,65 @@ fn test_dump_of_tiered_key_over_maxmemory_is_restorable_e2e() {
 }
 
 #[test]
+fn test_migrate_never_drops_keys_the_target_did_not_store_e2e() {
+    let (src_port, dst_port) = (17075, 17076);
+    let (src_s, dst_s) = (src_port.to_string(), dst_port.to_string());
+    let mut src =
+        spawn_rudis_listening(&["--port", &src_s, "--threads", "2", "--no-pin"], src_port);
+    let mut dst =
+        spawn_rudis_listening(&["--port", &dst_s, "--threads", "2", "--no-pin"], dst_port);
+    let mut s = TcpStream::connect(("127.0.0.1", src_port)).unwrap();
+    let mut d = TcpStream::connect(("127.0.0.1", dst_port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    d.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+
+    assert_eq!(resp_cmd(&mut s, &["HSET", "mg:h", "f", "v"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut s, &["TIER", "SPILL", "mg:h"]), ":1\r\n");
+    assert_eq!(
+        resp_cmd(&mut s, &["SET", "mg:t", "x", "PX", "100000"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut s, &["SET", "mg:busy", "src"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut d, &["SET", "mg:busy", "dst"]), "+OK\r\n");
+    // Keep the tiered key on the tier while it is migrated.
+    assert_eq!(
+        resp_cmd(&mut s, &["CONFIG", "SET", "maxmemory", "1"]),
+        "+OK\r\n"
+    );
+
+    // The target already has mg:busy and no REPLACE was given: it rejects
+    // that key, which must stay on the source. The others move.
+    let migrate = |s: &mut TcpStream, extra: &[&str]| {
+        let mut args = vec!["MIGRATE", "127.0.0.1", dst_s.as_str(), "", "0", "5000"];
+        args.extend_from_slice(extra);
+        resp_cmd(s, &args)
+    };
+    let reply = migrate(&mut s, &["KEYS", "mg:h", "mg:t", "mg:busy"]);
+    assert!(
+        reply.starts_with("-ERR Target instance replied with error: BUSYKEY"),
+        "{reply:?}"
+    );
+    assert_eq!(resp_cmd(&mut s, &["EXISTS", "mg:h", "mg:t"]), ":0\r\n");
+    assert_eq!(resp_cmd(&mut s, &["GET", "mg:busy"]), "$3\r\nsrc\r\n");
+    assert_eq!(resp_cmd(&mut d, &["HGET", "mg:h", "f"]), "$1\r\nv\r\n");
+    assert_eq!(resp_cmd(&mut d, &["GET", "mg:t"]), "$1\r\nx\r\n");
+    let pttl = resp_cmd(&mut d, &["PTTL", "mg:t"]);
+    let pttl: i64 = pttl.trim_start_matches(':').trim_end().parse().unwrap();
+    assert!(pttl > 0 && pttl <= 100_000, "{pttl}");
+    assert_eq!(resp_cmd(&mut d, &["GET", "mg:busy"]), "$3\r\ndst\r\n");
+
+    assert_eq!(migrate(&mut s, &["REPLACE", "KEYS", "mg:busy"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut s, &["EXISTS", "mg:busy"]), ":0\r\n");
+    assert_eq!(resp_cmd(&mut d, &["GET", "mg:busy"]), "$3\r\nsrc\r\n");
+    assert_eq!(migrate(&mut s, &["KEYS", "mg:gone"]), "+NOKEY\r\n");
+
+    drop(s);
+    drop(d);
+    shutdown_and_wait(src_port, &mut src);
+    shutdown_and_wait(dst_port, &mut dst);
+}
+
+#[test]
 fn test_sigterm_drains_clients_and_keeps_every_acked_write_e2e() {
     let port = 17073;
     let dir = std::env::temp_dir().join(format!("rudis-drain-e2e-{}", std::process::id()));

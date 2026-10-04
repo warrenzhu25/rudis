@@ -350,7 +350,7 @@ purpose:
 | Key/value ops | `Get`, `Set`, `Del`, `Delex`, `DelKeys`, `Exists`, `ExpireTime`, `IncrBy`, `Expire`, `Persist`, `Ttl`, `Keys`, `Scan`, `RandomKey`, `ActiveDefrag` |
 | Batched/scatter-gather fan-out | `Batch`, `Mget`, `Mset`, `ScatterMget`, `ScatterMset`, `FastGet`, `FastSet`, `JsonMget` |
 | Cluster/slot control | `CountKeysInSlot`, `GetKeysInSlot`, `SetSlotState`, `SetSlotOwner`, `FlushSlots`, `Stick`, `Unstick`, `IsSticky` |
-| Persistence | `SaveRdbChunk`, `RestoreRdbChunk`, `SyncAof`, `RewriteAof`, `DumpKey` |
+| Persistence | `SaveRdbChunk`, `RestoreRdbChunk`, `SyncAof`, `RewriteAof` |
 | Replication apply | `ExecuteReplicaCmd` |
 | Pub/Sub (global + sharded, Redis 7) | `Publish`, `PubsubChannels`, `PubsubNumsub`, `PubsubNumpat`, `Spublish`, `Ssubscribe`, `Sunsubscribe`, `PubsubShardchannels`, `PubsubShardnumsub`, `RemoveClientPubSub` |
 | Blocking-op wakeups | `NotifyList` |

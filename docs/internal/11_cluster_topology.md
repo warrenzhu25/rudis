@@ -540,21 +540,18 @@ now-identified way.**
 4. **Migration is always fully sequential, unpipelined, and capped at 100 keys per round-trip
    RTT** — `migrate_keys_to_node` `await`s a full write+read round trip per 100-key batch; large
    slots (millions of keys) will migrate key-batch-by-key-batch, one network RTT at a time.
-5. **New — silent data loss for tiered (NVMe-spilled) keys during migration under memory
-   pressure.** `migrate_keys_to_node`'s per-type match has `RudisValue::Tiered(_) |
-   RudisValue::Cooled { .. } => {}` (`connection.rs:3711`) — an empty arm that serializes nothing to
-   the wire for a key still in tiered/cooled representation. `router.dump_key` (`router.rs:944-961`)
-   calls `self.ensure_loaded(key)` first to page the value back into memory before reading it — but
-   `ensure_loaded` (`router.rs:695-715`) returns `false` immediately, **without loading anything**,
-   if `self.is_memory_constrained()` (used-memory over the per-shard `maxmemory` threshold,
-   `router.rs:608-618`) is true. In that state, `dump_key` can still return a `Tiered`/`Cooled`
-   value, `migrate_keys_to_node` silently emits zero bytes for it, and — because the source-side
-   deletion loop unconditionally removes **every** key `dump_key` returned regardless of whether it
-   produced output (`connection.rs:3726-3730`) — the key is deleted from the source and never
-   written to the target. **A slot migration performed while a node is over its configured
-   `maxmemory` can silently drop tiered keys.** This applies to `CLUSTER SETSLOT ... MIGRATING`,
-   `CLUSTER REBALANCE`, and `CLUSTER RESHARD` alike, since all three funnel through the same
-   `migrate_keys_to_node`.
+5. **Fixed — migration no longer drops keys the target didn't store.** `migrate_keys_to_node`
+   used to re-encode each value as SET/RPUSH/HSET/... commands, emitted nothing for a key still
+   tiered or cooled, read a single 1 KB reply without checking it, and then deleted every source
+   key regardless. It now sends each key as `RESTORE key ttl <DUMP payload> [REPLACE] [ABSTTL]`
+   (DUMP works straight from the tier record, so tiered keys move even over `maxmemory`), reads
+   one reply per key with a timeout, and deletes a source key only once the target replied `+OK`
+   for it, and only if the key still has the dumped value (`Router::del_if_unchanged`, checked
+   and deleted on the owning shard in one step). Any rejected key makes the call return an error
+   (`-ERR Target instance replied with error: ...` for MIGRATE), so slot migration stops instead
+   of moving on with the key left behind. Slot migration uses REPLACE; MIGRATE honours its own
+   `COPY`, `REPLACE` and `timeout` arguments. `CLUSTER SETSLOT ... MIGRATING`, `CLUSTER
+   REBALANCE`, `CLUSTER RESHARD` and `MIGRATE` all share this one path.
 6. **`Router::check_slot_redirection` is unreachable dead code** — see §6. Not a behavioral bug
    (the inline copy in `execute_command` is correct and is what runs), but a maintenance hazard:
    a future fix applied to one copy and not the other would silently diverge.

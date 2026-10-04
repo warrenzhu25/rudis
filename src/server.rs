@@ -468,6 +468,9 @@ pub fn run_shard_worker(
                         }
                         let _ = responder.send(deleted);
                     }
+                    ShardMessage::DelIfUnchanged { key, payload, responder } => {
+                        let _ = responder.send(cross_shard_router.del_if_unchanged_local(key, &payload));
+                    }
                     ShardMessage::DelKeys { keys, responder } => {
                         let mut count = 0usize;
                         let mut deleted_keys = Vec::with_capacity(keys.len());
@@ -1628,20 +1631,6 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                     ShardMessage::SetSlotOwner { slot, owner } => {
                         cross_shard_slot_states.borrow_mut().remove(&slot);
                         cross_shard_slot_owners.borrow_mut()[slot as usize] = owner;
-                    }
-                    ShardMessage::DumpKey { key, responder } => {
-                        let is_tiered = cross_shard_db.borrow_mut().table.is_tiered(&key).is_some();
-                        if is_tiered {
-                            let r = cross_shard_router.clone();
-                            monoio::spawn(async move {
-                                r.ensure_loaded(&key).await;
-                                let entry = r.local_db.borrow_mut().get_entry(&key);
-                                let _ = responder.send(entry);
-                            });
-                        } else {
-                            let entry = cross_shard_db.borrow_mut().get_entry(&key);
-                            let _ = responder.send(entry);
-                        }
                     }
                     ShardMessage::SyncAof { responder } => {
                         let (file, chunk, offset) = if let Some(aof) = &cross_shard_aof {

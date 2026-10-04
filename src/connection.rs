@@ -5989,290 +5989,167 @@ pub fn cmd_keys(cmd: &Command) -> Vec<&[u8]> {
     v
 }
 
+/// How [`migrate_keys_to_node`] moves keys.
+#[derive(Clone, Copy)]
+struct MigrateOpts {
+    /// Keep the source keys (MIGRATE COPY).
+    copy: bool,
+    /// Overwrite keys that already exist on the target.
+    replace: bool,
+    /// Limit for connecting to the target and for each read of its replies.
+    timeout: std::time::Duration,
+}
+
+/// Timeout for moving one batch of keys during slot migration.
+const SLOT_MIGRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Appends `args` to `out` as a RESP command (an array of bulk strings).
+fn write_resp_command(out: &mut Vec<u8>, args: &[&[u8]]) {
+    write_resp_array_header(out, args.len());
+    for arg in args {
+        write_resp_bulk(out, arg);
+    }
+}
+
+/// Splits complete simple-string / error replies off the front of `buf`
+/// into `replies`: Ok for `+...`, Err(message) for `-...` and for any other
+/// reply type. Returns how many bytes were consumed.
+fn take_simple_replies(buf: &[u8], replies: &mut Vec<Result<(), String>>) -> usize {
+    let mut pos = 0;
+    while let Some(nl) = buf[pos..].windows(2).position(|w| w == b"\r\n") {
+        let line = &buf[pos..pos + nl];
+        replies.push(match line.first() {
+            Some(b'+') => Ok(()),
+            Some(b'-') => Err(String::from_utf8_lossy(&line[1..]).into_owned()),
+            _ => Err(format!(
+                "unexpected reply {:?}",
+                String::from_utf8_lossy(line)
+            )),
+        });
+        pos += nl + 2;
+    }
+    pos
+}
+
+/// Moves `keys` to the node at `host:port` the way Redis MIGRATE does:
+/// each key goes as its DUMP payload plus absolute expiry and is RESTOREd
+/// there. Unless `copy`, a source key is deleted only after the target
+/// replied +OK for it, and only if it is unchanged since it was dumped, so
+/// a rejected, failed or interrupted transfer never loses a key. Missing
+/// keys are skipped. Returns how many keys the target stored, or the first
+/// error as a RESP error line without the leading '-'.
 async fn migrate_keys_to_node(
     router: &Router,
     keys: &[Bytes],
     host: &str,
     port: u16,
-    copy: bool,
+    opts: MigrateOpts,
 ) -> Result<usize, String> {
-    let mut dumps = Vec::new();
+    let mut dumps = Vec::with_capacity(keys.len());
     for k in keys {
-        if let Some(entry) = router.dump_key(k.clone()).await {
-            dumps.push((k.clone(), entry));
-        }
+        let shard = router.target_shard(k);
+        let dump = exec_on_shard(router, shard, Command::Dump(k.clone())).await;
+        let Some(payload) = resp_bulk_payload(&dump) else {
+            if let Some(err) = dump.strip_prefix(b"-") {
+                return Err(String::from_utf8_lossy(err).trim_end().to_string());
+            }
+            continue;
+        };
+        let expire_at =
+            resp_integer(&exec_on_shard(router, shard, Command::Expiretime(k.clone(), true)).await)
+                .unwrap_or(-1);
+        dumps.push((k.clone(), payload, expire_at));
     }
-
     if dumps.is_empty() {
         return Ok(0);
+    }
+
+    let mut tx_buf = Vec::new();
+    // ASKING lets a cluster target accept keys of a slot it is importing.
+    write_resp_command(&mut tx_buf, &[b"ASKING"]);
+    for (k, payload, expire_at) in &dumps {
+        let ttl = (*expire_at).max(0).to_string();
+        let mut args: Vec<&[u8]> = vec![b"RESTORE", k, ttl.as_bytes(), payload];
+        if opts.replace {
+            args.push(b"REPLACE");
+        }
+        if *expire_at > 0 {
+            args.push(b"ABSTTL");
+        }
+        write_resp_command(&mut tx_buf, &args);
     }
 
     let target_addr = format!("{}:{}", host, port);
     let socket_addr = match std::net::ToSocketAddrs::to_socket_addrs(&target_addr) {
         Ok(mut iter) => match iter.next() {
             Some(a) => a,
-            None => return Err("cannot resolve destination host".to_string()),
+            None => return Err("ERR cannot resolve destination host".to_string()),
         },
-        Err(e) => return Err(format!("invalid destination address: {}", e)),
+        Err(e) => return Err(format!("ERR invalid destination address: {}", e)),
     };
-
-    let mut stream = match TcpStream::connect(socket_addr).await {
-        Ok(s) => s,
-        Err(err) => return Err(format!("IOERR error connecting to destination: {}", err)),
-    };
-
-    let mut tx_buf = Vec::new();
-    tx_buf.extend_from_slice(b"*1\r\n$6\r\nASKING\r\n");
-    for (k, (val, ttl)) in &dumps {
-        match val {
-            crate::table::RudisValue::String(s) => {
-                if let Some(dur) = ttl {
-                    let ms = dur.as_millis().max(1);
-                    let ms_str = ms.to_string();
-                    tx_buf.extend_from_slice(
-                        format!("*5\r\n$3\r\nSET\r\n${}\r\n", k.len()).as_bytes(),
-                    );
-                    tx_buf.extend_from_slice(k);
-                    tx_buf.extend_from_slice(format!("\r\n${}\r\n", s.len()).as_bytes());
-                    tx_buf.extend_from_slice(s);
-                    tx_buf.extend_from_slice(
-                        format!("\r\n$2\r\nPX\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
-                    );
-                } else {
-                    tx_buf.extend_from_slice(
-                        format!("*3\r\n$3\r\nSET\r\n${}\r\n", k.len()).as_bytes(),
-                    );
-                    tx_buf.extend_from_slice(k);
-                    tx_buf.extend_from_slice(format!("\r\n${}\r\n", s.len()).as_bytes());
-                    tx_buf.extend_from_slice(s);
-                    tx_buf.extend_from_slice(b"\r\n");
-                }
-            }
-            crate::table::RudisValue::Int(n) => {
-                let s = crate::table::RudisTable::format_i64(*n);
-                if let Some(dur) = ttl {
-                    let ms = dur.as_millis().max(1);
-                    let ms_str = ms.to_string();
-                    tx_buf.extend_from_slice(
-                        format!("*5\r\n$3\r\nSET\r\n${}\r\n", k.len()).as_bytes(),
-                    );
-                    tx_buf.extend_from_slice(k);
-                    tx_buf.extend_from_slice(format!("\r\n${}\r\n", s.len()).as_bytes());
-                    tx_buf.extend_from_slice(&s);
-                    tx_buf.extend_from_slice(
-                        format!("\r\n$2\r\nPX\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
-                    );
-                } else {
-                    tx_buf.extend_from_slice(
-                        format!("*3\r\n$3\r\nSET\r\n${}\r\n", k.len()).as_bytes(),
-                    );
-                    tx_buf.extend_from_slice(k);
-                    tx_buf.extend_from_slice(format!("\r\n${}\r\n", s.len()).as_bytes());
-                    tx_buf.extend_from_slice(&s);
-                    tx_buf.extend_from_slice(b"\r\n");
-                }
-            }
-            crate::table::RudisValue::SmallHash(entries) => {
-                tx_buf.extend_from_slice(
-                    format!(
-                        "*{}\r\n$4\r\nHSET\r\n${}\r\n",
-                        2 + entries.len() * 2,
-                        k.len()
-                    )
-                    .as_bytes(),
-                );
-                tx_buf.extend_from_slice(k);
-                tx_buf.extend_from_slice(b"\r\n");
-                for (f, v) in entries {
-                    tx_buf.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
-                    tx_buf.extend_from_slice(f);
-                    tx_buf.extend_from_slice(format!("\r\n${}\r\n", v.len()).as_bytes());
-                    tx_buf.extend_from_slice(v);
-                    tx_buf.extend_from_slice(b"\r\n");
-                }
-                if let Some(dur) = ttl {
-                    let ms = dur.as_millis().max(1);
-                    let ms_str = ms.to_string();
-                    tx_buf.extend_from_slice(
-                        format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
-                    );
-                    tx_buf.extend_from_slice(k);
-                    tx_buf.extend_from_slice(
-                        format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
-                    );
-                }
-            }
-            crate::table::RudisValue::Hash(h) => {
-                tx_buf.extend_from_slice(
-                    format!("*{}\r\n$4\r\nHSET\r\n${}\r\n", 2 + h.len() * 2, k.len()).as_bytes(),
-                );
-                tx_buf.extend_from_slice(k);
-                tx_buf.extend_from_slice(b"\r\n");
-                for (f, v) in h.as_ref() {
-                    tx_buf.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
-                    tx_buf.extend_from_slice(f);
-                    tx_buf.extend_from_slice(format!("\r\n${}\r\n", v.len()).as_bytes());
-                    tx_buf.extend_from_slice(v);
-                    tx_buf.extend_from_slice(b"\r\n");
-                }
-                if let Some(dur) = ttl {
-                    let ms = dur.as_millis().max(1);
-                    let ms_str = ms.to_string();
-                    tx_buf.extend_from_slice(
-                        format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
-                    );
-                    tx_buf.extend_from_slice(k);
-                    tx_buf.extend_from_slice(
-                        format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
-                    );
-                }
-            }
-            crate::table::RudisValue::List(l) => {
-                tx_buf.extend_from_slice(
-                    format!("*{}\r\n$5\r\nRPUSH\r\n${}\r\n", 2 + l.len(), k.len()).as_bytes(),
-                );
-                tx_buf.extend_from_slice(k);
-                tx_buf.extend_from_slice(b"\r\n");
-                for item in l {
-                    tx_buf.extend_from_slice(format!("${}\r\n", item.len()).as_bytes());
-                    tx_buf.extend_from_slice(item);
-                    tx_buf.extend_from_slice(b"\r\n");
-                }
-                if let Some(dur) = ttl {
-                    let ms = dur.as_millis().max(1);
-                    let ms_str = ms.to_string();
-                    tx_buf.extend_from_slice(
-                        format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
-                    );
-                    tx_buf.extend_from_slice(k);
-                    tx_buf.extend_from_slice(
-                        format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
-                    );
-                }
-            }
-            crate::table::RudisValue::Set(s) => {
-                tx_buf.extend_from_slice(
-                    format!("*{}\r\n$4\r\nSADD\r\n${}\r\n", 2 + s.len(), k.len()).as_bytes(),
-                );
-                tx_buf.extend_from_slice(k);
-                tx_buf.extend_from_slice(b"\r\n");
-                for item in s.as_ref() {
-                    tx_buf.extend_from_slice(format!("${}\r\n", item.len()).as_bytes());
-                    tx_buf.extend_from_slice(item);
-                    tx_buf.extend_from_slice(b"\r\n");
-                }
-                if let Some(dur) = ttl {
-                    let ms = dur.as_millis().max(1);
-                    let ms_str = ms.to_string();
-                    tx_buf.extend_from_slice(
-                        format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
-                    );
-                    tx_buf.extend_from_slice(k);
-                    tx_buf.extend_from_slice(
-                        format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
-                    );
-                }
-            }
-            crate::table::RudisValue::ZSet(zset) => {
-                tx_buf.extend_from_slice(
-                    format!("*{}\r\n$4\r\nZADD\r\n${}\r\n", 2 + zset.len() * 2, k.len()).as_bytes(),
-                );
-                tx_buf.extend_from_slice(k);
-                tx_buf.extend_from_slice(b"\r\n");
-                zset.for_each(|m, score| {
-                    let s = format_score(score);
-                    tx_buf.extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
-                    tx_buf.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
-                    tx_buf.extend_from_slice(m);
-                    tx_buf.extend_from_slice(b"\r\n");
-                });
-                if let Some(dur) = ttl {
-                    let ms = dur.as_millis().max(1);
-                    let ms_str = ms.to_string();
-                    tx_buf.extend_from_slice(
-                        format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
-                    );
-                    tx_buf.extend_from_slice(k);
-                    tx_buf.extend_from_slice(
-                        format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
-                    );
-                }
-            }
-            crate::table::RudisValue::HyperLogLog(regs) => {
-                tx_buf.extend_from_slice(format!("*3\r\n$3\r\nSET\r\n${}\r\n", k.len()).as_bytes());
-                tx_buf.extend_from_slice(k);
-                tx_buf.extend_from_slice(b"\r\n$16384\r\n");
-                tx_buf.extend_from_slice(regs.as_ref());
-                tx_buf.extend_from_slice(b"\r\n");
-                if let Some(dur) = ttl {
-                    let ms = dur.as_millis().max(1);
-                    let ms_str = ms.to_string();
-                    tx_buf.extend_from_slice(
-                        format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
-                    );
-                    tx_buf.extend_from_slice(k);
-                    tx_buf.extend_from_slice(
-                        format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
-                    );
-                }
-            }
-            crate::table::RudisValue::Stream(stream) => {
-                for (id, fields) in &stream.entries {
-                    tx_buf.extend_from_slice(
-                        format!(
-                            "*{}\r\n$4\r\nXADD\r\n${}\r\n",
-                            3 + fields.len() * 2,
-                            k.len()
-                        )
-                        .as_bytes(),
-                    );
-                    tx_buf.extend_from_slice(k);
-                    let id_str = id.to_string();
-                    tx_buf.extend_from_slice(
-                        format!("\r\n${}\r\n{}\r\n", id_str.len(), id_str).as_bytes(),
-                    );
-                    for (f, v) in fields {
-                        tx_buf.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
-                        tx_buf.extend_from_slice(f);
-                        tx_buf.extend_from_slice(format!("\r\n${}\r\n", v.len()).as_bytes());
-                        tx_buf.extend_from_slice(v);
-                        tx_buf.extend_from_slice(b"\r\n");
-                    }
-                }
-                if let Some(dur) = ttl {
-                    let ms = dur.as_millis().max(1);
-                    let ms_str = ms.to_string();
-                    tx_buf.extend_from_slice(
-                        format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
-                    );
-                    tx_buf.extend_from_slice(k);
-                    tx_buf.extend_from_slice(
-                        format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
-                    );
-                }
-            }
-            crate::table::RudisValue::Tiered(_) | crate::table::RudisValue::Cooled { .. } => {}
-        }
-    }
-
+    let mut stream =
+        match monoio::time::timeout(opts.timeout, TcpStream::connect(socket_addr)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => return Err(format!("IOERR error connecting to destination: {}", e)),
+            Err(_) => return Err("IOERR timeout connecting to destination".to_string()),
+        };
     if let Err(e) = stream.write_all(tx_buf).await.0 {
         return Err(format!("IOERR error sending to destination: {}", e));
     }
 
-    let resp_buf = vec![0u8; 1024];
-    let (read_res, _) = stream.read(resp_buf).await;
-    if let Err(e) = read_res {
-        return Err(format!("IOERR error reading from destination: {}", e));
-    }
-
-    let count = dumps.len();
-    if !copy {
-        for (k, _) in &dumps {
-            let _ = router.del(k.clone()).await;
+    // One reply for ASKING, then one per RESTORE, in order.
+    let expected = dumps.len() + 1;
+    let mut replies = Vec::with_capacity(expected);
+    let mut failure = None;
+    let mut pending = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    while replies.len() < expected {
+        let (res, b) = match monoio::time::timeout(opts.timeout, stream.read(buf)).await {
+            Ok(r) => r,
+            Err(_) => {
+                failure = Some("IOERR timeout reading from destination".to_string());
+                break;
+            }
+        };
+        buf = b;
+        match res {
+            Ok(0) => {
+                failure = Some("IOERR destination closed the connection".to_string());
+                break;
+            }
+            Ok(n) => {
+                pending.extend_from_slice(&buf[..n]);
+                let used = take_simple_replies(&pending, &mut replies);
+                pending.drain(..used);
+            }
+            Err(e) => {
+                failure = Some(format!("IOERR error reading from destination: {}", e));
+                break;
+            }
         }
     }
 
-    Ok(count)
+    let mut stored = 0;
+    for (i, (k, payload, _)) in dumps.into_iter().enumerate() {
+        match replies.get(i + 1) {
+            Some(Ok(())) => {
+                stored += 1;
+                if !opts.copy {
+                    router.del_if_unchanged(k, payload).await;
+                }
+            }
+            Some(Err(e)) => {
+                failure.get_or_insert_with(|| {
+                    format!("ERR Target instance replied with error: {}", e)
+                });
+            }
+            None => {}
+        }
+    }
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(stored),
+    }
 }
 
 async fn execute_rebalance_plans(
@@ -6323,9 +6200,19 @@ async fn execute_rebalance_plans(
                 if keys.is_empty() {
                     break;
                 }
-                if migrate_keys_to_node(router, &keys, &host, target_port, false)
-                    .await
-                    .is_err()
+                if migrate_keys_to_node(
+                    router,
+                    &keys,
+                    &host,
+                    target_port,
+                    MigrateOpts {
+                        copy: false,
+                        replace: true,
+                        timeout: SLOT_MIGRATION_TIMEOUT,
+                    },
+                )
+                .await
+                .is_err()
                 {
                     break;
                 }
@@ -10260,8 +10147,18 @@ async fn execute_command(
                         if keys.is_empty() {
                             break;
                         }
-                        if let Err(e) =
-                            migrate_keys_to_node(router, &keys, &host, port, false).await
+                        if let Err(e) = migrate_keys_to_node(
+                            router,
+                            &keys,
+                            &host,
+                            port,
+                            MigrateOpts {
+                                copy: false,
+                                replace: true,
+                                timeout: SLOT_MIGRATION_TIMEOUT,
+                            },
+                        )
+                        .await
                         {
                             out.extend_from_slice(
                                 format!("-ERR migration failed: {}\r\n", e).as_bytes(),
@@ -14461,9 +14358,9 @@ async fn execute_command(
             key,
             keys,
             destination_db: _,
-            timeout_ms: _,
+            timeout_ms,
             copy,
-            replace: _,
+            replace,
         } => {
             let mut migrate_keys = Vec::new();
             if let Some(k) = key
@@ -14481,318 +14378,19 @@ async fn execute_command(
                 return false;
             }
 
-            let mut dumps = Vec::new();
-            for k in &migrate_keys {
-                if let Some(entry) = router.dump_key(k.clone()).await {
-                    dumps.push((k.clone(), entry));
-                }
-            }
-
-            if dumps.is_empty() {
-                out.extend_from_slice(b"+NOKEY\r\n");
-                return false;
-            }
-
-            let target_addr = format!("{}:{}", host, port);
-            let socket_addr = match std::net::ToSocketAddrs::to_socket_addrs(&target_addr) {
-                Ok(mut iter) => match iter.next() {
-                    Some(a) => a,
-                    None => {
-                        out.extend_from_slice(b"-ERR cannot resolve destination host\r\n");
-                        return false;
-                    }
-                },
-                Err(_) => {
-                    out.extend_from_slice(b"-ERR invalid destination address\r\n");
-                    return false;
-                }
+            // Redis treats a zero timeout as one second.
+            let timeout =
+                std::time::Duration::from_millis(if timeout_ms == 0 { 1000 } else { timeout_ms });
+            let opts = MigrateOpts {
+                copy,
+                replace,
+                timeout,
             };
-
-            let mut stream = match monoio::net::TcpStream::connect(socket_addr).await {
-                Ok(s) => s,
-                Err(err) => {
-                    out.extend_from_slice(
-                        format!("-IOERR error connecting to destination: {}\r\n", err).as_bytes(),
-                    );
-                    return false;
-                }
-            };
-
-            // Send ASKING first to allow import if destination slot is in IMPORTING state
-            let mut tx_buf = Vec::new();
-            tx_buf.extend_from_slice(b"*1\r\n$6\r\nASKING\r\n");
-            for (k, (val, ttl)) in &dumps {
-                match val {
-                    crate::table::RudisValue::String(s) => {
-                        if let Some(dur) = ttl {
-                            let ms = dur.as_millis().max(1);
-                            let ms_str = ms.to_string();
-                            tx_buf.extend_from_slice(
-                                format!("*5\r\n$3\r\nSET\r\n${}\r\n", k.len()).as_bytes(),
-                            );
-                            tx_buf.extend_from_slice(k);
-                            tx_buf.extend_from_slice(format!("\r\n${}\r\n", s.len()).as_bytes());
-                            tx_buf.extend_from_slice(s);
-                            tx_buf.extend_from_slice(
-                                format!("\r\n$2\r\nPX\r\n${}\r\n{}\r\n", ms_str.len(), ms_str)
-                                    .as_bytes(),
-                            );
-                        } else {
-                            tx_buf.extend_from_slice(
-                                format!("*3\r\n$3\r\nSET\r\n${}\r\n", k.len()).as_bytes(),
-                            );
-                            tx_buf.extend_from_slice(k);
-                            tx_buf.extend_from_slice(format!("\r\n${}\r\n", s.len()).as_bytes());
-                            tx_buf.extend_from_slice(s);
-                            tx_buf.extend_from_slice(b"\r\n");
-                        }
-                    }
-                    crate::table::RudisValue::Int(n) => {
-                        let s = crate::table::RudisTable::format_i64(*n);
-                        if let Some(dur) = ttl {
-                            let ms = dur.as_millis().max(1);
-                            let ms_str = ms.to_string();
-                            tx_buf.extend_from_slice(
-                                format!("*5\r\n$3\r\nSET\r\n${}\r\n", k.len()).as_bytes(),
-                            );
-                            tx_buf.extend_from_slice(k);
-                            tx_buf.extend_from_slice(format!("\r\n${}\r\n", s.len()).as_bytes());
-                            tx_buf.extend_from_slice(&s);
-                            tx_buf.extend_from_slice(
-                                format!("\r\n$2\r\nPX\r\n${}\r\n{}\r\n", ms_str.len(), ms_str)
-                                    .as_bytes(),
-                            );
-                        } else {
-                            tx_buf.extend_from_slice(
-                                format!("*3\r\n$3\r\nSET\r\n${}\r\n", k.len()).as_bytes(),
-                            );
-                            tx_buf.extend_from_slice(k);
-                            tx_buf.extend_from_slice(format!("\r\n${}\r\n", s.len()).as_bytes());
-                            tx_buf.extend_from_slice(&s);
-                            tx_buf.extend_from_slice(b"\r\n");
-                        }
-                    }
-                    crate::table::RudisValue::SmallHash(fields) => {
-                        tx_buf.extend_from_slice(
-                            format!(
-                                "*{}\r\n$4\r\nHSET\r\n${}\r\n",
-                                2 + fields.len() * 2,
-                                k.len()
-                            )
-                            .as_bytes(),
-                        );
-                        tx_buf.extend_from_slice(k);
-                        tx_buf.extend_from_slice(b"\r\n");
-                        for (f, v) in fields {
-                            tx_buf.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
-                            tx_buf.extend_from_slice(f);
-                            tx_buf.extend_from_slice(b"\r\n");
-                            tx_buf.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                            tx_buf.extend_from_slice(v);
-                            tx_buf.extend_from_slice(b"\r\n");
-                        }
-                        if let Some(dur) = ttl {
-                            let ms = dur.as_millis().max(1);
-                            let ms_str = ms.to_string();
-                            tx_buf.extend_from_slice(
-                                format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
-                            );
-                            tx_buf.extend_from_slice(k);
-                            tx_buf.extend_from_slice(
-                                format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
-                            );
-                        }
-                    }
-                    crate::table::RudisValue::Hash(fields) => {
-                        tx_buf.extend_from_slice(
-                            format!(
-                                "*{}\r\n$4\r\nHSET\r\n${}\r\n",
-                                2 + fields.len() * 2,
-                                k.len()
-                            )
-                            .as_bytes(),
-                        );
-                        tx_buf.extend_from_slice(k);
-                        tx_buf.extend_from_slice(b"\r\n");
-                        for (f, v) in fields.as_ref() {
-                            tx_buf.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
-                            tx_buf.extend_from_slice(f);
-                            tx_buf.extend_from_slice(b"\r\n");
-                            tx_buf.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                            tx_buf.extend_from_slice(v);
-                            tx_buf.extend_from_slice(b"\r\n");
-                        }
-                        if let Some(dur) = ttl {
-                            let ms = dur.as_millis().max(1);
-                            let ms_str = ms.to_string();
-                            tx_buf.extend_from_slice(
-                                format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
-                            );
-                            tx_buf.extend_from_slice(
-                                format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
-                            );
-                        }
-                    }
-                    crate::table::RudisValue::List(deque) => {
-                        tx_buf.extend_from_slice(
-                            format!("*{}\r\n$5\r\nRPUSH\r\n${}\r\n", 2 + deque.len(), k.len())
-                                .as_bytes(),
-                        );
-                        tx_buf.extend_from_slice(k);
-                        tx_buf.extend_from_slice(b"\r\n");
-                        for v in deque {
-                            tx_buf.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                            tx_buf.extend_from_slice(v);
-                            tx_buf.extend_from_slice(b"\r\n");
-                        }
-                        if let Some(dur) = ttl {
-                            let ms = dur.as_millis().max(1);
-                            let ms_str = ms.to_string();
-                            tx_buf.extend_from_slice(
-                                format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
-                            );
-                            tx_buf.extend_from_slice(k);
-                            tx_buf.extend_from_slice(
-                                format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
-                            );
-                        }
-                    }
-                    crate::table::RudisValue::Set(set) => {
-                        tx_buf.extend_from_slice(
-                            format!("*{}\r\n$4\r\nSADD\r\n${}\r\n", 2 + set.len(), k.len())
-                                .as_bytes(),
-                        );
-                        tx_buf.extend_from_slice(k);
-                        tx_buf.extend_from_slice(b"\r\n");
-                        for m in set.as_ref() {
-                            tx_buf.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
-                            tx_buf.extend_from_slice(m);
-                            tx_buf.extend_from_slice(b"\r\n");
-                        }
-                        if let Some(dur) = ttl {
-                            let ms = dur.as_millis().max(1);
-                            let ms_str = ms.to_string();
-                            tx_buf.extend_from_slice(
-                                format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
-                            );
-                            tx_buf.extend_from_slice(k);
-                            tx_buf.extend_from_slice(
-                                format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
-                            );
-                        }
-                    }
-                    crate::table::RudisValue::ZSet(zset) => {
-                        tx_buf.extend_from_slice(
-                            format!("*{}\r\n$4\r\nZADD\r\n${}\r\n", 2 + zset.len() * 2, k.len())
-                                .as_bytes(),
-                        );
-                        tx_buf.extend_from_slice(k);
-                        tx_buf.extend_from_slice(b"\r\n");
-                        zset.for_each(|m, score| {
-                            let s = format_score(score);
-                            tx_buf
-                                .extend_from_slice(format!("${}\r\n{}\r\n", s.len(), s).as_bytes());
-                            tx_buf.extend_from_slice(format!("${}\r\n", m.len()).as_bytes());
-                            tx_buf.extend_from_slice(m);
-                            tx_buf.extend_from_slice(b"\r\n");
-                        });
-                        if let Some(dur) = ttl {
-                            let ms = dur.as_millis().max(1);
-                            let ms_str = ms.to_string();
-                            tx_buf.extend_from_slice(
-                                format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
-                            );
-                            tx_buf.extend_from_slice(k);
-                            tx_buf.extend_from_slice(
-                                format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
-                            );
-                        }
-                    }
-                    crate::table::RudisValue::HyperLogLog(regs) => {
-                        tx_buf.extend_from_slice(
-                            format!("*3\r\n$3\r\nSET\r\n${}\r\n", k.len()).as_bytes(),
-                        );
-                        tx_buf.extend_from_slice(k);
-                        tx_buf.extend_from_slice(b"\r\n$16384\r\n");
-                        tx_buf.extend_from_slice(regs.as_ref());
-                        tx_buf.extend_from_slice(b"\r\n");
-                        if let Some(dur) = ttl {
-                            let ms = dur.as_millis().max(1);
-                            let ms_str = ms.to_string();
-                            tx_buf.extend_from_slice(
-                                format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
-                            );
-                            tx_buf.extend_from_slice(k);
-                            tx_buf.extend_from_slice(
-                                format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
-                            );
-                        }
-                    }
-                    crate::table::RudisValue::Stream(stream) => {
-                        for (id, fields) in &stream.entries {
-                            tx_buf.extend_from_slice(
-                                format!(
-                                    "*{}\r\n$4\r\nXADD\r\n${}\r\n",
-                                    3 + fields.len() * 2,
-                                    k.len()
-                                )
-                                .as_bytes(),
-                            );
-                            tx_buf.extend_from_slice(k);
-                            tx_buf.extend_from_slice(b"\r\n");
-                            let id_str = id.to_string();
-                            tx_buf.extend_from_slice(
-                                format!("${}\r\n{}\r\n", id_str.len(), id_str).as_bytes(),
-                            );
-                            for (f, v) in fields {
-                                tx_buf.extend_from_slice(format!("${}\r\n", f.len()).as_bytes());
-                                tx_buf.extend_from_slice(f);
-                                tx_buf.extend_from_slice(b"\r\n");
-                                tx_buf.extend_from_slice(format!("${}\r\n", v.len()).as_bytes());
-                                tx_buf.extend_from_slice(v);
-                                tx_buf.extend_from_slice(b"\r\n");
-                            }
-                        }
-                        if let Some(dur) = ttl {
-                            let ms = dur.as_millis().max(1);
-                            let ms_str = ms.to_string();
-                            tx_buf.extend_from_slice(
-                                format!("*3\r\n$7\r\nPEXPIRE\r\n${}\r\n", k.len()).as_bytes(),
-                            );
-                            tx_buf.extend_from_slice(k);
-                            tx_buf.extend_from_slice(
-                                format!("\r\n${}\r\n{}\r\n", ms_str.len(), ms_str).as_bytes(),
-                            );
-                        }
-                    }
-                    crate::table::RudisValue::Tiered(_)
-                    | crate::table::RudisValue::Cooled { .. } => {}
-                }
+            match migrate_keys_to_node(router, &migrate_keys, &host, port, opts).await {
+                Ok(0) => out.extend_from_slice(b"+NOKEY\r\n"),
+                Ok(_) => out.extend_from_slice(b"+OK\r\n"),
+                Err(e) => out.extend_from_slice(format!("-{}\r\n", e).as_bytes()),
             }
-
-            if let Err(e) = stream.write_all(tx_buf).await.0 {
-                out.extend_from_slice(
-                    format!("-IOERR error sending to destination: {}\r\n", e).as_bytes(),
-                );
-                return false;
-            }
-
-            let resp_buf = vec![0u8; 1024];
-            let (read_res, _) = stream.read(resp_buf).await;
-            if let Err(e) = read_res {
-                out.extend_from_slice(
-                    format!("-IOERR error reading from destination: {}\r\n", e).as_bytes(),
-                );
-                return false;
-            }
-
-            if !copy {
-                for (k, _) in dumps {
-                    let _ = router.del(k).await;
-                }
-            }
-
-            out.extend_from_slice(b"+OK\r\n");
             false
         }
         Command::Subscribe(_) | Command::Psubscribe(_) | Command::Ssubscribe(_) => false,
@@ -24871,6 +24469,34 @@ mod tests {
     use super::*;
     use crate::resp::Command;
     use bytes::Bytes;
+
+    #[test]
+    fn test_take_simple_replies_keeps_order_and_partial_lines() {
+        let mut replies = Vec::new();
+        let buf = b"+OK\r\n-BUSYKEY Target key name already exists.\r\n:1\r\n+O";
+        let used = take_simple_replies(buf, &mut replies);
+        // The trailing "+O" is incomplete and stays for the next read.
+        assert_eq!(used, buf.len() - 2);
+        assert_eq!(replies.len(), 3);
+        assert_eq!(replies[0], Ok(()));
+        assert_eq!(
+            replies[1],
+            Err("BUSYKEY Target key name already exists.".to_string())
+        );
+        assert!(replies[2].is_err(), "a non-simple reply is not an OK");
+        assert_eq!(take_simple_replies(b"+OK\r\n", &mut replies), 5);
+        assert_eq!(replies[3], Ok(()));
+    }
+
+    #[test]
+    fn test_write_resp_command_encodes_bulk_array() {
+        let mut out = Vec::new();
+        write_resp_command(&mut out, &[b"RESTORE", b"k", b"0", b""]);
+        assert_eq!(
+            out,
+            b"*4\r\n$7\r\nRESTORE\r\n$1\r\nk\r\n$1\r\n0\r\n$0\r\n\r\n"
+        );
+    }
 
     #[test]
     fn test_crdt_primary_key_and_target_shard() {

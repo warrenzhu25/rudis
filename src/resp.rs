@@ -1864,6 +1864,9 @@ impl Command {
                     false
                 }
             }
+            // Like Redis, MIGRATE is not denied over maxmemory: it only removes
+            // local keys, so it is one way to get back under the limit.
+            Command::Migrate { .. } => true,
             _ => false,
         }
     }
@@ -13955,6 +13958,15 @@ fn find_newline_at(buf: &[u8], start: usize) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_migrate_is_allowed_over_maxmemory() {
+        let mut buf = BytesMut::from("MIGRATE 127.0.0.1 6380 k 0 5000\r\n");
+        let migrate = parse_command(&mut buf).unwrap().unwrap();
+        assert!(migrate.allows_oom());
+        let mut buf = BytesMut::from("SET k v\r\n");
+        assert!(!parse_command(&mut buf).unwrap().unwrap().allows_oom());
+    }
 
     #[test]
     fn test_is_write_command_follows_command_table() {

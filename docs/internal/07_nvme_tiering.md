@@ -12,8 +12,7 @@
 > 1,082-line `src/tiering.rs` (previously ~932 lines) and its callers. Two of the three previously
 > documented issues have changed: the free-space-reuse bug is **fixed**; the `upload_threshold_pct`
 > dead-config issue is **unchanged**; the cross-file `MIGRATE`/tiering data-loss bug from the
-> Component 11 pass is **confirmed, and found to exist in two independently hand-duplicated
-> copies**. Three new findings are added in §7.
+> Component 11 pass has since been **fixed** (§7#3). Three new findings are added in §7.
 
 ---
 
@@ -440,7 +439,7 @@ and it only ever consults `offload_threshold_pct` (default 60).
 
 `read_cold_key_local` is the real GET-path entry point (called from `server.rs:389,429,1353` and
 `router.rs:819` via `get_local_direct`) — not `ensure_loaded`, which is reserved for the explicit
-`TIER LOAD` command and `dump_key` (§3.12/§7#5). Note `stream_cold_read_local`
+`TIER LOAD` command (§3.12). Note `stream_cold_read_local`
 (`router.rs:469-491`) only decodes `RudisValue::String`/`Int` — any other tiered value type reaching
 this path under memory pressure returns `None` rather than streaming, since GET is only ever issued
 against string-typed keys in normal operation this is not currently reachable as a user-visible bug,
@@ -523,16 +522,16 @@ tiered/cooled key can't be spilled again without first being loaded) — this is
   `GLOBAL_IDX_SHIFT`/`MASK`). This means the tiering spill cursor survives a directory
   split/grow transparently — re-verified against the current, much-larger `table.rs`, this
   integration is correct and was evidently designed for exactly this caller.
-- **`src/router.rs`**: the orchestration layer described in §3.10-§3.12. `Router::dump_key`
-  (`:944-961`) is the one place outside the normal GET path that calls `ensure_loaded` before
-  reading a value — used by both `MIGRATE` and `CLUSTER SETSLOT`/`REBALANCE`/`RESHARD` (§7#5).
+- **`src/router.rs`**: the orchestration layer described in §3.10-§3.12. Migration
+  (`MIGRATE` and `CLUSTER SETSLOT`/`REBALANCE`/`RESHARD`) no longer loads tiered values: it
+  DUMPs them straight from their tier record (§7#3).
 - **`src/shard.rs`**: `ShardDb.tier_manager: Option<Rc<ShardTierManager>>`, one instance per shard,
   created at shard startup; `save_rdb_chunk` hydrates `Tiered` values via `read_ptr_sync` (§3.8).
 - **`src/aof.rs`**: AOF rewrite/compaction hydrates `Tiered` values the same way (§3.8).
 - **`src/connection.rs`**: `GET` on a `Tiered`/`Cooled` key routes through
   `Router::get`→`get_local_direct`→`read_cold_key_local` (§3.11), not through the table directly.
-  The `TIER` command family (§8 below) and the `MIGRATE`/cluster-migration serialization paths
-  (§7#5) also live here.
+  The `TIER` command family (§8 below) and the `MIGRATE`/cluster-migration path (§7#3) also
+  live here.
 - **`src/main.rs`/`src/server.rs`**: `RUDIS_DIRECT_IO` and `RUDIS_TIER_DIR` are process env vars, not
   CLI flags; every shard unconditionally opens a `ShardTierManager` at startup regardless of whether
   `maxmemory` is configured. `--maxmemory`/`--tiered-offload-threshold`/`--tiered-upload-threshold`
@@ -563,34 +562,13 @@ tiered/cooled key can't be spilled again without first being loaded) — this is
    vs. promote it to RAM") consults only `offload_threshold_pct`. Either give `upload_threshold_pct`
    a real second gate or remove the config surface — it currently implies (per its own doc comment,
    `tiering.rs:45`) behavior it does not have.
-3. **Data loss during cluster slot migration for keys still in the `Tiered` (fully RAM-evicted)
-   state — confirmed present, and found in two independently hand-duplicated copies.** Both the
-   client-facing `MIGRATE` command handler (`connection.rs:10598-10937`, empty arm at
-   `:10908-10909`) and the internal `migrate_keys_to_node` helper used by `CLUSTER SETSLOT
-   MIGRATING`/`REBALANCE`/`RESHARD` (`connection.rs:3449-3732`, empty arm at `:3711`) build their
-   destination `SET`/`HSET`/... wire commands with a `match val { ... RudisValue::Tiered(_) |
-   RudisValue::Cooled { .. } => {} }` — an empty arm that serializes nothing for a value still in
-   either tiered representation. Both call `Router::dump_key` (`router.rs:944-961`), which calls
-   `self.ensure_loaded(key)` first, but `ensure_loaded` (`router.rs:695-715`) returns `false`
-   **without loading anything** whenever `is_memory_constrained()` is true. **In practice only the
-   pure `Tiered` state is reachable here, not `Cooled`**: `RudisTable::get_entry`
-   (`table.rs:2984-3007`), which both `dump_key` implementations read through, unwraps
-   `Cooled { val, .. }` to `(**val).clone()` before returning — so a `Cooled` key's in-RAM copy is
-   always available and gets serialized correctly regardless of memory pressure. A `Tiered` key,
-   however, is returned as-is (`other => other.clone()`) and hits the empty arm. Both migration
-   paths then **unconditionally delete every key `dump_key` returned** from the source
-   (`connection.rs:10929-10933` and `:3726-3730`) whenever `copy` was not requested — with no check
-   that anything was actually written to the destination for that key. **Net effect: migrating a
-   slot (via `MIGRATE`, `CLUSTER SETSLOT`, `REBALANCE`, or `RESHARD`) while the source shard is at or
-   above its `offload_threshold_pct` memory threshold silently drops any key that is fully
-   tiered-to-disk (not merely cooled) at the moment of migration — deleted from the source, never
-   written to the destination.** This is unaffected by the free-space-reuse fix in §7#1 (different
-   mechanism entirely) and is unaffected by the `089ca7a` parallel-cold-read changes (§3.12), which
-   only touch the local GET fast path, not `dump_key`/migration. Fixing this requires either making
-   `dump_key` force-load a `Tiered` value regardless of memory pressure (accepting the RAM spike) or
-   giving both match blocks a real arm that reads the value via `tm.read_ptr_sync`/an async
-   equivalent before serializing it — and doing so in **both** hand-duplicated copies, since nothing
-   shares this match logic between them today.
+3. **Fixed — cluster slot migration dropped keys still in the `Tiered` state.** `MIGRATE` and
+   `migrate_keys_to_node` used to share a hand-duplicated per-type re-encoder with an empty arm for
+   `Tiered`/`Cooled` values, and deleted every source key afterwards without checking the
+   target's replies. Both now go through one `migrate_keys_to_node` that sends DUMP payloads with
+   `RESTORE` (`ShardDb::dump` reads a tiered key's payload straight from its tier record, so no
+   load and no RAM spike is needed even over `maxmemory`) and deletes a source key only after the
+   target replied `+OK` for it and the key is unchanged (`Router::del_if_unchanged`).
 4. **New — restart/snapshot-restore does not repopulate `free_pages`/`free_extents`.**
    `ShardTierManager::open` (`:415-459`) always initializes both free lists empty, and the snapshot
    manifest (`:568-574`) records only `version`/`shard_id`/`file_size`/`is_reflink`/`current_offset`

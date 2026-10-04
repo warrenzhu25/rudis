@@ -1079,25 +1079,6 @@ impl Router {
         }
     }
 
-    pub async fn dump_key(
-        &self,
-        key: Bytes,
-    ) -> Option<(crate::table::RudisValue, Option<Duration>)> {
-        self.ensure_loaded(&key).await;
-        let target = self.target_shard(&key);
-        if target == self.shard_id {
-            self.local_db.borrow_mut().get_entry(&key)
-        } else {
-            let (tx, rx) = flume::bounded(1);
-            let msg = ShardMessage::DumpKey { key, responder: tx };
-            if self.senders[target].send(msg).is_ok() {
-                rx.recv_async().await.ok().flatten()
-            } else {
-                None
-            }
-        }
-    }
-
     pub async fn set(&self, key: Bytes, value: Bytes, expire_in: Option<Duration>) {
         let target = self.target_shard(&key);
         if target == self.shard_id {
@@ -1752,20 +1733,7 @@ impl Router {
     pub async fn del(&self, key: Bytes) -> bool {
         let target = target_shard(&key, self.num_shards);
         if target == self.shard_id {
-            let mut db = self.local_db.borrow_mut();
-            let deleted = db.del(&key);
-            if deleted {
-                db.delete_document_local(&String::from_utf8_lossy(&key));
-                crate::connection::notify_keyspace_event_sync(
-                    self,
-                    crate::connection::NOTIFY_GENERIC,
-                    "del",
-                    &key,
-                );
-                crate::connection::notify_stream_or_defer(&mut db, &key);
-                self.log_mutation(|| Command::Del(smallvec![key]));
-            }
-            deleted
+            self.del_local(key)
         } else {
             let (tx, rx) = flume::bounded(1);
             let msg = ShardMessage::Del { key, responder: tx };
@@ -1775,6 +1743,52 @@ impl Router {
                 false
             }
         }
+    }
+
+    /// Deletes a key owned by this shard, with the usual side effects
+    /// (keyspace events, AOF/replication).
+    pub fn del_local(&self, key: Bytes) -> bool {
+        let mut db = self.local_db.borrow_mut();
+        let deleted = db.del(&key);
+        if deleted {
+            db.delete_document_local(&String::from_utf8_lossy(&key));
+            crate::connection::notify_keyspace_event_sync(
+                self,
+                crate::connection::NOTIFY_GENERIC,
+                "del",
+                &key,
+            );
+            crate::connection::notify_stream_or_defer(&mut db, &key);
+            self.log_mutation(|| Command::Del(smallvec![key]));
+        }
+        deleted
+    }
+
+    /// Deletes `key` only if its DUMP is still `payload`, i.e. nothing
+    /// changed it since it was dumped. The check and the delete run on the
+    /// owning shard in one step.
+    pub async fn del_if_unchanged(&self, key: Bytes, payload: Bytes) -> bool {
+        let target = target_shard(&key, self.num_shards);
+        if target == self.shard_id {
+            self.del_if_unchanged_local(key, &payload)
+        } else {
+            let (tx, rx) = flume::bounded(1);
+            let msg = ShardMessage::DelIfUnchanged {
+                key,
+                payload,
+                responder: tx,
+            };
+            if self.senders[target].send(msg).is_ok() {
+                rx.recv_async().await.unwrap_or(false)
+            } else {
+                false
+            }
+        }
+    }
+
+    pub fn del_if_unchanged_local(&self, key: Bytes, payload: &[u8]) -> bool {
+        let unchanged = self.local_db.borrow_mut().dump(&key).as_deref() == Some(payload);
+        unchanged && self.del_local(key)
     }
 
     pub async fn del_keys(&self, mut keys: Vec<Bytes>) -> usize {
@@ -3863,6 +3877,26 @@ mod tests {
             .build()
             .unwrap()
             .block_on(f)
+    }
+
+    #[test]
+    fn test_del_if_unchanged_only_deletes_the_dumped_value() {
+        let (router, db) = single_shard_router(19874);
+        let key = Bytes::from_static(b"migrating");
+        block_on(router.set(key.clone(), Bytes::from_static(b"v1"), None));
+        let stale = Bytes::from(db.borrow_mut().dump(&key).unwrap());
+        // Written again after the dump: the migrated copy is out of date.
+        block_on(router.set(key.clone(), Bytes::from_static(b"v2"), None));
+        assert!(!router.del_if_unchanged_local(key.clone(), &stale));
+        assert!(db.borrow_mut().dump(&key).is_some());
+
+        let current = Bytes::from(db.borrow_mut().dump(&key).unwrap());
+        assert!(block_on(
+            router.del_if_unchanged(key.clone(), current.clone())
+        ));
+        assert!(db.borrow_mut().dump(&key).is_none());
+        // A key that is gone is not "unchanged".
+        assert!(!router.del_if_unchanged_local(key, &current));
     }
 
     #[test]

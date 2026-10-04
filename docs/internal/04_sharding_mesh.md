@@ -211,7 +211,7 @@ pub enum ShardMessage {
 
     // Other fresh-flume-channel-per-call single-key ops (§4.3): Del, DelKeys,
     // ActiveDefrag, Exists, IncrBy, Expire, Persist, Ttl, CountKeysInSlot,
-    // GetKeysInSlot, ClientList, JsonMget, DumpKey, RandomKey, ExpireTime, Delex,
+    // GetKeysInSlot, ClientList, JsonMget, DelIfUnchanged, RandomKey, ExpireTime, Delex,
     // IsSticky, Stick, Unstick, FlushSlots, TierSpill/TierLoad/TierSpillAll/TierCool/
     // TierDecommit/TierGc/TierSnapshot, GetUsedMemory, StreamColdRead,
     // AcquireTxLock/ReleaseTxLock, RestoreRdbChunk, ExecuteReplicaCmd, SyncAof,
@@ -831,7 +831,7 @@ cold read (`stream_cold_read_local`, when `is_memory_constrained()`) or loading 
 back into RAM (`load_local`) before returning it. The same split is reused by the
 `ScatterMget` remote handler in `server.rs` for cross-shard `MGET` cold keys (§4.4).
 
-**`del`/`exists`/`incr_by`/`expire`/`persist`/`ttl`/`dump_key`/`expiretime`/`random_key`/
+**`del`/`exists`/`incr_by`/`expire`/`persist`/`ttl`/`del_if_unchanged`/`expiretime`/`random_key`/
 `scan`/the `Tier*` operations/... still allocate a fresh `flume::bounded(1)` channel per
 remote call** (58 distinct `flume::bounded(1)` call sites remain in `router.rs`). Example,
 `del` (also the sole remaining static-routing call site, §4.2):
