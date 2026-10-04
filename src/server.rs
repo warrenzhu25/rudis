@@ -2031,17 +2031,8 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
             let next_tls_client_id = next_tls_client_id.clone();
             monoio::spawn(async move {
                 loop {
-                    if crate::shutdown::is_shutting_down() {
+                    let Some(accept_res) = accept_until_shutdown(&tls_listener).await else {
                         break;
-                    }
-                    let accept_res = match monoio::time::timeout(
-                        std::time::Duration::from_millis(200),
-                        tls_listener.accept(),
-                    )
-                    .await
-                    {
-                        Ok(res) => res,
-                        Err(_) => continue,
                     };
                     match accept_res {
                         Ok((mut stream, client_addr)) => {
@@ -2266,6 +2257,45 @@ async fn drain_clients(
     }
 }
 
+/// How often a listener waiting for a client re-checks for shutdown.
+const ACCEPT_SHUTDOWN_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+
+type Accepted = std::io::Result<(monoio::net::TcpStream, std::net::SocketAddr)>;
+
+/// Waits for the next client on `listener`, or `None` once shutdown starts.
+async fn accept_until_shutdown(listener: &monoio::net::TcpListener) -> Option<Accepted> {
+    accept_polling(
+        listener,
+        ACCEPT_SHUTDOWN_POLL,
+        crate::shutdown::is_shutting_down,
+    )
+    .await
+}
+
+/// Waits for the next client on `listener`, checking `stop` every `poll`.
+///
+/// The accept op is kept alive across those checks rather than wrapped in a
+/// fresh `timeout(.., listener.accept())` each time: dropping an in-flight
+/// io_uring accept only requests cancellation, and if the kernel has already
+/// accepted a connection by then, monoio discards the completion. The
+/// connection stays established, with its fd leaked and its requests unread,
+/// and the client hangs on its first command.
+async fn accept_polling(
+    listener: &monoio::net::TcpListener,
+    poll: std::time::Duration,
+    stop: fn() -> bool,
+) -> Option<Accepted> {
+    let mut accept = std::pin::pin!(listener.accept());
+    loop {
+        if stop() {
+            return None;
+        }
+        if let Ok(res) = monoio::time::timeout(poll, accept.as_mut()).await {
+            return Some(res);
+        }
+    }
+}
+
 /// Accepts plain-TCP clients on one listener until shutdown.
 async fn accept_loop(
     listener: monoio::net::TcpListener,
@@ -2277,16 +2307,9 @@ async fn accept_loop(
     cluster_enabled: bool,
 ) {
     loop {
-        if crate::shutdown::is_shutting_down() {
+        let Some(accept_res) = accept_until_shutdown(&listener).await else {
             break;
-        }
-        let accept_res =
-            match monoio::time::timeout(std::time::Duration::from_millis(200), listener.accept())
-                .await
-            {
-                Ok(res) => res,
-                Err(_) => continue,
-            };
+        };
         match accept_res {
             Ok((stream, client_addr)) => {
                 let raw_fd = std::os::unix::io::AsRawFd::as_raw_fd(&stream);
@@ -2424,6 +2447,51 @@ mod tests {
         let fut = catch_unwind_async(async { 42 });
         let res = fut.await;
         assert_eq!(res.unwrap(), 42);
+    }
+
+    /// With a poll interval far shorter than a connect, nearly every accept
+    /// races its timeout. Dropping the accept on each tick lost a connection
+    /// within the first ~100 here; every client must get its byte.
+    #[test]
+    fn test_accept_polling_never_loses_a_connection() {
+        const CONNS: usize = 2000;
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let addr = std_listener.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            use std::io::Read;
+            for i in 0..CONNS {
+                let mut c = std::net::TcpStream::connect(addr).unwrap();
+                c.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut b = [0u8; 1];
+                if let Err(e) = c.read_exact(&mut b) {
+                    panic!("connection {i} was accepted but never served: {e}");
+                }
+            }
+        });
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_timer()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            use monoio::io::AsyncWriteRentExt;
+            let listener = monoio::net::TcpListener::from_std(std_listener).unwrap();
+            // Bounded, so a lost connection fails via the client's panic
+            // instead of leaving this loop waiting for it forever.
+            let _ = monoio::time::timeout(std::time::Duration::from_secs(10), async {
+                for _ in 0..CONNS {
+                    let (mut stream, _) =
+                        accept_polling(&listener, std::time::Duration::from_micros(10), || false)
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    stream.write_all(b"y").await.0.unwrap();
+                }
+            })
+            .await;
+        });
+        client.join().unwrap();
     }
 
     #[test]
