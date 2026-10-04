@@ -857,9 +857,6 @@ impl ShardDb {
 
     #[inline]
     pub fn set(&mut self, key: Bytes, value: Bytes, expire_in: Option<Duration>) {
-        if let Some(tm) = &self.tier_manager {
-            tm.op_manager.cancel_pending_stash(&key);
-        }
         if let Some(ptr) = self.table.is_tiered(&key) {
             if let Some(tm) = &self.tier_manager {
                 tm.on_key_deleted(ptr);
@@ -892,9 +889,6 @@ impl ShardDb {
         expire_in: Option<Duration>,
         keepttl: bool,
     ) {
-        if let Some(tm) = &self.tier_manager {
-            tm.op_manager.cancel_pending_stash(&key);
-        }
         if let Some(ptr) = self.table.is_tiered(&key) {
             if let Some(tm) = &self.tier_manager {
                 tm.on_key_deleted(ptr);
@@ -934,9 +928,6 @@ impl ShardDb {
                     .is_some_and(|idx| !idx.is_empty());
             }
             return false;
-        }
-        if let Some(tm) = &self.tier_manager {
-            tm.op_manager.cancel_pending_stash(key);
         }
         let ptr = self.table.is_tiered(key);
         let cooled_ptr = if ptr.is_none() {
@@ -1958,12 +1949,46 @@ impl ShardDb {
 
     #[inline]
     pub fn rename(&mut self, src: &[u8], dst: Bytes, nx: bool) -> Result<bool, &'static str> {
-        self.table.rename(src, dst, nx)
+        let overwritten = (src != dst.as_ref() && self.tier_manager.is_some())
+            .then(|| {
+                self.table
+                    .is_tiered(&dst)
+                    .map(|p| (p, false))
+                    .or_else(|| self.table.is_cooled(&dst).map(|p| (p, true)))
+            })
+            .flatten();
+        let res = self.table.rename(src, dst, nx);
+        if matches!(res, Ok(true))
+            && let Some((ptr, is_cooled)) = overwritten
+            && let Some(tm) = &self.tier_manager
+        {
+            tm.on_key_overwritten(ptr, is_cooled);
+        }
+        res
     }
 
     #[inline]
     pub fn copy(&mut self, src: &[u8], dst: Bytes, replace: bool) -> Result<bool, &'static str> {
-        self.table.copy(src, dst, replace)
+        let hydrated = self
+            .table
+            .is_tiered(src)
+            .and_then(|ptr| self.hydrate_tiered(ptr));
+        let overwritten = (src != dst.as_ref() && replace && self.tier_manager.is_some())
+            .then(|| {
+                self.table
+                    .is_tiered(&dst)
+                    .map(|p| (p, false))
+                    .or_else(|| self.table.is_cooled(&dst).map(|p| (p, true)))
+            })
+            .flatten();
+        let res = self.table.copy_with_hydrated(src, dst, replace, hydrated);
+        if matches!(res, Ok(true))
+            && let Some((ptr, is_cooled)) = overwritten
+            && let Some(tm) = &self.tier_manager
+        {
+            tm.on_key_overwritten(ptr, is_cooled);
+        }
+        res
     }
 
     #[inline]

@@ -396,7 +396,10 @@ impl Router {
         let updated = {
             let mut db = self.local_db.borrow_mut();
             let stats = db.tier_manager.as_ref().map(|tm| tm.stats.clone());
-            if db.table.set_tiered_pointer(key, ptr) {
+            if db
+                .table
+                .set_spilled_pointer_if_unchanged(key, &entry_data, ptr, false)
+            {
                 if let Some(stats) = stats {
                     stats.tiered_keys.fetch_add(1, Ordering::Relaxed);
                     stats
@@ -418,6 +421,8 @@ impl Router {
             }
             true
         } else {
+            // The key changed during the I/O: the stashed copy is garbage.
+            tm.on_key_deleted(ptr);
             false
         }
     }
@@ -438,7 +443,7 @@ impl Router {
             None => return false,
         };
 
-        let (record_key, val_payload) = match crate::tiering::read_tiered_record(
+        let (_record_key, val_payload) = match crate::tiering::read_tiered_record(
             &tm.file,
             &tm.op_manager,
             Some(&tm.small_bins),
@@ -457,7 +462,7 @@ impl Router {
         };
 
         let mut db = self.local_db.borrow_mut();
-        if db.table.restore_tiered_value(&record_key, val) {
+        if db.table.restore_tiered_value(key, val) {
             tm.stats.total_fetches.fetch_add(1, Ordering::Relaxed);
             tm.stats.tiered_keys.fetch_sub(1, Ordering::Relaxed);
             tm.stats.cooled_keys.fetch_add(1, Ordering::Relaxed);
@@ -500,7 +505,10 @@ impl Router {
         let updated = {
             let mut db = self.local_db.borrow_mut();
             let stats = db.tier_manager.as_ref().map(|tm| tm.stats.clone());
-            if db.table.set_cooled_pointer(key, ptr) {
+            if db
+                .table
+                .set_spilled_pointer_if_unchanged(key, &entry_data, ptr, true)
+            {
                 if let Some(stats) = stats {
                     stats.cooled_keys.fetch_add(1, Ordering::Relaxed);
                     stats
@@ -517,6 +525,7 @@ impl Router {
             let _ = tm.flush_active_bin().await;
             true
         } else {
+            tm.on_key_deleted(ptr);
             false
         }
     }
@@ -4005,6 +4014,115 @@ mod tests {
         assert!(db.borrow_mut().dump(&key).is_none());
         // A key that is gone is not "unchanged".
         assert!(!router.del_if_unchanged_local(key, &current));
+    }
+
+    #[test]
+    fn test_spill_loses_to_a_write_or_delete_made_during_its_io() {
+        use crate::tiering::run_during_first_wait;
+        let port = 19876;
+        let (router, db) = single_shard_router(port);
+        let dir = std::env::temp_dir().join(format!("rudis-spillrace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        block_on(async {
+            let tm = Rc::new(
+                crate::tiering::ShardTierManager::open(0, port, &dir)
+                    .await
+                    .unwrap(),
+            );
+            db.borrow_mut().tier_manager = Some(tm.clone());
+            // Large values: their stash waits on a write before committing.
+            let old = Bytes::from(vec![b'1'; 5000]);
+            let new = Bytes::from(vec![b'2'; 5000]);
+
+            db.borrow_mut().set(Bytes::from("k"), old.clone(), None);
+            let (spilled, _) = run_during_first_wait(router.spill_local(b"k"), async {
+                db.borrow_mut().set(Bytes::from("k"), new.clone(), None)
+            })
+            .await;
+            assert!(!spilled);
+            assert_eq!(db.borrow_mut().get_checked(b"k"), Ok(Some(new)));
+            // The stale copy was freed, not leaked.
+            assert_eq!(tm.free_extents.borrow().len(), 1);
+
+            db.borrow_mut().set(Bytes::from("j"), old, None);
+            let (spilled, _) = run_during_first_wait(router.spill_local(b"j"), async {
+                db.borrow_mut().del(b"j")
+            })
+            .await;
+            assert!(!spilled);
+            assert_eq!(db.borrow_mut().get_checked(b"j"), Ok(None));
+            assert_eq!(
+                tm.free_extents.borrow().len(),
+                1,
+                "extent reused, then freed"
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rename_and_copy_of_tiered_and_cooled_keys() {
+        let port = 19877;
+        let (router, db) = single_shard_router(port);
+        let dir = std::env::temp_dir().join(format!("rudis-tiercopy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        block_on(async {
+            let tm = Rc::new(
+                crate::tiering::ShardTierManager::open(0, port, &dir)
+                    .await
+                    .unwrap(),
+            );
+            db.borrow_mut().tier_manager = Some(tm.clone());
+            let v1 = Bytes::from(vec![b'a'; 5000]);
+            let v2 = Bytes::from(vec![b'b'; 5000]);
+
+            // A renamed tiered key loads back under its new name, not the
+            // old name recorded in the disk header.
+            db.borrow_mut().set(Bytes::from("old"), v1.clone(), None);
+            assert!(router.spill_local(b"old").await);
+            assert_eq!(
+                db.borrow_mut().rename(b"old", Bytes::from("new"), false),
+                Ok(true)
+            );
+            assert_eq!(router.get(Bytes::from("old")).await, None);
+            assert_eq!(router.get(Bytes::from("new")).await, Some(v1.clone()));
+            assert!(db.borrow_mut().del(b"new"));
+
+            // COPY of a tiered key hydrates the copy and frees an overwritten
+            // destination's extent; deleting both keys frees each extent once.
+            tm.free_extents.borrow_mut().clear();
+            db.borrow_mut().set(Bytes::from("src"), v1.clone(), None);
+            db.borrow_mut().set(Bytes::from("dst"), v2, None);
+            assert!(router.spill_local(b"src").await);
+            assert!(router.spill_local(b"dst").await);
+            assert_eq!(
+                db.borrow_mut().copy(b"src", Bytes::from("dst"), true),
+                Ok(true)
+            );
+            assert_eq!(tm.free_extents.borrow().len(), 1, "overwritten dst freed");
+            assert_eq!(router.get(Bytes::from("dst")).await, Some(v1.clone()));
+            assert!(db.borrow_mut().del(b"src"));
+            assert!(db.borrow_mut().del(b"dst"));
+            assert_eq!(tm.free_extents.borrow().len(), 2, "src freed once");
+
+            // COPY of a cooled key does not share its disk pointer with the copy.
+            tm.free_extents.borrow_mut().clear();
+            db.borrow_mut().set(Bytes::from("cool"), v1.clone(), None);
+            assert!(router.cool_local(b"cool").await);
+            assert_eq!(
+                db.borrow_mut()
+                    .copy(b"cool", Bytes::from("cool_copy"), false),
+                Ok(true)
+            );
+            assert!(db.borrow_mut().del(b"cool"));
+            assert!(db.borrow_mut().del(b"cool_copy"));
+            assert_eq!(
+                tm.free_extents.borrow().len(),
+                1,
+                "cooled extent freed once"
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

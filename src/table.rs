@@ -3958,6 +3958,29 @@ impl RudisTable {
         false
     }
 
+    /// Swaps in a spill's pointer only if the key still holds the value that
+    /// was stashed (`payload`, from `get_value_for_spill`): a write, delete
+    /// or expiry during the stash's I/O wins over the stale copy.
+    pub fn set_spilled_pointer_if_unchanged(
+        &mut self,
+        key: &[u8],
+        payload: &[u8],
+        ptr: TieredPointer,
+        cooled: bool,
+    ) -> bool {
+        if self
+            .get_value_for_spill(key)
+            .is_none_or(|(current, _)| current != payload)
+        {
+            return false;
+        }
+        if cooled {
+            self.set_cooled_pointer(key, ptr)
+        } else {
+            self.set_tiered_pointer(key, ptr)
+        }
+    }
+
     #[inline]
     pub fn set_cooled_pointer(&mut self, key: &[u8], ptr: TieredPointer) -> bool {
         let h = hash_key(key);
@@ -4166,6 +4189,16 @@ impl RudisTable {
     }
 
     pub fn copy(&mut self, src: &[u8], dst: Bytes, replace: bool) -> Result<bool, &'static str> {
+        self.copy_with_hydrated(src, dst, replace, None)
+    }
+
+    pub fn copy_with_hydrated(
+        &mut self,
+        src: &[u8],
+        dst: Bytes,
+        replace: bool,
+        hydrated: Option<RudisValue>,
+    ) -> Result<bool, &'static str> {
         if src == dst.as_ref() {
             return Err("source and destination objects are the same");
         }
@@ -4180,7 +4213,16 @@ impl RudisTable {
         }
 
         let (_, entry) = self.table.find_entry(src, h_src).unwrap();
-        let val = entry.val.clone();
+        // Never clone a Tiered/Cooled pointer across two keys: deleting both
+        // would free the same disk extent twice.
+        let val = match &entry.val {
+            RudisValue::Tiered(_) => match hydrated {
+                Some(v) => v,
+                None => return Ok(false),
+            },
+            RudisValue::Cooled { val, .. } => (**val).clone(),
+            other => other.clone(),
+        };
         let expire_at = entry.expire_at;
 
         let h_dst = hash_key(&dst);

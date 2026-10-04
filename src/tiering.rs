@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -210,8 +210,6 @@ pub fn reset_tier_stats(port: u16) {
 pub struct OpManager {
     /// In-flight page reads: page_start offset -> list of subscriber responder channels
     pub in_flight_reads: RefCell<HashMap<u64, Vec<flume::Sender<Result<Rc<Vec<u8>>, String>>>>>,
-    /// Tracks in-flight stashes by key to prevent stale overwrites on DEL/SET
-    pub pending_stashes: RefCell<HashSet<Bytes>>,
     /// Tracks total in-flight stash bytes for write backpressure
     pub pending_stash_bytes: AtomicUsize,
 }
@@ -226,28 +224,16 @@ impl OpManager {
     pub fn new() -> Self {
         Self {
             in_flight_reads: RefCell::new(HashMap::new()),
-            pending_stashes: RefCell::new(HashSet::new()),
             pending_stash_bytes: AtomicUsize::new(0),
         }
     }
 
-    pub fn start_pending_stash(&self, key: &Bytes, size: usize) {
-        self.pending_stashes.borrow_mut().insert(key.clone());
+    pub fn start_pending_stash(&self, size: usize) {
         self.pending_stash_bytes.fetch_add(size, Ordering::Relaxed);
     }
 
-    pub fn cancel_pending_stash(&self, key: &[u8]) -> bool {
-        self.pending_stashes.borrow_mut().remove(key)
-    }
-
-    pub fn finish_pending_stash(&self, key: &[u8], size: usize) -> bool {
-        let existed = self.pending_stashes.borrow_mut().remove(key);
+    pub fn finish_pending_stash(&self, size: usize) {
         self.pending_stash_bytes.fetch_sub(size, Ordering::Relaxed);
-        existed
-    }
-
-    pub fn is_stash_pending(&self, key: &[u8]) -> bool {
-        self.pending_stashes.borrow().contains(key)
     }
 
     pub fn check_write_backpressure(&self) -> bool {
@@ -445,24 +431,19 @@ impl SmallBinsManager {
 /// failed write cannot leave its bytes counted toward write backpressure.
 struct PendingStash<'a> {
     op_manager: &'a OpManager,
-    key: &'a [u8],
     len: usize,
 }
 
 impl<'a> PendingStash<'a> {
-    fn start(op_manager: &'a OpManager, key: &'a Bytes, len: usize) -> Self {
-        op_manager.start_pending_stash(key, len);
-        Self {
-            op_manager,
-            key,
-            len,
-        }
+    fn start(op_manager: &'a OpManager, len: usize) -> Self {
+        op_manager.start_pending_stash(len);
+        Self { op_manager, len }
     }
 }
 
 impl Drop for PendingStash<'_> {
     fn drop(&mut self) {
-        self.op_manager.finish_pending_stash(self.key, self.len);
+        self.op_manager.finish_pending_stash(self.len);
     }
 }
 
@@ -745,7 +726,7 @@ impl ShardTierManager {
         let record = encode_tiered_record(key, val_payload, val_type);
         let record_len = record.len();
 
-        let _pending = PendingStash::start(&self.op_manager, key, record_len);
+        let _pending = PendingStash::start(&self.op_manager, record_len);
 
         if record_len < SMALL_VALUE_LIMIT {
             // Re-checked after every await: another stash may have installed
@@ -1032,6 +1013,28 @@ pub async fn read_tiered_record(
 }
 
 #[cfg(test)]
+/// Polls `a` once, then runs `b` to completion, then finishes `a`: `b`
+/// runs while `a` waits on its first write (which always yields in unit
+/// tests, see `ShardTierManager::write_all_at`).
+pub(crate) async fn run_during_first_wait<A: std::future::Future, B: std::future::Future>(
+    a: A,
+    b: B,
+) -> (A::Output, B::Output) {
+    let mut a = std::pin::pin!(a);
+    let mut first = None;
+    std::future::poll_fn(|cx| {
+        if let std::task::Poll::Ready(v) = a.as_mut().poll(cx) {
+            first = Some(v);
+        }
+        std::task::Poll::Ready(())
+    })
+    .await;
+    assert!(first.is_none(), "`a` finished without waiting on a write");
+    let b_out = b.await;
+    (a.await, b_out)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1096,25 +1099,18 @@ mod tests {
     #[test]
     fn test_op_manager_in_flight_and_backpressure() {
         let op_mgr = OpManager::new();
-        let key = Bytes::from_static(b"mykey");
-        assert!(!op_mgr.is_stash_pending(&key));
         assert!(!op_mgr.check_write_backpressure());
 
-        op_mgr.start_pending_stash(&key, 100);
-        assert!(op_mgr.is_stash_pending(&key));
+        op_mgr.start_pending_stash(100);
         assert_eq!(op_mgr.pending_stash_bytes.load(Ordering::Relaxed), 100);
-
-        // Cancel pending stash
-        assert!(op_mgr.cancel_pending_stash(&key));
-        assert!(!op_mgr.is_stash_pending(&key));
+        op_mgr.finish_pending_stash(100);
 
         // Start pending stash up to backpressure limit (> 16MB)
-        let big_key = Bytes::from_static(b"big1");
-        op_mgr.start_pending_stash(&big_key, 17 * 1024 * 1024);
+        op_mgr.start_pending_stash(17 * 1024 * 1024);
         assert!(op_mgr.check_write_backpressure());
 
         // Finish pending stash relieves backpressure
-        op_mgr.finish_pending_stash(&big_key, 17 * 1024 * 1024);
+        op_mgr.finish_pending_stash(17 * 1024 * 1024);
         assert!(!op_mgr.check_write_backpressure());
     }
 
@@ -1178,27 +1174,6 @@ mod tests {
             .build()
             .unwrap()
             .block_on(f)
-    }
-
-    /// Polls `a` once, then runs `b` to completion, then finishes `a`: `b`
-    /// runs while `a` waits on its first write (which always yields in unit
-    /// tests, see `ShardTierManager::write_all_at`).
-    async fn run_during_first_wait<A: std::future::Future, B: std::future::Future>(
-        a: A,
-        b: B,
-    ) -> (A::Output, B::Output) {
-        let mut a = std::pin::pin!(a);
-        let mut first = None;
-        std::future::poll_fn(|cx| {
-            if let std::task::Poll::Ready(v) = a.as_mut().poll(cx) {
-                first = Some(v);
-            }
-            std::task::Poll::Ready(())
-        })
-        .await;
-        assert!(first.is_none(), "`a` finished without waiting on a write");
-        let b_out = b.await;
-        (a.await, b_out)
     }
 
     #[test]

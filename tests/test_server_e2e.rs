@@ -20821,9 +20821,24 @@ fn test_tier_file_lives_under_dir_is_reset_at_startup_and_not_shared_e2e() {
     assert_eq!(resp_cmd(&mut o, &["SET", "tf:o", &big]), "+OK\r\n");
     assert_eq!(resp_cmd(&mut o, &["TIER", "SPILL", "tf:o"]), ":0\r\n");
     assert_eq!(tier_len(), spilled_len);
-    assert_eq!(resp_cmd(&mut c, &["GET", "tf:big"]), get_big);
     drop(o);
     shutdown_and_wait(other_port, &mut other.0);
+
+    // COPY and RENAME of a spilled key: deleting the copy must not punch out
+    // the source's extent, and loading the renamed key must restore it under
+    // its new name rather than the key recorded when it was spilled.
+    assert_eq!(resp_cmd(&mut c, &["COPY", "tf:big", "tf:copy"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["DEL", "tf:copy"]), ":1\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["RENAME", "tf:big", "tf:moved"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["GET", "tf:big"]), "$-1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "tf:moved"]), get_big);
+    assert_eq!(
+        resp_cmd(&mut c, &["RENAME", "tf:moved", "tf:big"]),
+        "+OK\r\n"
+    );
 
     // After a restart the AOF has the value; the tier file starts empty.
     drop(c);
