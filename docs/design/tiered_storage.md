@@ -88,7 +88,10 @@ Each shard is pinned to a physical core and runs an isolated `monoio` event loop
 ```
 
 Each shard's file lives at `<RUDIS_TIER_DIR>/tier_shard_<shard_id>.db`; `RUDIS_TIER_DIR` defaults
-to `$TMPDIR/rudis_tier_<port>` if the environment variable is unset. A `ShardTierManager` is
+to `<dir>/rudis_tier_<port>` (next to the RDB/AOF) if the environment variable is unset. At
+startup each shard takes an exclusive `flock` on its file (a second server configured with the
+same file gets no tiering rather than clobbering live data) and truncates it: RDB and AOF store
+values, not tier pointers, so nothing from a previous run is referenced. A `ShardTierManager` is
 opened for **every** shard unconditionally at startup, independent of whether `maxmemory` is
 configured — the automatic offload/decommit path simply never triggers if `maxmemory` is 0.
 There is no `ExternalAllocator` layer between `ShardTierManager` and the raw file (§8).
@@ -397,7 +400,7 @@ Per-Shard maxmemory Share
 - `--tiered-upload-threshold <0-100>` (default `80`) / `CONFIG SET tiered-upload-threshold`:
   configured and reported, currently inert (§9).
 - `RUDIS_TIER_DIR` (environment variable, **not** a CLI flag): base directory for each shard's
-  `tier_shard_<id>.db` file. Defaults to `$TMPDIR/rudis_tier_<port>`.
+  `tier_shard_<id>.db` file. Defaults to `<dir>/rudis_tier_<port>`.
 - `RUDIS_DIRECT_IO` (environment variable, **not** a CLI flag): any value other than `"0"`
   attempts `O_DIRECT` on the tier file, with a silent fallback to buffered I/O on failure (§2).
 

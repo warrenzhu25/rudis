@@ -285,8 +285,8 @@ In order (line numbers refer to `src/server.rs`):
    - **(205-208) Cluster bus**: only `shard_id == 0` calls `crate::cluster::start_cluster_bus(port)`
      — a single, once-per-process background listener.
    - **(210-221) Tiered storage**: opens a `crate::tiering::ShardTierManager` for this shard/port
-     (directory from `RUDIS_TIER_DIR` env var, else a per-port temp directory under
-     `std::env::temp_dir()`) and, on success, attaches it to `local_db.borrow_mut().tier_manager`.
+     (directory from `RUDIS_TIER_DIR` env var, else `<dir>/rudis_tier_<port>`; the file is locked
+     and truncated on open) and, on success, attaches it to `local_db.borrow_mut().tier_manager`.
    - **(223-241)** Builds `client_registry` (`Rc<RefCell<HashMap<u64, ClientInfo>>>`), `pubsub`
      (`Rc<RefCell<PubSubHub>>`), and the shard's `Router` via `Router::new(shard_id, num_shards,
      shard_port, local_db.clone(), senders, aof_writer.clone(), pubsub.clone(), aof_config.dir.clone())`,

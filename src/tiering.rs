@@ -411,6 +411,31 @@ pub struct ShardTierManager {
     pub free_extents: RefCell<Vec<(u64, u64)>>,
 }
 
+/// Takes the tier file for this process and empties it. Nothing outlives
+/// a run: RDB and AOF store values, not tier pointers, so whatever an earlier
+/// run left is garbage and would otherwise be kept (and appended after)
+/// forever. The lock keeps a second server configured with the same file
+/// from truncating or overwriting the first one's live data.
+fn claim_tier_file(file: &monoio::fs::File, path: &Path) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let fd = file.as_raw_fd();
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let err = io::Error::last_os_error();
+        return Err(io::Error::new(
+            err.kind(),
+            format!(
+                "tier file {} is in use by another server: {}",
+                path.display(),
+                err
+            ),
+        ));
+    }
+    if unsafe { libc::ftruncate(fd, 0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 impl ShardTierManager {
     pub async fn open(shard_id: usize, port: u16, dir: &Path) -> io::Result<Self> {
         use std::os::unix::fs::OpenOptionsExt;
@@ -438,16 +463,14 @@ impl ShardTierManager {
             (opts.open(&path).await?, false)
         };
 
-        let raw_len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-        // Align offset to 4KB page boundary
-        let current_offset = raw_len.div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;
+        claim_tier_file(&file, &path)?;
         let stats = get_tier_stats(port);
         Ok(Self {
             shard_id,
             port,
             file: Rc::new(file),
-            current_offset: Cell::new(current_offset),
-            preallocated_len: Cell::new(raw_len),
+            current_offset: Cell::new(0),
+            preallocated_len: Cell::new(0),
             path,
             stats,
             op_manager: Rc::new(OpManager::new()),
@@ -1037,6 +1060,40 @@ mod tests {
 
         assert_eq!(stats.disk_reads.load(Ordering::Relaxed), 0);
         assert_eq!(stats.ram_hits.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_open_discards_stale_data_and_refuses_a_file_in_use() {
+        let dir = std::env::temp_dir().join(format!("rudis_tier_claim_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tier_shard_0.db");
+        // Left by an earlier run: nothing can reference it any more.
+        std::fs::write(&path, vec![7u8; 3 * PAGE_SIZE + 5]).unwrap();
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let first = ShardTierManager::open(0, 55559, &dir).await.unwrap();
+            assert_eq!(first.current_offset.get(), 0);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+
+            let ptr = first
+                .stash_record(&Bytes::from_static(b"k"), b"live", 0)
+                .await
+                .unwrap();
+            first.flush_active_bin().await.unwrap();
+            // A second server on the same file must not wipe live data.
+            let err = ShardTierManager::open(0, 55559, &dir).await.err().unwrap();
+            assert!(err.to_string().contains("in use"), "{err}");
+            assert_eq!(first.read_ptr_sync(ptr).unwrap().1, b"live");
+
+            drop(first);
+            let again = ShardTierManager::open(0, 55559, &dir).await.unwrap();
+            assert_eq!(again.current_offset.get(), 0);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

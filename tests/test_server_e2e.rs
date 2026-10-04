@@ -15055,11 +15055,13 @@ fn test_failed_save_does_not_block_later_saves_e2e() {
         let r = resp_cmd(&mut c, &["SAVE"]);
         assert!(r.starts_with("-ERR") && !r.contains("in progress"), "{r}");
     }
-    assert_eq!(
-        std::fs::read_dir(&dir).unwrap().count(),
-        1,
-        "temp file left"
-    );
+    // The dir also holds the tier files; only temp RDBs matter here.
+    let leftovers: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("temp-"))
+        .collect();
+    assert!(leftovers.is_empty(), "temp file left: {leftovers:?}");
     std::fs::remove_dir(dir.join("dump.rdb")).unwrap();
     assert_eq!(resp_cmd(&mut c, &["SAVE"]), "+OK\r\n");
     assert!(dir.join("dump.rdb").is_file());
@@ -20660,4 +20662,95 @@ fn test_replica_replies_loading_while_it_loads_a_full_sync_e2e() {
     assert_eq!(resp_cmd(&mut c, &["REPLICAOF", "NO", "ONE"]), "+OK\r\n");
     drop(c);
     shutdown_and_wait(port, &mut child.0);
+}
+
+#[test]
+fn test_tier_file_lives_under_dir_is_reset_at_startup_and_not_shared_e2e() {
+    let port: u16 = 17087;
+    let other_port: u16 = 17088;
+    let dir = std::env::temp_dir().join(format!("rudis-tierfile-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let tier_dir = dir.join(format!("rudis_tier_{port}"));
+    std::fs::create_dir_all(&tier_dir).unwrap();
+    let tier_file = tier_dir.join("tier_shard_0.db");
+    // Left by an earlier run; nothing references it after a restart.
+    std::fs::write(&tier_file, vec![7u8; 1 << 20]).unwrap();
+    let tier_len = || std::fs::metadata(&tier_file).unwrap().len();
+
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "1",
+        "--no-pin",
+        "--aof",
+        "true",
+        "--aof-dir",
+        dir.to_str().unwrap(),
+    ];
+    let mut child = KillOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(tier_len(), 0, "stale tier data kept");
+
+    let big = "b".repeat(5000);
+    let get_big = format!("${}\r\n{big}\r\n", big.len());
+    assert_eq!(resp_cmd(&mut c, &["SET", "tf:big", &big]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["TIER", "SPILL", "tf:big"]), ":1\r\n");
+    let spilled_len = tier_len();
+    assert!(spilled_len > 0);
+
+    // A second server pointed at the same tier file gets no tiering
+    // rather than truncating or overwriting the first one's data.
+    let mut other = KillOnDrop(
+        std::process::Command::new(env!("CARGO_BIN_EXE_rudis"))
+            .args([
+                "--port",
+                &other_port.to_string(),
+                "--threads",
+                "1",
+                "--no-pin",
+            ])
+            .env("RUDIS_TIER_DIR", &tier_dir)
+            .env("MONOIO_FORCE_LEGACY_DRIVER", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn rudis"),
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut o = loop {
+        if let Ok(o) = TcpStream::connect(("127.0.0.1", other_port)) {
+            break o;
+        }
+        assert!(std::time::Instant::now() < deadline, "rudis did not start");
+        thread::sleep(Duration::from_millis(50));
+    };
+    o.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(resp_cmd(&mut o, &["SET", "tf:o", &big]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut o, &["TIER", "SPILL", "tf:o"]), ":0\r\n");
+    assert_eq!(tier_len(), spilled_len);
+    assert_eq!(resp_cmd(&mut c, &["GET", "tf:big"]), get_big);
+    drop(o);
+    shutdown_and_wait(other_port, &mut other.0);
+
+    // After a restart the AOF has the value; the tier file starts empty.
+    drop(c);
+    shutdown_and_wait(port, &mut child.0);
+    let mut child = KillOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(tier_len(), 0, "tier data from the previous run kept");
+    assert_eq!(resp_cmd(&mut c, &["GET", "tf:big"]), get_big);
+    drop(c);
+    shutdown_and_wait(port, &mut child.0);
+    let _ = std::fs::remove_dir_all(&dir);
 }

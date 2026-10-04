@@ -210,9 +210,11 @@ pub fn run_shard_worker(
         }
 
         // Initialize NVMe Tiered Storage Manager (io_uring)
+        // Under `dir` by default, like the RDB and AOF: the system temp dir
+        // is often tmpfs (RAM), which defeats tiering.
         let tier_dir = std::env::var("RUDIS_TIER_DIR")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::env::temp_dir().join(format!("rudis_tier_{}", port)));
+            .unwrap_or_else(|_| aof_config.dir.join(format!("rudis_tier_{}", port)));
         match crate::tiering::ShardTierManager::open(shard_id, port, &tier_dir).await {
             Ok(tm) => {
                 local_db.borrow_mut().tier_manager = Some(Rc::new(tm));
