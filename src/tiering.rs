@@ -362,8 +362,13 @@ impl ActiveBin {
 /// Manages active small bin aggregation and page occupancy tracking
 pub struct SmallBinsManager {
     pub active_bin: Option<ActiveBin>,
+    /// Live items per page, counted from the moment each is appended, so
+    /// items that die before their bin is written are not lost track of.
     pub page_active_counts: HashMap<u64, usize>,
     pub dead_pages: Vec<u64>,
+    /// Sealed bins whose write is in flight. Reads are served from here
+    /// until the page is on disk, and the page is not retired meanwhile.
+    pub flushing: HashMap<u64, Vec<u8>>,
 }
 
 impl Default for SmallBinsManager {
@@ -378,7 +383,20 @@ impl SmallBinsManager {
             active_bin: None,
             page_active_counts: HashMap::new(),
             dead_pages: Vec::new(),
+            flushing: HashMap::new(),
         }
+    }
+
+    /// Appends to the active bin, which the caller has made fit the record.
+    fn append_to_active(&mut self, key: Bytes, record: &[u8], val_type: u8) -> (u64, SmallBinItem) {
+        let ab = self
+            .active_bin
+            .as_mut()
+            .expect("caller installs an active bin that fits");
+        let page_index = ab.page_index;
+        let item = ab.append(key, record, val_type);
+        *self.page_active_counts.entry(page_index).or_insert(0) += 1;
+        (page_index, item)
     }
 
     pub fn decrement_page_key(&mut self, page_index: u64, stats: &TieringStats) {
@@ -387,12 +405,64 @@ impl SmallBinsManager {
         {
             *count -= 1;
             if *count == 0 {
-                stats
-                    .dead_bytes
-                    .fetch_add(PAGE_SIZE as u64, Ordering::Relaxed);
-                self.dead_pages.push(page_index);
+                self.retire_if_unused(page_index, stats);
             }
         }
+    }
+
+    /// Queues a page with no live items for GC, unless it is still the
+    /// active bin or being written (then the flush retires it).
+    fn retire_if_unused(&mut self, page_index: u64, stats: &TieringStats) {
+        let in_memory = self
+            .active_bin
+            .as_ref()
+            .is_some_and(|ab| ab.page_index == page_index)
+            || self.flushing.contains_key(&page_index);
+        if !in_memory && self.page_active_counts.get(&page_index) == Some(&0) {
+            self.page_active_counts.remove(&page_index);
+            stats
+                .dead_bytes
+                .fetch_add(PAGE_SIZE as u64, Ordering::Relaxed);
+            self.dead_pages.push(page_index);
+        }
+    }
+
+    /// The record's bytes if its page is not (yet) on disk.
+    fn bytes_in_memory(&self, ptr: TieredPointer) -> Option<Vec<u8>> {
+        let len = ptr.length as usize;
+        let offset_in_page = (ptr.offset % PAGE_SIZE as u64) as usize;
+        let page_index = ptr.offset / PAGE_SIZE as u64;
+        let buf = match &self.active_bin {
+            Some(ab) if ab.page_index == page_index => &ab.buffer,
+            _ => self.flushing.get(&page_index)?,
+        };
+        buf.get(offset_in_page..offset_in_page + len)
+            .map(|b| b.to_vec())
+    }
+}
+
+/// Keeps a stash counted as pending until it ends, however it ends, so a
+/// failed write cannot leave its bytes counted toward write backpressure.
+struct PendingStash<'a> {
+    op_manager: &'a OpManager,
+    key: &'a [u8],
+    len: usize,
+}
+
+impl<'a> PendingStash<'a> {
+    fn start(op_manager: &'a OpManager, key: &'a Bytes, len: usize) -> Self {
+        op_manager.start_pending_stash(key, len);
+        Self {
+            op_manager,
+            key,
+            len,
+        }
+    }
+}
+
+impl Drop for PendingStash<'_> {
+    fn drop(&mut self) {
+        self.op_manager.finish_pending_stash(self.key, self.len);
     }
 }
 
@@ -606,9 +676,18 @@ impl ShardTierManager {
             use std::os::unix::io::AsRawFd;
             let chunk = 64 * 1024 * 1024u64; // 64 MB chunks
             let new_len = needed_end.div_ceil(chunk) * chunk;
+            let old_len = self.preallocated_len.get();
             let fd = self.file.as_raw_fd();
+            // Only the new range: allocating from 0 would fill every hole
+            // that GC punched below the old end.
             unsafe {
-                if libc::fallocate(fd, 0, 0, new_len as libc::off_t) != 0 {
+                if libc::fallocate(
+                    fd,
+                    0,
+                    old_len as libc::off_t,
+                    (new_len - old_len) as libc::off_t,
+                ) != 0
+                {
                     let _ = libc::ftruncate(fd, new_len as libc::off_t);
                 }
             }
@@ -666,29 +745,34 @@ impl ShardTierManager {
         let record = encode_tiered_record(key, val_payload, val_type);
         let record_len = record.len();
 
-        self.op_manager.start_pending_stash(key, record_len);
+        let _pending = PendingStash::start(&self.op_manager, key, record_len);
 
-        let ptr_res = if record_len < SMALL_VALUE_LIMIT {
-            let need_new_bin = {
-                let bins = self.small_bins.borrow();
-                match &bins.active_bin {
-                    Some(ab) => !ab.can_fit(record_len),
-                    None => true,
+        if record_len < SMALL_VALUE_LIMIT {
+            // Re-checked after every await: another stash may have installed
+            // (and filled) a bin meanwhile, and replacing it would drop it
+            // unwritten.
+            loop {
+                let active = self
+                    .small_bins
+                    .borrow()
+                    .active_bin
+                    .as_ref()
+                    .map(|ab| ab.can_fit(record_len));
+                match active {
+                    Some(true) => break,
+                    Some(false) => self.flush_active_bin().await?,
+                    None => {
+                        let next_page_idx = self.allocate_page();
+                        self.small_bins.borrow_mut().active_bin =
+                            Some(ActiveBin::new(next_page_idx));
+                    }
                 }
-            };
-
-            if need_new_bin {
-                self.flush_active_bin().await?;
-                let next_page_idx = self.allocate_page();
-                self.small_bins.borrow_mut().active_bin = Some(ActiveBin::new(next_page_idx));
             }
 
             let (ptr, should_flush) = {
                 let mut bins = self.small_bins.borrow_mut();
-                let ab = bins.active_bin.as_mut().unwrap();
-                let page_idx = ab.page_index;
-                let item = ab.append(key.clone(), &record, val_type);
-                let should_flush = !ab.can_fit(64);
+                let (page_idx, item) = bins.append_to_active(key.clone(), &record, val_type);
+                let should_flush = !bins.active_bin.as_ref().is_some_and(|ab| ab.can_fit(64));
                 let ptr = TieredPointer {
                     file_id: self.shard_id as u32,
                     offset: page_idx * PAGE_SIZE as u64 + item.offset_in_page as u64,
@@ -714,8 +798,10 @@ impl ShardTierManager {
                 write_buf.resize(aligned_len, 0);
             }
             let offset = self.allocate_extent(aligned_len);
-            let (res, _) = self.file.write_all_at(write_buf, offset).await;
-            res?;
+            if let Err(e) = self.write_all_at(write_buf, offset).await {
+                self.release_extent(offset, aligned_len as u64);
+                return Err(e);
+            }
             self.stats.disk_writes.fetch_add(1, Ordering::Relaxed);
             self.stats.total_stashes.fetch_add(1, Ordering::Relaxed);
 
@@ -726,35 +812,63 @@ impl ShardTierManager {
                 value_type: val_type,
             };
             Ok(ptr)
-        };
-
-        self.op_manager.finish_pending_stash(key, record_len);
-        ptr_res
+        }
     }
 
     pub async fn flush_active_bin(&self) -> io::Result<()> {
-        let (page_buf, page_idx, items_len) = {
+        let (page_idx, page_buf) = {
             let mut bins = self.small_bins.borrow_mut();
-            if let Some(ab) = bins.active_bin.take() {
-                let page_idx = ab.page_index;
-                let (page_buf, items) = ab.seal();
-                (Some(page_buf), page_idx, items.len())
-            } else {
-                (None, 0, 0)
-            }
+            let Some(ab) = bins.active_bin.take() else {
+                return Ok(());
+            };
+            let page_idx = ab.page_index;
+            let (page_buf, _) = ab.seal();
+            bins.flushing.insert(page_idx, page_buf.clone());
+            (page_idx, page_buf)
         };
-        if let Some(page_buf) = page_buf {
-            let page_offset = page_idx * PAGE_SIZE as u64;
-            let (res, _) = self.file.write_all_at(page_buf, page_offset).await;
-            res?;
-            self.stats.disk_writes.fetch_add(1, Ordering::Relaxed);
-            self.stats.bin_pages.fetch_add(1, Ordering::Relaxed);
-            self.small_bins
-                .borrow_mut()
-                .page_active_counts
-                .insert(page_idx, items_len);
+        let page_offset = page_idx * PAGE_SIZE as u64;
+        let res = self.write_all_at(page_buf, page_offset).await;
+        {
+            // On error the items keep their counts, so the page is still
+            // reclaimed once they are deleted.
+            let mut bins = self.small_bins.borrow_mut();
+            bins.flushing.remove(&page_idx);
+            bins.retire_if_unused(page_idx, &self.stats);
         }
+        res?;
+        self.stats.disk_writes.fetch_add(1, Ordering::Relaxed);
+        self.stats.bin_pages.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Writes stashed data. In unit tests every write first yields once, so
+    /// tests can deterministically run other work while a write is in flight
+    /// (real I/O may or may not complete on the first poll).
+    async fn write_all_at(&self, buf: Vec<u8>, offset: u64) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            let mut yielded = false;
+            std::future::poll_fn(|cx| {
+                if yielded {
+                    std::task::Poll::Ready(())
+                } else {
+                    yielded = true;
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+        }
+        self.file.write_all_at(buf, offset).await.0
+    }
+
+    /// Returns a large record's blocks to the allocator.
+    fn release_extent(&self, offset: u64, aligned_len: u64) {
+        if aligned_len == PAGE_SIZE as u64 {
+            self.free_pages.borrow_mut().push(offset / PAGE_SIZE as u64);
+        } else {
+            self.free_extents.borrow_mut().push((offset, aligned_len));
+        }
     }
 
     pub fn on_key_deleted(&self, ptr: TieredPointer) {
@@ -772,18 +886,12 @@ impl ShardTierManager {
                 .dead_bytes
                 .fetch_add(aligned_len as u64, Ordering::Relaxed);
             Self::punch_hole(&self.file, ptr.offset, aligned_len as u64, &self.stats);
-            if aligned_len == PAGE_SIZE {
-                self.free_pages
-                    .borrow_mut()
-                    .push(ptr.offset / PAGE_SIZE as u64);
-            } else {
-                self.free_extents
-                    .borrow_mut()
-                    .push((ptr.offset, aligned_len as u64));
-            }
+            self.release_extent(ptr.offset, aligned_len as u64);
         }
     }
 
+    /// Frees the old value's space like a delete (punching large extents,
+    /// which otherwise stay allocated until reused) and fixes the counters.
     #[inline]
     pub fn on_key_overwritten(&self, ptr: TieredPointer, is_cooled: bool) {
         if is_cooled {
@@ -792,37 +900,14 @@ impl ShardTierManager {
             self.stats.tiered_keys.fetch_sub(1, Ordering::Relaxed);
         }
         self.stats.total_deletes.fetch_add(1, Ordering::Relaxed);
-        if (ptr.length as usize) < SMALL_VALUE_LIMIT {
-            let page_index = ptr.offset / PAGE_SIZE as u64;
-            self.small_bins
-                .borrow_mut()
-                .decrement_page_key(page_index, &self.stats);
-        } else {
-            let aligned_len = (ptr.length as usize).div_ceil(PAGE_SIZE) * PAGE_SIZE;
-            if aligned_len == PAGE_SIZE {
-                self.free_pages
-                    .borrow_mut()
-                    .push(ptr.offset / PAGE_SIZE as u64);
-            } else {
-                self.free_extents
-                    .borrow_mut()
-                    .push((ptr.offset, aligned_len as u64));
-            }
-        }
+        self.on_key_deleted(ptr);
     }
 
     pub fn read_ptr_sync(&self, ptr: TieredPointer) -> io::Result<(Bytes, Vec<u8>)> {
-        let len = ptr.length as usize;
-        let offset_in_page = (ptr.offset % PAGE_SIZE as u64) as usize;
-        let page_idx = ptr.offset / PAGE_SIZE as u64;
-
         if let Ok(sb) = self.small_bins.try_borrow()
-            && let Some(ab) = &sb.active_bin
-            && ab.page_index == page_idx
-            && ab.buffer.len() >= offset_in_page + len
+            && let Some(data) = sb.bytes_in_memory(ptr)
         {
-            let slice = &ab.buffer[offset_in_page..offset_in_page + len];
-            return decode_tiered_record(slice, ptr.value_type);
+            return decode_tiered_record(&data, ptr.value_type);
         }
 
         read_tiered_record_sync(&self.path, ptr)
@@ -925,22 +1010,7 @@ pub async fn read_tiered_record(
     let offset_in_page = (ptr.offset % PAGE_SIZE as u64) as usize;
     let data: Vec<u8> = if offset_in_page + len <= PAGE_SIZE {
         let page_start = (ptr.offset / PAGE_SIZE as u64) * PAGE_SIZE as u64;
-        let page_idx = ptr.offset / PAGE_SIZE as u64;
-
-        let in_mem = if let Some(sb) = small_bins {
-            let bins = sb.borrow();
-            if let Some(ab) = &bins.active_bin {
-                if ab.page_index == page_idx && ab.buffer.len() >= offset_in_page + len {
-                    Some(ab.buffer[offset_in_page..offset_in_page + len].to_vec())
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let in_mem = small_bins.and_then(|sb| sb.borrow().bytes_in_memory(ptr));
 
         if let Some(d) = in_mem {
             d
@@ -1092,6 +1162,151 @@ mod tests {
             drop(first);
             let again = ShardTierManager::open(0, 55559, &dir).await.unwrap();
             assert_eq!(again.current_offset.get(), 0);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn tier_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("rudis_tier_{name}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    /// Polls `a` once, then runs `b` to completion, then finishes `a`: `b`
+    /// runs while `a` waits on its first write (which always yields in unit
+    /// tests, see `ShardTierManager::write_all_at`).
+    async fn run_during_first_wait<A: std::future::Future, B: std::future::Future>(
+        a: A,
+        b: B,
+    ) -> (A::Output, B::Output) {
+        let mut a = std::pin::pin!(a);
+        let mut first = None;
+        std::future::poll_fn(|cx| {
+            if let std::task::Poll::Ready(v) = a.as_mut().poll(cx) {
+                first = Some(v);
+            }
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(first.is_none(), "`a` finished without waiting on a write");
+        let b_out = b.await;
+        (a.await, b_out)
+    }
+
+    #[test]
+    fn test_concurrent_small_stashes_keep_every_record() {
+        let dir = tier_test_dir("race");
+        block_on(async {
+            let m = ShardTierManager::open(0, 55560, &dir).await.unwrap();
+            // Nearly fill the active bin so the next record does not fit.
+            for k in ["f0", "f1"] {
+                m.stash_record(&Bytes::from(k), &[b'f'; 1900], 0)
+                    .await
+                    .unwrap();
+            }
+            let (ka, kb) = (Bytes::from_static(b"a"), Bytes::from_static(b"b"));
+            // `a` must flush the full bin first; `b` stashes meanwhile.
+            let (pa, pb) = run_during_first_wait(
+                m.stash_record(&ka, &[b'a'; 500], 0),
+                m.stash_record(&kb, &[b'b'; 500], 0),
+            )
+            .await;
+            m.flush_active_bin().await.unwrap();
+            assert_eq!(m.read_ptr_sync(pa.unwrap()).unwrap().1, vec![b'a'; 500]);
+            assert_eq!(m.read_ptr_sync(pb.unwrap()).unwrap().1, vec![b'b'; 500]);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_record_readable_while_its_bin_is_written() {
+        let dir = tier_test_dir("flushread");
+        block_on(async {
+            let m = ShardTierManager::open(0, 55561, &dir).await.unwrap();
+            let ptr = m
+                .stash_record(&Bytes::from_static(b"k"), b"v1", 0)
+                .await
+                .unwrap();
+            let (flushed, read) = run_during_first_wait(
+                m.flush_active_bin(),
+                read_tiered_record(&m.file, &m.op_manager, Some(&m.small_bins), ptr, &m.stats),
+            )
+            .await;
+            flushed.unwrap();
+            assert_eq!(read.unwrap().1, b"v1");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_page_reclaimed_when_items_die_before_their_bin_is_written() {
+        let dir = tier_test_dir("activedel");
+        block_on(async {
+            let m = ShardTierManager::open(0, 55562, &dir).await.unwrap();
+            let mut ptrs = Vec::new();
+            for k in ["x", "y"] {
+                ptrs.push(m.stash_record(&Bytes::from(k), b"val", 0).await.unwrap());
+            }
+            // Deleted while their page is still the active bin.
+            for p in ptrs {
+                m.on_key_deleted(p);
+            }
+            assert_eq!(m.run_gc(), 0, "the active page must not be reclaimed");
+            m.flush_active_bin().await.unwrap();
+            assert_eq!(m.run_gc(), PAGE_SIZE);
+            assert_eq!(m.allocate_page(), 0, "the page is reused");
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_overwritten_large_value_is_punched() {
+        let dir = tier_test_dir("overwrite");
+        block_on(async {
+            let m = ShardTierManager::open(0, 55563, &dir).await.unwrap();
+            let ptr = m
+                .stash_record(&Bytes::from_static(b"big"), &[b'z'; 5000], 0)
+                .await
+                .unwrap();
+            m.stats.tiered_keys.fetch_add(1, Ordering::Relaxed);
+            let before = m.stats.gc_reclaimed_bytes.load(Ordering::Relaxed);
+            m.on_key_overwritten(ptr, false);
+            assert_eq!(
+                m.stats.gc_reclaimed_bytes.load(Ordering::Relaxed) - before,
+                2 * PAGE_SIZE as u64
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_growing_the_file_keeps_punched_holes() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tier_test_dir("prealloc");
+        block_on(async {
+            let m = ShardTierManager::open(0, 55564, &dir).await.unwrap();
+            let allocated = || std::fs::metadata(&m.path).unwrap().blocks() * 512;
+            m.ensure_preallocated(PAGE_SIZE as u64);
+            let chunk = m.preallocated_len.get();
+            if allocated() < chunk {
+                return; // The filesystem does not preallocate; nothing to keep.
+            }
+            let hole = 1 << 20;
+            assert!(ShardTierManager::punch_hole(&m.file, 0, hole, &m.stats));
+            m.ensure_preallocated(chunk + 1);
+            assert!(
+                allocated() <= 2 * chunk - hole,
+                "growth refilled the hole: {} allocated",
+                allocated()
+            );
         });
         let _ = std::fs::remove_dir_all(&dir);
     }
