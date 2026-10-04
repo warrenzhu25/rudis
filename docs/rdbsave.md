@@ -19,36 +19,30 @@ familiar with real Redis might expect, that is called out explicitly.
   copy-on-write page semantics for snapshot isolation. A grep for `libc::fork`/`fn fork` across
   `src/` returns zero results. This is a real architectural difference from stock Redis, not
   merely a re-description of it.
-- **Blocking, synchronous file I/O, not `io_uring`.** The RDB writer (`Router::perform_save_rdb`,
-  `src/router.rs`) uses ordinary blocking `std::fs::File` plus `std::io::Write` — `File::create`,
-  `write_all`, `sync_all`, `std::fs::rename`. It does **not** use `io_uring` or `monoio`'s async
-  file I/O. (Rudis's AOF subsystem, by contrast, does use `monoio`'s async `write_all_at`/
-  `sync_data` for its periodic flush — see `src/server.rs`'s `ShardMessage::FlushAof` handler.
-  RDB save and AOF flush use different I/O strategies.)
-- **No true isolation from concurrent writes.** Because there is no fork and no MVCC/versioned
-  data structure, an RDB save is a synchronous scan of each shard's live hash table at the moment
-  that shard processes the save request. Concurrent client writes to keys **not yet visited** by
-  the scan on a given shard will be reflected in the snapshot; writes to keys **already visited**
-  will not. This means a Rudis RDB snapshot is not a strict single-instant point-in-time view the
-  way a forked child process's CoW-isolated memory is — it is closer to a fuzzy/non-atomic dump,
-  consistent per shard.
-- **Sequential, one-shard-at-a-time collection — this part is real.** The coordinating shard
-  serializes its own data first, then messages each other shard in turn over the existing
-  cross-shard mailbox channel (`ShardMessage::SaveRdbChunk`), waits for that shard's full
-  serialized chunk, appends it to the output file, and only then asks the next shard. Only one
-  shard's chunk is held in memory at a time; there is no gather step across all shards
-  simultaneously.
-- **Each remote shard's own serialization work fully blocks that shard's reactor thread.**
-  `ShardDb::save_rdb_chunk` is a plain, non-yielding loop over that shard's entire hash table
-  (up to `table.capacity()`, i.e. it walks allocated-but-empty slots too, not just live entries).
-  Nothing about it is `.await`-broken into smaller units. Because Rudis's shards are
-  single-threaded `monoio` reactors, this means **every other client connection pinned to that
-  shard stalls for the duration of that shard's own serialization**, even during a `BGSAVE`. The
-  "background" in `BGSAVE` means the connection that issued the command gets its `+OK`-style
-  reply immediately (the actual save runs in a separately spawned `monoio` task) — it does not
-  mean the save runs off the shard's own core, since `monoio` is thread-per-core with no
-  work-stealing. `SAVE`, unlike `BGSAVE`, blocks the issuing client's own connection until the
-  entire multi-shard save completes.
+- **File I/O on a dedicated `rdb-writer` thread, not `io_uring`.** `Router::perform_save_rdb`
+  (`src/router.rs`) spawns an `rdb-writer` thread that writes the header, appends every shard's
+  serialized pieces, computes the CRC64, then `sync_all`s, renames and fsyncs the directory,
+  using ordinary blocking `std::fs`/`std::io::Write`. No shard thread does file I/O or the CRC
+  for a save. (The AOF uses `monoio`'s async `write_all_at`/`sync_data` instead.)
+- **No true isolation from concurrent writes.** There is no fork and no MVCC, so a save is a
+  scan of each shard's live table while that shard keeps serving clients. Each key is written as
+  it is when the scan reaches it: the snapshot is consistent per key, not a single point in time
+  (closer to a fuzzy dump).
+- **Shards stream one after another.** The coordinating shard asks each shard in turn
+  (`ShardMessage::StreamRdbChunk`) to serialize its keyspace and send it to the writer in
+  ~4 MB pieces through a rendezvous channel, so the file layout is one shard after another and
+  memory stays at a few pieces rather than a whole shard.
+- **Serialization yields every ~1 ms.** `save_rdb_chunk_yielding` (`src/shard.rs`) serializes
+  a few table segments at a time and yields to the shard's other tasks between steps, so a
+  `BGSAVE` adds latency in ~1 ms slices instead of stalling a shard for its whole dataset. A
+  key moved by a segment split mid-save can be written twice; loading keeps the later copy.
+  Replica full syncs still serialize each shard in one non-yielding pass
+  (`ShardDb::save_rdb_chunk`), because the replication stream is cut right after serializing.
+- **NVMe-tiered keys are saved with their real value and type.** A `RudisValue::Tiered` entry
+  is read back from the tier file (CRC- and type-checked) and its payload is written verbatim,
+  before anything else for that key, so a failed read skips the key cleanly (logged) instead of
+  corrupting the file. Tiering state itself is not persisted: the key loads as an ordinary
+  in-memory key. `BGREWRITEAOF` decodes tiered values the same way.
 - **CRC64 checksum is a plain bitwise loop, not SIMD.** `crc64`/`crc64_update` in `src/table.rs`
   are a textbook bit-at-a-time CRC-64/XZ implementation (poly `0x42F0E1EBA9EA3693`). There is no
   vectorized/SIMD CRC64 anywhere in the codebase.
@@ -76,7 +70,7 @@ figures in this file were not traceable to any benchmark artifact in the reposit
 | Client request | `SAVE` | Yes — blocks the issuing connection until the whole multi-shard save (all shards) completes. |
 | Client request | `BGSAVE` | No — returns `+Background saving started` immediately; the save runs in a `monoio::spawn`-ed task on the same core as the connection that issued it. |
 | Replica initial sync | `PSYNC`/full resync | The master serializes a full in-memory RDB image (`Router::generate_full_rdb`) and streams it as the bulk payload following a `+FULLRESYNC <replid> <offset>\r\n$<len>\r\n` header. This reuses the same per-shard chunk serialization as `SAVE`/`BGSAVE`, but builds the entire image in memory and never writes it to disk. |
-| Automatic/periodic | *(none found)* | Rudis's config parser recognizes the classic Redis `save <seconds> <changes>` directive syntax, but only stores it verbatim in an `extra_directives` map (`src/config.rs`). No code path in `src/router.rs` or `src/server.rs` reads this value to schedule an automatic `BGSAVE`. **There is currently no automatic, save-point-triggered background snapshotting** — despite the directive being accepted in `rudis.conf` without a parse error, it has no runtime effect. |
+| Automatic/periodic | `save <seconds> <changes>` | No — shard 0 checks the configured save points every 100 ms (`run_shard_worker`, `src/server.rs`) and runs a `BGSAVE` when one is due, like Redis's `serverCron`. There are no default save points; with none configured nothing is saved automatically. Save points also make `SHUTDOWN`/`SIGTERM` save before exiting. |
 | Server startup | `dump.rdb` restore | If AOF persistence is **disabled**, each shard independently reads and parses the entire `dump.rdb` file from its data directory on startup (`crate::table::load_rdb`, called from `src/server.rs`) and keeps only the keys that hash to itself, discarding the rest. If AOF is enabled, AOF is authoritative and RDB restore is skipped entirely (matching the same AOF-precedence convention as Redis). |
 
 `is_saving: AtomicBool` on `Router` guards both `SAVE` and `BGSAVE` (and `BGREWRITEAOF`, which
@@ -99,14 +93,11 @@ backed by a real global dirty-write counter.
    attempts — blocked in practice by `is_saving` — would not collide).
 2. The 9-byte header `b"REDIS0011"` followed by a `SELECTDB` opcode pair (`0xFE, 0x00`) is
    written, and a running CRC64 accumulator is seeded from those bytes.
-3. **Local shard first**: the coordinating shard serializes its own `ShardDb` into an in-memory
-   `Vec<u8>` (`ShardDb::save_rdb_chunk`), folds it into the CRC64 accumulator, writes it to the
-   temp file, and drops the buffer.
-4. **Remote shards, one at a time**: for every other shard (in shard-index order), the
-   coordinator sends a `ShardMessage::SaveRdbChunk` over that shard's existing cross-shard mailbox
-   channel and awaits the response. The target shard, on its own reactor thread, runs the same
-   `ShardDb::save_rdb_chunk` synchronously and sends the resulting `Vec<u8>` back. The coordinator
-   folds it into the CRC64, writes it, and drops the buffer before moving to the next shard.
+3. The writer side runs on an `rdb-writer` thread; the coordinating shard asks each shard, in
+   shard-index order, to stream its keyspace (`ShardMessage::StreamRdbChunk`). Each shard runs
+   `save_rdb_chunk_yielding`: it serializes ~1 ms worth of table segments at a time (yielding to
+   its clients in between) and sends ~4 MB pieces to the writer through a rendezvous channel.
+4. The writer folds every piece into the CRC64 and writes it with a buffered writer.
 5. A single `0xFF` EOF opcode and the final 8-byte little-endian CRC64 are appended.
 6. `file.sync_all()` fsyncs the temp file's data and metadata.
 7. `std::fs::rename(tmp, "dump.rdb")` atomically replaces the previous snapshot.
@@ -127,20 +118,17 @@ backed by a real global dirty-write counter.
 So an RDB file produced by `SAVE`/`BGSAVE` is not limited to the classic Redis value types — it
 also round-trips Rudis's JSON store, probabilistic structures, vector indexes, and CRDT state.
 
-### 3.1 A known gap: tiered (spilled) values
+### 3.1 Tiered (spilled) values
 
 `RudisValue` has two variants used by the NVMe tiered-storage subsystem (Component 07):
 `Tiered(TieredPointer)` (value spilled to disk, not resident) and `Cooled { ptr, val }` (resident
-but tracked for eviction). `serialize_val_payload`'s match arm for `Cooled` correctly delegates to
-serializing the wrapped `val`. **The arm for `Tiered` writes nothing at all** (`RudisValue::Tiered(_)
-=> {}`) — not even a type tag. Since `save_rdb_chunk` always writes the key length and key bytes
-before calling `serialize_val_payload`, a key whose value is currently `Tiered` at the moment of
-save produces a key with zero payload bytes, which desynchronizes the reader's cursor for
-everything that follows it in that shard's chunk. This is a genuine correctness edge case in the
-current implementation, not a hypothetical one — it has not been observed to be specially handled
-(e.g. by forcing tiered values to be loaded back into RAM before a save) anywhere in the save
-path. Anyone relying on RDB snapshots while tiered storage is active and keys are actively spilled
-should be aware of this.
+but tracked for eviction). `Cooled` is saved from its in-memory `val`. For `Tiered`,
+`ShardDb::save_rdb_entry` reads the record back from the tier file (`read_ptr_sync`, which checks
+the record's CRC and header type) and, since the record already holds the value in
+`serialize_val_payload` form, writes that payload verbatim after checking its type tag. The read
+happens before the expiry opcode or key is written, so a failed read skips the key (logged as an
+error) without corrupting the rest of the chunk. Earlier versions wrote nothing for `Tiered`
+(desynchronizing the reader) and later re-encoded the payload as a string (losing the value's type).
 
 ---
 

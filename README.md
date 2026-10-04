@@ -431,13 +431,15 @@ Understand what "durable" means here today before relying on it:
 - **RDB autosave**: `save <seconds> <changes>` points schedule `BGSAVE` like Redis. Unlike
   Redis there are no default save points; with none configured, nothing is saved automatically
   (and not on shutdown).
-- **A known data-integrity gap**: keys currently offloaded to NVMe tiering
-  (`RudisValue::Tiered`) serialize to **zero bytes** in an RDB image — see
-  [`docs/rdbsave.md`](docs/rdbsave.md) before combining NVMe tiering with RDB-based backup in
-  production.
-- `SAVE`/`BGSAVE` never `fork()`s, but each shard's serialization work is synchronous and blocks
-  that shard's reactor for its duration — a `BGSAVE` is not a zero-impact operation on the shard
-  being saved, proportional to that shard's dataset size.
+- **NVMe-tiered keys** (`RudisValue::Tiered`) are read back from the tier and written with their
+  real value and type by `SAVE`/`BGSAVE` and `BGREWRITEAOF`. After a restart they come back as
+  ordinary in-memory keys (tiering state itself is not persisted). A tiered record that can't be
+  read (I/O error, CRC mismatch) is logged and left out of the snapshot.
+- `SAVE`/`BGSAVE` never `fork()`. Each shard serializes its keyspace in steps of at most ~1ms and
+  yields between them, and CRC, file writes and fsync run on a separate `rdb-writer` thread, so a
+  `BGSAVE` adds latency in ~1ms slices rather than stalling a shard for its whole dataset. The
+  snapshot is consistent per key, not a single point in time (see
+  [`docs/rdbsave.md`](docs/rdbsave.md)).
 
 ### Memory Sizing & Eviction
 
@@ -516,16 +518,15 @@ mutex/cache-line-bouncing cost of a traditional shared-memory multi-threaded sto
 
 - Rudis's `SAVE`/`BGSAVE` never calls `fork()` — there is no reliance on Linux copy-on-write
   page duplication for snapshot isolation, which is a real difference from stock Redis.
-- This does **not** mean the save path is `io_uring`-accelerated or truly async: RDB writing
-  uses ordinary blocking `std::fs::File`/`std::io::Write`, one shard's serialized chunk at a
-  time, and **each shard's own serialization work fully blocks that shard's reactor** for its
-  duration — `BGSAVE` returns immediately to the *issuing* connection, but every other client
-  pinned to a shard currently being saved will stall while that shard serializes.
+- The save path is not `io_uring`-based: shards serialize their keyspace segment by segment in
+  steps of at most ~1ms, yielding to their other clients in between, and stream ~4MB pieces to
+  an `rdb-writer` thread that does the CRC, buffered `std::fs` writes, fsync and rename. A
+  `BGSAVE` therefore adds small latency slices on every shard instead of stalling one shard for
+  its whole dataset.
 - Reflink (`ioctl(FICLONE)`) snapshotting is real, working code — but it belongs to the NVMe
   tiered-storage subsystem (`TIER.SNAPSHOT`), not to `SAVE`/`BGSAVE`. The two are unrelated
   features that happen to both be called "snapshotting."
-- Full detail, including the exact save-trigger table and known gaps (no automatic
-  `save N M` scheduling), is in [`docs/rdbsave.md`](docs/rdbsave.md).
+- Full detail, including the save-trigger table, is in [`docs/rdbsave.md`](docs/rdbsave.md).
 
 ### 3. Redis 7 Sharded Pub/Sub & Striped Presence Bitmask
 
@@ -575,9 +576,8 @@ Rudis implements **two independent replication protocols on the master side**:
 - **Direct I/O**: reads/writes bypass the page cache via `O_DIRECT`; space reclamation uses
   `fallocate(FALLOC_FL_PUNCH_HOLE)`.
 - Details: [`docs/design/07_nvme_tiering.md`](docs/design/07_nvme_tiering.md) and
-  [`docs/design/tiered_storage.md`](docs/design/tiered_storage.md) (the latter also documents a
-  real correctness gap: `RudisValue::Tiered` values currently serialize to zero bytes in a
-  `SAVE`/`BGSAVE` RDB image — see that document for scope and status).
+  [`docs/design/tiered_storage.md`](docs/design/tiered_storage.md). Tiered keys are read back
+  and saved with their real value and type by `SAVE`/`BGSAVE` and `BGREWRITEAOF`.
 
 ### 7. Kernel-Bypass Networking & TLS: Status
 
@@ -655,7 +655,7 @@ links go to the corresponding source-verified subsystem specification.
 | **Pub/Sub incl. Sharded Pub/Sub** | Implemented | 16-stripe presence bitmask; CRC16 slot routing for `SPUBLISH`. | [19](docs/design/19_pubsub.md), [pub-sub.md](docs/pub-sub.md) |
 | **Scripting & Functions** | Implemented | `EVAL`/`EVALSHA` and `FUNCTION`/`FCALL` via sandboxed `mlua` (Lua 5.4). | [13](docs/design/13_scripting_functions.md) |
 | **ACL & Security** | Implemented | Per-user permissions, category selectors, `AUTH`. | [15](docs/design/15_security_tls.md) |
-| **RDB persistence** | Implemented, with gaps | No `fork()`; blocking, per-shard-sequential file I/O; persists KV, Vector Sets, and extended `RDBX` search/vector indexes; `RudisValue::Tiered` serializes to zero bytes today. | [rdbsave.md](docs/rdbsave.md) |
+| **RDB persistence** | Implemented, with gaps | No `fork()`; shards serialize in ~1ms yielding steps, I/O on an `rdb-writer` thread; persists KV (including NVMe-tiered keys), Vector Sets, and extended `RDBX` search/vector indexes; the snapshot is not a single point in time. | [rdbsave.md](docs/rdbsave.md) |
 | **AOF persistence** | Implemented | Async (`monoio`) periodic flush, distinct I/O strategy from RDB save. | [14](docs/design/14_persistence_replication.md) |
 | **Replication (`PSYNC`)** | Implemented | Single-connection, used for all Rudis-to-Rudis replication. | [replication.md](docs/replication.md) |
 | **Replication (`DFLY FLOW`)** | Implemented, narrow scope | Master-side only, for Dragonfly-protocol clients; Rudis replicas never use it. | [replication.md](docs/replication.md) |
@@ -667,7 +667,7 @@ links go to the corresponding source-verified subsystem specification.
 | **HNSW & Redis 8 Vector Sets (`V*`)** | Implemented | Redis 8 Vector Sets (`VADD`/`VSIM`/`VEMB`/`VLINKS`/`VSETATTR`), Cosine/L2/IP SIMD kernels, SQ8/BIN/PQ compression, `REDUCE` projection, NVMe `.vtier` disk reranking (`TIERED` + `RERANK`). | [08](docs/design/08_vector_engine.md) |
 | **Agent memory, LLM quota & checkpoints** | Implemented, with a gap | Working + HNSW episodic memory (`AGENT.MEM.*`), DAG checkpoints (`AGENT.CHECKPOINT.*`), tool leases (`AGENT.TOOL.*`) all get RDB+AOF/replication coverage; the RPM/TPM quota governor (`LLM.QUOTA.*`) has none and resets on restart. | [20](docs/design/20_agent_memory.md) |
 | **MCP server & semantic cache** | Implemented | Built-in MCP JSON-RPC 2.0 server (`MCP.*`, 11 tools) translating into ordinary commands via the normal dispatch path; semantic cache (`SEMANTIC.*`) lives in `src/vector.rs`. | [21](docs/design/21_mcp_server.md), [08](docs/design/08_vector_engine.md) |
-| **NVMe tiered storage** | Implemented, with a known gap | Hot/Cooled/Cold lifecycle, `SmallBins`, Direct I/O; see tiered-value RDB gap above. | [07](docs/design/07_nvme_tiering.md), [tiered_storage.md](docs/design/tiered_storage.md) |
+| **NVMe tiered storage** | Implemented | Hot/Cooled/Cold lifecycle, `SmallBins`, Direct I/O; tiered keys are written with their real value and type by `SAVE`/`BGSAVE` and `BGREWRITEAOF`. | [07](docs/design/07_nvme_tiering.md), [tiered_storage.md](docs/design/tiered_storage.md) |
 | **`TIER.SNAPSHOT` reflink checkpoints** | Implemented | Real `ioctl(FICLONE)` cloning of the NVMe tier's backing file — unrelated to `SAVE`/`BGSAVE`. | [tiered_storage.md](docs/design/tiered_storage.md) |
 | **Multi-region CRDTs** | Implemented, manual sync only | LWW-Register, OR-Set, PN-Counter with HLC ordering; export/merge (`CRDT.DUMP`/`CRDT.MERGE`) is explicit and manual — there is no automatic peer discovery or background cross-region streaming. | [12](docs/design/12_crdt_types.md) |
 | **AF_XDP kernel bypass** | Experimental, not on live path | Real, unit-tested data structures; reachable only via `XDP.*` admin commands, not real NIC/eBPF I/O. | [10](docs/design/10_kernel_bypass_xdp.md) |

@@ -478,13 +478,14 @@ agent-runtime (`AGENT.*`) commands are **not** affected — all of those do have
 (`Router::perform_save_rdb`, `Router::generate_full_rdb`, `run_shard_replication_flow`, and the cross-shard
 `ShardMessage::SaveRdbChunk` responder all call `ShardDb::save_rdb_chunk`, never `RudisTable::save_rdb_chunk`) —
 writes, per live table entry: an optional `0xFC` `EXPIRETIME_MS` opcode + 8-byte unix-ms expiry, then
-`key_len:u32 | key_bytes`, then the value payload. For `RudisValue::Tiered(ptr)` specifically, it now hydrates
-via `self.tier_manager.read_ptr_sync(*ptr)` and writes the hydrated bytes as a normal `String` payload (type byte
-`0`) — **this is a fix, not a re-confirmation of the previously-known bug**: a prior revision of this document
-found `RudisValue::Tiered` serialized to zero bytes; that is no longer true for the code path actually used in
-production, per commit `7c7061e` ("hydrate NVMe tiered values on RDB snapshot and AOF compaction"). After restore,
-a previously-tiered key comes back as a regular hot `String` entry — tiering state itself is not round-tripped,
-only the value.
+`key_len:u32 | key_bytes`, then the value payload. For `RudisValue::Tiered(ptr)` specifically, it reads the
+record back via `self.tier_manager.read_ptr_sync(*ptr)` *before* writing anything for the entry and, because the
+record already holds the value in `serialize_val_payload` form, writes that payload verbatim (after checking its
+type tag against `ptr.value_type`), so tiered hashes, lists, sets and zsets keep their type. A failed read skips
+the whole entry and logs an error, rather than leaving a dangling `0xFC` opcode. (History: the code once wrote
+zero bytes for `Tiered`, then re-wrapped the encoded payload as a `String`, corrupting every spilled key.) After
+restore, a previously-tiered key comes back as a regular hot entry of its original type — tiering state itself is
+not round-tripped, only the value.
 
 It then calls `save_extended_rdb_chunk` (`shard.rs:2320-2656`), which appends one additional tagged record per
 entry in each of these `ShardDb` side-stores, using the **same** `key_len:u32 | key_bytes | type_byte | ...`
