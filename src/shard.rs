@@ -2122,6 +2122,14 @@ impl ShardDb {
 
     #[inline]
     pub fn dump(&mut self, key: &[u8]) -> Option<Vec<u8>> {
+        // A key still on the tier (it is only loaded back when memory
+        // allows) is dumped from its record, which already holds the value
+        // in DUMP's payload encoding.
+        if let Some(ptr) = self.table.is_tiered(key) {
+            let mut payload = self.read_tiered_payload(ptr)?;
+            crate::table::RudisTable::seal_dump_payload(&mut payload);
+            return Some(payload);
+        }
         self.table.dump(key)
     }
 
@@ -4334,6 +4342,40 @@ mod tests {
             .await
             .unwrap();
         assert!(db.table.set_tiered_pointer(key, ptr));
+    }
+
+    #[test]
+    fn test_dump_of_tiered_key_restores_its_value() {
+        let dir = std::env::temp_dir().join(format!("rudis_tier_dump_{}", std::process::id()));
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut db = ShardDb::new(0);
+            db.tier_manager = Some(std::rc::Rc::new(
+                crate::tiering::ShardTierManager::open(0, 55558, &dir)
+                    .await
+                    .unwrap(),
+            ));
+            db.hset(
+                Bytes::from_static(b"h"),
+                vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))],
+            )
+            .unwrap();
+            spill_for_test(&mut db, b"h").await;
+
+            let payload = db.dump(b"h").expect("tiered key dumps");
+            let mut other = ShardDb::new(0);
+            other
+                .restore(Bytes::from_static(b"h2"), 0, &payload, false, false)
+                .unwrap();
+            assert_eq!(
+                other.hget(b"h2", b"f").unwrap(),
+                Some(Bytes::from_static(b"v"))
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

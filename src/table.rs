@@ -13604,12 +13604,16 @@ impl RudisTable {
         let entry = self.table.get_slot(idx)?;
         let mut payload = Vec::new();
         Self::serialize_val_payload(&entry.val, &mut payload);
-        // 2-byte RDB version: 10
-        payload.extend_from_slice(&10u16.to_le_bytes());
-        // 8-byte CRC64
-        let crc = crc64(&payload);
-        payload.extend_from_slice(&crc.to_le_bytes());
+        Self::seal_dump_payload(&mut payload);
         Some(payload)
+    }
+
+    /// Appends DUMP's trailer to a `serialize_val_payload` encoding: the
+    /// 2-byte RDB version (10) and a CRC64 of everything before it.
+    pub fn seal_dump_payload(payload: &mut Vec<u8>) {
+        payload.extend_from_slice(&10u16.to_le_bytes());
+        let crc = crc64(payload);
+        payload.extend_from_slice(&crc.to_le_bytes());
     }
 
     pub fn restore(

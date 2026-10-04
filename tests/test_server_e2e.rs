@@ -18194,6 +18194,43 @@ fn test_bgrewriteaof_keeps_tiered_keys_with_their_types_e2e() {
 }
 
 #[test]
+fn test_dump_of_tiered_key_over_maxmemory_is_restorable_e2e() {
+    let port = 17074;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "1", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["HSET", "td:h", "f", "v"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["TIER", "SPILL", "td:h"]), ":1\r\n");
+    // Over maxmemory the key can't be loaded back, so DUMP must work from
+    // the tier record itself.
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory", "1"]),
+        "+OK\r\n"
+    );
+    let dump = send_and_read_bytes(&mut c, b"*2\r\n$4\r\nDUMP\r\n$4\r\ntd:h\r\n");
+    assert_eq!(dump[0], b'$', "{:?}", String::from_utf8_lossy(&dump));
+    let nl = dump.iter().position(|&b| b == b'\n').unwrap();
+    let len: usize = std::str::from_utf8(&dump[1..nl - 1])
+        .unwrap()
+        .parse()
+        .unwrap();
+    let payload = &dump[nl + 1..nl + 1 + len];
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "maxmemory", "0"]),
+        "+OK\r\n"
+    );
+    let mut restore =
+        format!("*4\r\n$7\r\nRESTORE\r\n$5\r\ntd:h2\r\n$1\r\n0\r\n${len}\r\n").into_bytes();
+    restore.extend_from_slice(payload);
+    restore.extend_from_slice(b"\r\n");
+    assert_eq!(send_and_read(&mut c, &restore), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["HGET", "td:h2", "f"]), "$1\r\nv\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}
+
+#[test]
 fn test_sigterm_drains_clients_and_keeps_every_acked_write_e2e() {
     let port = 17073;
     let dir = std::env::temp_dir().join(format!("rudis-drain-e2e-{}", std::process::id()));
