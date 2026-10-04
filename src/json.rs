@@ -284,6 +284,22 @@ pub fn query_json_path_mut<'a>(
     current
 }
 
+/// Most `null` slots `JSON.SET` pads an array with to reach an index past its end.
+const MAX_SET_INDEX_GAP: usize = 1 << 16;
+
+/// Resolves the array index `JSON.SET` writes: negative indexes count from the end
+/// and must land inside the array; positive ones may extend it by at most
+/// [`MAX_SET_INDEX_GAP`] padding `null`s (the client-chosen index used to drive an
+/// unbounded padding loop).
+fn set_index(len: usize, idx: isize) -> Result<usize, &'static str> {
+    let actual = if idx < 0 {
+        len.checked_sub(idx.unsigned_abs())
+    } else {
+        Some(idx as usize).filter(|&i| i.saturating_sub(len) <= MAX_SET_INDEX_GAP)
+    };
+    actual.ok_or("ERR index out of bounds")
+}
+
 /// Sets a JSON value at the specified JSONPath.
 /// Creates intermediate objects if necessary.
 /// Respects `nx` (only set if target does not exist) and `xx` (only set if target exists).
@@ -336,14 +352,8 @@ pub fn set_json_path(
                     *curr = Value::Array(Vec::new());
                 }
                 let arr = curr.as_array_mut().unwrap();
-                let actual_idx = if *idx < 0 {
-                    (arr.len() as isize + idx) as usize
-                } else {
-                    *idx as usize
-                };
-                while arr.len() <= actual_idx {
-                    arr.push(Value::Null);
-                }
+                let actual_idx = set_index(arr.len(), *idx)?;
+                arr.resize(arr.len().max(actual_idx + 1), Value::Null);
                 curr = &mut arr[actual_idx];
             }
             _ => return Err("ERR wildcards not supported as parent path for SET"),
@@ -365,14 +375,8 @@ pub fn set_json_path(
                 *curr = Value::Array(Vec::new());
             }
             let arr = curr.as_array_mut().unwrap();
-            let actual_idx = if *idx < 0 {
-                (arr.len() as isize + idx) as usize
-            } else {
-                *idx as usize
-            };
-            while arr.len() <= actual_idx {
-                arr.push(Value::Null);
-            }
+            let actual_idx = set_index(arr.len(), *idx)?;
+            arr.resize(arr.len().max(actual_idx + 1), Value::Null);
             arr[actual_idx] = new_value;
             Ok(true)
         }
@@ -987,5 +991,41 @@ mod tests {
         assert!(get_res.contains("20"));
         assert!(get_res.contains("50"));
         assert!(get_res.contains("100"));
+    }
+
+    /// Array indexes in JSON.SET paths are bounded: negative ones must hit the
+    /// array and positive ones may pad it by at most MAX_SET_INDEX_GAP nulls
+    /// (`$.a[9223372036854775807]` used to pad forever).
+    #[test]
+    fn test_set_json_path_bounds_array_index() {
+        let mut v: Value = serde_json::from_str(r#"{"a":[1,2,3]}"#).unwrap();
+        for path in ["$.a[9223372036854775807]", "$.a[-4]", "$.a[99999999][0]"] {
+            assert_eq!(
+                set_json_path(&mut v, path, json!(1), false, false),
+                Err("ERR index out of bounds"),
+                "{path}"
+            );
+        }
+        assert_eq!(v, json!({"a": [1, 2, 3]}));
+        let mut fresh = json!({});
+        assert_eq!(
+            set_json_path(&mut fresh, "$.b[-1]", json!(1), false, false),
+            Err("ERR index out of bounds")
+        );
+        assert_eq!(
+            set_json_path(&mut v, "$.a[-1]", json!(9), false, false),
+            Ok(true)
+        );
+        assert_eq!(
+            set_json_path(&mut v, "$.a[5]", json!(7), false, false),
+            Ok(true)
+        );
+        assert_eq!(v, json!({"a": [1, 2, 9, null, null, 7]}));
+        let gap = format!("$.c[{MAX_SET_INDEX_GAP}]");
+        assert_eq!(
+            set_json_path(&mut v, &gap, json!(1), false, false),
+            Ok(true)
+        );
+        assert_eq!(v["c"].as_array().unwrap().len(), MAX_SET_INDEX_GAP + 1);
     }
 }

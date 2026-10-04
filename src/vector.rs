@@ -2,6 +2,19 @@ use bytes::Bytes;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
+/// Largest vector dimension accepted from clients (`FT.CREATE`/`FT.ALTER ... DIM`,
+/// `VADD`), the same limit as Redis vector sets (`VSET_MAX_VECTOR_DIM`).
+pub const MAX_VECTOR_DIM: usize = 1 << 16;
+/// Largest HNSW `M` accepted from clients, as Redis' `HNSW_MAX_M`.
+pub const MAX_HNSW_M: usize = 4096;
+/// Largest `EF` accepted by `VADD`/`VSIM`, as in Redis vector sets.
+pub const MAX_VSET_EF: usize = 1_000_000;
+/// Largest `VADD ... REDUCE` projection matrix (input dim x reduced dim), 64 MiB of f32.
+pub const MAX_PROJECTION_ENTRIES: usize = 1 << 24;
+/// Most f32 slots a `FLAT` index preallocates for `INITIAL_CAP` (64 MiB); the index
+/// still grows on demand past it.
+const FLAT_INITIAL_RESERVE_FLOATS: usize = 1 << 24;
+
 /// Supported vector distance metrics
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VectorMetric {
@@ -1085,7 +1098,7 @@ impl HnswIndex {
         ef_runtime: usize,
     ) -> Self {
         let mut idx = Self::new(name, dim, metric);
-        let m = m.max(2);
+        let m = m.clamp(2, MAX_HNSW_M);
         idx.m = m;
         idx.m0 = m * 2;
         idx.ml = 1.0 / (m as f64).ln();
@@ -1836,7 +1849,7 @@ impl HnswIndex {
 
         // 2. Layer 0 search with ef_search
         let search_ef = if rerank {
-            base_ef.max(k * 3)
+            base_ef.max(k.saturating_mul(3))
         } else {
             base_ef.max(k)
         };
@@ -2519,13 +2532,15 @@ pub struct FlatIndex {
 
 impl FlatIndex {
     pub fn new(name: String, dim: usize, metric: VectorMetric, initial_cap: usize) -> Self {
-        let cap = initial_cap.min(1 << 20);
+        let cap = initial_cap
+            .min(1 << 20)
+            .min(FLAT_INITIAL_RESERVE_FLOATS / dim.max(1));
         Self {
             name,
             dim,
             metric,
             keys: Vec::with_capacity(cap),
-            data: Vec::with_capacity(cap.saturating_mul(dim)),
+            data: Vec::with_capacity(cap * dim),
             key_to_pos: HashMap::with_capacity(cap),
         }
     }
@@ -2587,7 +2602,8 @@ impl FlatIndex {
         if k == 0 || query.len() != self.dim {
             return Vec::new();
         }
-        let mut heap: BinaryHeap<FurthestCandidate> = BinaryHeap::with_capacity(k + 1);
+        let mut heap: BinaryHeap<FurthestCandidate> =
+            BinaryHeap::with_capacity(k.min(self.keys.len()) + 1);
         for (pos, key) in self.keys.iter().enumerate() {
             if let Some(f) = filter
                 && !f(key)
@@ -3301,5 +3317,36 @@ mod tests {
         if let Some(p) = &idx.tier_path {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    /// Client-chosen DIM, INITIAL_CAP, KNN k and M must not drive allocations
+    /// or arithmetic past the index's actual size.
+    #[test]
+    fn test_client_sizes_do_not_overflow_or_overallocate() {
+        let flat = FlatIndex::new("f".into(), MAX_VECTOR_DIM, VectorMetric::L2, usize::MAX);
+        assert!(flat.data.capacity() <= FLAT_INITIAL_RESERVE_FLOATS);
+        assert!(flat.keys.capacity() * MAX_VECTOR_DIM <= FLAT_INITIAL_RESERVE_FLOATS);
+        // Small indexes keep their full INITIAL_CAP reservation.
+        let small = FlatIndex::new("s".into(), 4, VectorMetric::L2, 1024);
+        assert!(small.keys.capacity() >= 1024 && small.data.capacity() >= 4096);
+
+        let mut flat = FlatIndex::new("f".into(), 2, VectorMetric::L2, 16);
+        flat.add(Bytes::from_static(b"a"), vec![0.0, 0.0]).unwrap();
+        flat.add(Bytes::from_static(b"b"), vec![1.0, 1.0]).unwrap();
+        let hits = flat.search_filtered(&[0.0, 0.0], usize::MAX, None);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0.as_ref(), b"a");
+
+        let mut h = HnswIndex::with_params("h".into(), 2, VectorMetric::L2, usize::MAX, 8, 8);
+        assert_eq!(h.m, MAX_HNSW_M);
+        assert_eq!(h.m0, 2 * MAX_HNSW_M);
+        h.add(Bytes::from_static(b"a"), vec![1.0, 0.0]).unwrap();
+        h.add(Bytes::from_static(b"b"), vec![0.0, 1.0]).unwrap();
+        assert_eq!(
+            h.search_ext(&[1.0, 0.0], usize::MAX, Some(usize::MAX), true)
+                .len(),
+            2
+        );
+        assert_eq!(h.search_ext(&[1.0, 0.0], usize::MAX, None, false).len(), 2);
     }
 }

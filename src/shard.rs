@@ -3563,7 +3563,7 @@ impl ShardDb {
         let raw_hits = if truth {
             idx.search_exact(&query_vec, count, filter_opt)
         } else if filter.is_some() {
-            let eff_ef = filter_ef.or(ef).or(Some((count * 10).max(64)));
+            let eff_ef = filter_ef.or(ef).or(Some(count.saturating_mul(10).max(64)));
             let mut hits = idx.search_filtered(&query_vec, count, eff_ef, rerank, filter_opt);
             if hits.len() < count {
                 hits = idx.search_exact(&query_vec, count, filter_opt);
@@ -3891,7 +3891,7 @@ impl ShardDb {
         self.crdt_store.del(key)
     }
 
-    pub fn crdt_incrby(&mut self, key: Bytes, delta: i64) -> i64 {
+    pub fn crdt_incrby(&mut self, key: Bytes, delta: i64) -> Result<i64, &'static str> {
         self.crdt_store.counter_incr(key, delta)
     }
 
@@ -4088,7 +4088,7 @@ mod tests {
             Bytes::from_static(b"crdt:reg"),
             Bytes::from_static(b"val_crdt"),
         );
-        db.crdt_incrby(Bytes::from_static(b"crdt:cnt"), 99);
+        db.crdt_incrby(Bytes::from_static(b"crdt:cnt"), 99).unwrap();
 
         // 7. Add Vector
         let vec_doc = Bytes::from("doc:1");

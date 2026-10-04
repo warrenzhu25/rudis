@@ -261,6 +261,8 @@ impl OrSet {
     }
 }
 
+const PN_OVERFLOW: &str = "increment or decrement would overflow";
+
 /// Positive-Negative Counter (PN-Counter).
 /// Allows distributed atomic increments and decrements with commutative state merges.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -274,28 +276,31 @@ impl PnCounter {
         Self::default()
     }
 
-    pub fn value(&self) -> i64 {
-        // Summed in i128 and clamped: merged components can be anything up
-        // to i64::MAX, and the result must not depend on map order.
+    /// Exact counter value; summed in i128 so merged per-node maxima cannot overflow.
+    fn total(&self) -> i128 {
         let pos_sum: i128 = self.p.values().map(|&v| v as i128).sum();
         let neg_sum: i128 = self.n.values().map(|&v| v as i128).sum();
-        (pos_sum - neg_sum).clamp(i64::MIN as i128, i64::MAX as i128) as i64
+        pos_sum - neg_sum
     }
 
-    pub fn inc(&mut self, node_id: u16, delta: i64) {
-        // Components only grow (merge takes the maximum), so they saturate
-        // rather than wrap.
-        if delta >= 0 {
-            let p = self.p.entry(node_id).or_default();
-            *p = p.saturating_add(delta);
-        } else {
-            let n = self.n.entry(node_id).or_default();
-            *n = n.saturating_add(delta.checked_neg().unwrap_or(i64::MAX));
-        }
+    pub fn value(&self) -> i64 {
+        self.total().clamp(i64::MIN as i128, i64::MAX as i128) as i64
     }
 
-    pub fn dec(&mut self, node_id: u16, delta: i64) {
-        self.inc(node_id, delta.checked_neg().unwrap_or(i64::MAX));
+    /// Adds `delta` to this node's component. Like INCRBY, a change that would
+    /// overflow the value or a component is refused and leaves the counter as is.
+    pub fn inc(&mut self, node_id: u16, delta: i64) -> Result<(), &'static str> {
+        i64::try_from(self.total() + delta as i128).map_err(|_| PN_OVERFLOW)?;
+        let side = if delta >= 0 { &mut self.p } else { &mut self.n };
+        let cur = side.get(&node_id).copied().unwrap_or(0);
+        let next =
+            i64::try_from(cur as i128 + delta.unsigned_abs() as i128).map_err(|_| PN_OVERFLOW)?;
+        side.insert(node_id, next);
+        Ok(())
+    }
+
+    pub fn dec(&mut self, node_id: u16, delta: i64) -> Result<(), &'static str> {
+        self.inc(node_id, delta.checked_neg().ok_or(PN_OVERFLOW)?)
     }
 
     /// Merges another PN-Counter using component-wise maximum.
@@ -357,11 +362,18 @@ impl CrdtStore {
         false
     }
 
-    pub fn counter_incr(&mut self, key: Bytes, delta: i64) -> i64 {
+    pub fn counter_incr(&mut self, key: Bytes, delta: i64) -> Result<i64, &'static str> {
         let node_id = self.clock.node_id;
-        let c = self.counters.entry(key).or_default();
-        c.inc(node_id, delta);
-        c.value()
+        if let Some(c) = self.counters.get_mut(&key) {
+            c.inc(node_id, delta)?;
+            return Ok(c.value());
+        }
+        // Built aside so a refused increment does not leave an empty counter.
+        let mut c = PnCounter::new();
+        c.inc(node_id, delta)?;
+        let value = c.value();
+        self.counters.insert(key, c);
+        Ok(value)
     }
 
     pub fn counter_get(&self, key: &Bytes) -> i64 {
@@ -826,12 +838,12 @@ mod tests {
     #[test]
     fn test_pn_counter_convergence() {
         let mut c1 = PnCounter::new();
-        c1.inc(1, 10);
-        c1.dec(1, 2);
+        c1.inc(1, 10).unwrap();
+        c1.dec(1, 2).unwrap();
 
         let mut c2 = PnCounter::new();
-        c2.inc(2, 5);
-        c2.dec(2, 1);
+        c2.inc(2, 5).unwrap();
+        c2.dec(2, 1).unwrap();
 
         c1.merge(&c2);
         assert_eq!(c1.value(), (10 - 2) + (5 - 1)); // 12
@@ -880,9 +892,9 @@ mod tests {
         log.push(src.register_payload(b"gone"));
         assert!(src.del(&b("gone")));
         log.push(src.register_payload(b"gone"));
-        src.counter_incr(b("c"), 10);
+        src.counter_incr(b("c"), 10).unwrap();
         log.push(src.counter_payload(b"c"));
-        src.counter_incr(b("c"), -3);
+        src.counter_incr(b("c"), -3).unwrap();
         log.push(src.counter_payload(b"c"));
         for m in ["a", "b", "a"] {
             src.set_add(b("s"), b(m));
@@ -925,8 +937,8 @@ mod tests {
         src.set(b("r"), b("v"));
         src.set(b("d"), b("v"));
         src.del(&b("d"));
-        src.counter_incr(b("c"), 5);
-        src.counter_incr(b("c"), -2);
+        src.counter_incr(b("c"), 5).unwrap();
+        src.counter_incr(b("c"), -2).unwrap();
         src.set_add(b("s"), b("m1"));
         src.set_add(b("s"), b("m2"));
         src.set_rem(&b("s"), &b("m1"));
@@ -1011,17 +1023,46 @@ mod tests {
         assert!(dst.registers.is_empty());
     }
 
+    /// Like INCRBY, an increment that would overflow is refused and leaves the
+    /// counter unchanged (it used to panic, or wrap in release builds).
     #[test]
-    fn test_counter_saturates_instead_of_overflowing() {
+    fn test_pn_counter_refuses_overflow() {
         let mut c = PnCounter::new();
-        c.inc(1, i64::MAX);
-        c.inc(1, i64::MAX);
-        assert_eq!(c.p[&1], i64::MAX);
-        c.inc(2, i64::MAX);
+        c.inc(1, i64::MAX).unwrap();
+        assert_eq!(c.inc(1, 1), Err(PN_OVERFLOW));
         assert_eq!(c.value(), i64::MAX);
-        c.inc(1, i64::MIN);
-        c.dec(3, i64::MIN);
-        assert_eq!(c.n[&1], i64::MAX);
-        assert_eq!(c.p[&3], i64::MAX);
+        c.inc(1, i64::MIN + 1).unwrap();
+        assert_eq!(c.value(), 0);
+        // The value is back in range, but this node's positive side is full.
+        assert_eq!(c.inc(1, 1), Err(PN_OVERFLOW));
+        assert_eq!(c.dec(1, i64::MIN), Err(PN_OVERFLOW));
+        // A component holds a magnitude, and 2^63 does not fit in one.
+        assert_eq!(PnCounter::new().inc(1, i64::MIN), Err(PN_OVERFLOW));
+        assert_eq!(c.value(), 0);
+
+        // Merged per-node maxima may exceed i64 together; value() saturates.
+        let mut a = PnCounter::new();
+        a.inc(1, i64::MAX).unwrap();
+        let mut b = PnCounter::new();
+        b.inc(2, i64::MAX).unwrap();
+        a.merge(&b);
+        assert_eq!(a.value(), i64::MAX);
+
+        // Refused store increments leave no trace, not even an empty counter.
+        let mut store = CrdtStore::new(1);
+        assert_eq!(
+            store.counter_incr(Bytes::from_static(b"k"), i64::MIN),
+            Err(PN_OVERFLOW)
+        );
+        assert!(store.counters.is_empty());
+        store
+            .counter_incr(Bytes::from_static(b"k"), i64::MAX)
+            .unwrap();
+        let before = store.counters.clone();
+        assert_eq!(
+            store.counter_incr(Bytes::from_static(b"k"), 1),
+            Err(PN_OVERFLOW)
+        );
+        assert_eq!(store.counters, before);
     }
 }

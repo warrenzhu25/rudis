@@ -2798,6 +2798,23 @@ pub fn is_experimental_command_name(name: &str) -> bool {
     EXPERIMENTAL_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
+/// Most elements a negative (repeating) `SRANDMEMBER`/`HRANDFIELD`/`ZRANDMEMBER`/
+/// `VRANDMEMBER` count may ask for. Redis streams such replies; rudis builds them in
+/// memory first, so a count near -i64::MAX hung the shard or exhausted memory.
+pub const MAX_RANDOM_REPEATS: i64 = 1 << 20;
+
+/// Parses the `count` of the `*RANDMEMBER`/`HRANDFIELD` family.
+fn parse_random_count(arg: &[u8]) -> Result<i64, String> {
+    let c: i64 = std::str::from_utf8(arg)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| "value is not an integer or out of range".to_string())?;
+    if c < -MAX_RANDOM_REPEATS {
+        return Err("value is out of range".to_string());
+    }
+    Ok(c)
+}
+
 pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
     if args.is_empty() {
         return Ok(None);
@@ -9304,14 +9321,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'hrandfield' command".to_string());
             }
             let count = if args.len() >= 3 {
-                let c: i64 = std::str::from_utf8(&args[2])
-                    .map_err(|_| "value is not an integer or out of range".to_string())?
-                    .parse()
-                    .map_err(|_| "value is not an integer or out of range".to_string())?;
-                if c == i64::MIN {
-                    return Err("value is out of range".to_string());
-                }
-                Some(c)
+                Some(parse_random_count(&args[2])?)
             } else {
                 None
             };
@@ -9396,14 +9406,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'srandmember' command".to_string());
             }
             let count = if args.len() == 3 {
-                let c: i64 = std::str::from_utf8(&args[2])
-                    .map_err(|_| "value is not an integer or out of range".to_string())?
-                    .parse()
-                    .map_err(|_| "value is not an integer or out of range".to_string())?;
-                if c == i64::MIN {
-                    return Err("value is out of range".to_string());
-                }
-                Some(c)
+                Some(parse_random_count(&args[2])?)
             } else {
                 None
             };
@@ -9478,14 +9481,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'zrandmember' command".to_string());
             }
             let count = if args.len() >= 3 {
-                let c: i64 = std::str::from_utf8(&args[2])
-                    .map_err(|_| "value is not an integer or out of range".to_string())?
-                    .parse()
-                    .map_err(|_| "value is not an integer or out of range".to_string())?;
-                if c == i64::MIN {
-                    return Err("value is out of range".to_string());
-                }
-                Some(c)
+                Some(parse_random_count(&args[2])?)
             } else {
                 None
             };
@@ -10389,6 +10385,20 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 } else {
                     return Err("syntax error".to_string());
                 };
+                // Same limits as Redis vector sets; REDUCE also bounds the projection
+                // matrix, which is input dim x reduced dim floats.
+                if vector.len() > crate::vector::MAX_VECTOR_DIM
+                    || reduce.is_some_and(|r| r > vector.len())
+                {
+                    return Err("invalid vector specification".to_string());
+                }
+                if reduce.is_some_and(|r| r * vector.len() > crate::vector::MAX_PROJECTION_ENTRIES)
+                {
+                    return Err(format!(
+                        "REDUCE projection too large: input dim x reduced dim must be <= {}",
+                        crate::vector::MAX_PROJECTION_ENTRIES
+                    ));
+                }
                 if i >= args.len() {
                     return Err("wrong number of arguments for 'vadd' command".to_string());
                 }
@@ -10431,6 +10441,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                                 .map_err(|_| "value is not an integer or out of range")?
                                 .parse()
                                 .map_err(|_| "value is not an integer or out of range")?;
+                            if val > crate::vector::MAX_VSET_EF {
+                                return Err("invalid EF".to_string());
+                            }
                             ef = Some(val.max(1));
                             i += 2;
                         }
@@ -10459,6 +10472,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                                 .map_err(|_| "value is not an integer or out of range")?;
                             if val < 2 {
                                 return Err("M must be >= 2".to_string());
+                            }
+                            if val > crate::vector::MAX_HNSW_M {
+                                return Err("invalid M".to_string());
                             }
                             m = Some(val);
                             i += 2;
@@ -10738,6 +10754,9 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                                 .map_err(|_| "value is not an integer or out of range")?
                                 .parse()
                                 .map_err(|_| "value is not an integer or out of range")?;
+                            if val > crate::vector::MAX_VSET_EF {
+                                return Err("invalid EF".to_string());
+                            }
                             ef = Some(val.max(1));
                             i += 2;
                         }
@@ -10872,11 +10891,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 return Err("wrong number of arguments for 'vrandmember' command".to_string());
             }
             let count = if args.len() == 3 {
-                let c: i64 = std::str::from_utf8(&args[2])
-                    .map_err(|_| "value is not an integer or out of range")?
-                    .parse()
-                    .map_err(|_| "value is not an integer or out of range")?;
-                Some(c)
+                Some(parse_random_count(&args[2])?)
             } else {
                 None
             };
@@ -12281,7 +12296,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                                 }
                                 "DIM" => {
                                     let d = parse_usize(&val)?;
-                                    if d == 0 {
+                                    if d == 0 || d > crate::vector::MAX_VECTOR_DIM {
                                         return Err(bad("DIM"));
                                     }
                                     dim = Some(d);
@@ -12297,7 +12312,12 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                                 "BLOCK_SIZE" if algorithm == "FLAT" => {
                                     attrs.block_size = parse_usize(&val)?
                                 }
-                                "M" if algorithm == "HNSW" => attrs.m = parse_usize(&val)?,
+                                "M" if algorithm == "HNSW" => {
+                                    attrs.m = parse_usize(&val)?;
+                                    if attrs.m > crate::vector::MAX_HNSW_M {
+                                        return Err(bad("M"));
+                                    }
+                                }
                                 "EF_CONSTRUCTION" if algorithm == "HNSW" => {
                                     attrs.ef_construction = parse_usize(&val)?
                                 }
@@ -12874,6 +12894,17 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                         }
                         if nargs.is_some() {
                             i = end;
+                        }
+                        for (attr, val, max) in [
+                            ("DIM", dim, crate::vector::MAX_VECTOR_DIM),
+                            ("M", attrs.m, crate::vector::MAX_HNSW_M),
+                        ] {
+                            if val > max {
+                                return Err(format!(
+                                    "Bad arguments for vector similarity {} argument {}",
+                                    algorithm, attr
+                                ));
+                            }
                         }
                         Some(crate::search::FieldType::Vector {
                             dim,
@@ -15549,5 +15580,127 @@ mod tests {
         let err = parse_command(&mut buf).unwrap_err();
         assert!(err.contains("bad data chunk"), "{err}");
         assert_eq!(parse_command(&mut buf), Ok(Some(Command::Ping(None))));
+    }
+
+    /// Client sizes that reached allocations or loops at execution time are
+    /// refused by the parser with Redis-compatible errors.
+    #[test]
+    fn test_vector_and_random_count_limits() {
+        let max_dim = crate::vector::MAX_VECTOR_DIM.to_string();
+        let over_dim = (crate::vector::MAX_VECTOR_DIM + 1).to_string();
+        let over_m = (crate::vector::MAX_HNSW_M + 1).to_string();
+        let over_ef = (crate::vector::MAX_VSET_EF + 1).to_string();
+        let flat = |dim: &str| {
+            cmd_args(&[
+                "FT.CREATE",
+                "i",
+                "SCHEMA",
+                "v",
+                "VECTOR",
+                "FLAT",
+                "6",
+                "TYPE",
+                "FLOAT32",
+                "DIM",
+                dim,
+                "DISTANCE_METRIC",
+                "L2",
+            ])
+        };
+        assert!(build_command(flat(&max_dim)).is_ok());
+        assert_eq!(
+            build_command(flat(&over_dim)).unwrap_err(),
+            "Bad arguments for vector similarity FLAT argument DIM"
+        );
+        let hnsw_m = |m: &str| {
+            cmd_args(&[
+                "FT.CREATE",
+                "i",
+                "SCHEMA",
+                "v",
+                "VECTOR",
+                "HNSW",
+                "8",
+                "TYPE",
+                "FLOAT32",
+                "DIM",
+                "2",
+                "DISTANCE_METRIC",
+                "L2",
+                "M",
+                m,
+            ])
+        };
+        assert!(build_command(hnsw_m("4096")).is_ok());
+        assert_eq!(
+            build_command(hnsw_m(&over_m)).unwrap_err(),
+            "Bad arguments for vector similarity HNSW argument M"
+        );
+        for (attr, val) in [("DIM", over_dim.as_str()), ("M", over_m.as_str())] {
+            let err = build_command(cmd_args(&[
+                "FT.ALTER", "i", "SCHEMA", "ADD", "w", "VECTOR", "HNSW", "6", "TYPE", "FLOAT32",
+                attr, val,
+            ]))
+            .unwrap_err();
+            assert_eq!(
+                err,
+                format!("Bad arguments for vector similarity HNSW argument {attr}")
+            );
+        }
+
+        // VADD: vector dimension, REDUCE, EF and M as in Redis vector sets.
+        let blob = vec![0u8; (crate::vector::MAX_VECTOR_DIM + 1) * 4];
+        let mut args = cmd_args(&["VADD", "k", "FP32"]);
+        args.push(Bytes::from(blob));
+        args.push(Bytes::from_static(b"e"));
+        assert_eq!(
+            build_command(args).unwrap_err(),
+            "invalid vector specification"
+        );
+        let vadd = |extra: &[&str]| {
+            let mut a = vec!["VADD", "k"];
+            a.extend_from_slice(extra);
+            build_command(cmd_args(&a))
+        };
+        assert_eq!(
+            vadd(&["REDUCE", "3", "VALUES", "2", "1", "1", "e"]).unwrap_err(),
+            "invalid vector specification"
+        );
+        assert!(vadd(&["REDUCE", "1", "VALUES", "2", "1", "1", "e"]).is_ok());
+        assert_eq!(
+            vadd(&["VALUES", "2", "1", "1", "e", "EF", &over_ef]).unwrap_err(),
+            "invalid EF"
+        );
+        assert_eq!(
+            vadd(&["VALUES", "2", "1", "1", "e", "M", &over_m]).unwrap_err(),
+            "invalid M"
+        );
+        assert!(vadd(&["VALUES", "2", "1", "1", "e", "EF", "1000000", "M", "4096"]).is_ok());
+        // input dim x reduced dim floats: 4096 x 4097 > MAX_PROJECTION_ENTRIES.
+        let mut big = cmd_args(&["VADD", "k", "REDUCE", "4097", "FP32"]);
+        big.push(Bytes::from(vec![0u8; 8192 * 4]));
+        big.push(Bytes::from_static(b"e"));
+        assert!(
+            build_command(big)
+                .unwrap_err()
+                .starts_with("REDUCE projection too large")
+        );
+        assert_eq!(
+            build_command(cmd_args(&["VSIM", "k", "ELE", "e", "EF", &over_ef])).unwrap_err(),
+            "invalid EF"
+        );
+
+        // Repeating random counts are bounded; Redis streams them, rudis buffers.
+        let limit = MAX_RANDOM_REPEATS.to_string();
+        let over = (-MAX_RANDOM_REPEATS - 1).to_string();
+        for cmd in ["SRANDMEMBER", "HRANDFIELD", "ZRANDMEMBER", "VRANDMEMBER"] {
+            assert!(build_command(cmd_args(&[cmd, "k", &format!("-{limit}")])).is_ok());
+            assert_eq!(
+                build_command(cmd_args(&[cmd, "k", &over])).unwrap_err(),
+                "value is out of range",
+                "{cmd}"
+            );
+            assert!(build_command(cmd_args(&[cmd, "k", "9223372036854775807"])).is_ok());
+        }
     }
 }

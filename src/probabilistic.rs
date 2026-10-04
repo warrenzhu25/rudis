@@ -20,6 +20,10 @@ fn double_hash(data: &[u8]) -> (u64, u64) {
     (h1, if h2 == 0 { 1 } else { h2 })
 }
 
+/// Largest structure `BF.RESERVE`, `CF.RESERVE` or `CMS.INITBYDIM` may allocate:
+/// 512 MiB, the same bound Redis puts on a single string value.
+pub const MAX_SKETCH_BYTES: usize = 512 << 20;
+
 // ---------------------------------------------------------------------------
 // 1. Bloom Filter
 // ---------------------------------------------------------------------------
@@ -38,11 +42,7 @@ impl BloomFilter {
     pub fn new(capacity: usize, error_rate: f64) -> Self {
         let cap = capacity.max(1);
         let err = error_rate.clamp(0.00001, 0.5);
-
-        // m = -n * ln(p) / (ln(2)^2)
-        let ln2_sq = std::f64::consts::LN_2 * std::f64::consts::LN_2;
-        let m = (-(cap as f64) * err.ln() / ln2_sq).ceil() as usize;
-        let num_bits = m.max(64);
+        let num_bits = (Self::bits_for(cap, err) as usize).max(64);
 
         // k = (m / n) * ln(2)
         let k = ((num_bits as f64 / cap as f64) * std::f64::consts::LN_2).round() as usize;
@@ -57,6 +57,24 @@ impl BloomFilter {
             count: 0,
             bits: vec![0u64; u64_len],
         }
+    }
+
+    /// `new` for client-supplied sizes: refuses filters over [`MAX_SKETCH_BYTES`]
+    /// instead of attempting the allocation.
+    pub fn try_new(capacity: usize, error_rate: f64) -> Result<Self, String> {
+        let bits = Self::bits_for(capacity.max(1), error_rate.clamp(0.00001, 0.5));
+        if bits / 8.0 > MAX_SKETCH_BYTES as f64 {
+            return Err(format!(
+                "Bloom filter too large: at most {MAX_SKETCH_BYTES} bytes"
+            ));
+        }
+        Ok(Self::new(capacity, error_rate))
+    }
+
+    /// m = -n * ln(p) / (ln(2)^2), in f64 so huge capacities cannot overflow.
+    fn bits_for(cap: usize, err: f64) -> f64 {
+        let ln2_sq = std::f64::consts::LN_2 * std::f64::consts::LN_2;
+        (-(cap as f64) * err.ln() / ln2_sq).ceil()
     }
 
     #[inline]
@@ -129,6 +147,19 @@ impl CuckooFilter {
             num_buckets,
             count: 0,
             buckets: vec![[0u16; BUCKET_SIZE]; num_buckets],
+        }
+    }
+
+    /// `new` for client-supplied sizes: refuses filters over [`MAX_SKETCH_BYTES`].
+    pub fn try_new(capacity: usize) -> Result<Self, String> {
+        let bucket_bytes = std::mem::size_of::<[u16; BUCKET_SIZE]>();
+        match (capacity.max(1) / BUCKET_SIZE).checked_next_power_of_two() {
+            Some(n) if n.saturating_mul(bucket_bytes) <= MAX_SKETCH_BYTES => {
+                Ok(Self::new(capacity))
+            }
+            _ => Err(format!(
+                "Cuckoo filter too large: at most {MAX_SKETCH_BYTES} bytes"
+            )),
         }
     }
 
@@ -249,6 +280,17 @@ impl CountMinSketch {
             total_count: 0,
             table: vec![vec![0u64; w]; d],
         }
+    }
+
+    /// `new` for client-supplied dimensions: refuses sketches over [`MAX_SKETCH_BYTES`].
+    pub fn try_new(width: usize, depth: usize) -> Result<Self, String> {
+        let cells = width.max(4).saturating_mul(depth.clamp(1, 16));
+        if cells.saturating_mul(std::mem::size_of::<u64>()) > MAX_SKETCH_BYTES {
+            return Err(format!(
+                "CMS: width x depth too large: at most {MAX_SKETCH_BYTES} bytes"
+            ));
+        }
+        Ok(Self::new(width, depth))
     }
 
     pub fn from_prob(err: f64, conf: f64) -> Self {
@@ -831,5 +873,33 @@ mod tests {
         tk.extend_from_slice(&u32::MAX.to_le_bytes());
         assert!(s.restore(ProbKind::TopK, k, &tk).is_err());
         assert_eq!(s, ProbabilisticStore::new());
+    }
+
+    /// Reserve commands refuse sizes past MAX_SKETCH_BYTES instead of
+    /// attempting (and aborting on) the allocation.
+    #[test]
+    fn test_try_new_bounds_client_sizes() {
+        assert!(BloomFilter::try_new(usize::MAX, 0.01).is_err());
+        let bf = BloomFilter::try_new(1000, 0.01).unwrap();
+        assert_eq!(bf, BloomFilter::new(1000, 0.01));
+        // About 448M items at 1% fill 512 MiB of bits.
+        assert!(BloomFilter::try_new(400_000_000, 0.01).is_ok());
+        assert!(BloomFilter::try_new(500_000_000, 0.01).is_err());
+        assert!(BloomFilter::try_new(1, 0.01).is_ok());
+
+        assert!(CuckooFilter::try_new(usize::MAX).is_err());
+        assert!(CuckooFilter::try_new(1 << 40).is_err());
+        assert_eq!(
+            CuckooFilter::try_new(1000).unwrap(),
+            CuckooFilter::new(1000)
+        );
+
+        assert!(CountMinSketch::try_new(usize::MAX, 16).is_err());
+        assert!(CountMinSketch::try_new(MAX_SKETCH_BYTES / 8 + 1, 1).is_err());
+        assert!(CountMinSketch::try_new(MAX_SKETCH_BYTES / 8 / 16, 16).is_ok());
+        assert_eq!(
+            CountMinSketch::try_new(50, 3).unwrap(),
+            CountMinSketch::new(50, 3)
+        );
     }
 }

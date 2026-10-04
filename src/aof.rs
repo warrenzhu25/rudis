@@ -3564,7 +3564,9 @@ mod tests {
         // State from another region, merged in below.
         let mut remote = crate::crdt::CrdtStore::new(9);
         remote.set(Bytes::from_static(b"m:reg"), Bytes::from_static(b"remote"));
-        remote.counter_incr(Bytes::from_static(b"ctr"), 100);
+        remote
+            .counter_incr(Bytes::from_static(b"ctr"), 100)
+            .unwrap();
         remote.set_add(Bytes::from_static(b"set"), Bytes::from_static(b"r1"));
         let remote_payload = remote.export_sync_payload();
 

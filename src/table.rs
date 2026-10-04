@@ -6832,7 +6832,11 @@ impl RudisTable {
 
         let mut res = Vec::new();
         let mut idx = cursor;
-        let limit = if no_values { count } else { count * 2 };
+        let limit = if no_values {
+            count
+        } else {
+            count.saturating_mul(2)
+        };
         while idx < pairs.len() && res.len() < limit {
             let (f, v) = &pairs[idx];
             let matches = match pattern {
@@ -15638,7 +15642,7 @@ mod tests {
         let keys: Vec<Bytes> = (0..16).map(|i| Bytes::from(format!("crdt:{i}"))).collect();
         for k in &keys {
             src.crdt_set(k.clone(), Bytes::from_static(b"v"));
-            src.crdt_incrby(k.clone(), 1);
+            src.crdt_incrby(k.clone(), 1).unwrap();
             src.crdt_sadd(k.clone(), Bytes::from_static(b"m"));
         }
         let mut chunk = Vec::new();

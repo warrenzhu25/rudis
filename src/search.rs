@@ -347,7 +347,8 @@ impl RangeTree {
     /// Performs a balanced B-tree range scan in O(log N + K) time.
     #[inline]
     pub fn range(&self, min: f64, max: f64) -> Vec<DocId> {
-        if min > max {
+        // NaN bounds (`@n:[nan 0]`) would make BTreeMap::range panic.
+        if min.is_nan() || max.is_nan() || min > max {
             return Vec::new();
         }
         let start = OrderedF64(min);
@@ -4113,5 +4114,15 @@ mod tests {
         assert_eq!(total_lin, 2);
         assert_eq!(hits_lin[0].doc_id, "doc:1");
         assert!(hits_lin[0].score > hits_lin[1].score);
+    }
+
+    /// NaN bounds (`@n:[nan 0]`) made BTreeMap::range panic.
+    #[test]
+    fn test_range_tree_nan_bounds_are_empty() {
+        let mut tree = RangeTree::new();
+        tree.add(1, 1.0);
+        assert!(tree.range(f64::NAN, 0.0).is_empty());
+        assert!(tree.range(0.0, f64::NAN).is_empty());
+        assert_eq!(tree.range(f64::NEG_INFINITY, f64::INFINITY), vec![1]);
     }
 }

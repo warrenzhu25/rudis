@@ -456,6 +456,27 @@ Understand what "durable" means here today before relying on it:
 - `maxmemory` also drives the thresholds that trigger NVMe tiering offload — see
   [NVMe Tiered Storage](#6-nvme-tiered-storage-smallbins--direct-io) below.
 
+### Limits on Client-Supplied Sizes
+
+Sizes taken from command arguments are checked before they drive an allocation or loop, so
+one command cannot hang a shard or abort the process. Where Redis or its modules define a
+limit, Rudis uses the same one, with the Redis error text where one exists.
+
+| Argument | Limit | Reply when exceeded |
+|----------|-------|---------------------|
+| `FT.CREATE` / `FT.ALTER` vector `DIM` | 65536 (Redis vector sets' maximum) | `Bad arguments for vector similarity <ALGO> argument DIM` |
+| `FT.CREATE` / `FT.ALTER` HNSW `M`, `VADD ... M` | 4096 (Redis `HNSW_MAX_M`) | `... argument M` / `invalid M` |
+| `VADD` vector dimension; `REDUCE` larger than it | 65536 | `invalid vector specification` |
+| `VADD ... REDUCE` projection (input dim x reduced dim) | 2^24 floats (64 MiB) | `REDUCE projection too large ...` |
+| `VADD` / `VSIM ... EF` | 1000000, as in Redis | `invalid EF` |
+| `BF.RESERVE`, `CF.RESERVE`, `CMS.INITBYDIM` | 512 MiB per structure (Redis' value size limit) | `Bloom filter too large ...` / `Cuckoo filter too large ...` / `CMS: width x depth too large ...` |
+| Negative (repeating) `SRANDMEMBER` / `HRANDFIELD` / `ZRANDMEMBER` / `VRANDMEMBER` count | -1048576; Redis streams such replies, Rudis builds them in memory | `value is out of range` |
+| `JSON.SET` array index past the end | pads at most 65536 `null`s; negative indexes must be in the array | `index out of bounds` |
+| `CRDT.INCRBY` | the counter and each node's component stay within i64 | `increment or decrement would overflow` |
+
+KNN `k`, `VSIM COUNT`, `EF_RUNTIME` and `LIMIT` are not refused: results are capped at what the
+index holds, and `FLAT` `INITIAL_CAP` preallocates at most 64 MiB of vectors.
+
 ### Graceful Shutdown
 
 `SIGTERM`/`SIGINT` and `SHUTDOWN` run the same sequence ([`src/shutdown.rs`](src/shutdown.rs),

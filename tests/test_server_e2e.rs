@@ -18635,6 +18635,16 @@ fn crdt_writes_survive_restart(port: u16, rewrite: bool) {
         (&["CRDT.SREM", "cr:set2", "x"], ":1"),
         // Its keys live on different shards; each must keep its own.
         (&["CRDT.MERGE", &remote], ":3"),
+        // Refused increments change nothing and log nothing, so the counter
+        // still reads 12 after the restart below.
+        (
+            &["CRDT.INCRBY", "cr:ctr", "9223372036854775807"],
+            "-ERR increment or decrement would overflow",
+        ),
+        (
+            &["CRDT.INCRBY", "cr:ctr2", "-9223372036854775808"],
+            "-ERR increment or decrement would overflow",
+        ),
     ] {
         let reply = resp_cmd(&mut c, cmd);
         assert!(reply.starts_with(want), "{cmd:?}: {reply}");
@@ -19533,4 +19543,161 @@ fn test_config_rewrite_targets_the_startup_config_file_e2e() {
     assert!(!stderr.contains("panicked"), "{stderr}");
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Client-chosen sizes that parse fine must not reach unbounded loops or
+/// allocations at execution: KNN k = 2^63 aborted the process on a heap
+/// preallocation, VADD REDUCE built a 2^32 x dim projection, JSON.SET
+/// `$.a[2^63]` padded the array forever, BF/CF/CMS reserves aborted on their
+/// bit arrays, CRDT.INCRBY and HSCAN COUNT overflowed. Each must answer, with
+/// an error where the size is refused, and the server keeps serving.
+#[test]
+fn test_hostile_sizes_get_bounded_replies_e2e() {
+    let port = 17087;
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--enable-experimental-commands",
+        "yes",
+    ];
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = KillOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // "AAAA" is a valid little-endian f32, so the query blob stays ASCII.
+    for cmd in [
+        &[
+            "FT.CREATE",
+            "hzi",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "hz:",
+            "SCHEMA",
+            "n",
+            "NUMERIC",
+            "v",
+            "VECTOR",
+            "FLAT",
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "2",
+            "DISTANCE_METRIC",
+            "L2",
+        ][..],
+        &["HSET", "hz:1", "n", "1", "v", "AAAAAAAA"],
+        &["HSET", "hz:2", "n", "2", "v", "BBBBBBBB"],
+        &["VADD", "vs", "VALUES", "2", "1", "2", "a"],
+        &["HSET", "h", "f", "v"],
+        &["SADD", "s", "a"],
+        &["JSON.SET", "j", "$", r#"{"a":[1,2,3]}"#],
+    ] {
+        let reply = resp_cmd(&mut c, cmd);
+        assert!(!reply.starts_with('-'), "{cmd:?}: {reply}");
+    }
+
+    let huge = "9223372036854775807";
+    let knn = format!("*=>[KNN {huge} @v $B]");
+    let json_idx = format!("$.a[{huge}]");
+    for cmd in [
+        &[
+            "FT.CREATE",
+            "hzx",
+            "SCHEMA",
+            "v",
+            "VECTOR",
+            "FLAT",
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            huge,
+            "DISTANCE_METRIC",
+            "L2",
+        ][..],
+        &[
+            "FT.CREATE",
+            "hzx",
+            "SCHEMA",
+            "v",
+            "VECTOR",
+            "HNSW",
+            "8",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "2",
+            "DISTANCE_METRIC",
+            "L2",
+            "M",
+            huge,
+        ],
+        &[
+            "VADD",
+            "v2",
+            "REDUCE",
+            "4294967296",
+            "VALUES",
+            "2",
+            "1",
+            "1",
+            "e",
+        ],
+        &["VADD", "v2", "VALUES", "2", "1", "1", "e", "M", huge],
+        &["VSIM", "vs", "ELE", "a", "EF", huge],
+        &["VRANDMEMBER", "vs", "-4294967296"],
+        &["SRANDMEMBER", "s", "-9223372036854775807"],
+        &["BF.RESERVE", "b", "0.01", huge],
+        &["CF.RESERVE", "c", huge],
+        &["CMS.INITBYDIM", "m", huge, huge],
+        &["JSON.SET", "j", &json_idx, "1"],
+    ] {
+        let reply = resp_cmd(&mut c, cmd);
+        assert!(reply.starts_with("-ERR"), "{cmd:?}: {reply}");
+        assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n", "after {cmd:?}");
+    }
+    assert_eq!(
+        resp_cmd(&mut c, &["CRDT.INCRBY", "cnt", huge]),
+        format!(":{huge}\r\n")
+    );
+    let reply = resp_cmd(&mut c, &["CRDT.INCRBY", "cnt", "1"]);
+    assert!(
+        reply.starts_with("-ERR increment or decrement would overflow"),
+        "{reply}"
+    );
+
+    // Huge k / COUNT are clamped to what exists.
+    for (cmd, want) in [
+        (
+            &["FT.SEARCH", "hzi", &knn, "PARAMS", "2", "B", "AAAAAAAA"][..],
+            "*5\r\n:2\r\n",
+        ),
+        (&["FT.SEARCH", "hzi", "@n:[nan 0]"], "*1\r\n:0\r\n"),
+        (&["VSIM", "vs", "ELE", "a", "COUNT", huge], "*1\r\n"),
+        (
+            &["HSCAN", "h", "0", "COUNT", "18446744073709551615"],
+            "*2\r\n",
+        ),
+    ] {
+        let reply = resp_cmd(&mut c, cmd);
+        assert!(reply.starts_with(want), "{cmd:?}: {reply}");
+        assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n", "after {cmd:?}");
+    }
+    drop(c);
+
+    shutdown_and_wait(port, &mut child.0);
 }

@@ -756,10 +756,12 @@ pub fn write_slowlog_entries_resp(entries: &[SlowlogEntry], out: &mut Vec<u8>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// Held by tests that assert on the global slowlog, and by tests that run
+    /// enough commands through `execute_command` to log into it meanwhile.
+    pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn test_slowlog_crud_and_ring_buffer() {

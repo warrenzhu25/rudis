@@ -21290,12 +21290,14 @@ pub fn execute_local_command(
             if db.probabilistic_store.bloom_filters.contains_key(key) {
                 out.extend_from_slice(b"-ERR item exists\r\n");
             } else {
-                db.probabilistic_store.bloom_filters.insert(
-                    key.clone(),
-                    crate::probabilistic::BloomFilter::new(*capacity, *error_rate),
-                );
-                record_change!(cmd);
-                out.extend_from_slice(b"+OK\r\n");
+                match crate::probabilistic::BloomFilter::try_new(*capacity, *error_rate) {
+                    Ok(bf) => {
+                        db.probabilistic_store.bloom_filters.insert(key.clone(), bf);
+                        record_change!(cmd);
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    Err(e) => out.extend_from_slice(format!("-ERR {e}\r\n").as_bytes()),
+                }
             }
             false
         }
@@ -21385,12 +21387,16 @@ pub fn execute_local_command(
             if db.probabilistic_store.cuckoo_filters.contains_key(key) {
                 out.extend_from_slice(b"-ERR item exists\r\n");
             } else {
-                db.probabilistic_store.cuckoo_filters.insert(
-                    key.clone(),
-                    crate::probabilistic::CuckooFilter::new(*capacity),
-                );
-                record_change!(cmd);
-                out.extend_from_slice(b"+OK\r\n");
+                match crate::probabilistic::CuckooFilter::try_new(*capacity) {
+                    Ok(cf) => {
+                        db.probabilistic_store
+                            .cuckoo_filters
+                            .insert(key.clone(), cf);
+                        record_change!(cmd);
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
+                    Err(e) => out.extend_from_slice(format!("-ERR {e}\r\n").as_bytes()),
+                }
             }
             false
         }
@@ -21477,12 +21483,14 @@ pub fn execute_local_command(
             false
         }
         Command::CmsInitbydim { key, width, depth } => {
-            db.probabilistic_store.cms_sketches.insert(
-                key.clone(),
-                crate::probabilistic::CountMinSketch::new(*width, *depth),
-            );
-            record_change!(cmd);
-            out.extend_from_slice(b"+OK\r\n");
+            match crate::probabilistic::CountMinSketch::try_new(*width, *depth) {
+                Ok(cms) => {
+                    db.probabilistic_store.cms_sketches.insert(key.clone(), cms);
+                    record_change!(cmd);
+                    out.extend_from_slice(b"+OK\r\n");
+                }
+                Err(e) => out.extend_from_slice(format!("-ERR {e}\r\n").as_bytes()),
+            }
             false
         }
         Command::CmsInitbyprob {
@@ -21778,9 +21786,14 @@ pub fn execute_local_command(
             false
         }
         Command::CrdtIncrby { key, delta } => {
-            let val = db.crdt_incrby(key.clone(), *delta);
-            record_crdt_effect!(db.crdt_store.counter_payload(key));
-            write_resp_integer(out, val);
+            match db.crdt_incrby(key.clone(), *delta) {
+                Ok(val) => {
+                    record_crdt_effect!(db.crdt_store.counter_payload(key));
+                    write_resp_integer(out, val);
+                }
+                // Refused: the counter is unchanged, so nothing is logged.
+                Err(e) => out.extend_from_slice(format!("-ERR {e}\r\n").as_bytes()),
+            }
             false
         }
         Command::CrdtSadd { key, member } => {
@@ -24589,7 +24602,7 @@ mod tests {
     fn test_crdt_merge_keys_come_from_its_payload() {
         let mut store = crate::crdt::CrdtStore::new(1);
         store.set(Bytes::from_static(b"r"), Bytes::from_static(b"v"));
-        store.counter_incr(Bytes::from_static(b"c"), 1);
+        store.counter_incr(Bytes::from_static(b"c"), 1).unwrap();
         store.set_add(Bytes::from_static(b"s"), Bytes::from_static(b"m"));
         let cmd = Command::CrdtMerge(store.export_sync_payload().into());
         let mut keys = cmd_keys(&cmd);
@@ -26077,5 +26090,228 @@ mod tests {
         out.clear();
         format_bzpop_response(&mut out, &Bytes::from("zk"), &Bytes::from("m1"), 10.0);
         assert!(out.starts_with(b"*3\r\n"));
+    }
+
+    /// Client-chosen sizes that pass the parser must still get a bounded reply
+    /// when executed: KNN k, VSIM COUNT/EF, DIM, M, INITIAL_CAP, reserve sizes,
+    /// JSON array indexes, counts and ranges used to panic, loop for 2^63
+    /// iterations or abort on a huge allocation. Pins each fixed input, then
+    /// runs every family's templates with each hostile number in each slot.
+    #[test]
+    fn test_hostile_sizes_execute_with_bounded_replies() {
+        // Thousands of commands, some slow, would land in the global slowlog
+        // while the slowlog tests assert on its exact contents.
+        let _slowlog = crate::slowlog::tests::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // execute_command's future is too deep for the default test stack in debug builds.
+        std::thread::Builder::new()
+            .stack_size(256 << 20)
+            .spawn(|| {
+                monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(hostile_sizes())
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    async fn hostile_sizes() {
+        const PORT: u16 = 6393;
+        let (senders_mesh, _receivers) = crate::mailbox::create_shard_mesh(1);
+        let router = std::rc::Rc::new(Router::new(
+            0,
+            1,
+            PORT,
+            std::rc::Rc::new(std::cell::RefCell::new(crate::shard::ShardDb::new(PORT))),
+            senders_mesh[0].clone(),
+            None,
+            std::rc::Rc::new(std::cell::RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        ));
+        set_current_router(router.clone());
+        let registry = std::cell::RefCell::new(hashbrown::HashMap::new());
+        let blob = |a: f32, b: f32| [a.to_le_bytes(), b.to_le_bytes()].concat();
+        let run = async |args: &[&str]| {
+            let args: Vec<Bytes> = args
+                .iter()
+                .map(|a| match *a {
+                    "@V1" => Bytes::from(blob(1.0, 2.0)),
+                    "@V2" => Bytes::from(blob(3.0, 4.0)),
+                    "@B" => Bytes::from(blob(1.0, 1.0)),
+                    a => Bytes::from(a.to_string()),
+                })
+                .collect();
+            let cmd = match crate::resp::build_command(args) {
+                Ok(Some(cmd)) => cmd,
+                Ok(None) => return String::new(),
+                Err(e) => return format!("-ERR {e}"),
+            };
+            let mut out = Vec::new();
+            let (mut asking, mut authenticated) = (false, true);
+            let mut auth_user = String::from("default");
+            execute_command(
+                cmd,
+                &router,
+                1,
+                &registry,
+                &mut out,
+                &mut asking,
+                &mut authenticated,
+                &mut auth_user,
+            )
+            .await;
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        #[rustfmt::skip]
+        let setup: &[&[&str]] = &[
+            &["FT.CREATE", "hz_idx", "ON", "HASH", "PREFIX", "1", "hzdoc:", "SCHEMA", "t", "TEXT",
+              "n", "NUMERIC", "v", "VECTOR", "FLAT", "6", "TYPE", "FLOAT32", "DIM", "2",
+              "DISTANCE_METRIC", "L2"],
+            &["FT.CREATE", "hz_hidx", "ON", "HASH", "PREFIX", "1", "hzhd:", "SCHEMA", "t", "TEXT",
+              "v", "VECTOR", "HNSW", "6", "TYPE", "FLOAT32", "DIM", "2", "DISTANCE_METRIC", "COSINE"],
+            &["HSET", "hzdoc:1", "t", "hello", "n", "1", "v", "@V1"],
+            &["HSET", "hzdoc:2", "t", "hello", "n", "2", "v", "@V2"],
+            &["HSET", "hzhd:1", "t", "hello", "v", "@V1"], &["HSET", "hzhd:2", "t", "bye", "v", "@V2"],
+            &["VADD", "vs", "VALUES", "2", "1", "2", "a"], &["VADD", "vs", "VALUES", "2", "3", "4", "b"],
+            &["SADD", "s", "a", "b"], &["HSET", "h", "f", "v"], &["ZADD", "z", "1", "a"],
+            &["JSON.SET", "j", "$", r#"{"a":[1,2,3]}"#],
+        ];
+        for args in setup {
+            let reply = run(args).await;
+            assert!(!reply.starts_with('-'), "{args:?}: {reply}");
+        }
+
+        let huge = "9223372036854775807";
+        #[rustfmt::skip]
+        let errors: &[(&[&str], &str)] = &[
+            (&["FT.CREATE", "hz_x", "SCHEMA", "v", "VECTOR", "FLAT", "6", "TYPE", "FLOAT32",
+               "DIM", huge, "DISTANCE_METRIC", "L2"], "argument DIM"),
+            (&["FT.CREATE", "hz_x", "SCHEMA", "v", "VECTOR", "HNSW", "8", "TYPE", "FLOAT32",
+               "DIM", "2", "DISTANCE_METRIC", "L2", "M", huge], "argument M"),
+            (&["FT.ALTER", "hz_idx", "SCHEMA", "ADD", "w", "VECTOR", "FLAT", "6", "TYPE",
+               "FLOAT32", "DIM", huge, "DISTANCE_METRIC", "L2"], "argument DIM"),
+            (&["VADD", "v2", "REDUCE", "4294967296", "VALUES", "2", "1", "1", "e"],
+             "invalid vector specification"),
+            (&["VADD", "v2", "VALUES", "2", "1", "1", "e", "M", huge], "invalid M"),
+            (&["VSIM", "vs", "ELE", "a", "EF", huge], "invalid EF"),
+            (&["VRANDMEMBER", "vs", "-4294967296"], "out of range"),
+            (&["SRANDMEMBER", "s", "-9223372036854775807"], "out of range"),
+            (&["BF.RESERVE", "b2", "0.01", huge], "Bloom filter too large"),
+            (&["CF.RESERVE", "c2", huge], "Cuckoo filter too large"),
+            (&["CMS.INITBYDIM", "m2", huge, huge], "CMS: width x depth too large"),
+            (&["CRDT.INCRBY", "c", huge], ""),
+            (&["CRDT.INCRBY", "c", "1"], "increment or decrement would overflow"),
+            (&["JSON.SET", "j", &format!("$.a[{huge}]"), "1"], "index out of bounds"),
+            (&["JSON.SET", "j", "$.a[-9]", "1"], "index out of bounds"),
+        ];
+        for (args, want) in errors {
+            let reply = run(args).await;
+            if want.is_empty() {
+                assert!(!reply.starts_with('-'), "{args:?}: {reply}");
+            } else {
+                assert!(
+                    reply.starts_with("-ERR") && reply.contains(want),
+                    "{args:?}: {reply}"
+                );
+            }
+        }
+        // Huge k/COUNT/LIMIT/COUNT are clamped to what exists.
+        #[rustfmt::skip]
+        let bounded: &[(&[&str], &str)] = &[
+            (&["FT.SEARCH", "hz_idx", &format!("*=>[KNN {huge} @v $B]"), "PARAMS", "2", "B", "@B"],
+             "*5\r\n:2\r\n"),
+            (&["FT.SEARCH", "hz_hidx", &format!("*=>[KNN {huge} @v $B EF_RUNTIME {huge}]"),
+               "PARAMS", "2", "B", "@B"], "*5\r\n:2\r\n"),
+            (&["FT.SEARCH", "hz_idx", "@n:[nan 0]"], "*1\r\n:0\r\n"),
+            (&["VSIM", "vs", "ELE", "a", "COUNT", huge], "*2\r\n"),
+            (&["VSIM", "vs", "ELE", "a", "COUNT", huge, "FILTER", ".x > 1"], "*0\r\n"),
+            (&["HSCAN", "h", "0", "COUNT", "18446744073709551615"], "*2\r\n$1\r\n0\r\n*2\r\n"),
+        ];
+        for (args, want) in bounded {
+            let reply = run(args).await;
+            assert!(reply.starts_with(want), "{args:?}: {reply}");
+        }
+
+        // Every hostile number in each `#` slot (others "2"), then in all slots.
+        #[rustfmt::skip]
+        const HOSTILE: &[&str] = &[
+            "9223372036854775807", "18446744073709551615", "4294967296", "4294967295", "2147483648",
+            "-1", "-9223372036854775808", "-9223372036854775807", "-4294967296", "1e308", "inf",
+            "nan", "-inf", "1000000000", "16777217", "0",
+        ];
+        #[rustfmt::skip]
+        let templates: &[&[&str]] = &[
+            &["FT.SEARCH", "hz_idx", "*=>[KNN # @v $B]", "PARAMS", "2", "B", "@B", "LIMIT", "#", "#"],
+            &["FT.SEARCH", "hz_idx", "*=>[KNN $K @v $B]", "PARAMS", "4", "K", "#", "B", "@B"],
+            &["FT.SEARCH", "hz_hidx", "*=>[KNN # @v $B EF_RUNTIME #]", "PARAMS", "2", "B", "@B"],
+            &["FT.SEARCH", "hz_hidx", "@t:hello=>[KNN # @v $B]", "PARAMS", "2", "B", "@B"],
+            &["FT.SEARCH", "hz_idx", "@n:[# #]", "LIMIT", "#", "#"],
+            &["FT.SEARCH", "hz_idx", "hello|*=>[KNN # @v $B]", "PARAMS", "2", "B", "@B"],
+            &["FT.AGGREGATE", "hz_idx", "*", "LOAD", "1", "@n", "SORTBY", "2", "@n", "DESC", "MAX", "#",
+              "LIMIT", "#", "#"],
+            &["FT.CREATE", "hz_c1", "SCHEMA", "v", "VECTOR", "FLAT", "8", "TYPE", "FLOAT32", "DIM", "#",
+              "DISTANCE_METRIC", "L2", "INITIAL_CAP", "#"],
+            &["FT.CREATE", "hz_c2", "SCHEMA", "v", "VECTOR", "HNSW", "10", "TYPE", "FLOAT32", "DIM", "2",
+              "DISTANCE_METRIC", "L2", "M", "#", "EF_CONSTRUCTION", "#"],
+            &["FT.ALTER", "hz_idx", "SCHEMA", "ADD", "w", "VECTOR", "HNSW", "8", "TYPE", "FLOAT32",
+              "DIM", "#", "INITIAL_CAP", "#", "M", "#"],
+            &["VSIM", "vs", "VALUES", "2", "1", "1", "COUNT", "#", "EF", "#"],
+            &["VSIM", "vs", "ELE", "a", "FILTER", ".x > 1", "FILTER-EF", "#", "COUNT", "#"],
+            &["VADD", "v3", "REDUCE", "#", "VALUES", "2", "1", "1", "e"],
+            &["VADD", "v4", "VALUES", "2", "1", "1", "e", "M", "#", "EF", "#"],
+            &["VRANDMEMBER", "vs", "#"], &["SRANDMEMBER", "s", "#"], &["HRANDFIELD", "h", "#"],
+            &["ZRANDMEMBER", "z", "#", "WITHSCORES"],
+            &["BF.RESERVE", "b3", "#", "#"], &["CF.RESERVE", "c3", "#"],
+            &["CMS.INITBYDIM", "m3", "#", "#"], &["CMS.INITBYPROB", "m4", "#", "#"],
+            &["TOPK.RESERVE", "t3", "#"], &["CRDT.INCRBY", "c2", "#"],
+            &["JSON.SET", "j", "$.a[#]", "1"], &["JSON.SET", "j", "$.x[#][#]", "1"],
+            &["JSON.ARRTRIM", "j", "$.a", "#", "#"], &["JSON.ARRINSERT", "j", "$.a", "#", "1"],
+            &["HSCAN", "h", "#", "COUNT", "#"], &["SSCAN", "s", "0", "COUNT", "#"],
+            &["LPOS", "l", "a", "RANK", "#", "COUNT", "#", "MAXLEN", "#"],
+            &["ZRANGE", "z", "0", "-1", "BYSCORE", "LIMIT", "#", "#"],
+            &["XADD", "st", "MAXLEN", "~", "#", "LIMIT", "#", "*", "f", "v"],
+            &["XRANGE", "st", "-", "+", "COUNT", "#"], &["SPOP", "s", "#"],
+        ];
+        for t in templates {
+            let slots = t.iter().map(|a| a.matches('#').count()).sum::<usize>();
+            for h in HOSTILE {
+                for target in (0..slots).chain([usize::MAX]) {
+                    let mut slot = 0;
+                    let args: Vec<String> = t
+                        .iter()
+                        .map(|a| {
+                            let mut out = String::new();
+                            for ch in a.chars() {
+                                if ch == '#' {
+                                    out += if target == usize::MAX || target == slot {
+                                        h
+                                    } else {
+                                        "2"
+                                    };
+                                    slot += 1;
+                                } else {
+                                    out.push(ch);
+                                }
+                            }
+                            out
+                        })
+                        .collect();
+                    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                    let reply = run(&refs).await;
+                    assert!(
+                        reply.len() < 1 << 20,
+                        "{refs:?}: reply of {} bytes",
+                        reply.len()
+                    );
+                }
+            }
+        }
+        for name in ["hz_idx", "hz_hidx", "hz_c1", "hz_c2"] {
+            let _ = crate::search::drop_search_index(name);
+        }
     }
 }
