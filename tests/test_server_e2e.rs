@@ -20312,3 +20312,44 @@ fn test_replica_ack_beyond_master_offset_does_not_satisfy_wait_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child);
 }
+
+#[test]
+fn test_restore_accepts_a_zero_crc_and_rejects_a_wrong_one_e2e() {
+    let port: u16 = 17089;
+    let port_s = port.to_string();
+    let args = ["--port", &port_s, "--threads", "2", "--no-pin"];
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["SET", "crc:src", "v"]), "+OK\r\n");
+    let reply = send_and_read_bytes(&mut c, &format_resp_cmd(&["DUMP", "crc:src"]));
+    let header_end = reply.iter().position(|&b| b == b'\n').unwrap() + 1;
+    let dumped = reply[header_end..reply.len() - 2].to_vec();
+    let restore = |c: &mut TcpStream, key: &str, payload: &[u8]| {
+        let mut cmd = format!(
+            "*4\r\n$7\r\nRESTORE\r\n${}\r\n{key}\r\n$1\r\n0\r\n",
+            key.len()
+        )
+        .into_bytes();
+        cmd.extend_from_slice(format!("${}\r\n", payload.len()).as_bytes());
+        cmd.extend_from_slice(payload);
+        cmd.extend_from_slice(b"\r\n");
+        send_and_read(c, &cmd)
+    };
+    let crc_at = dumped.len() - 8;
+
+    let mut no_crc = dumped.clone();
+    no_crc[crc_at..].fill(0);
+    assert_eq!(restore(&mut c, "crc:zero", &no_crc), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "crc:zero"]), "$1\r\nv\r\n");
+
+    let mut bad_crc = dumped;
+    bad_crc[crc_at] ^= 1;
+    assert_eq!(
+        restore(&mut c, "crc:bad", &bad_crc),
+        "-ERR DUMP payload version or checksum are wrong\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["EXISTS", "crc:bad"]), ":0\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}

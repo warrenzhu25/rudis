@@ -13671,6 +13671,9 @@ impl RudisTable {
                 .try_into()
                 .map_err(|_| "DUMP payload version or checksum are wrong")?,
         );
+        // Like Redis (verifyDumpPayload), a zero CRC means "no checksum":
+        // payloads made by tools that skip it must restore. The decoder
+        // below still rejects malformed payloads.
         if expected_crc != 0 {
             let actual_crc = crc64(&serialized[..data_len]);
             if expected_crc != actual_crc {
@@ -16465,6 +16468,40 @@ mod tests {
             .unwrap();
         let c_merged = table.pfcount(&[Bytes::from_static(b"hll_merged")]).unwrap();
         assert_eq!(c_merged, 6);
+    }
+
+    #[test]
+    fn test_restore_skips_a_zero_crc_but_checks_any_other() {
+        let mut table = RudisTable::new();
+        table.set(Bytes::from_static(b"k"), Bytes::from_static(b"v"), None);
+        let dumped = table.dump(b"k").unwrap();
+        let crc_at = dumped.len() - 8;
+
+        let mut no_crc = dumped.clone();
+        no_crc[crc_at..].fill(0);
+        table
+            .restore(Bytes::from_static(b"a"), 0, &no_crc, false, false)
+            .unwrap();
+        assert_eq!(table.get(b"a").unwrap(), Some(Bytes::from_static(b"v")));
+
+        let mut bad_crc = dumped.clone();
+        bad_crc[crc_at] ^= 1;
+        assert_eq!(
+            table.restore(Bytes::from_static(b"b"), 0, &bad_crc, false, false),
+            Err("DUMP payload version or checksum are wrong")
+        );
+
+        // Skipping the checksum does not skip decoding.
+        let mut garbage = vec![0xff; 4];
+        garbage.extend_from_slice(&10u16.to_le_bytes());
+        garbage.extend_from_slice(&[0; 8]);
+        assert!(
+            table
+                .restore(Bytes::from_static(b"c"), 0, &garbage, false, false)
+                .is_err()
+        );
+        assert_eq!(table.get(b"b").unwrap(), None);
+        assert_eq!(table.get(b"c").unwrap(), None);
     }
 
     #[test]
