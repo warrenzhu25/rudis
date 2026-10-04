@@ -2335,39 +2335,53 @@ impl ShardDb {
         clock: &RdbClock,
         buf: &mut Vec<u8>,
     ) {
+        if let Some(exp) = entry.expire_at
+            && exp <= clock.now
+        {
+            return;
+        }
+        // A tiered record's payload is already in `serialize_val_payload`
+        // form (see `RudisTable::get_value_for_spill`), so it is copied
+        // verbatim. It must be read before anything is written for this
+        // entry: a failed read has to skip the whole entry, never leave an
+        // expiry opcode or a key without a value behind.
+        let tiered_payload = match &entry.val {
+            crate::table::RudisValue::Tiered(ptr) => match self.read_tiered_payload(*ptr) {
+                Some(raw) => Some(raw),
+                None => {
+                    tracing::error!(
+                        key = %String::from_utf8_lossy(&entry.key),
+                        "RDB save: failed to read tiered value, key skipped"
+                    );
+                    return;
+                }
+            },
+            _ => None,
+        };
         if let Some(exp) = entry.expire_at {
-            if exp <= clock.now {
-                return;
-            }
             let rem_ms = exp.duration_since(clock.now).as_millis() as u64;
             let expire_unix_ms = clock.unix_ms + rem_ms;
             buf.push(0xFC);
             buf.extend_from_slice(&expire_unix_ms.to_le_bytes());
         }
-        match &entry.val {
-            crate::table::RudisValue::Tiered(ptr) => {
-                if let Some(ref tm) = self.tier_manager
-                    && let Ok((_, raw)) = tm.read_ptr_sync(*ptr)
-                {
-                    buf.extend_from_slice(&(entry.key.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(&entry.key);
-                    crate::table::RudisTable::serialize_val_payload(
-                        &crate::table::RudisValue::String(bytes::Bytes::from(raw)),
-                        buf,
-                    );
-                }
-            }
-            crate::table::RudisValue::Cooled { val, .. } => {
-                buf.extend_from_slice(&(entry.key.len() as u32).to_le_bytes());
-                buf.extend_from_slice(&entry.key);
+        buf.extend_from_slice(&(entry.key.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&entry.key);
+        match (&entry.val, tiered_payload) {
+            (_, Some(raw)) => buf.extend_from_slice(&raw),
+            (crate::table::RudisValue::Cooled { val, .. }, None) => {
                 crate::table::RudisTable::serialize_val_payload(val, buf);
             }
-            other => {
-                buf.extend_from_slice(&(entry.key.len() as u32).to_le_bytes());
-                buf.extend_from_slice(&entry.key);
-                crate::table::RudisTable::serialize_val_payload(other, buf);
-            }
+            (other, None) => crate::table::RudisTable::serialize_val_payload(other, buf),
         }
+    }
+
+    /// Reads a tiered record's value payload, already in
+    /// `serialize_val_payload` form. The record's CRC and header type are
+    /// checked by the tier manager; the payload's own type tag must agree.
+    fn read_tiered_payload(&self, ptr: crate::table::TieredPointer) -> Option<Vec<u8>> {
+        let tm = self.tier_manager.as_ref()?;
+        let (_, raw) = tm.read_ptr_sync(ptr).ok()?;
+        (raw.first() == Some(&ptr.value_type)).then_some(raw)
     }
 
     pub fn save_extended_rdb_chunk(&self, buf: &mut Vec<u8>) {
@@ -4298,5 +4312,94 @@ mod tests {
     #[test]
     fn test_shard_message_size() {
         assert!(std::mem::size_of::<ShardMessage>() <= 88);
+    }
+
+    /// Moves `key` to the tier the way `Router::spill_local` does.
+    async fn spill_for_test(db: &mut ShardDb, key: &[u8]) {
+        let (payload, val_type) = db.table.get_value_for_spill(key).unwrap();
+        let tm = db.tier_manager.clone().unwrap();
+        let ptr = tm
+            .stash_record(&Bytes::copy_from_slice(key), &payload, val_type)
+            .await
+            .unwrap();
+        assert!(db.table.set_tiered_pointer(key, ptr));
+    }
+
+    #[test]
+    fn test_rdb_save_keeps_tiered_values_and_types() {
+        let dir = std::env::temp_dir().join(format!("rudis_tier_rdb_{}", std::process::id()));
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut db = ShardDb::new(0);
+            db.tier_manager = Some(std::rc::Rc::new(
+                crate::tiering::ShardTierManager::open(0, 55556, &dir)
+                    .await
+                    .unwrap(),
+            ));
+            db.set(
+                Bytes::from_static(b"s"),
+                Bytes::from_static(b"plain-value"),
+                Some(Duration::from_secs(1000)),
+            );
+            db.hset(
+                Bytes::from_static(b"h"),
+                vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))],
+            )
+            .unwrap();
+            db.zadd(
+                Bytes::from_static(b"z"),
+                vec![(2.5, Bytes::from_static(b"m"))],
+                crate::table::ZAddFlags::default(),
+            )
+            .unwrap();
+            db.set(Bytes::from_static(b"hot"), Bytes::from_static(b"x"), None);
+            for k in [&b"s"[..], b"h", b"z"] {
+                spill_for_test(&mut db, k).await;
+            }
+
+            let mut chunk = Vec::new();
+            db.save_rdb_chunk(&mut chunk);
+            let mut restored = ShardDb::new(0);
+            restored.restore_rdb_chunk(&chunk).unwrap();
+
+            assert_eq!(restored.get(b"s"), Some(Bytes::from_static(b"plain-value")));
+            assert!(restored.ttl(b"s", false) > 900);
+            assert_eq!(
+                restored.hget(b"h", b"f").unwrap(),
+                Some(Bytes::from_static(b"v"))
+            );
+            assert_eq!(restored.zscore(b"z", b"m").unwrap(), Some(2.5));
+            assert_eq!(restored.get(b"hot"), Some(Bytes::from_static(b"x")));
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_rdb_save_skips_unreadable_tiered_key_cleanly() {
+        let mut db = ShardDb::new(0);
+        db.set(
+            Bytes::from_static(b"lost"),
+            Bytes::from_static(b"v"),
+            Some(Duration::from_secs(1000)),
+        );
+        db.set(Bytes::from_static(b"kept"), Bytes::from_static(b"k"), None);
+        // No tier manager: the tiered value can't be read back.
+        let ptr = crate::table::TieredPointer {
+            file_id: 0,
+            offset: 0,
+            length: 32,
+            value_type: 0,
+        };
+        assert!(db.table.set_tiered_pointer(b"lost", ptr));
+
+        let mut chunk = Vec::new();
+        db.save_rdb_chunk(&mut chunk);
+        let mut restored = ShardDb::new(0);
+        restored.restore_rdb_chunk(&chunk).unwrap();
+        assert_eq!(restored.get(b"kept"), Some(Bytes::from_static(b"k")));
+        assert_eq!(restored.get(b"lost"), None);
     }
 }

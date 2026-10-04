@@ -18088,6 +18088,61 @@ fn test_dbfilename_is_used_for_save_and_load_e2e() {
 }
 
 #[test]
+fn test_save_restores_tiered_keys_with_their_types_e2e() {
+    let port = 17071;
+    let dir = std::env::temp_dir().join(format!("rudis-tier-rdb-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let conf = dir.join("rudis.conf");
+    std::fs::write(&conf, format!("dir {}\n", dir.display())).unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "-c",
+        conf.to_str().unwrap(),
+    ];
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(
+        resp_cmd(&mut c, &["SET", "t:s", "hello", "EX", "1000"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["HSET", "t:h", "f", "v"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["ZADD", "t:z", "2.5", "m"]), ":1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["RPUSH", "t:l", "a", "b"]), ":2\r\n");
+    for k in ["t:s", "t:h", "t:z", "t:l"] {
+        assert_eq!(resp_cmd(&mut c, &["TIER", "SPILL", k]), ":1\r\n", "{k}");
+    }
+    assert_eq!(resp_cmd(&mut c, &["SAVE"]), "+OK\r\n");
+    drop(c);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["GET", "t:s"]), "$5\r\nhello\r\n");
+    let ttl = resp_cmd(&mut c, &["TTL", "t:s"]);
+    let ttl: i64 = ttl.trim_start_matches(':').trim().parse().unwrap();
+    assert!(ttl > 900, "ttl {ttl}");
+    assert_eq!(resp_cmd(&mut c, &["HGET", "t:h", "f"]), "$1\r\nv\r\n");
+    assert_eq!(resp_cmd(&mut c, &["ZSCORE", "t:z", "m"]), "$3\r\n2.5\r\n");
+    assert_eq!(
+        resp_cmd(&mut c, &["LRANGE", "t:l", "0", "-1"]),
+        "*2\r\n$1\r\na\r\n$1\r\nb\r\n"
+    );
+    drop(c);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_blocking_pops_never_miss_a_concurrent_push_e2e() {
     // The pusher's command can reach the key's owner shard while the blocked
     // client is between "all keys empty" and "registered as a waiter". That
