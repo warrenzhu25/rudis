@@ -18377,3 +18377,125 @@ $7\r\nkeystep\r\n:1\r\n$5\r\nlimit\r\n:0\r\n*0\r\n";
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[test]
+fn test_bgsave_does_not_stall_shards_e2e() {
+    // BGSAVE used to serialize each shard in one go and CRC/write the whole
+    // dump on the coordinating shard, stalling its clients for the entire
+    // save (~1.4 s for 2M keys). Clients must keep being served, and keys
+    // written meanwhile must not break the snapshot.
+    let port = 17104;
+    let dir = std::env::temp_dir().join(format!("rudis-bgsave-stall-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let conf = dir.join("rudis.conf");
+    std::fs::write(&conf, format!("dir {}\nsave \"\"\n", dir.display())).unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "-c",
+        conf.to_str().unwrap(),
+    ];
+    // Killed even if an assertion fails: with SO_REUSEPORT a leaked server
+    // would silently share the port with the next run's.
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let child = KillOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+
+    const KEYS: usize = 400_000;
+    const BATCH: usize = 1000;
+    let val = "v".repeat(100);
+    let mut out = Vec::new();
+    for start in (0..KEYS).step_by(BATCH) {
+        out.extend_from_slice(format!("*{}\r\n$4\r\nMSET\r\n", 1 + 2 * BATCH).as_bytes());
+        for i in start..start + BATCH {
+            let k = format!("base:{i}");
+            out.extend_from_slice(format!("${}\r\n{k}\r\n$100\r\n{val}\r\n", k.len()).as_bytes());
+        }
+    }
+    c.write_all(&out).unwrap();
+    let (mut oks, mut buf) = (0, [0u8; 65536]);
+    while oks < KEYS / BATCH {
+        let n = c.read(&mut buf).unwrap();
+        assert!(n > 0, "server closed during fill");
+        oks += buf[..n].iter().filter(|&&b| b == b'+').count();
+    }
+    assert_eq!(resp_cmd(&mut c, &["DBSIZE"]), format!(":{KEYS}\r\n"));
+
+    let rdb = dir.join("dump.rdb");
+    let started = std::time::Instant::now();
+    assert_eq!(
+        resp_cmd(&mut c, &["BGSAVE"]),
+        "+Background saving started\r\n"
+    );
+    let (mut worst, mut during) = (Duration::ZERO, 0usize);
+    while !rdb.exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "BGSAVE did not finish"
+        );
+        let t = std::time::Instant::now();
+        assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n");
+        assert_eq!(
+            resp_cmd(&mut c, &["SET", &format!("during:{during}"), "x"]),
+            "+OK\r\n"
+        );
+        worst = worst.max(t.elapsed());
+        during += 1;
+    }
+    let save_time = started.elapsed();
+    // Only meaningful when the save takes a while; on a stalled shard the
+    // worst round trip is about as long as the whole save.
+    if save_time > Duration::from_millis(150) {
+        assert!(
+            worst < save_time / 3,
+            "a round trip took {worst:?} during a {save_time:?} BGSAVE"
+        );
+    }
+    drop(c);
+    drop(child);
+
+    // Every key that existed for the whole save is in the snapshot; keys
+    // written during it may or may not be.
+    let child = KillOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let dbsize = loop {
+        let r = resp_cmd(&mut c, &["DBSIZE"]);
+        if !r.starts_with("-LOADING") {
+            break r;
+        }
+        assert!(std::time::Instant::now() < deadline, "still loading");
+        thread::sleep(Duration::from_millis(100));
+    };
+    let n: usize = dbsize.trim_start_matches(':').trim().parse().unwrap();
+    assert!(
+        (KEYS..=KEYS + during).contains(&n),
+        "dbsize {n}, during {during}"
+    );
+    let mut base = 0;
+    for i in (0..KEYS).step_by(997) {
+        assert_eq!(
+            resp_cmd(&mut c, &["EXISTS", &format!("base:{i}")]),
+            ":1\r\n",
+            "base:{i}"
+        );
+        base += 1;
+    }
+    assert!(base > 400);
+    drop(c);
+    drop(child);
+    let _ = std::fs::remove_dir_all(&dir);
+}

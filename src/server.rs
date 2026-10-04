@@ -1664,12 +1664,21 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         let _ = responder.send(());
                     }
                     ShardMessage::SaveRdbChunk { responder, arm_replica } => {
+                        // Full syncs and shard flows arm their stream right
+                        // around this, so the shard must not change between.
                         let mut buf = Vec::new();
                         cross_shard_db.borrow_mut().save_rdb_chunk(&mut buf);
                         if let Some(id) = arm_replica {
                             crate::replication::get_replication_hub(port).arm_full_sync(id, shard_id);
                         }
                         let _ = responder.send(buf);
+                    }
+                    ShardMessage::StreamRdbChunk { sink, done } => {
+                        let db = cross_shard_db.clone();
+                        monoio::spawn(async move {
+                            let ok = crate::shard::save_rdb_chunk_yielding(&db, &sink).await;
+                            let _ = done.send(ok);
+                        });
                     }
                     ShardMessage::Publish {
                         channel,

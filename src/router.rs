@@ -168,6 +168,8 @@ pub struct MsetInFlight {
 }
 
 const WRONGTYPE_ERR: &str = "WRONGTYPE Operation against a key holding the wrong kind of value";
+/// Producer-side error when the RDB writer thread hung up; its own error wins.
+const WRITER_GONE: &str = "rdb writer gone";
 
 /// The router handles dispatching operations.
 /// If the key belongs to the current shard, it directly touches `local_db` without locking.
@@ -3586,54 +3588,107 @@ impl Router {
 
     async fn write_rdb_file(&self, tmp_filename: &std::path::Path) -> Result<(), String> {
         let filename = self.db_dir.join(crate::config::dbfilename(self.base_port));
-        use std::io::Write;
-        let mut file = std::fs::File::create(tmp_filename).map_err(|e| e.to_string())?;
 
-        let header = b"REDIS0011\xFE\x00";
-        file.write_all(header).map_err(|e| e.to_string())?;
-        let mut crc = crate::table::crc64(header);
+        // CRC64 and write/fsync of a large dump take hundreds of ms; doing them
+        // here would stall every client on this shard. A writer thread does them
+        // instead. Shards stream ~4 MB pieces through a rendezvous channel,
+        // so only a few pieces are alive at once, however big the dataset.
+        let (chunk_tx, chunk_rx) = flume::bounded::<Option<Vec<u8>>>(0);
+        let (done_tx, done_rx) = flume::bounded::<Result<(), String>>(1);
+        let tmp_path = tmp_filename.to_path_buf();
+        std::thread::Builder::new()
+            .name("rdb-writer".into())
+            .spawn(move || {
+                let _ = done_tx.send(Self::rdb_writer(&tmp_path, &filename, chunk_rx));
+            })
+            .map_err(|e| e.to_string())?;
 
-        // Local shard chunk
-        let mut local_chunk = Vec::new();
-        self.local_db.borrow_mut().save_rdb_chunk(&mut local_chunk);
-        if !local_chunk.is_empty() {
-            crc = crate::table::crc64_update(crc, &local_chunk);
-            file.write_all(&local_chunk).map_err(|e| e.to_string())?;
+        let produced = self.produce_rdb_chunks(&chunk_tx).await;
+        if produced.is_ok() {
+            // If the writer already failed it has hung up; its error is
+            // reported below.
+            let _ = chunk_tx.send_async(None).await;
         }
-        drop(local_chunk);
+        drop(chunk_tx);
+        // Always wait for the writer, so the caller's cleanup of the temp file
+        // cannot race with the writer still creating or writing it.
+        let written = done_rx
+            .recv_async()
+            .await
+            .unwrap_or_else(|_| Err("rdb writer thread died".to_string()));
+        match produced {
+            Err(e) if e != WRITER_GONE => Err(e),
+            _ => written,
+        }
+    }
 
-        // Remote shard chunks streamed sequentially one-by-one:
-        // Only one shard ever holds a serialized chunk in memory at any time.
+    /// Stream every shard's keyspace, one shard after another, into `chunk_tx`.
+    async fn produce_rdb_chunks(
+        &self,
+        chunk_tx: &flume::Sender<Option<Vec<u8>>>,
+    ) -> Result<(), String> {
+        if !crate::shard::save_rdb_chunk_yielding(&self.local_db, chunk_tx).await {
+            return Err(WRITER_GONE.to_string());
+        }
+
+        // Shards stream in turn (each finishes before the next starts), so
+        // pieces from different shards never interleave.
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
-                let (tx, rx) = flume::bounded(1);
+                let (done_tx, done_rx) = flume::bounded(1);
                 // A missing shard would silently drop its keys from the dump.
                 sender
-                    .send(ShardMessage::SaveRdbChunk {
-                        responder: tx,
-                        arm_replica: None,
+                    .send(ShardMessage::StreamRdbChunk {
+                        sink: chunk_tx.clone(),
+                        done: done_tx,
                     })
                     .map_err(|_| format!("shard {} is not reachable", sid))?;
-                let chunk = rx
-                    .recv_async()
-                    .await
-                    .map_err(|_| format!("shard {} did not return its data", sid))?;
-                if !chunk.is_empty() {
-                    crc = crate::table::crc64_update(crc, &chunk);
-                    file.write_all(&chunk).map_err(|e| e.to_string())?;
+                match done_rx.recv_async().await {
+                    Ok(true) => {}
+                    Ok(false) => return Err(WRITER_GONE.to_string()),
+                    Err(_) => return Err(format!("shard {} did not return its data", sid)),
                 }
-                drop(chunk);
+            }
+        }
+        Ok(())
+    }
+
+    /// Body of the `rdb-writer` thread: header, chunks, EOF + CRC64, fsync,
+    /// atomic rename. A channel closed without the `None` terminator aborts.
+    fn rdb_writer(
+        tmp_filename: &std::path::Path,
+        filename: &std::path::Path,
+        chunks: flume::Receiver<Option<Vec<u8>>>,
+    ) -> Result<(), String> {
+        use std::io::Write;
+        let file = std::fs::File::create(tmp_filename).map_err(|e| e.to_string())?;
+        let mut out = std::io::BufWriter::with_capacity(1 << 20, file);
+
+        let header = b"REDIS0011\xFE\x00";
+        out.write_all(header).map_err(|e| e.to_string())?;
+        let mut crc = crate::table::crc64(header);
+        loop {
+            match chunks.recv() {
+                Ok(Some(chunk)) => {
+                    if !chunk.is_empty() {
+                        crc = crate::table::crc64_update(crc, &chunk);
+                        out.write_all(&chunk).map_err(|e| e.to_string())?;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => return Err("save aborted".to_string()),
             }
         }
 
         let eof = [0xFF];
         crc = crate::table::crc64_update(crc, &eof);
-        file.write_all(&eof).map_err(|e| e.to_string())?;
-        file.write_all(&crc.to_le_bytes())
+        out.write_all(&eof).map_err(|e| e.to_string())?;
+        out.write_all(&crc.to_le_bytes())
             .map_err(|e| e.to_string())?;
+        let file = out.into_inner().map_err(|e| e.error().to_string())?;
         file.sync_all().map_err(|e| e.to_string())?;
-        std::fs::rename(tmp_filename, &filename).map_err(|e| e.to_string())?;
-        let _ = crate::aof::sync_parent_dir(std::path::Path::new(&filename));
+        std::fs::rename(tmp_filename, filename).map_err(|e| e.to_string())?;
+        let _ = crate::aof::sync_parent_dir(filename);
         Ok(())
     }
 

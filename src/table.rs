@@ -1999,6 +1999,11 @@ pub struct RudisFlatTable {
     pub capacity: usize,
     pub items: usize,
     pub slot_counts: Box<[u32; 16384]>,
+    /// Bumped when segments are renumbered (`clear`, `defrag` collapsing to
+    /// one segment). Splits only append segments and in-place rebuilds keep
+    /// a segment's entries in it, so walking segment ids in order sees every
+    /// entry that stays put for the whole walk unless this changes.
+    layout_epoch: u64,
 }
 
 impl RudisFlatTable {
@@ -2013,6 +2018,7 @@ impl RudisFlatTable {
             capacity: init_cap,
             items: 0,
             slot_counts: vec![0u32; 16384].into_boxed_slice().try_into().unwrap(),
+            layout_epoch: 0,
         }
     }
 
@@ -2298,6 +2304,21 @@ impl RudisFlatTable {
         self.segments.iter().flat_map(|s| s.slots.iter().flatten())
     }
 
+    pub fn layout_epoch(&self) -> u64 {
+        self.layout_epoch
+    }
+
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    pub fn segment_entries(&self, seg: usize) -> impl Iterator<Item = &RudisEntry> {
+        self.segments
+            .get(seg)
+            .into_iter()
+            .flat_map(|s| s.slots.iter().flatten())
+    }
+
     #[inline]
     pub fn entries_mut(&mut self) -> impl Iterator<Item = &mut RudisEntry> {
         self.segments
@@ -2366,6 +2387,7 @@ impl RudisFlatTable {
     #[inline(always)]
     pub fn clear(&mut self) {
         let seg = RawSegment::new(64, 0);
+        self.layout_epoch += 1;
         self.segments.clear();
         self.segments.push(seg);
         self.directory.clear();
@@ -2396,6 +2418,7 @@ impl RudisFlatTable {
                     }
                 }
             }
+            self.layout_epoch += 1;
             self.segments.clear();
             self.segments.push(single);
             self.directory.clear();
@@ -2784,6 +2807,19 @@ impl RudisTable {
     #[inline]
     pub fn entries(&self) -> impl Iterator<Item = &RudisEntry> {
         self.table.entries()
+    }
+
+    /// See [`RudisFlatTable::layout_epoch`].
+    pub fn layout_epoch(&self) -> u64 {
+        self.table.layout_epoch()
+    }
+
+    pub fn segment_count(&self) -> usize {
+        self.table.segment_count()
+    }
+
+    pub fn segment_entries(&self, seg: usize) -> impl Iterator<Item = &RudisEntry> {
+        self.table.segment_entries(seg)
     }
 
     #[inline(always)]

@@ -450,6 +450,14 @@ pub enum ShardMessage {
         /// arms the replica's stream cut right after serializing.
         arm_replica: Option<u64>,
     },
+    /// SAVE/BGSAVE: stream this shard's keyspace into `sink` in pieces,
+    /// yielding in between (see [`save_rdb_chunk_yielding`]), then report on
+    /// `done` (`false` if the sink hung up). Unlike `SaveRdbChunk` this is a
+    /// fuzzy snapshot, so it must not be used where an exact cut is needed.
+    StreamRdbChunk {
+        sink: flume::Sender<Option<Vec<u8>>>,
+        done: flume::Sender<bool>,
+    },
     Publish {
         channel: Bytes,
         message: Bytes,
@@ -2307,49 +2315,59 @@ impl ShardDb {
 
     #[inline]
     pub fn save_rdb_chunk(&mut self, buf: &mut Vec<u8>) {
-        let now = std::time::Instant::now();
-        let unix_now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
+        let clock = RdbClock::now();
         for entry in self.table.entries() {
-            if let Some(exp) = entry.expire_at {
-                if exp <= now {
-                    continue;
-                }
-                let rem_ms = exp.duration_since(now).as_millis() as u64;
-                let expire_unix_ms = unix_now + rem_ms;
-                buf.push(0xFC);
-                buf.extend_from_slice(&expire_unix_ms.to_le_bytes());
+            self.save_rdb_entry(entry, &clock, buf);
+        }
+        self.save_extended_rdb_chunk(buf);
+    }
+
+    /// Serializes one table segment (see [`crate::table::RudisFlatTable::layout_epoch`]).
+    fn save_rdb_segment(&self, seg: usize, clock: &RdbClock, buf: &mut Vec<u8>) {
+        for entry in self.table.segment_entries(seg) {
+            self.save_rdb_entry(entry, clock, buf);
+        }
+    }
+
+    fn save_rdb_entry(
+        &self,
+        entry: &crate::table::RudisEntry,
+        clock: &RdbClock,
+        buf: &mut Vec<u8>,
+    ) {
+        if let Some(exp) = entry.expire_at {
+            if exp <= clock.now {
+                return;
             }
-            match &entry.val {
-                crate::table::RudisValue::Tiered(ptr) => {
-                    if let Some(ref tm) = self.tier_manager
-                        && let Ok((_, raw)) = tm.read_ptr_sync(*ptr)
-                    {
-                        buf.extend_from_slice(&(entry.key.len() as u32).to_le_bytes());
-                        buf.extend_from_slice(&entry.key);
-                        crate::table::RudisTable::serialize_val_payload(
-                            &crate::table::RudisValue::String(bytes::Bytes::from(raw)),
-                            buf,
-                        );
-                    }
-                }
-                crate::table::RudisValue::Cooled { val, .. } => {
+            let rem_ms = exp.duration_since(clock.now).as_millis() as u64;
+            let expire_unix_ms = clock.unix_ms + rem_ms;
+            buf.push(0xFC);
+            buf.extend_from_slice(&expire_unix_ms.to_le_bytes());
+        }
+        match &entry.val {
+            crate::table::RudisValue::Tiered(ptr) => {
+                if let Some(ref tm) = self.tier_manager
+                    && let Ok((_, raw)) = tm.read_ptr_sync(*ptr)
+                {
                     buf.extend_from_slice(&(entry.key.len() as u32).to_le_bytes());
                     buf.extend_from_slice(&entry.key);
-                    crate::table::RudisTable::serialize_val_payload(val, buf);
+                    crate::table::RudisTable::serialize_val_payload(
+                        &crate::table::RudisValue::String(bytes::Bytes::from(raw)),
+                        buf,
+                    );
                 }
-                other => {
-                    buf.extend_from_slice(&(entry.key.len() as u32).to_le_bytes());
-                    buf.extend_from_slice(&entry.key);
-                    crate::table::RudisTable::serialize_val_payload(other, buf);
-                }
+            }
+            crate::table::RudisValue::Cooled { val, .. } => {
+                buf.extend_from_slice(&(entry.key.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&entry.key);
+                crate::table::RudisTable::serialize_val_payload(val, buf);
+            }
+            other => {
+                buf.extend_from_slice(&(entry.key.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&entry.key);
+                crate::table::RudisTable::serialize_val_payload(other, buf);
             }
         }
-
-        self.save_extended_rdb_chunk(buf);
     }
 
     pub fn save_extended_rdb_chunk(&self, buf: &mut Vec<u8>) {
@@ -4009,6 +4027,92 @@ impl ShardDb {
         self.crdt_store.gc_tombstones(ttl)
     }
 }
+
+/// "Now" for one serialization step: expiries are written as absolute unix
+/// milliseconds.
+struct RdbClock {
+    now: std::time::Instant,
+    unix_ms: u64,
+}
+
+impl RdbClock {
+    fn now() -> Self {
+        RdbClock {
+            now: std::time::Instant::now(),
+            unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+        }
+    }
+}
+
+/// How long one step of [`save_rdb_chunk_yielding`] may hold the shard.
+const RDB_SAVE_STEP: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// [`ShardDb::save_rdb_chunk`] for SAVE/BGSAVE: serializes a few table
+/// segments at a time and yields to the shard's other tasks in between, so
+/// a big shard does not stall its clients for the whole serialization.
+///
+/// Like the cross-shard save it is a fuzzy snapshot: each key is written as
+/// it is when its segment is reached. Every key that exists for the whole
+/// save is written; a key moved to a new segment by a split can be written
+/// twice, which loading resolves (the later copy wins). If the table is
+/// renumbered mid-way (FLUSHALL, collapsing defrag), the rest of the table
+/// is small or empty and is written again in one go.
+///
+/// Not for full syncs: those arm the replication stream cut right after
+/// serializing, which needs the shard not to change in between.
+///
+/// Output goes to `sink` as `Some(piece)` every ~[`RDB_FLUSH_BYTES`] (and a
+/// final tail), which keeps memory bounded and avoids reallocating (copying)
+/// one huge buffer on the shard thread. Returns `false` if the sink hung up.
+pub async fn save_rdb_chunk_yielding(
+    db: &std::cell::RefCell<ShardDb>,
+    sink: &flume::Sender<Option<Vec<u8>>>,
+) -> bool {
+    let epoch = db.borrow().table.layout_epoch();
+    let mut seg = 0;
+    let mut buf = Vec::with_capacity(RDB_FLUSH_BYTES * 2);
+    let finished = loop {
+        {
+            let db = db.borrow();
+            let clock = RdbClock::now();
+            if db.table.layout_epoch() != epoch {
+                for entry in db.table.entries() {
+                    db.save_rdb_entry(entry, &clock, &mut buf);
+                }
+                db.save_extended_rdb_chunk(&mut buf);
+                break buf;
+            }
+            let segments = db.table.segment_count();
+            while seg < segments
+                && clock.now.elapsed() < RDB_SAVE_STEP
+                && buf.len() < RDB_FLUSH_BYTES
+            {
+                db.save_rdb_segment(seg, &clock, &mut buf);
+                seg += 1;
+            }
+            if seg >= segments {
+                db.save_extended_rdb_chunk(&mut buf);
+                break buf;
+            }
+        }
+        if buf.len() >= RDB_FLUSH_BYTES {
+            let piece = std::mem::replace(&mut buf, Vec::with_capacity(RDB_FLUSH_BYTES * 2));
+            if sink.send_async(Some(piece)).await.is_err() {
+                return false;
+            }
+        }
+        // A send that completes at once does not yield; always let the
+        // shard's other tasks in between steps.
+        crate::mailbox::yield_now().await;
+    };
+    finished.is_empty() || sink.send_async(Some(finished)).await.is_ok()
+}
+
+/// Piece size [`save_rdb_chunk_yielding`] streams to its sink.
+const RDB_FLUSH_BYTES: usize = 4 << 20;
 
 #[cfg(test)]
 mod tests {
