@@ -1629,6 +1629,72 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             }
             Some(buf)
         }
+        // JSON.* writes are logged as issued; replaying them in order
+        // rebuilds the same document.
+        Command::JsonSet {
+            key,
+            path,
+            json_val,
+            nx,
+            xx,
+        } => {
+            let mut args: Vec<&[u8]> = vec![b"JSON.SET", key, path.as_bytes(), json_val.as_bytes()];
+            if *nx {
+                args.push(b"NX");
+            }
+            if *xx {
+                args.push(b"XX");
+            }
+            Some(resp_argv(&args))
+        }
+        Command::JsonDel { key, path } | Command::JsonClear { key, path } => {
+            let name: &[u8] = if matches!(cmd, Command::JsonDel { .. }) {
+                b"JSON.DEL"
+            } else {
+                b"JSON.CLEAR"
+            };
+            let mut args: Vec<&[u8]> = vec![name, key];
+            args.extend(path.as_deref().map(str::as_bytes));
+            Some(resp_argv(&args))
+        }
+        Command::JsonNumIncrBy { key, path, delta } => Some(resp_argv(&[
+            b"JSON.NUMINCRBY".as_slice(),
+            key,
+            path.as_bytes(),
+            delta.to_string().as_bytes(),
+        ])),
+        Command::JsonNumMultBy { key, path, factor } => Some(resp_argv(&[
+            b"JSON.NUMMULTBY".as_slice(),
+            key,
+            path.as_bytes(),
+            factor.to_string().as_bytes(),
+        ])),
+        Command::JsonStrAppend { key, path, value } => {
+            let mut args: Vec<&[u8]> = vec![b"JSON.STRAPPEND", key];
+            args.extend(path.as_deref().map(str::as_bytes));
+            args.push(value.as_bytes());
+            Some(resp_argv(&args))
+        }
+        Command::JsonArrAppend { key, path, values } => {
+            let mut args: Vec<&[u8]> = vec![b"JSON.ARRAPPEND", key, path.as_bytes()];
+            args.extend(values.iter().map(String::as_bytes));
+            Some(resp_argv(&args))
+        }
+        Command::JsonArrPop { key, path, index } => {
+            let index = index.map(|i| i.to_string());
+            let mut args: Vec<&[u8]> = vec![b"JSON.ARRPOP", key];
+            // The parser only reads an index after a path.
+            args.extend(path.as_deref().map(str::as_bytes));
+            if path.is_some() {
+                args.extend(index.as_deref().map(str::as_bytes));
+            }
+            Some(resp_argv(&args))
+        }
+        Command::JsonToggle { key, path } => Some(resp_argv(&[
+            b"JSON.TOGGLE".as_slice(),
+            key,
+            path.as_bytes(),
+        ])),
         Command::SemanticSet {
             namespace,
             id,
@@ -3198,6 +3264,39 @@ mod tests {
         let p = std::env::temp_dir().join(format!("rudis-aoftail-{}-{}", std::process::id(), name));
         std::fs::write(&p, content).unwrap();
         p
+    }
+
+    #[test]
+    fn test_json_writes_round_trip_through_aof_encoding() {
+        let writes: &[&[&str]] = &[
+            &[
+                "JSON.SET",
+                "j",
+                "$",
+                r#"{"a":[1,2],"s":"x","b":true,"n":1.5}"#,
+            ],
+            &["JSON.SET", "j", "$.a", "3", "NX"],
+            &["JSON.SET", "j", "$.a", "3", "XX"],
+            &["JSON.DEL", "j"],
+            &["JSON.DEL", "j", "$.a"],
+            &["JSON.CLEAR", "j"],
+            &["JSON.CLEAR", "j", "$.a"],
+            &["JSON.NUMINCRBY", "j", "$.n", "0.1"],
+            &["JSON.NUMMULTBY", "j", "$.n", "-2.5"],
+            &["JSON.STRAPPEND", "j", r#""y""#],
+            &["JSON.STRAPPEND", "j", "$.s", r#""y""#],
+            &["JSON.ARRAPPEND", "j", "$.a", "3", r#"{"k":1}"#],
+            &["JSON.ARRPOP", "j"],
+            &["JSON.ARRPOP", "j", "$.a"],
+            &["JSON.ARRPOP", "j", "$.a", "-1"],
+            &["JSON.TOGGLE", "j", "$.b"],
+        ];
+        for args in writes {
+            let cmd = parse_resp(&resp_argv(args));
+            assert!(cmd.is_write_command(), "{args:?} should be a write");
+            let bytes = command_to_resp(&cmd).unwrap_or_else(|| panic!("{args:?} not encoded"));
+            assert_eq!(parse_resp(&bytes), cmd, "{args:?}");
+        }
     }
 
     fn parse_line(line: &str) -> Command {

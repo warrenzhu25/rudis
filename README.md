@@ -644,8 +644,9 @@ links go to the corresponding source-verified subsystem specification.
 > [!IMPORTANT]
 > The non-Redis command families `JSON.*`, `BF.*`, `CF.*`, `CMS.*`, `TOPK.*`, `FT.*`,
 > `SEMANTIC.*`, `CRDT.*`, `LLM.*`, `MCP.*` and `XDP.*` are **off by default** and answer
-> `ERR unknown command`. Most of their writes are not written to the AOF or replicated, so data
-> written with them is lost on restart or failover. Enable them with
+> `ERR unknown command`. `JSON.*` and `SEMANTIC.*` writes go to the AOF and to replicas like
+> core writes; most writes of the other families are not written to the AOF or replicated, so
+> that data is lost on restart or failover. Enable them with
 > `enable-experimental-commands yes` (config file) or `--enable-experimental-commands yes`.
 
 | Subsystem | Status | Notes | Design Doc |

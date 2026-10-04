@@ -2713,10 +2713,11 @@ pub fn experimental_commands_enabled() -> bool {
 }
 
 /// Command families that are off unless `enable-experimental-commands` is
-/// set. They are not Redis/Valkey commands, and most of their writes are
-/// neither written to the AOF nor replicated, so a restart or failover
-/// silently loses that data and replicas never see it. MCP./XDP. also
-/// expose tool calls and packet-filter control.
+/// set. They are not Redis/Valkey commands, and apart from JSON. and
+/// SEMANTIC. most of their writes are neither written to the AOF nor
+/// replicated, so a restart or failover silently loses that data and
+/// replicas never see it. MCP./XDP. also expose tool calls and
+/// packet-filter control.
 const EXPERIMENTAL_PREFIXES: &[&str] = &[
     "JSON.",
     "BF.",

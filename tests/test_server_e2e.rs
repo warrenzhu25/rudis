@@ -18289,6 +18289,69 @@ fn test_migrate_never_drops_keys_the_target_did_not_store_e2e() {
     shutdown_and_wait(dst_port, &mut dst);
 }
 
+#[test]
+fn test_json_writes_survive_restart_through_the_aof_e2e() {
+    let port = 17080;
+    let port_s = port.to_string();
+    let dir = std::env::temp_dir().join(format!("rudis-json-aof-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_s = dir.to_str().unwrap();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--aof",
+        "true",
+        "--aof-dir",
+        dir_s,
+        "--enable-experimental-commands",
+        "yes",
+    ];
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let doc = r#"{"n":1,"a":[1,2,3],"s":"x","b":false,"gone":1}"#;
+    assert_eq!(resp_cmd(&mut c, &["JSON.SET", "jd", "$", doc]), "+OK\r\n");
+    for cmd in [
+        &["JSON.NUMINCRBY", "jd", "$.n", "2"][..],
+        &["JSON.NUMMULTBY", "jd", "$.n", "10"],
+        &["JSON.ARRAPPEND", "jd", "$.a", "4"],
+        &["JSON.ARRPOP", "jd", "$.a", "0"],
+        &["JSON.STRAPPEND", "jd", "$.s", r#""y""#],
+        &["JSON.TOGGLE", "jd", "$.b"],
+        &["JSON.DEL", "jd", "$.gone"],
+        &["JSON.SET", "jd2", "$", "[1]"],
+        &["JSON.CLEAR", "jd2", "$"],
+    ] {
+        let reply = resp_cmd(&mut c, cmd);
+        assert!(!reply.starts_with('-'), "{cmd:?}: {reply}");
+    }
+    let before = resp_cmd(&mut c, &["JSON.GET", "jd"]);
+    let before2 = resp_cmd(&mut c, &["JSON.GET", "jd2"]);
+    assert!(before.contains(r#""n":30"#), "{before}");
+    drop(c);
+    {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(b"*2\r\n$8\r\nSHUTDOWN\r\n$6\r\nNOSAVE\r\n")
+            .unwrap();
+    }
+    let _ = child.wait();
+    // Nothing but the AOF can bring the documents back.
+    assert!(!dir.join("dump.rdb").exists());
+
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["JSON.GET", "jd"]), before);
+    assert_eq!(resp_cmd(&mut c, &["JSON.GET", "jd2"]), before2);
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn http_get(port: u16, path: &str) -> String {
     let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
     c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();

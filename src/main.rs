@@ -71,8 +71,9 @@ struct Args {
     cluster_enabled: Option<String>,
 
     /// Accept the experimental, non-Redis command families (JSON., BF., CF.,
-    /// CMS., TOPK., FT., SEMANTIC., CRDT., LLM., MCP., XDP.). Most of their
-    /// writes are not persisted to the AOF or replicated (yes|no, default no)
+    /// CMS., TOPK., FT., SEMANTIC., CRDT., LLM., MCP., XDP.). Apart from JSON.
+    /// and SEMANTIC., most of their writes are not persisted to the AOF or
+    /// replicated (yes|no, default no)
     #[arg(long)]
     enable_experimental_commands: Option<String>,
 
