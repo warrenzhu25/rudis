@@ -5756,6 +5756,9 @@ pub fn for_each_cmd_key<'a, F: FnMut(&'a [u8])>(cmd: &'a Command, mut f: F) {
         | Command::TopkList(key)
         | Command::TopkInfo(key)
         | Command::ProbRestore { key, .. } => f(key.as_ref()),
+        // The keys it merges: WATCH, tracking, ACL key patterns and scripts'
+        // shard checks all see them.
+        Command::CrdtMerge(payload) => crate::crdt::for_each_payload_key(payload, f),
 
         Command::Smove {
             source,
@@ -24578,6 +24581,22 @@ mod tests {
             assert_eq!(cmd_primary_key(cmd), Some(&k));
             assert_eq!(target_shard_of_cmd(cmd, num_shards), Some(expected_shard));
         }
+    }
+
+    /// CRDT.MERGE reports the keys in its payload (so scripts, WATCH and ACL
+    /// see them) but has no single shard: the router splits it.
+    #[test]
+    fn test_crdt_merge_keys_come_from_its_payload() {
+        let mut store = crate::crdt::CrdtStore::new(1);
+        store.set(Bytes::from_static(b"r"), Bytes::from_static(b"v"));
+        store.counter_incr(Bytes::from_static(b"c"), 1);
+        store.set_add(Bytes::from_static(b"s"), Bytes::from_static(b"m"));
+        let cmd = Command::CrdtMerge(store.export_sync_payload().into());
+        let mut keys = cmd_keys(&cmd);
+        keys.sort();
+        assert_eq!(keys, vec![&b"c"[..], b"r", b"s"]);
+        assert_eq!(target_shard_of_cmd(&cmd, 4), None);
+        assert!(cmd_keys(&Command::CrdtMerge(Bytes::from_static(b"\x01\xff"))).is_empty());
     }
 
     #[test]

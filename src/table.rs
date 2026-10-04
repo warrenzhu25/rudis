@@ -15472,7 +15472,14 @@ pub fn load_rdb_bytes(
             }
             let payload = &data[cursor..cursor + payload_len];
             cursor += payload_len;
-            let _ = db.crdt_store.merge_sync_payload(payload);
+            // Every shard's CRDT state is in the file; keep this shard's.
+            if let Ok(entries) = crate::crdt::decode_sync_payload(payload) {
+                db.crdt_store.merge_entries(
+                    entries
+                        .into_iter()
+                        .filter(|e| crate::router::target_shard(e.key(), num_shards) == shard_id),
+                );
+            }
             count += 1;
             continue;
         } else if type_byte == 14 {
@@ -15621,6 +15628,48 @@ mod tests {
         let foreign = rdb_with_body(b"\xFA\x09redis-ver\x058.1.0\xFE\x00\xFF");
         let err = load_rdb_bytes(&foreign, &mut db, 0, 1).unwrap_err();
         assert!(err.to_string().contains("Redis/Valkey RDB"), "{err}");
+    }
+
+    /// An RDB holds every shard's CRDT state in one record; each shard loads
+    /// only the keys it owns, so none ends up on two shards.
+    #[test]
+    fn test_load_rdb_keeps_only_the_crdt_keys_this_shard_owns() {
+        let mut src = crate::shard::ShardDb::new(0);
+        let keys: Vec<Bytes> = (0..16).map(|i| Bytes::from(format!("crdt:{i}"))).collect();
+        for k in &keys {
+            src.crdt_set(k.clone(), Bytes::from_static(b"v"));
+            src.crdt_incrby(k.clone(), 1);
+            src.crdt_sadd(k.clone(), Bytes::from_static(b"m"));
+        }
+        let mut chunk = Vec::new();
+        src.save_rdb_chunk(&mut chunk);
+        let mut body = vec![0xFE, 0x00];
+        body.extend_from_slice(&chunk);
+        body.push(0xFF);
+        let rdb = rdb_with_body(&body);
+
+        let mut seen = 0;
+        for shard in 0..2 {
+            let mut db = crate::shard::ShardDb::new(0).with_shard(shard);
+            load_rdb_bytes(&rdb, &mut db, shard, 2).unwrap();
+            let mut owned: Vec<&Bytes> = keys
+                .iter()
+                .filter(|k| crate::router::target_shard(k, 2) == shard)
+                .collect();
+            owned.sort();
+            assert!(!owned.is_empty() && owned.len() < keys.len());
+            for store in [
+                db.crdt_store.registers.keys().collect::<Vec<_>>(),
+                db.crdt_store.counters.keys().collect(),
+                db.crdt_store.sets.keys().collect(),
+            ] {
+                let mut store = store;
+                store.sort();
+                assert_eq!(store, owned);
+            }
+            seen += owned.len();
+        }
+        assert_eq!(seen, keys.len());
     }
 
     #[test]

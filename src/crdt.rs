@@ -473,12 +473,17 @@ impl CrdtStore {
     /// The whole payload is decoded before anything is applied, so a
     /// malformed one is an error that changes nothing.
     pub fn merge_sync_payload(&mut self, data: &[u8]) -> Result<usize, String> {
-        let entries = decode_sync_payload(data)?;
-        let merged_items = entries.len();
+        Ok(self.merge_entries(decode_sync_payload(data)?))
+    }
+
+    /// Merges decoded entries; returns how many.
+    pub fn merge_entries(&mut self, entries: impl IntoIterator<Item = CrdtEntry>) -> usize {
+        let mut merged_items = 0;
         for entry in entries {
             self.merge_entry(entry);
+            merged_items += 1;
         }
-        Ok(merged_items)
+        merged_items
     }
 
     fn merge_entry(&mut self, entry: CrdtEntry) {
@@ -693,6 +698,47 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Calls `f` with the key of each entry of a sync payload, as a slice of
+/// `data`, without decoding the entries. Stops at the first malformed entry
+/// (merging such a payload fails anyway).
+pub fn for_each_payload_key<'a>(data: &'a [u8], mut f: impl FnMut(&'a [u8])) {
+    const TS_LEN: usize = 14;
+    let mut r = Reader { data };
+    let mut next_key = || -> Result<&'a [u8], String> {
+        let item_type = r.u8()?;
+        let n = r.len()?;
+        let key = r.take(n)?;
+        match item_type {
+            1 => {
+                let n = r.len()?;
+                r.take(n)?;
+                r.take(TS_LEN + 1)?;
+            }
+            2 => {
+                for _ in 0..2 {
+                    let n = r.len()?;
+                    r.take(n.saturating_mul(10))?;
+                }
+            }
+            3 => {
+                for _ in 0..r.len()? {
+                    let n = r.len()?;
+                    r.take(n)?;
+                    let tags = r.len()?;
+                    r.take(tags.saturating_mul(TS_LEN))?;
+                }
+                let n = r.len()?;
+                r.take(n.saturating_mul(TS_LEN))?;
+            }
+            _ => return Err(format!("Unknown CRDT item type: {}", item_type)),
+        }
+        Ok(key)
+    };
+    while let Ok(key) = next_key() {
+        f(key);
+    }
+}
+
 /// Decodes a sync payload. Never panics: malformed input is an error.
 pub fn decode_sync_payload(data: &[u8]) -> Result<Vec<CrdtEntry>, String> {
     let mut r = Reader { data };
@@ -886,13 +932,29 @@ mod tests {
         src.set_rem(&b("s"), &b("m1"));
         let good = src.export_sync_payload();
 
+        let keys_of = |data: &[u8]| {
+            let mut keys = Vec::new();
+            for_each_payload_key(data, |k| keys.push(k.to_vec()));
+            keys
+        };
+        let all_keys: Vec<Vec<u8>> = decode_sync_payload(&good)
+            .unwrap()
+            .iter()
+            .map(|e| e.key().to_vec())
+            .collect();
+        assert_eq!(keys_of(&good), all_keys);
         // Every strict prefix is truncated mid-entry or ends cleanly between
         // entries; either way nothing panics, and an error applies nothing.
+        // The key walker yields exactly the complete entries.
         for len in 0..good.len() {
             let mut dst = CrdtStore::new(2);
-            if dst.merge_sync_payload(&good[..len]).is_err() {
-                assert!(dst.registers.is_empty() && dst.counters.is_empty());
-                assert!(dst.sets.is_empty());
+            match dst.merge_sync_payload(&good[..len]) {
+                Ok(n) => assert_eq!(keys_of(&good[..len]), all_keys[..n]),
+                Err(_) => {
+                    assert!(dst.registers.is_empty() && dst.counters.is_empty());
+                    assert!(dst.sets.is_empty());
+                    assert!(keys_of(&good[..len]).len() < all_keys.len());
+                }
             }
         }
         // Flipping any byte must not panic either.
@@ -901,6 +963,7 @@ mod tests {
                 let mut bad = good.clone();
                 bad[i] ^= flip;
                 let _ = CrdtStore::new(2).merge_sync_payload(&bad);
+                keys_of(&bad);
             }
         }
 
@@ -934,6 +997,7 @@ mod tests {
         encode_counter(&mut ctr, b"k", &neg);
         cases.push(ctr);
         for case in &cases {
+            keys_of(case);
             let mut dst = CrdtStore::new(2);
             assert!(dst.merge_sync_payload(case).is_err(), "{case:?}");
             assert!(dst.registers.is_empty() && dst.counters.is_empty() && dst.sets.is_empty());

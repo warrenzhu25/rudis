@@ -18514,10 +18514,19 @@ fn test_probabilistic_writes_survive_aof_rewrite_and_restart_e2e() {
     probabilistic_writes_survive_restart(17082, true);
 }
 
+/// The keys of `crdt_remote_payload`: a register, a counter and a set.
+const CRDT_REMOTE_KEYS: [&str; 3] = ["cr:remote2", "cr:ctr", "cr:set"];
+
 /// A `CRDT.MERGE` payload with one register, one counter and one set entry
-/// from region node 9. Every byte is below 0x80, so it can go through
-/// `resp_cmd` as a `&str`.
+/// from region node 9, whose keys span both shards of a `--threads 2`
+/// server. Every byte is below 0x80, so it can go through `resp_cmd` as a
+/// `&str`.
 fn crdt_remote_payload() -> String {
+    let shards: std::collections::HashSet<usize> = CRDT_REMOTE_KEYS
+        .iter()
+        .map(|k| rudis::router::target_shard(k.as_bytes(), 2))
+        .collect();
+    assert_eq!(shards.len(), 2, "the payload must span both shards");
     let mut p = Vec::new();
     let ts = |p: &mut Vec<u8>, phys: u64| {
         p.extend_from_slice(&phys.to_le_bytes());
@@ -18528,9 +18537,9 @@ fn crdt_remote_payload() -> String {
         p.extend_from_slice(&(b.len() as u32).to_le_bytes());
         p.extend_from_slice(b);
     };
-    // Register cr:remote = "far" (deliberately old timestamp).
+    // Register cr:remote2 = "far" (deliberately old timestamp).
     p.push(1);
-    bytes(&mut p, b"cr:remote");
+    bytes(&mut p, b"cr:remote2");
     bytes(&mut p, b"far");
     ts(&mut p, 65);
     p.push(0);
@@ -18606,7 +18615,7 @@ fn crdt_writes_survive_restart(port: u16, rewrite: bool) {
     let queries: &[&[&str]] = &[
         &["CRDT.GET", "cr:reg"],
         &["CRDT.GET", "cr:gone"],
-        &["CRDT.GET", "cr:remote"],
+        &["CRDT.GET", "cr:remote2"],
         &["CRDT.SMEMBERS", "cr:set"],
         &["CRDT.SMEMBERS", "cr:set2"],
         // INCRBY 0 reads a counter.
@@ -18684,9 +18693,97 @@ fn crdt_writes_survive_restart(port: u16, rewrite: bool) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Occurrences of `key` as an entry key in a `CRDT.DUMP` reply.
+fn crdt_dump_key_count(c: &mut TcpStream, key: &str) -> usize {
+    let dump = send_and_read_bytes(c, b"*1\r\n$9\r\nCRDT.DUMP\r\n");
+    assert!(dump.starts_with(b"$"), "{dump:?}");
+    let mut needle = (key.len() as u32).to_le_bytes().to_vec();
+    needle.extend_from_slice(key.as_bytes());
+    dump.windows(needle.len()).filter(|w| *w == needle).count()
+}
+
+/// With several shards, a CRDT.MERGE queued in MULTI or issued from a
+/// script must not put keys on shards that don't own them, and neither may
+/// loading an RDB (which holds every shard's CRDT state in one record).
+fn crdt_keys_stay_on_their_shard(port: u16) {
+    let port_s = port.to_string();
+    let dir = std::env::temp_dir().join(format!(
+        "rudis-crdt-rdb-e2e-{}-{}",
+        port,
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--aof-dir",
+        dir.to_str().unwrap(),
+        "--enable-experimental-commands",
+        "yes",
+    ];
+    let remote = crdt_remote_payload();
+    let remote_keys = CRDT_REMOTE_KEYS;
+    let local_keys = ["cr:a", "cr:b", "cr:c", "cr:d"];
+
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    for k in local_keys {
+        assert!(resp_cmd(&mut c, &["CRDT.SET", k, &format!("v-{k}")]).starts_with("+OK"));
+    }
+    // A script runs on one shard; a payload spanning shards is refused like
+    // any other non-local key, instead of landing on the wrong shard.
+    let script = "return redis.call('CRDT.MERGE', ARGV[1])";
+    let reply = resp_cmd(&mut c, &["EVAL", script, "0", &remote]);
+    assert!(reply.contains("non local key"), "{reply}");
+    assert_eq!(resp_cmd(&mut c, &["CRDT.GET", "cr:remote2"]), "$-1\r\n");
+    // In MULTI it goes through the router, which splits it by shard.
+    assert_eq!(resp_cmd(&mut c, &["MULTI"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["CRDT.MERGE", &remote]), "+QUEUED\r\n");
+    assert_eq!(resp_cmd(&mut c, &["EXEC"]), "*1\r\n:3\r\n");
+    for k in remote_keys.iter().chain(&local_keys) {
+        assert_eq!(crdt_dump_key_count(&mut c, k), 1, "{k} before restart");
+    }
+    assert_eq!(resp_cmd(&mut c, &["SAVE"]), "+OK\r\n");
+    drop(c);
+    {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(b"*2\r\n$8\r\nSHUTDOWN\r\n$6\r\nNOSAVE\r\n")
+            .unwrap();
+    }
+    let _ = child.wait();
+
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    for k in remote_keys.iter().chain(&local_keys) {
+        assert_eq!(crdt_dump_key_count(&mut c, k), 1, "{k} after RDB load");
+    }
+    for k in local_keys {
+        assert_eq!(
+            resp_cmd(&mut c, &["CRDT.GET", k]),
+            format!("${}\r\nv-{k}\r\n", k.len() + 2)
+        );
+    }
+    assert_eq!(
+        resp_cmd(&mut c, &["CRDT.GET", "cr:remote2"]),
+        "$3\r\nfar\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["CRDT.INCRBY", "cr:ctr", "0"]), ":5\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_crdt_writes_survive_restart_through_the_aof_e2e() {
     crdt_writes_survive_restart(17085, false);
+    // Same port, run after the first server has stopped.
+    crdt_keys_stay_on_their_shard(17085);
 }
 
 #[test]

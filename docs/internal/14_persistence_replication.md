@@ -454,6 +454,10 @@ macro, which appends `crate::aof::command_to_resp(cmd)` to the AOF and propagate
   shard that pruned something logs `CRDT.GC BEFORE <unix-ms>`, so a later replay prunes exactly the same
   tombstones. Since a replica receives all shards on one stream, `execute_replica_command` re-splits
   `CRDT.MERGE` by shard and applies `CRDT.GC` to every shard. `BGREWRITEAOF` snapshots CRDT state (§3.3).
+  `for_each_cmd_key` reports a `CRDT.MERGE`'s payload keys, so a script (which runs on one shard) gets the
+  usual non-local-key error for a payload spanning shards, and WATCH/tracking/ACL key checks see them.
+  Loading an RDB (tag 13 holds every shard's CRDT state in one record) merges only the keys the loading
+  shard owns.
 
 Vector-set (`VADD`/`VREM`/`VSETATTR`), semantic-cache (`SEMANTIC.*`) and agent-runtime (`AGENT.*`) commands have
 explicit `command_to_resp` arms and are AOF-logged and replicated live.
