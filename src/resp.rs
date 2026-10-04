@@ -11890,6 +11890,10 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                 .map_err(|_| "not a valid float")?
                 .parse()
                 .map_err(|_| "not a valid float")?;
+            // Written so NaN is refused too.
+            if !(error_rate > 0.0 && error_rate < 1.0) {
+                return Err("(0 < error rate range < 1)".to_string());
+            }
             let capacity: usize = std::str::from_utf8(&args[3])
                 .map_err(|_| "not an integer")?
                 .parse()
@@ -15580,6 +15584,22 @@ mod tests {
         let err = parse_command(&mut buf).unwrap_err();
         assert!(err.contains("bad data chunk"), "{err}");
         assert_eq!(parse_command(&mut buf), Ok(Some(Command::Ping(None))));
+    }
+
+    /// Like RedisBloom, BF.RESERVE needs 0 < error rate < 1; NaN used to build
+    /// a minimum-size filter.
+    #[test]
+    fn test_bf_reserve_error_rate_range() {
+        for rate in ["nan", "NaN", "0", "-0.1", "1", "1.5", "inf", "-inf"] {
+            assert_eq!(
+                build_command(cmd_args(&["BF.RESERVE", "b", rate, "100"])).unwrap_err(),
+                "(0 < error rate range < 1)",
+                "{rate}"
+            );
+        }
+        for rate in ["0.000001", "0.01", "0.999"] {
+            assert!(build_command(cmd_args(&["BF.RESERVE", "b", rate, "100"])).is_ok());
+        }
     }
 
     /// Client sizes that reached allocations or loops at execution time are

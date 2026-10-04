@@ -19692,6 +19692,19 @@ fn test_hostile_sizes_get_bounded_replies_e2e() {
             &["HSCAN", "h", "0", "COUNT", "18446744073709551615"],
             "*2\r\n",
         ),
+        (
+            &["BF.RESERVE", "bnan", "nan", "100"],
+            "-ERR (0 < error rate range < 1)",
+        ),
+        (
+            &["BF.RESERVE", "bnan", "0", "100"],
+            "-ERR (0 < error rate range < 1)",
+        ),
+        (
+            &["BF.RESERVE", "bnan", "1", "100"],
+            "-ERR (0 < error rate range < 1)",
+        ),
+        (&["EXISTS", "bnan"], ":0"),
     ] {
         let reply = resp_cmd(&mut c, cmd);
         assert!(reply.starts_with(want), "{cmd:?}: {reply}");

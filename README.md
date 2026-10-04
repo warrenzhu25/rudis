@@ -470,6 +470,7 @@ limit, Rudis uses the same one, with the Redis error text where one exists.
 | `VADD ... REDUCE` projection (input dim x reduced dim) | 2^24 floats (64 MiB) | `REDUCE projection too large ...` |
 | `VADD` / `VSIM ... EF` | 1000000, as in Redis | `invalid EF` |
 | `BF.RESERVE`, `CF.RESERVE`, `CMS.INITBYDIM` | 512 MiB per structure (Redis' value size limit) | `Bloom filter too large ...` / `Cuckoo filter too large ...` / `CMS: width x depth too large ...` |
+| `BF.RESERVE` error rate | strictly between 0 and 1 (NaN refused), as in RedisBloom | `(0 < error rate range < 1)` |
 | Negative (repeating) `SRANDMEMBER` / `HRANDFIELD` / `ZRANDMEMBER` / `VRANDMEMBER` count | -1048576; Redis streams such replies, Rudis builds them in memory | `value is out of range` |
 | `JSON.SET` array index past the end | pads at most 65536 `null`s; negative indexes must be in the array | `index out of bounds` |
 | `CRDT.INCRBY` | the counter and each node's component stay within i64 | `increment or decrement would overflow` |
