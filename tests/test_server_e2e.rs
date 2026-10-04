@@ -18514,6 +18514,186 @@ fn test_probabilistic_writes_survive_aof_rewrite_and_restart_e2e() {
     probabilistic_writes_survive_restart(17082, true);
 }
 
+/// A `CRDT.MERGE` payload with one register, one counter and one set entry
+/// from region node 9. Every byte is below 0x80, so it can go through
+/// `resp_cmd` as a `&str`.
+fn crdt_remote_payload() -> String {
+    let mut p = Vec::new();
+    let ts = |p: &mut Vec<u8>, phys: u64| {
+        p.extend_from_slice(&phys.to_le_bytes());
+        p.extend_from_slice(&0u32.to_le_bytes());
+        p.extend_from_slice(&9u16.to_le_bytes());
+    };
+    let bytes = |p: &mut Vec<u8>, b: &[u8]| {
+        p.extend_from_slice(&(b.len() as u32).to_le_bytes());
+        p.extend_from_slice(b);
+    };
+    // Register cr:remote = "far" (deliberately old timestamp).
+    p.push(1);
+    bytes(&mut p, b"cr:remote");
+    bytes(&mut p, b"far");
+    ts(&mut p, 65);
+    p.push(0);
+    // Counter cr:ctr: node 9 contributed +5.
+    p.push(2);
+    bytes(&mut p, b"cr:ctr");
+    p.extend_from_slice(&1u32.to_le_bytes());
+    p.extend_from_slice(&9u16.to_le_bytes());
+    p.extend_from_slice(&5i64.to_le_bytes());
+    p.extend_from_slice(&0u32.to_le_bytes());
+    // Set cr:set gains "r1".
+    p.push(3);
+    bytes(&mut p, b"cr:set");
+    p.extend_from_slice(&1u32.to_le_bytes());
+    bytes(&mut p, b"r1");
+    p.extend_from_slice(&1u32.to_le_bytes());
+    ts(&mut p, 66);
+    p.extend_from_slice(&0u32.to_le_bytes());
+    String::from_utf8(p).unwrap()
+}
+
+/// Writes CRDT registers, counters and sets (with deletions, removals and a
+/// cross-shard merge), optionally rewrites the AOF, restarts without an RDB
+/// and checks every read answers the same.
+fn crdt_writes_survive_restart(port: u16, rewrite: bool) {
+    let port_s = port.to_string();
+    let dir = std::env::temp_dir().join(format!(
+        "rudis-crdt-aof-e2e-{}-{}",
+        port,
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_s = dir.to_str().unwrap();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--aof",
+        "true",
+        "--aof-dir",
+        dir_s,
+        "--enable-experimental-commands",
+        "yes",
+    ];
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let remote = crdt_remote_payload();
+    for (cmd, want) in [
+        (&["CRDT.SET", "cr:reg", "v1"][..], "+OK"),
+        (&["CRDT.SET", "cr:reg", "v2"], "+OK"),
+        (&["CRDT.SET", "cr:gone", "x"], "+OK"),
+        (&["CRDT.DEL", "cr:gone"], ":1"),
+        (&["CRDT.INCRBY", "cr:ctr", "10"], ":10"),
+        (&["CRDT.INCRBY", "cr:ctr", "-3"], ":7"),
+        (&["CRDT.INCRBY", "cr:ctr2", "4"], ":4"),
+        (&["CRDT.SADD", "cr:set", "a"], ":1"),
+        (&["CRDT.SADD", "cr:set", "b"], ":1"),
+        (&["CRDT.SADD", "cr:set", "a"], ":0"),
+        (&["CRDT.SREM", "cr:set", "a"], ":1"),
+        (&["CRDT.SADD", "cr:set2", "x"], ":1"),
+        (&["CRDT.SREM", "cr:set2", "x"], ":1"),
+        // Its keys live on different shards; each must keep its own.
+        (&["CRDT.MERGE", &remote], ":3"),
+    ] {
+        let reply = resp_cmd(&mut c, cmd);
+        assert!(reply.starts_with(want), "{cmd:?}: {reply}");
+    }
+
+    let queries: &[&[&str]] = &[
+        &["CRDT.GET", "cr:reg"],
+        &["CRDT.GET", "cr:gone"],
+        &["CRDT.GET", "cr:remote"],
+        &["CRDT.SMEMBERS", "cr:set"],
+        &["CRDT.SMEMBERS", "cr:set2"],
+        // INCRBY 0 reads a counter.
+        &["CRDT.INCRBY", "cr:ctr", "0"],
+        &["CRDT.INCRBY", "cr:ctr2", "0"],
+    ];
+    // SMEMBERS order is not stable across processes.
+    let ask = |c: &mut TcpStream| -> Vec<String> {
+        queries
+            .iter()
+            .map(|q| {
+                let reply = resp_cmd(c, q);
+                if q[0] == "CRDT.SMEMBERS" {
+                    let mut lines: Vec<&str> = reply.split("\r\n").collect();
+                    lines[1..].sort();
+                    lines.join("\r\n")
+                } else {
+                    reply
+                }
+            })
+            .collect()
+    };
+    let mut before = ask(&mut c);
+    assert_eq!(before[0], "$2\r\nv2\r\n");
+    assert_eq!(before[1], "$-1\r\n");
+    assert_eq!(before[2], "$3\r\nfar\r\n");
+    assert!(
+        before[3].contains("\r\nb") && before[3].contains("\r\nr1") && !before[3].contains("\r\na"),
+        "{}",
+        before[3]
+    );
+    assert!(before[4].starts_with("*0"), "{}", before[4]);
+    assert_eq!(before[5], ":12\r\n");
+    assert_eq!(before[6], ":4\r\n");
+
+    if rewrite {
+        assert!(resp_cmd(&mut c, &["BGREWRITEAOF"]).starts_with('+'));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while info_field(&mut c, "aof_rewrite_in_progress") != "0" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "rewrite never finished"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(info_field(&mut c, "aof_last_bgrewrite_status"), "ok");
+        // Writes after the rewrite are appended to the rewritten file.
+        assert_eq!(resp_cmd(&mut c, &["CRDT.SREM", "cr:set", "b"]), ":1\r\n");
+        assert_eq!(resp_cmd(&mut c, &["CRDT.DEL", "cr:reg"]), ":1\r\n");
+        before = ask(&mut c);
+    }
+    drop(c);
+    {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(b"*2\r\n$8\r\nSHUTDOWN\r\n$6\r\nNOSAVE\r\n")
+            .unwrap();
+    }
+    let _ = child.wait();
+    // Nothing but the AOF can bring the CRDT state back.
+    assert!(!dir.join("dump.rdb").exists());
+
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let after = ask(&mut c);
+    for ((q, b), a) in queries.iter().zip(&before).zip(&after) {
+        assert_eq!(a, b, "{q:?}");
+    }
+    // The restarted clock is past every replayed timestamp: a new write to
+    // a deleted key wins.
+    assert!(resp_cmd(&mut c, &["CRDT.SET", "cr:gone", "back"]).starts_with("+OK"));
+    assert_eq!(resp_cmd(&mut c, &["CRDT.GET", "cr:gone"]), "$4\r\nback\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_crdt_writes_survive_restart_through_the_aof_e2e() {
+    crdt_writes_survive_restart(17085, false);
+}
+
+#[test]
+fn test_crdt_writes_survive_aof_rewrite_and_restart_e2e() {
+    crdt_writes_survive_restart(17086, true);
+}
+
 fn http_get(port: u16, path: &str) -> String {
     let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
     c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();

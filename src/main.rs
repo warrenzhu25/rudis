@@ -72,8 +72,8 @@ struct Args {
 
     /// Accept the experimental, non-Redis command families (JSON., BF., CF.,
     /// CMS., TOPK., FT., SEMANTIC., CRDT., LLM., MCP., XDP.). Apart from JSON.,
-    /// SEMANTIC., BF., CF., CMS. and TOPK., most of their writes are not
-    /// persisted to the AOF or replicated (yes|no, default no)
+    /// SEMANTIC., BF., CF., CMS., TOPK. and CRDT., most of their writes are
+    /// not persisted to the AOF or replicated (yes|no, default no)
     #[arg(long)]
     enable_experimental_commands: Option<String>,
 

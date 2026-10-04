@@ -14793,45 +14793,43 @@ async fn execute_command(
             false
         }
         Command::CrdtMerge(payload) => {
-            let mut total_merged = match router.local_db.borrow_mut().crdt_merge(&payload) {
-                Ok(count) => count,
+            // Each shard merges, and logs, only the keys it owns.
+            let parts = match router.split_crdt_payload(&payload) {
+                Ok(parts) => parts,
                 Err(e) => {
                     let err_resp = format!("-ERR {}\r\n", e);
                     out.extend_from_slice(err_resp.as_bytes());
                     return false;
                 }
             };
-            for sid in 0..router.num_shards {
-                if sid != router.shard_id {
-                    let res = router
-                        .execute_remote(sid, Command::CrdtMerge(payload.clone()))
-                        .await;
-                    if let Ok(s) = std::str::from_utf8(&res)
-                        && let Some(num_str) =
-                            s.strip_prefix(':').and_then(|x| x.split("\r\n").next())
-                        && let Ok(n) = num_str.parse::<usize>()
-                    {
-                        total_merged += n;
-                    }
+            let mut total_merged = 0;
+            for (sid, part) in parts {
+                let res = router.execute_on_shard(sid, Command::CrdtMerge(part)).await;
+                if let Ok(s) = std::str::from_utf8(&res)
+                    && let Some(num_str) = s.strip_prefix(':').and_then(|x| x.split("\r\n").next())
+                    && let Ok(n) = num_str.parse::<usize>()
+                {
+                    total_merged += n;
                 }
             }
             write_resp_integer(out, total_merged as i64);
             false
         }
-        Command::CrdtGc(ttl_ms) => {
-            let (mut total_regs, mut total_sets) = router.local_db.borrow_mut().crdt_gc(ttl_ms);
+        Command::CrdtGc(horizon) => {
+            // One absolute cutoff for every shard, so they all log (and a
+            // replica applies) the same GC.
+            let before = Command::CrdtGc(crate::crdt::GcHorizon::Before(horizon.cutoff_ms()));
+            let (mut total_regs, mut total_sets) = (0, 0);
             for sid in 0..router.num_shards {
-                if sid != router.shard_id {
-                    let res = router.execute_remote(sid, Command::CrdtGc(ttl_ms)).await;
-                    if let Ok(s) = std::str::from_utf8(&res) {
-                        let parts: Vec<&str> = s.split("\r\n").collect();
-                        if parts.len() >= 6 {
-                            if let Ok(r) = parts[3].trim_start_matches(':').parse::<usize>() {
-                                total_regs += r;
-                            }
-                            if let Ok(st) = parts[5].trim_start_matches(':').parse::<usize>() {
-                                total_sets += st;
-                            }
+                let res = router.execute_on_shard(sid, before.clone()).await;
+                if let Ok(s) = std::str::from_utf8(&res) {
+                    let parts: Vec<&str> = s.split("\r\n").collect();
+                    if parts.len() >= 7 {
+                        if let Ok(r) = parts[3].trim_start_matches(':').parse::<usize>() {
+                            total_regs += r;
+                        }
+                        if let Ok(st) = parts[6].trim_start_matches(':').parse::<usize>() {
+                            total_sets += st;
                         }
                     }
                 }
@@ -16399,6 +16397,18 @@ pub fn execute_local_command(
                     }
                 }
             }
+        };
+    }
+    // CRDT writes are logged as their effect, a CRDT.MERGE of the changed
+    // state: their HLC timestamps (and the counter's node id) would differ
+    // if the command itself were replayed. `record_change!` still runs for
+    // key invalidation; it logs nothing for these commands.
+    macro_rules! record_crdt_effect {
+        ($payload:expr) => {
+            record_change!(cmd);
+            crate::replication::log_shard_mutation(db.port, db.shard_id, aof, || {
+                Command::CrdtMerge(bytes::Bytes::from($payload))
+            });
         };
     }
     struct ReadTrackGuard<'a> {
@@ -21741,7 +21751,7 @@ pub fn execute_local_command(
         }
         Command::CrdtSet { key, val } => {
             let ts = db.crdt_set(key.clone(), val.clone());
-            record_change!(cmd);
+            record_crdt_effect!(db.crdt_store.register_payload(key));
             let s = format!("+OK {}:{}:{}\r\n", ts.physical_ms, ts.logical, ts.node_id);
             out.extend_from_slice(s.as_bytes());
             false
@@ -21757,7 +21767,7 @@ pub fn execute_local_command(
         Command::CrdtDel(key) => {
             let removed = db.crdt_del(key);
             if removed {
-                record_change!(cmd);
+                record_crdt_effect!(db.crdt_store.register_payload(key));
                 write_resp_integer(out, 1);
             } else {
                 write_resp_integer(out, 0);
@@ -21766,13 +21776,14 @@ pub fn execute_local_command(
         }
         Command::CrdtIncrby { key, delta } => {
             let val = db.crdt_incrby(key.clone(), *delta);
-            record_change!(cmd);
+            record_crdt_effect!(db.crdt_store.counter_payload(key));
             write_resp_integer(out, val);
             false
         }
         Command::CrdtSadd { key, member } => {
+            // Even a re-add changes the set: it adds another tag.
             let added = db.crdt_sadd(key.clone(), member.clone());
-            record_change!(cmd);
+            record_crdt_effect!(db.crdt_store.set_member_payload(key, member));
             write_resp_integer(out, if added { 1 } else { 0 });
             false
         }
@@ -21786,8 +21797,8 @@ pub fn execute_local_command(
         }
         Command::CrdtSrem { key, member } => {
             let removed = db.crdt_srem(key, member);
-            if removed {
-                record_change!(cmd);
+            if !removed.is_empty() {
+                record_crdt_effect!(crate::crdt::CrdtStore::set_removal_payload(key, &removed));
                 write_resp_integer(out, 1);
             } else {
                 write_resp_integer(out, 0);
@@ -21802,6 +21813,8 @@ pub fn execute_local_command(
         Command::CrdtMerge(payload) => {
             match db.crdt_merge(payload) {
                 Ok(count) => {
+                    // Merging is a pure function of the payload and the
+                    // current state, so it is logged as issued.
                     record_change!(cmd);
                     write_resp_integer(out, count as i64);
                 }
@@ -21812,8 +21825,16 @@ pub fn execute_local_command(
             }
             false
         }
-        Command::CrdtGc(ttl_ms) => {
-            let (regs, set_tombstones) = db.crdt_gc(*ttl_ms);
+        Command::CrdtGc(horizon) => {
+            // Logged with its absolute cutoff: replaying a TTL later would
+            // prune more than this did.
+            let cutoff = horizon.cutoff_ms();
+            let (regs, set_tombstones) = db.crdt_gc(cutoff);
+            if regs + set_tombstones > 0 {
+                crate::replication::log_shard_mutation(db.port, db.shard_id, aof, || {
+                    Command::CrdtGc(crate::crdt::GcHorizon::Before(cutoff))
+                });
+            }
             out.extend_from_slice(b"*4\r\n");
             write_resp_bulk(out, b"registers_pruned");
             write_resp_integer(out, regs as i64);

@@ -2433,6 +2433,38 @@ impl Router {
         res
     }
 
+    /// Runs `cmd` on shard `target` (in place if that is this shard) and
+    /// returns the reply.
+    pub async fn execute_on_shard(&self, target: usize, cmd: Command) -> Vec<u8> {
+        if target == self.shard_id {
+            let mut out = Vec::new();
+            crate::connection::execute_local_command(
+                &cmd,
+                &mut self.local_db.borrow_mut(),
+                &mut out,
+                self.aof.as_deref(),
+            );
+            out
+        } else {
+            self.execute_remote(target, cmd).await
+        }
+    }
+
+    /// Splits a `CRDT.MERGE` payload into one payload per shard that owns
+    /// some of its keys, so that each shard merges (and logs) only its own.
+    pub fn split_crdt_payload(&self, payload: &[u8]) -> Result<Vec<(usize, Bytes)>, String> {
+        let mut parts = vec![Vec::new(); self.num_shards];
+        for entry in crate::crdt::decode_sync_payload(payload)? {
+            entry.encode(&mut parts[self.target_shard(entry.key())]);
+        }
+        Ok(parts
+            .into_iter()
+            .enumerate()
+            .filter(|(_, part)| !part.is_empty())
+            .map(|(sid, part)| (sid, Bytes::from(part)))
+            .collect())
+    }
+
     /// Like [`Self::execute_remote`] for several `(shard, command)` pairs, but
     /// sends them all before waiting, so K remote shards cost one round trip
     /// instead of K. Replies are returned in input order.
@@ -3519,26 +3551,31 @@ impl Router {
         }
     }
 
+    /// Applies a replicated command on shard `target` and waits for it.
+    async fn apply_replica_on(&self, target: usize, cmd: Command) {
+        if target == self.shard_id {
+            let mut dummy_out = Vec::new();
+            crate::connection::execute_local_command(
+                &cmd,
+                &mut self.local_db.borrow_mut(),
+                &mut dummy_out,
+                self.aof.as_deref(),
+            );
+        } else {
+            let (tx, rx) = flume::bounded(1);
+            let msg = ShardMessage::ExecuteReplicaCmd {
+                cmd: Box::new(cmd),
+                responder: tx,
+            };
+            if self.senders[target].send(msg).is_ok() {
+                let _ = rx.recv_async().await;
+            }
+        }
+    }
+
     pub async fn execute_replica_command(&self, cmd: Command) {
         if let Some(target) = crate::connection::target_shard_of_cmd(&cmd, self.num_shards) {
-            if target == self.shard_id {
-                let mut dummy_out = Vec::new();
-                crate::connection::execute_local_command(
-                    &cmd,
-                    &mut self.local_db.borrow_mut(),
-                    &mut dummy_out,
-                    self.aof.as_deref(),
-                );
-            } else {
-                let (tx, rx) = flume::bounded(1);
-                let msg = ShardMessage::ExecuteReplicaCmd {
-                    cmd: Box::new(cmd),
-                    responder: tx,
-                };
-                if self.senders[target].send(msg).is_ok() {
-                    let _ = rx.recv_async().await;
-                }
-            }
+            self.apply_replica_on(target, cmd).await;
         } else {
             match cmd {
                 Command::Flushall | Command::Flushdb => {
@@ -3566,6 +3603,22 @@ impl Router {
                 Command::Del(keys) => {
                     for k in keys {
                         self.del(k).await;
+                    }
+                }
+                // The master logs CRDT changes per shard, but they arrive
+                // here on one stream: hand each shard the keys it owns.
+                Command::CrdtMerge(payload) => {
+                    if let Ok(parts) = self.split_crdt_payload(&payload) {
+                        for (sid, part) in parts {
+                            self.apply_replica_on(sid, Command::CrdtMerge(part)).await;
+                        }
+                    }
+                }
+                // Every master shard logs the same absolute cutoff, so
+                // applying it to every shard is exact (and idempotent).
+                Command::CrdtGc(horizon) => {
+                    for sid in 0..self.num_shards {
+                        self.apply_replica_on(sid, Command::CrdtGc(horizon)).await;
                     }
                 }
                 _ => {

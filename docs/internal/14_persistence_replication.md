@@ -41,9 +41,9 @@ called out explicitly where it occurs.
                          │                        │
                     Some(bytes)                  None  ──────────────►  NOT written to AOF,
                          │                                               NOT propagated to replicas
-                         ▼                        ▼                      (see §3.9 — this currently
-              AofWriter::append (if Some)   ReplicationHub::propagate    affects the CRDT.* command
-                         │                    (per port/shard)           family)
+                         ▼                        ▼                      (see §3.9 — CRDT.* writes
+              AofWriter::append (if Some)   ReplicationHub::propagate    return None here and log a
+                         │                    (per port/shard)           CRDT.MERGE of their effect)
               5ms flush task in server.rs          │
               (write_all_at + ~1s fsync)            ├─► backlog.append (1MB ring buffer)
                                                      ├─► every ConnectedReplica.sender.send (PSYNC path)
@@ -301,9 +301,9 @@ task. `perform_rewrite_aof`:
      `BF.RESTORE`/`CF.RESTORE`/`CMS.RESTORE`/`TOPK.RESTORE <key> <payload>` per structure; the payload is the
      same per-entry encoding the RDB uses (tags 8/10/11/12), since a filter or sketch can't be rebuilt from user
      commands.
-   - **Remaining gap — CRDT state is never rewritten (and never AOF-logged at all).** `rewrite_shard_aof` has no
-     code path that touches `db.crdt_store`, and `command_to_resp` has no arm for any `CRDT.*` command, so CRDT
-     state has zero AOF-based durability; it persists only via RDB (§3.10, tag 13).
+   - CRDT state is rewritten as one `CRDT.MERGE <payload>` per register, counter and set
+     (`CrdtStore::export_entry_payloads`, tombstones included) — the same form live CRDT writes are logged in
+     (§3.9).
 3. `fsync`s the temp file, atomically `rename`s it over the live `appendonly-<shard>.aof`, and `fsync`s the
    containing directory (`sync_parent_dir`, `aof.rs:2571-2583`) so the rename survives a crash before the
    directory entry is durable.
@@ -429,7 +429,7 @@ enabled on this node, whether it's caught up to the fsync point, or whether `num
 is therefore functionally identical to `WAIT` today except for its reply shape; it provides no actual guarantee
 about local AOF durability.
 
-### 3.9 Live AOF and replication coverage of the experimental families — JSON.* and probabilistic fixed, CRDT.* still uncovered
+### 3.9 Live AOF and replication coverage of the experimental families — JSON.*, probabilistic and CRDT.* covered
 
 Every mutating command handler in `connection.rs` that wants AOF+replication effects calls the `record_change!`
 macro, which appends `crate::aof::command_to_resp(cmd)` to the AOF and propagates it to replicas — but only if
@@ -442,8 +442,18 @@ macro, which appends `crate::aof::command_to_resp(cmd)` to the AOF and propagate
   deterministic: the hashes are fixed-seed and Top-K breaks count ties by the smallest item instead of hash-map
   order. A `CF.ADD`/`CF.ADDNX` that fails with "filter is full" has already moved fingerprints, so it is logged
   too. `BGREWRITEAOF` emits one `*.RESTORE` per structure (§3.3).
-- **`CRDT.*`: still uncovered.** No `command_to_resp` arm and no rewrite step, so CRDT state written after the
-  last RDB save is lost on an AOF-only restart and never reaches a PSYNC replica.
+- **`CRDT.*`**: logged by effect, not as issued. `CRDT.SET`/`DEL`/`INCRBY`/`SADD`/`SREM` stamp wall-clock HLC
+  timestamps and count per node id, so replaying them would not rebuild the same state; `command_to_resp`
+  returns `None` for them and the handler instead logs (via `log_shard_mutation`, on the shard that owns the
+  key) a `CRDT.MERGE <payload>` of just the change: the key's register (incl. a `DEL` tombstone), its whole
+  PN-counter, the added member's tags, or the tags an `SREM` tombstoned. Merging is idempotent and
+  deterministic, so replay and replicas reach exactly the master's state, and merging advances their HLC
+  past every replayed timestamp. A client `CRDT.MERGE` is validated, split by owning shard
+  (`Router::split_crdt_payload`) and each part merged and logged as issued on its shard; a malformed payload
+  is an error that applies nothing. `CRDT.GC [ttl]` resolves one absolute cutoff for all shards and each
+  shard that pruned something logs `CRDT.GC BEFORE <unix-ms>`, so a later replay prunes exactly the same
+  tombstones. Since a replica receives all shards on one stream, `execute_replica_command` re-splits
+  `CRDT.MERGE` by shard and applies `CRDT.GC` to every shard. `BGREWRITEAOF` snapshots CRDT state (§3.3).
 
 Vector-set (`VADD`/`VREM`/`VSETATTR`), semantic-cache (`SEMANTIC.*`) and agent-runtime (`AGENT.*`) commands have
 explicit `command_to_resp` arms and are AOF-logged and replicated live.
@@ -562,10 +572,9 @@ periodic `bgsave`. A configured `save 900 1` directive is accepted at startup an
 
 ## 5. Known Bugs & Limitations (re-verified against current source)
 
-- **`CRDT.*` has no live AOF or replication coverage** (§3.9): it persists only through point-in-time RDB
-  snapshots; any live write is invisible to a connected replica and to AOF replay after restart.
-- **RESOLVED — JSON.\* and `BF.*`/`CF.*`/`CMS.*`/`TOPK.*` writes are AOF-logged and replicated live**, and
-  `BGREWRITEAOF` snapshots both (§3.3, §3.9).
+- **RESOLVED — JSON.\*, `BF.*`/`CF.*`/`CMS.*`/`TOPK.*` and `CRDT.*` writes are AOF-logged and replicated
+  live**, and `BGREWRITEAOF` snapshots all of them (§3.3, §3.9). CRDT writes are logged as a `CRDT.MERGE` of
+  their effect.
 - **NEW — `XAUTOCLAIM` is replicated/persisted as its original wall-clock-relative filter, not as its resolved
   claim set** (§3.1): a replica or an AOF replay can independently compute a different set of claimed messages
   than what the master actually claimed, because `min_idle_time` is re-evaluated against a different "now".
@@ -579,8 +588,8 @@ periodic `bgsave`. A configured `save 900 1` directive is accepted at startup an
   used in production (§3.10, §3.3): both `ShardDb::save_rdb_chunk` and `rewrite_shard_aof` now hydrate tiered
   values via `tier_manager.read_ptr_sync` before serializing them as `String` payloads.
 - **RESOLVED — AOF rewrite and compaction via `BGREWRITEAOF`** now additionally covers JSON, vector-set,
-  semantic-cache, agent-runtime and probabilistic state (previously it covered only the base table + HLL +
-  streams) — but still does not cover CRDT state (§3.3), consistent with that family never having AOF support.
+  semantic-cache, agent-runtime, probabilistic and CRDT state (previously it covered only the base table + HLL +
+  streams) (§3.3).
 - **STILL OPEN — `save N M` is parsed into a generic `extra_directives` map and never scheduled** (§3.11): no
   periodic-save mechanism exists anywhere in the codebase.
 - **STILL OPEN — RDB save uses blocking `std::fs` calls inside an `async fn`, and there is no `fork()`-based
@@ -605,11 +614,11 @@ periodic `bgsave`. A configured `save 900 1` directive is accepted at startup an
 * **Gotcha 2**: `BGREWRITEAOF` uses a 64KB `BufWriter` to stream the rewritten AOF file without allocating a
   large heap buffer for the whole dataset — keep new value types' rewrite logic writing through that same
   buffered writer rather than building an intermediate `Vec` (`aof.rs:1993`).
-* **Gotcha 3 (now with concrete, currently-shipping examples)**: A write command is invisible to both AOF and
-  replication unless it has an explicit arm in `command_to_resp` (§3.1) — **today this is true for every `CRDT.*`
-  mutating command** (§3.9). Adding a new mutating command (or
-  fixing one of these families) requires adding a `command_to_resp` arm, or it will silently not persist or
-  replicate live.
+* **Gotcha 3**: A write command is invisible to both AOF and
+  replication unless it has an explicit arm in `command_to_resp` (§3.1) or its handler logs an equivalent
+  command itself (the `CRDT.*` writes log a `CRDT.MERGE` of their effect, §3.9). Adding a new mutating command
+  requires one of the two, or it will silently not persist or replicate live. If replaying the command would
+  not reproduce the state (wall-clock or node-dependent effects), log its effect instead.
 * **Gotcha 4**: `DFLY FLOW` is a master-side-only capability today; do not assume rudis-to-rudis replication ever
   uses it — `run_replica_worker` only speaks `PSYNC`/`SYNC`.
 * **Gotcha 5**: `ReplicationBacklog`'s 1MB size is a compile-time constant (`ReplicationHub::new`); a write burst

@@ -198,16 +198,15 @@ impl OrSet {
     }
 
     /// Removes a member by moving all its current add timestamps to the tombstone set.
-    pub fn remove(&mut self, element: &Bytes) -> bool {
-        if let Some(tags) = self.elements.remove(element) {
-            let count = tags.len();
-            for tag in tags {
-                self.tombstones.insert(tag);
-            }
-            count > 0
-        } else {
-            false
-        }
+    /// Returns the tombstoned timestamps (empty if the member was absent).
+    pub fn remove(&mut self, element: &Bytes) -> Vec<HlcTimestamp> {
+        let tags: Vec<HlcTimestamp> = self
+            .elements
+            .remove(element)
+            .map(|tags| tags.into_iter().collect())
+            .unwrap_or_default();
+        self.tombstones.extend(tags.iter().copied());
+        tags
     }
 
     /// Reads active elements in the set (where at least one add tag has not been tombstoned).
@@ -276,21 +275,27 @@ impl PnCounter {
     }
 
     pub fn value(&self) -> i64 {
-        let pos_sum: i64 = self.p.values().sum();
-        let neg_sum: i64 = self.n.values().sum();
-        pos_sum - neg_sum
+        // Summed in i128 and clamped: merged components can be anything up
+        // to i64::MAX, and the result must not depend on map order.
+        let pos_sum: i128 = self.p.values().map(|&v| v as i128).sum();
+        let neg_sum: i128 = self.n.values().map(|&v| v as i128).sum();
+        (pos_sum - neg_sum).clamp(i64::MIN as i128, i64::MAX as i128) as i64
     }
 
     pub fn inc(&mut self, node_id: u16, delta: i64) {
+        // Components only grow (merge takes the maximum), so they saturate
+        // rather than wrap.
         if delta >= 0 {
-            *self.p.entry(node_id).or_default() += delta;
+            let p = self.p.entry(node_id).or_default();
+            *p = p.saturating_add(delta);
         } else {
-            *self.n.entry(node_id).or_default() += -delta;
+            let n = self.n.entry(node_id).or_default();
+            *n = n.saturating_add(delta.checked_neg().unwrap_or(i64::MAX));
         }
     }
 
     pub fn dec(&mut self, node_id: u16, delta: i64) {
-        self.inc(node_id, -delta);
+        self.inc(node_id, delta.checked_neg().unwrap_or(i64::MAX));
     }
 
     /// Merges another PN-Counter using component-wise maximum.
@@ -375,254 +380,376 @@ impl CrdtStore {
         self.sets.get(key).map(|s| s.read()).unwrap_or_default()
     }
 
-    pub fn set_rem(&mut self, key: &Bytes, member: &Bytes) -> bool {
-        if let Some(s) = self.sets.get_mut(key) {
-            s.remove(member)
-        } else {
-            false
-        }
+    /// Removes `member` from the set at `key`. Returns the add timestamps it
+    /// tombstoned (empty if `member` was not in the set).
+    pub fn set_rem(&mut self, key: &Bytes, member: &Bytes) -> Vec<HlcTimestamp> {
+        self.sets
+            .get_mut(key)
+            .map(|s| s.remove(member))
+            .unwrap_or_default()
     }
 
     /// Exports full CRDT state payload for replication sync across regions.
     pub fn export_sync_payload(&self) -> Vec<u8> {
-        // Simple fast binary serialization: [type: u8][key_len: u32][key]...
         let mut buf = Vec::new();
-        // Registers
         for (k, r) in &self.registers {
-            buf.push(1u8); // type: Register
-            buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
-            buf.extend_from_slice(k);
-            buf.extend_from_slice(&(r.value.len() as u32).to_le_bytes());
-            buf.extend_from_slice(&r.value);
-            buf.extend_from_slice(&r.timestamp.physical_ms.to_le_bytes());
-            buf.extend_from_slice(&r.timestamp.logical.to_le_bytes());
-            buf.extend_from_slice(&r.timestamp.node_id.to_le_bytes());
-            buf.push(if r.tombstone { 1 } else { 0 });
+            encode_register(&mut buf, k, r);
         }
-        // Counters
         for (k, c) in &self.counters {
-            buf.push(2u8); // type: Counter
-            buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
-            buf.extend_from_slice(k);
-            buf.extend_from_slice(&(c.p.len() as u32).to_le_bytes());
-            for (&nid, &v) in &c.p {
-                buf.extend_from_slice(&nid.to_le_bytes());
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
-            buf.extend_from_slice(&(c.n.len() as u32).to_le_bytes());
-            for (&nid, &v) in &c.n {
-                buf.extend_from_slice(&nid.to_le_bytes());
-                buf.extend_from_slice(&v.to_le_bytes());
-            }
+            encode_counter(&mut buf, k, c);
         }
-        // Sets
         for (k, s) in &self.sets {
-            buf.push(3u8); // type: Set
-            buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
-            buf.extend_from_slice(k);
-            buf.extend_from_slice(&(s.elements.len() as u32).to_le_bytes());
-            for (elem, tags) in &s.elements {
-                buf.extend_from_slice(&(elem.len() as u32).to_le_bytes());
-                buf.extend_from_slice(elem);
-                buf.extend_from_slice(&(tags.len() as u32).to_le_bytes());
-                for tag in tags {
-                    buf.extend_from_slice(&tag.physical_ms.to_le_bytes());
-                    buf.extend_from_slice(&tag.logical.to_le_bytes());
-                    buf.extend_from_slice(&tag.node_id.to_le_bytes());
-                }
-            }
-            buf.extend_from_slice(&(s.tombstones.len() as u32).to_le_bytes());
-            for tag in &s.tombstones {
-                buf.extend_from_slice(&tag.physical_ms.to_le_bytes());
-                buf.extend_from_slice(&tag.logical.to_le_bytes());
-                buf.extend_from_slice(&tag.node_id.to_le_bytes());
-            }
+            encode_set(&mut buf, k, s.elements.iter(), s.tombstones.iter());
         }
         buf
     }
 
-    /// Merges remote CRDT state payload into local store.
-    pub fn merge_sync_payload(&mut self, data: &[u8]) -> Result<usize, String> {
-        let mut offset = 0;
-        let mut merged_items = 0;
+    /// The same state as `export_sync_payload`, as one payload per register,
+    /// counter and set. The AOF rewrite logs each as a `CRDT.MERGE`.
+    pub fn export_entry_payloads(&self) -> impl Iterator<Item = Vec<u8>> + '_ {
+        let registers = self.registers.iter().map(|(k, r)| {
+            let mut buf = Vec::new();
+            encode_register(&mut buf, k, r);
+            buf
+        });
+        let counters = self.counters.iter().map(|(k, c)| {
+            let mut buf = Vec::new();
+            encode_counter(&mut buf, k, c);
+            buf
+        });
+        let sets = self.sets.iter().map(|(k, s)| {
+            let mut buf = Vec::new();
+            encode_set(&mut buf, k, s.elements.iter(), s.tombstones.iter());
+            buf
+        });
+        registers.chain(counters).chain(sets)
+    }
 
-        while offset < data.len() {
-            let item_type = data[offset];
-            offset += 1;
-
-            match item_type {
-                1 => {
-                    // Register
-                    if offset + 4 > data.len() {
-                        break;
-                    }
-                    let k_len =
-                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-                    offset += 4;
-                    let k = Bytes::copy_from_slice(&data[offset..offset + k_len]);
-                    offset += k_len;
-
-                    let v_len =
-                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-                    offset += 4;
-                    let v = Bytes::copy_from_slice(&data[offset..offset + v_len]);
-                    offset += v_len;
-
-                    let phys = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-                    offset += 8;
-                    let log = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-                    offset += 4;
-                    let nid = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap());
-                    offset += 2;
-                    let tombstone = data[offset] == 1;
-                    offset += 1;
-
-                    let ts = HlcTimestamp::new(phys, log, nid);
-                    self.clock.update(&ts);
-
-                    let remote_reg = LwwRegister {
-                        value: v,
-                        timestamp: ts,
-                        tombstone,
-                    };
-                    self.registers
-                        .entry(k)
-                        .or_insert_with(|| remote_reg.clone())
-                        .merge(&remote_reg);
-                    merged_items += 1;
-                }
-                2 => {
-                    // Counter
-                    if offset + 4 > data.len() {
-                        break;
-                    }
-                    let k_len =
-                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-                    offset += 4;
-                    let k = Bytes::copy_from_slice(&data[offset..offset + k_len]);
-                    offset += k_len;
-
-                    let mut p = HashMap::new();
-                    let p_len =
-                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-                    offset += 4;
-                    for _ in 0..p_len {
-                        let nid = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap());
-                        offset += 2;
-                        let val = i64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-                        offset += 8;
-                        p.insert(nid, val);
-                    }
-
-                    let mut n = HashMap::new();
-                    let n_len =
-                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-                    offset += 4;
-                    for _ in 0..n_len {
-                        let nid = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap());
-                        offset += 2;
-                        let val = i64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-                        offset += 8;
-                        n.insert(nid, val);
-                    }
-
-                    let remote_counter = PnCounter { p, n };
-                    self.counters.entry(k).or_default().merge(&remote_counter);
-                    merged_items += 1;
-                }
-                3 => {
-                    // Set
-                    if offset + 4 > data.len() {
-                        break;
-                    }
-                    let k_len =
-                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-                    offset += 4;
-                    let k = Bytes::copy_from_slice(&data[offset..offset + k_len]);
-                    offset += k_len;
-
-                    let mut elements = HashMap::new();
-                    let elem_count =
-                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-                    offset += 4;
-                    for _ in 0..elem_count {
-                        let e_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
-                            as usize;
-                        offset += 4;
-                        let elem = Bytes::copy_from_slice(&data[offset..offset + e_len]);
-                        offset += e_len;
-
-                        let tag_count =
-                            u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
-                                as usize;
-                        offset += 4;
-                        let mut tags = HashSet::new();
-                        for _ in 0..tag_count {
-                            let phys =
-                                u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-                            offset += 8;
-                            let log =
-                                u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-                            offset += 4;
-                            let nid =
-                                u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap());
-                            offset += 2;
-                            let ts = HlcTimestamp::new(phys, log, nid);
-                            self.clock.update(&ts);
-                            tags.insert(ts);
-                        }
-                        elements.insert(elem, tags);
-                    }
-
-                    let mut tombstones = HashSet::new();
-                    let tomb_count =
-                        u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-                    offset += 4;
-                    for _ in 0..tomb_count {
-                        let phys = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
-                        offset += 8;
-                        let log = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-                        offset += 4;
-                        let nid = u16::from_le_bytes(data[offset..offset + 2].try_into().unwrap());
-                        offset += 2;
-                        let ts = HlcTimestamp::new(phys, log, nid);
-                        self.clock.update(&ts);
-                        tombstones.insert(ts);
-                    }
-
-                    let remote_set = OrSet {
-                        elements,
-                        tombstones,
-                    };
-                    self.sets.entry(k).or_default().merge(&remote_set);
-                    merged_items += 1;
-                }
-                _ => return Err(format!("Unknown CRDT item type: {}", item_type)),
-            }
+    /// The register at `key` (including a deletion tombstone) as a sync
+    /// payload; empty if there is none.
+    pub fn register_payload(&self, key: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        if let Some(r) = self.registers.get(key) {
+            encode_register(&mut buf, key, r);
         }
+        buf
+    }
 
+    /// The counter at `key` as a sync payload; empty if there is none.
+    pub fn counter_payload(&self, key: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        if let Some(c) = self.counters.get(key) {
+            encode_counter(&mut buf, key, c);
+        }
+        buf
+    }
+
+    /// `member`'s add timestamps in the set at `key` as a sync payload, so
+    /// merging it adds `member` exactly as this store holds it; empty if
+    /// `member` is not in the set.
+    pub fn set_member_payload(&self, key: &[u8], member: &Bytes) -> Vec<u8> {
+        let mut buf = Vec::new();
+        if let Some(tags) = self.sets.get(key).and_then(|s| s.elements.get(member)) {
+            encode_set(
+                &mut buf,
+                key,
+                std::iter::once((member, tags)),
+                std::iter::empty(),
+            );
+        }
+        buf
+    }
+
+    /// A sync payload that tombstones `tags` in the set at `key`: merging it
+    /// removes what the `set_rem` that returned `tags` removed.
+    pub fn set_removal_payload(key: &[u8], tags: &[HlcTimestamp]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        encode_set(&mut buf, key, std::iter::empty(), tags.iter());
+        buf
+    }
+
+    /// Merges remote CRDT state payload into local store.
+    ///
+    /// The whole payload is decoded before anything is applied, so a
+    /// malformed one is an error that changes nothing.
+    pub fn merge_sync_payload(&mut self, data: &[u8]) -> Result<usize, String> {
+        let entries = decode_sync_payload(data)?;
+        let merged_items = entries.len();
+        for entry in entries {
+            self.merge_entry(entry);
+        }
         Ok(merged_items)
     }
 
-    /// Automated garbage collection for all tombstones older than `ttl_ms` (default: 86_400_000 ms / 24h).
-    pub fn gc_tombstones(&mut self, ttl_ms: u64) -> (usize, usize) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let cutoff = now.saturating_sub(ttl_ms);
+    fn merge_entry(&mut self, entry: CrdtEntry) {
+        match entry {
+            CrdtEntry::Register(k, remote_reg) => {
+                self.clock.update(&remote_reg.timestamp);
+                self.registers
+                    .entry(k)
+                    .or_insert_with(|| remote_reg.clone())
+                    .merge(&remote_reg);
+            }
+            CrdtEntry::Counter(k, remote_counter) => {
+                self.counters.entry(k).or_default().merge(&remote_counter);
+            }
+            CrdtEntry::Set(k, remote_set) => {
+                for ts in remote_set
+                    .elements
+                    .values()
+                    .flatten()
+                    .chain(&remote_set.tombstones)
+                {
+                    self.clock.update(ts);
+                }
+                self.sets.entry(k).or_default().merge(&remote_set);
+            }
+        }
+    }
 
+    /// Garbage collection for all tombstones from before `cutoff_physical_ms`
+    /// (unix ms; see `GcHorizon`): deleted registers are dropped and removed
+    /// set tags forgotten. Returns how many of each were pruned.
+    pub fn gc_tombstones(&mut self, cutoff_physical_ms: u64) -> (usize, usize) {
         let before_regs = self.registers.len();
         self.registers
-            .retain(|_, reg| !reg.tombstone || reg.timestamp.physical_ms >= cutoff);
+            .retain(|_, reg| !reg.tombstone || reg.timestamp.physical_ms >= cutoff_physical_ms);
         let reg_pruned = before_regs - self.registers.len();
 
         let mut set_pruned = 0;
         for s in self.sets.values_mut() {
-            set_pruned += s.prune_tombstones(cutoff);
+            set_pruned += s.prune_tombstones(cutoff_physical_ms);
         }
         (reg_pruned, set_pruned)
     }
+}
+
+/// Which tombstones `CRDT.GC` prunes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GcHorizon {
+    /// `CRDT.GC [ttl-ms]`: those older than `ttl-ms` (default 24 hours).
+    Ttl(Option<u64>),
+    /// `CRDT.GC BEFORE <unix-ms>`: those from before an absolute time. A GC
+    /// is logged in this form, so replaying it later prunes exactly what the
+    /// original did.
+    Before(u64),
+}
+
+impl GcHorizon {
+    pub const DEFAULT_TTL_MS: u64 = 86_400_000;
+
+    /// The absolute cutoff, in unix milliseconds.
+    pub fn cutoff_ms(self) -> u64 {
+        match self {
+            GcHorizon::Ttl(ttl) => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                now.saturating_sub(ttl.unwrap_or(Self::DEFAULT_TTL_MS))
+            }
+            GcHorizon::Before(cutoff) => cutoff,
+        }
+    }
+}
+
+/// One keyed entry of a sync payload (`CRDT.DUMP` / `CRDT.MERGE`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CrdtEntry {
+    Register(Bytes, LwwRegister),
+    Counter(Bytes, PnCounter),
+    Set(Bytes, OrSet),
+}
+
+impl CrdtEntry {
+    pub fn key(&self) -> &Bytes {
+        match self {
+            CrdtEntry::Register(k, _) | CrdtEntry::Counter(k, _) | CrdtEntry::Set(k, _) => k,
+        }
+    }
+
+    pub fn encode(&self, buf: &mut Vec<u8>) {
+        match self {
+            CrdtEntry::Register(k, r) => encode_register(buf, k, r),
+            CrdtEntry::Counter(k, c) => encode_counter(buf, k, c),
+            CrdtEntry::Set(k, s) => encode_set(buf, k, s.elements.iter(), s.tombstones.iter()),
+        }
+    }
+}
+
+// Sync payload wire format: a sequence of entries, each
+//   [type: u8][key_len: u32][key] followed by
+//   1 (register): [value_len: u32][value][ts][tombstone: u8]
+//   2 (counter):  [p_len: u32]([node_id: u16][count: i64])* [n_len: u32]([node_id: u16][count: i64])*
+//   3 (set):      [elem_count: u32]([elem_len: u32][elem][tag_count: u32][ts]*)* [tomb_count: u32][ts]*
+// where ts = [physical_ms: u64][logical: u32][node_id: u16], all little-endian.
+
+fn put_bytes(buf: &mut Vec<u8>, b: &[u8]) {
+    buf.extend_from_slice(&(b.len() as u32).to_le_bytes());
+    buf.extend_from_slice(b);
+}
+
+fn put_ts(buf: &mut Vec<u8>, ts: &HlcTimestamp) {
+    buf.extend_from_slice(&ts.physical_ms.to_le_bytes());
+    buf.extend_from_slice(&ts.logical.to_le_bytes());
+    buf.extend_from_slice(&ts.node_id.to_le_bytes());
+}
+
+fn encode_register(buf: &mut Vec<u8>, key: &[u8], r: &LwwRegister) {
+    buf.push(1u8);
+    put_bytes(buf, key);
+    put_bytes(buf, &r.value);
+    put_ts(buf, &r.timestamp);
+    buf.push(if r.tombstone { 1 } else { 0 });
+}
+
+fn encode_counter(buf: &mut Vec<u8>, key: &[u8], c: &PnCounter) {
+    buf.push(2u8);
+    put_bytes(buf, key);
+    for side in [&c.p, &c.n] {
+        buf.extend_from_slice(&(side.len() as u32).to_le_bytes());
+        for (&nid, &v) in side {
+            buf.extend_from_slice(&nid.to_le_bytes());
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+}
+
+fn encode_set<'a>(
+    buf: &mut Vec<u8>,
+    key: &[u8],
+    elements: impl ExactSizeIterator<Item = (&'a Bytes, &'a HashSet<HlcTimestamp>)>,
+    tombstones: impl ExactSizeIterator<Item = &'a HlcTimestamp>,
+) {
+    buf.push(3u8);
+    put_bytes(buf, key);
+    buf.extend_from_slice(&(elements.len() as u32).to_le_bytes());
+    for (elem, tags) in elements {
+        put_bytes(buf, elem);
+        buf.extend_from_slice(&(tags.len() as u32).to_le_bytes());
+        for tag in tags {
+            put_ts(buf, tag);
+        }
+    }
+    buf.extend_from_slice(&(tombstones.len() as u32).to_le_bytes());
+    for tag in tombstones {
+        put_ts(buf, tag);
+    }
+}
+
+/// Bounds-checked cursor over an untrusted payload.
+struct Reader<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        if self.data.len() < n {
+            return Err("truncated CRDT payload".to_string());
+        }
+        let (head, rest) = self.data.split_at(n);
+        self.data = rest;
+        Ok(head)
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], String> {
+        let mut a = [0u8; N];
+        a.copy_from_slice(self.take(N)?);
+        Ok(a)
+    }
+
+    fn u8(&mut self) -> Result<u8, String> {
+        Ok(self.array::<1>()?[0])
+    }
+
+    fn len(&mut self) -> Result<usize, String> {
+        Ok(u32::from_le_bytes(self.array()?) as usize)
+    }
+
+    fn bytes(&mut self) -> Result<Bytes, String> {
+        let n = self.len()?;
+        Ok(Bytes::copy_from_slice(self.take(n)?))
+    }
+
+    fn ts(&mut self) -> Result<HlcTimestamp, String> {
+        let physical_ms = u64::from_le_bytes(self.array()?);
+        let logical = u32::from_le_bytes(self.array()?);
+        let node_id = u16::from_le_bytes(self.array()?);
+        Ok(HlcTimestamp::new(physical_ms, logical, node_id))
+    }
+
+    fn counter_side(&mut self) -> Result<HashMap<u16, i64>, String> {
+        let mut side = HashMap::new();
+        for _ in 0..self.len()? {
+            let nid = u16::from_le_bytes(self.array()?);
+            let v = i64::from_le_bytes(self.array()?);
+            if v < 0 {
+                return Err("negative CRDT counter component".to_string());
+            }
+            let e = side.entry(nid).or_insert(0);
+            *e = v.max(*e);
+        }
+        Ok(side)
+    }
+}
+
+/// Decodes a sync payload. Never panics: malformed input is an error.
+pub fn decode_sync_payload(data: &[u8]) -> Result<Vec<CrdtEntry>, String> {
+    let mut r = Reader { data };
+    let mut entries = Vec::new();
+    while !r.data.is_empty() {
+        let item_type = r.u8()?;
+        if !(1..=3).contains(&item_type) {
+            return Err(format!("Unknown CRDT item type: {}", item_type));
+        }
+        let k = r.bytes()?;
+        entries.push(match item_type {
+            1 => {
+                let value = r.bytes()?;
+                let timestamp = r.ts()?;
+                let tombstone = match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    b => return Err(format!("invalid CRDT register tombstone flag: {}", b)),
+                };
+                CrdtEntry::Register(
+                    k,
+                    LwwRegister {
+                        value,
+                        timestamp,
+                        tombstone,
+                    },
+                )
+            }
+            2 => {
+                let p = r.counter_side()?;
+                let n = r.counter_side()?;
+                CrdtEntry::Counter(k, PnCounter { p, n })
+            }
+            _ => {
+                let mut elements: HashMap<Bytes, HashSet<HlcTimestamp>> = HashMap::new();
+                for _ in 0..r.len()? {
+                    let elem = r.bytes()?;
+                    let tags = elements.entry(elem).or_default();
+                    for _ in 0..r.len()? {
+                        tags.insert(r.ts()?);
+                    }
+                }
+                let mut tombstones = HashSet::new();
+                for _ in 0..r.len()? {
+                    tombstones.insert(r.ts()?);
+                }
+                CrdtEntry::Set(
+                    k,
+                    OrSet {
+                        elements,
+                        tombstones,
+                    },
+                )
+            }
+        });
+    }
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -681,5 +808,156 @@ mod tests {
         s1.merge(&s2);
         // Add-wins: ts2 was not tombstoned by s2, so apple remains!
         assert!(s1.contains(&Bytes::from_static(b"apple")));
+    }
+
+    fn assert_same_state(a: &CrdtStore, b: &CrdtStore) {
+        assert_eq!(a.registers, b.registers);
+        assert_eq!(a.counters, b.counters);
+        assert_eq!(a.sets, b.sets);
+    }
+
+    fn b(s: &str) -> Bytes {
+        Bytes::copy_from_slice(s.as_bytes())
+    }
+
+    /// Merging the payload logged for each write, in order, rebuilds the
+    /// writer's state exactly, deletions and removals included.
+    #[test]
+    fn test_write_payloads_replay_exactly() {
+        let mut src = CrdtStore::new(1);
+        let mut log: Vec<Vec<u8>> = Vec::new();
+        src.set(b("r"), b("v1"));
+        log.push(src.register_payload(b"r"));
+        src.set(b("r"), b("v2"));
+        log.push(src.register_payload(b"r"));
+        src.set(b("gone"), b("x"));
+        log.push(src.register_payload(b"gone"));
+        assert!(src.del(&b("gone")));
+        log.push(src.register_payload(b"gone"));
+        src.counter_incr(b("c"), 10);
+        log.push(src.counter_payload(b"c"));
+        src.counter_incr(b("c"), -3);
+        log.push(src.counter_payload(b"c"));
+        for m in ["a", "b", "a"] {
+            src.set_add(b("s"), b(m));
+            log.push(src.set_member_payload(b"s", &b(m)));
+        }
+        let removed = src.set_rem(&b("s"), &b("a"));
+        assert_eq!(removed.len(), 2, "both adds of 'a' are tombstoned");
+        log.push(CrdtStore::set_removal_payload(b"s", &removed));
+        assert!(src.set_rem(&b("s"), &b("zz")).is_empty());
+
+        let mut dst = CrdtStore::new(2);
+        for p in &log {
+            dst.merge_sync_payload(p).unwrap();
+        }
+        assert_same_state(&src, &dst);
+        assert_eq!(dst.get(&b("r")), Some(b("v2")));
+        assert_eq!(dst.get(&b("gone")), None);
+        assert_eq!(dst.counter_get(&b("c")), 7);
+        assert_eq!(dst.set_members(&b("s")), vec![b("b")]);
+        // Replaying twice changes nothing: merge is idempotent.
+        for p in &log {
+            dst.merge_sync_payload(p).unwrap();
+        }
+        assert_same_state(&src, &dst);
+        // The replica's clock moved past every merged timestamp, so its own
+        // next write wins.
+        dst.set(b("r"), b("v3"));
+        assert!(dst.registers[&b("r")].timestamp > src.registers[&b("r")].timestamp);
+
+        let mut rebuilt = CrdtStore::new(3);
+        for p in src.export_entry_payloads() {
+            rebuilt.merge_sync_payload(&p).unwrap();
+        }
+        assert_same_state(&src, &rebuilt);
+    }
+
+    #[test]
+    fn test_malformed_payloads_are_errors_not_panics() {
+        let mut src = CrdtStore::new(1);
+        src.set(b("r"), b("v"));
+        src.set(b("d"), b("v"));
+        src.del(&b("d"));
+        src.counter_incr(b("c"), 5);
+        src.counter_incr(b("c"), -2);
+        src.set_add(b("s"), b("m1"));
+        src.set_add(b("s"), b("m2"));
+        src.set_rem(&b("s"), &b("m1"));
+        let good = src.export_sync_payload();
+
+        // Every strict prefix is truncated mid-entry or ends cleanly between
+        // entries; either way nothing panics, and an error applies nothing.
+        for len in 0..good.len() {
+            let mut dst = CrdtStore::new(2);
+            if dst.merge_sync_payload(&good[..len]).is_err() {
+                assert!(dst.registers.is_empty() && dst.counters.is_empty());
+                assert!(dst.sets.is_empty());
+            }
+        }
+        // Flipping any byte must not panic either.
+        for i in 0..good.len() {
+            for flip in [0x01u8, 0x80, 0xff] {
+                let mut bad = good.clone();
+                bad[i] ^= flip;
+                let _ = CrdtStore::new(2).merge_sync_payload(&bad);
+            }
+        }
+
+        let huge = u32::MAX.to_le_bytes();
+        let mut cases: Vec<Vec<u8>> = vec![
+            vec![9],
+            vec![1],
+            [&[1u8][..], &huge].concat(),
+            [&[1u8, 1, 0, 0, 0, b'k'][..], &huge].concat(),
+            [&[2u8, 1, 0, 0, 0, b'k'][..], &huge].concat(),
+            [&[3u8, 1, 0, 0, 0, b'k'][..], &huge].concat(),
+            [
+                &[3u8, 1, 0, 0, 0, b'k', 1, 0, 0, 0, 1, 0, 0, 0, b'e'][..],
+                &huge,
+            ]
+            .concat(),
+        ];
+        // A register with a tombstone flag other than 0/1.
+        let mut reg = Vec::new();
+        encode_register(
+            &mut reg,
+            b"k",
+            &LwwRegister::new(b("v"), HlcTimestamp::new(1, 0, 1)),
+        );
+        *reg.last_mut().unwrap() = 7;
+        cases.push(reg);
+        // A counter with a negative component.
+        let mut neg = PnCounter::new();
+        neg.p.insert(1, -1);
+        let mut ctr = Vec::new();
+        encode_counter(&mut ctr, b"k", &neg);
+        cases.push(ctr);
+        for case in &cases {
+            let mut dst = CrdtStore::new(2);
+            assert!(dst.merge_sync_payload(case).is_err(), "{case:?}");
+            assert!(dst.registers.is_empty() && dst.counters.is_empty() && dst.sets.is_empty());
+        }
+
+        // A good entry followed by garbage applies nothing.
+        let mut dst = CrdtStore::new(2);
+        let mut mixed = src.register_payload(b"r");
+        mixed.push(42);
+        assert!(dst.merge_sync_payload(&mixed).is_err());
+        assert!(dst.registers.is_empty());
+    }
+
+    #[test]
+    fn test_counter_saturates_instead_of_overflowing() {
+        let mut c = PnCounter::new();
+        c.inc(1, i64::MAX);
+        c.inc(1, i64::MAX);
+        assert_eq!(c.p[&1], i64::MAX);
+        c.inc(2, i64::MAX);
+        assert_eq!(c.value(), i64::MAX);
+        c.inc(1, i64::MIN);
+        c.dec(3, i64::MIN);
+        assert_eq!(c.n[&1], i64::MAX);
+        assert_eq!(c.p[&3], i64::MAX);
     }
 }

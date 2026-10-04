@@ -3907,7 +3907,9 @@ impl ShardDb {
         self.crdt_store.set_members(key)
     }
 
-    pub fn crdt_srem(&mut self, key: &Bytes, member: &Bytes) -> bool {
+    /// Returns the add timestamps the removal tombstoned (empty if `member`
+    /// was not in the set).
+    pub fn crdt_srem(&mut self, key: &Bytes, member: &Bytes) -> Vec<crate::crdt::HlcTimestamp> {
         self.crdt_store.set_rem(key, member)
     }
 
@@ -3919,9 +3921,9 @@ impl ShardDb {
         self.crdt_store.merge_sync_payload(payload)
     }
 
-    pub fn crdt_gc(&mut self, ttl_ms: Option<u64>) -> (usize, usize) {
-        let ttl = ttl_ms.unwrap_or(86_400_000); // 24 hours default
-        self.crdt_store.gc_tombstones(ttl)
+    /// Prunes tombstones from before `cutoff_ms` (see `GcHorizon::cutoff_ms`).
+    pub fn crdt_gc(&mut self, cutoff_ms: u64) -> (usize, usize) {
+        self.crdt_store.gc_tombstones(cutoff_ms)
     }
 }
 

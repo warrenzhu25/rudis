@@ -1463,8 +1463,11 @@ pub enum Command {
         member: Bytes,
     },
     CrdtDump,
+    /// `CRDT.MERGE payload`. The CRDT write handlers log their effect in this
+    /// form (the changed key's state as a payload), since their HLC
+    /// timestamps would differ on replay.
     CrdtMerge(Bytes),
-    CrdtGc(Option<u64>),
+    CrdtGc(crate::crdt::GcHorizon),
     // REDIS 7 FUNCTIONS
     FunctionLoad {
         replace: bool,
@@ -2772,8 +2775,8 @@ pub fn experimental_commands_enabled() -> bool {
 
 /// Command families that are off unless `enable-experimental-commands` is
 /// set. They are not Redis/Valkey commands, and apart from JSON.,
-/// SEMANTIC., BF., CF., CMS. and TOPK. most of their writes are neither
-/// written to the AOF nor replicated, so a restart or failover silently
+/// SEMANTIC., BF., CF., CMS., TOPK. and CRDT. most of their writes are
+/// neither written to the AOF nor replicated, so a restart or failover silently
 /// loses that data and replicas never see it. MCP./XDP. also expose tool
 /// calls and packet-filter control.
 const EXPERIMENTAL_PREFIXES: &[&str] = &[
@@ -10614,16 +10617,21 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
             Ok(Some(Command::CrdtMerge(args[1].clone())))
         }
         "CRDT.GC" => {
-            let ttl = if args.len() > 1 {
-                let s = std::str::from_utf8(&args[1])
-                    .map_err(|_| "value is not an integer or out of range")?
-                    .parse()
-                    .map_err(|_| "value is not an integer or out of range")?;
-                Some(s)
-            } else {
-                None
+            use crate::crdt::GcHorizon;
+            let int = |arg: &Bytes| -> Result<u64, String> {
+                std::str::from_utf8(arg)
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| "value is not an integer or out of range".to_string())
             };
-            Ok(Some(Command::CrdtGc(ttl)))
+            let horizon = if args.len() == 3 && args[1].eq_ignore_ascii_case(b"BEFORE") {
+                GcHorizon::Before(int(&args[2])?)
+            } else if args.len() > 1 {
+                GcHorizon::Ttl(Some(int(&args[1])?))
+            } else {
+                GcHorizon::Ttl(None)
+            };
+            Ok(Some(Command::CrdtGc(horizon)))
         }
         "VSIM" => {
             if args.len() < 4 {

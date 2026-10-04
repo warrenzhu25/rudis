@@ -1773,6 +1773,26 @@ pub fn command_to_resp(cmd: &Command) -> Option<Vec<u8>> {
             key,
             payload,
         ])),
+        // CRDT.SET/DEL/INCRBY/SADD/SREM stamp HLC timestamps and the node id,
+        // so replaying them would not rebuild the same state; their handlers
+        // log the change as a CRDT.MERGE of the affected key instead.
+        Command::CrdtSet { .. }
+        | Command::CrdtDel(_)
+        | Command::CrdtIncrby { .. }
+        | Command::CrdtSadd { .. }
+        | Command::CrdtSrem { .. } => None,
+        Command::CrdtMerge(payload) => Some(resp_argv(&[b"CRDT.MERGE".as_slice(), payload])),
+        Command::CrdtGc(horizon) => Some(match horizon {
+            crate::crdt::GcHorizon::Ttl(None) => resp_argv(&[b"CRDT.GC"]),
+            crate::crdt::GcHorizon::Ttl(Some(ttl)) => {
+                resp_argv(&[b"CRDT.GC".as_slice(), ttl.to_string().as_bytes()])
+            }
+            crate::crdt::GcHorizon::Before(cutoff) => resp_argv(&[
+                b"CRDT.GC".as_slice(),
+                b"BEFORE",
+                cutoff.to_string().as_bytes(),
+            ]),
+        }),
         Command::SemanticSet {
             namespace,
             id,
@@ -3322,6 +3342,15 @@ fn write_rewritten_aof(
         }
     }
 
+    // 9. Snapshot CRDT state as one CRDT.MERGE per register, counter and set
+    //    (tombstones included), the same form CRDT writes are logged in.
+    for payload in db.crdt_store.export_entry_payloads() {
+        if let Some(resp) = command_to_resp(&Command::CrdtMerge(payload.into())) {
+            writer.write_all(&resp)?;
+            count += 1;
+        }
+    }
+
     writer.flush()?;
     let file = writer.into_inner().map_err(|e| e.into_error())?;
     file.sync_all()?;
@@ -3480,6 +3509,143 @@ mod tests {
         let applied = replay_aof(&dir.join("appendonly-0.aof"), &mut rewritten).unwrap();
         assert_eq!(applied, 8);
         assert_eq!(rewritten.probabilistic_store, db.probabilistic_store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_crdt_writes_round_trip_through_aof_encoding() {
+        let mut remote = crate::crdt::CrdtStore::new(9);
+        remote.set(
+            Bytes::from_static(b"k"),
+            Bytes::from_static(b"\x00\r\n\xff"),
+        );
+        let payload = remote.export_sync_payload();
+        let writes: &[&[&[u8]]] = &[
+            &[b"CRDT.MERGE", &payload],
+            &[b"CRDT.MERGE", b""],
+            &[b"CRDT.GC"],
+            &[b"CRDT.GC", b"0"],
+            &[b"CRDT.GC", b"BEFORE", b"1700000000000"],
+        ];
+        for args in writes {
+            let cmd = parse_resp(&resp_argv(args));
+            assert!(cmd.is_write_command(), "{cmd:?} should be a write");
+            let bytes = command_to_resp(&cmd).unwrap_or_else(|| panic!("{cmd:?} not encoded"));
+            assert_eq!(parse_resp(&bytes), cmd);
+        }
+        // These are logged as the CRDT.MERGE of their effect instead.
+        for args in [
+            &["CRDT.SET", "k", "v"][..],
+            &["CRDT.DEL", "k"],
+            &["CRDT.INCRBY", "k", "1"],
+            &["CRDT.SADD", "k", "m"],
+            &["CRDT.SREM", "k", "m"],
+        ] {
+            assert_eq!(command_to_resp(&parse_resp(&resp_argv(args))), None);
+        }
+    }
+
+    /// Replaying the logged CRDT writes, or a rewrite of the result, rebuilds
+    /// exactly the same CRDT state, deletions and removals included.
+    #[test]
+    fn test_crdt_state_survives_aof_replay_and_rewrite() {
+        let dir = std::env::temp_dir().join(format!("rudis-aof-crdt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut db = ShardDb::new(6379);
+        let aof = std::cell::RefCell::new(AofWriter::new_in_memory());
+        let mut out = Vec::new();
+        let mut run = |db: &mut ShardDb, args: &[&[u8]]| {
+            out.clear();
+            let cmd = parse_resp(&resp_argv(args));
+            crate::connection::execute_local_command(&cmd, db, &mut out, Some(&aof));
+            String::from_utf8_lossy(&out).into_owned()
+        };
+        // State from another region, merged in below.
+        let mut remote = crate::crdt::CrdtStore::new(9);
+        remote.set(Bytes::from_static(b"m:reg"), Bytes::from_static(b"remote"));
+        remote.counter_incr(Bytes::from_static(b"ctr"), 100);
+        remote.set_add(Bytes::from_static(b"set"), Bytes::from_static(b"r1"));
+        let remote_payload = remote.export_sync_payload();
+
+        let scripted: &[(&[&[u8]], &str)] = &[
+            (&[b"CRDT.SET", b"reg", b"v1"], "+OK"),
+            (&[b"CRDT.SET", b"reg", b"v2"], "+OK"),
+            (&[b"CRDT.SET", b"gone", b"x"], "+OK"),
+            (&[b"CRDT.DEL", b"gone"], ":1"),
+            (&[b"CRDT.DEL", b"never"], ":0"),
+            (&[b"CRDT.INCRBY", b"ctr", b"10"], ":10"),
+            (&[b"CRDT.INCRBY", b"ctr", b"-3"], ":7"),
+            (&[b"CRDT.SADD", b"set", b"a"], ":1"),
+            (&[b"CRDT.SADD", b"set", b"b"], ":1"),
+            (&[b"CRDT.SADD", b"set", b"a"], ":0"),
+            (&[b"CRDT.SREM", b"set", b"a"], ":1"),
+            (&[b"CRDT.SREM", b"set", b"zz"], ":0"),
+            (&[b"CRDT.SADD", b"set2", b"x"], ":1"),
+            (&[b"CRDT.SREM", b"set2", b"x"], ":1"),
+            (&[b"CRDT.MERGE", &remote_payload], ":3"),
+            (&[b"CRDT.MERGE", b"\x07bad"], "-ERR"),
+        ];
+        for (args, want) in scripted {
+            let reply = run(&mut db, args);
+            assert!(reply.starts_with(want), "{args:?}: {reply}");
+        }
+        // An add of 'b' as it is now, merged again after 'b' is removed and
+        // its tombstone collected, resurrects it; replay must agree.
+        let stale_b = db
+            .crdt_store
+            .set_member_payload(b"set", &Bytes::from_static(b"b"));
+        assert!(run(&mut db, &[b"CRDT.SREM", b"set", b"b"]).starts_with(":1"));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let gc = run(&mut db, &[b"CRDT.GC", b"0"]);
+        assert!(gc.contains("registers_pruned\r\n:1\r\n"), "{gc}");
+        assert!(run(&mut db, &[b"CRDT.MERGE", &stale_b]).starts_with(":1"));
+
+        let observe = |db: &ShardDb| {
+            let mut members: Vec<Vec<Bytes>> = ["set", "set2"]
+                .iter()
+                .map(|k| db.crdt_smembers(&Bytes::from(*k)))
+                .collect();
+            members.iter_mut().for_each(|m| m.sort());
+            (
+                ["reg", "gone", "never", "m:reg"].map(|k| db.crdt_get(&Bytes::from(k))),
+                db.crdt_counter_get(&Bytes::from_static(b"ctr")),
+                members,
+            )
+        };
+        let want = observe(&db);
+        assert_eq!(want.0[0], Some(Bytes::from_static(b"v2")));
+        assert_eq!(want.0[1], None);
+        assert_eq!(want.0[3], Some(Bytes::from_static(b"remote")));
+        assert_eq!(want.1, 107);
+        assert_eq!(
+            want.2,
+            vec![
+                vec![Bytes::from_static(b"b"), Bytes::from_static(b"r1")],
+                vec![]
+            ]
+        );
+        let same_state = |a: &ShardDb, b: &ShardDb| {
+            assert_eq!(a.crdt_store.registers, b.crdt_store.registers);
+            assert_eq!(a.crdt_store.counters, b.crdt_store.counters);
+            assert_eq!(a.crdt_store.sets, b.crdt_store.sets);
+            assert_eq!(observe(a), observe(b));
+        };
+
+        let log = dir.join("log.aof");
+        std::fs::write(&log, aof.borrow().buffer()).unwrap();
+        let mut replayed = ShardDb::new(6380);
+        replay_aof(&log, &mut replayed).unwrap();
+        same_state(&replayed, &db);
+
+        let entries =
+            db.crdt_store.registers.len() + db.crdt_store.counters.len() + db.crdt_store.sets.len();
+        let n = rewrite_shard_aof(&mut db, &dir, 0).unwrap();
+        assert_eq!(n, entries, "one CRDT.MERGE per register, counter and set");
+        let mut rewritten = ShardDb::new(6380);
+        let applied = replay_aof(&dir.join("appendonly-0.aof"), &mut rewritten).unwrap();
+        assert_eq!(applied, entries);
+        same_state(&rewritten, &db);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
