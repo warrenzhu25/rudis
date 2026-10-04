@@ -2015,8 +2015,10 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
         if !tls_listeners.is_empty()
             && let Some(tls_cfg) = tls_config
         {
+            // Bit 46 keeps TLS ids apart from both the plain accept loop's
+            // `(shard_id << 48) + n` and the adopted-connection range (bit 47).
             let next_tls_client_id = Rc::new(std::cell::Cell::new(
-                ((shard_id as u64) << 48) | 0x8000_0000_0000,
+                ((shard_id as u64) << 48) | (1u64 << 46) | 1,
             ));
             for tls_listener in tls_listeners {
             let r = router.clone();
