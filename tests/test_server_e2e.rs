@@ -18157,3 +18157,109 @@ fn test_blocking_pops_never_miss_a_concurrent_push_e2e() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[test]
+fn test_timeout_keepalive_and_replica_read_only_directives_e2e() {
+    let (port, mport, rport) = (17100u16, 17101u16, 17102u16);
+    let dir = std::env::temp_dir().join(format!("rudis-idle-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let conf = dir.join("idle.conf");
+    std::fs::write(&conf, "timeout 1\ntcp-keepalive 60\n").unwrap();
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "2",
+            "--no-pin",
+            "-c",
+            conf.to_str().unwrap(),
+        ],
+        port,
+    );
+    let connect = || {
+        let c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c
+    };
+    let mut active = connect();
+    assert_eq!(
+        resp_cmd(&mut active, &["CONFIG", "GET", "timeout"]),
+        "*2\r\n$7\r\ntimeout\r\n$1\r\n1\r\n"
+    );
+    assert_eq!(
+        resp_cmd(&mut active, &["CONFIG", "GET", "tcp-keepalive"]),
+        "*2\r\n$13\r\ntcp-keepalive\r\n$2\r\n60\r\n"
+    );
+    let mut idle = connect();
+    assert_eq!(resp_cmd(&mut idle, &["PING"]), "+PONG\r\n");
+    let mut sub = connect();
+    sub.write_all(b"*2\r\n$9\r\nSUBSCRIBE\r\n$4\r\nidch\r\n")
+        .unwrap();
+    let mut buf = [0u8; 256];
+    assert!(sub.read(&mut buf).unwrap() > 0);
+    // Keep one client busy past the timeout.
+    for _ in 0..8 {
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(resp_cmd(&mut active, &["PING"]), "+PONG\r\n");
+    }
+    // The idle client was closed by the server...
+    assert_eq!(
+        idle.read(&mut buf).unwrap_or(0),
+        0,
+        "idle client still open"
+    );
+    // ...while the subscriber, which only listens, was kept.
+    assert_eq!(resp_cmd(&mut active, &["PUBLISH", "idch", "hi"]), ":1\r\n");
+    let n = sub.read(&mut buf).unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).contains("hi"));
+    drop(active);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    // replica-read-only no lets a replica's clients write.
+    let rconf = dir.join("replica.conf");
+    std::fs::write(
+        &rconf,
+        format!("replicaof 127.0.0.1 {mport}\nreplica-read-only no\n"),
+    )
+    .unwrap();
+    let (mport_s, rport_s) = (mport.to_string(), rport.to_string());
+    let mut master =
+        spawn_rudis_listening(&["--port", &mport_s, "--threads", "2", "--no-pin"], mport);
+    let mut replica = spawn_rudis_listening(
+        &[
+            "--port",
+            &rport_s,
+            "--threads",
+            "2",
+            "--no-pin",
+            "-c",
+            rconf.to_str().unwrap(),
+        ],
+        rport,
+    );
+    let mut r = TcpStream::connect(("127.0.0.1", rport)).unwrap();
+    r.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while !resp_cmd(&mut r, &["INFO", "replication"]).contains("master_link_status:up") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replica never connected"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(resp_cmd(&mut r, &["SET", "ro:k", "v"]), "+OK\r\n");
+    assert_eq!(
+        resp_cmd(&mut r, &["CONFIG", "SET", "replica-read-only", "yes"]),
+        "+OK\r\n"
+    );
+    assert!(resp_cmd(&mut r, &["SET", "ro:k", "v"]).starts_with("-READONLY"));
+    let _ = replica.kill();
+    let _ = replica.wait();
+    let _ = master.kill();
+    let _ = master.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}

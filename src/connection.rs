@@ -1025,6 +1025,68 @@ pub fn write_latency_response(sub: &LatencySubcommand, out: &mut Vec<u8>) {
     }
 }
 
+/// `timeout`: close a client connection after this many idle seconds
+/// (0, the default, means never).
+pub static CLIENT_IDLE_TIMEOUT_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `tcp-keepalive`: SO_KEEPALIVE idle time in seconds for client sockets
+/// (0 disables keepalive). 300 like Redis.
+pub static TCP_KEEPALIVE_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(300);
+
+/// `replica-read-only`: whether a replica rejects writes from its clients.
+pub static REPLICA_READ_ONLY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// Applies `tcp-keepalive` to an accepted client socket, like Redis's
+/// anetKeepAlive: probes start after the idle time and are sent every third
+/// of it, three times, before the peer is considered dead.
+pub fn apply_tcp_keepalive(fd: std::os::unix::io::RawFd) {
+    let secs = TCP_KEEPALIVE_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    if secs == 0 {
+        return;
+    }
+    let set = |level: libc::c_int, opt: libc::c_int, val: libc::c_int| unsafe {
+        libc::setsockopt(
+            fd,
+            level,
+            opt,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of_val(&val) as libc::socklen_t,
+        );
+    };
+    let idle = secs.min(i32::MAX as u64) as libc::c_int;
+    set(libc::SOL_SOCKET, libc::SO_KEEPALIVE, 1);
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPIDLE, idle);
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, (idle / 3).max(1));
+    set(libc::IPPROTO_TCP, libc::TCP_KEEPCNT, 3);
+}
+
+/// How long the next read from this client may wait before the connection
+/// is closed for being idle, or None if it must not time out. As in Redis,
+/// MONITOR clients and Pub/Sub subscribers are exempt (replica links leave
+/// this loop for the replication stream); blocked clients are not reading.
+fn idle_read_limit(
+    router: &Router,
+    client_id: u64,
+    registry: &RefCell<hashbrown::HashMap<u64, ClientInfo>>,
+) -> Option<std::time::Duration> {
+    let secs = CLIENT_IDLE_TIMEOUT_SECS.load(std::sync::atomic::Ordering::Relaxed);
+    if secs == 0 {
+        return None;
+    }
+    if router.pubsub.borrow().clients.contains_key(&client_id)
+        || registry
+            .borrow()
+            .get(&client_id)
+            .is_some_and(|c| c.is_monitor)
+    {
+        return None;
+    }
+    Some(std::time::Duration::from_secs(secs))
+}
+
 pub static PAUSE_DEADLINE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static PAUSE_WRITE_ONLY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -2490,6 +2552,15 @@ pub fn apply_config_value(
         "backupdirname" => *CONFIG_BACKUPDIRNAME.write().unwrap() = val_str.to_string(),
         "slaveof" | "replicaof" => *CONFIG_SLAVEOF.write().unwrap() = val_str.to_string(),
         "dbfilename" => crate::config::set_dbfilename(base_port, val_str)?,
+        "timeout" => {
+            CLIENT_IDLE_TIMEOUT_SECS.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
+        }
+        "tcp-keepalive" => {
+            TCP_KEEPALIVE_SECS.store(parse_config_num(name, val_str)?, Ordering::Relaxed)
+        }
+        "replica-read-only" | "slave-read-only" => {
+            REPLICA_READ_ONLY.store(parse_config_bool(name, val_str)?, Ordering::Relaxed)
+        }
         "masterauth" => crate::replication::set_masterauth(port, val_str),
         "masteruser" => crate::replication::set_masteruser(port, val_str),
         _ => return Ok(false),
@@ -2957,10 +3028,16 @@ pub async fn handle_tls_connection(
     let mut tx_has_error = false;
 
     loop {
-        let n = match session
-            .read_plaintext(&mut stream, &mut read_buf, &mut temp_plain)
-            .await
-        {
+        let read = session.read_plaintext(&mut stream, &mut read_buf, &mut temp_plain);
+        let res = match idle_read_limit(&router, client_id, &client_registry) {
+            None => read.await,
+            Some(limit) => match monoio::time::timeout(limit, read).await {
+                Ok(r) => r,
+                // Idle for `timeout` seconds: close, like Redis.
+                Err(_) => break,
+            },
+        };
+        let n = match res {
             Ok(0) => break,
             Ok(n) => n,
             Err(_) => break,
@@ -3518,7 +3595,20 @@ pub async fn handle_connection(
         let avail_before = buf.capacity() - buf.len();
 
         // Rent BytesMut directly to monoio's io_uring driver (zero intermediate read_buf memcpy)
-        let (res, RecvBytesMut(returned_buf)) = stream.read(RecvBytesMut(buf)).await;
+        let (res, RecvBytesMut(returned_buf)) =
+            match idle_read_limit(&router, client_id, &client_registry) {
+                None => stream.read(RecvBytesMut(buf)).await,
+                Some(limit) => {
+                    match monoio::time::timeout(limit, stream.read(RecvBytesMut(buf))).await {
+                        Ok(r) => r,
+                        Err(_) => {
+                            // Idle for `timeout` seconds: close, like Redis.
+                            buf = BytesMut::new();
+                            break;
+                        }
+                    }
+                }
+            };
         buf = returned_buf;
 
         match res {
@@ -8205,6 +8295,7 @@ async fn execute_command(
     }
 
     if crate::replication::HAS_SLAVE_INSTANCE.load(std::sync::atomic::Ordering::Relaxed)
+        && REPLICA_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed)
         && crate::replication::get_replication_hub(router.port).is_slave()
         && (cmd.is_write_command() || crate::aof::command_to_resp(&cmd).is_some())
     {
@@ -9682,7 +9773,12 @@ async fn execute_command(
                     let backup_dir = CONFIG_BACKUPDIRNAME.read().unwrap().clone();
                     let slaveof_cfg = CONFIG_SLAVEOF.read().unwrap().clone();
 
-                    let all_configs: [(&str, String); 46] = [
+                    let ro = if REPLICA_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+                        "yes"
+                    } else {
+                        "no"
+                    };
+                    let all_configs: [(&str, String); 50] = [
                         ("port", port_str),
                         (
                             "protected-mode",
@@ -9756,6 +9852,20 @@ async fn execute_command(
                                 .to_string(),
                         ),
                         ("dbfilename", crate::config::dbfilename(router.base_port)),
+                        (
+                            "timeout",
+                            CLIENT_IDLE_TIMEOUT_SECS
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                .to_string(),
+                        ),
+                        (
+                            "tcp-keepalive",
+                            TCP_KEEPALIVE_SECS
+                                .load(std::sync::atomic::Ordering::Relaxed)
+                                .to_string(),
+                        ),
+                        ("replica-read-only", ro.to_string()),
+                        ("slave-read-only", ro.to_string()),
                     ];
                     let hidden_configs: [(&str, String); 2] = [
                         ("key-load-delay", key_load_delay),
@@ -9830,6 +9940,7 @@ async fn execute_command(
                         let canonical = match p_str.as_str() {
                             "busy-reply-threshold" | "lua-time-limit" => "lua-time-limit",
                             "slaveof" | "replicaof" => "replicaof",
+                            "slave-read-only" | "replica-read-only" => "replica-read-only",
                             "hash-max-ziplist-entries" | "hash-max-listpack-entries" => {
                                 "hash-max-listpack-entries"
                             }
@@ -9888,6 +9999,29 @@ async fn execute_command(
                                     format!(
                                         "-ERR CONFIG SET failed (possibly related to argument 'appendfsync') - {}\r\n",
                                         e
+                                    )
+                                    .as_bytes(),
+                                );
+                                return false;
+                            }
+                        } else if matches!(p_str.as_str(), "timeout" | "tcp-keepalive") {
+                            if val_str.parse::<u64>().is_err() {
+                                out.extend_from_slice(
+                                    format!(
+                                        "-ERR CONFIG SET failed (possibly related to argument '{}') - argument couldn't be parsed into an integer\r\n",
+                                        p_str
+                                    )
+                                    .as_bytes(),
+                                );
+                                return false;
+                            }
+                        } else if matches!(p_str.as_str(), "replica-read-only" | "slave-read-only")
+                        {
+                            if !matches!(val_str.to_ascii_lowercase().as_str(), "yes" | "no") {
+                                out.extend_from_slice(
+                                    format!(
+                                        "-ERR CONFIG SET failed (possibly related to argument '{}') - argument must be 'yes' or 'no'\r\n",
+                                        p_str
                                     )
                                     .as_bytes(),
                                 );

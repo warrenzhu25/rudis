@@ -2034,6 +2034,9 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                     match accept_res {
                         Ok((mut stream, client_addr)) => {
                             let _ = stream.set_nodelay(true);
+                            crate::connection::apply_tcp_keepalive(
+                                std::os::unix::io::AsRawFd::as_raw_fd(&stream),
+                            );
                             let client_id = next_tls_client_id.get();
                             next_tls_client_id.set(client_id + 1);
                             let router_clone = r.clone();
@@ -2220,6 +2223,7 @@ async fn accept_loop(
                     continue;
                 }
                 let _ = stream.set_nodelay(true);
+                crate::connection::apply_tcp_keepalive(raw_fd);
                 unsafe {
                     let yes: libc::c_int = 1;
                     libc::setsockopt(
