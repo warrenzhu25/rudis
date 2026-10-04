@@ -102,10 +102,16 @@ pub struct BlockHub {
     blocked_stream_clients: HashMap<u64, Sender<BlockedStreamResult>>,
     paused_count: usize,
     pending_notifies: Vec<Bytes>,
+    /// This hub's share of `TOTAL_BLOCKED_WAITERS`.
+    published_waiters: usize,
 }
 
 pub static PORT_BLOCK_HUBS: LazyLock<Mutex<HashMap<u16, Arc<Mutex<BlockHub>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Sum of every hub's waiters. Each hub adds and removes only its own share:
+/// with several servers in one process (one hub per port), a hub storing its
+/// own count would hide another hub's waiters, and a push there would skip
+/// the wakeup.
 static TOTAL_BLOCKED_WAITERS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -127,6 +133,12 @@ impl Default for BlockHub {
     }
 }
 
+impl Drop for BlockHub {
+    fn drop(&mut self) {
+        self.publish_waiters(0);
+    }
+}
+
 impl BlockHub {
     pub fn new(port: u16) -> Self {
         Self {
@@ -139,11 +151,12 @@ impl BlockHub {
             blocked_stream_clients: HashMap::new(),
             paused_count: 0,
             pending_notifies: Vec::new(),
+            published_waiters: 0,
         }
     }
 
     #[inline(always)]
-    pub fn sync_atomic_waiters_count(&self) {
+    pub fn sync_atomic_waiters_count(&mut self) {
         let count = self.paused_count
             + self.list_waiters.values().map(|w| w.len()).sum::<usize>()
             + self.zset_waiters.values().map(|w| w.len()).sum::<usize>()
@@ -151,7 +164,17 @@ impl BlockHub {
             + self.blocked_clients.len()
             + self.blocked_zset_clients.len()
             + self.blocked_stream_clients.len();
-        TOTAL_BLOCKED_WAITERS.store(count, std::sync::atomic::Ordering::Relaxed);
+        self.publish_waiters(count);
+    }
+
+    fn publish_waiters(&mut self, count: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if count > self.published_waiters {
+            TOTAL_BLOCKED_WAITERS.fetch_add(count - self.published_waiters, Relaxed);
+        } else {
+            TOTAL_BLOCKED_WAITERS.fetch_sub(self.published_waiters - count, Relaxed);
+        }
+        self.published_waiters = count;
     }
 
     pub fn is_paused(&self) -> bool {
@@ -789,7 +812,23 @@ mod tests {
                 .map_or(0, |v| v.len()),
             0
         );
-        assert!(!has_blocked_waiters(12345));
+        assert_eq!(hub.published_waiters, 0);
+    }
+
+    #[test]
+    fn test_one_hub_emptying_does_not_hide_another_hubs_waiters() {
+        let mut busy = BlockHub::new(12348);
+        let (tx, _rx) = unbounded();
+        busy.register_list_waiter(400, Bytes::from_static(b"k"), ListPopType::Left, 1, tx);
+
+        let mut other = BlockHub::new(12349);
+        let (tx2, _rx2) = unbounded();
+        other.register_blocked_client(401, tx2);
+        other.unregister_blocked_client(401);
+        assert!(
+            has_blocked_waiters(12348),
+            "a push on the busy hub's port must still look for waiters"
+        );
     }
 
     #[test]

@@ -2955,19 +2955,34 @@ fn test_valkey_missing_features_e2e() {
     );
     assert_eq!(blmove_timeout, "$-1\r\n");
 
-    // BLMOVE blocking cross-thread notification
-    let pusher_port = port;
-    thread::spawn(move || {
-        thread::sleep(Duration::from_millis(50));
-        let mut pusher = TcpStream::connect(format!("127.0.0.1:{}", pusher_port)).unwrap();
-        send_and_read(&mut pusher, b"LPUSH {blmove_q} blocked_item\r\n");
-    });
-
-    let blmove_blocked = send_and_read(
-        &mut client,
-        b"BLMOVE {blmove_q} {blmove_q}_dst LEFT RIGHT 2.0\r\n",
+    // BLMOVE blocking cross-thread notification: push from another
+    // connection once the client is blocked.
+    client
+        .write_all(b"BLMOVE {blmove_q} {blmove_q}_dst LEFT RIGHT 2.0\r\n")
+        .unwrap();
+    let mut pusher = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !send_and_read(&mut pusher, b"INFO clients\r\n").contains("blocked_clients:1\r\n") {
+        assert!(std::time::Instant::now() < deadline, "BLMOVE never blocked");
+        thread::sleep(Duration::from_millis(5));
+    }
+    // Another server in this process (one block hub per port; no test
+    // listens on port + 1) gaining and losing a waiter must not hide this
+    // one from the push.
+    {
+        let other_hub = rudis::block::get_block_hub_for_port(port + 1);
+        let mut other_hub = other_hub.lock().unwrap();
+        let (tx, _rx) = flume::unbounded();
+        other_hub.register_blocked_client(1, tx);
+        other_hub.unregister_blocked_client(1);
+    }
+    send_and_read(&mut pusher, b"LPUSH {blmove_q} blocked_item\r\n");
+    let mut buf = [0u8; 64];
+    let n = client.read(&mut buf).unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&buf[..n]),
+        "$12\r\nblocked_item\r\n"
     );
-    assert_eq!(blmove_blocked, "$12\r\nblocked_item\r\n");
     let dest_pop = send_and_read(&mut client, b"RPOP {blmove_q}_dst\r\n");
     assert_eq!(dest_pop, "$12\r\nblocked_item\r\n");
 
