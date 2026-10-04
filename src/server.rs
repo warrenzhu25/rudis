@@ -239,7 +239,7 @@ pub fn run_shard_worker(
             pubsub.clone(),
             aof_config.dir.clone(),
         );
-        r.base_port = base_port;
+        r.set_base_port(base_port);
         r.cluster_enabled = cluster_enabled;
         let router = Rc::new(r);
         crate::connection::set_current_router(router.clone());

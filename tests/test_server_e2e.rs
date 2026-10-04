@@ -20852,3 +20852,88 @@ fn test_tier_file_lives_under_dir_is_reset_at_startup_and_not_shared_e2e() {
     shutdown_and_wait(port, &mut child.0);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_bgsave_and_bgrewriteaof_exclusive_across_shards_e2e() {
+    let port = 17098;
+    let dir = std::env::temp_dir().join(format!("rudis-bgsave-lock-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let args = [
+        "--port",
+        "17098",
+        "--threads",
+        "2",
+        "--no-pin",
+        "--aof",
+        "true",
+        "--aof-dir",
+        dir.to_str().unwrap(),
+    ];
+    let mut child = spawn_rudis_listening(&args, port);
+
+    let mut c1 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let mut c2 = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c1.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    c2.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+
+    // Populate enough keys and delay saves so the background operation stays
+    // in flight long enough to test exclusivity across both shard threads.
+    for i in 0..100 {
+        assert_eq!(
+            resp_cmd(&mut c1, &["SET", &format!("k:{i}"), "val"]),
+            "+OK\r\n"
+        );
+    }
+    assert_eq!(
+        resp_cmd(&mut c1, &["CONFIG", "SET", "rdb-key-save-delay", "10"]),
+        "+OK\r\n"
+    );
+
+    assert_eq!(
+        resp_cmd(&mut c1, &["BGSAVE"]),
+        "+Background saving started\r\n"
+    );
+
+    // Another client (even on another shard thread) must be refused
+    let err_save = resp_cmd(&mut c2, &["BGSAVE"]);
+    assert_eq!(
+        err_save, "-ERR Background save already in progress\r\n",
+        "{err_save}"
+    );
+    let err_rw = resp_cmd(&mut c2, &["BGREWRITEAOF"]);
+    assert_eq!(
+        err_rw, "-ERR Background save or rewrite already in progress\r\n",
+        "{err_rw}"
+    );
+
+    // Clear the artificial delay and wait for the save to finish
+    assert_eq!(
+        resp_cmd(&mut c1, &["CONFIG", "SET", "rdb-key-save-delay", "0"]),
+        "+OK\r\n"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while resp_cmd(&mut c1, &["INFO", "persistence"]).contains("rdb_bgsave_in_progress:1") {
+        assert!(std::time::Instant::now() < deadline, "save did not finish");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // Now a rewrite can start without conflict
+    assert_eq!(
+        resp_cmd(&mut c2, &["BGREWRITEAOF"]),
+        "+Background append only file rewriting started\r\n"
+    );
+    while resp_cmd(&mut c1, &["INFO", "persistence"]).contains("aof_rewrite_in_progress:1") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rewrite did not finish"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    drop(c1);
+    drop(c2);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}

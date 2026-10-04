@@ -175,6 +175,18 @@ pub fn aof_rewrite_state(port: u16) -> Arc<AofRewriteState> {
         .clone()
 }
 
+static IS_SAVING: Mutex<Option<HashMap<u16, Arc<AtomicBool>>>> = Mutex::new(None);
+
+/// Mutual exclusivity flag for SAVE / BGSAVE / BGREWRITEAOF, shared by all
+/// shard threads of the server (keyed by base port).
+pub fn is_saving(port: u16) -> Arc<AtomicBool> {
+    let mut map = IS_SAVING.lock().unwrap_or_else(|e| e.into_inner());
+    map.get_or_insert_with(HashMap::new)
+        .entry(port)
+        .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+        .clone()
+}
+
 /// Same contract as `SnapshotState`: `begin` before the reply, `finish`
 /// after the save lock is released, and the outcome is visible by the time
 /// `in_progress` reads false (INFO may run on another shard thread).

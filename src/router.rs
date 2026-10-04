@@ -239,7 +239,7 @@ impl Router {
             pubsub,
             tx_lock: Rc::new(RefCell::new(None)),
             tx_waiters: Rc::new(RefCell::new(std::collections::VecDeque::new())),
-            is_saving: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            is_saving: crate::snapshot::is_saving(port),
             db_dir,
             is_auto_tiering: Rc::new(Cell::new(false)),
             notify_channel_pool: Rc::new(RefCell::new(Vec::new())),
@@ -252,6 +252,11 @@ impl Router {
             presence_table: crate::pubsub::get_presence_table(port),
             tier_stats: crate::tiering::get_tier_stats(port),
         }
+    }
+
+    pub fn set_base_port(&mut self, base_port: u16) {
+        self.base_port = base_port;
+        self.is_saving = crate::snapshot::is_saving(base_port);
     }
 
     #[inline(always)]
@@ -4150,6 +4155,38 @@ mod tests {
         block_on(router.save_rdb()).unwrap();
         assert!(dir.join("dump.rdb").is_file());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_is_saving_flag_is_shared_across_shards_of_same_server() {
+        let port0 = 19882;
+        let port1 = 19883;
+        let base_port = 19882;
+        let (mut router0, _db0) = single_shard_router(port0);
+        router0.set_base_port(base_port);
+        let (mut router1, _db1) = single_shard_router(port1);
+        router1.set_base_port(base_port);
+
+        assert!(!router0.is_saving.load(Ordering::SeqCst));
+        assert!(!router1.is_saving.load(Ordering::SeqCst));
+
+        // When Shard 0 marks a save in progress, Shard 1 immediately sees it
+        assert!(
+            router0
+                .is_saving
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        );
+        assert!(router1.is_saving.load(Ordering::SeqCst));
+        assert!(
+            router1
+                .is_saving
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        );
+
+        router0.is_saving.store(false, Ordering::SeqCst);
+        assert!(!router1.is_saving.load(Ordering::SeqCst));
     }
 
     #[test]
