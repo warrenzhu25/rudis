@@ -519,6 +519,8 @@ fn test_binary_serves_tls_with_pem_cert_files() {
     }
     let mut child = KillOnDrop(
         std::process::Command::new(env!("CARGO_BIN_EXE_rudis"))
+            // Keeps the default tier dir (under the working dir) out of the repo.
+            .current_dir(std::env::temp_dir())
             .args([
                 "--port",
                 &BIN_PORT.to_string(),

@@ -6,7 +6,46 @@ use std::time::Duration;
 use rudis::router::target_shard;
 use rudis::server::run_shard_worker;
 
+/// Removes the `rudis-{srv,cluster,tls}-<pid>-<port>` dirs of test processes
+/// that are gone.
+/// In-process servers never shut down, so their dirs (RDB, AOF, tier files)
+/// cannot be removed by the test that made them; the next run does it.
+fn sweep_dead_test_server_dirs() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let pid = ["rudis-srv-", "rudis-cluster-", "rudis-tls-"]
+                .iter()
+                .find_map(|prefix| name.strip_prefix(prefix))
+                .and_then(|rest| rest.split('-').next())
+                .and_then(|pid| pid.parse::<u32>().ok());
+            if let Some(pid) = pid
+                && !std::path::Path::new(&format!("/proc/{pid}")).exists()
+            {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    });
+}
+
+/// The server binary, run from a per-process scratch dir (swept like the
+/// others) so files it puts in its working dir, such as the default tier
+/// dir, stay out of the repo.
+fn rudis_bin() -> std::process::Command {
+    sweep_dead_test_server_dirs();
+    let cwd = std::env::temp_dir().join(format!("rudis-srv-{}-cwd", std::process::id()));
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_rudis"));
+    cmd.current_dir(cwd);
+    cmd
+}
+
 fn start_test_server(port: u16, num_shards: usize) {
+    sweep_dead_test_server_dirs();
     let dir = std::env::temp_dir().join(format!("rudis-srv-{}-{}", std::process::id(), port));
     let _ = std::fs::create_dir_all(&dir);
     start_test_server_with_aof(
@@ -67,6 +106,7 @@ fn start_test_server_cluster(port: u16, num_shards: usize) {
     hub.num_shards
         .store(num_shards, std::sync::atomic::Ordering::Release);
 
+    sweep_dead_test_server_dirs();
     let dir = std::env::temp_dir().join(format!("rudis-cluster-{}-{}", std::process::id(), port));
     let _ = std::fs::create_dir_all(&dir);
     let aof_config = rudis::aof::AofConfig {
@@ -124,6 +164,7 @@ fn start_test_server_with_tls(port: u16, tls_port: u16, num_shards: usize) -> (V
         server_config,
     };
 
+    sweep_dead_test_server_dirs();
     let dir = std::env::temp_dir().join(format!("rudis-tls-{}-{}", std::process::id(), port));
     let _ = std::fs::create_dir_all(&dir);
     let aof_config = rudis::aof::AofConfig {
@@ -4035,8 +4076,6 @@ fn test_tiered_storage_gc_and_hole_punching_e2e() {
     // 3. Test explicit TIER GC command
     let gc_resp = send_and_read(&mut client, b"TIER GC\r\n");
     assert!(gc_resp.starts_with(':'));
-
-    let _ = std::fs::remove_dir_all(format!("/tmp/rudis_tier_{}", port));
 }
 
 #[test]
@@ -4071,7 +4110,6 @@ fn test_option1_zero_copy_snapshots_e2e() {
     assert!(entries > 0);
 
     let _ = std::fs::remove_dir_all(&snap_dir);
-    let _ = std::fs::remove_dir_all(format!("/tmp/rudis_tier_{}", port));
 }
 
 #[test]
@@ -7206,12 +7244,20 @@ fn test_config_resetstat_and_info_commandstats_cross_shard_e2e() {
 fn test_graceful_shutdown_command_and_worker_exit_e2e() {
     let port = 16711;
     rudis::shutdown::reset_shutdown();
+    sweep_dead_test_server_dirs();
+    let dir = std::env::temp_dir().join(format!("rudis-srv-{}-{}", std::process::id(), port));
+    std::fs::create_dir_all(&dir).unwrap();
+    let aof_config = rudis::aof::AofConfig {
+        dir,
+        ..Default::default()
+    };
 
     let (senders_mesh, receivers) = rudis::mailbox::create_shard_mesh(2);
     let mut handles = Vec::new();
 
     for (shard_id, rx) in receivers.into_iter().enumerate() {
         let shard_senders = senders_mesh[shard_id].clone();
+        let shard_aof_config = aof_config.clone();
         let handle = thread::Builder::new()
             .stack_size(rudis::server::SHARD_THREAD_STACK_SIZE)
             .spawn(move || {
@@ -7222,7 +7268,7 @@ fn test_graceful_shutdown_command_and_worker_exit_e2e() {
                     shard_senders,
                     rx,
                     None,
-                    rudis::aof::AofConfig::default(),
+                    shard_aof_config,
                     None,
                     false,
                 );
@@ -14725,7 +14771,7 @@ fn test_script_redis_call_enforces_caller_acl_e2e() {
 
 /// Runs the real binary until it exits (or fails the test after 20s).
 fn run_rudis_until_exit(args: &[&str]) -> (std::process::ExitStatus, String) {
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rudis"))
+    let mut child = rudis_bin()
         .args(args)
         .env("MONOIO_FORCE_LEGACY_DRIVER", "1")
         .stdout(std::process::Stdio::null())
@@ -14811,7 +14857,7 @@ fn test_startup_refuses_unloadable_rdb_and_aof_e2e() {
 
 /// Starts the real binary and waits until it accepts connections.
 fn spawn_rudis_listening(args: &[&str], port: u16) -> std::process::Child {
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rudis"))
+    let mut child = rudis_bin()
         .args(args)
         .env("MONOIO_FORCE_LEGACY_DRIVER", "1")
         .stdout(std::process::Stdio::null())
@@ -18004,7 +18050,7 @@ fn test_config_file_directives_are_applied_or_rejected_e2e() {
         "maxclients lots\n",
     ] {
         std::fs::write(&conf, bad).unwrap();
-        let status = std::process::Command::new(env!("CARGO_BIN_EXE_rudis"))
+        let status = rudis_bin()
             .args(args)
             .env("MONOIO_FORCE_LEGACY_DRIVER", "1")
             .stdout(std::process::Stdio::null())
@@ -18900,7 +18946,7 @@ fn test_metrics_port_serves_prometheus_over_http_e2e() {
 
     // A metrics port that can't be bound is a startup error, not a silent
     // missing endpoint.
-    let status = std::process::Command::new(env!("CARGO_BIN_EXE_rudis"))
+    let status = rudis_bin()
         .args(["--port", "17079", "--threads", "1", "--no-pin"])
         .args(["--metrics-port", &metrics_s])
         .stdout(std::process::Stdio::null())
@@ -18915,7 +18961,7 @@ fn test_metrics_port_serves_prometheus_over_http_e2e() {
 
 /// Runs the binary expecting it to refuse to start; returns its stderr.
 fn rudis_startup_error(args: &[&str]) -> String {
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rudis"))
+    let mut child = rudis_bin()
         .args(args)
         .env("MONOIO_FORCE_LEGACY_DRIVER", "1")
         .stdout(std::process::Stdio::null())
@@ -19568,7 +19614,7 @@ fn test_config_rewrite_targets_the_startup_config_file_e2e() {
     std::fs::create_dir_all(&cwd).unwrap();
     std::fs::write(conf_dir.join("server.conf"), "# mine\nmaxclients 1000\n").unwrap();
     let spawn = |args: &[&str], stderr: std::process::Stdio| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_rudis"))
+        rudis_bin()
             .args(args)
             .current_dir(&cwd)
             .env("MONOIO_FORCE_LEGACY_DRIVER", "1")
@@ -20711,7 +20757,7 @@ fn test_tier_file_lives_under_dir_is_reset_at_startup_and_not_shared_e2e() {
     // A second server pointed at the same tier file gets no tiering
     // rather than truncating or overwriting the first one's data.
     let mut other = KillOnDrop(
-        std::process::Command::new(env!("CARGO_BIN_EXE_rudis"))
+        rudis_bin()
             .args([
                 "--port",
                 &other_port.to_string(),
