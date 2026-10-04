@@ -2584,6 +2584,13 @@ fn test_cluster_migrate_slot_e2e() {
         "$11\r\ntransferred\r\n"
     );
 
+    let mut c1_conns: Vec<TcpStream> = (0..8)
+        .map(|_| TcpStream::connect(("127.0.0.1", port1)).unwrap())
+        .collect();
+    let mut c2_conns: Vec<TcpStream> = (0..8)
+        .map(|_| TcpStream::connect(("127.0.0.1", port2)).unwrap())
+        .collect();
+
     // Migrate this slot to server2
     let migrate_cmd = format!("CLUSTER MIGRATE-SLOT {} 127.0.0.1 {}\r\n", slot, port2);
     assert_eq!(
@@ -2591,14 +2598,21 @@ fn test_cluster_migrate_slot_e2e() {
         "+OK\r\n"
     );
 
-    // Server 1 should now redirect with MOVED for this slot
-    let moved_resp = send_and_read(&mut client1, format!("GET {}\r\n", key).as_bytes());
-    assert_eq!(
-        moved_resp,
-        format!("-MOVED {} 127.0.0.1:{}\r\n", slot, port2)
-    );
-
-    // Server 2 should now have the key
+    // Every shard on server 1 must redirect with MOVED immediately after +OK,
+    // and every shard on server 2 must serve the migrated key.
+    for c in &mut c1_conns {
+        let moved_resp = send_and_read(c, format!("GET {}\r\n", key).as_bytes());
+        assert_eq!(
+            moved_resp,
+            format!("-MOVED {} 127.0.0.1:{}\r\n", slot, port2)
+        );
+    }
+    for c in &mut c2_conns {
+        assert_eq!(
+            send_and_read(c, format!("GET {}\r\n", key).as_bytes()),
+            "$11\r\ntransferred\r\n"
+        );
+    }
     assert_eq!(
         send_and_read(&mut client2, format!("GET {}\r\n", key).as_bytes()),
         "$11\r\ntransferred\r\n"

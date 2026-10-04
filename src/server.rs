@@ -1642,6 +1642,9 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
                         cross_shard_slot_states.borrow_mut().remove(&slot);
                         cross_shard_slot_owners.borrow_mut()[slot as usize] = owner;
                     }
+                    ShardMessage::SlotBarrier { responder } => {
+                        let _ = responder.send(());
+                    }
                     ShardMessage::SyncAof { responder } => {
                         let (file, chunk, offset) = if let Some(aof) = &cross_shard_aof {
                             let mut writer = aof.borrow_mut();

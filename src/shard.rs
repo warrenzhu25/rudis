@@ -437,6 +437,11 @@ pub enum ShardMessage {
         slot: u16,
         owner: usize,
     },
+    /// Answered once every slot update sent earlier on the same ring has
+    /// been applied (see `Router::sync_slot_tables`).
+    SlotBarrier {
+        responder: flume::Sender<()>,
+    },
     SyncAof {
         responder: flume::Sender<()>,
     },

@@ -335,6 +335,35 @@ impl Router {
         }
     }
 
+    /// Waits until every other shard has applied the slot updates this shard
+    /// sent before the call. `set_slot_state`/`set_slot_owner` only post the
+    /// change, so without this a command on a connection owned by another
+    /// shard can still see the old state after the caller has replied. Each
+    /// ring is FIFO, so a barrier answered means everything ahead of it is
+    /// applied.
+    pub async fn sync_slot_tables(&self) {
+        let mut waiters = Vec::with_capacity(self.senders.len());
+        for (sid, sender) in self.senders.iter().enumerate() {
+            if sid != self.shard_id {
+                let (tx, rx) = self.acquire_notify_channel();
+                if sender
+                    .send(ShardMessage::SlotBarrier {
+                        responder: tx.clone(),
+                    })
+                    .is_ok()
+                {
+                    waiters.push((tx, rx));
+                } else {
+                    self.release_notify_channel(tx, rx);
+                }
+            }
+        }
+        for (tx, rx) in waiters {
+            let _ = rx.recv_async().await;
+            self.release_notify_channel(tx, rx);
+        }
+    }
+
     pub async fn spill_local(&self, key: &[u8]) -> bool {
         self.spill_local_internal(key, true).await
     }
@@ -5363,6 +5392,62 @@ mod tests {
         });
         assert_eq!(replies, vec![b":1\r\n".to_vec(), b":7\r\n".to_vec()]);
         assert_eq!(router.remote_responder_pool.borrow().len(), 2);
+        t1.join().unwrap();
+        t2.join().unwrap();
+    }
+
+    #[test]
+    fn test_sync_slot_tables_waits_for_earlier_slot_updates() {
+        let (mut senders_mesh, mut receivers) = crate::mailbox::create_shard_mesh(3);
+        let senders = senders_mesh.remove(0);
+        let _rx0 = receivers.remove(0);
+        let rx1 = receivers.remove(0);
+        let rx2 = receivers.remove(0);
+
+        let applied = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spawn_worker =
+            |rx: crate::mailbox::ShardReceiver, applied: Arc<std::sync::atomic::AtomicUsize>| {
+                std::thread::spawn(move || {
+                    while let Ok(msg) = rx.recv() {
+                        match msg {
+                            ShardMessage::SetSlotState { .. }
+                            | ShardMessage::SetSlotOwner { .. } => {
+                                std::thread::sleep(Duration::from_millis(5));
+                                applied.fetch_add(1, Ordering::Release);
+                            }
+                            ShardMessage::SlotBarrier { responder } => {
+                                let _ = responder.send(());
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                })
+            };
+        let t1 = spawn_worker(rx1, applied.clone());
+        let t2 = spawn_worker(rx2, applied.clone());
+
+        let router = Router::new(
+            0,
+            3,
+            9984,
+            Rc::new(RefCell::new(ShardDb::new(9984))),
+            senders,
+            None,
+            Rc::new(RefCell::new(crate::pubsub::PubSubHub::new())),
+            std::env::temp_dir(),
+        );
+        let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            router.set_slot_owner(42, 1);
+            router.set_slot_state(42, crate::shard::SlotState::Stable);
+            router.sync_slot_tables().await;
+        });
+        assert_eq!(applied.load(Ordering::Acquire), 4);
+        assert_eq!(router.notify_channel_pool.borrow().len(), 2);
         t1.join().unwrap();
         t2.join().unwrap();
     }

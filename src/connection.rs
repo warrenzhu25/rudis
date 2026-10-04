@@ -5968,6 +5968,7 @@ async fn execute_rebalance_plans(
                 p.slot,
                 crate::shard::SlotState::Migrating(p.target_addr.clone()),
             );
+            router.sync_slot_tables().await;
 
             let target_sock = format!("{}:{}", host, target_port)
                 .parse::<std::net::SocketAddr>()
@@ -6031,6 +6032,7 @@ async fn execute_rebalance_plans(
                 p.slot,
                 crate::shard::SlotState::Moved(p.target_addr.clone()),
             );
+            router.sync_slot_tables().await;
             hub.assign_slot(p.slot, &p.target_node_id);
             hub.slot_states.write().unwrap().remove(&p.slot);
             hub.bump_config_epoch();
@@ -6048,6 +6050,7 @@ async fn execute_rebalance_plans(
                 p.slot,
                 crate::shard::SlotState::Importing(p.source_addr.clone()),
             );
+            router.sync_slot_tables().await;
 
             hub.assign_slot(p.slot, &p.target_node_id);
             hub.slot_states.write().unwrap().remove(&p.slot);
@@ -9818,7 +9821,10 @@ async fn execute_command(
                     out.extend_from_slice(&links_bytes);
                 }
                 ClusterSubcommand::AddSlots(slots) => match router.cluster_addslots(&slots) {
-                    Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                    Ok(()) => {
+                        router.sync_slot_tables().await;
+                        out.extend_from_slice(b"+OK\r\n");
+                    }
                     Err(e) => out.extend_from_slice(format!("-{}\r\n", e).as_bytes()),
                 },
                 ClusterSubcommand::DelSlots(slots) => match router.cluster_delslots(&slots) {
@@ -9827,7 +9833,10 @@ async fn execute_command(
                 },
                 ClusterSubcommand::AddSlotsRange(ranges) => {
                     match router.cluster_addslotsrange(&ranges) {
-                        Ok(()) => out.extend_from_slice(b"+OK\r\n"),
+                        Ok(()) => {
+                            router.sync_slot_tables().await;
+                            out.extend_from_slice(b"+OK\r\n");
+                        }
                         Err(e) => out.extend_from_slice(format!("-{}\r\n", e).as_bytes()),
                     }
                 }
@@ -9882,6 +9891,7 @@ async fn execute_command(
                             .write()
                             .unwrap()
                             .insert(slot, ("migrating".to_string(), node));
+                        router.sync_slot_tables().await;
                         out.extend_from_slice(b"+OK\r\n");
                     }
                     SetSlotSubcommand::Importing(node) => {
@@ -9903,12 +9913,14 @@ async fn execute_command(
                             .write()
                             .unwrap()
                             .insert(slot, ("importing".to_string(), node));
+                        router.sync_slot_tables().await;
                         out.extend_from_slice(b"+OK\r\n");
                     }
                     SetSlotSubcommand::Stable => {
                         router.set_slot_state(slot, crate::shard::SlotState::Stable);
                         let hub = crate::cluster::get_cluster_hub(router.port);
                         hub.slot_states.write().unwrap().remove(&slot);
+                        router.sync_slot_tables().await;
                         out.extend_from_slice(b"+OK\r\n");
                     }
                     SetSlotSubcommand::Node(node) => {
@@ -9971,6 +9983,7 @@ async fn execute_command(
                             router
                                 .set_slot_state(slot, crate::shard::SlotState::Moved(target_addr));
                         }
+                        router.sync_slot_tables().await;
                         out.extend_from_slice(b"+OK\r\n");
                     }
                 },
@@ -9981,6 +9994,7 @@ async fn execute_command(
                         slot,
                         crate::shard::SlotState::Migrating(target_addr.clone()),
                     );
+                    router.sync_slot_tables().await;
 
                     // 2. Notify remote node: CLUSTER SETSLOT <slot> IMPORTING <my_id>
                     let my_id = router.my_id();
@@ -10051,6 +10065,7 @@ async fn execute_command(
 
                     // 5. Update local state to Moved
                     router.set_slot_state(slot, crate::shard::SlotState::Moved(target_addr));
+                    router.sync_slot_tables().await;
                     out.extend_from_slice(b"+OK\r\n");
                 }
                 ClusterSubcommand::Rebalance {
