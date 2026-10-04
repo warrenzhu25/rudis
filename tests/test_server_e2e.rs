@@ -20353,3 +20353,82 @@ fn test_restore_accepts_a_zero_crc_and_rejects_a_wrong_one_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child);
 }
+
+#[test]
+fn test_flushall_clears_every_key_family_and_stays_flushed_after_aof_replay_e2e() {
+    let port: u16 = 17087;
+    let dir = std::env::temp_dir().join(format!("rudis-flushfam-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--enable-experimental-commands",
+        "yes",
+        "--aof",
+        "true",
+        "--aof-dir",
+        dir.to_str().unwrap(),
+    ];
+    let present = [
+        (&["GET", "fam:s"][..], "$1\r\n1\r\n"),
+        (&["JSON.GET", "fam:j"][..], "$7\r\n{\"a\":1}\r\n"),
+        (&["BF.EXISTS", "fam:bf", "x"][..], ":1\r\n"),
+        (&["CRDT.GET", "fam:r"][..], "$1\r\nv\r\n"),
+        (&["CRDT.SMEMBERS", "fam:cs"][..], "*1\r\n$1\r\nm\r\n"),
+        (&["CRDT.INCRBY", "fam:c", "0"][..], ":5\r\n"),
+    ];
+    let gone = [
+        (&["GET", "fam:s"][..], "$-1\r\n"),
+        (&["JSON.GET", "fam:j"][..], "$-1\r\n"),
+        (&["BF.EXISTS", "fam:bf", "x"][..], ":0\r\n"),
+        (&["CRDT.GET", "fam:r"][..], "$-1\r\n"),
+        (&["CRDT.SMEMBERS", "fam:cs"][..], "*0\r\n"),
+        (&["CRDT.INCRBY", "fam:c", "0"][..], ":0\r\n"),
+    ];
+    let check = |c: &mut TcpStream, want: &[(&[&str], &str)], when: &str| {
+        for (cmd, reply) in want {
+            assert_eq!(resp_cmd(c, cmd), *reply, "{when}: {cmd:?}");
+        }
+    };
+
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    for cmd in [
+        &["SET", "fam:s", "1"][..],
+        &["JSON.SET", "fam:j", "$", "{\"a\":1}"],
+        &["BF.ADD", "fam:bf", "x"],
+        &["CRDT.SET", "fam:r", "v"],
+        &["CRDT.SADD", "fam:cs", "m"],
+        &["CRDT.INCRBY", "fam:c", "5"],
+    ] {
+        let r = resp_cmd(&mut c, cmd);
+        assert!(!r.starts_with('-'), "{cmd:?}: {r}");
+    }
+    check(&mut c, &present, "written");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+
+    // The AOF carries every family, so the flush below has something to undo.
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    check(&mut c, &present, "replayed");
+    assert_eq!(resp_cmd(&mut c, &["FLUSHALL", "ASYNC"]), "+OK\r\n");
+    check(&mut c, &gone, "flushed");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    check(&mut c, &gone, "flushed then replayed");
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}

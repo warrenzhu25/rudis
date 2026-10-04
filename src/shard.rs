@@ -1863,6 +1863,8 @@ impl ShardDb {
         self.table.zscan(key, cursor, pattern, count)
     }
 
+    /// Empties the shard's whole dataset, every key family included. The
+    /// CRDT clock stays, so it never runs backwards.
     #[inline]
     pub fn flushdb(&mut self) {
         self.table.flushdb();
@@ -1872,6 +1874,11 @@ impl ShardDb {
         self.llm_quotas.clear();
         self.agent_checkpoints.clear();
         self.agent_tools.clear();
+        self.json_store = crate::json::JsonStore::new();
+        self.probabilistic_store = crate::probabilistic::ProbabilisticStore::new();
+        self.crdt_store.registers.clear();
+        self.crdt_store.sets.clear();
+        self.crdt_store.counters.clear();
     }
 
     /// Replaces this shard's dataset with its part of a master's full-sync
@@ -1883,24 +1890,13 @@ impl ShardDb {
         shard_id: usize,
         num_shards: usize,
     ) -> Result<(), String> {
-        self.clear_replicated_data();
+        self.flushdb();
         crate::table::load_rdb_bytes(data, self, shard_id, num_shards)
             .map(|_| ())
             .map_err(|e| {
-                self.clear_replicated_data();
+                self.flushdb();
                 e.to_string()
             })
-    }
-
-    /// Empties everything a full-sync RDB carries. The CRDT clock stays, so
-    /// it never runs backwards.
-    fn clear_replicated_data(&mut self) {
-        self.flushdb();
-        self.json_store = crate::json::JsonStore::new();
-        self.probabilistic_store = crate::probabilistic::ProbabilisticStore::new();
-        self.crdt_store.registers.clear();
-        self.crdt_store.sets.clear();
-        self.crdt_store.counters.clear();
     }
 
     #[inline]

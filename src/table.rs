@@ -17908,4 +17908,35 @@ mod tests {
         assert!(replica.load_full_sync_rdb(&cut, 0, 1).is_err());
         assert_eq!(replica.dbsize(), 0);
     }
+
+    #[test]
+    fn test_flushdb_clears_every_key_family() {
+        let mut db = crate::shard::ShardDb::new(0);
+        db.table
+            .set(Bytes::from_static(b"s"), Bytes::from_static(b"1"), None);
+        db.json_store
+            .insert_raw(Bytes::from_static(b"j"), serde_json::json!({"a": 1}));
+        db.probabilistic_store.bloom_filters.insert(
+            Bytes::from_static(b"bf"),
+            crate::probabilistic::BloomFilter::new(10, 0.01),
+        );
+        let ts = db
+            .crdt_store
+            .set(Bytes::from_static(b"r"), Bytes::from_static(b"v"));
+        db.crdt_store
+            .set_add(Bytes::from_static(b"cs"), Bytes::from_static(b"m"));
+        db.crdt_store
+            .counter_incr(Bytes::from_static(b"c"), 1)
+            .unwrap();
+
+        db.flushdb();
+        assert_eq!(db.dbsize(), 0);
+        assert!(db.json_store.is_empty());
+        assert!(db.probabilistic_store.bloom_filters.is_empty());
+        assert!(db.crdt_store.registers.is_empty());
+        assert!(db.crdt_store.sets.is_empty());
+        assert!(db.crdt_store.counters.is_empty());
+        // The clock keeps going, so later writes still win over old ones.
+        assert!(db.crdt_store.clock.now() > ts);
+    }
 }
