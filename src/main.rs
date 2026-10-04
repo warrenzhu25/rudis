@@ -75,6 +75,15 @@ struct Args {
     /// writes are not persisted to the AOF or replicated (yes|no, default no)
     #[arg(long)]
     enable_experimental_commands: Option<String>,
+
+    /// Serve Prometheus metrics over HTTP (GET /metrics) on this port
+    #[arg(long)]
+    metrics_port: Option<u16>,
+
+    /// Address the metrics port listens on (default 127.0.0.1; the
+    /// endpoint has no authentication)
+    #[arg(long)]
+    metrics_bind: Option<std::net::IpAddr>,
 }
 
 fn get_process_affinity_cores() -> Vec<usize> {
@@ -217,6 +226,19 @@ fn main() {
     }
     rudis::resp::set_experimental_commands(server_config.enable_experimental_commands);
     rudis::config::set_save_points(port, server_config.save_points.clone());
+    if let Some(p) = args.metrics_port {
+        server_config.metrics_port = Some(p);
+    }
+    if let Some(b) = args.metrics_bind {
+        server_config.metrics_bind = b;
+    }
+    let metrics_addr = server_config.metrics_port.map(|metrics_port| {
+        let addr = std::net::SocketAddr::new(server_config.metrics_bind, metrics_port);
+        rudis::telemetry::bind_metrics_listener(port, addr).unwrap_or_else(|e| {
+            eprintln!("FATAL CONFIG: cannot listen for metrics on {}: {}", addr, e);
+            std::process::exit(1);
+        })
+    });
     let mut ignored_directives: Vec<&str> = Vec::new();
     for (name, value) in &server_config.extra_directives {
         if (name == "replicaof" || name == "slaveof")
@@ -316,6 +338,9 @@ fn main() {
         "  Shards:       {} worker threads (pinned to CPU cores)",
         num_shards
     );
+    if let Some(addr) = metrics_addr {
+        println!("  Metrics:      http://{}/metrics", addr);
+    }
     if cluster_enabled {
         println!(
             "  Cluster Mode: ENABLED (Per-shard ports: {}-{})",

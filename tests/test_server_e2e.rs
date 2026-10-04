@@ -18289,6 +18289,65 @@ fn test_migrate_never_drops_keys_the_target_did_not_store_e2e() {
     shutdown_and_wait(dst_port, &mut dst);
 }
 
+fn http_get(port: u16, path: &str) -> String {
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    write!(c, "GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+    let mut out = String::new();
+    c.read_to_string(&mut out).unwrap();
+    out
+}
+
+#[test]
+fn test_metrics_port_serves_prometheus_over_http_e2e() {
+    let (port, metrics_port) = (17077, 17078);
+    let (port_s, metrics_s) = (port.to_string(), metrics_port.to_string());
+    let mut child = spawn_rudis_listening(
+        &[
+            "--port",
+            &port_s,
+            "--threads",
+            "2",
+            "--no-pin",
+            "--metrics-port",
+            &metrics_s,
+        ],
+        port,
+    );
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["SET", "m:k", "v"]), "+OK\r\n");
+
+    let res = http_get(metrics_port, "/metrics");
+    assert!(res.starts_with("HTTP/1.1 200 OK\r\n"), "{res}");
+    assert!(res.contains("Content-Type: text/plain; version=0.0.4"));
+    let value = |name: &str| -> u64 {
+        let line = res
+            .lines()
+            .find(|l| l.starts_with(&format!("{name} ")))
+            .unwrap_or_else(|| panic!("{name} missing in {res}"));
+        line.split(' ').nth(1).unwrap().parse().unwrap()
+    };
+    assert!(value("rudis_commands_processed_total") >= 1);
+    assert!(value("rudis_used_memory_bytes") > 0);
+    assert_eq!(value("rudis_connected_clients"), 1);
+    assert!(http_get(metrics_port, "/").starts_with("HTTP/1.1 404 "));
+
+    // A metrics port that can't be bound is a startup error, not a silent
+    // missing endpoint.
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_rudis"))
+        .args(["--port", "17079", "--threads", "1", "--no-pin"])
+        .args(["--metrics-port", &metrics_s])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(1));
+
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}
+
 #[test]
 fn test_sigterm_drains_clients_and_keeps_every_acked_write_e2e() {
     let port = 17073;

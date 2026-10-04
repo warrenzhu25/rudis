@@ -31,6 +31,12 @@ pub struct RudisConfig {
     pub cluster_enabled: bool,
     pub tiered_offload_threshold: u64,
     pub tiered_upload_threshold: u64,
+    /// `metrics-port`: serve Prometheus metrics over HTTP (`GET /metrics`)
+    /// on this port. Off by default.
+    pub metrics_port: Option<u16>,
+    /// `metrics-bind`: address the metrics port listens on. Defaults to
+    /// loopback because the endpoint has no authentication.
+    pub metrics_bind: std::net::IpAddr,
     /// `save <seconds> <changes>` points. Empty (the default) means no
     /// snapshots unless asked for, unlike Redis's built-in defaults.
     pub save_points: Vec<(u64, u64)>,
@@ -67,6 +73,8 @@ impl Default for RudisConfig {
             cluster_enabled: false,
             tiered_offload_threshold: 60,
             tiered_upload_threshold: 80,
+            metrics_port: None,
+            metrics_bind: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             save_points: Vec::new(),
             users: Vec::new(),
             extra_directives: Vec::new(),
@@ -528,6 +536,16 @@ impl RudisConfig {
                         }
                     };
                 }
+                "metrics-port" => {
+                    config.metrics_port = Some(rest[0].parse::<u16>().map_err(|e| {
+                        format!("Invalid metrics-port at line {}: {}", line_num + 1, e)
+                    })?);
+                }
+                "metrics-bind" => {
+                    config.metrics_bind = rest[0].parse().map_err(|e| {
+                        format!("Invalid metrics-bind at line {}: {}", line_num + 1, e)
+                    })?;
+                }
                 "cross-shard-spin" => {
                     config.cross_shard_spin = rest[0].parse::<usize>().map_err(|e| {
                         format!("Invalid cross-shard-spin at line {}: {}", line_num + 1, e)
@@ -923,6 +941,18 @@ mod tests {
                 .aof_load_truncated
         );
         assert!(RudisConfig::parse_str("aof-load-truncated maybe").is_err());
+    }
+
+    #[test]
+    fn test_parse_metrics_port_and_bind() {
+        let c = RudisConfig::parse_str("").unwrap();
+        assert_eq!(c.metrics_port, None);
+        assert_eq!(c.metrics_bind.to_string(), "127.0.0.1");
+        let c = RudisConfig::parse_str("metrics-port 9121\nmetrics-bind 0.0.0.0").unwrap();
+        assert_eq!(c.metrics_port, Some(9121));
+        assert_eq!(c.metrics_bind.to_string(), "0.0.0.0");
+        assert!(RudisConfig::parse_str("metrics-port 70000").is_err());
+        assert!(RudisConfig::parse_str("metrics-bind localhost:1").is_err());
     }
 
     #[test]

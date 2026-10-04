@@ -410,11 +410,14 @@ docker run -d --name rudis \
 - `INFO` (optionally `INFO <section>` — `server` (default), `clients`, `memory`, `persistence`,
   `replication`, `storage`/`tiered`, `stats`, `commandstats`) returns Redis-protocol text over
   the normal client connection: `redis-cli -p 6379 INFO`.
-- `INFO metrics` (alias `INFO prometheus`) returns Prometheus exposition-format text
-  ([`src/telemetry.rs`](src/telemetry.rs)) — but **there is no separate HTTP `/metrics`
-  endpoint**; it is a RESP bulk-string reply on the same port. To feed a real Prometheus
-  scraper, run a small sidecar that issues `redis-cli -p 6379 INFO metrics` on an interval and
-  republishes the text over HTTP.
+- Prometheus metrics: start with `--metrics-port 9121` (or `metrics-port 9121` in the config
+  file) and scrape `http://127.0.0.1:9121/metrics`. The endpoint listens on loopback by default
+  because it has no authentication; use `--metrics-bind 0.0.0.0` / `metrics-bind` to expose it to
+  a remote scraper, behind a firewall. Other paths return 404. A metrics port that can't be bound
+  stops startup. The same text is available as `INFO metrics` (alias `INFO prometheus`) on the
+  normal port ([`src/telemetry.rs`](src/telemetry.rs)): connected clients, memory used/limit,
+  expired/evicted keys, tiering hits and misses, and the INFO stats counters (commands processed,
+  connections, network bytes, keyspace hits/misses).
 - There is no built-in log file rotation or structured JSON logging; redirect and rotate at the
   process-manager level (systemd journal, your container runtime's log driver, or `logrotate`).
 

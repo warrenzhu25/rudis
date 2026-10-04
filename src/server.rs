@@ -253,6 +253,14 @@ pub fn run_shard_worker(
             }
         });
 
+        if shard_id == 0
+            && let Some(l) = crate::telemetry::take_metrics_listener(base_port)
+        {
+            let listener = monoio::net::TcpListener::from_std(l)
+                .expect("Failed to convert metrics socket into Monoio TcpListener");
+            monoio::spawn(crate::telemetry::serve_metrics(router.clone(), listener));
+        }
+
         // Background Tiered Storage Offload cycle: run every 20ms
         let offload_router = router.clone();
         monoio::spawn(async move {
