@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -15,6 +15,7 @@ pub fn request_shutdown() {
 /// Resets the shutdown state (primarily used in tests between test cases).
 pub fn reset_shutdown() {
     SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+    SHARDS_DRAINED.store(0, Ordering::SeqCst);
 }
 
 /// Installs OS signal handlers (SIGINT, SIGTERM) to trigger graceful server shutdown.
@@ -48,6 +49,28 @@ pub fn take_shutdown_signal() -> bool {
 /// Simulates a signal (for tests).
 pub fn signal_shutdown() {
     SHUTDOWN_SIGNALLED.store(true, Ordering::SeqCst);
+}
+
+/// How long a shard waits for its clients to finish their in-flight
+/// commands once shutdown starts. Clients still connected after this (for
+/// example blocked in `BLPOP`) are dropped.
+pub const CLIENT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a drained shard keeps serving cross-shard requests while the
+/// other shards finish draining.
+pub const SHARD_BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+static SHARDS_DRAINED: AtomicUsize = AtomicUsize::new(0);
+
+/// Records that this shard has no more clients that can issue commands.
+pub fn mark_shard_drained() {
+    SHARDS_DRAINED.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Whether every one of `num_shards` shards has drained its clients, so no
+/// new cross-shard request can arrive any more.
+pub fn all_shards_drained(num_shards: usize) -> bool {
+    SHARDS_DRAINED.load(Ordering::SeqCst) >= num_shards
 }
 
 #[cfg(test)]
@@ -97,5 +120,20 @@ mod tests {
         request_shutdown();
         assert!(handle.join().unwrap());
         reset_shutdown();
+    }
+
+    #[test]
+    fn test_drain_barrier_waits_for_every_shard_and_resets() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_shutdown();
+        assert!(!all_shards_drained(3));
+        let shards: Vec<_> = (0..2).map(|_| thread::spawn(mark_shard_drained)).collect();
+        shards.into_iter().for_each(|s| s.join().unwrap());
+        assert!(!all_shards_drained(3));
+        mark_shard_drained();
+        assert!(all_shards_drained(3));
+        assert!(!all_shards_drained(4));
+        reset_shutdown();
+        assert!(!all_shards_drained(1));
     }
 }

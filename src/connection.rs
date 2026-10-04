@@ -588,7 +588,11 @@ pub async fn wait_for_blocked_result<T>(
             Ok(Ok(res)) => return (Some(res), false),
             Ok(Err(_)) => return (None, false),
             Err(_) => {
+                // While draining for shutdown the server has shut the read
+                // side itself, which reads as a peer close: let the command
+                // finish (the drain timeout bounds the wait) and reply.
                 if let Some(fd) = raw_fd
+                    && !crate::shutdown::is_shutting_down()
                     && is_fd_closed(fd)
                 {
                     return (None, true);
@@ -633,6 +637,7 @@ pub async fn wait_for_stream_result(
             Ok(Err(_)) => return (None, false),
             Err(_) => {
                 if let Some(fd) = raw_fd
+                    && !crate::shutdown::is_shutting_down()
                     && is_fd_closed(fd)
                 {
                     return (None, true);

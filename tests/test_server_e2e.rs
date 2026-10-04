@@ -18194,6 +18194,104 @@ fn test_bgrewriteaof_keeps_tiered_keys_with_their_types_e2e() {
 }
 
 #[test]
+fn test_sigterm_drains_clients_and_keeps_every_acked_write_e2e() {
+    let port = 17073;
+    let dir = std::env::temp_dir().join(format!("rudis-drain-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "4",
+        "--no-pin",
+        "--aof",
+        "true",
+        "--aof-dir",
+        dir.to_str().unwrap(),
+    ];
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut idle = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert_eq!(resp_cmd(&mut idle, &["PING"]), "+PONG\r\n");
+
+    // Writers keep going until the server closes them; each records the
+    // last key it got +OK for.
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            thread::spawn(move || {
+                let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                let mut acked = 0usize;
+                loop {
+                    let key = format!("drain:{w}:{}", acked + 1);
+                    let cmd = format!("*3\r\n$3\r\nSET\r\n${}\r\n{key}\r\n$1\r\nv\r\n", key.len());
+                    if c.write_all(cmd.as_bytes()).is_err() {
+                        return acked;
+                    }
+                    let mut buf = [0u8; 5];
+                    match c.read_exact(&mut buf) {
+                        Ok(()) if &buf == b"+OK\r\n" => acked += 1,
+                        _ => return acked,
+                    }
+                }
+            })
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(300));
+    // A command still running when the signal arrives must get its reply.
+    let mut blocked = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    blocked
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    blocked
+        .write_all(b"*3\r\n$5\r\nBLPOP\r\n$12\r\ndrain:nolist\r\n$3\r\n0.8\r\n")
+        .unwrap();
+    thread::sleep(Duration::from_millis(100));
+    let started = std::time::Instant::now();
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+
+    idle.set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut buf = [0u8; 16];
+    assert_eq!(
+        idle.read(&mut buf).unwrap_or(0),
+        0,
+        "idle client not closed"
+    );
+    let mut reply = [0u8; 5];
+    blocked
+        .read_exact(&mut reply)
+        .expect("in-flight BLPOP lost its reply");
+    assert_eq!(&reply, b"*-1\r\n");
+    let acked: Vec<usize> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+    assert!(
+        acked.iter().all(|&n| n > 0),
+        "writers made no progress: {acked:?}"
+    );
+    let status = wait_exit(&mut child, Duration::from_secs(10)).expect("SIGTERM must stop rudis");
+    assert!(status.success(), "{status}");
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "shutdown took {:?}",
+        started.elapsed()
+    );
+
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    for (w, &n) in acked.iter().enumerate() {
+        for i in [1, n / 2 + 1, n] {
+            let key = format!("drain:{w}:{i}");
+            assert_eq!(resp_cmd(&mut c, &["EXISTS", &key]), ":1\r\n", "{key} lost");
+        }
+    }
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_blocking_pops_never_miss_a_concurrent_push_e2e() {
     // The pusher's command can reach the key's owner shard while the blocked
     // client is between "all keys empty" and "registered as a waiter". That

@@ -453,16 +453,22 @@ Understand what "durable" means here today before relying on it:
 
 ### Graceful Shutdown
 
-- `SIGTERM`/`SIGINT` set a cooperative flag ([`src/shutdown.rs`](src/shutdown.rs)); each shard
-  stops accepting *new* connections within ~200ms of the signal and its worker thread exits once
-  its accept loop observes the flag.
-- This is **not a full drain**: shutdown does not wait for in-flight commands to finish, does not
-  flush AOF early, and does not trigger an automatic snapshot before the process exits. If you
-  need a guaranteed-fresh RDB snapshot before stopping, issue a blocking `SAVE` (or `BGSAVE` and
-  poll for completion) first.
-- `SIGKILL` (a `docker stop`/systemd stop past its grace period) skips all of the above. Give the
-  process a real shutdown grace period — `docker stop -t <seconds>`, systemd `TimeoutStopSec=` —
-  so it at least has the ~200ms it needs to stop accepting new connections cleanly.
+`SIGTERM`/`SIGINT` and `SHUTDOWN` run the same sequence ([`src/shutdown.rs`](src/shutdown.rs),
+`run_shard_worker` in [`src/server.rs`](src/server.rs)):
+
+1. **Save**: if save points are configured (or `SHUTDOWN SAVE` is given), a snapshot is taken
+   first. If it fails the server keeps running and reports the error (`SHUTDOWN NOSAVE` skips it).
+2. **Stop accepting**: every shard stops accepting new connections within ~200ms.
+3. **Drain clients** (up to 2s): the read side of every client socket is shut. Idle clients see
+   EOF at once; a command already running (including a blocked `BLPOP`/`XREAD` until its own
+   timeout) finishes and gets its reply. Clients still busy at the deadline are dropped.
+4. **Shard barrier** (up to 3s): each shard keeps serving cross-shard requests until every shard
+   has drained, so no shard exits while another shard's client is waiting on it.
+5. **Final AOF flush + fsync**, then the process exits with status 0.
+
+With AOF enabled, every write acknowledged before exit is in the AOF. `SIGKILL` (a `docker stop`/systemd
+stop past its grace period) skips all of the above, so give the process at least ~6s:
+`docker stop -t 10`, systemd `TimeoutStopSec=10` or more.
 
 ### Security Checklist
 

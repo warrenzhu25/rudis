@@ -2173,7 +2173,15 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
         )
         .await;
 
-        // 6. Graceful shutdown cleanup: sync AOF and notify
+        // 6. Drain, then sync the AOF for the last time.
+        drain_clients(&client_registry).await;
+        crate::shutdown::mark_shard_drained();
+        let deadline = std::time::Instant::now() + crate::shutdown::SHARD_BARRIER_TIMEOUT;
+        while !crate::shutdown::all_shards_drained(num_shards)
+            && std::time::Instant::now() < deadline
+        {
+            monoio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
         if let Some(aof) = aof_writer {
             let (file, chunk, offset) = {
                 let mut writer = aof.borrow_mut();
@@ -2192,6 +2200,34 @@ crate::replication::log_shard_mutation(port, shard_id, cross_shard_aof.as_deref(
             }
         }
     });
+}
+
+/// Stops reading from this shard's clients and waits for them to finish.
+///
+/// `shutdown(SHUT_RD)` makes an idle client's pending read return EOF right
+/// away, while a client in the middle of a command still runs it to the end
+/// and writes the reply before its next read sees EOF. Repeated each round so
+/// connections adopted from another shard meanwhile are drained too. Clients
+/// that never get back to reading (blocked commands) are dropped at the
+/// timeout.
+async fn drain_clients(
+    client_registry: &Rc<RefCell<hashbrown::HashMap<u64, crate::connection::ClientInfo>>>,
+) {
+    let deadline = std::time::Instant::now() + crate::shutdown::CLIENT_DRAIN_TIMEOUT;
+    loop {
+        let fds: Vec<_> = client_registry
+            .borrow()
+            .values()
+            .map(|c| c.raw_fd)
+            .collect();
+        if fds.is_empty() || std::time::Instant::now() >= deadline {
+            return;
+        }
+        for fd in fds {
+            unsafe { libc::shutdown(fd, libc::SHUT_RD) };
+        }
+        monoio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
 }
 
 /// Accepts plain-TCP clients on one listener until shutdown.
