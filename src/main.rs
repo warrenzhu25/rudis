@@ -124,8 +124,15 @@ fn main() {
 
     // 1. Load initial config from file if provided, else use defaults
     let mut server_config = if let Some(ref config_path) = args.config {
-        rudis::config::RudisConfig::load_file(config_path)
-            .unwrap_or_else(|e| panic!("Failed to load config file {:?}: {}", config_path, e))
+        let loaded = rudis::config::RudisConfig::load_file(config_path)
+            .and_then(|cfg| rudis::config::set_active_config_file(config_path).map(|()| cfg));
+        match loaded {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!("Failed to load config file {:?}: {}", config_path, e);
+                std::process::exit(1);
+            }
+        }
     } else {
         rudis::config::RudisConfig::default()
     };

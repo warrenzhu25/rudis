@@ -776,15 +776,27 @@ impl RudisConfig {
     }
 }
 
+/// The file the server was started with (`--config`), stored as an absolute
+/// path so that CONFIG REWRITE does not depend on the working directory.
 pub static ACTIVE_CONFIG_FILE: std::sync::RwLock<Option<PathBuf>> = std::sync::RwLock::new(None);
+
+/// Records `path` as the file CONFIG REWRITE updates.
+pub fn set_active_config_file(path: &Path) -> Result<(), String> {
+    let abs = std::path::absolute(path)
+        .map_err(|e| format!("Failed to resolve config file {:?}: {}", path, e))?;
+    *ACTIVE_CONFIG_FILE.write().unwrap() = Some(abs);
+    Ok(())
+}
 
 /// Rewrites the active configuration file atomically with current runtime settings
 pub fn rewrite_config_file(port: u16) -> Result<(), String> {
+    // Like Redis, there is nothing to rewrite without a config file; never
+    // invent one in the working directory.
     let path = ACTIVE_CONFIG_FILE
         .read()
         .unwrap()
         .clone()
-        .unwrap_or_else(|| PathBuf::from("rudis.conf"));
+        .ok_or_else(|| "The server is running without a config file".to_string())?;
 
     // 1. Read existing file if it exists, or create a new template
     let mut lines: Vec<String> = if path.exists() {
@@ -1201,8 +1213,32 @@ mod tests {
         assert!(cfg.cluster_enabled);
     }
 
+    /// Serializes the tests that set the process-wide `ACTIVE_CONFIG_FILE`.
+    static ACTIVE_CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_rewrite_requires_a_config_file_and_resolves_it_absolutely() {
+        let _guard = ACTIVE_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = ACTIVE_CONFIG_FILE.write().unwrap().take();
+
+        let err = rewrite_config_file(9999).unwrap_err();
+        assert_eq!(err, "The server is running without a config file");
+        assert!(ACTIVE_CONFIG_FILE.read().unwrap().is_none());
+
+        set_active_config_file(Path::new("conf/rudis.conf")).unwrap();
+        let active = ACTIVE_CONFIG_FILE.read().unwrap().clone().unwrap();
+        assert!(active.is_absolute(), "{active:?}");
+        assert_eq!(
+            active,
+            std::env::current_dir().unwrap().join("conf/rudis.conf")
+        );
+
+        *ACTIVE_CONFIG_FILE.write().unwrap() = saved;
+    }
+
     #[test]
     fn test_rewrite_config_file_atomic_and_durable() {
+        let _guard = ACTIVE_CONFIG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp_dir = std::env::temp_dir().join(format!("rudis-cfg-test-{}", std::process::id()));
         let _ = fs::create_dir_all(&temp_dir);
         let cfg_path = temp_dir.join("test_rudis.conf");

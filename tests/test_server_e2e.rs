@@ -19412,3 +19412,97 @@ fn test_hostile_argument_counts_get_error_replies_e2e() {
 
     shutdown_and_wait(port, &mut child.0);
 }
+
+/// CONFIG REWRITE updates the `--config` file (even when given relative to a
+/// working directory the server no longer resolves against), refuses without
+/// one instead of writing `rudis.conf` into the working directory, and a bad
+/// config file is a clean startup error.
+#[test]
+fn test_config_rewrite_targets_the_startup_config_file_e2e() {
+    let port = 17095;
+    let root = std::env::temp_dir().join(format!("rudis-e2e-cfgfile-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let conf_dir = root.join("conf");
+    let cwd = root.join("cwd");
+    std::fs::create_dir_all(&conf_dir).unwrap();
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(conf_dir.join("server.conf"), "# mine\nmaxclients 1000\n").unwrap();
+    let spawn = |args: &[&str], stderr: std::process::Stdio| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_rudis"))
+            .args(args)
+            .current_dir(&cwd)
+            .env("MONOIO_FORCE_LEGACY_DRIVER", "1")
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr)
+            .spawn()
+            .expect("spawn rudis")
+    };
+    let wait_listening = |child: &mut std::process::Child| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Ok(c) = TcpStream::connect(("127.0.0.1", port)) {
+                c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                return c;
+            }
+            if let Some(s) = child.try_wait().unwrap() {
+                panic!("rudis exited early: {s}");
+            }
+            assert!(std::time::Instant::now() < deadline, "rudis did not start");
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let stop = |c: &mut TcpStream, child: &mut std::process::Child| {
+        let _ = c.write_all(b"*2\r\n$8\r\nSHUTDOWN\r\n$6\r\nNOSAVE\r\n");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("rudis did not shut down");
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let port_s = port.to_string();
+
+    // 1. Started with a config file given relative to the working directory.
+    let mut child = spawn(
+        &["--config", "../conf/server.conf", "--port", &port_s],
+        std::process::Stdio::null(),
+    );
+    let mut c = wait_listening(&mut child);
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "SET", "maxclients", "2345"]),
+        "+OK\r\n"
+    );
+    assert_eq!(resp_cmd(&mut c, &["CONFIG", "REWRITE"]), "+OK\r\n");
+    let content = std::fs::read_to_string(conf_dir.join("server.conf")).unwrap();
+    assert!(content.contains("# mine"), "{content}");
+    assert!(content.contains("maxclients 2345"), "{content}");
+    assert!(!cwd.join("rudis.conf").exists());
+    stop(&mut c, &mut child);
+
+    // 2. Started without a config file: nothing to rewrite.
+    let mut child = spawn(&["--port", &port_s], std::process::Stdio::null());
+    let mut c = wait_listening(&mut child);
+    assert_eq!(
+        resp_cmd(&mut c, &["CONFIG", "REWRITE"]),
+        "-ERR The server is running without a config file\r\n"
+    );
+    assert!(!cwd.join("rudis.conf").exists());
+    assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n");
+    stop(&mut c, &mut child);
+
+    // 3. A missing config file is a startup error with a message, not a panic.
+    let out = spawn(
+        &["--config", "../conf/missing.conf", "--port", &port_s],
+        std::process::Stdio::piped(),
+    )
+    .wait_with_output()
+    .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Failed to load config file"), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
