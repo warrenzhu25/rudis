@@ -18888,6 +18888,83 @@ fn test_metrics_port_serves_prometheus_over_http_e2e() {
     shutdown_and_wait(port, &mut child);
 }
 
+/// Runs the binary expecting it to refuse to start; returns its stderr.
+fn rudis_startup_error(args: &[&str]) -> String {
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_rudis"))
+        .args(args)
+        .env("MONOIO_FORCE_LEGACY_DRIVER", "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn rudis");
+    let Some(status) = wait_exit(&mut child, Duration::from_secs(10)) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("rudis {:?} started instead of refusing", args);
+    };
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    assert_eq!(status.code(), Some(1), "{err}");
+    err
+}
+
+#[test]
+fn test_second_server_on_a_port_in_use_refuses_to_start_e2e() {
+    let port = 17096;
+    let port_s = port.to_string();
+    let free_s = 17097.to_string();
+    let args = ["--port", &port_s, "--threads", "2", "--no-pin"];
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    assert_eq!(send_and_read(&mut c, b"SET owner first\r\n"), "+OK\r\n");
+
+    // Listeners use SO_REUSEPORT, so without a check the second server
+    // would bind too and take a share of the connections.
+    let err = rudis_startup_error(&args);
+    assert!(
+        err.contains(&format!(
+            "Could not create server TCP listening socket 0.0.0.0:{port}: bind: Address already in use"
+        )),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!("Failed listening on port {port} (tcp), aborting.")),
+        "{err}"
+    );
+    // The TLS port is checked the same way.
+    let err = rudis_startup_error(&[
+        "--port",
+        &free_s,
+        "--tls-port",
+        &port_s,
+        "--threads",
+        "1",
+        "--no-pin",
+    ]);
+    assert!(
+        err.contains(&format!("Failed listening on port {port} (tcp), aborting.")),
+        "{err}"
+    );
+
+    // Every new connection still reaches the first server.
+    for _ in 0..20 {
+        let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        assert_eq!(send_and_read(&mut c, b"GET owner\r\n"), "$5\r\nfirst\r\n");
+    }
+
+    // The server closes `c` as it exits, leaving that socket on its port
+    // (FIN_WAIT/TIME_WAIT); it must not block a restart.
+    shutdown_and_wait(port, &mut child);
+    drop(c);
+    let mut child = spawn_rudis_listening(&args, port);
+    shutdown_and_wait(port, &mut child);
+}
+
 #[test]
 fn test_sigterm_drains_clients_and_keeps_every_acked_write_e2e() {
     let port = 17073;

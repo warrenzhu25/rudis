@@ -217,6 +217,26 @@ fn main() {
             .store(num_shards, std::sync::atomic::Ordering::Release);
     }
 
+    // Like Redis, refuse to start on a port something already listens on;
+    // see `ensure_port_free` for why the shards' own bind can't tell.
+    let mut listen_ports: Vec<u16> = if cluster_enabled {
+        (0..num_shards as u16).map(|i| port + i).collect()
+    } else {
+        vec![port]
+    };
+    listen_ports.extend(server_config.tls_port);
+    if cluster_enabled {
+        listen_ports.push(port + 10000);
+    }
+    let listen_addrs = rudis::netsec::bind_addrs(port);
+    for p in listen_ports {
+        if let Err(e) = rudis::netsec::ensure_port_free(&listen_addrs, p) {
+            eprintln!("{}", e);
+            eprintln!("Failed listening on port {} (tcp), aborting.", p);
+            std::process::exit(1);
+        }
+    }
+
     rudis::aof::set_aof_load_truncated(server_config.aof_load_truncated);
     rudis::mailbox::set_cross_shard_spin(server_config.cross_shard_spin);
     if let Some(v) = args.enable_experimental_commands {

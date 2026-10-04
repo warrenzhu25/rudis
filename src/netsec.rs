@@ -183,6 +183,55 @@ pub fn bind_all(
     Ok(out)
 }
 
+/// Fails if something already listens on `port` at any of `addrs`.
+///
+/// Shard listeners use `SO_REUSEPORT`, so their own bind would quietly join
+/// another process's listener (same user) and split its connections instead
+/// of failing. This probe binds without `SO_REUSEPORT`, which Linux refuses
+/// with `EADDRINUSE` while any socket, reuseport or not, listens there.
+/// `SO_REUSEADDR` keeps `TIME_WAIT` leftovers of a previous run from counting.
+/// The probe is closed before the shards bind, so a process that grabs the
+/// port in between still slips through; this catches the common case of a
+/// second server started on a port in use.
+pub fn ensure_port_free(addrs: &[BindAddr], port: u16) -> Result<(), String> {
+    for b in addrs {
+        let addr = SocketAddr::new(b.ip, port);
+        let domain = if b.ip.is_ipv6() {
+            Domain::IPV6
+        } else {
+            Domain::IPV4
+        };
+        let probe = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+            .and_then(|s| {
+                if b.ip.is_ipv6() {
+                    s.set_only_v6(true)?;
+                }
+                s.set_reuse_address(true)?;
+                Ok(s)
+            })
+            .and_then(|s| s.bind(&addr.into()));
+        match probe {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                return Err(format!(
+                    "Could not create server TCP listening socket {}: bind: Address already in use",
+                    addr
+                ));
+            }
+            // Same as `bind_all`: an optional address that can't be bound
+            // (e.g. no IPv6) is skipped, a required one is fatal.
+            Err(_) if b.optional => {}
+            Err(e) => {
+                return Err(format!(
+                    "Could not create server TCP listening socket {}: bind: {}",
+                    addr, e
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +277,36 @@ mod tests {
         assert_eq!(bind_all(&opt, 0, 16).unwrap().len(), 1);
         let req = parse_bind_spec("192.0.2.123").unwrap();
         assert!(bind_all(&req, 0, 16).is_err());
+    }
+
+    #[test]
+    fn test_ensure_port_free_sees_reuseport_and_plain_listeners() {
+        let lo = parse_bind_spec("127.0.0.1").unwrap();
+        let wildcard = parse_bind_spec("*").unwrap();
+
+        // A reuseport listener: the shards' own bind would just join it.
+        let held = bind_all(&lo, 0, 16).unwrap().remove(0).1;
+        let port = held.local_addr().unwrap().port();
+        assert!(bind_all(&lo, port, 16).is_ok());
+        let err = ensure_port_free(&lo, port).unwrap_err();
+        assert!(err.contains("Address already in use"), "{err}");
+        assert!(err.contains(&format!("127.0.0.1:{port}")), "{err}");
+        // `*` overlaps 127.0.0.1.
+        assert!(ensure_port_free(&wildcard, port).is_err());
+        drop(held);
+
+        // A plain listener (no SO_REUSEPORT), e.g. another program.
+        let plain = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = plain.local_addr().unwrap().port();
+        assert!(ensure_port_free(&lo, port).is_err());
+        drop(plain);
+        assert!(ensure_port_free(&lo, port).is_ok());
+
+        // An unassignable optional address is skipped, a required one is not.
+        let opt = parse_bind_spec("127.0.0.1 -192.0.2.123").unwrap();
+        assert!(ensure_port_free(&opt, port).is_ok());
+        let req = parse_bind_spec("192.0.2.123").unwrap();
+        assert!(ensure_port_free(&req, port).is_err());
     }
 
     #[test]
