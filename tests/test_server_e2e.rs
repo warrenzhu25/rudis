@@ -4332,7 +4332,7 @@ fn test_sq8_quantized_vector_and_rerank_e2e() {
 }
 
 #[test]
-fn test_tls_in_memory_cert_and_ktls_e2e() {
+fn test_tls_in_memory_cert_e2e() {
     // 1. Test in-memory self-signed certificate generation
     let (cert_der, key_der) = rudis::tls::generate_self_signed_cert(vec![
         "localhost".to_string(),

@@ -36,7 +36,7 @@ what is still partial or experimental.
 
 This is a young, single-maintainer project, not a drop-in production replacement for Redis or
 Dragonfly. Several subsystems described in this README and in `docs/` are real and load-bearing;
-a few others (kernel-bypass networking, kernel TLS offload, automatic multi-region CRDT sync)
+a few others (kernel-bypass networking, automatic multi-region CRDT sync)
 exist as working building blocks that are **not yet wired onto the live request path** — those
 are called out explicitly rather than left implicit, both here and in the linked subsystem docs.
 
@@ -505,8 +505,7 @@ stop past its grace period) skips all of the above, so give the process at least
 - Set `tls-port`/`tls-cert-file`/`tls-key-file` for traffic leaving a trusted network. Without an
   explicit cert/key pair, Rudis generates a self-signed certificate **in memory** at startup — do
   not rely on that beyond local testing, since clients have nothing to verify it against.
-- TLS connections run through userspace `rustls` only today — kernel TLS offload is attempted
-  best-effort but its result is currently discarded (see
+- TLS connections run through userspace `rustls` only; there is no kernel TLS offload (see
   [Kernel-Bypass Networking & TLS: Status](#7-kernel-bypass-networking--tls-status)) — and TLS
   connections never receive pipeline-squashing acceleration.
 - Run as a dedicated non-root user; the included [`Dockerfile`](Dockerfile) already does this via
@@ -614,10 +613,12 @@ network path today**:
 - **`src/zerocopy.rs`** implements correct `SO_ZEROCOPY`/registered-buffer primitives, but
   nothing outside its own unit tests calls them — the real connection write path
   (`src/connection.rs`, on `monoio`) does not use this module.
-- **Kernel TLS (kTLS)**: `rustls` performs the real (userspace) TLS handshake and encryption.
-  The server attempts to promote a connection to kernel TLS (`TCP_ULP`) afterward on a
-  best-effort basis, but the result is currently discarded — `is_ktls_active` is always
-  `false` in the current build, so the kTLS zero-copy benefit is aspirational, not realized.
+- **Kernel TLS (kTLS)**: not implemented. `rustls` performs the handshake and all
+  encryption in userspace. Offload would need the session keys installed with
+  `setsockopt(SOL_TLS, TLS_TX/TLS_RX)`, TLS 1.3 control records handled out of band on
+  receive, and the `tls` kernel module; since Rudis does not use `sendfile`, it would mostly
+  move the same AES-GCM work into the kernel. An earlier best-effort `TCP_ULP` attach that
+  never installed keys (and so never activated) was removed rather than kept as scaffolding.
 
 Treat these as real, tested building blocks for a future kernel-bypass data path, not as
 currently active acceleration. See
@@ -699,7 +700,7 @@ links go to the corresponding source-verified subsystem specification.
 | **Multi-region CRDTs** | Implemented, manual sync only | LWW-Register, OR-Set, PN-Counter with HLC ordering; export/merge (`CRDT.DUMP`/`CRDT.MERGE`) is explicit and manual — there is no automatic peer discovery or background cross-region streaming. | [12](docs/design/12_crdt_types.md) |
 | **AF_XDP kernel bypass** | Experimental, not on live path | Real, unit-tested data structures; reachable only via `XDP.*` admin commands, not real NIC/eBPF I/O. | [10](docs/design/10_kernel_bypass_xdp.md) |
 | **`SO_ZEROCOPY` send path** | Experimental, not on live path | Correct primitives in `src/zerocopy.rs`; unused by the real connection write path. | [10](docs/design/10_kernel_bypass_xdp.md) |
-| **Kernel TLS (kTLS)** | Attempted, inert | `rustls` handles real TLS; kernel offload is attempted best-effort and its result is currently discarded. | [15](docs/design/15_security_tls.md) |
+| **Kernel TLS (kTLS)** | Not implemented | `rustls` handles TLS in userspace; there is no kernel offload. | [15](docs/design/15_security_tls.md) |
 | **Jemalloc memory telemetry** | Implemented | Global allocator is `tikv-jemallocator`; live stats via `tikv-jemalloc-ctl` in `INFO memory`. | [15](docs/design/15_security_tls.md) |
 
 ---

@@ -1,12 +1,17 @@
-//! TLS and Kernel TLS (kTLS) hardware-accelerated framing support for Rudis.
+//! TLS support for Rudis, in userspace with `rustls`.
 //!
-//! Provides in-memory and file-based TLS certificate provisioning with `rustls`,
-//! plus Linux Kernel TLS (`kTLS` via `TCP_ULP`) socket promotion for line-rate zero-copy
-//! streaming over `io_uring`.
+//! Provides in-memory and file-based TLS certificate provisioning and the
+//! server-side handshake.
+//!
+//! Kernel TLS offload is deliberately not implemented: it needs the session
+//! keys installed with `setsockopt(SOL_TLS, TLS_TX/TLS_RX)` (via rustls'
+//! secret extraction), TLS 1.3 control records (key updates, tickets, alerts)
+//! handled out of band on receive, and the `tls` kernel module. Rudis does not
+//! use `sendfile`, so offload would mostly move the same AES-GCM work into the
+//! kernel.
 
 use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
-use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -73,96 +78,16 @@ pub fn load_certs_and_key_from_files(
     create_server_config(&cert_bytes, &key_bytes)
 }
 
-/// Attempts to enable Linux Kernel TLS (`kTLS`) on a TCP stream via `TCP_ULP`.
-///
-/// If supported by the Linux kernel (`CONFIG_TLS=y/m` and `modprobe tls`), this allows
-/// the kernel network stack or NIC crypto engines to perform hardware-accelerated
-/// AES-GCM framing directly with zero user-space memory copies.
-pub fn enable_ktls(raw_fd: RawFd) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        const IPPROTO_TCP: libc::c_int = 6;
-        const TCP_ULP: libc::c_int = 31;
-        let ulp_name = b"tls\0";
-
-        let ret = unsafe {
-            libc::setsockopt(
-                raw_fd,
-                IPPROTO_TCP,
-                TCP_ULP,
-                ulp_name.as_ptr() as *const libc::c_void,
-                ulp_name.len() as libc::socklen_t,
-            )
-        };
-
-        if ret == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = raw_fd;
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "kTLS is only supported on Linux",
-        ))
-    }
-}
-
-/// User-space TLS session wrapper when kTLS offload is unavailable or during handshake.
+/// A server-side `rustls` session.
 pub struct TlsSession {
     pub conn: rustls::ServerConnection,
-    pub is_ktls_active: bool,
 }
 
 impl TlsSession {
     pub fn new(config: Arc<ServerConfig>) -> Result<Self, String> {
         let conn = rustls::ServerConnection::new(config)
             .map_err(|e| format!("Failed to create ServerConnection: {}", e))?;
-        Ok(Self {
-            conn,
-            is_ktls_active: false,
-        })
-    }
-
-    /// Performs the initial TLS handshake on a raw stream.
-    pub fn complete_handshake<S: Read + Write + AsRawFd>(
-        &mut self,
-        stream: &mut S,
-    ) -> io::Result<()> {
-        while self.conn.is_handshaking() {
-            while self.conn.wants_write() {
-                self.conn.write_tls(stream)?;
-                stream.flush()?;
-            }
-            if self.conn.wants_read() {
-                let n = self.conn.read_tls(stream)?;
-                if n == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "TLS handshake EOF",
-                    ));
-                }
-                self.conn.process_new_packets().map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("TLS error: {}", e))
-                })?;
-            }
-        }
-
-        // Flush any remaining handshake or session ticket frames
-        while self.conn.wants_write() {
-            self.conn.write_tls(stream)?;
-            stream.flush()?;
-        }
-
-        // Try promoting to kTLS if on Linux
-        let raw_fd = stream.as_raw_fd();
-        let _ = enable_ktls(raw_fd);
-        self.is_ktls_active = false;
-
-        Ok(())
+        Ok(Self { conn })
     }
 
     /// Asynchronously performs TLS handshake using monoio TcpStream
@@ -208,10 +133,6 @@ impl TlsSession {
             }
         }
 
-        let raw_fd = stream.as_raw_fd();
-        let _ = enable_ktls(raw_fd);
-        self.is_ktls_active = false;
-
         Ok(())
     }
 
@@ -224,53 +145,40 @@ impl TlsSession {
     ) -> io::Result<usize> {
         use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 
-        if self.is_ktls_active {
+        // First check if rustls reader already has decrypted data available
+        match self.conn.reader().read(plaintext_out) {
+            Ok(n) if n > 0 => return Ok(n),
+            Err(e) if e.kind() != io::ErrorKind::WouldBlock => return Err(e),
+            _ => {}
+        }
+
+        // Otherwise read more encrypted TLS frames from the wire
+        loop {
             let (res, returned) = stream.read(std::mem::take(read_buf)).await;
             *read_buf = returned;
             let n = res?;
-            if n > 0 {
-                let to_copy = n.min(plaintext_out.len());
-                plaintext_out[..to_copy].copy_from_slice(&read_buf[..to_copy]);
-                Ok(to_copy)
-            } else {
-                Ok(0)
+            if n == 0 {
+                return Ok(0);
             }
-        } else {
-            // First check if rustls reader already has decrypted data available
+            let mut slice = &read_buf[..n];
+            self.conn.read_tls(&mut slice)?;
+            self.conn.process_new_packets().map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("TLS error: {}", e))
+            })?;
+
+            while self.conn.wants_write() {
+                let mut out = Vec::new();
+                self.conn.write_tls(&mut out)?;
+                if !out.is_empty() {
+                    let (res, _) = stream.write_all(out).await;
+                    res?;
+                }
+            }
+
             match self.conn.reader().read(plaintext_out) {
                 Ok(n) if n > 0 => return Ok(n),
                 Err(e) if e.kind() != io::ErrorKind::WouldBlock => return Err(e),
                 _ => {}
-            }
-
-            // Otherwise read more encrypted TLS frames from the wire
-            loop {
-                let (res, returned) = stream.read(std::mem::take(read_buf)).await;
-                *read_buf = returned;
-                let n = res?;
-                if n == 0 {
-                    return Ok(0);
-                }
-                let mut slice = &read_buf[..n];
-                self.conn.read_tls(&mut slice)?;
-                self.conn.process_new_packets().map_err(|e| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("TLS error: {}", e))
-                })?;
-
-                while self.conn.wants_write() {
-                    let mut out = Vec::new();
-                    self.conn.write_tls(&mut out)?;
-                    if !out.is_empty() {
-                        let (res, _) = stream.write_all(out).await;
-                        res?;
-                    }
-                }
-
-                match self.conn.reader().read(plaintext_out) {
-                    Ok(n) if n > 0 => return Ok(n),
-                    Err(e) if e.kind() != io::ErrorKind::WouldBlock => return Err(e),
-                    _ => {}
-                }
             }
         }
     }
@@ -283,18 +191,13 @@ impl TlsSession {
     ) -> io::Result<()> {
         use monoio::io::AsyncWriteRentExt;
 
-        if self.is_ktls_active {
-            let (res, _) = stream.write_all(plaintext.to_vec()).await;
-            res?;
-        } else {
-            self.conn.writer().write_all(plaintext)?;
-            while self.conn.wants_write() {
-                let mut out = Vec::new();
-                self.conn.write_tls(&mut out)?;
-                if !out.is_empty() {
-                    let (res, _) = stream.write_all(out).await;
-                    res?;
-                }
+        self.conn.writer().write_all(plaintext)?;
+        while self.conn.wants_write() {
+            let mut out = Vec::new();
+            self.conn.write_tls(&mut out)?;
+            if !out.is_empty() {
+                let (res, _) = stream.write_all(out).await;
+                res?;
             }
         }
         Ok(())
@@ -339,8 +242,5 @@ mod tests {
 
         // Invalid key der returns error
         assert!(create_server_config(&cert_der, &[0xDE, 0xAD, 0xBE, 0xEF]).is_err());
-
-        // enable_ktls on invalid fd returns error safely
-        assert!(enable_ktls(-1).is_err());
     }
 }
