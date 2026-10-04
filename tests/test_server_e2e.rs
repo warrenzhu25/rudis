@@ -19791,3 +19791,31 @@ fn test_hostile_sizes_get_bounded_replies_e2e() {
 
     shutdown_and_wait(port, &mut child.0);
 }
+
+#[test]
+fn test_client_reply_off_skip_inside_one_pipeline_e2e() {
+    // CLIENT REPLY must apply to the commands after it even when they arrive
+    // in the same read, i.e. in a batch that would otherwise be squashed.
+    let port = 17092;
+    start_test_server(port, 2);
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    stream
+        .write_all(
+            b"CLIENT REPLY OFF\r\nSET reply:k 1\r\nINCR reply:k\r\nCLIENT REPLY SKIP\r\n\
+              INCR reply:k\r\nCLIENT REPLY ON\r\nCLIENT REPLY SKIP\r\nINCR reply:k\r\n\
+              INCR reply:k\r\n",
+        )
+        .unwrap();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !got.ends_with(b":5\r\n") {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+        }
+    }
+    assert_eq!(String::from_utf8_lossy(&got), "+OK\r\n:5\r\n");
+}

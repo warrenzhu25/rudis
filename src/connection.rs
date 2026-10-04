@@ -22980,6 +22980,9 @@ fn is_special_pipeline_cmd(cmd: &Command) -> bool {
             | Command::Quit
             | Command::Wait { .. }
             | Command::WaitAof { .. }
+            // Changes whether the commands after it reply; the squashed path
+            // only applies the reply mode in effect when the batch started.
+            | Command::Client(ClientSubcommand::Reply(_))
     )
 }
 
