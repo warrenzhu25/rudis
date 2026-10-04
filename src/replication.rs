@@ -461,6 +461,26 @@ impl ReplicationHub {
         self.is_slave_atomic.store(false, Ordering::Release);
     }
 
+    /// After a failed or interrupted sync: marks the link down and drops
+    /// the master's replication id and offset, so the next attempt is a full
+    /// resync. The dataset may not match any offset of the master's.
+    fn forget_master_history(&self) {
+        let mut role = self.role.write().unwrap_or_else(|e| e.into_inner());
+        if let ReplicationRole::Slave {
+            ref mut link_status,
+            ref mut master_replid,
+            ref mut master_repl_offset,
+            ref mut sync_in_progress,
+            ..
+        } = *role
+        {
+            *link_status = "down".to_string();
+            master_replid.clear();
+            *master_repl_offset = 0;
+            *sync_in_progress = true;
+        }
+    }
+
     pub fn stop_sync(&self) {
         if let Some(cancel) = self.cancel_sync.write().unwrap().take() {
             let _ = cancel.send(());
@@ -1603,8 +1623,21 @@ async fn run_replica_worker(
 
             let rdb_bytes = buf.split_to(rdb_len).freeze();
 
-            // 7. Restore RDB into router
-            router.restore_rdb_bytes(rdb_bytes).await;
+            // 7. Restore RDB into router. A failed load leaves the dataset
+            // empty; forget the master's history too, so the next attempt
+            // is a full resync rather than a partial one on top of nothing.
+            if let Err(e) = router.restore_rdb_bytes(rdb_bytes).await {
+                eprintln!(
+                    "Failed to load the RDB from MASTER {}:{}: {}",
+                    master_host, master_port, e
+                );
+                hub.forget_master_history();
+                if is_sync_cancelled(&cancel_rx) {
+                    break 'reconnect_loop;
+                }
+                monoio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                continue 'reconnect_loop;
+            }
         }
 
         // 8. Mark link_status up

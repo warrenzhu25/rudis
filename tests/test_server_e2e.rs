@@ -20112,3 +20112,142 @@ fn test_restore_forged_payloads_are_refused_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child.0);
 }
+
+/// A full sync replaces the replica's dataset (old keys go, like Redis), and
+/// an RDB that fails to load leaves it empty with the link down and the
+/// master's history forgotten, so the next attempt is a full resync.
+#[test]
+fn test_full_sync_replaces_dataset_and_failed_load_leaves_none_e2e() {
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    let port: u16 = 17087;
+    let port_s = port.to_string();
+    let args = ["--port", &port_s, "--threads", "2", "--no-pin"];
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = KillOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    assert_eq!(resp_cmd(&mut c, &["SET", "stale", "1"]), "+OK\r\n");
+
+    let mut src = rudis::shard::ShardDb::new(0);
+    src.table.set(
+        bytes::Bytes::from_static(b"fresh"),
+        bytes::Bytes::from_static(b"1"),
+        None,
+    );
+    let mut chunk = Vec::new();
+    src.save_rdb_chunk(&mut chunk);
+    let rdb = |chunk: &[u8]| {
+        let mut v = b"REDIS0011\xFE\x00".to_vec();
+        v.extend_from_slice(chunk);
+        v.push(0xFF);
+        let crc = rudis::table::crc64(&v);
+        v.extend_from_slice(&crc.to_le_bytes());
+        v
+    };
+    let good = rdb(&chunk);
+    // Valid checksum, but the last record is cut short.
+    let corrupt = rdb(&chunk[..chunk.len() - 1]);
+
+    let master = TcpListener::bind("127.0.0.1:0").unwrap();
+    let master_port = master.local_addr().unwrap().port();
+    let (psync_tx, psync_rx) = mpsc::channel::<String>();
+    let (close_tx, close_rx) = mpsc::channel::<()>();
+    thread::spawn(move || {
+        let replid = "a".repeat(40);
+        let mut held = Vec::new();
+        for (i, conn) in master.incoming().enumerate() {
+            let Ok(mut conn) = conn else { return };
+            conn.set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            // Reads until `until` and then `crlfs` more line ends.
+            let mut read_to = |conn: &mut TcpStream, until: &[u8], crlfs: usize| {
+                got.clear();
+                loop {
+                    if let Some(p) = got.windows(until.len()).position(|w| w == until) {
+                        let tail = &got[p + until.len()..];
+                        if tail.windows(2).filter(|w| w == b"\r\n").count() >= crlfs {
+                            return Some(String::from_utf8_lossy(&got).into_owned());
+                        }
+                    }
+                    match conn.read(&mut buf) {
+                        Ok(n) if n > 0 => got.extend_from_slice(&buf[..n]),
+                        _ => return None,
+                    }
+                }
+            };
+            let ok = read_to(&mut conn, b"PING\r\n", 0).is_some()
+                && conn.write_all(b"+PONG\r\n").is_ok()
+                && read_to(&mut conn, b"listening-port\r\n", 2).is_some()
+                && conn.write_all(b"+OK\r\n").is_ok()
+                && read_to(&mut conn, b"psync2\r\n", 0).is_some()
+                && conn.write_all(b"+OK\r\n").is_ok();
+            let Some(psync) = read_to(&mut conn, b"PSYNC\r\n", 4).filter(|_| ok) else {
+                return;
+            };
+            let _ = psync_tx.send(psync);
+            let payload = match i {
+                0 => &good,
+                1 => &corrupt,
+                _ => {
+                    held.push(conn);
+                    continue;
+                }
+            };
+            let mut reply =
+                format!("+FULLRESYNC {replid} 0\r\n${}\r\n", payload.len()).into_bytes();
+            reply.extend_from_slice(payload);
+            let _ = conn.write_all(&reply);
+            if i == 0 {
+                let _ = close_rx.recv();
+            } else {
+                held.push(conn);
+            }
+        }
+    });
+
+    let wait_for = |c: &mut TcpStream, args: &[&str], want: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let got = resp_cmd(c, args);
+            if got.contains(want) {
+                return got;
+            }
+            assert!(std::time::Instant::now() < deadline, "{args:?}: {got:?}");
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let mport = master_port.to_string();
+    assert_eq!(
+        resp_cmd(&mut c, &["REPLICAOF", "127.0.0.1", &mport]),
+        "+OK\r\n"
+    );
+    let first = psync_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(first.contains("\r\n?\r\n"), "{first:?}");
+    wait_for(&mut c, &["INFO", "replication"], "master_link_status:up");
+    assert_eq!(resp_cmd(&mut c, &["GET", "fresh"]), "$1\r\n1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["GET", "stale"]), "$-1\r\n");
+
+    // The link drops; the next full sync delivers an RDB that fails to load.
+    close_tx.send(()).unwrap();
+    let second = psync_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(second.contains(&"a".repeat(40)), "{second:?}");
+    wait_for(&mut c, &["DBSIZE"], ":0\r\n");
+    let third = psync_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(third.contains("\r\n?\r\n"), "{third:?}");
+    let info = resp_cmd(&mut c, &["INFO", "replication"]);
+    assert!(!info.contains("master_link_status:up"), "{info}");
+    assert_eq!(resp_cmd(&mut c, &["GET", "fresh"]), "$-1\r\n");
+    assert_eq!(resp_cmd(&mut c, &["REPLICAOF", "NO", "ONE"]), "+OK\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child.0);
+}

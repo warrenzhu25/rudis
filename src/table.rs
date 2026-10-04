@@ -17835,4 +17835,40 @@ mod tests {
             );
         }
     }
+
+    /// A full sync replaces the dataset; a load that fails part-way leaves
+    /// it empty instead of mixing old, new and missing keys.
+    #[test]
+    fn test_full_sync_load_replaces_dataset_or_leaves_it_empty() {
+        let mut master = crate::shard::ShardDb::new(0);
+        master
+            .table
+            .set(Bytes::from_static(b"fresh"), Bytes::from_static(b"1"), None);
+        let mut chunk = Vec::new();
+        master.save_rdb_chunk(&mut chunk);
+        let body = |chunk: &[u8]| {
+            let mut b = vec![0xFE, 0x00];
+            b.extend_from_slice(chunk);
+            b.push(0xFF);
+            rdb_with_body(&b)
+        };
+
+        let mut replica = crate::shard::ShardDb::new(0);
+        replica
+            .table
+            .set(Bytes::from_static(b"stale"), Bytes::from_static(b"1"), None);
+        replica.probabilistic_store.bloom_filters.insert(
+            Bytes::from_static(b"bf"),
+            crate::probabilistic::BloomFilter::new(10, 0.01),
+        );
+        replica.load_full_sync_rdb(&body(&chunk), 0, 1).unwrap();
+        assert!(replica.table.exists(b"fresh"));
+        assert!(!replica.table.exists(b"stale"));
+        assert!(replica.probabilistic_store.bloom_filters.is_empty());
+
+        // Valid checksum, but the record is cut short.
+        let cut = body(&chunk[..chunk.len() - 1]);
+        assert!(replica.load_full_sync_rdb(&cut, 0, 1).is_err());
+        assert_eq!(replica.dbsize(), 0);
+    }
 }

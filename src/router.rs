@@ -3476,31 +3476,44 @@ impl Router {
         full_rdb
     }
 
-    pub async fn restore_rdb_bytes(&self, data: Bytes) {
-        let _ = crate::table::load_rdb_bytes(
-            &data,
-            &mut self.local_db.borrow_mut(),
-            self.shard_id,
-            self.num_shards,
-        );
+    /// Replaces the whole dataset with a master's full-sync RDB. If any
+    /// shard fails to load it, every shard is left empty and the error is
+    /// returned, so nothing half loaded is served as in sync.
+    pub async fn restore_rdb_bytes(&self, data: Bytes) -> Result<(), String> {
+        let result = self.load_full_sync_rdb_on_all_shards(data).await;
+        if result.is_err() {
+            // Shards that did load drop their part too.
+            let _ = self.load_full_sync_rdb_on_all_shards(Bytes::new()).await;
+        }
+        result
+    }
+
+    async fn load_full_sync_rdb_on_all_shards(&self, data: Bytes) -> Result<(), String> {
         let mut responders = Vec::new();
         for (sid, sender) in self.senders.iter().enumerate() {
             if sid != self.shard_id {
                 let (tx, rx) = flume::bounded(1);
-                if sender
+                sender
                     .send(ShardMessage::RestoreRdbChunk {
                         data: data.clone(),
                         responder: tx,
                     })
-                    .is_ok()
-                {
-                    responders.push(rx);
-                }
+                    .map_err(|_| format!("shard {sid} is gone"))?;
+                responders.push(rx);
             }
         }
+        let mut result =
+            self.local_db
+                .borrow_mut()
+                .load_full_sync_rdb(&data, self.shard_id, self.num_shards);
         for rx in responders {
-            let _ = rx.recv_async().await;
+            let shard_result = rx
+                .recv_async()
+                .await
+                .unwrap_or_else(|_| Err("shard dropped the load".to_string()));
+            result = result.and(shard_result);
         }
+        result
     }
 
     /// Applies a replicated command, deferring commands for other shards

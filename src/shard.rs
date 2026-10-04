@@ -541,9 +541,10 @@ pub enum ShardMessage {
     ReleaseTxLock {
         tx_id: u64,
     },
+    /// Replaces the shard's dataset with its part of a full-sync RDB.
     RestoreRdbChunk {
         data: Bytes,
-        responder: flume::Sender<()>,
+        responder: flume::Sender<Result<(), String>>,
     },
     ExecuteReplicaCmd {
         cmd: Box<Command>,
@@ -1871,6 +1872,35 @@ impl ShardDb {
         self.llm_quotas.clear();
         self.agent_checkpoints.clear();
         self.agent_tools.clear();
+    }
+
+    /// Replaces this shard's dataset with its part of a master's full-sync
+    /// RDB. Like Redis, the old dataset goes first, and a load that fails
+    /// part-way leaves the shard empty rather than half loaded.
+    pub fn load_full_sync_rdb(
+        &mut self,
+        data: &[u8],
+        shard_id: usize,
+        num_shards: usize,
+    ) -> Result<(), String> {
+        self.clear_replicated_data();
+        crate::table::load_rdb_bytes(data, self, shard_id, num_shards)
+            .map(|_| ())
+            .map_err(|e| {
+                self.clear_replicated_data();
+                e.to_string()
+            })
+    }
+
+    /// Empties everything a full-sync RDB carries. The CRDT clock stays, so
+    /// it never runs backwards.
+    fn clear_replicated_data(&mut self) {
+        self.flushdb();
+        self.json_store = crate::json::JsonStore::new();
+        self.probabilistic_store = crate::probabilistic::ProbabilisticStore::new();
+        self.crdt_store.registers.clear();
+        self.crdt_store.sets.clear();
+        self.crdt_store.counters.clear();
     }
 
     #[inline]
