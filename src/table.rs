@@ -2747,6 +2747,14 @@ pub struct IncrexOutput {
     pub events: smallvec::SmallVec<[&'static str; 2]>,
 }
 
+/// Capacity to reserve for `count` serialized elements of at least
+/// `min_size` bytes each starting at `data[cursor..]`: never more than the
+/// remaining bytes can hold, so a forged count cannot force a huge
+/// allocation before the decoder runs out of input.
+fn claimed_capacity(count: usize, data: &[u8], cursor: usize, min_size: usize) -> usize {
+    count.min(data.len().saturating_sub(cursor) / min_size)
+}
+
 impl RudisTable {
     pub fn new() -> Self {
         let base_mem = 64 * std::mem::size_of::<Option<RudisEntry>>() + 64 + GROUP_SIZE + 16384 * 4;
@@ -5893,7 +5901,7 @@ impl RudisTable {
                     if justid {
                         pel_entry.delivery_count
                     } else {
-                        pel_entry.delivery_count + 1
+                        pel_entry.delivery_count.saturating_add(1)
                     }
                 });
                 if let Some(pe) = grp.pel.get_mut(&sid) {
@@ -6029,7 +6037,7 @@ impl RudisTable {
                     pe.consumer = consumer.clone();
                     pe.delivery_time_ms = now_ms;
                     if !justid {
-                        pe.delivery_count += 1;
+                        pe.delivery_count = pe.delivery_count.saturating_add(1);
                     }
                 }
                 if let Some(new_c) = grp.consumers.get_mut(&consumer) {
@@ -12961,7 +12969,9 @@ impl RudisTable {
                 let count =
                     u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
                 cursor += 4;
-                let mut list = std::collections::VecDeque::with_capacity(count);
+                let mut list = std::collections::VecDeque::with_capacity(claimed_capacity(
+                    count, data, cursor, 4,
+                ));
                 for _ in 0..count {
                     if cursor + 4 > data.len() {
                         return Err("DUMP payload version or checksum are wrong");
@@ -12984,7 +12994,7 @@ impl RudisTable {
                 let count =
                     u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
                 cursor += 4;
-                let mut set = RudisSet::with_capacity(count);
+                let mut set = RudisSet::with_capacity(claimed_capacity(count, data, cursor, 4));
                 for _ in 0..count {
                     if cursor + 4 > data.len() {
                         return Err("DUMP payload version or checksum are wrong");
@@ -13027,6 +13037,9 @@ impl RudisTable {
                         u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
                     cursor += 8;
                     let score = f64::from_bits(score_bits);
+                    if score.is_nan() {
+                        return Err("DUMP payload version or checksum are wrong");
+                    }
                     zset.insert(score, member);
                 }
                 RudisValue::ZSet(Box::new(zset))
@@ -13065,12 +13078,17 @@ impl RudisTable {
                         let v = Bytes::copy_from_slice(&data[cursor..cursor + v_len]);
                         cursor += v_len;
 
+                        if pairs.iter().any(|(k, _)| *k == f) {
+                            return Err("DUMP payload version or checksum are wrong");
+                        }
                         pairs.push((f, v));
                     }
                     RudisValue::SmallHash(pairs)
                 } else {
-                    let mut hash =
-                        RudisHashMap::with_capacity_and_hasher(count, FxBuildHasher::default());
+                    let mut hash = RudisHashMap::with_capacity_and_hasher(
+                        claimed_capacity(count, data, cursor, 8),
+                        FxBuildHasher::default(),
+                    );
                     for _ in 0..count {
                         if cursor + 4 > data.len() {
                             return Err("DUMP payload version or checksum are wrong");
@@ -13133,7 +13151,7 @@ impl RudisTable {
                     let f_count =
                         u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
                     cursor += 4;
-                    let mut fields = Vec::with_capacity(f_count);
+                    let mut fields = Vec::with_capacity(claimed_capacity(f_count, data, cursor, 8));
                     for _ in 0..f_count {
                         if cursor + 4 > data.len() {
                             return Err("DUMP payload version or checksum are wrong");
@@ -14154,7 +14172,7 @@ impl RudisTable {
                             let eligible = if pe.delivery_time_ms == 0 {
                                 true
                             } else {
-                                now >= pe.delivery_time_ms + min_idle
+                                now >= pe.delivery_time_ms.saturating_add(min_idle)
                             };
                             if eligible {
                                 candidates.push((
@@ -14207,7 +14225,7 @@ impl RudisTable {
                             {
                                 old_c.pel.remove(&id);
                             }
-                            let new_delivery_count = del_cnt + 1;
+                            let new_delivery_count = del_cnt.saturating_add(1);
                             if let Some(pe) = grp.pel.get_mut(&id) {
                                 pe.consumer = consumer.clone();
                                 pe.delivery_time_ms = now;
@@ -14338,7 +14356,7 @@ impl RudisTable {
                     for (id, _, _) in &results {
                         if let Some(pel_entry) = grp.pel.get_mut(id) {
                             pel_entry.delivery_time_ms = now;
-                            pel_entry.delivery_count += 1;
+                            pel_entry.delivery_count = pel_entry.delivery_count.saturating_add(1);
                         }
                         if let Some(cons) = grp.consumers.get_mut(&consumer) {
                             cons.pel.insert(*id, now);
@@ -14449,7 +14467,9 @@ impl RudisTable {
                 let w = if pe.delivery_time_ms == 0 {
                     0
                 } else {
-                    (pe.delivery_time_ms + min_idle).saturating_sub(now)
+                    pe.delivery_time_ms
+                        .saturating_add(min_idle)
+                        .saturating_sub(now)
                 };
                 min_wait = Some(min_wait.map_or(w, |m: u64| m.min(w)));
             }
@@ -15195,47 +15215,16 @@ pub fn load_rdb_bytes(
             continue;
         } else if type_byte == 8 {
             cursor += 1;
-            if cursor + 40 > content_len {
+            let Ok((value, used)) =
+                crate::probabilistic::BloomFilter::decode(&data[cursor..content_len])
+            else {
                 break;
-            }
-            let capacity =
-                u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap()) as usize;
-            let error_rate = f64::from_bits(u64::from_le_bytes(
-                data[cursor + 8..cursor + 16].try_into().unwrap(),
-            ));
-            let num_bits =
-                u64::from_le_bytes(data[cursor + 16..cursor + 24].try_into().unwrap()) as usize;
-            let num_hashes =
-                u32::from_le_bytes(data[cursor + 24..cursor + 28].try_into().unwrap()) as usize;
-            let count_val =
-                u64::from_le_bytes(data[cursor + 28..cursor + 36].try_into().unwrap()) as usize;
-            let bits_len =
-                u32::from_le_bytes(data[cursor + 36..cursor + 40].try_into().unwrap()) as usize;
-            cursor += 40;
-            if cursor + bits_len * 8 > content_len {
-                break;
-            }
-            let mut bits = Vec::with_capacity(bits_len);
-            for i in 0..bits_len {
-                bits.push(u64::from_le_bytes(
-                    data[cursor + i * 8..cursor + (i + 1) * 8]
-                        .try_into()
-                        .unwrap(),
-                ));
-            }
-            cursor += bits_len * 8;
+            };
+            cursor += used;
             if crate::router::target_shard(&key, num_shards) == shard_id {
-                db.probabilistic_store.bloom_filters.insert(
-                    key.clone(),
-                    crate::probabilistic::BloomFilter {
-                        capacity,
-                        error_rate,
-                        num_bits,
-                        num_hashes,
-                        count: count_val,
-                        bits,
-                    },
-                );
+                db.probabilistic_store
+                    .bloom_filters
+                    .insert(key.clone(), value);
                 count += 1;
             }
             continue;
@@ -15354,112 +15343,45 @@ pub fn load_rdb_bytes(
             continue;
         } else if type_byte == 10 {
             cursor += 1;
-            if cursor + 28 > content_len {
+            let Ok((value, used)) =
+                crate::probabilistic::CuckooFilter::decode(&data[cursor..content_len])
+            else {
                 break;
-            }
-            let capacity =
-                u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap()) as usize;
-            let num_buckets =
-                u64::from_le_bytes(data[cursor + 8..cursor + 16].try_into().unwrap()) as usize;
-            let count_val =
-                u64::from_le_bytes(data[cursor + 16..cursor + 24].try_into().unwrap()) as usize;
-            let buckets_len =
-                u32::from_le_bytes(data[cursor + 24..cursor + 28].try_into().unwrap()) as usize;
-            cursor += 28;
-            if cursor + buckets_len * 8 > content_len {
-                break;
-            }
-            let mut buckets = Vec::with_capacity(buckets_len);
-            for i in 0..buckets_len {
-                let base = cursor + i * 8;
-                let fp0 = u16::from_le_bytes(data[base..base + 2].try_into().unwrap());
-                let fp1 = u16::from_le_bytes(data[base + 2..base + 4].try_into().unwrap());
-                let fp2 = u16::from_le_bytes(data[base + 4..base + 6].try_into().unwrap());
-                let fp3 = u16::from_le_bytes(data[base + 6..base + 8].try_into().unwrap());
-                buckets.push([fp0, fp1, fp2, fp3]);
-            }
-            cursor += buckets_len * 8;
+            };
+            cursor += used;
             if crate::router::target_shard(&key, num_shards) == shard_id {
-                db.probabilistic_store.cuckoo_filters.insert(
-                    key.clone(),
-                    crate::probabilistic::CuckooFilter {
-                        capacity,
-                        num_buckets,
-                        count: count_val,
-                        buckets,
-                    },
-                );
+                db.probabilistic_store
+                    .cuckoo_filters
+                    .insert(key.clone(), value);
                 count += 1;
             }
             continue;
         } else if type_byte == 11 {
             cursor += 1;
-            if cursor + 20 > content_len {
+            let Ok((value, used)) =
+                crate::probabilistic::CountMinSketch::decode(&data[cursor..content_len])
+            else {
                 break;
-            }
-            let width = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap()) as usize;
-            let depth =
-                u32::from_le_bytes(data[cursor + 8..cursor + 12].try_into().unwrap()) as usize;
-            let total_count =
-                u64::from_le_bytes(data[cursor + 12..cursor + 20].try_into().unwrap());
-            cursor += 20;
-            let total_cells = width * depth;
-            if cursor + total_cells * 8 > content_len {
-                break;
-            }
-            let mut table = Vec::with_capacity(depth);
-            for _ in 0..depth {
-                let mut row = Vec::with_capacity(width);
-                for _ in 0..width {
-                    let cell = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
-                    cursor += 8;
-                    row.push(cell);
-                }
-                table.push(row);
-            }
+            };
+            cursor += used;
             if crate::router::target_shard(&key, num_shards) == shard_id {
-                db.probabilistic_store.cms_sketches.insert(
-                    key.clone(),
-                    crate::probabilistic::CountMinSketch {
-                        width,
-                        depth,
-                        total_count,
-                        table,
-                    },
-                );
+                db.probabilistic_store
+                    .cms_sketches
+                    .insert(key.clone(), value);
                 count += 1;
             }
             continue;
         } else if type_byte == 12 {
             cursor += 1;
-            if cursor + 12 > content_len {
+            let Ok((value, used)) = crate::probabilistic::TopK::decode(&data[cursor..content_len])
+            else {
                 break;
-            }
-            let k = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap()) as usize;
-            let items_len =
-                u32::from_le_bytes(data[cursor + 8..cursor + 12].try_into().unwrap()) as usize;
-            cursor += 12;
-            let mut items = hashbrown::HashMap::with_capacity(items_len);
-            for _ in 0..items_len {
-                if cursor + 4 > content_len {
-                    break;
-                }
-                let item_len =
-                    u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap()) as usize;
-                cursor += 4;
-                if cursor + item_len + 8 > content_len {
-                    break;
-                }
-                let item_key = Bytes::copy_from_slice(&data[cursor..cursor + item_len]);
-                cursor += item_len;
-                let count_val = u64::from_le_bytes(data[cursor..cursor + 8].try_into().unwrap());
-                cursor += 8;
-                items.insert(item_key, count_val);
-            }
+            };
+            cursor += used;
             if crate::router::target_shard(&key, num_shards) == shard_id {
                 db.probabilistic_store
                     .topk_trackers
-                    .insert(key.clone(), crate::probabilistic::TopK { k, items });
+                    .insert(key.clone(), value);
                 count += 1;
             }
             continue;
@@ -17697,6 +17619,219 @@ mod tests {
             assert_eq!(
                 got.as_slice(),
                 format!("${}\r\n{}\r\n", v.len(), v).as_bytes()
+            );
+        }
+    }
+
+    const BAD_PAYLOAD: &str = "DUMP payload version or checksum are wrong";
+
+    /// Element counts are attacker-controlled: they must not size an
+    /// allocation beyond what the payload's bytes can hold.
+    #[test]
+    fn test_payload_counts_cannot_force_huge_allocations() {
+        let max = u32::MAX.to_le_bytes();
+        let mut stream = vec![6];
+        stream.extend_from_slice(&1u32.to_le_bytes());
+        stream.extend_from_slice(&[0; 16 + 16]);
+        stream.extend_from_slice(&max);
+        for payload in [
+            [&[1u8][..], &max].concat(),
+            [&[2u8][..], &max].concat(),
+            [&[4u8][..], &max].concat(),
+            stream,
+        ] {
+            assert_eq!(
+                RudisTable::deserialize_val_payload(&payload).err(),
+                Some(BAD_PAYLOAD),
+                "{payload:?}"
+            );
+            let mut sealed = payload.clone();
+            RudisTable::seal_dump_payload(&mut sealed);
+            let mut t = RudisTable::new();
+            assert!(
+                t.restore(Bytes::from_static(b"k"), 0, &sealed, false, false)
+                    .is_err()
+            );
+            assert!(!t.exists(b"k"));
+        }
+    }
+
+    #[test]
+    fn test_payload_rejects_nan_scores_and_duplicate_fields() {
+        let zset = |score: f64| {
+            let mut p = vec![3];
+            p.extend_from_slice(&1u32.to_le_bytes());
+            p.extend_from_slice(&1u32.to_le_bytes());
+            p.push(b'm');
+            p.extend_from_slice(&score.to_bits().to_le_bytes());
+            p
+        };
+        assert!(RudisTable::deserialize_val_payload(&zset(1.5)).is_ok());
+        assert_eq!(
+            RudisTable::deserialize_val_payload(&zset(f64::NAN)).err(),
+            Some(BAD_PAYLOAD)
+        );
+
+        let hash = |fields: &[&[u8]]| {
+            let mut p = vec![4];
+            p.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+            for f in fields {
+                for part in [*f, b"v"] {
+                    p.extend_from_slice(&(part.len() as u32).to_le_bytes());
+                    p.extend_from_slice(part);
+                }
+            }
+            p
+        };
+        assert!(RudisTable::deserialize_val_payload(&hash(&[b"a", b"b"])).is_ok());
+        assert_eq!(
+            RudisTable::deserialize_val_payload(&hash(&[b"a", b"a"])).err(),
+            Some(BAD_PAYLOAD)
+        );
+    }
+
+    /// Cheap deterministic fuzz of the DUMP payload decoder with hostile
+    /// lengths: it must never panic, and whatever it accepts must
+    /// re-serialize.
+    #[test]
+    fn test_deserialize_val_payload_fuzz() {
+        const HOSTILE: [u32; 8] = [0, 1, 2, 64, 65, 0x7FFF_FFFF, 0xFFFF_FFFE, u32::MAX];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..20_000 {
+            let mut p = vec![(next() % 8) as u8];
+            for _ in 0..next() % 12 {
+                match next() % 4 {
+                    0 => p.extend_from_slice(&HOSTILE[(next() % 8) as usize].to_le_bytes()),
+                    1 => p.extend_from_slice(&next().to_le_bytes()),
+                    2 => p.extend_from_slice(&f64::NAN.to_bits().to_le_bytes()),
+                    _ => p.push(next() as u8),
+                }
+            }
+            if let Ok((v, used)) = RudisTable::deserialize_val_payload(&p) {
+                assert!(used <= p.len());
+                let mut out = Vec::new();
+                RudisTable::serialize_val_payload(&v, &mut out);
+            }
+        }
+    }
+
+    /// Restored pending entries can carry any delivery count and time;
+    /// claiming them must saturate rather than overflow.
+    #[test]
+    fn test_claiming_restored_extreme_pending_entries() {
+        let id = StreamId::new(1, 0);
+        let mut s = RudisStream::new();
+        s.last_id = id;
+        s.entries.insert(
+            id,
+            vec![(Bytes::from_static(b"f"), Bytes::from_static(b"v"))],
+        );
+        s.rebuild_nodes();
+        let mut g = StreamGroup {
+            name: Bytes::from_static(b"g"),
+            last_delivered_id: id,
+            entries_read: Some(1),
+            consumers: HashMap::new(),
+            pel: std::collections::BTreeMap::new(),
+            next_nack_seq: 0,
+        };
+        g.pel.insert(
+            id,
+            StreamPelEntry {
+                consumer: Bytes::from_static(b"c"),
+                delivery_time_ms: u64::MAX,
+                delivery_count: usize::MAX,
+                nack_seq: 0,
+            },
+        );
+        s.groups.insert(Bytes::from_static(b"g"), g);
+        let mut payload = Vec::new();
+        RudisTable::serialize_val_payload(&RudisValue::Stream(Box::new(s)), &mut payload);
+        RudisTable::seal_dump_payload(&mut payload);
+        let mut t = RudisTable::new();
+        t.restore(Bytes::from_static(b"s"), 0, &payload, false, false)
+            .unwrap();
+
+        let (mut entries, mut bytes) = (0, 0);
+        let (claimed, _) = t
+            .xreadgroup(
+                b"s",
+                b"g",
+                Bytes::from_static(b"c"),
+                ">",
+                None,
+                false,
+                Some(u64::MAX),
+                usize::MAX,
+                &mut entries,
+                &mut bytes,
+            )
+            .unwrap();
+        assert!(claimed.is_empty());
+        assert!(
+            t.earliest_claim_wait_ms(b"s", b"g", u64::MAX)
+                .is_some_and(|w| w > 0)
+        );
+        let (claimed, _) = t
+            .xclaim(
+                b"s",
+                b"g",
+                Bytes::from_static(b"c2"),
+                0,
+                &[Bytes::from_static(b"1-0")],
+                None,
+                None,
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+    }
+
+    /// Probabilistic records in a full-sync RDB go through the same
+    /// validating decoders as their RESTORE commands.
+    #[test]
+    fn test_load_rdb_validates_probabilistic_records() {
+        let record = |ty: u8, payload: &[u8]| {
+            let mut body = vec![0xFE, 0x00];
+            body.extend_from_slice(&1u32.to_le_bytes());
+            body.extend_from_slice(&[b'k', ty]);
+            body.extend_from_slice(payload);
+            body.push(0xFF);
+            rdb_with_body(&body)
+        };
+        let mut good = Vec::new();
+        crate::probabilistic::BloomFilter::new(100, 0.01).encode(&mut good);
+        let mut db = crate::shard::ShardDb::new(0);
+        assert_eq!(load_rdb_bytes(&record(8, &good), &mut db, 0, 1).unwrap(), 1);
+        assert!(db.probabilistic_store.bloom_filters.contains_key(&b"k"[..]));
+
+        // A Bloom filter with 2^31 hash functions (each lookup would loop
+        // that many times), a zero-width Count-Min sketch and a Top-K with
+        // more items than k are all refused.
+        let mut bloom = good.clone();
+        bloom[24..28].copy_from_slice(&(1u32 << 31).to_le_bytes());
+        let mut cms = 0u64.to_le_bytes().to_vec();
+        cms.extend_from_slice(&1u32.to_le_bytes());
+        cms.extend_from_slice(&0u64.to_le_bytes());
+        let mut topk = 1u64.to_le_bytes().to_vec();
+        topk.extend_from_slice(&u32::MAX.to_le_bytes());
+        for (ty, payload) in [(8, bloom), (11, cms), (12, topk)] {
+            let mut db = crate::shard::ShardDb::new(0);
+            let _ = load_rdb_bytes(&record(ty, &payload), &mut db, 0, 1);
+            let ps = &db.probabilistic_store;
+            assert!(
+                ps.bloom_filters.is_empty()
+                    && ps.cms_sketches.is_empty()
+                    && ps.topk_trackers.is_empty(),
+                "type {ty} loaded"
             );
         }
     }

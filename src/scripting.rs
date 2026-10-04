@@ -3,7 +3,7 @@ use bytes::Bytes;
 use mlua::{Lua, MultiValue, Value};
 use sha1::{Digest, Sha1};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{LazyLock, RwLock};
 
@@ -657,6 +657,12 @@ pub fn dump_functions() -> Vec<u8> {
     out
 }
 
+/// The lowercased names of every function in `libs`.
+fn function_names<'a>(libs: impl Iterator<Item = &'a FunctionLib>) -> HashSet<String> {
+    libs.flat_map(|l| l.functions.iter().map(|f| f.name.to_ascii_lowercase()))
+        .collect()
+}
+
 pub fn restore_functions(payload: &[u8], policy: &str) -> Result<(), String> {
     if payload.len() < 12 || !payload.starts_with(b"RUDFUNCv1\x00") {
         return Err("ERR DUMP payload version or checksum are wrong".to_string());
@@ -670,26 +676,32 @@ pub fn restore_functions(payload: &[u8], policy: &str) -> Result<(), String> {
     let libs: Vec<FunctionLib> = serde_json::from_slice(json)
         .map_err(|_| "ERR DUMP payload version or checksum are wrong".to_string())?;
 
-    let mut cache = FUNCTION_LIBS.write().unwrap();
+    merge_function_libs(&mut FUNCTION_LIBS.write().unwrap(), libs, policy)
+}
+
+/// Adds restored `libs` to `cache` under FUNCTION RESTORE's `policy`.
+fn merge_function_libs(
+    cache: &mut HashMap<String, FunctionLib>,
+    libs: Vec<FunctionLib>,
+    policy: &str,
+) -> Result<(), String> {
     if policy == "FLUSH" {
         cache.clear();
         for lib in libs {
             cache.insert(lib.name.clone(), lib);
         }
     } else if policy == "APPEND" {
+        // Name sets keep the checks linear: a payload may carry many
+        // libraries and this runs under the global write lock.
+        let lib_names: HashSet<String> = cache.keys().map(|k| k.to_ascii_lowercase()).collect();
+        let func_names = function_names(cache.values());
         for lib in &libs {
-            if cache.keys().any(|k| k.eq_ignore_ascii_case(&lib.name)) {
+            if lib_names.contains(&lib.name.to_ascii_lowercase()) {
                 return Err(format!("ERR Library {} already exists", lib.name));
             }
             for f in &lib.functions {
-                for existing_lib in cache.values() {
-                    if existing_lib
-                        .functions
-                        .iter()
-                        .any(|ef| ef.name.eq_ignore_ascii_case(&f.name))
-                    {
-                        return Err(format!("ERR Function {} already exists", f.name));
-                    }
+                if func_names.contains(&f.name.to_ascii_lowercase()) {
+                    return Err(format!("ERR Function {} already exists", f.name));
                 }
             }
         }
@@ -697,28 +709,25 @@ pub fn restore_functions(payload: &[u8], policy: &str) -> Result<(), String> {
             cache.insert(lib.name.clone(), lib);
         }
     } else if policy == "REPLACE" {
+        let replaced: HashSet<String> = libs.iter().map(|l| l.name.to_ascii_lowercase()).collect();
+        let kept_funcs = function_names(
+            cache
+                .values()
+                .filter(|l| !replaced.contains(&l.name.to_ascii_lowercase())),
+        );
         for lib in &libs {
             for f in &lib.functions {
-                for existing_lib in cache.values() {
-                    let being_replaced = libs
-                        .iter()
-                        .any(|nl| nl.name.eq_ignore_ascii_case(&existing_lib.name));
-                    if !being_replaced
-                        && existing_lib
-                            .functions
-                            .iter()
-                            .any(|ef| ef.name.eq_ignore_ascii_case(&f.name))
-                    {
-                        return Err(format!("ERR Function {} already exists", f.name));
-                    }
+                if kept_funcs.contains(&f.name.to_ascii_lowercase()) {
+                    return Err(format!("ERR Function {} already exists", f.name));
                 }
             }
         }
+        let mut keys: HashMap<String, String> = cache
+            .keys()
+            .map(|k| (k.to_ascii_lowercase(), k.clone()))
+            .collect();
         for lib in libs {
-            if let Some(existing_key) = cache
-                .keys()
-                .find(|k| k.eq_ignore_ascii_case(&lib.name))
-                .cloned()
+            if let Some(existing_key) = keys.insert(lib.name.to_ascii_lowercase(), lib.name.clone())
             {
                 cache.remove(&existing_key);
             }
@@ -3051,5 +3060,68 @@ mod tests {
             aof_str.contains("test_val"),
             "AOF buffer must contain test_val"
         );
+    }
+
+    fn lib(name: &str, funcs: &[&str]) -> FunctionLib {
+        FunctionLib {
+            name: name.to_string(),
+            engine: "LUA".to_string(),
+            raw_code: String::new(),
+            original_code: String::new(),
+            functions: funcs
+                .iter()
+                .map(|f| FunctionDef {
+                    name: f.to_string(),
+                    description: String::new(),
+                    flags: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_merge_function_libs_policies() {
+        let mut cache = HashMap::new();
+        merge_function_libs(&mut cache, vec![lib("Lib", &["F"])], "FLUSH").unwrap();
+        assert_eq!(
+            merge_function_libs(&mut cache, vec![lib("lib", &["g"])], "APPEND"),
+            Err("ERR Library lib already exists".to_string())
+        );
+        assert_eq!(
+            merge_function_libs(&mut cache, vec![lib("other", &["f"])], "APPEND"),
+            Err("ERR Function f already exists".to_string())
+        );
+        assert_eq!(
+            merge_function_libs(&mut cache, vec![lib("other", &["f"])], "REPLACE"),
+            Err("ERR Function f already exists".to_string())
+        );
+        // Replacing the library that owns a function frees its name.
+        merge_function_libs(
+            &mut cache,
+            vec![lib("LIB", &["f"]), lib("x", &["g"])],
+            "REPLACE",
+        )
+        .unwrap();
+        let mut names: Vec<_> = cache.keys().cloned().collect();
+        names.sort();
+        assert_eq!(names, ["LIB", "x"]);
+        merge_function_libs(&mut cache, vec![lib("y", &["h"])], "APPEND").unwrap();
+        assert_eq!(cache.len(), 3);
+    }
+
+    /// FUNCTION RESTORE checks run under the global library lock, so they
+    /// must stay linear in the payload size.
+    #[test]
+    fn test_merge_function_libs_scales_linearly() {
+        let libs: Vec<FunctionLib> = (0..20_000)
+            .map(|i| lib(&format!("lib{i}"), &[&format!("f{i}")]))
+            .collect();
+        let mut cache = HashMap::new();
+        let start = std::time::Instant::now();
+        merge_function_libs(&mut cache, libs.clone(), "FLUSH").unwrap();
+        merge_function_libs(&mut cache, libs.clone(), "REPLACE").unwrap();
+        assert!(merge_function_libs(&mut cache, libs, "APPEND").is_err());
+        assert_eq!(cache.len(), 20_000);
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
     }
 }

@@ -48,6 +48,20 @@ impl Ord for HlcTimestamp {
     }
 }
 
+/// Furthest ahead of local time a remote timestamp may move this clock.
+/// Without a bound one peer sending `physical_ms = u64::MAX` would pin the
+/// clock there for good and its logical counter would then overflow.
+const MAX_REMOTE_CLOCK_AHEAD_MS: u64 = 60 * 60 * 1000;
+
+/// The timestamp right after `(physical_ms, logical)`: the logical counter
+/// carries into the physical part instead of overflowing.
+fn next_tick(physical_ms: u64, logical: u32) -> (u64, u32) {
+    match logical.checked_add(1) {
+        Some(l) => (physical_ms, l),
+        None => (physical_ms.saturating_add(1), 0),
+    }
+}
+
 /// Hybrid Logical Clock generator.
 pub struct HybridLogicalClock {
     pub node_id: u16,
@@ -82,7 +96,7 @@ impl HybridLogicalClock {
             let (next_phys, next_log) = if phys_now > cur_phys {
                 (phys_now, 0)
             } else {
-                (cur_phys, cur_log + 1)
+                next_tick(cur_phys, cur_log)
             };
 
             if self
@@ -112,15 +126,18 @@ impl HybridLogicalClock {
             let cur_phys = self.latest_physical_ms.load(AtomicOrdering::Acquire);
             let cur_log = self.latest_logical.load(AtomicOrdering::Acquire);
 
-            let max_phys = phys_now.max(cur_phys).max(remote.physical_ms);
-            let next_log = if max_phys == cur_phys && max_phys == remote.physical_ms {
-                cur_log.max(remote.logical) + 1
+            let remote_phys = remote
+                .physical_ms
+                .min(phys_now.saturating_add(MAX_REMOTE_CLOCK_AHEAD_MS));
+            let max_phys = phys_now.max(cur_phys).max(remote_phys);
+            let (max_phys, next_log) = if max_phys == cur_phys && max_phys == remote_phys {
+                next_tick(max_phys, cur_log.max(remote.logical))
             } else if max_phys == cur_phys {
-                cur_log + 1
-            } else if max_phys == remote.physical_ms {
-                remote.logical + 1
+                next_tick(max_phys, cur_log)
+            } else if max_phys == remote_phys {
+                next_tick(max_phys, remote.logical)
             } else {
-                0
+                (max_phys, 0)
             };
 
             if self
@@ -1064,5 +1081,31 @@ mod tests {
             Err(PN_OVERFLOW)
         );
         assert_eq!(store.counters, before);
+    }
+
+    /// A peer's timestamp can't push the clock past local time plus the
+    /// allowed lead, and the logical counter carries instead of overflowing.
+    #[test]
+    fn test_clock_survives_hostile_remote_timestamps() {
+        let clock = HybridLogicalClock::new(1);
+        let wall = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let ts = clock.update(&HlcTimestamp::new(u64::MAX, u32::MAX, 2));
+        assert!(ts.physical_ms <= wall + MAX_REMOTE_CLOCK_AHEAD_MS + 1_000);
+        let mut prev = ts;
+        for _ in 0..4 {
+            let t = clock.now();
+            assert!(t > prev);
+            prev = t;
+        }
+
+        let clock = HybridLogicalClock::new(1);
+        let edge = HlcTimestamp::new(wall + 600_000, u32::MAX, 2);
+        let t = clock.update(&edge);
+        assert!(t > edge);
+        assert_eq!((t.physical_ms, t.logical), (edge.physical_ms + 1, 0));
+        assert!(clock.now() > t);
     }
 }

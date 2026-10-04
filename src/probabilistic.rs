@@ -24,6 +24,10 @@ fn double_hash(data: &[u8]) -> (u64, u64) {
 /// 512 MiB, the same bound Redis puts on a single string value.
 pub const MAX_SKETCH_BYTES: usize = 512 << 20;
 
+/// Most hash functions a decoded Bloom filter may use; `new` picks at most
+/// 30, and every add and lookup runs this many.
+const MAX_BLOOM_HASHES: usize = 64;
+
 // ---------------------------------------------------------------------------
 // 1. Bloom Filter
 // ---------------------------------------------------------------------------
@@ -104,7 +108,7 @@ impl BloomFilter {
         }
 
         if !was_present {
-            self.count += 1;
+            self.count = self.count.saturating_add(1);
             true
         } else {
             false
@@ -192,14 +196,14 @@ impl CuckooFilter {
         for slot in self.buckets[i1].iter_mut() {
             if *slot == 0 {
                 *slot = fp;
-                self.count += 1;
+                self.count = self.count.saturating_add(1);
                 return Ok(true);
             }
         }
         for slot in self.buckets[i2].iter_mut() {
             if *slot == 0 {
                 *slot = fp;
-                self.count += 1;
+                self.count = self.count.saturating_add(1);
                 return Ok(true);
             }
         }
@@ -220,7 +224,7 @@ impl CuckooFilter {
             for slot in self.buckets[cur_i].iter_mut() {
                 if *slot == 0 {
                     *slot = cur_fp;
-                    self.count += 1;
+                    self.count = self.count.saturating_add(1);
                     return Ok(true);
                 }
             }
@@ -346,7 +350,7 @@ impl TopK {
     pub fn add(&mut self, item: Bytes, increment: u64) -> Option<Bytes> {
         let inc = increment.max(1);
         if let Some(count) = self.items.get_mut(&item) {
-            *count += inc;
+            *count = count.saturating_add(inc);
             return None;
         }
 
@@ -366,7 +370,7 @@ impl TopK {
 
         if let Some((evicted, min_val)) = min {
             self.items.remove(&evicted);
-            self.items.insert(item, min_val + inc);
+            self.items.insert(item, min_val.saturating_add(inc));
             return Some(evicted);
         }
         None
@@ -560,7 +564,10 @@ impl BloomFilter {
         let num_hashes = r.u32(HDR)?;
         let count = r.u64(HDR)? as usize;
         let bits_len = r.u32(HDR)?;
-        if num_bits == 0 || num_hashes == 0 || bits_len != num_bits.div_ceil(64) {
+        if num_bits == 0
+            || !(1..=MAX_BLOOM_HASHES).contains(&num_hashes)
+            || bits_len != num_bits.div_ceil(64)
+        {
             return Err("Invalid BloomFilter dimensions");
         }
         let raw = r.take(bits_len * 8, "Truncated BloomFilter bits")?;
@@ -901,5 +908,47 @@ mod tests {
             CountMinSketch::try_new(50, 3).unwrap(),
             CountMinSketch::new(50, 3)
         );
+    }
+
+    #[test]
+    fn test_decode_refuses_bloom_hash_counts_new_never_picks() {
+        let mut enc = Vec::new();
+        BloomFilter::new(100, 0.01).encode(&mut enc);
+        for (k, ok) in [
+            (1u32, true),
+            (64, true),
+            (0, false),
+            (65, false),
+            (u32::MAX, false),
+        ] {
+            let mut e = enc.clone();
+            e[24..28].copy_from_slice(&k.to_le_bytes());
+            assert_eq!(BloomFilter::decode(&e).is_ok(), ok, "num_hashes {k}");
+        }
+    }
+
+    /// Decoded state may hold any counter; updates saturate instead of
+    /// overflowing.
+    #[test]
+    fn test_restored_counters_saturate() {
+        let mut tk = TopK::new(1);
+        tk.items.insert(Bytes::from_static(b"a"), u64::MAX);
+        assert_eq!(tk.add(Bytes::from_static(b"a"), 5), None);
+        assert_eq!(tk.count(b"a"), u64::MAX);
+        assert_eq!(
+            tk.add(Bytes::from_static(b"b"), u64::MAX),
+            Some(Bytes::from_static(b"a"))
+        );
+        assert_eq!(tk.count(b"b"), u64::MAX);
+
+        let mut bf = BloomFilter::new(100, 0.01);
+        bf.count = usize::MAX;
+        assert!(bf.add(b"x"));
+        assert_eq!(bf.count, usize::MAX);
+
+        let mut cf = CuckooFilter::new(100);
+        cf.count = usize::MAX;
+        assert_eq!(cf.add(b"x"), Ok(true));
+        assert_eq!(cf.count, usize::MAX);
     }
 }

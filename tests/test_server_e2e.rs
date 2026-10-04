@@ -20053,3 +20053,62 @@ fn test_hostile_replication_peer_drops_link_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child.0);
 }
+
+/// RESTORE payloads come from clients: forged element counts and corrupt
+/// probabilistic state must be refused without taking the server down.
+#[test]
+fn test_restore_forged_payloads_are_refused_e2e() {
+    let port: u16 = 17087;
+    let port_s = port.to_string();
+    let args = [
+        "--port",
+        &port_s,
+        "--threads",
+        "2",
+        "--no-pin",
+        "--enable-experimental-commands",
+        "yes",
+    ];
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = KillOnDrop(spawn_rudis_listening(&args, port));
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let send = |c: &mut TcpStream, args: &[&[u8]]| {
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for a in args {
+            out.extend_from_slice(format!("${}\r\n", a.len()).as_bytes());
+            out.extend_from_slice(a);
+            out.extend_from_slice(b"\r\n");
+        }
+        send_and_read(c, &out)
+    };
+    // A list, set and hash claiming 2^32 - 1 elements with none present,
+    // sealed with version 10 and a zero (unchecked) CRC.
+    for ty in [1u8, 2, 4] {
+        let mut payload = vec![ty, 0xFF, 0xFF, 0xFF, 0xFF, 10, 0];
+        payload.extend_from_slice(&[0; 8]);
+        let reply = send(&mut c, &[b"RESTORE", b"k", b"0", &payload]);
+        assert!(reply.starts_with('-'), "type {ty}: {reply:?}");
+    }
+    // A Bloom filter whose every lookup would run 2^31 hash functions.
+    let mut bloom = Vec::new();
+    bloom.extend_from_slice(&100u64.to_le_bytes());
+    bloom.extend_from_slice(&0.01f64.to_bits().to_le_bytes());
+    bloom.extend_from_slice(&64u64.to_le_bytes());
+    bloom.extend_from_slice(&(1u32 << 31).to_le_bytes());
+    bloom.extend_from_slice(&0u64.to_le_bytes());
+    bloom.extend_from_slice(&1u32.to_le_bytes());
+    bloom.extend_from_slice(&0u64.to_le_bytes());
+    let reply = send(&mut c, &[b"BF.RESTORE", b"bf", &bloom]);
+    assert!(reply.starts_with('-'), "{reply:?}");
+    assert_eq!(send(&mut c, &[b"BF.EXISTS", b"bf", b"x"]), ":0\r\n");
+    assert_eq!(resp_cmd(&mut c, &["PING"]), "+PONG\r\n");
+    drop(c);
+    shutdown_and_wait(port, &mut child.0);
+}
