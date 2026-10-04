@@ -561,6 +561,17 @@ pub fn is_fd_closed(fd: std::os::unix::io::RawFd) -> bool {
     false
 }
 
+/// Remaining milliseconds until `dl`, rounded up so a caller that waits in
+/// whole-millisecond steps never times out before `dl` has passed.
+#[inline]
+pub(crate) fn remaining_wait_ms(dl: Instant, now: Instant) -> u64 {
+    if now >= dl {
+        0
+    } else {
+        (dl - now).as_nanos().div_ceil(1_000_000) as u64
+    }
+}
+
 pub async fn wait_for_blocked_result<T>(
     rx: &flume::Receiver<T>,
     timeout_secs: f64,
@@ -577,11 +588,11 @@ pub async fn wait_for_blocked_result<T>(
         let check_dur = match deadline {
             Some(dl) => {
                 let now = Instant::now();
-                if now >= dl {
+                let rem_ms = remaining_wait_ms(dl, now);
+                if rem_ms == 0 {
                     return (None, false);
                 }
-                let rem = dl - now;
-                rem.min(std::time::Duration::from_millis(20))
+                std::time::Duration::from_millis(rem_ms.min(20))
             }
             None => std::time::Duration::from_millis(20),
         };
@@ -625,11 +636,11 @@ pub async fn wait_for_stream_result(
         let check_dur = match deadline {
             Some(dl) => {
                 let now = Instant::now();
-                if now >= dl {
+                let rem_ms = remaining_wait_ms(dl, now);
+                if rem_ms == 0 {
                     return (None, false);
                 }
-                let rem = dl - now;
-                rem.min(std::time::Duration::from_millis(20))
+                std::time::Duration::from_millis(rem_ms.min(20))
             }
             None => std::time::Duration::from_millis(20),
         };
@@ -11068,14 +11079,7 @@ async fn execute_command(
                         };
                         loop {
                             let remaining_ms = match deadline {
-                                Some(dl) => {
-                                    let now = std::time::Instant::now();
-                                    if now >= dl {
-                                        0
-                                    } else {
-                                        (dl - now).as_millis() as u64
-                                    }
-                                }
+                                Some(dl) => remaining_wait_ms(dl, std::time::Instant::now()),
                                 None => 0,
                             };
                             if deadline.is_some() && remaining_ms == 0 {
@@ -11268,14 +11272,7 @@ async fn execute_command(
                             recheck_blocking_keys(router, keys.iter());
 
                             let remaining_ms = match deadline {
-                                Some(dl) => {
-                                    let now = std::time::Instant::now();
-                                    if now >= dl {
-                                        0
-                                    } else {
-                                        (dl - now).as_millis() as u64
-                                    }
-                                }
+                                Some(dl) => remaining_wait_ms(dl, std::time::Instant::now()),
                                 None => 0,
                             };
 
@@ -26210,5 +26207,26 @@ mod tests {
         for name in ["hz_idx", "hz_hidx", "hz_c1", "hz_c2"] {
             let _ = crate::search::drop_search_index(name);
         }
+    }
+
+    #[test]
+    fn test_remaining_wait_ms_rounds_up_until_deadline() {
+        let t0 = Instant::now();
+        let dl = t0 + std::time::Duration::from_millis(100);
+        // After a 50.05ms first poll step, 49.95ms remains: rounding down to
+        // 49ms and then 0.90ms down to 0ms used to time out at 99.10ms.
+        assert_eq!(
+            remaining_wait_ms(dl, t0 + std::time::Duration::from_micros(50_050)),
+            50
+        );
+        assert_eq!(
+            remaining_wait_ms(dl, t0 + std::time::Duration::from_micros(99_100)),
+            1
+        );
+        assert_eq!(remaining_wait_ms(dl, dl), 0);
+        assert_eq!(
+            remaining_wait_ms(dl, dl + std::time::Duration::from_nanos(1)),
+            0
+        );
     }
 }

@@ -11840,6 +11840,29 @@ fn test_hash_field_expiration_and_stream_claim_e2e() {
     assert!(autoclaim_res.contains("0-0"));
     assert!(autoclaim_res.contains("100-0"));
     assert!(autoclaim_res.contains("200-0"));
+
+    // A blocking XREADGROUP CLAIM that times out must wait at least its BLOCK
+    // duration, never cut the last millisecond short across poll steps.
+    for block_ms in [55u64, 100] {
+        assert_eq!(
+            send_and_read(
+                &mut stream,
+                b"XCLAIM events:1 workers w3 0 100-0 200-0 JUSTID\r\n",
+            ),
+            "*2\r\n$5\r\n100-0\r\n$5\r\n200-0\r\n"
+        );
+        let t0 = std::time::Instant::now();
+        let cmd = format!(
+            "XREADGROUP GROUP workers w4 BLOCK {block_ms} CLAIM 500 STREAMS events:1 >\r\n"
+        );
+        let res = send_and_read(&mut stream, cmd.as_bytes());
+        let elapsed = t0.elapsed();
+        assert_eq!(res, "$-1\r\n");
+        assert!(
+            elapsed >= Duration::from_millis(block_ms),
+            "XREADGROUP BLOCK {block_ms} CLAIM timed out early after {elapsed:?}"
+        );
+    }
 }
 
 #[test]
