@@ -614,6 +614,12 @@ impl ReplicationHub {
     }
 
     pub fn update_replica_ack(&self, id: u64, offset: u64) {
+        // Every byte is counted in the master offset before it is queued
+        // for a replica, so an ack beyond it is a lie or a bug; counting it
+        // would let WAIT succeed for writes the replica never received.
+        if offset > self.master_repl_offset.load(Ordering::SeqCst) {
+            return;
+        }
         if let Some(rep) = self.replicas.read().unwrap().get(&id) {
             rep.ack_offset.store(offset, Ordering::SeqCst);
             let now = std::time::SystemTime::now()
@@ -2128,6 +2134,24 @@ mod tests {
         hub.make_master();
         assert!(hub.is_master());
         assert!(!hub.is_slave());
+    }
+
+    #[test]
+    fn test_replica_ack_beyond_master_offset_is_ignored() {
+        let hub = ReplicationHub::new(19992);
+        let (tx, _rx) = flume::unbounded();
+        let rep = hub.register_replica(11, tx);
+        hub.propagate(b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n");
+        let offset = hub.master_repl_offset.load(Ordering::SeqCst);
+
+        hub.update_replica_ack(rep.id, offset + 1);
+        hub.update_replica_ack(rep.id, u64::MAX);
+        assert_eq!(rep.ack_offset.load(Ordering::SeqCst), 0);
+        assert_eq!(rep.last_ack_time.load(Ordering::SeqCst), 0);
+
+        hub.update_replica_ack(rep.id, offset);
+        assert_eq!(rep.ack_offset.load(Ordering::SeqCst), offset);
+        hub.unregister_replica(rep.id);
     }
 
     #[test]

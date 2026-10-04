@@ -20251,3 +20251,64 @@ fn test_full_sync_replaces_dataset_and_failed_load_leaves_none_e2e() {
     drop(c);
     shutdown_and_wait(port, &mut child.0);
 }
+
+#[test]
+fn test_replica_ack_beyond_master_offset_does_not_satisfy_wait_e2e() {
+    let port: u16 = 17088;
+    let port_s = port.to_string();
+    let args = ["--port", &port_s, "--threads", "2", "--no-pin"];
+    let mut child = spawn_rudis_listening(&args, port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let repl_field = |c: &mut TcpStream, field: &str| {
+        let info = resp_cmd(c, &["INFO", "replication"]);
+        info.lines()
+            .find_map(|l| l.strip_prefix(&format!("{field}:")))
+            .unwrap_or_else(|| panic!("{field} missing in {info}"))
+            .trim()
+            .to_string()
+    };
+
+    let mut replica = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    replica
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    replica
+        .write_all(&format_resp_cmd(&["PSYNC", "?", "-1"]))
+        .unwrap();
+    let mut buf = [0u8; 256];
+    let n = replica.read(&mut buf).unwrap();
+    let reply = String::from_utf8_lossy(&buf[..n]).into_owned();
+    assert!(reply.starts_with("+FULLRESYNC"), "{reply:?}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while repl_field(&mut c, "connected_slaves") != "1" {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replica never attached"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // An ack for bytes the master never produced must not count.
+    replica
+        .write_all(&format_resp_cmd(&[
+            "REPLCONF",
+            "ACK",
+            &u64::MAX.to_string(),
+        ]))
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(resp_cmd(&mut c, &["SET", "wait:k", "v"]), "+OK\r\n");
+    assert_eq!(resp_cmd(&mut c, &["WAIT", "1", "500"]), ":0\r\n");
+
+    // An honest ack of everything sent so far still does.
+    let offset = repl_field(&mut c, "master_repl_offset");
+    replica
+        .write_all(&format_resp_cmd(&["REPLCONF", "ACK", &offset]))
+        .unwrap();
+    assert_eq!(resp_cmd(&mut c, &["WAIT", "1", "5000"]), ":1\r\n");
+
+    drop(replica);
+    drop(c);
+    shutdown_and_wait(port, &mut child);
+}
