@@ -6666,7 +6666,7 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
         Command::Lastsave => "LASTSAVE",
         Command::Ping(_) => "PING",
         Command::Monitor => "MONITOR",
-        Command::CommandDocs => "COMMAND",
+        Command::CommandDocs(_) => "COMMAND",
         Command::Info(_) => "INFO",
         Command::Replicaof { .. } => "REPLICAOF",
         Command::Psync { .. } => "PSYNC",
@@ -6757,7 +6757,10 @@ pub fn get_cmd_name(cmd: &Command) -> &'static str {
                 "EVALSHA"
             }
         }
-        Command::ScriptLoad(_) | Command::ScriptExists(_) | Command::ScriptFlush => "SCRIPT",
+        Command::ScriptLoad(_)
+        | Command::ScriptExists(_)
+        | Command::ScriptFlush
+        | Command::ScriptKill => "SCRIPT",
         Command::Vadd { .. } => "VADD",
         Command::Vquery { .. } => "VQUERY",
         Command::Vsim { .. } | Command::Vdist { .. } => "VSIM",
@@ -6998,143 +7001,6 @@ pub fn acl_cmd_name(cmd: &Command) -> &'static str {
     }
 }
 
-pub fn write_command_list(out: &mut Vec<u8>, filter: Option<(&str, &str)>) {
-    const ALL_CMD_NAMES: &[&str] = &[
-        "get",
-        "set",
-        "del",
-        "delex",
-        "exists",
-        "unlink",
-        "incr",
-        "decr",
-        "mget",
-        "mset",
-        "msetnx",
-        "msetex",
-        "hget",
-        "hset",
-        "hdel",
-        "hlen",
-        "hgetall",
-        "lpush",
-        "rpush",
-        "lpop",
-        "rpop",
-        "lrange",
-        "lmove",
-        "blmove",
-        "sadd",
-        "srem",
-        "smembers",
-        "sismember",
-        "zadd",
-        "zrem",
-        "zrange",
-        "zscore",
-        "zcard",
-        "xadd",
-        "xread",
-        "xreadgroup",
-        "xrange",
-        "xgroup",
-        "xack",
-        "xlen",
-        "xinfo",
-        "ping",
-        "echo",
-        "info",
-        "config",
-        "config|get",
-        "config|set",
-        "config|resetstat",
-        "config|rewrite",
-        "config|help",
-        "client",
-        "client|list",
-        "client|help",
-        "client|info",
-        "client|setname",
-        "client|getname",
-        "client|id",
-        "client|kill",
-        "cluster",
-        "cluster|help",
-        "memory",
-        "memory|usage",
-        "memory|help",
-        "eval",
-        "eval_ro",
-        "evalsha",
-        "evalsha_ro",
-        "script",
-        "script|kill",
-        "script|load",
-        "script|exists",
-        "script|flush",
-        "script|help",
-        "select",
-        "quit",
-        "publish",
-        "subscribe",
-        "psubscribe",
-        "wait",
-        "waitaof",
-        "readonly",
-        "readwrite",
-        "object",
-        "sort",
-        "sort_ro",
-    ];
-    match filter {
-        None => {
-            write_resp_array_header(out, ALL_CMD_NAMES.len());
-            for name in ALL_CMD_NAMES {
-                write_resp_bulk(out, name.as_bytes());
-            }
-        }
-        Some(("MODULE", _)) => {
-            write_resp_array_header(out, 0);
-        }
-        Some(("ACLCAT", cat)) => {
-            if cat.eq_ignore_ascii_case("scripting") {
-                const SCRIPTING_CMDS: &[&str] = &[
-                    "eval",
-                    "eval_ro",
-                    "evalsha",
-                    "evalsha_ro",
-                    "script",
-                    "script|kill",
-                    "script|load",
-                    "script|exists",
-                    "script|flush",
-                    "script|help",
-                ];
-                write_resp_array_header(out, SCRIPTING_CMDS.len());
-                for name in SCRIPTING_CMDS {
-                    write_resp_bulk(out, name.as_bytes());
-                }
-            } else {
-                write_resp_array_header(out, 0);
-            }
-        }
-        Some(("PATTERN", pat)) => {
-            let pat_lower = pat.to_lowercase();
-            let matched: Vec<&&str> = ALL_CMD_NAMES
-                .iter()
-                .filter(|name| crate::pubsub::glob_match(pat_lower.as_bytes(), name.as_bytes()))
-                .collect();
-            write_resp_array_header(out, matched.len());
-            for name in matched {
-                write_resp_bulk(out, name.as_bytes());
-            }
-        }
-        Some(_) => {
-            write_resp_array_header(out, 0);
-        }
-    }
-}
-
 pub fn write_command_getkeys(out: &mut Vec<u8>, cmd_args: &[Bytes]) {
     if cmd_args.is_empty() {
         out.extend_from_slice(b"-ERR Invalid number of arguments specified for command\r\n");
@@ -7241,99 +7107,6 @@ pub fn write_command_getkeys_and_flags(out: &mut Vec<u8>, cmd_args: &[Bytes]) {
                 }
             }
         }
-    }
-}
-
-pub fn write_command_info(out: &mut Vec<u8>, cmds: &[String]) {
-    let default_cmds = [
-        "get".to_string(),
-        "set".to_string(),
-        "eval".to_string(),
-        "zunionstore".to_string(),
-    ];
-    let list = if cmds.is_empty() {
-        &default_cmds[..]
-    } else {
-        cmds
-    };
-    write_resp_array_header(out, list.len());
-    for cmd_str in list {
-        let c = cmd_str.to_lowercase();
-        let is_invalid_sub = c.contains('|')
-            && !matches!(
-                c.as_str(),
-                "memory|usage"
-                    | "memory|help"
-                    | "config|get"
-                    | "config|set"
-                    | "config|resetstat"
-                    | "config|rewrite"
-                    | "config|help"
-                    | "client|list"
-                    | "client|help"
-                    | "client|info"
-                    | "client|setname"
-                    | "client|getname"
-                    | "client|id"
-                    | "client|kill"
-                    | "script|kill"
-                    | "script|load"
-                    | "script|exists"
-                    | "script|flush"
-                    | "script|help"
-                    | "cluster|help"
-            );
-        if is_invalid_sub || c == "unknown" || c == "nonexistent" {
-            write_resp_null(out);
-            continue;
-        }
-        let is_movable = matches!(
-            c.as_str(),
-            "zunionstore"
-                | "zinterstore"
-                | "zdiffstore"
-                | "zunion"
-                | "zinter"
-                | "zdiff"
-                | "zintercard"
-                | "xread"
-                | "xreadgroup"
-                | "eval"
-                | "eval_ro"
-                | "evalsha"
-                | "evalsha_ro"
-                | "fcall"
-                | "fcall_ro"
-                | "sort"
-                | "sort_ro"
-                | "migrate"
-                | "georadius"
-                | "georadiusbymember"
-                | "geosearchstore"
-                | "sintercard"
-                | "lmpop"
-                | "blmpop"
-                | "zmpop"
-                | "bzmpop"
-        );
-        write_resp_array_header(out, 10);
-        write_resp_bulk(out, c.as_bytes());
-        write_resp_integer(out, -1);
-        if is_movable {
-            write_resp_array_header(out, 2);
-            write_resp_bulk(out, b"write");
-            write_resp_bulk(out, b"movablekeys");
-        } else {
-            write_resp_array_header(out, 1);
-            write_resp_bulk(out, b"readonly");
-        }
-        write_resp_integer(out, 0);
-        write_resp_integer(out, 0);
-        write_resp_integer(out, 0);
-        write_resp_array_header(out, 0);
-        write_resp_array_header(out, 0);
-        write_resp_array_header(out, 0);
-        write_resp_array_header(out, 0);
     }
 }
 
@@ -9031,8 +8804,8 @@ async fn execute_command(
             out.extend_from_slice(b"+OK\r\n");
             false
         }
-        Command::CommandDocs => {
-            out.extend_from_slice(b"*0\r\n");
+        Command::CommandDocs(ref cmds) => {
+            crate::command_info::write_docs(out, cmds, CURRENT_CLIENT_RESP3.get());
             false
         }
         Command::McpTools => {
@@ -15382,6 +15155,10 @@ async fn execute_command(
             }
             false
         }
+        Command::ScriptKill => {
+            out.extend_from_slice(b"-NOTBUSY No scripts in execution right now.\r\n");
+            false
+        }
         Command::ScriptFlush => {
             crate::scripting::flush_scripts();
             out.extend_from_slice(b"+OK\r\n");
@@ -16338,18 +16115,18 @@ async fn execute_command(
             false
         }
         Command::CommandCount => {
-            write_resp_integer(out, 250);
+            crate::command_info::write_count(out);
             false
         }
         Command::CommandList => {
-            write_command_list(out, None);
+            crate::command_info::write_list(out, None);
             false
         }
         Command::CommandListFiltered {
             ref filter_type,
             ref filter_val,
         } => {
-            write_command_list(out, Some((filter_type.as_str(), filter_val.as_str())));
+            crate::command_info::write_list(out, Some((filter_type.as_str(), filter_val.as_str())));
             false
         }
         Command::CommandGetkeys(ref cmd_args) => {
@@ -16361,7 +16138,7 @@ async fn execute_command(
             false
         }
         Command::CommandInfo(ref cmds) => {
-            write_command_info(out, cmds);
+            crate::command_info::write_info(out, cmds, CURRENT_CLIENT_RESP3.get());
             false
         }
         Command::Quit => {
@@ -19031,18 +18808,18 @@ pub fn execute_local_command(
             false
         }
         Command::CommandCount => {
-            write_resp_integer(out, 250);
+            crate::command_info::write_count(out);
             false
         }
         Command::CommandList => {
-            write_command_list(out, None);
+            crate::command_info::write_list(out, None);
             false
         }
         Command::CommandListFiltered {
             filter_type,
             filter_val,
         } => {
-            write_command_list(out, Some((filter_type.as_str(), filter_val.as_str())));
+            crate::command_info::write_list(out, Some((filter_type.as_str(), filter_val.as_str())));
             false
         }
         Command::CommandGetkeys(cmd_args) => {
@@ -19054,7 +18831,7 @@ pub fn execute_local_command(
             false
         }
         Command::CommandInfo(cmds) => {
-            write_command_info(out, cmds);
+            crate::command_info::write_info(out, cmds, CURRENT_CLIENT_RESP3.get());
             false
         }
         Command::Dbsize => {
@@ -19325,8 +19102,8 @@ pub fn execute_local_command(
             out.extend_from_slice(b"+OK\r\n");
             false
         }
-        Command::CommandDocs => {
-            out.extend_from_slice(b"*0\r\n");
+        Command::CommandDocs(cmds) => {
+            crate::command_info::write_docs(out, cmds, CURRENT_CLIENT_RESP3.get());
             false
         }
         Command::Keys(pattern) => {
@@ -23688,7 +23465,6 @@ async fn execute_commands_squashed(
                         && !matches!(
                             cmd,
                             Command::Ping(_)
-                                | Command::CommandDocs
                                 | Command::Quit
                                 | Command::Time
                                 | Command::Echo(_)
@@ -24266,7 +24042,6 @@ async fn execute_commands_squashed(
         } else if !matches!(
             cmd,
             Command::Ping(_)
-                | Command::CommandDocs
                 | Command::Quit
                 | Command::Time
                 | Command::Echo(_)
@@ -26320,7 +26095,11 @@ mod tests {
 
         // COMMAND COUNT / LIST
         execute_local_command(&Command::CommandCount, &mut db, &mut out, None);
-        assert_eq!(&out[..], b":250\r\n");
+        let count: usize = std::str::from_utf8(&out[1..out.len() - 2])
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(count > 200, "COMMAND COUNT {count}");
         out.clear();
 
         execute_local_command(&Command::CommandList, &mut db, &mut out, None);

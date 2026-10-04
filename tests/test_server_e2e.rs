@@ -11581,7 +11581,9 @@ fn test_e2e_unlink_readonly_wait_object_and_proto_max() {
     assert!(xinfo_help_resp.contains("CONSUMERS"));
 
     // 7. COMMAND COUNT and COMMAND LIST
-    assert_eq!(send_and_read(&mut stream, b"COMMAND COUNT\r\n"), ":250\r\n");
+    let count = send_and_read(&mut stream, b"COMMAND COUNT\r\n");
+    let count: usize = count.trim().trim_start_matches(':').parse().unwrap();
+    assert!(count > 200, "COMMAND COUNT {count}");
     let cmd_list_resp = send_and_read(&mut stream, b"COMMAND LIST\r\n");
     assert!(cmd_list_resp.contains("xinfo"));
     assert!(cmd_list_resp.contains("unlink"));
@@ -18262,4 +18264,116 @@ fn test_timeout_keepalive_and_replica_read_only_directives_e2e() {
     let _ = master.kill();
     let _ = master.wait();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Counts the top-level elements of a RESP2 array reply.
+fn resp2_top_level_len(reply: &str) -> usize {
+    fn skip(b: &[u8], mut i: usize) -> usize {
+        let end = i + b[i..].windows(2).position(|w| w == b"\r\n").unwrap();
+        let n: i64 = std::str::from_utf8(&b[i + 1..end])
+            .unwrap()
+            .parse()
+            .unwrap_or(0);
+        let t = b[i];
+        i = end + 2;
+        match t {
+            b'*' => (0..n.max(0)).fold(i, |i, _| skip(b, i)),
+            b'$' if n >= 0 => i + n as usize + 2,
+            _ => i,
+        }
+    }
+    let b = reply.as_bytes();
+    let end = b.windows(2).position(|w| w == b"\r\n").unwrap();
+    let n: usize = reply[1..end].parse().unwrap();
+    let mut i = end + 2;
+    for _ in 0..n {
+        i = skip(b, i);
+    }
+    assert_eq!(i, b.len(), "trailing data after the reply");
+    n
+}
+
+#[test]
+fn test_command_introspection_matches_valkey_e2e() {
+    let port = 17103u16;
+    let port_s = port.to_string();
+    let mut child = spawn_rudis_listening(&["--port", &port_s, "--threads", "2", "--no-pin"], port);
+    let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    // Byte-for-byte what Valkey replies.
+    let get_info = "*10\r\n$3\r\nget\r\n:2\r\n*2\r\n+readonly\r\n+fast\r\n:1\r\n:1\r\n:1\r\n\
+*3\r\n+@read\r\n+@string\r\n+@fast\r\n*0\r\n*1\r\n*6\r\n$5\r\nflags\r\n*2\r\n+RO\r\n+access\r\n\
+$12\r\nbegin_search\r\n*4\r\n$4\r\ntype\r\n$5\r\nindex\r\n$4\r\nspec\r\n*2\r\n$5\r\nindex\r\n:1\r\n\
+$9\r\nfind_keys\r\n*4\r\n$4\r\ntype\r\n$5\r\nrange\r\n$4\r\nspec\r\n*6\r\n$7\r\nlastkey\r\n:0\r\n\
+$7\r\nkeystep\r\n:1\r\n$5\r\nlimit\r\n:0\r\n*0\r\n";
+    assert_eq!(
+        resp_cmd_full(&mut c, &["COMMAND", "INFO", "get", "no-such-command"]),
+        format!("*2\r\n{get_info}$-1\r\n")
+    );
+    // Movable-key commands carry the flag cluster clients key off.
+    let zu = resp_cmd_full(&mut c, &["COMMAND", "INFO", "zunionstore"]);
+    assert!(zu.contains("+movablekeys\r\n"), "{zu}");
+    assert!(zu.contains("$6\r\nkeynum\r\n"), "{zu}");
+
+    // COMMAND lists every command COMMAND COUNT counts.
+    let count = resp_cmd(&mut c, &["COMMAND", "COUNT"]);
+    let count: usize = count.trim().trim_start_matches(':').parse().unwrap();
+    assert!(count > 200, "COMMAND COUNT {count}");
+    let all = resp_cmd_full(&mut c, &["COMMAND"]);
+    assert_eq!(resp2_top_level_len(&all), count);
+    assert!(all.contains(get_info));
+
+    // Containers list only the subcommands that exist.
+    let client = resp_cmd_full(&mut c, &["COMMAND", "INFO", "client"]);
+    assert!(client.contains("$11\r\nclient|list\r\n"), "{client}");
+    let list = resp_cmd_full(&mut c, &["COMMAND", "LIST"]);
+    assert!(list.contains("$11\r\nclient|list\r\n"));
+    assert!(!list.contains("sentinel"));
+    // Experimental families are off by default and never listed.
+    assert!(!list.to_ascii_lowercase().contains("json."));
+    assert_eq!(
+        resp_cmd_full(&mut c, &["COMMAND", "INFO", "json.set"]),
+        "*1\r\n$-1\r\n"
+    );
+    let pat = resp_cmd_full(
+        &mut c,
+        &["COMMAND", "LIST", "FILTERBY", "PATTERN", "ZUNION*"],
+    );
+    assert_eq!(pat, "*2\r\n$6\r\nzunion\r\n$11\r\nzunionstore\r\n");
+
+    // DOCS: a map, flattened for RESP2; unknown names are skipped.
+    let docs = resp_cmd_full(&mut c, &["COMMAND", "DOCS", "get", "no-such-command"]);
+    assert!(
+        docs.starts_with("*2\r\n$3\r\nget\r\n*10\r\n$7\r\nsummary\r\n$34\r\nReturns the string value of a key.\r\n"),
+        "{docs}"
+    );
+    assert!(resp_cmd(&mut c, &["COMMAND", "FOO"]).starts_with("-ERR unknown subcommand 'FOO'"));
+    let scripting = resp_cmd_full(
+        &mut c,
+        &["COMMAND", "LIST", "FILTERBY", "ACLCAT", "scripting"],
+    );
+    assert!(scripting.contains("$11\r\nscript|kill\r\n"), "{scripting}");
+    assert!(!scripting.contains("$3\r\nset\r\n"), "{scripting}");
+    assert_eq!(
+        resp_cmd(&mut c, &["SCRIPT", "KILL"]),
+        "-NOTBUSY No scripts in execution right now.\r\n"
+    );
+
+    // RESP3 uses sets and maps.
+    resp_cmd(&mut c, &["HELLO", "3"]);
+    let info3 = resp_cmd_full(&mut c, &["COMMAND", "INFO", "get"]);
+    assert!(
+        info3.starts_with("*1\r\n*10\r\n$3\r\nget\r\n:2\r\n~2\r\n+readonly\r\n"),
+        "{info3}"
+    );
+    assert!(
+        info3.contains("%3\r\n$5\r\nflags\r\n~2\r\n+RO\r\n"),
+        "{info3}"
+    );
+    let docs3 = resp_cmd_full(&mut c, &["COMMAND", "DOCS", "get"]);
+    assert!(docs3.starts_with("%1\r\n$3\r\nget\r\n%5\r\n"), "{docs3}");
+
+    let _ = child.kill();
+    let _ = child.wait();
 }

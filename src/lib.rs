@@ -9,6 +9,9 @@ pub mod aof;
 
 pub mod block;
 pub mod cluster;
+#[rustfmt::skip]
+pub mod command_docs;
+pub mod command_info;
 pub mod config;
 pub mod conn_balance;
 pub mod connection;

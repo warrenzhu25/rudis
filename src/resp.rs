@@ -794,7 +794,8 @@ pub enum Command {
     Lastsave,
     Ping(Option<Bytes>),
     Monitor,
-    CommandDocs,
+    /// COMMAND DOCS [name ...] (lower-cased names).
+    CommandDocs(Vec<String>),
     Info(Option<Bytes>),
     Replicaof {
         host: Bytes,
@@ -825,6 +826,9 @@ pub enum Command {
     ScriptLoad(Bytes),
     ScriptExists(Vec<Bytes>),
     ScriptFlush,
+    /// SCRIPT KILL. Scripts run to completion on their shard, so there is
+    /// never one to kill.
+    ScriptKill,
     // TIERED STORAGE COMMANDS
     Tier(TierSubcommand),
     // CONFIG COMMANDS
@@ -6161,7 +6165,8 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
         }
         "COMMAND" => {
             if args.len() == 1 {
-                Ok(Some(Command::CommandDocs))
+                // COMMAND is COMMAND INFO for every command.
+                Ok(Some(Command::CommandInfo(Vec::new())))
             } else {
                 let sub = String::from_utf8_lossy(&args[1]).to_uppercase();
                 match sub.as_str() {
@@ -6213,8 +6218,18 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                             .collect();
                         Ok(Some(Command::CommandInfo(cmds)))
                     }
+                    "DOCS" => {
+                        let cmds = args[2..]
+                            .iter()
+                            .map(|b| String::from_utf8_lossy(b).to_lowercase())
+                            .collect();
+                        Ok(Some(Command::CommandDocs(cmds)))
+                    }
                     "HELP" => Ok(Some(Command::Unknown("COMMAND HELP".to_string()))),
-                    _ => Ok(Some(Command::CommandDocs)),
+                    _ => Err(format!(
+                        "unknown subcommand '{}'. Try COMMAND HELP.",
+                        String::from_utf8_lossy(&args[1])
+                    )),
                 }
             }
         }
@@ -6356,6 +6371,7 @@ pub fn build_command(mut args: Vec<Bytes>) -> Result<Option<Command>, String> {
                     Ok(Some(Command::ScriptExists(args[2..].to_vec())))
                 }
                 "FLUSH" => Ok(Some(Command::ScriptFlush)),
+                "KILL" if args.len() == 2 => Ok(Some(Command::ScriptKill)),
                 _ => Err(format!(
                     "ERR Unknown SCRIPT subcommand or wrong number of arguments for '{}'",
                     sub
