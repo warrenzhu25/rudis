@@ -3154,27 +3154,27 @@ fn test_primary_replica_replication_e2e() {
         ":2\r\n"
     );
 
-    // Wait for replication stream propagation
-    for _ in 0..40 {
-        if send_and_read(&mut replica_client, b"GET live_key\r\n") == "$8\r\nlive_val\r\n" {
-            break;
+    // Wait for replication stream propagation. Each write is propagated on
+    // its own (from whichever shard owns the key, with no order across
+    // shards), so seeing the first one says nothing about the others: wait
+    // for each.
+    for (cmd, want) in [
+        (&b"GET live_key\r\n"[..], "$8\r\nlive_val\r\n"),
+        (b"GET live_counter\r\n", "$2\r\n42\r\n"),
+        (
+            b"LRANGE mylist 0 -1\r\n",
+            "*2\r\n$5\r\nitemA\r\n$5\r\nitemB\r\n",
+        ),
+    ] {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut got = send_and_read(&mut replica_client, cmd);
+        while got != want && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+            got = send_and_read(&mut replica_client, cmd);
         }
-        thread::sleep(Duration::from_millis(50));
+        // Verify replicated on replica
+        assert_eq!(got, want, "{}", String::from_utf8_lossy(cmd).trim());
     }
-
-    // Verify replicated on replica
-    assert_eq!(
-        send_and_read(&mut replica_client, b"GET live_key\r\n"),
-        "$8\r\nlive_val\r\n"
-    );
-    assert_eq!(
-        send_and_read(&mut replica_client, b"GET live_counter\r\n"),
-        "$2\r\n42\r\n"
-    );
-    assert_eq!(
-        send_and_read(&mut replica_client, b"LRANGE mylist 0 -1\r\n"),
-        "*2\r\n$5\r\nitemA\r\n$5\r\nitemB\r\n"
-    );
 
     // 8. Promotion via REPLICAOF NO ONE
     assert_eq!(
